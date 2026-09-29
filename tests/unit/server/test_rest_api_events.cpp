@@ -29,12 +29,19 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "pg/pg_exec.hpp" // #2146 A2-R4: DROP TABLE fault injection for the store-degrade tests
+#include "pg/pg_raii.hpp"
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "stream_budget.hpp"
 #include "execution_tracker.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_api_v1.hpp"
+#include "test_approval_manager_pg_helper.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
+#include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -42,7 +49,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
-#include <sqlite3.h>
+#include <libpq-fe.h>
 
 #include <atomic>
 #include <chrono>
@@ -51,6 +58,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../test_helpers.hpp"
@@ -60,38 +68,42 @@ using namespace yuzu::server;
 
 namespace {
 
-fs::path uniq(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
+// Fault-injection helper for the #2146 A2-R1 Gate 8 degrade test below: runs
+// a raw statement over a fresh side connection (never the harness's own
+// pool, so the tracker's `open_`/pool state stays otherwise healthy -- only
+// the ONE targeted query fails). Mirrors test_rest_executions_v1_twins.cpp's
+// identical `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
 }
-
-// RAII closer for the raw sqlite3* the ExecutionTracker borrows. Declared
-// FIRST in RestEventsHarness so it destructs LAST — matches the
-// SqliteHandleGuard pattern from test_workflow_routes.cpp (qa-B2).
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
 
 struct AuditCall {
     std::string action, result, target_type, target_id, detail;
 };
 
 struct RestEventsHarness {
-    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path tracker_db;
-    std::unique_ptr<ExecutionTracker> tracker;
+    /// Optional shared admission budget (ADR-0034). nullptr keeps every pre-existing
+    /// test on the unmetered path; the admission tests pass one in.
+    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+
     // Bus outlives tracker — same invariant as production server.cpp
-    // (execution_event_bus_ declared before execution_tracker_).
+    // (execution_event_bus_ declared before execution_tracker_; members
+    // destruct in reverse declaration order, so declaring the bus FIRST
+    // makes it destruct LAST).
     std::unique_ptr<ExecutionEventBus> event_bus;
+    std::optional<yuzu::test::ExecutionTrackerPg> tracker_bundle;
+    ExecutionTracker* tracker{nullptr};
 
     // Auth/perm/audit toggles for negative cases.
     bool session_present{true};
     bool perm_grant{true};
+    authz::VisibleSet fleet_read_scope{std::nullopt};
     bool audit_should_fail{false};
     bool audit_should_throw{false};
 
@@ -107,18 +119,16 @@ struct RestEventsHarness {
     /// bus so the 503-on-no-bus path can be exercised independently.
     /// `with_tracker=false` opts out of the tracker entirely (separate
     /// 503 path).
-    explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true)
-        : tracker_db(uniq("rest-events-tracker")) {
-        fs::remove(tracker_db);
-
+    explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
+                               yuzu::server::detail::StreamBudget* budget = nullptr,
+                               RestApiV1::AuthFn auth_override = {},
+                               RestApiV1::FleetReadFn fleet_read_override = {})
+        : stream_budget(budget) {
         if (with_tracker) {
-            REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
+            tracker_bundle.emplace();
+            tracker = tracker_bundle->get();
             if (with_bus) {
                 event_bus = std::make_unique<ExecutionEventBus>();
-            }
-            tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-            tracker->create_tables();
-            if (event_bus) {
                 tracker->set_event_bus(event_bus.get());
             }
         } else if (with_bus) {
@@ -127,8 +137,8 @@ struct RestEventsHarness {
             event_bus = std::make_unique<ExecutionEventBus>();
         }
 
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response& res) -> std::optional<auth::Session> {
+        RestApiV1::AuthFn auth_fn = [this](const httplib::Request&,
+                                           httplib::Response& res) -> std::optional<auth::Session> {
             if (!session_present) {
                 // Mirror require_auth's 401 contract — set status +
                 // body so the handler short-circuits.
@@ -141,6 +151,8 @@ struct RestEventsHarness {
             s.role = auth::Role::admin;
             return s;
         };
+        if (auth_override)
+            auth_fn = std::move(auth_override);
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                               const std::string&) -> bool {
             if (!perm_grant) {
@@ -158,6 +170,23 @@ struct RestEventsHarness {
                 throw std::runtime_error("simulated audit pipeline failure");
             return !audit_should_fail;
         };
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) -> authz::FleetReadGate {
+            if (!session_present) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            if (!perm_grant) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, fleet_read_scope};
+        };
+        if (fleet_read_override)
+            fleet_read_fn = std::move(fleet_read_override);
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
@@ -165,7 +194,7 @@ struct RestEventsHarness {
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
-                            /*instruction_store=*/nullptr, tracker.get(),
+                            /*instruction_store=*/nullptr, tracker,
                             /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr,
@@ -179,31 +208,38 @@ struct RestEventsHarness {
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
                             /*metrics_registry=*/&metrics,
-                            /*session_revoke_fn=*/{}, event_bus.get());
+                            /*session_revoke_fn=*/{}, event_bus.get(),
+                            // Everything from here to stream_budget is a defaulted
+                            // dependency this harness does not use. Spelled out because
+                            // the budget is the LAST parameter and C++ has no way to skip
+                            // to it — which is precisely how the production wiring came to
+                            // be omitted without anything noticing.
+                            /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{},
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{},
+                            /*network_api=*/{},
+                            /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr,
+                            /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
+                            /*response_scope_fn=*/{},
+                            /*engine_principal_store=*/nullptr,
+                            /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
+                            /*directory_sync=*/nullptr, stream_budget,
+                            /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, fleet_read_fn);
     }
 
-    ~RestEventsHarness() {
-        // Drop tracker BEFORE bus — tracker borrows event_bus_ via
-        // set_event_bus, must reset first. Same invariant as
-        // ExecHarness in test_workflow_routes.cpp.
-        tracker.reset();
-        event_bus.reset();
-        if (tracker_guard.db) {
-            sqlite3_close(tracker_guard.db);
-            tracker_guard.db = nullptr;
-        }
-        std::error_code ec;
-        fs::remove(tracker_db, ec);
-        fs::remove(tracker_db.string() + "-wal", ec);
-        fs::remove(tracker_db.string() + "-shm", ec);
-    }
-
-    std::string make_exec(const std::string& status) {
+    std::string make_exec(const std::string& status,
+                          const std::string& dispatched_by = "tester") {
         Execution e;
         e.id = "exec-events-" + std::to_string(exec_counter.fetch_add(1));
         e.definition_id = "def-events";
         e.status = status;
-        e.dispatched_by = "tester";
+        e.scope_expression = "agent:secret-target";
+        e.parameter_values = R"({"secret_agent":"agent-hidden"})";
+        e.dispatched_by = dispatched_by;
         e.dispatched_at = 1735689600;
         e.agents_targeted = 3;
         e.agents_success = (status == "completed") ? 3 : 0;
@@ -213,6 +249,19 @@ struct RestEventsHarness {
         auto id = tracker->create_execution(e);
         REQUIRE(id.has_value());
         return *id;
+    }
+
+    void agent_status(const std::string& exec_id, const std::string& agent_id,
+                      const std::string& status, const std::string& error_detail = {},
+                      int64_t completed_at = 1735689660) {
+        AgentExecStatus a;
+        a.agent_id = agent_id;
+        a.status = status;
+        a.dispatched_at = 1735689600;
+        a.first_response_at = 1735689601;
+        a.completed_at = completed_at;
+        a.error_detail = error_detail;
+        tracker->update_agent_status(exec_id, a);
     }
 };
 
@@ -287,7 +336,7 @@ TEST_CASE("make_event_envelope: empty payload becomes JSON null", "[events][enve
 
 // ── Auth + permission preflight ─────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[events][auth]") {
+TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[pg][events][auth]") {
     RestEventsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/events?execution_id=anything");
@@ -298,7 +347,7 @@ TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[events][perm]") {
+TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[pg][events][perm]") {
     RestEventsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-X");
@@ -310,9 +359,115 @@ TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[events
     REQUIRE(h.audit_log.empty());
 }
 
+// ── ADR-0034 shared-budget admission (governance regression guards) ─────────
+//
+// This route's lease block was DEAD CODE on a real server: server.cpp never passed
+// the budget, the parameter defaults to nullptr, and nothing observed the gap — the
+// boot log, stream_budget.hpp and rest-api.md all asserted the opposite. Nothing in
+// this suite wired a budget in either, so the omission was unfalsifiable. These
+// tests make it falsifiable.
+
+TEST_CASE("GET /api/v1/events: 429 A4 envelope once the shared budget is exhausted",
+          "[pg][events][admission][sse]") {
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalApiEvents);
+    REQUIRE(held.lease);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    // A REAL running execution: the handler validates the id BEFORE admission, which
+    // is the right order (a bogus id must not consume a lease), so a synthetic id
+    // would 404 and never reach the branch under test.
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    // A4 envelope, not a bare status — this is an agentic-first surface.
+    CHECK(res->body.find(R"("code":429)") != std::string::npos);
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    // The remediation must name a flag that can actually resolve the rejection.
+    CHECK(res->body.find("--max-sse-streams") != std::string::npos);
+    // Retry-After header alongside the envelope (the platform 429 convention).
+    CHECK(res->get_header_value("Retry-After") == "5");
+    // A live stream is never evicted for a newcomer.
+    CHECK(budget.active() == 1);
+}
+
+TEST_CASE("GET /api/v1/events: a budget rejection leaves no subscriber and no gauge drift",
+          "[pg][events][admission][sse]") {
+    // The lease is taken before BOTH the bus subscription and the active-gauge bump.
+    // Getting either order wrong is silent: a leaked listener is only visible in
+    // memory, and a leaked gauge increment only shows up as a slowly-rising number
+    // on the very dashboard the budget exists to make trustworthy.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalApiEvents);
+    REQUIRE(held.lease);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    const auto before = h.event_bus->subscribers_total();
+    for (int i = 0; i < 5; ++i) {
+        auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 429);
+    }
+    CHECK(h.event_bus->subscribers_total() == before);
+}
+
+TEST_CASE("GET /api/v1/events: the PER-PRINCIPAL cap is keyed on the authenticated identity",
+          "[pg][events][admission][sse]") {
+    // Falsification guard the global-cap tests above cannot provide: they force a reject
+    // by pre-seeding a DIFFERENT principal, so they would still pass if the handler keyed
+    // its lease on a hardcoded literal instead of `session->username`. Here the reject can
+    // only fire if the handler keys on the SAME principal the harness authenticates as
+    // ("tester"). A generous global cap isolates the per-principal cap as the sole cause.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/100}};
+    // Fill "tester"'s per-principal allowance (compile-time kPerPrincipalApiEvents).
+    std::vector<yuzu::server::detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < yuzu::server::detail::kPerPrincipalApiEvents; ++i) {
+        auto a = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "tester",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    // Global budget still has plenty of room — only the per-principal cap is exhausted.
+    REQUIRE(budget.active() < 100);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    // If the handler used any principal string other than "tester", its key would have 0
+    // prior leases and it would be ADMITTED (200). The 429 proves it keyed on the session.
+    CHECK(res->status == 429);
+    // And the remediation must be the per-principal one (no --max-sse-streams, which would
+    // not resolve a per-principal reject).
+    CHECK(res->body.find("per-principal") != std::string::npos);
+    CHECK(res->body.find("--max-sse-streams") == std::string::npos);
+
+    // A different principal is unaffected — proves the cap is per-principal, not global.
+    auto other = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+    CHECK(other.lease);
+}
+
+TEST_CASE("GET /api/v1/events: an unmetered route still serves (nullptr budget is a seam)",
+          "[pg][events][admission][sse]") {
+    // Guards against the admission tests above passing for the wrong reason.
+    RestEventsHarness h; // no budget
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status != 429);
+}
+
 // ── Input validation ────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[events][input]") {
+TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[pg][events][input]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/events");
     REQUIRE(res);
@@ -326,7 +481,7 @@ TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[even
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: malformed execution_id → 400 A4 envelope", "[events][input]") {
+TEST_CASE("GET /api/v1/events: malformed execution_id → 400 A4 envelope", "[pg][events][input]") {
     RestEventsHarness h;
     // Path-traversal-style payload exercises the char-class regex; the
     // 128-char cap is also implicit (rejects 200+-char IDs).
@@ -349,7 +504,7 @@ TEST_CASE("GET /api/v1/events: tracker unavailable → 503 A4", "[events][noreso
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[events][noresources]") {
+TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[pg][events][noresources]") {
     RestEventsHarness h(/*with_bus=*/false, /*with_tracker=*/true);
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-x");
     REQUIRE(res);
@@ -360,19 +515,65 @@ TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[events][nore
 
 // ── Execution-state preflight ───────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[events][notfound]") {
+TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notfound]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-does-not-exist");
     REQUIRE(res);
     REQUIRE(res->status == 404);
     REQUIRE(res->body.find("execution not found") != std::string::npos);
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
-    // 404 deliberately does NOT audit — leaking enumeration evidence
-    // into the audit log would give an attacker a side channel.
-    REQUIRE(h.audit_log.empty());
+    // #1634 (governance Gate 4 fix): a `denied` audit row is now emitted here
+    // (CC7.2 evidence, parity with MCP get_execution_status and every other
+    // migrated route's scope-drop audit). This does NOT reopen an enumeration
+    // side channel: the audited detail string is IDENTICAL for a genuinely
+    // nonexistent id and an exists-but-invisible one (no distinguishing text),
+    // matching the #1700/#3558 precedent for get_agent_details — the
+    // distinguishing fact lives only in a server-side spdlog::debug line no
+    // audited-evidence reader (including query_audit_log) can reach.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "api.v1.events.subscribe");
+    CHECK(h.audit_log[0].result == "denied");
 }
 
-TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[events][terminal]") {
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("GET /api/v1/events: a transient tracker degrade is 503 (not a false 404) "
+          "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][events][notfound]") {
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running");
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault (a full outage would
+    // already hit the pre-existing tracker-unavailable/pool-exhaustion
+    // branch above and mask this specific defect).
+    exec_sql(h.tracker_bundle->dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146b");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    exec_sql(h.tracker_bundle->dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146b RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    REQUIRE(res->body.find("execution tracker degraded") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // api.v1.events.subscribe/denied here.
+    for (const auto& c : h.audit_log)
+        CHECK(c.target_id != exec_id);
+}
+
+TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[pg][events][terminal]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("completed");
     auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
@@ -387,7 +588,7 @@ TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[events][termina
 
 // ── Happy path ──────────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[events][happy]") {
+TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[pg][events][happy]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -419,7 +620,7 @@ TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[events
     REQUIRE(h.audit_log[0].detail.starts_with("correlation_id=req-"));
 }
 
-TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[events][happy][audit]") {
+TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[pg][events][happy][audit]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.audit_should_fail = true;
@@ -437,7 +638,7 @@ TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[eve
 }
 
 TEST_CASE("GET /api/v1/events: audit exception → Sec-Audit-Failed header",
-          "[events][happy][audit]") {
+          "[pg][events][happy][audit]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.audit_should_throw = true;
@@ -453,7 +654,7 @@ TEST_CASE("GET /api/v1/events: audit exception → Sec-Audit-Failed header",
 
 // ── Replay window ───────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[events][replay]") {
+TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -485,7 +686,7 @@ TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[events][
     REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
 }
 
-TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[events][replay]") {
+TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "execution-progress", R"({"pending":1})", false);
@@ -500,7 +701,7 @@ TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[events
 
 // ── OpenAPI discovery (A2) ──────────────────────────────────────────────────
 
-TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events][discovery][a2]") {
+TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -514,7 +715,7 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events
 }
 
 TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
-          "[events][discovery][a2]") {
+          "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -525,7 +726,7 @@ TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
 }
 
 TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
-          "[events][discovery][a2][lockout]") {
+          "[pg][events][discovery][a2][lockout]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -539,7 +740,7 @@ TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
 }
 
 TEST_CASE("OpenAPI spec lists the JIT admin-elevation routes (A2 discovery)",
-          "[events][discovery][a2][jit]") {
+          "[pg][events][discovery][a2][jit]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -553,7 +754,7 @@ TEST_CASE("OpenAPI spec lists the JIT admin-elevation routes (A2 discovery)",
 }
 
 TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
-          "[events][discovery][a2]") {
+          "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -604,7 +805,7 @@ TEST_CASE("error_json_a4 no-retry overload emits retry_after_ms:null (A4 field s
 }
 
 TEST_CASE("GET /api/v1/events: 503 (no bus) envelope includes retry_after_ms",
-          "[events][noresources][a4]") {
+          "[pg][events][noresources][a4]") {
     RestEventsHarness h(/*with_bus=*/false, /*with_tracker=*/true);
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-x");
     REQUIRE(res);
@@ -636,7 +837,7 @@ TEST_CASE("make_event_envelope: malformed payload becomes JSON null", "[events][
 // ── X-Content-Type-Options nosniff (security-LOW-2) ─────────────────────────
 
 TEST_CASE("GET /api/v1/events: response sets X-Content-Type-Options: nosniff",
-          "[events][happy][security]") {
+          "[pg][events][happy][security]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
@@ -648,7 +849,7 @@ TEST_CASE("GET /api/v1/events: response sets X-Content-Type-Options: nosniff",
 // ── Last-Event-ID header as replay source ───────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since absent",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
@@ -674,7 +875,7 @@ TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since ab
 
 TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header (with "
           "header injected)",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     // Paired with the existing `?since` precedence test — that one
     // proves `?since` alone works; this one proves `?since` WINS when
     // a conflicting Last-Event-ID is present in the request. G1
@@ -696,7 +897,7 @@ TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID 
 }
 
 TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     // Both signals coexist; the handler MUST honour the query param
@@ -813,7 +1014,7 @@ TEST_CASE("detail::enqueue_capped: drops oldest on cap overflow + bumps dropped_
 // ── Replay-gap detection ────────────────────────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: replay-gap envelope condition is detectable from bus snapshot",
-          "[events][replay][gap]") {
+          "[pg][events][replay][gap]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     // Simulate a buffer that has already evicted the early events:
@@ -866,7 +1067,7 @@ TEST_CASE("GET /api/v1/events: replay-gap envelope condition is detectable from 
 // ── Endpoint-scoped metrics ─────────────────────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: subscribe increments yuzu_server_sse_api_* metrics",
-          "[events][metrics][observability]") {
+          "[pg][events][metrics][observability]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -897,7 +1098,7 @@ TEST_CASE("GET /api/v1/events: subscribe increments yuzu_server_sse_api_* metric
 // ── GET /api/v1/executions/{id} (#1088 R2 — UAT-found contract gap) ─────────
 
 TEST_CASE("GET /api/v1/executions/{id}: returns final state JSON for known execution",
-          "[events][executions][issue-1088]") {
+          "[pg][events][executions][issue-1088]") {
     // The W5.1 /api/v1/events 410 envelope remediation hint points at
     // this endpoint. UAT smoke on #1088 caught that the endpoint did
     // not exist (only /sse/executions/{id} HTML+SSE and the dashboard
@@ -920,7 +1121,7 @@ TEST_CASE("GET /api/v1/executions/{id}: returns final state JSON for known execu
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
-          "[events][executions][issue-1088][notfound]") {
+          "[pg][events][executions][issue-1088][notfound]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
     REQUIRE(res);
@@ -930,6 +1131,135 @@ TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
     // A4 mandates an api_version meta block on every error envelope.
     REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: unknown id emits execution.detail.fetch denied audit "
+          "row (Doomgoose review, important — was undocumented and untested)",
+          "[pg][events][executions][issue-1088][notfound][audit]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.detail.fetch" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: invisible and nonexistent ids share one 404 shape",
+          "[pg][events][executions][scope][notfound]") {
+    RestEventsHarness h;
+    auto invisible_id = h.make_exec("running", "alice");
+    h.agent_status(invisible_id, "alice-agent", "success");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto invisible = h.sink.Get("/api/v1/executions/" + invisible_id);
+    auto missing = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined dispatcher is visible but still projected",
+          "[pg][events][executions][scope][owner]") {
+    // #1634 adversarial-review fix: dispatcher ownership admits the caller to their
+    // OWN execution (avoids a false 404 before any response has landed) but must
+    // NEVER bypass the confined projection — a dispatcher later confined out of a
+    // management group (or reading an execution dispatched before they were ever
+    // confined) must not retain durable full-fidelity access to hidden-agent data
+    // just because they fired the dispatch.
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running", "tester");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // visible: dispatcher ownership still avoids the 404
+    CHECK(res->body.find("agent:secret-target") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
+    CHECK(res->body.find("redacted - confined view") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined non-owner gets visible-only projection",
+          "[pg][events][executions][scope][projection]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "bob-agent", "success");
+    h.agent_status(exec_id, "alice-agent", "failure", "alice-only-error", 1735689661);
+
+    const auto token = authz_rig.mint_bob();
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id,
+                          yuzu::test::ResponseExecutionAuthzPgRig::bearer(token));
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& data = body.at("data");
+    CHECK(data.at("agents_targeted") == 1);
+    CHECK(data.at("agents_responded") == 1);
+    CHECK(data.at("agents_success") == 1);
+    CHECK(data.at("agents_failure") == 0);
+    CHECK(data.at("scope_expression") == "(redacted - confined view)");
+    CHECK(data.at("parameter_values") == "(redacted - confined view)");
+    CHECK(data.at("last_error_detail") == "");
+    CHECK(res->body.find("alice-only-error") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
+}
+
+// #1634 (governance Gate 3 quality-engineer finding): every sibling
+// single-execution surface (GET /api/v1/executions/{id} above, dashboard
+// GET /sse/executions/{id}, MCP get_execution_status/list_executions) has a
+// real-rig test driving the actual AuthRoutes + RbacStore + ManagementGroupStore
+// composition; this route only ever had the synthetic-fleet_read_fn tests
+// above, which cannot catch a wrong securable/operation string at this call
+// site or a regression in the real-gate composition specifically for SSE.
+TEST_CASE("GET /api/v1/events: real fleet-read gate collapses an invisible "
+          "execution to the missing-id 404",
+          "[pg][events][executions][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "alice-agent", "success");
+
+    const auto token = authz_rig.mint_bob();
+    const auto headers = yuzu::test::ResponseExecutionAuthzPgRig::bearer(token);
+    auto invisible = h.sink.Get("/api/v1/events?execution_id=" + exec_id, headers);
+    auto missing = h.sink.Get("/api/v1/events?execution_id=exec-does-not-exist", headers);
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+    CHECK(h.event_bus->subscribers_total() == 0);
+    // #1634 (governance Gate 4 consistency-auditor fix): a suppressed
+    // cross-operator subscribe attempt now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with MCP get_execution_status) — it must
+    // never be the `success`-shaped `execution.live_subscribe`/subscribe row a
+    // genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "api.v1.events.subscribe" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",
@@ -944,7 +1274,7 @@ TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retr
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: auth denied → 401 (no body leak)",
-          "[events][executions][issue-1088][auth]") {
+          "[pg][events][executions][issue-1088][auth]") {
     RestEventsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/executions/exec-1");
@@ -953,7 +1283,7 @@ TEST_CASE("GET /api/v1/executions/{id}: auth denied → 401 (no body leak)",
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
-          "[events][executions][issue-1088][perm]") {
+          "[pg][events][executions][issue-1088][perm]") {
     RestEventsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/executions/exec-1");
@@ -965,25 +1295,30 @@ TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
 
 namespace {
 
-/// Minimal harness that wires a real ApprovalManager (in-memory SQLite) into
-/// RestApiV1 so the versioned single-approval route can be driven end-to-end
-/// via the TestRouteSink dispatch pattern. `with_manager=false` exercises the
-/// 503-on-unwired-store path.
+/// Minimal harness that wires a real ApprovalManager (ADR-0065, Postgres —
+/// PgSkipGate-style, migration-programme PR 5 commit 2/3) into RestApiV1 so
+/// the versioned single-approval route can be driven end-to-end via the
+/// TestRouteSink dispatch pattern. `with_manager=false` exercises the
+/// 503-on-unwired-store path and deliberately does NOT SKIP on a missing PG
+/// DSN — no database is needed for that path.
 struct RestApprovalsHarness {
     yuzu::server::test::TestRouteSink sink;
-    sqlite3* db{nullptr};
-    std::unique_ptr<ApprovalManager> approvals;
+    std::optional<yuzu::test::ApprovalManagerPg> approvals_bundle;
     bool session_present{true};
     bool perm_grant{true};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
+    // compliance-officer governance finding (#2146 A2-R4): captures each
+    // audit_fn call's (action, result, detail) so a test can assert content,
+    // not just that a 200 came back -- a future refactor deleting the
+    // audit_fn(...) call on a handler would otherwise pass every existing
+    // test silently.
+    std::vector<std::tuple<std::string, std::string, std::string>> audit_calls;
 
     explicit RestApprovalsHarness(bool with_manager = true) {
-        if (with_manager) {
-            REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-            approvals = std::make_unique<ApprovalManager>(db);
-            approvals->create_tables();
-        }
+        if (with_manager)
+            approvals_bundle.emplace();
+        ApprovalManager* approvals = with_manager ? approvals_bundle->get() : nullptr;
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!session_present) {
@@ -1005,8 +1340,10 @@ struct RestApprovalsHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string&, const std::string& detail) -> bool {
+            audit_calls.emplace_back(action, result, detail);
             return true;
         };
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -1018,24 +1355,23 @@ struct RestApprovalsHarness {
                             /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
-                            /*approval_manager=*/approvals.get(),
+                            /*approval_manager=*/approvals,
                             /*tag_store=*/nullptr,
                             /*audit_store=*/nullptr);
     }
 
-    ~RestApprovalsHarness() {
-        approvals.reset();
-        if (db)
-            sqlite3_close(db);
-    }
+    /// Convenience accessor so a TEST_CASE can write `h->submit(...)`
+    /// directly, only valid when `with_manager=true` (the harness's own
+    /// 503-unwired-store test never dereferences it).
+    ApprovalManager* operator->() const { return approvals_bundle->get(); }
 };
 
 } // namespace
 
 TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full object",
-          "[events][approvals][a4]") {
+          "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
-    auto id = h.approvals->submit("def-123", "alice", "tag:prod");
+    auto id = h->submit("def-123", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
     REQUIRE(id.has_value());
 
     auto res = h.sink.Get("/api/v1/approvals/" + *id);
@@ -1053,7 +1389,7 @@ TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full objec
 }
 
 TEST_CASE("GET /api/v1/approvals/{id}: unknown id → 404 A4 envelope",
-          "[events][approvals][a4]") {
+          "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
     auto res = h.sink.Get("/api/v1/approvals/deadbeefdeadbeefdeadbeefdeadbeef");
     REQUIRE(res);
@@ -1077,7 +1413,7 @@ TEST_CASE("GET /api/v1/approvals/{id}: unwired store → 503 A4 envelope with re
     REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[events][approvals][auth]") {
+TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[pg][events][approvals][auth]") {
     RestApprovalsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/approvals/anything");
@@ -1085,10 +1421,251 @@ TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[events][approvals
     REQUIRE(res->status == 401);
 }
 
-TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[events][approvals][perm]") {
+TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[pg][events][approvals][perm]") {
     RestApprovalsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/approvals/anything");
     REQUIRE(res);
     REQUIRE(res->status == 403);
+}
+
+// ── GET /api/v1/approvals — approval list (#2146 A2-R4) ──────────────────────
+
+TEST_CASE("GET /api/v1/approvals: happy path lists the seeded approval with the full "
+          "field set",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto id = h->submit("def-list-1", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    REQUIRE(j["data"].size() == 1);
+    CHECK(j["data"][0]["id"] == *id);
+    CHECK(j["data"][0]["definition_id"] == "def-list-1");
+    CHECK(j["data"][0]["status"] == "pending");
+    CHECK(j["data"][0]["submitted_by"] == "alice");
+    CHECK(j["data"][0]["scope_expression"] == "tag:prod");
+    CHECK(j["data"][0].contains("reviewed_by"));
+    CHECK(j["data"][0].contains("reviewed_at"));
+    CHECK(j["data"][0].contains("review_comment"));
+    CHECK(j["pagination"]["total"] == 1);
+    CHECK_FALSE(j["pagination"].contains("result_truncated_by_cap"));
+    CHECK(j["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("GET /api/v1/approvals: status and submitted_by filters, matching the legacy route",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction);
+    h->submit("def-b", "operator2", "scope-b", "", ApprovalOrigin::kInstruction);
+    auto to_approve = h->submit("def-c", "operator1", "scope-c", "", ApprovalOrigin::kInstruction);
+    REQUIRE(to_approve.has_value());
+    REQUIRE(h->approve(*to_approve, "reviewer1", "").has_value());
+
+    auto by_status = h.sink.Get("/api/v1/approvals?status=approved");
+    REQUIRE(by_status);
+    auto approved = nlohmann::json::parse(by_status->body)["data"];
+    REQUIRE(approved.size() == 1);
+    CHECK(approved[0]["definition_id"] == "def-c");
+
+    auto by_submitter = h.sink.Get("/api/v1/approvals?submitted_by=operator1");
+    REQUIRE(by_submitter);
+    CHECK(nlohmann::json::parse(by_submitter->body)["data"].size() == 2); // def-a + def-c
+}
+
+TEST_CASE("GET /api/v1/approvals: status AND submitted_by combined filter (happy-path "
+          "governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction);
+    auto to_approve1 =
+        h->submit("def-b", "operator1", "scope-b", "", ApprovalOrigin::kInstruction);
+    auto to_approve2 =
+        h->submit("def-c", "operator2", "scope-c", "", ApprovalOrigin::kInstruction);
+    REQUIRE(to_approve1.has_value());
+    REQUIRE(to_approve2.has_value());
+    REQUIRE(h->approve(*to_approve1, "reviewer1", "").has_value());
+    REQUIRE(h->approve(*to_approve2, "reviewer1", "").has_value());
+
+    // Two rows are status=approved; only one of those is also
+    // submitted_by=operator1 -- proves the two filters AND-compose rather
+    // than one silently overriding the other or an off-by-one in the SQL
+    // placeholder indexing when both are present.
+    auto res = h.sink.Get("/api/v1/approvals?status=approved&submitted_by=operator1");
+    REQUIRE(res);
+    auto data = nlohmann::json::parse(res->body)["data"];
+    REQUIRE(data.size() == 1);
+    CHECK(data[0]["definition_id"] == "def-b");
+}
+
+TEST_CASE("GET /api/v1/approvals: an out-of-enum status is rejected with 400, not silently "
+          "producing a false-empty result (unhappy-path governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    // Pre-fix: this silently produced data:[] -- indistinguishable from a
+    // genuinely empty match -- instead of rejecting the malformed input.
+    auto res = h.sink.Get("/api/v1/approvals?status=aproved");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/v1/approvals: audits a success read with surface/count detail "
+          "(compliance-officer governance finding, #2146 A2-R4)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-a", "operator1", "scope-a", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // A future refactor that deletes the audit_fn(...) call on this handler
+    // would otherwise pass every other test in this file silently.
+    bool found = false;
+    for (const auto& [action, result, detail] : h.audit_calls) {
+        if (action == "approval.read" && result == "success") {
+            found = true;
+            CHECK(detail.find("surface=list") != std::string::npos);
+            CHECK(detail.find("count=1") != std::string::npos);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /api/v1/approvals: result_truncated_by_cap appears when more than 100 "
+          "approvals match (#2146 A2-R4 boundary)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    for (int i = 0; i < 101; ++i)
+        REQUIRE(h->submit("def-cap", "operator1", "scope-" + std::to_string(i), "",
+                          ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"].size() == 100);
+    CHECK(j["pagination"]["result_truncated_by_cap"] == true);
+}
+
+TEST_CASE("GET /api/v1/approvals: unwired store → 503 A4 envelope with retry",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h(/*with_manager=*/false);
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals: permission denied → 403", "[pg][events][approvals][perm]") {
+    RestApprovalsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/approvals: a genuine store failure answers 503, never a false "
+          "empty list, and a permanent one (DROP TABLE, 42P01) is NOT presented as "
+          "retryable (review finding, PR #4656)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    {
+        auto lease = h.approvals_bundle->pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = h.sink.Get("/api/v1/approvals");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    // DROP TABLE is a class-42 (42P01) failure -- is_permanent_pg_error
+    // classifies it PERMANENT, so this must NOT carry the retryable hint:
+    // retry_after_ms=5000 on a condition that will not clear without an
+    // operator is an unbounded retry loop.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
+}
+
+// ── GET /api/v1/approvals/pending/count (#2146 A2-R4) ────────────────────────
+
+TEST_CASE("GET /api/v1/approvals/pending/count: happy path reflects the pending queue, "
+          "excluding a non-pending row (review finding, PR #4656: a query counting ALL "
+          "statuses would have passed the prior version of this test unnoticed)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    auto pending_id = h->submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(pending_id.has_value());
+    REQUIRE(h->submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    // Approve one of the two -- the count must exclude it, proving the
+    // underlying query is actually WHERE status='pending', not a bare
+    // COUNT(*) that would also pass with two submitted-then-untouched rows.
+    REQUIRE(h->approve(*pending_id, "reviewer-bob", "").has_value());
+
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["count"] == 1);
+    CHECK(j["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: unwired store → 503 A4 envelope with retry",
+          "[events][approvals][a4]") {
+    RestApprovalsHarness h(/*with_manager=*/false);
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: permission denied → 403",
+          "[pg][events][approvals][perm]") {
+    RestApprovalsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/approvals/pending/count: a genuine store failure answers 503, "
+          "never a false zero, and a permanent one (DROP TABLE, 42P01) is NOT "
+          "presented as retryable (review finding, PR #4656)",
+          "[pg][events][approvals][a4]") {
+    RestApprovalsHarness h;
+    REQUIRE(h->submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    {
+        auto lease = h.approvals_bundle->pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = h.sink.Get("/api/v1/approvals/pending/count");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find(R"("code":503)") != std::string::npos);
+    // Same permanent (42P01) classification as the list route above.
+    REQUIRE(res->body.find(R"("message":"approval store unavailable")") != std::string::npos);
+    REQUIRE(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
 }

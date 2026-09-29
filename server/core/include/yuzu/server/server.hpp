@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -19,11 +20,24 @@ struct Config {
     std::string web_address{"127.0.0.1"};            // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
+    // External origins the dashboard is served on, for the CSRF same-site gate
+    // (--csrf-trusted-origin, repeatable, comma-separated permitted; #2537).
+    // A reverse proxy that rewrites Host makes the browser's Origin and the
+    // server's Host legitimately differ, which 403'd every CSRF-gated dashboard
+    // action behind nginx/Envoy/ALB/Cloudflare. Declaring the external origin
+    // here lets the gate accept it. Entries are normalised ONCE at boot by
+    // web_utils.hpp's normalise_trusted_origins; an entry carrying a scheme
+    // ("https://yuzu.example") is matched on scheme AND host, a bare host on
+    // host only. No forwarded header is ever consulted — the trust anchor is
+    // this config value, which an attacker cannot set. Empty (default) =
+    // same-host only, i.e. pre-#2537 behaviour.
+    std::vector<std::string> csrf_trusted_origins;
+
     bool tls_enabled{true};
     std::filesystem::path tls_server_cert; // PEM server certificate
     std::filesystem::path tls_server_key;  // PEM server private key
     std::filesystem::path tls_ca_cert;     // For mTLS agent verification
-    bool allow_one_way_tls{false};         // Permit TLS without client cert verification
+    bool insecure_skip_client_verify{false}; // Permit TLS without client cert verification
 
     // PKI default certs (PR2). With no operator cert flags and without
     // --no-default-certs, the server generates a per-install CA + server-side
@@ -121,10 +135,44 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // HA WS-8 (ADR-2002 §12): minimum seconds stop() keeps the listener open
+    // after /readyz starts answering 503 `draining`, so a load balancer stops
+    // routing here before the socket closes. 0 = no minimum (the single-node
+    // default). Range [0, 60] — see shutdown_drain_rules.hpp for why 60. Wired
+    // via --shutdown-drain-seconds / YUZU_SHUTDOWN_DRAIN_SECONDS.
+    int shutdown_drain_seconds{0};
+
+    // Set by main.cpp iff `RbacStore::provision_first_admin` actually
+    // provisioned the sole admin user + their fleet-wide Administrator
+    // grant this boot (a genuinely-empty `auth.users` — fresh start /
+    // Postgres cutover). Sourced from `provision_first_admin`'s outcome,
+    // NOT `AuthDB::seed_admin_if_empty`'s — `provision_first_admin` is the
+    // SOLE production seeder now (main.cpp's fresh-start bootstrap block
+    // performs the fresh-start INSERT there; `seed_admin_if_empty` has no
+    // production caller at all); the flag's own meaning ("did this boot
+    // seed the sole admin user into an empty auth.users table") is
+    // unchanged, only which call detects it. Threaded through Config rather
+    // than set directly on a
+    // metrics registry because this happens before `Server::create()`
+    // constructs `ServerImpl` (and therefore before `metrics_` exists) —
+    // ServerImpl's ctor reads this once to pre-seed
+    // `yuzu_auth_fresh_start_reset_total`.
+    bool auth_fresh_start_seeded{false};
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
+
+    // HA WS-4 4.3: per-cluster ManagementService addresses for cross-cluster
+    // command fan-out (`--gateway-cluster-addr cluster_id=host:port`, comma-
+    // repeatable). Empty (the default) means single-cluster mode:
+    // `gateway_command_address` alone is used regardless of which cluster_id
+    // an agent's gateway announces — byte-for-byte the pre-4.3 behavior. Set
+    // means multi-cluster mode: see `GatewayMgmtStubPool`
+    // (gateway_mgmt_stub_pool.hpp) for the full resolution rule, including
+    // the `"default"` auto-alias to `gateway_command_address`.
+    std::unordered_map<std::string, std::string> gateway_cluster_addresses;
 
     // #1128: operator-declared multi-egress NAT/proxy ranges. When a direct-
     // connect agent's Register and Subscribe present different source IPs that
@@ -173,6 +221,11 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    // ADR-2001 §1 — which validated ID token claim is used as the
+    // SCIM-externalId join key at OIDC login. Allow-list {sub, oid} is
+    // enforced at boot (main.cpp, CLI::IsMember) — fail-closed on anything
+    // else, never a silent fallback to the default.
+    std::string oidc_scim_link_claim{"sub"};
 
     // SAML 2.0 SSO
     // Enabled when idp_sso_url + idp_cert + sp_entity_id + sp_acs_url are all non-empty
@@ -184,8 +237,12 @@ struct Config {
     std::string saml_idp_cert;      // Filesystem path to IdP signing cert PEM (pinned key)
     std::string saml_sp_entity_id;  // SP entityID (used as AudienceRestriction)
     std::string saml_sp_acs_url;    // SP Assertion Consumer Service URL (POST binding)
+    std::string saml_sp_key;        // Filesystem path to SP AuthnRequest signing key PEM (RSA);
+                                     // empty means AuthnRequests are unsigned (backward-compatible)
     std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
     std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
+    std::string saml_name_attribute;  // <Attribute Name="..."> carrying the display name (else NameID)
+    std::string saml_email_attribute; // <Attribute Name="..."> carrying the email (display fallback)
 
     // Response persistence
     int response_retention_days{90};
@@ -221,6 +278,71 @@ struct Config {
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
 
+    // Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).
+    // Gates only principal_kind=="engine" sessions at the pre-routing
+    // chokepoint; human/agent/anonymous traffic is unaffected. See
+    // principal_quota.hpp. `burst` is derived as 2x rate at construction.
+    int principal_max_concurrency{16};    // per-engine-principal in-flight cap
+    double principal_rate_limit{20.0};    // per-engine-principal requests/second
+
+    // Agent OTA pull bounds (issue #913 per-peer limit, #911 deadlines).
+    // `DownloadUpdate` was previously unbounded in every dimension: any
+    // mTLS-authenticated agent could open unlimited parallel streams, each
+    // pinning a gRPC thread on blocking disk reads and network writes.
+    //
+    // The CONCURRENCY cap is the primary defence; the rate bucket is
+    // deliberately loose. The attack is N parallel streams, which a semaphore
+    // stops exactly, whereas a tight bucket meters RETRIES and produces the
+    // lockout pathologies recorded on #934 and #941. Raise the rate knobs only
+    // with that in mind. See agent_service_impl.hpp's OtaBoundConfig.
+    int ota_max_concurrent_per_peer{2};   // parallel DownloadUpdate streams per peer
+    double ota_rate_capacity{20.0};       // token-bucket burst per peer
+    double ota_rate_refill_per_min{1.0};  // tokens restored per minute per peer
+    int ota_transfer_deadline_secs{900};  // whole-transfer bound (watchdog TryCancel)
+    int ota_chunk_write_deadline_secs{30};// single-chunk stall bound
+    // Cardinality ceiling on the per-peer map. The admission key falls back to
+    // peer IP when no client certificate is presented, so this key space is
+    // attacker-influenced (issue #935) and must be capped.
+    int ota_max_peers_tracked{50000};
+
+    // gRPC server-wide resource bounds. Before these, the one ServerBuilder set
+    // keepalive/ping args and NOTHING else — no ResourceQuota, no stream cap —
+    // which is what made the unbounded OTA path severe rather than theoretical.
+    // A repo-wide search found no other gRPC resource bound anywhere on the
+    // server; the governance ledger row for #3401 (finding UP-4) records the
+    // same absence.
+    int grpc_max_concurrent_streams{128};  // per-connection HTTP/2 stream cap
+    int grpc_max_resource_memory_mb{512};  // gRPC ResourceQuota ceiling
+    // Thread ceiling for the gRPC sync server.
+    //
+    // THIS IS A FLEET-SIZE CEILING, NOT A WORK CEILING, and it must be set above
+    // your concurrently-connected agent count. AgentService is a SYNCHRONOUS
+    // service and Subscribe blocks for the life of each agent's command stream, so
+    // every connected agent permanently occupies one thread. Once the quota is
+    // exhausted gRPC answers ResourceExhausted to EVERY rpc on every service
+    // sharing it — agent, management and gateway-upstream alike — so a value below
+    // the fleet size is a fleet-wide outage, not back-pressure.
+    //
+    // The default is therefore generous rather than tight. It exists to stop
+    // pathological runaway (and to give the OTA admission map's overshoot a real
+    // bound), not to size the fleet.
+    int grpc_max_threads{8192};
+
+    // Fraction of ota_max_concurrent_total reserved for peers admitted on a
+    // CERTIFICATE identity, expressed as a percentage. The server-wide cap is a
+    // shared exhaustible resource, so without a reserve a handful of source
+    // addresses holding slow transfers can starve the whole fleet — a cheaper
+    // denial than the address-space scaling the cap was added to prevent. Peers
+    // keyed on source IP may occupy at most (100 - this)% of the cap; enrolled
+    // peers may use all of it.
+    int ota_cert_reserve_pct{50};
+    // Server-wide ceiling on concurrent DownloadUpdate transfers, across ALL peers.
+    // The per-peer cap bounds one identity; on a deployment where the identity gate
+    // is inert the admission key falls back to source IP, so the per-peer bound
+    // scales with the caller's address space (a /24 buys 256 buckets). This is the
+    // bound that does not.
+    int ota_max_concurrent_total{64};
+
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
     // attempts the account is locked for `auth_lockout_window_secs`. The
@@ -252,11 +374,12 @@ struct Config {
     // (constrained break-glass). See docs/auth-architecture.md "Hardened mode".
     //
     // "standard" (default) leaves local-password login enabled. "sso-only"
-    // disables the local-password path fleet-wide — only OIDC SSO mints a
-    // session — EXCEPT for a single designated break-glass account that is
+    // disables the local-password path fleet-wide — only an SSO provider mints
+    // a session — EXCEPT for a single designated break-glass account that is
     // exempt ONLY while armed (an out-of-band host operator ran
-    // --break-glass-arm within the window). sso-only refuses to start without
-    // OIDC configured (it would otherwise lock every operator out).
+    // --break-glass-arm within the window). sso-only refuses to start unless an
+    // SSO provider is configured — OIDC, or (Linux/macOS, HTTPS on) SAML — since
+    // it would otherwise lock every operator out (gate: sso_boot_guard.hpp).
     std::string auth_mode{"standard"}; // "standard" | "sso-only"
     /// Username of the single local account exempt from sso-only while armed.
     /// Empty = no break-glass account. Must exist and have MFA enrolled
@@ -281,10 +404,48 @@ struct Config {
     /// Required (fail-closed) whenever scim_enable is true. Wired via
     /// --scim-token / YUZU_SCIM_TOKEN.
     std::string scim_token;
+    /// SCIM Group `displayName` (from ScimStore's scim_groups table) that
+    /// maps to admin role — mirrors --saml-admin-group's group-to-role
+    /// pattern (#2021, slice 2). Empty (the default) means no SCIM group
+    /// grants admin. Wired via --scim-admin-group / YUZU_SCIM_ADMIN_GROUP.
+    std::string scim_admin_group;
 
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
+    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships ON: the machinery is complete and
+    /// reviewed, and the four defects that gated the on-by-default flip (#2739, #2740,
+    /// #2785, #2789) are fixed. Pass --no-mcp-streamed-post to opt out.
+    /// NOT --mcp-no-streaming, which disables the whole transport (sessions +
+    /// GET/DELETE) including rungs already shipped.
+    bool mcp_streamed_post_enable{true}; // --mcp-enable-streamed-post
+    /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
+    /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
+    /// allowed because the endpoint requires a credential). Wired via the
+    /// repeatable --mcp-allowed-origin / YUZU_MCP_ALLOWED_ORIGINS.
+    std::vector<std::string> mcp_allowed_origins;
+    /// Concurrently held-open MCP SSE streams, globally and per principal
+    /// (Decision 15(d)/(h)). Each stream pins one HTTP worker for its whole life,
+    /// so this is a worker-pool budget, not a taste setting: the global cap is
+    /// clamped at boot to `pool_max - plain-REST reserve`. Per-principal is
+    /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
+    /// cursor, a held-open worker is not.
+    /// Concurrent held-open SSE responses this server is sized for, across EVERY streaming
+    /// surface (MCP GET, MCP streamed POST, /api/v1/events, the dashboard executions
+    /// drawer, the legacy /events stream). The worker pool is derived FROM this — not
+    /// the other way round (ADR-0034):
+    /// a stream costs a blocked thread, which is cheap, so the operator declares the workload
+    /// and the pool is sized to honour it. 0 = the default (128).
+    std::size_t max_sse_streams{0};
+    /// Per-principal MCP stream allowance — a per-surface anti-monopoly policy, NOT a
+    /// capacity limit (the pool is protected by the global budget alone).
+    std::size_t mcp_max_streams_per_principal{4};
+    /// Pin the shared HTTP worker pool by hand. 0 = derive it from `max_sse_streams`, which
+    /// is what you want. Setting it overrides the derivation, and the stream target is then
+    /// clamped to whatever the pool you chose can actually carry.
+    std::size_t http_worker_threads{0};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
@@ -313,6 +474,39 @@ struct Config {
     /// audit event + a startup spdlog::warn — exact parity with
     /// `--allow-unsigned-packs`.
     bool allow_unsigned_definitions{false};
+
+    // KEK rotation runaway control (#2530 B5). See kek_routes.hpp and the
+    // rotate control-flow comment in server.cpp (secrets_kek_op lock
+    // section) for how these two feed the durable checks.
+    /// Durable rate limit: a rotate request is refused (`Cooldown`, 429) when
+    /// the newest `secrets.kek_meta` row is younger than this, read from the
+    /// database server's own clock (not the app host's). This is a
+    /// RUNAWAY/ABUSE GUARD against looping automation, NOT a rotation-cadence
+    /// setting — default 3600s (1h) is sized for that job and most operators
+    /// should never change it. Raising it directly delays EMERGENCY
+    /// re-rotation after a suspected key compromise, with no bypass
+    /// (`/rewrap` only resumes an already-half-committed rotation; it never
+    /// mints a new version) short of a restart with a lower value —
+    /// mid-incident. Do not set this to your rotation cadence (e.g. 90d for
+    /// "quarterly"): that would leave an operator refused for up to that
+    /// long during the one operation this whole surface exists to make fast.
+    /// CLI-bounded to [1, 31536000] (365d, main.cpp) as a sanity ceiling
+    /// against a fat-fingered value, not an endorsement of setting it that
+    /// high. The honest `cooldown_retry_after_ms` this feeds is a uint32
+    /// millisecond count; `evaluate_rotate_preconditions`
+    /// (kek_rotate_control.hpp) saturates rather than wraps past ~49.7 days,
+    /// so the 365d CLI bound is defence-in-depth, not the only thing keeping
+    /// the hint honest.
+    /// Wired via --kek-min-rotate-interval / YUZU_KEK_MIN_ROTATE_INTERVAL.
+    int kek_min_rotate_interval_secs{3600};
+    /// Backstop ceiling: a rotate request is refused (`VersionCeiling`, 409)
+    /// once the count of non-retired KEK versions reaches this. There is no
+    /// retire route (#2525), so raising this above the default is the
+    /// supported escape hatch that keeps rotation usable for an install that
+    /// has hit the ceiling — an explicit, logged and audited temporary risk
+    /// acceptance pending #2525, not a routine tuning knob. Default 32.
+    /// Wired via --kek-max-live-versions / YUZU_KEK_MAX_LIVE_VERSIONS.
+    int kek_max_live_versions{32};
 };
 
 /// Trim leading/trailing ASCII whitespace (space/tab/CR/LF). Used to

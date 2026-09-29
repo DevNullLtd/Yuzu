@@ -15,6 +15,7 @@
 
 #include "fleet_topology_store.hpp"
 #include "fleet_topology_types.hpp"
+#include "offline_endpoint_store.hpp"
 #include "process_category.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -944,6 +945,46 @@ TEST_CASE("topology: parser clamps oversize process + hostname + conn-meta field
     CHECK(parsed->connections[0].process_name.size() == 256);
 }
 
+TEST_CASE("topology: a byte-clamped multi-byte hostname serializes without throwing",
+          "[viz][topology][hardening][gate4]") {
+    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): clamp_field()
+    // truncates by BYTE length with no UTF-8 boundary awareness. 100
+    // repetitions of the 3-byte euro sign (U+20AC, bytes E2 82 AC) is 300
+    // bytes; clamped to the 256-byte hostname cap, byte 256 lands one byte
+    // into the 86th codepoint (85*3=255), producing an incomplete trailing
+    // sequence. Before the fix, nlohmann::json::dump()'s strict default threw
+    // an uncaught type_error.316 on exactly this input - a fleet-wide 500
+    // triggerable by ordinary internationalized agent data, not a
+    // hypothetical. The prior "clamps oversize" test above is ASCII-only and
+    // provides zero coverage of this: truncating single-byte characters can
+    // never produce an invalid sequence, so it is not valid closure evidence
+    // for this defect.
+    const std::string euro = "\xE2\x82\xAC"; // U+20AC, 3 bytes
+    std::string multibyte_hostname;
+    multibyte_hostname.reserve(300);
+    for (int i = 0; i < 100; ++i)
+        multibyte_hostname += euro;
+    REQUIRE(multibyte_hostname.size() == 300);
+
+    std::string body = snapshot_body(multibyte_hostname, "proc", "cmd", "user", "ESTABLISHED");
+    std::string ex;
+    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(body, "agent-utf8", "linux", &ex);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->hostname.size() == 256); // clamped, and split mid-codepoint
+
+    FleetTopologyStore store(fixed_fetcher({*parsed}));
+    auto snap = store.get(false);
+    REQUIRE(snap != nullptr);
+
+    nlohmann::json j = *snap;
+    std::string dumped;
+    CHECK_NOTHROW(dumped = dump_topology_safe(j));
+    CHECK_FALSE(dumped.empty());
+    // U+FFFD (EF BF BD) replaces the invalid trailing bytes rather than
+    // dropping them silently or throwing.
+    CHECK(dumped.find("\xEF\xBF\xBD") != std::string::npos);
+}
+
 TEST_CASE("topology: parser rejects malformed / hostile input without throwing",
           "[viz][topology][hardening][gate7]") {
     // Gate 7 qe-S3 — the parser is called on every heartbeat; it must
@@ -1083,4 +1124,78 @@ TEST_CASE("topology: push-staleness gate keys on server-receipt time, not agent 
     auto snap = store.build_snapshot(std::move(raw), false);
     REQUIRE(snap.machines.size() == 1);
     CHECK(snap.machines[0].stale); // stale by server clock despite the future ts
+}
+
+// gov cpp-safety finding (#2146 B3): merge_offline_topology had zero direct
+// unit-test coverage even before this PR's extraction into a named, testable
+// free function (fleet_topology_store.hpp). Three tests below pin its
+// documented contract exactly: online-dedup skip, empty-persisted no-op
+// (returns the SAME shared_ptr, no copy), and the add-stale-nodes
+// copy-on-write path.
+
+TEST_CASE("merge_offline_topology: an already-online agent_id is skipped, never duplicated",
+          "[viz][merge_offline]") {
+    auto snap = std::make_shared<TopologySnapshot>();
+    snap->generated_at = 1000;
+    MachineNode online;
+    online.agent_id = "agent-A";
+    online.hostname = "host-a";
+    snap->machines.push_back(online);
+
+    std::vector<OfflineEndpoint> persisted;
+    OfflineEndpoint dup;
+    dup.agent_id = "agent-A"; // already online -- must be skipped
+    dup.hostname = "stale-hostname-should-not-appear";
+    persisted.push_back(dup);
+
+    auto merged = merge_offline_topology(snap, persisted);
+    REQUIRE(merged->machines.size() == 1);
+    CHECK(merged->machines[0].agent_id == "agent-A");
+    CHECK(merged->machines[0].hostname == "host-a"); // NOT overwritten by the offline row
+    CHECK_FALSE(merged->machines[0].stale);
+}
+
+TEST_CASE("merge_offline_topology: empty persisted list returns the SAME shared_ptr, no copy",
+          "[viz][merge_offline]") {
+    auto snap = std::make_shared<TopologySnapshot>();
+    snap->generated_at = 2000;
+    MachineNode online;
+    online.agent_id = "agent-B";
+    snap->machines.push_back(online);
+
+    auto merged = merge_offline_topology(snap, {});
+    CHECK(merged.get() == snap.get()); // steady-state: no copy-on-write triggered
+}
+
+TEST_CASE("merge_offline_topology: a persisted-but-offline agent becomes a stale placeholder "
+          "(copy-on-write)",
+          "[viz][merge_offline]") {
+    auto snap = std::make_shared<TopologySnapshot>();
+    snap->generated_at = 3000;
+    MachineNode online;
+    online.agent_id = "agent-C";
+    snap->machines.push_back(online);
+    const auto* orig_ptr = snap.get();
+
+    std::vector<OfflineEndpoint> persisted;
+    OfflineEndpoint offline;
+    offline.agent_id = "agent-D";
+    offline.hostname = "host-d";
+    offline.os = "linux";
+    persisted.push_back(offline);
+
+    auto merged = merge_offline_topology(snap, persisted);
+    CHECK(merged.get() != orig_ptr); // copy-on-write: a new snapshot was allocated
+    REQUIRE(merged->machines.size() == 2);
+    const MachineNode* stale_node = nullptr;
+    for (const auto& m : merged->machines)
+        if (m.agent_id == "agent-D")
+            stale_node = &m;
+    REQUIRE(stale_node != nullptr);
+    CHECK(stale_node->hostname == "host-d");
+    CHECK(stale_node->os == "linux");
+    CHECK(stale_node->stale);
+    CHECK(stale_node->processes.empty());
+    CHECK(stale_node->connections.empty());
+    CHECK(stale_node->listeners.empty());
 }

@@ -11,6 +11,7 @@ tells you where it belongs.
 | Ecosystem         | Source of truth                               | Update path                                                                                  |
 |-------------------|-----------------------------------------------|----------------------------------------------------------------------------------------------|
 | GitHub Actions    | `uses: ...@vX` in every `.github/workflows/*` | Dependabot (weekly) — `.github/dependabot.yml` `github-actions` entry                         |
+| Windows SDK       | `10.0.26100.0` in the Windows build/provisioning contract | Deliberate reviewed PR; `tests/test_windows_sdk_contract.py` prevents drift (Dependabot tracks the MSVC action, not its `with.sdk` input) |
 | Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry                                 |
 | Python tooling    | `requirements-ci.txt` (repo root)             | Dependabot (weekly) — `.github/dependabot.yml` `pip` entry                                    |
 | npm tooling       | `package-lock.json` in `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` | Dependabot (weekly, grouped per directory) — `.github/dependabot.yml` `npm` entry; see "npm tooling" below |
@@ -27,7 +28,7 @@ tier — not the tracking mechanism — decides the remediation posture:
   server, agent, or gateway: vcpkg deps, Docker base images, rebar3 deps,
   and the vendored JS assets embedded into the server binary. Security
   advisories here follow the vulnerability-management commitments in
-  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream F).
+  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream C).
 - **Tier 2 — repo tooling.** Build/test/docs/demo tooling that never
   ships in a product artifact: the three npm directories and the pip CI
   tooling. Advisories are tracked, surfaced, and auto-patched through the
@@ -133,6 +134,17 @@ that harness. The docs site pins its toolchain floor in
 `site/package.json` `engines` (mirrors Astro's own floor — currently
 Node ≥ 22.12.0, npm ≥ 9.6.5; the docs-site job runs Node 22).
 
+**Standing convention — puppeteer launch args.** Every script in
+`tests/puppeteer/` passes `--no-sandbox` in its `puppeteer.launch` args (all
+seven do, as of the fix that closed this gap). On hosts where user-namespace/
+AppArmor restrictions block Chromium's own sandbox, its absence is an
+outright launch failure — not a puppeteer-version problem — which is exactly
+what blocked the manual pre-approval smoke this doc mandates above for
+puppeteer majors: four of the seven scripts silently diverged from the other
+three and none of them could launch a browser at all until the flag was
+added back. A new script in this directory must carry the flag from
+creation.
+
 **Standing convention — new npm directories.** A directory gaining a
 `package.json` ships, in the same PR: a committed `package-lock.json`,
 an entry in the `npm` block's `directories:` list in
@@ -166,10 +178,11 @@ runs at 10:00 UTC on the 1st of each month (and is
    to get the current master SHA.
 2. Reads `vcpkg.json` `builtin-baseline` via `jq`.
 3. If they match, exits silently.
-4. Otherwise, `sed -i`s the new SHA into **every** tracked reference —
-   the workflow file keeps an authoritative list and fails loudly if any
-   listed file still has the old SHA after the sed (guards against new
-   references being added without updating the workflow).
+4. Otherwise, `sed -i`s the new SHA into every **active** tracked reference.
+   Historical `docs/reviews/` evidence is immutable and deliberately keeps the
+   baseline that was reviewed at the time. The workflow file keeps the
+   authoritative active list and fails loudly if a listed file still has the
+   old SHA after the sed.
 5. Opens a PR via `peter-evans/create-pull-request@v7` with label
    `dependencies,ci`.
 
@@ -177,10 +190,11 @@ CI on the PR re-resolves every downstream vcpkg port against the new
 baseline — if anything breaks, the PR is left open for manual
 investigation instead of silently merging a broken build.
 
-When adding a new file that pins the vcpkg baseline SHA (e.g., a new
-CI workflow, a new Dockerfile), **add it to the `files` array in
-`.github/workflows/vcpkg-baseline-update.yml`**. The post-sed grep
-verifier ensures the omission doesn't slip through silently.
+When adding a new active file that pins the vcpkg baseline SHA (e.g., a new CI
+workflow or Dockerfile), **add it to the `files` array in
+`.github/workflows/vcpkg-baseline-update.yml`**. Do not add immutable
+`docs/reviews/` evidence. The post-sed verifier checks listed files, while the
+toolchain-contract inventory test finds an unlisted active reference.
 
 ## Rebar3 deps review checklist
 
@@ -226,7 +240,7 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
 | Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
 | Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
-| Yuzu fleet renderer | `server/core/src/yuzu_viz_js_bundle.cpp` (hand-written) | `kYuzuVizJs` | first-party | n/a |
+| Yuzu fleet renderer | `yuzu_viz_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-viz.js`) | `kYuzuVizJs` | first-party | n/a |
 
 ### Refresh procedure (vendored vendor JS only)
 

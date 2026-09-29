@@ -920,3 +920,39 @@ TEST_CASE("TriggerEngine: unregister frees slot under cap", "[trigger_engine][ca
     engine.register_trigger(c3);
     CHECK(engine.trigger_count() == 2);
 }
+
+TEST_CASE("stop() wakes parked workers promptly — condvar, not sleep-poll", "[trigger][shutdown]") {
+    // Pins the 482be2b4 contract: workers wait on a condition variable and wake on
+    // stop() immediately, instead of sleeping out a poll interval (the registry
+    // watcher slept a FULL 5s per iteration on Linux/macOS, and stop() joins workers
+    // SERIALLY — so pre-change teardown of an idle engine cost multiple seconds).
+    //
+    // Bound rationale (the retracted-hang lesson: a timeout must justify itself
+    // against a measured baseline): post-change stop() of an idle engine is
+    // millisecond-scale; the PRE-change worst case is >= one full 5s sleep. 3s sits
+    // far above healthy (~1000x) and decisively below the old floor, so a regression
+    // back to sleep-polling goes red even on a loaded CI box.
+    DispatchRecorder recorder;
+    TriggerEngine engine;
+    engine.set_dispatch(recorder.callback());
+    // One long-interval trigger so at least one worker genuinely parks waiting.
+    TriggerConfig cfg;
+    cfg.id = "condvar-wake-test";
+    cfg.plugin = "test_plugin";
+    cfg.action = "noop";
+    cfg.type = TriggerType::Interval;
+    cfg.interval_seconds = 3600;
+    engine.register_trigger(cfg);
+    engine.start();
+    // Let the workers reach their waits (generous; no correctness dependence).
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::seconds{3});
+
+    // And stop() is idempotent after the condvar rework.
+    engine.stop();
+    SUCCEED("stop() returned promptly and is idempotent");
+}

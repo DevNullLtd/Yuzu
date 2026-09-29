@@ -1,0 +1,58 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 0e82a6f385ea
+== action=version
+version|0.13.1+7854
+build_number|7854
+git_commit|4c377398e
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=info
+os|Windows
+arch|x86_64
+hostname|DESKTOP-04DNSIG
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=health
+uptime_seconds|69196
+timestamp_epoch_ms|1788775738117
+memory_rss_kb|9772
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=plugins
+plugins_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=modules
+modules_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=connection
+server_address|
+tls_enabled|
+encrypted|true
+debug_mode|
+verbose_logging|
+log_level|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=switch
+switch_address|
+session_id|
+connected_since|
+reconnect_count|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=config
+agent_id|
+agent_version|
+build_number|
+git_commit|
+server_address|
+tls_enabled|
+heartbeat_interval|
+plugin_dir|
+data_dir|
+log_level|
+debug_mode|
+verbose_logging|
+[result_status] UNDECLARED / UNKNOWN / 
+

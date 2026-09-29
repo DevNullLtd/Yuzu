@@ -1,0 +1,5 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 16f60d46b82f
+== action=free
+disk|/|485473984512|407729123328|16
+[result_status] UNDECLARED / UNKNOWN / 
+

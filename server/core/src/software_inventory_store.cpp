@@ -562,6 +562,46 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     return InventoryIngestOutcome::kStored;
 }
 
+std::optional<std::int64_t> SoftwareInventoryStore::source_last_seen(std::string_view agent_id,
+                                                                     std::string_view source) {
+    // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent 0.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (agent_id.empty() || source.empty())
+        return 0;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT last_seen FROM software_inventory_store.inventory_state "
+        "WHERE agent_id = $1 AND source = $2",
+        std::vector<std::string>{std::string(agent_id), std::string(source)});
+    if (!res.ok()) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQresultErrorMessage(res.get()), d.occurrence);
+        return std::nullopt;
+    }
+    if (PQntuples(res.get()) == 0)
+        return 0;
+    return std::strtoll(PQgetvalue(res.get(), 0, 0), nullptr, 10);
+}
+
 std::optional<std::vector<SoftwareEntry>>
 SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent
@@ -728,14 +768,20 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive title
-    // filter; over a small (one-row-per-title) table the scan+sort is trivial.
+    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive
+    // filter, matched against EITHER title or publisher (round-3 item 8 — a search
+    // for "adobe" should surface every Adobe title, not just ones with "adobe" in
+    // the name) — ONE bind reused in both arms (Postgres allows repeating a
+    // parameter placeholder), never two separate params for the same input. Over a
+    // small (one-row-per-title) table the scan+sort is trivial either way.
     std::string sql = "SELECT name, publisher, device_count, version_count "
                       "FROM software_inventory_store.catalog_rollup ";
     std::vector<std::string> params;
     int p = 0;
     if (!q.name_filter.empty()) {
-        sql += "WHERE name ILIKE '%' || $" + std::to_string(++p) + " || '%' ";
+        const std::string ph = "$" + std::to_string(++p);
+        sql += "WHERE (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +
+              " || '%') ";
         params.push_back(q.name_filter);
     }
     sql += "ORDER BY device_count DESC, name LIMIT $" + std::to_string(++p) + "::bigint";
@@ -932,13 +978,13 @@ std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
     return m;
 }
 
-void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
+bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
-        return;
+        return false;
     const std::string id{agent_id};
     // Both deletes in one transaction so an agent removal can't leave a parent
     // inventory_state row without its child rows, or vice versa (Gate 2 INFO).
-    pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
+    const bool committed = pool_.with_txn_for(kIngestAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult d1 = pg::exec_params(
             c, "DELETE FROM software_inventory_store.installed_software WHERE agent_id = $1",
             std::vector<std::string>{id});
@@ -947,6 +993,10 @@ void SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
             std::vector<std::string>{id});
         return d1.status() == PGRES_COMMAND_OK && d2.status() == PGRES_COMMAND_OK;
     });
+    if (!committed)
+        spdlog::debug("SoftwareInventoryStore: delete_agent did not commit for agent={} ({})",
+                      agent_id, pool_.last_error());
+    return committed;
 }
 
 std::vector<std::string> SoftwareInventoryStore::list_agent_ids(std::string_view source,

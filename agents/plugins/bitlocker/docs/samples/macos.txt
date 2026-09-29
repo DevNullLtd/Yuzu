@@ -1,0 +1,5 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash ba3cbe6a5b56
+== action=state
+filevault|enabled
+[result_status] UNDECLARED / UNKNOWN / 
+

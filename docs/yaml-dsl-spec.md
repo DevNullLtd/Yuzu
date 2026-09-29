@@ -87,7 +87,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). |
+| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). The `mcp.` prefix is **reserved** and cannot be authored (#2442) — it names MCP approval tickets, whose recall matches on the definition id. |
 | `displayName` | string | Yes | -- | Human-readable name shown in the dashboard. |
 | `version` | string | Yes | -- | Semantic version (e.g., `1.2.0`). Used for compatibility checks and pack versioning. |
 | `description` | string | No | `""` | Detailed description of what this definition does. |
@@ -118,7 +118,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Plugin identifier (must match a registered plugin's `name` field). |
 | `action` | string | Yes | -- | Action name (must exist in the plugin's `actions[]` array). Case-insensitive; normalized to lowercase at creation time and at dispatch. |
-| `concurrency` | string | No | `per-device` | Concurrency mode. Values: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. See [Section 12](#12-concurrency-model). |
+| `concurrency` | string | No | `per-device` | Concurrency mode. **Only `per-device` is actually enforced** (server-side); `per-definition`/`per-set`/`global:<N>`/`unlimited` are accepted but unenforced. Not validated — any string is accepted. See [Section 12](#12-concurrency-model). |
 | `stagger` | object | No | -- | Stagger configuration for large-fleet dispatch. |
 | `minSuccessPercent` | integer | No | `100` | Minimum percentage of agents that must succeed. `0` = best-effort, `100` = all must succeed. |
 
@@ -147,7 +147,7 @@ Each parameter descriptor supports:
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
 | `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
-| `validation` | object | No | -- | Validation constraints. See below. |
+| `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 
@@ -173,6 +173,10 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`; the extra keys pass through the embedded `result_schema` untouched. |
+| `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Meaningful only on a `string` column. Not enforced at runtime; `tools/plugin-doc-gen` validates the shape of these four keys (a list where a list is meant, `platforms` drawn from the vocabulary below) and fails its `--check` otherwise. |
+| `example` | string | No | -- | Documentation only: one representative value. |
+| `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
 
 #### `spec.result.aggregation`
 
@@ -197,14 +201,26 @@ Each column object:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `mode` | string | No | `auto` | Approval mode. `auto` -- no approval required. `role-gated` -- requires approval from a user with an approved role. `always` -- every execution requires explicit approval. |
+| `mode` | string | No | `auto` | Approval mode. `auto` -- no approval required. `role-gated` -- requires approval from a user with an approved role. `always` -- every execution requires explicit approval. Enforced on the governed `POST /api/instructions/:id/execute` path directly, and on every raw-dispatch surface (`POST /api/command`, MCP `execute_instruction`, and any future dispatch caller) via a compiled, per-`plugin.action` `ExecuteGate` derived strictest-wins from every shipped definition targeting that pair (#1398) -- see `docs/mcp-server.md` and `command_capability.hpp`. |
 
 #### `spec.permissions`
 
+**Advisory content metadata, not enforced by the server.** Neither field has a
+server-side representation: `executeRoles`' labels (`endpoint-admin`,
+`security-admin`, ...) are a content-authoring convention that matches no
+seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+drops the entire `permissions` block at build time -- it never reaches the
+running server. Actual execute-time enforcement is `spec.approval.mode` (see
+above); actual author-time enforcement is the `InstructionDefinition:Write`
+RBAC permission on the create/update route, unrelated to `authorRoles`. Both
+fields may still be authored for human-readable documentation of intent, but
+neither controls anything at runtime.
+
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `executeRoles` | list of string | No | `[]` | Roles permitted to execute this definition. Empty list means no restriction. |
-| `authorRoles` | list of string | No | `[]` | Roles permitted to create or modify this definition. |
+| `executeRoles` | list of string | No | `[]` | **Advisory only (unenforced) -- see note above.** Documents which roles a content author intends to permit; actual enforcement is `spec.approval.mode`. |
+| `authorRoles` | list of string | No | `[]` | **Advisory only (unenforced) -- see note above.** Documents which roles a content author intends to permit to create or modify this definition; actual enforcement is the `InstructionDefinition:Write` RBAC permission. |
 
 #### `spec.compatibility`
 
@@ -244,7 +260,7 @@ Optional chart configuration consumed by the dashboard's instruction-response vi
 
 > **Limitations.** The engine caps each chart at 10 000 underlying response rows; when truncated, the response payload includes `rows_capped: true` so the dashboard can show a banner. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
 
-> **Authoring through the dashboard YAML editor strips visualization.** When saving a definition via the dashboard's CodeMirror editor (`POST /api/instructions/yaml`), the lightweight line-scanner extracts `name`, `plugin`, `action`, `type`, `description`, `concurrency`, `approval` from the YAML source but does NOT extract `spec.visualization` into the indexed `visualization_spec` column. The chart spec is preserved in `yaml_source` (verbatim source of truth) but not indexed, so the chart deck does not render the chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or until the next server restart triggers the bundled-content auto-import. Author chart-bearing definitions through the JSON import path or the in-tree `content/definitions/` library, not the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
+> **Authoring through the dashboard YAML editor strips visualization.** When saving a definition via the dashboard's CodeMirror editor (`POST /api/instructions/yaml`), the schema-aware extractor (`instruction_yaml::parse_definition_yaml`) indexes `id`, `name`, `plugin`, `action`, `type`, `description`, `concurrency`, `approval` from the YAML source (canonical nested or flat schema) but does NOT extract `spec.visualization` into the indexed `visualization_spec` column. The chart spec is preserved in `yaml_source` (verbatim source of truth) but not indexed, so the chart deck does not render the chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or until the next server restart triggers the bundled-content auto-import. Author chart-bearing definitions through the JSON import path or the in-tree `content/definitions/` library, not the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 
 The engine returns a self-contained payload the dashboard's renderer (`/static/yuzu-charts.js`) can draw without a second request:
 
@@ -331,7 +347,7 @@ spec:
         - {column: Severity, op: equals, value: critical}
 ```
 
-> **Authoring through the dashboard YAML editor strips response templates.** Same caveat as `spec.visualization` — the lightweight line-scanner used by `POST /api/instructions/yaml` does not extract `spec.responseTemplates` into the indexed column. Use `POST /api/v1/definitions/import` (JSON envelope) or the in-tree `content/definitions/` library, or call `POST /api/v1/definitions/{id}/response-templates` directly to author templates against an already-imported definition.
+> **Authoring through the dashboard YAML editor strips response templates.** Same caveat as `spec.visualization` — the extractor used by `POST /api/instructions/yaml` does not index `spec.responseTemplates` into the indexed column. Use `POST /api/v1/definitions/import` (JSON envelope) or the in-tree `content/definitions/` library, or call `POST /api/v1/definitions/{id}/response-templates` directly to author templates against an already-imported definition.
 
 #### `spec.offload`
 
@@ -381,7 +397,7 @@ spec:
   execution:
     plugin: services
     action: inspect
-    concurrency: per-device              # per-device | per-definition | per-set | global:<N> | unlimited
+    concurrency: per-device              # only per-device is enforced — see Section 12
     stagger:
       maxDelaySeconds: 0                 # 0 = no stagger
       fixedDelaySeconds: 0               # 0 = no fixed delay
@@ -467,11 +483,15 @@ The grouping unit and permission boundary. Sets aggregate definitions, policy fr
 
 #### `metadata.permissions`
 
+**Advisory content metadata, not enforced by the server** -- same status as
+`spec.permissions` above (#1398); none of the three fields below has a
+server-side representation or reads through to any RBAC check.
+
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `executeRoles` | list of string | No | `[]` | Roles permitted to execute definitions in this set. |
-| `authorRoles` | list of string | No | `[]` | Roles permitted to author or modify definitions in this set. |
-| `approveRoles` | list of string | No | `[]` | Roles permitted to approve executions of definitions in this set. |
+| `executeRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to execute definitions in this set; member definitions' own `spec.approval.mode` is what's actually enforced. |
+| `authorRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to author or modify definitions in this set; actual enforcement is the `InstructionDefinition:Write` RBAC permission. |
+| `approveRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to approve executions; actual enforcement is the `Approval:Approve` RBAC permission on the approvals route. |
 
 #### `metadata.contents`
 
@@ -698,7 +718,7 @@ status:
 
 ## 6. Kind: Policy (Phase 5)
 
-> **Implementation phase:** Phase 5 -- Policy engine. Not yet implemented.
+> **Implementation phase:** Phase 5 -- Policy engine. **Corrected 2026-09-11 (Gate-of-record pass 5, arch-P5-1): this banner was stale.** `PolicyStore` is implemented and live in production (`server/core/src/policy_store.cpp`, `compliance_routes.cpp`) -- policies are created and evaluated today; remediation is operator-initiated, never automatic (see §16 of `docs/capability-map.md` and `docs/user-manual/policy-engine.md`). What is genuinely not implemented is the `spec.triggers[]` schema documented in this section (`ref:`/`with:` references to a `TriggerTemplate`) -- see the caveat under `spec.triggers[]` below for what the shipped parser actually accepts.
 
 A Policy binds a PolicyFragment to a device scope and a set of triggers. Policies are the deployment unit for compliance enforcement.
 
@@ -765,6 +785,8 @@ Each trigger object:
 | `ref` | string | Yes | -- | ID of a TriggerTemplate. |
 | `with` | map of string to varies | No | `{}` | Parameter bindings for the trigger. |
 
+> **Implementation caveat (added 2026-09-11, Gate-of-record pass 5, arch-P5-1): the shipped `PolicyStore` parser does not implement this `ref:`/`with:` schema at all.** It reads each trigger entry for a bare `type:` key (`extract_yaml_value(item_block, "type")`) and, when `type: interval`, an `interval_seconds:` key -- there is no `TriggerTemplate` resolution, no `ref:` lookup, anywhere in `policy_store.cpp`. A trigger object written exactly as this table specifies (`ref:` + optional `with:`, no `type:` key) parses with an empty `trigger_type` and is **silently dropped -- not stored at all**, not even as an unrecognized/errored trigger: `if (!t.trigger_type.empty()) triggers.push_back(...)` (`server/core/src/policy_store.cpp:678-679`) simply skips it. A policy authored per this exact schema therefore has zero triggers in the database and falls back to the 3600-second interval default (see `docs/user-manual/policy-engine.md` § Trigger Configuration). The shipped, working schema is `- type: interval` / `interval_seconds: <seconds>` per-entry -- `type` values other than `interval` are accepted and stored (unlike `ref:`, which is dropped) but do not affect evaluation cadence either. This is a real gap between this normative spec and the implementation, not a documentation nuance: content authored to this table's schema silently does nothing. Tracked as issue #4244.
+
 #### `spec.schedule`
 
 | Field | Type | Required | Default | Description |
@@ -808,6 +830,17 @@ Each trigger object:
 | `phase` | string | No | `proposed` | Lifecycle phase. Values: `proposed`, `active`, `deprecated`, `archived`. |
 
 ### 6.2 Complete Example
+
+> **This example's `triggers:` block uses the `ref:`/`with:` schema documented
+> above -- see the implementation caveat under `spec.triggers[]`: the shipped
+> parser drops these entries (zero triggers stored), and the policy falls back
+> to the 3600-second interval default rather than the `ref: trigger.interval.five_minutes` /
+> `ref: trigger.service_status_changed` cadence this example implies. This
+> example is kept as-is because it is the normative schema, unmodified by an
+> implementation gap -- do not copy its `triggers:` block into a real policy
+> and expect it to work; use the shipped `type: interval` / `interval_seconds:`
+> form from `docs/user-manual/policy-engine.md` instead. *(Added 2026-09-11,
+> Gate-of-record pass 5, arch-P5-1.)*
 
 ```yaml
 apiVersion: yuzu.io/v1alpha1
@@ -1276,7 +1309,7 @@ This lowers to the scope-engine string `from_result_set:windows-chrome-suspects 
 
 1. `fromResultSet` may not be combined with `assignment.managementGroups` — a result set already defines a fixed device set; layering management-group filtering on top is rejected.
 2. When `fromResultSet` is present, `assignment.mode` must be `static` (an omitted mode defaults to static). `dynamic` is rejected — the point of a result set is a fixed target.
-3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and the dispatch targets zero of that set's devices.
+3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned — including a set deleted in the window between the pre-dispatch owner-check gate and the registry's own membership read, closed as a TOCTOU by #4981 PR-1) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and — as of governance M1, 2026-07-29 — **aborts the entire dispatch**: zero devices are targeted, including devices matched by other scope atoms (a paired `scope.evaluation_aborted` row records `reason=owner_check_failed`, or one of `db_degraded`/`principal_unresolved`/`presence_degraded`/`unresolvable` for the other abort classes — see `docs/user-manual/rest-api.md`'s audit-event table for the full vocabulary). The previous behavior (proceed with only that reference zeroed) inverted to a fleet-wide match under a `NOT` combinator and is gone.
 4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
 5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
 
@@ -1440,34 +1473,68 @@ The `clob` type indicates a potentially large text field. The server may apply c
 
 ## 12. Concurrency Model
 
-Five concurrency modes control parallel execution of instruction definitions. The default (`per-device`) requires zero server coordination and scales to any fleet size.
+**Corrected 2026-08-31 (ADR-1007) — only `per-device` is actually enforced.** An earlier revision
+of this section described 5 modes as shipped; a real-usage audit of `content/definitions/*.yaml`
+plus a direct read of the dispatch path found that only `per-device` has ever been enforced, and
+the other four values are either unspecified or attach exclusively to catalog-only definitions
+that never dispatch through the agent path at all. `concurrency_mode` is not validated anywhere in
+the load/CRUD path — any string is accepted verbatim, so a typo or an unsupported value is silently
+treated as no limit, never rejected.
 
-| Mode | Enforcement | Scope | Use Case |
+| Mode | Enforcement | Scope | Status |
 |---|---|---|---|
-| `per-device` | Agent-side | One execution of this definition per device at a time | Default. Prevents conflicting operations on the same device. |
-| `per-definition` | Server-side | One fleet-wide execution of this definition at a time | Dangerous global operations (schema migration, bulk delete). |
-| `per-set` | Agent-side | One execution of any definition in this set per device | Set-level mutual exclusion (e.g., all patch operations). |
-| `global:<N>` | Server-side | At most N concurrent executions fleet-wide | Patch rollouts, license-limited operations. Server maintains a semaphore in SQLite. |
-| `unlimited` | None | No limits | Read-only queries, diagnostic gathering. |
+| `per-device` | Server-side (see below) | One execution of this definition per device at a time | **Enforced.** Default. The one mode with real, present-day usage (191 shipped definitions). |
+| `per-definition` | None | — | **Not enforced.** Accepted as a YAML value; used only on catalog-only `plugin: server`-class definitions that never dispatch through the agent path — see below. |
+| `per-set` | None | — | **Not enforced, and unspecified** — no "set" grouping key is defined anywhere in this spec or the code. Zero real usage. |
+| `global:<N>` | None | — | **Not enforced.** Not used in any shipped definition — real content uses the bare literals `global`/`global-singleton` instead, neither of which this or any other syntax ever parsed. |
+| `unlimited` | None | No limits | No enforcement needed — this was always the intended behavior. |
 
-### Agent-Side Enforcement (per-device, per-set)
+### Enforcement (per-device)
 
-The agent maintains an in-memory `std::unordered_set` of active definition IDs (or set IDs). On `CommandRequest` arrival, the agent checks the set. If occupied, the agent returns `REJECTED` with error code `3003` (`ORCH_CONCURRENCY_LIMIT`). No server round-trip is required.
+Enforced **server-side**, not agent-side as an earlier revision of this spec described — see
+ADR-1007 for why (the wire `CommandRequest` carries no `definition_id`, and building agent-side
+dedup would require a proto + gateway change with no correctness benefit once the server-side
+design is made race-free). The server holds a claim (a dedicated Postgres table, race-free via a
+partial unique index — not the `concurrency_locks` an earlier revision of this section described,
+which was never built) on `(definition_id, agent_id)` at dispatch time and releases it when that
+agent's execution reaches a terminal state. An agent already holding a claim for the same
+definition is excluded from the dispatch — for a single-target dispatch this means "no agents
+reached"; there is no queueing (an earlier revision of this section claimed an at-limit execution
+"enters a wait queue" — no such mechanism has ever existed, agent or server side). The caller may
+retry once the in-flight execution completes. Error code `3003`
+(`kConcurrencyBlocked`) is registered in the taxonomy for this condition but is not currently
+surfaced through the dispatch response — see ADR-1007's follow-ups.
 
-### Server-Side Enforcement (per-definition, global:N)
+**Not covered:** raw MCP `execute_instruction` and raw REST command dispatch (no `definition_id`
+in scope — cannot be gated by definition), and fleet-broadcast dispatch of a `per-device`
+definition (`scope: __all__`) — both real, deliberate gaps, not oversights.
 
-The server checks a `concurrency_locks` SQLite table before dispatch. If the lock is held (or the semaphore count is at the limit), the execution enters a wait queue. The lock is released when the execution completes or times out.
+**One release exception:** cancelling an execution does not release its claim (no agent-side
+cancel/kill path exists, so the claim stays open exactly as if the execution were still running,
+until a terminal response or the reconciler's TTL bound — at most one hour — releases it). A
+`per-device` definition dispatched via a workflow step releases and renews the same way as any
+other dispatch path (a `command_id`-keyed fallback covers it, since workflow-step dispatch still
+doesn't correlate a real execution id) — see ADR-1007.
+
+### `plugin: server` / `server_internal` / `_server` definitions
+
+The 42 shipped definitions using `per-definition`/`global`/`global-singleton` are catalog/discovery
+metadata for the management API and dashboard, not live execution artifacts — no agent plugin
+named `server`/`server_internal`/`_server` exists. Their real functionality (directory sync,
+deployment orchestration, policy CRUD, etc.) is implemented by dedicated REST routes calling
+dedicated C++ objects directly, which never consult `concurrency_mode`. Where real concurrent-call
+protection is needed for one of these operations, it is implemented directly on the handler (see
+`DirectorySync::sync_entra`'s re-entrancy guard, ADR-1007) rather than through this DSL field.
 
 ### YAML Syntax
 
 ```yaml
 spec:
   execution:
-    concurrency: per-device          # default
-    # concurrency: per-definition    # one fleet-wide at a time
-    # concurrency: per-set           # one per set per device
-    # concurrency: global:50         # at most 50 concurrent across fleet
-    # concurrency: unlimited         # no limits
+    concurrency: per-device          # default — the only mode actually enforced
+    # concurrency: per-definition    # accepted, NOT enforced — see above
+    # concurrency: per-set           # accepted, NOT enforced, unspecified grouping — see above
+    # concurrency: unlimited         # no limits (also the practical effect of any unsupported value)
 ```
 
 ---
@@ -1500,11 +1567,17 @@ Errors are categorized into four domains with non-overlapping numeric ranges.
 
 | Code | Name | Description | Retry |
 |---|---|---|---|
-| 3001 | `ORCH_EXPIRED` | Instruction passed its `expires_at` before dispatch | Never |
-| 3002 | `ORCH_AGENT_MISSING` | Target agent not connected at dispatch time | Yes (on reconnect) |
-| 3003 | `ORCH_CONCURRENCY_LIMIT` | Concurrency mode blocked execution | Yes (after slot frees) |
-| 3004 | `ORCH_APPROVAL_REQUIRED` | Execution blocked pending approval | No (awaits human) |
-| 3005 | `ORCH_CANCELLED` | Execution cancelled by operator | Never |
+| 3001 | `DefinitionNotFound` | The referenced InstructionDefinition does not exist | Never |
+| 3002 | `ApprovalRequired` | Execution blocked pending approval | No (awaits human) |
+| 3003 | `ConcurrencyBlocked` | Registered for `per-device` claim exclusion; not yet surfaced through the dispatch response (ADR-1007) | Yes (after slot frees) |
+| 3004 | `ScopeEmpty` | The resolved target scope matched no agents | Never |
+| 3005 | `ScheduleExpired` | The schedule's execution window has passed | Never |
+
+Names above are the taxonomy's actual registered names (`server/core/src/error_codes.cpp`) — this
+row set was corrected from a stale naming scheme this table had carried (`ORCH_*` prefixes that
+never matched the code). Like 3003, none of 3001/3002/3004/3005 currently has a production call
+site that emits it — the retry column states the DESIGNED behavior per the taxonomy entry, not an
+observed one.
 
 ### 4xxx -- Agent Errors
 
@@ -1602,7 +1675,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.config.get` | `network_config` | Y | Y | Y | Verified |
 | `network.route.list` | `network_config` | Y | Y | Y | Verified |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified |
-| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified |
+| `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified |
 | `network.probe.icmp` | `netprobe` | Y | Y | Y | Verified |
@@ -1620,7 +1693,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
 | `software.inventory` | `installed_apps` | Y | Y | Y | Verified |
-| `software.package.inventory` | `msi_packages` | Y | - | - | Verified |
+| `software.package.inventory` | `msi_packages` | Y | - | Y | Verified |
 | `software.uninstall` | `software_actions` | Y | Y | Y | Verified |
 | `software.install` | content staging | Y | Y | Y | Planned |
 | `software.update` | pkg adapter | Y | Y | Y | Proposed |
@@ -1680,6 +1753,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_keys` | `registry` | Y | - | - | Verified |
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
+| `registry.list_profiles` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |
@@ -1763,7 +1837,7 @@ This section enumerates the stable builtin primitives that content authors targe
 
 **`tar.compatibility`** -- Emit the live OS compatibility matrix for every registered capture source (process, tcp, service, user, perf, plus the opt-in procperf, netqual, module, arp, dns). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`; the mechanism actually in force is reported as `network_capture_method_effective` by the `status` action (always `polling` today).
 
-**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (opt-in, off by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: on Linux, a tick whose core `/proc` reads fail (e.g. a hardened container masking `/proc/stat`) reports `unsupported_platform` for that tick even though the platform is supported — cross-check `tar.compatibility` before concluding a build lacks the collector (a distinct status token is a tracked follow-up). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
+**`tar.collect_perf`** -- Record one device performance sample (CPU/memory/disk/network) into `$Perf_Live`, and — when `procperf_enabled` is set (opt-in, off by default) — one per-application top-N sample into `$ProcPerf_Live` on the same tick (output line `tar|collect_procperf|N|...`). Trigger-driven on the `perf_interval_seconds` cadence (default 30 s; Windows and Linux — macOS records nothing until its collector lands); a manual invocation forces one immediate sample. Note: a tick whose core counter read fails (e.g. a hardened container masking `/proc/stat` on Linux, or an NT-counter read failure on Windows) reports `counters_unavailable` on any OS the registry lists as supported for `perf`/`procperf`, and `unsupported_platform` only where no perf collector exists (macOS today) — so a supported platform whose reads are failing is distinguishable from an unsupported one. The per-source streak is in `tar.status` (`perf_last_status` / `perf_consecutive_failures`, and identically `procperf_last_status` / `procperf_consecutive_failures`). The first sample after agent start is a baseline (records no row). See [the TAR user manual](user-manual/tar.md) for the perf/procperf tiers and their `perf_enabled` / `procperf_enabled` / `perf_interval_seconds` configuration.
 
 **`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 

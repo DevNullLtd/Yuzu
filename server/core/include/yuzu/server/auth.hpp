@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -16,7 +19,10 @@ class MetricsRegistry;
 }
 namespace yuzu::server {
 class AuthDB;
-}
+class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
+struct SessionRow;        // session_store.hpp — the durable row shape
+struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
+} // namespace yuzu::server
 
 namespace yuzu::server::auth {
 
@@ -27,6 +33,51 @@ inline constexpr std::size_t kMaxSessionTokenLength = 64;
 inline constexpr std::size_t kMaxApiTokenLength = 256;
 
 enum class Role { user, admin };
+
+/// Outcome of re-checking a credential that is already in use — the tri-state a
+/// HELD-OPEN connection needs and a request does not.
+///
+/// Ordinary request auth collapses "definitively gone" and "we cannot reach the
+/// store to find out" into one answer, because both mean 401. A long-lived
+/// stream cannot: a revocation must cut it immediately, while an unreachable
+/// auth store must NOT cut every stream on the fleet at the same instant
+/// (ADR-1005 Decision 15(c)/(i), chaos CH-4) — the consumer rides out an
+/// indeterminate answer for a bounded grace window instead.
+///
+/// The underlying type is pinned so this can be opaquely forward-declared by
+/// consumers (e.g. `mcp_stream.hpp`) without dragging in this header: a later
+/// `: std::uint8_t` here would otherwise silently name a different type in every
+/// TU that saw only the forward declaration — an ODR violation with no diagnostic.
+enum class CredentialCheck : int {
+    kValid,
+    kRevoked,       ///< definitive: signed out, expired, revoked, rebound, or absent
+    kIndeterminate, ///< the auth store could not answer — NOT evidence of revocation
+    /// Valid, but the answer came from a cache — nothing was asked of the
+    /// authoritative store on this tick (#2367).
+    ///
+    /// This exists because "still valid" and "re-confirmed valid" are different
+    /// facts to a held-open stream, and conflating them silently extends how
+    /// long a stream can outlive its credential. A consumer that treats this as
+    /// plain `kValid` and resets its grace clock makes cache residency and the
+    /// grace window ADD: the stream rides the cache, and only once the cache
+    /// expires does a full FRESH grace window start. The consumer must instead
+    /// keep measuring its grace budget from the last AUTHORITATIVE `kValid`, so
+    /// total survival past a real confirmation stays bounded by the grace
+    /// window however much of it was spent on cached answers.
+    ///
+    /// Not a denial and not a degradation — the credential IS valid. A consumer
+    /// that does not model staleness may safely treat this as `kValid`; it will
+    /// simply inherit the additive window described above.
+    ///
+    /// PRODUCER INVARIANT: every site that returns this must be bounded by a
+    /// staleness limit the consumer knows about. `McpStreamPump` clamps its
+    /// authoritative floor forward by `Config::revalidate_max_staleness`, which
+    /// is wired from the ONE current producer's cache TTL
+    /// (`EnginePrincipalStore::kAuthCacheTtl`). A second producer with a longer
+    /// window, added without raising that config, would silently over-grant
+    /// grace — the clamp would credit a confirmation that never happened.
+    kValidStale,
+};
 
 struct UserEntry {
     std::string username;
@@ -39,6 +90,58 @@ struct UserEntry {
     /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
     /// populated by every list/read path — see the call site's doc comment.
     std::string identity_source{"local"};
+    /// Gate 5 chaos-injector CH-1 (#4020 follow-up): a stamp from
+    /// `AuthManager::next_role_version_()`'s single PROCESS-WIDE monotonic
+    /// counter, taken every time ANY entry (any username) is created or has
+    /// `.role` mutated in place - NOT a per-username counter starting at 0.
+    ///
+    /// #4107 (row-locking rewrite) REMOVED the only code that ever COMPARED
+    /// this stamp - `recheck_role_after_credential_check` now serializes via
+    /// a real Postgres row lock instead (see that function's header doc),
+    /// and no longer reads `pre_check_version` at all. This field is
+    /// retained purely as a write-ordering stamp: every writer still bumps
+    /// it in lockstep with `.role` (an invariant several reviewers have
+    /// checked for and relied on), which is useful for future consumers and
+    /// for reasoning about write ordering, but nothing compares it for
+    /// correctness today. The history below (why it's process-wide, not
+    /// per-username) explains the counter's DESIGN and remains accurate;
+    /// just read every "the compare-guard" reference below as "the retired
+    /// compare-guard, historical context for why this field is shaped the
+    /// way it is."
+    ///
+    /// Comparing this stamp instead of `.role` itself in the (retired)
+    /// recheck compare-guard closed an ABA hole a role-VALUE compare cannot:
+    /// a promote-then-demote back to the same role value inside one PBKDF2
+    /// window would satisfy a value-equality guard and let a stale read win
+    /// over the demote that already landed. A cpp-safety re-review of the
+    /// first version of that fix (which used a per-username counter
+    /// carried forward across `upsert_user`/reactivate) found that a
+    /// PER-USERNAME scheme reopens the identical class through a different
+    /// door: `remove_user()` erases the cache entry outright, and
+    /// `reactivate_user()`/a fresh cold hydrate then reinstalls a NEW entry
+    /// whose counter restarts at a low value (typically 0) - a stale
+    /// in-flight call's captured pre-check version could coincidentally
+    /// match that reset value. A single process-wide source stamped at
+    /// EVERY write (including first creation, not just later mutation) made
+    /// any two equal stamps observed by this process mean the exact same
+    /// write event, full stop - erase/reinsert included. Only a u64
+    /// wraparound (~2^64 writes across every username combined, over one
+    /// process's lifetime) could theoretically repeat a stamp, which was
+    /// never a realistic concern.
+    ///
+    /// One creation path is a carve-out, not covered by "every entry is
+    /// stamped": `load_config()`'s cfg-file bulk load builds entries directly
+    /// and never calls `next_role_version_()`, so a cfg-seeded entry keeps
+    /// this field's struct-default `0`. Safe ONLY because
+    /// `role_version_epoch_` starts at 1 and can never (re)issue 0 - see that
+    /// field's own doc - and because `load_config()` runs boot-only,
+    /// single-threaded, strictly before `set_auth_db()` is ever called on the
+    /// same `AuthManager` (`main.cpp`), so no in-flight recheck call can exist
+    /// yet to capture a stale `pre_check_version` against one of these
+    /// entries. A future config-reload feature reusing `load_config()` at
+    /// runtime would need to stamp these entries too, or it would reopen
+    /// this exact ABA class for cfg-file-seeded accounts.
+    std::uint64_t role_version{0};
 };
 
 struct Session {
@@ -59,55 +162,163 @@ struct Session {
     /// display-name changes without perturbing the stable `username` above.
     std::string display_name;
     Role role;
-    std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"}; // "local", "oidc", "saml", "api_token", or "mcp_token"
+    /// Absolute session-lifetime ceiling. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a (ADR-2002 §4): sessions are durable Postgres rows, so their
+    /// lifetime is an absolute wall-clock instant that any replica compares
+    /// against, not a per-process monotonic point. The NTP-step resistance the
+    /// former `steady_clock` gave is replaced by (a) the DB-primary clock being
+    /// a monitored security dependency (WS-11) and (b) the hard wall-clock
+    /// ceilings on the elevation/MFA windows below.
+    std::chrono::system_clock::time_point expires_at;
+    // "local", "oidc", "saml", "api_token", "mcp_token", or "engine_token" (six values —
+    // docs/auth-engine-principals-design.md §6; the sixth is minted only by
+    // AuthRoutes::synthesize_token_session for a principal_kind="engine" ApiToken).
+    std::string auth_source{"local"};
     std::string oidc_sub;             // OIDC subject claim (empty for local auth)
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
+    /// Discriminator for the session's principal class — "human" (default) or
+    /// "engine". In-memory only (no auth.db schema change: token sessions are
+    /// synthesized fresh per request, never persisted — see design doc §6).
+    /// Set by `synthesize_token_session` from the source `ApiToken::principal_kind`;
+    /// every other session-creation site leaves the "human" default. This is the
+    /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
+    /// never infer principal kind from the shape of `username`.
+    std::string principal_kind{"human"};
+
+    /// True iff this session authenticates as an ADR-0031 engine principal.
+    /// The canonical engine-session discriminator (mirrors the belts in
+    /// rest_api_v1.cpp deny_engine_session / mcp_server.cpp
+    /// deny_if_engine_session / principal_quota_gate.hpp apply_engine_quota_gate).
+    [[nodiscard]] bool is_engine() const {
+        return principal_kind == "engine" || auth_source == "engine_token";
+    }
+
     /// Timestamp of the most recent successful MFA proof on this session
     /// (login completion or step-up). Default-constructed sentinel means
-    /// "no MFA proof yet". Compared against
-    /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
-    /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::chrono::steady_clock::time_point mfa_verified_at{};
+    /// "no MFA proof yet". WALL-CLOCK (`system_clock`) since HA WS-1/1a
+    /// (durable rows). Compared against
+    /// `system_clock::now() - cfg.mfa_step_up_window_secs` by high-risk route
+    /// handlers, which fail CLOSED on a backward step (a proof timestamped
+    /// AFTER `now` is treated as no proof — see mfa_step_up.cpp). SOC 2 CC6.6 —
+    /// see docs/auth-mfa-design.md.
+    std::chrono::system_clock::time_point mfa_verified_at{};
 
-    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `steady_clock::now() <
-    /// elevated_until`, this session's EFFECTIVE role is `admin` regardless of
-    /// the base `role` — a time-boxed, justified, MFA-gated activation set by
-    /// `POST /api/v1/elevate` (eligibility = `users.elevation_eligible`). The
-    /// default-constructed sentinel (epoch) means "not elevated" — fail-closed,
-    /// monotonic (an NTP step can't extend it). Per-session + in-memory: a
-    /// restart or logout drops the elevation. See `effective_role()` and
-    /// docs/auth-architecture.md "JIT admin elevation".
-    std::chrono::steady_clock::time_point elevated_until{};
+    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `system_clock::now() <
+    /// elevated_until` (AND the window is within the `kMaxElevationWindow` hard
+    /// ceiling — see `is_elevated()`), this session's EFFECTIVE role is `admin`
+    /// regardless of the base `role` — a time-boxed, justified, MFA-gated
+    /// activation set by `POST /api/v1/elevate` (eligibility =
+    /// `users.elevation_eligible`). The default-constructed sentinel (epoch)
+    /// means "not elevated". WALL-CLOCK since HA WS-1/1a (durable rows); the
+    /// former monotonic NTP-step resistance is replaced by the paired
+    /// `elevation_issued_at` anchor + `kMaxElevationWindow` ceiling below. See
+    /// `effective_role()` and docs/auth-architecture.md "JIT admin elevation".
+    std::chrono::system_clock::time_point elevated_until{};
+
+    /// Wall-clock instant the current elevation was GRANTED (the max-delta
+    /// anchor, ADR-2002 §4). Paired with `elevated_until`: `is_elevated()`
+    /// rejects any elevation whose granted window `elevated_until -
+    /// elevation_issued_at` exceeds `kMaxElevationWindow`, so a forward clock
+    /// corruption (at grant, or a tampered durable row) cannot push admin
+    /// beyond the hard ceiling independent of what `elevated_until` holds. Epoch
+    /// sentinel when not elevated; set together with `elevated_until` at every
+    /// grant site and cleared together on revoke.
+    std::chrono::system_clock::time_point elevation_issued_at{};
 
     /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
-    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// bumped toward `system_clock::now()` on authenticated requests when the
     /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
     /// throttled to once per touch-granularity; `validate_session` rejects the
     /// session once `now - last_activity_at` exceeds the window — a sliding
-    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
-    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
-    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
-    /// most one write per session per kActivityPersistGranularity, keeping the
-    /// hot path off a per-request SQL write.
+    /// window UNDER the absolute `expires_at`. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a: the sliding anchor is a durable row column advanced via
+    /// `SessionStore::touch_activity` (which deliberately does NOT bump the
+    /// write-generation), so any replica ages the session from the same
+    /// absolute instant. `last_activity_persisted_at` throttles the durable
+    /// mirror to at most one write per session per kActivityPersistGranularity,
+    /// keeping the hot path off a per-request SQL write.
     ///
-    /// Both are STAMPED at each of the three session-creation sites
-    /// (authenticate / create_local_session / create_oidc_session). The `{}`
-    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
-    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
-    /// **Invariant:** any future path that inserts a Session into
-    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
-    /// work) MUST stamp `last_activity_at`, or the restored session is
-    /// idle-evicted on its first validate when the feature is on.
-    std::chrono::steady_clock::time_point last_activity_at{};
-    std::chrono::steady_clock::time_point last_activity_persisted_at{};
+    /// Both are STAMPED at every session-creation and rehydration site. The `{}`
+    /// member-init is the EPOCH, which is fail-closed: an unstamped session
+    /// reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any path that inserts a Session into the validate-cache
+    /// (creation OR rehydration from a `SessionRow`) MUST stamp
+    /// `last_activity_at`, or the restored session is idle-evicted on its first
+    /// validate when the feature is on.
+    std::chrono::system_clock::time_point last_activity_at{};
+    std::chrono::system_clock::time_point last_activity_persisted_at{};
+
+    // ── Local monotonic adjudication (ADR-2002 §4 DB-clock authority, WS-1/1a) ──
+    // Per-request authorization is decided against these steady_clock deadlines,
+    // derived ONCE at session mint / cache-populate from the AUTHORITY clock
+    // (Postgres `now()` for a durable session, this host's wall clock for the
+    // legacy no-store path) by `AuthManager::derive_session_deadlines`. They are
+    // immune to local wall-clock skew and steps: a +Nh-skewed replica derives the
+    // same REMAINING duration and ages it monotonically. The system_clock fields
+    // above stay the AUTHORED ABSOLUTE instants — used for display/audit and as
+    // the suspend backstop (a steady_clock deadline is blind to host suspend; a
+    // generous wall sanity ceiling on the absolute instant is not — see
+    // is_elevated / validate). The `{}` (steady-epoch) sentinel is fail-closed:
+    // an underived session reads as instantly-expired / not-elevated / no-proof.
+    std::chrono::steady_clock::time_point steady_expires{};        ///< base-lifetime deadline
+    std::chrono::steady_clock::time_point steady_elevated_until{}; ///< {} = not (validly) elevated
+    std::chrono::steady_clock::time_point steady_last_activity{};  ///< idle slide anchor
+    std::chrono::steady_clock::time_point steady_mfa_verified{};   ///< {} = no valid MFA proof
+    /// Durable-touch throttle marker — the local MONOTONIC instant this replica
+    /// last mirrored `last_activity` to the store (seeded at populate from how
+    /// stale the durable row already is). The throttle MUST be steady, not wall:
+    /// gating the durable write on `system_clock` vs a DB-authored timestamp
+    /// (cross clock domains) lets host skew suppress touches so an actively-used
+    /// session idles out on another replica / after failover (adversarial-review
+    /// CDX-P1-001) — the very cross-host-skew contract WS-1/1a exists to close.
+    std::chrono::steady_clock::time_point steady_last_persisted{};
 };
 
-/// True iff `s` currently holds an unexpired JIT admin elevation.
+/// Defense-in-depth hard ceiling on any JIT elevation window (ADR-2002 §4).
+/// With sessions on wall-clock (durable rows), `is_elevated()` additionally
+/// rejects any elevation whose granted window (`elevated_until -
+/// elevation_issued_at`) exceeds this bound — so a forward clock corruption at
+/// grant time, or a tampered durable row, cannot extend admin beyond it,
+/// INDEPENDENT of the per-deployment `--jit-max-elevation-secs` clamp the caller
+/// applies at grant. Chosen generously so every legitimate grant (default 1h,
+/// config-capped) passes while an implausible far-future value is refused.
+inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
+
+/// Wall-clock sanity tolerance for the suspend backstop (ADR-2002 §4, design-
+/// review H5). A steady_clock deadline is blind to host/VM suspend
+/// (CLOCK_MONOTONIC pauses), so a cached session could out-live its authored
+/// expiry by the suspend duration. The absolute `system_clock` deadline is the
+/// backstop, consulted with THIS slack. The tradeoff: a replica whose local wall
+/// clock is synced within this slack of the DB primary is never wrongly rejected,
+/// and only a gross wall jump past expiry (a long suspend) trips it; but a replica
+/// whose wall clock LEADS the DB primary by MORE than this slack WILL fail-CLOSED
+/// (spurious 401 / re-auth) on a session in its last (skew − slack). That is
+/// deliberate and fail-safe — it requires replicas to be roughly NTP-synced within
+/// this slack, which is the operational precondition for the suspend backstop
+/// (the steady deadline alone handles arbitrary skew; this only backstops
+/// suspend). Bounds suspend over-extension to this slack + the residual, negligible
+/// against an 8h session / 24h elevation ceiling.
+inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
+
+/// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
+/// Decided against the local MONOTONIC steady deadline derived at populate
+/// (ADR-2002 §4 DB-clock authority) — immune to local wall skew/steps — with a
+/// generous wall-clock sanity backstop for steady_clock's suspend-blindness. The
+/// authored-width ceiling and future-issued rejection are pre-applied when
+/// `steady_elevated_until` is derived (derive_session_deadlines); {} means not
+/// (validly) elevated.
 inline bool is_elevated(const Session& s) {
-    return s.elevated_until.time_since_epoch().count() != 0 &&
-           std::chrono::steady_clock::now() < s.elevated_until;
+    if (s.steady_elevated_until.time_since_epoch().count() == 0)
+        return false;
+    if (std::chrono::steady_clock::now() >= s.steady_elevated_until)
+        return false;
+    // Suspend backstop: the absolute authored instant, consulted only with the
+    // generous slack so a skewed-but-not-suspended replica is unaffected.
+    if (s.elevated_until.time_since_epoch().count() != 0 &&
+        std::chrono::system_clock::now() > s.elevated_until + kWallSanitySkew)
+        return false;
+    return true;
 }
 
 /// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
@@ -249,11 +460,22 @@ public:
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
     /// `auth_source="local"`. If `mfa_verified` is true, stamps
-    /// `mfa_verified_at = steady_clock::now()` so the step-up window
+    /// `mfa_verified_at = system_clock::now()` so the step-up window
     /// covers immediate high-risk actions taken right after login.
+    ///
+    /// Requires the account to already have an AuthDB `users` row when
+    /// `auth_db_` is configured: post_mint_role_recheck (see its own doc)
+    /// re-reads AuthDB immediately after minting and fails closed - empty
+    /// string returned, no session - on ANY read failure, including a
+    /// plain UserNotFound (never provisioned, or removed). Every real
+    /// production caller (auth_routes.cpp's 3 call sites) is only reached
+    /// after a local-auth verify_password() call that already guarantees
+    /// the row exists; calling this directly for an account with no row
+    /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
+    /// principal) will always be denied (#4107 CI finding, 38cc33b88).
     std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
 
-    /// Stamp `mfa_verified_at = steady_clock::now()` on the named session.
+    /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
     /// /login/mfa/stepup route (PR 2) to mark an already-issued session
     /// as freshly MFA-verified.
@@ -266,7 +488,7 @@ public:
     /// cookie session that carries it (residual-risk follow-up B, security
     /// review 2026-06-30). The CALLER is responsible for the eligibility +
     /// MFA-step-up gates; this only mutates the in-memory session. Returns the
-    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// absolute (possibly-clamped) expiry `system_clock::time_point` on success
     /// (so the route can report it), nullopt if the session does not exist OR
     /// is already at/past its own `expires_at` (a dead-window guard, governance
     /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
@@ -275,21 +497,30 @@ public:
     /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
     /// caller's nullopt→401 path already covers this. `duration` is assumed
     /// already clamped to the configured `--jit-max-elevation-secs` cap by the
-    /// caller.
-    std::optional<std::chrono::steady_clock::time_point>
+    /// caller; the durable grant additionally stamps `elevation_issued_at` so
+    /// the `kMaxElevationWindow` ceiling (auth.hpp) can bound it wall-clock.
+    std::optional<std::chrono::system_clock::time_point>
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
     /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
-    /// on the named session. Returns true if the session existed and was
-    /// elevated (so the route can distinguish a real revoke from a no-op).
-    bool revoke_elevation(const std::string& token);
+    /// on the named session. On success the value is whether the session existed
+    /// AND was elevated (so the route can distinguish a real revoke from a
+    /// no-op). Returns `unexpected` ONLY when a durable `SessionStore` clear
+    /// FAILED — the route MUST fail closed there (the elevation is still live
+    /// durably; reporting success would falsely tell an incident responder the
+    /// admin was revoked, governance-missed / adversarial C2). Store-less
+    /// (legacy) mode never errors.
+    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
     /// devices). Called when an admin removes a user's elevation eligibility so
     /// an in-flight elevation is terminated immediately — symmetric with the
-    /// session wipe on demote/delete (governance UP-1). Returns the number of
-    /// sessions whose elevation was cleared.
-    int revoke_user_elevations(const std::string& username);
+    /// session wipe on demote/delete (governance UP-1). On success the value is
+    /// the number of sessions whose elevation was cleared. Returns `unexpected`
+    /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
+    /// closed (an in-flight elevation may still be live durably; the eligibility
+    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
     /// security review 2026-06-30): if `token`'s session holds an elevation
@@ -317,11 +548,114 @@ public:
     /// no-op if `token` is not a live session.
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
 
+    /// TEST-ONLY: installs a callback fired inside
+    /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
+    /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
+    /// between an unlocked DB read and a plain `mu_` acquire (Gate 5
+    /// chaos-injector's CH-1 window); #4107's row-locking rewrite moved the
+    /// firing point earlier, because a hook that synchronously called
+    /// `update_role()` at the OLD point would now self-deadlock (this
+    /// thread would go on to hold the row lock its own hook is blocked
+    /// trying to acquire). A hook that needs to simulate a GENUINE
+    /// concurrent write racing the row lock must spawn a separate
+    /// `std::thread` to do it (join it before the test ends) - see
+    /// `tests/unit/server/test_auth.cpp` for the pattern. Production code
+    /// MUST NOT call this - no caller in `server/core/src/**` references it.
+    /// A no-op (nullptr) by default.
+    void set_role_recheck_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired INSIDE
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback - i.e. while AuthDB genuinely holds the row lock, immediately
+    /// before the in-process cache write. Lets a test spawn a writer thread
+    /// here and confirm its `update_role()` call genuinely blocks (proving
+    /// the row lock is real, not just documented) before letting this hook
+    /// return, which lets the enclosing transaction commit and the writer
+    /// unblock. Must NOT synchronously call anything that itself needs this
+    /// row's lock (self-deadlock - same reason
+    /// `set_role_recheck_race_hook_for_test` moved its own firing point) -
+    /// spawn a thread and join it AFTER `recheck_role_after_credential_check`
+    /// returns, never inside this callback. Production code MUST NOT call
+    /// this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default.
+    void set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired in `authenticate()` (cpp-safety
+    /// Gate 8 catch: NOT in `create_local_session()` - that function has no
+    /// pre-mint recheck of its own to race against, since its `role`
+    /// parameter comes from an EARLIER caller-side check; see the doc on
+    /// `test_auth.cpp`'s parameter-based stale-role test for that path's
+    /// coverage instead), AFTER the row lock has already been released
+    /// (`recheck_role_after_credential_check` has returned) but BEFORE
+    /// `persist_new_session` mints the session - i.e. squarely inside the
+    /// #4107 check-then-mint window `post_mint_role_recheck` exists to
+    /// close. Unlike the two hooks
+    /// above, there is no lock held at this firing point, so a hook MAY
+    /// safely call `update_role()` (or spawn+join a thread that does)
+    /// synchronously and wait for it to fully complete before returning -
+    /// this lets a test force a demote to land, fully committed, strictly
+    /// inside the gap, with no race/timing dependence at all (deterministic
+    /// red/green, unlike the row-lock-blocking test's genuinely-racy
+    /// coverage of this same window). Production code MUST NOT call this -
+    /// no caller in `server/core/src/**` references it. A no-op (nullptr) by
+    /// default.
+    void set_post_mint_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
+    /// `get_user_role()`, which is DB-authoritative and so cannot observe
+    /// cache staleness at all). Lets a test confirm the version-guard in
+    /// `recheck_role_after_credential_check` actually left the cache alone
+    /// rather than clobbering it with a stale read (Gate 5 CH-1 regression).
+    /// Returns nullopt if the username isn't cached (cold or evicted).
+    /// Production code MUST NOT call this - no caller in `server/core/src/**`
+    /// references it.
+    [[nodiscard]] std::optional<Role> cached_role_for_test(const std::string& username) const;
+
+    /// TEST-ONLY: raw `users_` cache peek of `role_version` - the version-side
+    /// twin of `cached_role_for_test`. Returns nullopt if the username isn't
+    /// cached. Production code MUST NOT call this - no caller in
+    /// `server/core/src/**` references it.
+    [[nodiscard]] std::optional<std::uint64_t>
+    cached_role_version_for_test(const std::string& username) const;
+
+    /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
+    /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
+    /// session; this host's wall clock for the legacy no-store path). Sets the
+    /// wall-clock absolutes (display/audit + suspend backstop) and the local
+    /// monotonic steady deadlines, CLAMPING every derived remaining so a backward
+    /// `now_ms` cannot inflate the lived duration past its authored maximum
+    /// (design-review H2). Returns false iff the base lifetime is already past at
+    /// `now_ms` (the caller must NOT cache or honor it — H4 underflow guard).
+    /// PUBLIC because the clamps are security-critical and unit-tested directly.
+    [[nodiscard]] static bool
+    derive_session_deadlines(Session& s, std::int64_t created_ms, std::int64_t expires_ms,
+                             std::int64_t last_activity_ms, std::int64_t mfa_verified_ms,
+                             std::int64_t elevated_until_ms, std::int64_t elevation_issued_ms,
+                             std::int64_t now_ms);
+
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
 
+private:
+    /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative
+    /// `SessionStore::find`, with the same absolute-expiry + idle-timeout gates
+    /// as the legacy in-memory path. Only reached when `session_store_` is set;
+    /// the store-less deployment keeps the legacy body unchanged. A degraded
+    /// authoritative read for an uncached token fails the request (401), never a
+    /// silent grant.
+    std::optional<Session> validate_session_durable(const std::string& token,
+                                                    bool idle_enabled) const;
+
+public:
+
     /// Destroy a session (logout).
-    void invalidate_session(const std::string& token);
+    /// Destroy a session (logout). Returns whether the durable delete
+    /// persisted: true when no store is configured OR the durable row was
+    /// deleted; FALSE on a durable-delete store error (the local cache is still
+    /// erased, but the durable row survives and can rehydrate a valid session on
+    /// another replica / from a copied cookie, so the caller MUST NOT report a
+    /// clean logout — adversarial-round blocker #3).
+    [[nodiscard]] bool invalidate_session(const std::string& token);
 
     /// Outcome of `invalidate_user_sessions`. The in-memory `count` is the
     /// number of session cookies erased; `db_persisted` is true iff the
@@ -376,7 +710,16 @@ public:
     /// Returns false if user not found.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found.
+    /// Look up a user's legacy role. Returns nullopt if user not found (or,
+    /// in AuthDB-backed mode, if the store could not answer - never falls
+    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// EVERY call when configured (no cache, no cache fallback) - see the
+    /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
+    /// #4020: this is the call auth_routes.cpp's legacy API-token session
+    /// synthesis makes on every request, so a stale cached role here was a
+    /// live stale-privilege gap after a demotion, independent of
+    /// authenticate()/verify_password() entirely). Config-file mode (no
+    /// AuthDB) remains cache-only, unchanged.
     std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
@@ -386,6 +729,25 @@ public:
     /// If set, user operations go through the DB instead of config file.
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// Set the durable session store (HA WS-1/1a, ADR-2002 §4). When set,
+    /// operator sessions are written-through to Postgres and validated
+    /// against it, with the in-memory `sessions_` map serving as a
+    /// generation-gated process-local cache; a session then survives a
+    /// core-replica restart/failover and validates on any replica. When
+    /// NULL (config-file-only deployments, and unit tests that do not wire
+    /// a pool) the legacy in-memory-only behavior is preserved unchanged —
+    /// the same optional-backing pattern as `set_auth_db`. Wired at startup
+    /// before any request is served.
+    void set_session_store(yuzu::server::SessionStore* s) { session_store_ = s; }
+
+    /// True iff a durable SessionStore is set AND reports open. Wired into
+    /// /readyz alongside `is_auth_db_ok()`: with sessions durable, a
+    /// half-open/failed session store is a readiness failure (the node cannot
+    /// mint or validate durable sessions). Returns true in the legacy
+    /// in-memory path (no store configured) so the signal only fires on an
+    /// actual store failure. Fail-closed like `is_auth_db_ok`.
+    bool is_session_store_ok() const noexcept;
 
     /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
     /// `validate_session` rejects a cookie session idle longer than `window` and
@@ -423,13 +785,13 @@ public:
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
     ///
     /// `mfa_verified_at` seeds the new session's MFA-proof timestamp. The
-    /// caller passes a non-default `steady_clock` value only when the IdP
+    /// caller passes a non-default `system_clock` value only when the IdP
     /// attested a multi-factor login via the `amr` claim (PR3 / SOC 2
     /// CC6.6). A default-constructed value leaves the session un-stepped-up,
     /// so the local step-up gate prompts for a TOTP code on the first
-    /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
-    /// so an NTP step cannot extend the step-up window — see
-    /// docs/auth-mfa-design.md hard invariant #5.
+    /// high-risk action. Wall-clock (`system_clock`) since HA WS-1/1a (durable
+    /// rows); the step-up window is short and fails CLOSED on a backward clock
+    /// step (see mfa_step_up.cpp) — docs/auth-mfa-design.md hard invariant #5.
     ///
     /// #1837 — the session's STABLE `username` (authorization principal) is
     /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
@@ -448,7 +810,7 @@ public:
                                     const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
-                                    std::chrono::steady_clock::time_point mfa_verified_at = {});
+                                    std::chrono::system_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
     /// Role: admin if `groups` contains `admin_group` (exact match), user
@@ -458,9 +820,31 @@ public:
     /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
     /// per the standing invariant: any new session-creation site MUST stamp it
     /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
-    std::string create_saml_session(const std::string& name_id,
+    ///
+    /// ADR-2001 PR4a — the session's STABLE `username` (authorization
+    /// principal) is `saml::saml_principal_id(entity_id, name_id)`
+    /// (`"saml:" + entity_id + "#" + name_id`, saml_principal.hpp), NOT the
+    /// raw NameID: mirrors #1837's OIDC split exactly (`oidc_principal_id
+    /// (iss, sub)`) — a NameID is only unique per-IdP, so a bare NameID is
+    /// unsafe as a durable cross-IdP join key, and the same collision-risk
+    /// argument OIDC's split closes applies here. `display_name` stays the
+    /// raw `name_id` (human-readable rendering only — dashboard, audit
+    /// detail). `entity_id` is the operator-configured, boot-validated IdP
+    /// entityID (`Config::saml_idp_entity_id`) — already verified by
+    /// `SamlProvider::validate_response` to equal the assertion's signed
+    /// `<saml:Issuer>` before this is called (see the ACS handler,
+    /// auth_routes.cpp).
+    /// `saml_display_name` / `saml_email` are the session-enrichment attribute
+    /// values parsed from the same XSW-verified assertion (empty when the
+    /// `--saml-name-attribute`/`--saml-email-attribute` flags are unset). They
+    /// only derive `Session::display_name` (name -> email -> raw NameID,
+    /// mirroring `create_oidc_session`); email is never stored durably, and
+    /// neither is ever an identity/authz/SCIM-linkage input.
+    std::string create_saml_session(const std::string& name_id, const std::string& entity_id,
                                     const std::vector<std::string>& groups = {},
-                                    const std::string& admin_group = {});
+                                    const std::string& admin_group = {},
+                                    const std::string& saml_display_name = {},
+                                    const std::string& saml_email = {});
 
     /// #1852 — auto-provision (or refresh) a durable `users` row for an
     /// OIDC-authenticated principal, so JIT admin elevation (which reads
@@ -477,11 +861,12 @@ public:
     /// caller's session is already minted and must not be un-minted
     /// because provisioning failed; the principal simply cannot elevate
     /// until a future successful login provisions it. SAML is NOT wired
-    /// to this method yet — SAML sessions are keyed on the raw NameID
-    /// (no reserved-prefix stable principal; see `create_saml_session`'s
-    /// "#1837 fast-follow" comment), which `is_valid_principal` would
-    /// reject, so a SAML session cannot elevate until that fast-follow
-    /// lands (docs/auth-architecture.md).
+    /// to this method yet — ADR-2001 PR4a gave SAML a reserved-prefix
+    /// stable principal (`saml_principal_id`, see `create_saml_session`),
+    /// but no `auth.db` `users` row is ever provisioned for it, so a SAML
+    /// session still cannot elevate (JIT elevation's identity-source guard,
+    /// auth_routes.cpp, fails closed on the absent row) — that remains a
+    /// separate follow-up (docs/auth-architecture.md).
     void provision_sso_identity(const std::string& principal, const std::string& iss,
                                 const std::string& sub, const std::string& display_name);
 
@@ -619,6 +1004,267 @@ public:
 private:
     static std::string generate_session_token();
 
+    /// Why a `users_` credential lookup produced no entry (#4020): "no such
+    /// active row" vs "AuthDB could not answer". Kept distinct so a DB outage
+    /// is never logged or counted as a bad username.
+    enum class UserLookupMiss { NotFound, DbError };
+
+    /// Look a user up for a credential check, hydrating `users_` from AuthDB on
+    /// a cache miss (#4020). `users_` is warmed only by load_config() and by THIS
+    /// process's own per-username writes, so a row created anywhere else (a
+    /// dashboard `POST /api/settings/users` before a restart, SCIM, another
+    /// replica) is invisible to a cache-only lookup - authenticate() and
+    /// verify_password() reported "unknown user" for a genuinely active account
+    /// until the next cfg-file boot. The AuthDB row is authoritative and the map
+    /// is a read-optimisation layered on top (the remove_user / update_role /
+    /// reactivate_user contract). PG I/O runs OUTSIDE `mu_`; the insert never
+    /// overwrites an entry an in-process write installed while that read was in
+    /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
+    /// Caller must NOT hold `mu_`.
+    [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
+    find_user_or_hydrate(const std::string& username);
+
+    /// A fresh, process-wide-unique stamp for `UserEntry::role_version` - see
+    /// that field's doc comment. Cheap (single atomic increment), callable
+    /// with or without `mu_` held (the counter is independent of it).
+    [[nodiscard]] std::uint64_t next_role_version_();
+
+    /// Shared by authenticate()/verify_password(): the post-password-check
+    /// re-read of AuthDB (already firing to catch a soft-deleted user) made
+    /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
+    /// follow-up). Went through several hardening rounds against increasingly
+    /// subtle same-process races (compare-by-role-value -> compare-by-version
+    /// -> return-value-follows-the-guard -> re-verify-on-divergence -> this
+    /// one) - see `git log -p` on this function for the blow-by-blow if the
+    /// history matters; this comment describes only the CURRENT mechanism.
+    ///
+    /// #4107: re-verifies via `AuthDB::recheck_role_locked`, which takes a
+    /// `SELECT ... FOR UPDATE` row lock and holds it across the callback
+    /// below (where the in-process cache write happens) before committing.
+    /// This SERIALIZES against any concurrent `update_role()` write to this
+    /// user's row, and against `reactivate_user()` too WHEN the row is
+    /// active at read time (authdb Gate 8: `reactivate_user`'s UPDATE has no
+    /// `is_active` filter, so it contends for the same lock; but if the row's
+    /// last-COMMITTED state is already inactive, its own `is_active = TRUE`
+    /// filter excludes it under READ COMMITTED's own snapshot rules,
+    /// regardless of whether a `reactivate_user()` happens to be
+    /// concurrently uncommitted at that instant - correct fail-closed
+    /// denial, not a missed serialization - see `recheck_role_locked`'s own
+    /// doc in `auth_db.hpp` for the full asymmetry). This is by construction, not by
+    /// detecting a race after the fact - closing the whole class of
+    /// same-process divergence residuals every EARLIER version of this
+    /// function's version-counter guard could only narrow, never eliminate
+    /// (a version counter can tell you something changed since you looked;
+    /// it cannot make your look happen atomically with the change). No more
+    /// case-2/case-3 split, no more `pre_check_version` comparison - a role
+    /// this call observes under the row lock is provably not stale relative
+    /// to any OTHER writer's commit, full stop. `pre_check_version` stays in
+    /// the signature (now used only by the cfg-file-mode early return above,
+    /// which doesn't touch it either) rather than reworking both call sites
+    /// in the same round as this rewrite - signature cleanup is a follow-up.
+    ///
+    /// What this does NOT close: the gap between THIS function returning and
+    /// the caller (`authenticate()`/`verify_password()`) actually minting a
+    /// session via `persist_new_session` - a separate, later step that is not
+    /// itself inside the row lock. A demote committing in that specific
+    /// window still mints a stale session, surviving that demote's own sweep
+    /// (`update_role`'s `std::erase_if(sessions_, ...)`, which already ran
+    /// before the new session existed). External adversarial review
+    /// (fjarvis, PR #4076, "C1") named this the "inherent check-then-mint gap
+    /// no non-serialized recheck can close" - true of every version of this
+    /// function including this one; only serializing all the way through
+    /// session creation would close it, which is a materially bigger change
+    /// (would need `persist_new_session`, and its own DB write in HA mode, to
+    /// run inside the same transaction/lock). This is NOT a same-process-only
+    /// gap: Postgres row locks serialize at the DATABASE-ENGINE level, not
+    /// per-process or per-connection, so a racing writer from a DIFFERENT
+    /// replica sharing the same Postgres primary is serialized against this
+    /// function's own row-locked read exactly like a same-process writer
+    /// (security-guardian Gate 8 re-review verified this empirically against
+    /// a live instance, in both directions - a corrected earlier draft of
+    /// this doc wrongly described a separate "cross-replica" residual here;
+    /// there isn't one - the check-then-mint window is the one remaining gap,
+    /// same mechanism regardless of which process the racing writer runs in).
+    /// This is the CURRENT scope of issue #4107 (re-scoped from its original
+    /// case-2/case-3 framing, which this commit closes) - `validate_session`
+    /// still performs no per-request AuthDB re-verification, so a session
+    /// minted via this gap still carries a stale role for its full lifetime,
+    /// not one request.
+    ///
+    /// Returns the current role on success (cfg-file mode, no `auth_db_`,
+    /// trivially returns `pre_check_role` unchanged - there's no DB to
+    /// re-check against). Returns nullopt if AuthDB reports the user no
+    /// longer active (soft-deleted/removed) - in which case the stale cache
+    /// entry is ALSO evicted, mirroring remove_user()'s own eviction: a
+    /// removal made through a DIFFERENT AuthManager never touches this
+    /// process's map, so without this a removed principal stays "active,
+    /// role R" forever in any consumer of that stale `users_` entry -
+    /// reachable via a still-valid API token, since remove_user() only wipes
+    /// sessions, never tokens. (get_user_role() itself is no longer such a
+    /// consumer - a later fix made it AuthDB-authoritative on every call,
+    /// independent of this eviction entirely.)
+    ///
+    /// CALLER-SIDE NOTE: every `nullopt` this function returns (store error,
+    /// or a genuine `UserNotFound`) is indistinguishable from a genuine bad
+    /// password to `verify_password`'s REST caller (`auth_routes.cpp`), which
+    /// counts ANY `nullopt` toward the account lockout threshold
+    /// (`AuthDB::record_failed_login`). Pre-existing (present since the
+    /// original C1 fix), not this round's concern; no new capability for an
+    /// attacker (only affects legitimate concurrent operations on the SAME
+    /// already-authenticating principal), so LOW availability impact,
+    /// disclose-don't-fix is proportionate. Distinguishing "denied by a
+    /// detected race, retry" from "wrong password" would need a richer
+    /// return type than `std::optional<Role>` threaded through both callers.
+    ///
+    /// `context` is the log-message prefix ("Auth failed" / "verify_password
+    /// failed") so both callers keep their existing distinct wording. Caller
+    /// must NOT hold `mu_`.
+    [[nodiscard]] std::optional<Role>
+    recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                        std::uint64_t pre_check_version,
+                                        std::string_view context);
+
+    /// Closes the #4107 check-then-mint gap: `recheck_role_after_credential_
+    /// check`'s row-locked read (or, for `create_local_session`'s callers, an
+    /// even earlier `verify_password()` call) can be stale by the time a
+    /// session actually finishes minting - `persist_new_session` is a
+    /// separate, later step, not itself inside any row lock. Call this
+    /// immediately after a successful `persist_new_session`, passing the
+    /// role the just-minted session was stamped with; on divergence (or a
+    /// store error) it revokes that session via `invalidate_user_sessions`
+    /// and returns `false` - the caller must then treat the mint as denied
+    /// (return `nullopt`/`{}` per its own contract), never hand out a token
+    /// past this point.
+    ///
+    /// This is the SAME pattern (mint, then post-mint re-check, then revoke-
+    /// and-deny on divergence) `docs/auth-architecture.md` already documents
+    /// for the structurally identical OIDC/SAML deprovision-race - chosen
+    /// over serializing the mint inside AuthDB's row lock, which that doc's
+    /// §3 explicitly rejects for this race class ("never hold one store's
+    /// pool lease while calling another" - `SessionStore`'s shared write-
+    /// generation row is exactly the cross-store lock that discipline
+    /// exists to avoid). See this method's own `.cpp` doc for the ordering
+    /// proof that this closes the race rather than merely narrowing it.
+    ///
+    /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
+    /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              std::string_view context);
+
+    /// Backing field for `set_role_recheck_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`.
+    std::function<void()> role_recheck_race_hook_for_test_;
+
+    /// Backing field for `set_role_recheck_inside_lock_hook_for_test` - see
+    /// that method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback, i.e. while the row lock is held. Same shape/lifetime/
+    /// production-reachability as `role_recheck_race_hook_for_test_` above -
+    /// see that field's Resource Ledger entry, which covers this one too.
+    std::function<void()> role_recheck_inside_lock_hook_for_test_;
+
+    /// Backing field for `set_post_mint_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside `authenticate()` only
+    /// (NOT `create_local_session()` - see the setter's doc), after the row
+    /// lock releases but before `persist_new_session`. Same shape/lifetime/
+    /// production-reachability
+    /// as `role_recheck_race_hook_for_test_` above - see that field's
+    /// Resource Ledger entry, which covers this one too.
+    std::function<void()> post_mint_race_hook_for_test_;
+
+    /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
+    /// doc for why this is process-wide, not per-username. `std::atomic` since
+    /// it's drawn from both under `mu_` (most call sites) and without it
+    /// (`find_user_or_hydrate`/`reactivate_user` stamp a LOCAL copy before ever
+    /// taking `mu_`) - safe either way, since uniqueness comes from `fetch_add`'s
+    /// atomicity alone (no two RMWs on one atomic ever observe the same prior
+    /// value, independent of memory order) and cross-thread visibility of the
+    /// stamped value, once published into `users_`, comes from `mu_` itself, not
+    /// from this counter's ordering. Starts at 1, not 0: `load_config()`
+    /// (cfg-file bulk load, boot-only, always before `set_auth_db()` - see that
+    /// call's doc) seeds entries at the struct default `role_version{0}`
+    /// without drawing a stamp at all, and 0 must stay a value this counter can
+    /// never (re)issue - historically (pre-#4107) so such an entry's version
+    /// could never coincidentally match a stale in-flight caller's
+    /// `pre_check_version` in the now-retired recheck compare-guard; kept
+    /// unconditionally true today even though nothing compares this value
+    /// anymore (see `UserEntry::role_version`'s doc).
+    std::atomic<std::uint64_t> role_version_epoch_{1};
+
+    // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
+    // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.
+
+    /// SHA-256 (hex) of a raw session token — the SessionStore row key. Secrets
+    /// at rest: the store never sees the raw bearer token (session_store.hpp).
+    static std::string hash_token(const std::string& raw_token);
+
+    /// Count a degraded durable-session operation on the auth hot path
+    /// (yuzu_auth_session_store_degrade_total{op}) so a PG blip/failover is
+    /// observable without log-grepping (mirrors the rbac/login degrade
+    /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
+    void note_session_store_degrade(const char* op) const;
+
+    /// Reconstruct a cache `Session` from a durable `SessionRow` PLUS the DB
+    /// clock at read time (`db_now_ms`, from `SessionStore::find`). Sets the
+    /// authored wall-clock absolutes AND the local monotonic steady deadlines
+    /// (via `derive_session_deadlines`) so is_elevated/idle/MFA read a
+    /// fully-formed, DB-clock-adjudicated session (ADR-2002 §4).
+    static Session session_from_row(const yuzu::server::SessionRow& row, std::int64_t db_now_ms);
+
+    /// Write-through a newly-created session from DB-clock-authored params: when
+    /// a durable store is configured, `create()` FIRST (outside `mu_`, authoring
+    /// timestamps from Postgres `now()`) and FAIL CLOSED on a store error — a
+    /// login whose session cannot be made durable is not honored (ADR-0007). The
+    /// cached `Session` is built from the RETURNED authored times so it matches
+    /// the durable row exactly. In the legacy no-store path the timestamps are
+    /// authored from this host's wall clock. Returns false on durable-write
+    /// failure; always true legacy. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool persist_new_session(const std::string& raw_token,
+                                           const yuzu::server::SessionWriteParams& params);
+
+    /// Durably delete every session for a username (bumps the generation so all
+    /// replicas drop the cached copies). Called from the role-change / demote /
+    /// delete paths ALONGSIDE the local-cache wipe, so a stale-role session
+    /// cannot survive on another replica or across a restart.
+    ///
+    /// Returns true when there is nothing durable to fail (no store configured)
+    /// OR the durable delete succeeded; FALSE on a durable-delete error. A false
+    /// return MUST fail the enclosing role-change/remove operation closed: in
+    /// store mode the local `sessions_` erase is only cache eviction — a
+    /// cache-missed token is re-served from the authoritative row — so if the
+    /// durable delete did not land, the stale-(higher-)role session survives and
+    /// the generation was NOT bumped (other replicas keep serving it). Reporting
+    /// success there would grant a demoted/removed operator their old privilege
+    /// past the change (governance authdb-BLOCKING). `invalidate_user` is
+    /// idempotent, so an operator retry after a false return is safe. No-op
+    /// (true) without a store. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// Poll the durable write-generation on an interval; when it has advanced
+    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
+    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// re-reads authoritative state. Interval-gated + single-flight (mirrors
+    /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
+    /// existing cache (the absolute `expires_at` on every session is the
+    /// backstop). No-op without a store. Caller must NOT hold `mu_`.
+    ///
+    /// Coherence does NOT depend on anchoring a locally-committed write: a
+    /// mutation bumps the durable generation, so within one refresh interval
+    /// this same poll observes the advance and clears the cache, re-reading
+    /// authoritative state — write-through to the local cache only covers the
+    /// sub-interval window until then.
+    void maybe_refresh_session_generation() const;
+
+    /// True when the validate-cache's generation view is too stale to trust — the
+    /// generation was never confirmed, OR the last SUCCESSFUL refresh is older
+    /// than kSessionGenStaleServeBoundMs (a sustained refresh outage). A cache
+    /// hit is served only when this is false; past the bound, validate falls to
+    /// the authoritative store and fails closed if it too is degraded (the
+    /// rbac_store bounded-stale-serve pattern, ADR-2002 §4). No-op-false without
+    /// a store. Takes `session_gen_mtx_`; caller must NOT hold it.
+    [[nodiscard]] bool session_generation_view_stale() const;
+
     /// Persist enrollment tokens to disk.
     bool save_tokens() const;
     /// Load enrollment tokens from disk.
@@ -638,10 +1284,33 @@ private:
     std::filesystem::path cfg_path_;
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
+    // Keyed by the token HASH when a durable store is configured (it is the
+    // store row key too), by the raw token in the legacy in-memory-only mode.
+    // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    // Non-owning pointer to the durable SessionStore (HA WS-1/1a). Null =
+    // legacy in-memory-only sessions. Set once at startup before serving.
+    yuzu::server::SessionStore* session_store_ = nullptr;
+
+    // Validate-cache generation state (guarded by `session_gen_mtx_`, a
+    // dedicated mutex so a generation poll never contends on the session-map
+    // `mu_`). `cached_session_gen_` is the durable write-generation this
+    // replica's `sessions_` cache is coherent with; `session_gen_valid_` is
+    // false until the first successful anchor. `last_session_gen_refresh_ms_`
+    // interval-gates the poll (single-flight claim, like RbacStore).
+    mutable std::mutex session_gen_mtx_;
+    mutable std::uint64_t cached_session_gen_ = 0;
+    mutable bool session_gen_valid_ = false;
+    mutable std::int64_t last_session_gen_refresh_ms_ = 0;
+    // steady-ms of the last SUCCESSFUL generation read (bounded stale-serve, the
+    // rbac_store pattern). 0 = never succeeded. Read by
+    // session_generation_view_stale() to decide when a cache hit is too stale to
+    // trust during a refresh outage.
+    mutable std::int64_t last_successful_session_gen_refresh_ms_ = 0;
 
     /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
     /// Read on the validate_session hot path; set once at startup before any

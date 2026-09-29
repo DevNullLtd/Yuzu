@@ -9,8 +9,21 @@ import { ENTRIES } from './nav.mjs';
 const manual = defineCollection({
   loader: glob({
     base: '../docs',
-    pattern: ENTRIES.map((e) => `${e.file}.md`),
+    pattern: ENTRIES.filter((e) => !e.file.startsWith('agents/')).map((e) => `${e.file}.md`),
   }),
 });
 
-export const collections = { manual };
+// Plugin READMEs live beside their code (docs/plugin-readme-standard.md rule 1)
+// and are read from there for the same drift-impossible reason. Which plugins
+// appear is decided by the generated fragment src/nav.plugins.mjs — every
+// plugin that has adopted the standard — so this glob is manifest-driven too.
+const plugins = defineCollection({
+  loader: glob({
+    base: '../agents/plugins',
+    pattern: ENTRIES.filter((e) => e.file.startsWith('agents/plugins/')).map(
+      (e) => `${e.file.replace(/^agents\/plugins\//, '')}.md`,
+    ),
+  }),
+});
+
+export const collections = { manual, plugins };

@@ -1,5 +1,9 @@
 #include <yuzu/agent/plugin_loader.hpp>
 
+#include <yuzu/agent/detached_signature.hpp>
+
+#include <yuzu/agent/file_hash.hpp> // sha256_from_fd / sha256_from_handle (#807, extracted)
+
 #include <spdlog/spdlog.h>
 
 #include <cerrno>
@@ -32,14 +36,9 @@
 #endif
 #endif
 
-#include <openssl/bio.h>
 // pem.h must come before cms.h so the PEM_*_CMS macros are declared
 // (cms.h gates them on OPENSSL_PEM_H).
-#include <openssl/pem.h>
-#include <openssl/cms.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 
 namespace yuzu::agent {
@@ -133,145 +132,6 @@ std::string sha256_file(const std::filesystem::path& path, std::size_t max_bytes
     return hex;
 }
 
-// ── Handle/fd-scoped SHA-256 (W2.2 / #807) ───────────────────────────────────
-//
-// `sha256_file` opens the path freshly, which is the bug behind #807: between
-// the hash and a later `dlopen`/`LoadLibrary` (which opens the path AGAIN) an
-// attacker who can write to the plugin directory can swap the file content.
-// These helpers hash from an already-open fd/HANDLE so the discovery loop can
-// pin the inode once with O_NOFOLLOW (POSIX) or FILE_SHARE_READ+
-// FILE_FLAG_OPEN_REPARSE_POINT (Windows), hash, and then load via the same
-// fd-bridge (Linux) or rely on the share-mode pin preventing path-swap
-// (Windows). macOS keeps a documented narrower race.
-//
-// Errno / GetLastError is preserved across spdlog::error so callers retain
-// the OS reason.
-namespace {
-#ifdef _WIN32
-std::string sha256_from_handle(HANDLE h) {
-    if (h == INVALID_HANDLE_VALUE)
-        return {};
-    LARGE_INTEGER zero{};
-    if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
-        spdlog::error("sha256_from_handle: SetFilePointerEx failed: {}", GetLastError());
-        return {};
-    }
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        spdlog::error("sha256_from_handle: BCryptOpenAlgorithmProvider failed: 0x{:08x}",
-                      static_cast<unsigned>(status));
-        return {};
-    }
-
-    DWORD obj_size = 0, data_len = 0;
-    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size),
-                               sizeof(DWORD), &data_len, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        spdlog::error("sha256_from_handle: BCryptGetProperty failed: 0x{:08x}",
-                      static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return {};
-    }
-    std::vector<unsigned char> hash_obj(obj_size);
-    status = BCryptCreateHash(alg, &hash, hash_obj.data(), static_cast<ULONG>(hash_obj.size()),
-                              nullptr, 0, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        spdlog::error("sha256_from_handle: BCryptCreateHash failed: 0x{:08x}",
-                      static_cast<unsigned>(status));
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return {};
-    }
-
-    constexpr DWORD kBufSize = 64 * 1024;
-    std::vector<unsigned char> buf(kBufSize);
-    for (;;) {
-        DWORD bytes_read = 0;
-        if (!ReadFile(h, buf.data(), kBufSize, &bytes_read, nullptr)) {
-            spdlog::error("sha256_from_handle: ReadFile failed: {}", GetLastError());
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(alg, 0);
-            return {};
-        }
-        if (bytes_read == 0)
-            break;
-        status = BCryptHashData(hash, buf.data(), bytes_read, 0);
-        if (!BCRYPT_SUCCESS(status)) {
-            spdlog::error("sha256_from_handle: BCryptHashData failed: 0x{:08x}",
-                          static_cast<unsigned>(status));
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(alg, 0);
-            return {};
-        }
-    }
-
-    unsigned char digest[32]{};
-    status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        spdlog::error("sha256_from_handle: BCryptFinishHash failed: 0x{:08x}",
-                      static_cast<unsigned>(status));
-        return {};
-    }
-
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string hex;
-    hex.reserve(64);
-    for (unsigned char b : digest) {
-        hex.push_back(kHex[b >> 4]);
-        hex.push_back(kHex[b & 0x0F]);
-    }
-    return hex;
-}
-#else
-std::string sha256_from_fd(int fd) {
-    if (fd < 0)
-        return {};
-    if (::lseek(fd, 0, SEEK_SET) == static_cast<off_t>(-1)) {
-        spdlog::error("sha256_from_fd: lseek failed: {}", std::strerror(errno));
-        return {};
-    }
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
-        if (ctx)
-            EVP_MD_CTX_free(ctx);
-        return {};
-    }
-    constexpr size_t kBufSize = 64 * 1024;
-    char buf[kBufSize];
-    for (;;) {
-        ssize_t n = ::read(fd, buf, kBufSize);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            spdlog::error("sha256_from_fd: read failed: {}", std::strerror(errno));
-            EVP_MD_CTX_free(ctx);
-            return {};
-        }
-        if (n == 0)
-            break;
-        EVP_DigestUpdate(ctx, buf, static_cast<size_t>(n));
-    }
-    unsigned char digest[32]{};
-    unsigned int out_len = 0;
-    bool ok = EVP_DigestFinal_ex(ctx, digest, &out_len) == 1 && out_len == 32;
-    EVP_MD_CTX_free(ctx);
-    if (!ok)
-        return {};
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string hex;
-    hex.reserve(64);
-    for (unsigned char b : digest) {
-        hex.push_back(kHex[b >> 4]);
-        hex.push_back(kHex[b & 0x0F]);
-    }
-    return hex;
-}
-#endif // _WIN32
-} // namespace
-
 // ── Plugin code-signing verification ─────────────────────────────────────────
 //
 // Wire format:
@@ -298,81 +158,6 @@ std::string sha256_from_fd(int fd) {
 // (digest mismatch); stolen-sig-on-renamed-original → allowlist filename
 // mismatch.
 
-namespace {
-
-struct OpenSslDeleter {
-    void operator()(BIO* p) const noexcept { BIO_free_all(p); }
-    void operator()(CMS_ContentInfo* p) const noexcept { CMS_ContentInfo_free(p); }
-    void operator()(X509_STORE* p) const noexcept { X509_STORE_free(p); }
-    void operator()(X509* p) const noexcept { X509_free(p); }
-};
-
-template <typename T> using openssl_ptr = std::unique_ptr<T, OpenSslDeleter>;
-
-// Drain the OpenSSL error queue into (text, classification). The
-// classification flag is true if any drained error came from the
-// X.509 chain validation path (CMS or X509 lib reporting cert-verify
-// failure) — so the caller can pick between
-// kSignatureUntrustedReason and kSignatureInvalidReason without
-// re-parsing free-form text.
-struct DrainedErrors {
-    std::string text;
-    bool chain_failure{false};
-};
-
-DrainedErrors drain_openssl_errors() {
-    DrainedErrors out;
-    char buf[256];
-    unsigned long e;
-    while ((e = ERR_get_error()) != 0) {
-        const int lib = ERR_GET_LIB(e);
-        const int reason = ERR_GET_REASON(e);
-        // ERR_LIB_CMS / CMS_R_CERTIFICATE_VERIFY_ERROR == 100
-        // ERR_LIB_X509 covers all chain-validation surfaces.
-        if (lib == ERR_LIB_X509 ||
-            (lib == ERR_LIB_CMS && reason == CMS_R_CERTIFICATE_VERIFY_ERROR)) {
-            out.chain_failure = true;
-        }
-        ERR_error_string_n(e, buf, sizeof(buf));
-        if (!out.text.empty())
-            out.text += "; ";
-        out.text += buf;
-    }
-    return out;
-}
-
-openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_path) {
-    openssl_ptr<X509_STORE> store{X509_STORE_new()};
-    if (!store)
-        return nullptr;
-
-    // X509_STORE_load_locations interprets a *file* parameter as one or
-    // more concatenated PEM certs — exactly the format we promise the
-    // operator. The third arg (path) lets OpenSSL also accept a hashed
-    // dir; we only support a single bundle file today, so pass nullptr.
-    if (X509_STORE_load_locations(store.get(), bundle_path.string().c_str(), nullptr) != 1) {
-        spdlog::error("Failed to load plugin trust bundle '{}': {}", bundle_path.string(),
-                      drain_openssl_errors().text);
-        return nullptr;
-    }
-    // Plugin signing certs MUST carry EKU=codeSigning (RFC 5280 §4.2.1.12).
-    // Setting the X509_STORE purpose forces OpenSSL to enforce the EKU
-    // during chain validation. A leaf without codeSigning EKU — e.g. an
-    // mTLS server cert, S/MIME cert, or TLS client cert minted by the
-    // *same* CA the operator trusts — is rejected. Without this, a
-    // single CA whose downstream issues a non-code-signing cert (very
-    // common in internal PKIs that issue mTLS + S/MIME from one root)
-    // becomes a plugin-signing authority too. Fixed in governance
-    // hardening round 1 (sec-LOW-2 / UP-8).
-    if (X509_STORE_set_purpose(store.get(), X509_PURPOSE_CODE_SIGN) != 1) {
-        spdlog::error("Failed to set X509 purpose to codeSigning: {}", drain_openssl_errors().text);
-        return nullptr;
-    }
-    return store;
-}
-
-} // namespace
-
 std::optional<std::string> verify_plugin_signature(const std::filesystem::path& plugin_path,
                                                    const std::filesystem::path& trust_bundle_path) {
     auto sig_path = plugin_path;
@@ -383,60 +168,36 @@ std::optional<std::string> verify_plugin_signature(const std::filesystem::path& 
         return std::string{kSignatureMissingReason};
     }
 
-    auto store = load_trust_store(trust_bundle_path);
-    if (!store) {
-        // Bundle path unreadable → we cannot prove anything, refuse to
-        // trust. Operator misconfiguration must surface, not silently
-        // pass plugins through.
-        return std::string{kSignatureUntrustedReason} + ": trust bundle unreadable";
+    // Read the detached signature into memory and hand it to the shared
+    // verifier. The verifier takes a buffer rather than a path because the OTA
+    // update path (#416/#3807) receives its signature over the wire; the CMS
+    // policy, the codeSigning-EKU purpose and the flag ban all live there now,
+    // so the two callers cannot drift apart.
+    // BOUNDED. The lift replaced a streaming BIO_new_file with a whole-file read,
+    // which dropped the implicit bound the stream gave us: a plugin directory is
+    // root-owned, but a .sig symlinked at /dev/zero would otherwise be read until
+    // memory ran out. A detached CMS signature is a few KB; the server side caps
+    // the equivalent OTA sidecar at the same order.
+    std::error_code sig_sz_ec;
+    const auto sig_size = std::filesystem::file_size(sig_path, sig_sz_ec);
+    if (sig_sz_ec || sig_size > kMaxSignatureBytes) {
+        return std::string{kSignatureInvalidReason} + ": signature file unusable or too large";
     }
-
-    openssl_ptr<BIO> sig_bio{BIO_new_file(sig_path.string().c_str(), "rb")};
-    if (!sig_bio) {
-        const auto err = drain_openssl_errors();
-        return std::string{kSignatureInvalidReason} + ": cannot open signature file: " + err.text;
+    std::ifstream sig_in(sig_path, std::ios::binary);
+    if (!sig_in) {
+        return std::string{kSignatureInvalidReason} + ": cannot open signature file";
     }
+    const std::string sig_pem((std::istreambuf_iterator<char>(sig_in)),
+                              std::istreambuf_iterator<char>());
 
-    openssl_ptr<CMS_ContentInfo> cms{PEM_read_bio_CMS(sig_bio.get(), nullptr, nullptr, nullptr)};
-    if (!cms) {
-        const auto err = drain_openssl_errors();
-        return std::string{kSignatureInvalidReason} + ": malformed PEM CMS: " + err.text;
-    }
+    auto err = verify_detached_cms(plugin_path, sig_pem, trust_bundle_path);
+    if (!err)
+        return std::nullopt; // verified
 
-    openssl_ptr<BIO> content_bio{BIO_new_file(plugin_path.string().c_str(), "rb")};
-    if (!content_bio) {
-        const auto err = drain_openssl_errors();
-        return std::string{kSignatureInvalidReason} + ": cannot open plugin file: " + err.text;
-    }
-
-    // Single CMS_verify does both checks atomically:
-    //   * chain-validates each signer cert against the trust store
-    //     (purpose was set to CODE_SIGN in load_trust_store so any leaf
-    //     without EKU=codeSigning is rejected — even if the leaf chains
-    //     to a CA the operator trusts).
-    //   * verifies the signature digest over the detached payload.
-    //   * CMS_BINARY suppresses CRLF canonicalisation we do not want on
-    //     a binary payload.
-    //   * MUST NOT pass CMS_NO_SIGNER_CERT_VERIFY or CMS_NO_CONTENT_VERIFY
-    //     — those flags individually disable the chain check or the
-    //     digest check and would silently weaken the verifier. Pinning
-    //     the policy here as a load-bearing invariant for future edits
-    //     (governance hardening round 1, sec-INFO-8).
-    if (CMS_verify(cms.get(), nullptr, store.get(), content_bio.get(), nullptr,
-                   CMS_BINARY | CMS_DETACHED) != 1) {
-        const auto err = drain_openssl_errors();
-        const std::string_view prefix =
-            err.chain_failure ? kSignatureUntrustedReason : kSignatureInvalidReason;
-        return std::string{prefix} + ": " + err.text;
-    }
-
-    // Drain any benign residual error-queue entries from the success
-    // path so a httplib worker thread that handles a /tls call after
-    // this one does not see stale OpenSSL errors. PEM_read_bio_X509 +
-    // friends push end-of-stream sentinels onto the thread-local queue
-    // even on success (cpp-S5 / sec-LOW-6).
-    ERR_clear_error();
-    return std::nullopt; // verified
+    const std::string_view prefix = err->kind == CmsFailure::kUntrusted
+                                        ? kSignatureUntrustedReason
+                                        : kSignatureInvalidReason;
+    return std::string{prefix} + ": " + err->detail;
 }
 
 std::unordered_map<std::string, std::string>
@@ -479,6 +240,22 @@ load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
 }
 
 // ── PluginHandle ──────────────────────────────────────────────────────────────
+
+// #2204 / plugin B2 — single source of truth for the ABI-gate on
+// action_descriptor_count: action_descriptors/action_descriptor_count exist
+// ONLY at ABI v4+ (sdk/include/yuzu/plugin.h). An ABI<4 plugin's actual
+// in-memory descriptor (tests/fixtures/abi3/plugin_abi3.h is the frozen,
+// real-world proof) ends at sdk_version — reading action_descriptor_count
+// off it is not merely wrong data, it is a read past the end of the real
+// allocation. Kept as the one place that computes this value (PluginHandle::
+// load()'s diagnostic log line below calls it) so nothing can silently read
+// the raw field instead. No public header — tests/unit/
+// test_capability_descriptor.cpp forward-declares it directly, the same
+// convention agents/core/src/agent.cpp uses for
+// derive_effective_result_status()/dispatch_with_capture().
+YUZU_EXPORT std::size_t gated_action_descriptor_count(const YuzuPluginDescriptor* desc) {
+    return (desc->abi_version >= 4) ? desc->action_descriptor_count : 0;
+}
 
 PluginHandle::PluginHandle(PluginHandle&& o) noexcept
     : handle_{o.handle_}, descriptor_{o.descriptor_}, path_{std::move(o.path_)} {
@@ -547,8 +324,13 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
     // ABI v3+ includes sdk_version for diagnostics
     const char* sdk_ver =
         (desc->abi_version >= 3 && desc->sdk_version) ? desc->sdk_version : "unknown";
-    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={})", desc->name, desc->version,
-                 desc->abi_version, sdk_ver);
+    // ABI v4+ includes per-action capability declarations (#2204); ABI<4
+    // plugins (or an ABI4 plugin that simply never populated the array)
+    // report 0 here, which the capability-matrix generator reads as
+    // "undeclared" for every action rather than an error.
+    const std::size_t action_descriptor_count = gated_action_descriptor_count(desc);
+    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={}, capability declarations={})", desc->name,
+                 desc->version, desc->abi_version, sdk_ver, action_descriptor_count);
 
     PluginHandle ph;
     ph.handle_ = handle;

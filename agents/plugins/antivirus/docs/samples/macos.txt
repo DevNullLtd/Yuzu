@@ -1,0 +1,17 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a4abf06e398d
+== action=products
+av|XProtect|active
+xprotect_version|5358
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=status
+definition_version|5358
+last_update|2026-08-28T08:11:38
+remediator_version|157
+mrt_version|1.93
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=av_exclusions
+unsupported|av_exclusions is Windows-only
+[result_status] UNDECLARED / UNKNOWN / 
+

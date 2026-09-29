@@ -32,6 +32,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <cstdint>
+#include <cstdlib>
+#include <mach-o/dyld.h>
+#include <sys/syslimits.h>
 #endif
 
 namespace {
@@ -191,6 +196,37 @@ void scan_directory(yuzu::CommandContext& ctx, const fs::path& dir) {
     }
 }
 
+// ABI4 capability declarations (#2204). Both actions are native, in-process
+// filesystem/config reads on every OS — no subprocess anywhere in this
+// plugin. "get_key_files"'s own-executable-path lookup differs per OS
+// (/proc/self/exe symlink on Linux, _NSGetExecutablePath+realpath on macOS
+// — the macOS path further below at ~331-363 — GetModuleFileNameA on
+// Windows) but each is a native, in-process OS API call, so all three legs
+// are rung 1.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "get_log",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+    },
+    {
+        /* .action      = */ "get_key_files",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/proc/self/exe symlink + std::filesystem metadata", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "_NSGetExecutablePath + realpath(3) + std::filesystem metadata", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "GetModuleFileNameA + std::filesystem metadata", nullptr},
+    },
+};
+
 } // namespace
 
 class AgentLoggingPlugin final : public yuzu::Plugin {
@@ -204,6 +240,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"get_log", "get_key_files", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
@@ -285,14 +329,36 @@ private:
             }
         }
 #elif defined(__APPLE__)
-        // On macOS, use _NSGetExecutablePath or /proc alternative
-        // Just report the standard install path
+        // _NSGetExecutablePath uses a two-call idiom: the first call passes
+        // a zero-length buffer, which always fails and writes the required
+        // buffer size (including the terminating NUL) into `size`; allocate
+        // exactly that much and call again to actually fill it in. Then
+        // resolve symlinks/./.. via realpath so the reported path matches
+        // the real on-disk binary, not just wherever it was launched from.
         {
-            fs::path p = "/usr/local/bin/yuzu-agent";
-            std::error_code ec;
-            if (fs::exists(p, ec)) {
-                emit_file_info(ctx, p);
+            uint32_t size = 0;
+            _NSGetExecutablePath(nullptr, &size);
+
+            std::string raw_path(size, '\0');
+            if (size > 0 && _NSGetExecutablePath(raw_path.data(), &size) == 0) {
+                // raw_path includes the NUL terminator written by the call;
+                // drop it so it doesn't end up embedded in the std::string.
+                if (!raw_path.empty() && raw_path.back() == '\0') {
+                    raw_path.pop_back();
+                }
+
+                char resolved[PATH_MAX];
+                if (realpath(raw_path.c_str(), resolved) != nullptr) {
+                    emit_file_info(ctx, fs::path{resolved});
+                } else if (!raw_path.empty()) {
+                    // realpath failed (e.g. dangling component) — fall back
+                    // to the unresolved-but-real path rather than fabricate
+                    // one.
+                    emit_file_info(ctx, fs::path{raw_path});
+                }
             }
+            // If _NSGetExecutablePath itself fails, honestly report nothing
+            // rather than guess at an install location.
         }
 #endif
 

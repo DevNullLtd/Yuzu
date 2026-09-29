@@ -44,8 +44,8 @@ bool table_exists(PGconn* conn, const std::string& schema, const std::string& ta
 
 } // namespace
 
-TEST_CASE("PgMigrationRunner versioning", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+TEST_CASE("PgMigrationRunner versioning", "[pg][migration][pg-smoke]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     const std::vector<PgMigration> v1 = {
@@ -86,7 +86,7 @@ TEST_CASE("PgMigrationRunner versioning", "[pg][migration]") {
 }
 
 TEST_CASE("PgMigrationRunner schema namespacing", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     // Two stores create the SAME unqualified table name; each must land in
@@ -115,7 +115,7 @@ TEST_CASE("PgMigrationRunner schema namespacing", "[pg][migration]") {
 }
 
 TEST_CASE("PgMigrationRunner failure handling", "[pg][migration]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgConn conn = connect(db.dsn());
 
     SECTION("failing step stops the run; earlier steps stay applied") {
@@ -173,5 +173,70 @@ TEST_CASE("PgMigrationRunner failure handling", "[pg][migration]") {
         // PR 3 feeds run() from Lease::get(), which is nullptr on an empty
         // lease — success here would boot a store against nothing.
         CHECK_FALSE(PgMigrationRunner::run(nullptr, "store_a", {}));
+    }
+}
+
+// #3013 (found in review, #2961/#2964): before this guard, a duplicate or
+// out-of-order version in a store's own migrations() vector was silently
+// swallowed by the apply loop's `m.version <= current` skip — `run()` still
+// returned true, and the store opened against a schema missing whatever the
+// swallowed migration was meant to add. Disabling this guard left the
+// entire server suite green (4879 cases, 94587 assertions) before these
+// cases existed.
+TEST_CASE("PgMigrationRunner #3013 duplicate/non-monotonic version guard", "[pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+
+    SECTION("a duplicate version anywhere in the vector refuses the whole run") {
+        const std::vector<PgMigration> dup = {
+            {1, "CREATE TABLE items (id INT PRIMARY KEY)"},
+            {2, "ALTER TABLE items ADD COLUMN name TEXT"},
+            {2, "ALTER TABLE items ADD COLUMN other TEXT"}, // duplicate of the step above
+        };
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_a", dup));
+        // Nothing applied — not even migration 1, which is individually
+        // valid: the guard runs BEFORE ensure_meta_and_schema/the apply
+        // loop, so a duplicate anywhere in the vector fails the whole call
+        // closed rather than applying a valid prefix.
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 0);
+        CHECK_FALSE(table_exists(conn.get(), "store_a", "items"));
+    }
+
+    SECTION("a descending pair refuses the whole run") {
+        const std::vector<PgMigration> descending = {
+            {1, "CREATE TABLE items (id INT PRIMARY KEY)"},
+            {3, "ALTER TABLE items ADD COLUMN name TEXT"},
+            {2, "ALTER TABLE items ADD COLUMN out_of_order TEXT"}, // < the prior entry
+        };
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_a", descending));
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 0);
+        CHECK_FALSE(table_exists(conn.get(), "store_a", "items"));
+    }
+
+    SECTION("a strictly-increasing positive vector is unaffected (positive control)") {
+        const std::vector<PgMigration> ok = {
+            {1, "CREATE TABLE items (id INT PRIMARY KEY)"},
+            {2, "ALTER TABLE items ADD COLUMN name TEXT"},
+            {3, "CREATE INDEX items_name_idx ON items (name)"},
+        };
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_a", ok));
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 3);
+        CHECK(table_exists(conn.get(), "store_a", "items"));
+    }
+
+    SECTION("a non-positive first version refuses the whole run") {
+        // read_version returns 0 for an untracked store, so a vector
+        // beginning at version 0 passes the pairwise ordering check (it IS
+        // strictly increasing against version 1) but is indistinguishable
+        // from "already applied" to the apply loop's `m.version <= current`
+        // skip, and version 0 would be skipped forever — #3013's shape at
+        // index 0 rather than a duplicate/descending pair.
+        const std::vector<PgMigration> zero_start = {
+            {0, "CREATE TABLE items (id INT PRIMARY KEY)"},
+            {1, "ALTER TABLE items ADD COLUMN name TEXT"},
+        };
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_a", zero_start));
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_a") == 0);
+        CHECK_FALSE(table_exists(conn.get(), "store_a", "items"));
     }
 }

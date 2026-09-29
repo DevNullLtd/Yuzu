@@ -1,0 +1,14 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash fdf67a9b8831
+== action=device_name
+device_name|d7023653759f
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=domain
+domain|N/A
+joined|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ou
+ou|N/A
+[result_status] UNDECLARED / UNKNOWN / 
+

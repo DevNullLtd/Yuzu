@@ -20,8 +20,11 @@
  *       validate_response()→std::unexpected, build_authn_request()→"".
  */
 
+#include <openssl/evp.h> // EVP_PKEY — OpenSSL is a mandatory dep on every platform (CLAUDE.md)
+
 #include <chrono>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -33,8 +36,18 @@ namespace yuzu::server::saml {
 /// are extracted from the configured group_attribute, across however many
 /// <Attribute Name="..."> elements carry that Name. Parsing stops once the
 /// cap is reached — remaining values (and remaining Attribute elements) are
-/// silently ignored rather than rejecting the whole assertion.
-inline constexpr std::size_t kMaxGroupValues = 64;
+/// silently ignored rather than rejecting the whole assertion. Aligned with
+/// `RbacStore::kMaxIdpGroupsPerLogin` (200) — SAML fine-grained RBAC
+/// reconciles `groups` into the RBAC store the same way OIDC does, and the
+/// two caps must agree or a SAML assertion could pass this parser only to
+/// be rejected (or worse, silently under-reconciled) at the RBAC boundary.
+/// `group_cap_truncated` (below) trips once an assertion carries more than
+/// 200 non-empty group values; the ACS route (auth_routes.cpp) DENIES the
+/// login in that case rather than reconciling a truncated (i.e. incomplete)
+/// membership set. Raising this from 64 to 200 also improves the coarse
+/// `--saml-admin-group` path: an admin group asserted at position 65-200
+/// was previously silently missed.
+inline constexpr std::size_t kMaxGroupValues = 200;
 
 /// Configuration for the SAML 2.0 SP. All string fields are UTF-8.
 struct SamlConfig {
@@ -52,11 +65,51 @@ struct SamlConfig {
     /// deployment that never configures this behaves exactly like the thin
     /// slice (SamlAssertion::groups always empty).
     std::string group_attribute;
+
+    /// Name of the `<Attribute Name="...">` whose first `<AttributeValue>` is
+    /// the user's human display name (e.g. Entra's
+    /// `http://schemas.microsoft.com/identity/claims/displayname` or the SAML
+    /// 2.0 `urn:oid:2.16.840.1.113730.3.1.241`). Empty (default) disables
+    /// display-name parsing — `SamlAssertion::display_name` stays empty and the
+    /// session display falls back to the raw NameID, exactly as before. Purely
+    /// session-enrichment (dashboard/audit rendering); NEVER an identity or
+    /// authz input — see `saml_principal_id` (identity stays NameID-only).
+    std::string name_attribute;
+
+    /// Name of the `<Attribute Name="...">` whose first `<AttributeValue>` is
+    /// the user's email (e.g. Entra's
+    /// `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`).
+    /// Empty (default) disables email parsing. Same session-enrichment-only
+    /// contract as `name_attribute`: it feeds the session display fallback and
+    /// a log line, is NEVER stored as a durable session field, and NEVER
+    /// participates in identity/SCIM linkage (mirrors the OIDC email posture,
+    /// `create_oidc_session`).
+    std::string email_attribute;
+
+    /// PEM-encoded SP AuthnRequest signing private key (RSA only). TRANSIT
+    /// field only — server.cpp reads the key file and populates this; the
+    /// SamlProvider constructor parses it once, retains the owned EVP_PKEY,
+    /// and clears this member. Empty (default) means AuthnRequests are
+    /// unsigned (backward-compatible).
+    std::string sp_signing_key_pem;
 };
 
 /// Claims extracted from a verified SAML assertion.
 struct SamlAssertion {
     std::string name_id;
+
+    /// ADR-2001 PR4a — the verified `<saml:NameID Format="...">` attribute,
+    /// read from the SAME XSW-verified assertion node as `name_id` (never a
+    /// second document-wide search — N2 parity). Empty when the assertion's
+    /// NameID carries no Format attribute at all. Consumed by
+    /// `saml_scim_link.hpp`'s `is_linkable_name_id_format` to decide whether
+    /// this NameID is a safe SCIM-externalId join key: only a STABLE format
+    /// (persistent, or the 1.1 emailAddress format) is; a `transient` (or
+    /// missing/empty) Format NameID is re-minted per login and must never be
+    /// trusted into a durable link. This field is purely descriptive — the
+    /// verifier itself never rejects a login based on Format; that decision
+    /// is entirely the login-site linking orchestration's.
+    std::string name_id_format;
 
     /// Group identifiers extracted from the configured `group_attribute`'s
     /// `<AttributeValue>` children. Always empty when `SamlConfig::group_attribute`
@@ -77,6 +130,22 @@ struct SamlAssertion {
     /// `_blocked_total`/`_local_disabled_total` metric-only signals
     /// documented in docs/observability-conventions.md.
     bool group_cap_truncated{false};
+
+    /// The first `<AttributeValue>` of the configured `name_attribute`, read
+    /// from the SAME XSW-verified assertion node as `name_id` (N2 parity —
+    /// never a second document-wide search). Empty when `name_attribute` is
+    /// unset or the assertion carries no such attribute/value. PURELY
+    /// descriptive session-enrichment: the login site uses it (with `email`)
+    /// only to render `Session::display_name`; it is NEVER an identity, authz,
+    /// or SCIM-linkage input (identity remains NameID-only, `saml_principal.hpp`).
+    std::string display_name;
+
+    /// The first `<AttributeValue>` of the configured `email_attribute`, read
+    /// from the SAME XSW-verified assertion node. Empty when unset/absent.
+    /// Session-enrichment only, same contract as `display_name`: a display
+    /// fallback + a log line, never a durable session field and never an
+    /// identity/linkage input.
+    std::string email;
 };
 
 /// SAML 2.0 SP verifier — pure library, no HTTP routes, no session minting.
@@ -124,6 +193,19 @@ public:
     /// Purge expired pending AuthnRequest IDs (call periodically).
     void cleanup_expired_states();
 
+    /// True when SamlConfig::sp_signing_key_pem was non-empty but failed to
+    /// parse as a usable SP signing key (malformed PEM, or a non-RSA key —
+    /// EC/RSA-PSS are rejected). Callers (server.cpp) use this to disable
+    /// SAML LOUDLY on a misconfigured key rather than silently falling back
+    /// to unsigned AuthnRequests. Always false on Windows and when
+    /// sp_signing_key_pem was empty.
+    bool signing_configured_but_broken() const;
+
+    /// Human-readable reason signing_configured_but_broken() is true.
+    /// Empty when signing_configured_but_broken() is false. Never contains
+    /// the PEM bytes.
+    const std::string& signing_init_error() const;
+
 private:
     void cleanup_expired_states_locked(); ///< Must be called with mu_ held.
 
@@ -141,6 +223,14 @@ private:
 
     static constexpr auto kRequestTtl          = std::chrono::minutes(10);
     static constexpr std::size_t kMaxPendingRequests = 1000;
+
+    /// Owned SP AuthnRequest signing key, parsed once at construction from
+    /// SamlConfig::sp_signing_key_pem. Null when signing is not configured,
+    /// or when signing_init_failed_ is true (a malformed/non-RSA key is
+    /// never retained — see signing_configured_but_broken()).
+    std::shared_ptr<EVP_PKEY> sp_signing_key_;
+    bool        signing_init_failed_{false};
+    std::string signing_init_error_;
 };
 
 } // namespace yuzu::server::saml

@@ -22,12 +22,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <comdef.h>
-#include <wbemidl.h>
-#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
-#pragma comment(lib, "wbemuuid.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleaut32.lib")
+#include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <wmi_bounded.hpp> // shared yuzu::shared::wmi bounded query (never WBEM_INFINITE)
 #endif
 
 namespace {
@@ -38,24 +34,6 @@ YuzuPluginContext* g_ctx = nullptr;
 // to_wide now comes from the shared agents/shared/win_str.hpp (#1681)
 // instead of a local copy; behaviour-identical for valid input.
 using yuzu::win::to_wide;
-
-// BSTR is an OLECHAR* (wchar_t*). The prior local copy read it as NUL-terminated
-// (-1), so the shared from_wide with its default length is behaviour-identical.
-std::string from_bstr(BSTR bs) { return yuzu::win::from_wide(bs); }
-
-std::string variant_to_string(VARIANT& v) {
-    switch (v.vt) {
-        case VT_BSTR:  return from_bstr(v.bstrVal);
-        case VT_I4:    return std::to_string(v.lVal);
-        case VT_UI4:   return std::to_string(v.ulVal);
-        case VT_I2:    return std::to_string(v.iVal);
-        case VT_BOOL:  return v.boolVal ? "true" : "false";
-        case VT_R8:    return std::format("{}", v.dblVal);
-        case VT_NULL:  return "(null)";
-        case VT_EMPTY: return "(empty)";
-        default:       return std::format("(vt={})", v.vt);
-    }
-}
 
 bool is_select_only(std::string_view wql) {
     // Only allow SELECT statements
@@ -101,22 +79,30 @@ bool is_valid_wmi_namespace(std::string_view ns) {
     return false;
 }
 
-class ComInit {
-public:
-    ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
-    ~ComInit() { if (SUCCEEDED(hr_)) CoUninitialize(); }
-    bool ok() const { return SUCCEEDED(hr_); }
-private:
-    HRESULT hr_;
-};
 #endif
+
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: IWbemLocator/IWbemServices COM API -- native, rung 1.
+// linux/macos: no WMI equivalent -- execute() returns an explicit
+// "WMI not available on this platform" error outright.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"query",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi", nullptr}},
+    {"get_instance",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi", nullptr}},
+};
 
 } // namespace
 
 class WmiPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "wmi"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Windows Management Instrumentation — WQL queries and instance enumeration";
     }
@@ -124,6 +110,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"query", "get_instance", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override { g_ctx = ctx.raw(); return {}; }
@@ -155,47 +148,25 @@ private:
             return 1;
         }
 
-        ComInit com;
-        if (!com.ok()) { ctx.write_output("error|COM initialization failed"); return 1; }
-
-        IWbemLocator* locator = nullptr;
-        HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_IWbemLocator, reinterpret_cast<void**>(&locator));
-        if (FAILED(hr)) { ctx.write_output("error|failed to create WbemLocator"); return 1; }
-
-        IWbemServices* services = nullptr;
-        auto wns = to_wide(ns);
-        hr = locator->ConnectServer(_bstr_t(wns.c_str()), nullptr, nullptr, nullptr, 0, nullptr, nullptr, &services);
-        locator->Release();
-        if (FAILED(hr)) { ctx.write_output(std::format("error|failed to connect to namespace {}", ns)); return 1; }
-
-        CoSetProxyBlanket(services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
-
-        IEnumWbemClassObject* enumerator = nullptr;
-        auto wwql = to_wide(wql);
-        hr = services->ExecQuery(_bstr_t(L"WQL"), _bstr_t(wwql.c_str()), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &enumerator);
-        if (FAILED(hr)) { services->Release(); ctx.write_output("error|query execution failed"); return 1; }
-
-        IWbemClassObject* obj = nullptr;
-        ULONG count = 0;
-        int row = 0;
-        while (enumerator->Next(WBEM_INFINITE, 1, &obj, &count) == S_OK && count > 0) {
-            // Enumerate all properties of each result
-            obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
-            BSTR prop_name = nullptr;
-            VARIANT prop_val;
-            while (obj->Next(0, &prop_name, &prop_val, nullptr, nullptr) == WBEM_S_NO_ERROR) {
-                ctx.write_output(std::format("row{}|{}|{}", row, from_bstr(prop_name), variant_to_string(prop_val)));
-                SysFreeString(prop_name);
-                VariantClear(&prop_val);
-            }
-            obj->Release();
-            ++row;
+        auto qres = yuzu::shared::wmi::run_bounded_wmi_query(to_wide(ns), to_wide(wql));
+        if (qres.error) {
+            ctx.write_output(std::format("error|{}", *qres.error));
+            return 1;
         }
 
-        enumerator->Release();
-        services->Release();
+        int row = 0;
+        for (const auto& r : qres.rows) {
+            for (const auto& [k, v] : r)
+                ctx.write_output(std::format("row{}|{}|{}", row, k, v));
+            ++row;
+        }
+        if (qres.truncated) {
+            // Bounded row cap reached — the enumeration did not complete.
+            // Rows gathered so far are still emitted for diagnostics.
+            ctx.write_output("error|row_cap_exceeded");
+        }
         ctx.write_output(std::format("rows|{}", row));
-        return 0;
+        return qres.truncated ? 1 : 0;
     }
 
     int do_get_instance(yuzu::CommandContext& ctx, yuzu::Params params) {
@@ -216,36 +187,21 @@ private:
             return 1;
         }
 
-        ComInit com;
-        if (!com.ok()) { ctx.write_output("error|COM initialization failed"); return 1; }
-
-        IWbemLocator* locator = nullptr;
-        CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_IWbemLocator, reinterpret_cast<void**>(&locator));
-        IWbemServices* services = nullptr;
-        locator->ConnectServer(_bstr_t(to_wide(ns).c_str()), nullptr, nullptr, nullptr, 0, nullptr, nullptr, &services);
-        locator->Release();
-        CoSetProxyBlanket(services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
-
-        IEnumWbemClassObject* enumerator = nullptr;
-        services->ExecQuery(_bstr_t(L"WQL"), _bstr_t(to_wide(wql).c_str()), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &enumerator);
-
-        IWbemClassObject* obj = nullptr;
-        ULONG count = 0;
-        // Get first instance only
-        if (enumerator->Next(5000, 1, &obj, &count) == S_OK && count > 0) {
-            obj->BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY);
-            BSTR prop_name = nullptr;
-            VARIANT prop_val;
-            while (obj->Next(0, &prop_name, &prop_val, nullptr, nullptr) == WBEM_S_NO_ERROR) {
-                ctx.write_output(std::format("property|{}|{}", from_bstr(prop_name), variant_to_string(prop_val)));
-                SysFreeString(prop_name);
-                VariantClear(&prop_val);
-            }
-            obj->Release();
+        // First instance only, bounded to ~5s total (matches the prior
+        // single-shot Next(5000, ...) behaviour) — never WBEM_INFINITE.
+        yuzu::shared::wmi::BoundedQueryOptions opts;
+        opts.next_timeout_ms = 5000;
+        opts.row_cap = 1;
+        opts.enumeration_deadline_ms = 5000;
+        auto qres = yuzu::shared::wmi::run_bounded_wmi_query(to_wide(ns), to_wide(wql), opts);
+        if (qres.error) {
+            ctx.write_output(std::format("error|{}", *qres.error));
+            return 1;
         }
-
-        enumerator->Release();
-        services->Release();
+        if (!qres.rows.empty()) {
+            for (const auto& [k, v] : qres.rows.front())
+                ctx.write_output(std::format("property|{}|{}", k, v));
+        }
         return 0;
     }
 #endif

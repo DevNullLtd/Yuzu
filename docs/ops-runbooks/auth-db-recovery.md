@@ -1,530 +1,556 @@
-# Auth DB Recovery Runbook
+# Auth Store Recovery Runbook
 
-Operator runbook for recovering a Yuzu server when its on-disk authentication
-database (`auth.db`) cannot be opened or fails the integrity check at startup.
-Symptoms covered, recovery procedure, prevention via routine backup, and the
-Windows-specific Defender exclusion.
+Operator runbook for recovering a Yuzu server when authentication is broken or
+an operator is locked out. Auth data lives in the server's **PostgreSQL
+substrate, schema `auth`** (ADR-0006/0007) — there is no `auth.db` file, and
+there is nothing to move aside.
 
-This runbook assumes a single-node Yuzu deployment. For HA deployments the
-recovery procedure must be coordinated with the active leader; see
-`docs/architecture.md` for the leader-follower model once HA lands.
+**Read this first if you are mid-incident:** the two facts that change how you
+recover, relative to the SQLite era, are
+
+1. **The server fails closed without Postgres.** No SQLite fallback, no
+   degraded mode. If Postgres is unreachable, `yuzu-server` refuses to start —
+   so "auth is broken" is usually "Postgres is broken", and the fix is a
+   Postgres fix, not a Yuzu fix.
+2. **TOTP secrets are encrypted with a key that is NOT in the database.** A
+   Postgres backup on its own cannot restore working MFA. See
+   [Backup — the KEK pairing rule](#backup--the-kek-pairing-rule). This is the
+   single most common way to turn a recoverable incident into an unrecoverable
+   one.
+
+This runbook assumes a single-node Yuzu deployment. For HA, coordinate with the
+active leader; see `docs/architecture.md`.
+
+> **Looking for the SQLite procedure?** It is gone, deliberately. Every
+> file-based step (`sqlite3 .backup`, moving `auth.db`/`-wal`/`-shm` aside,
+> `UPDATE`/`DELETE` against `auth.db`, the Windows Defender exclusion for those
+> files) is inapplicable and will not work. Git history has it if you are
+> recovering a pre-migration release.
 
 ## Detection signal
 
-`yuzu-server` exits with a non-zero status at startup and `journalctl -u
-yuzu-server` (Linux) or the Windows event log shows one of these lines:
+`yuzu-server` exits non-zero at startup. `journalctl -u yuzu-server` (Linux) or
+the Windows event log shows one of these, and they mean different things:
 
-```
-[error] Auth DB integrity check failed: <sqlite-error>
-[error] Failed to open auth DB: <path> (<errno>)
-[error] AuthDB: schema migration failed, closing database
-```
+| Log line | Meaning | Go to |
+|---|---|---|
+| `[PG] Refusing to start: no PostgreSQL DSN` | `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset | [Config](#no-dsn-configured) |
+| `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
+| `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
+| `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
-If the systemd unit shipped in this release (`deploy/systemd/yuzu-server.service`)
-is in use, the unit will retry up to `StartLimitBurst=3` times within
-`StartLimitIntervalSec=60` and then enter the `failed` state:
+If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
+within `StartLimitIntervalSec=60`, then enters `failed`:
 
 ```
 $ systemctl status yuzu-server
 ● yuzu-server.service - Yuzu Endpoint Management Server
-     Loaded: loaded (...)
      Active: failed (Result: start-limit-hit) since ...
 ```
 
-That `failed` state is the lever: it stops a tight crash-loop from drowning
-the journal and surfaces the underlying problem cleanly.
+That `failed` state is deliberate — it stops a crash-loop from drowning the
+journal. Clear it with `systemctl reset-failed yuzu-server` once fixed.
 
-## Recovery procedure
+## Recovery procedures
 
-The on-disk schema is rebuilt from the seed config (`yuzu-server.cfg`) on
-fresh boot. The runtime state (active sessions, in-memory user list) does
-NOT need to be preserved across this procedure — operators will need to
-re-authenticate after recovery.
+### No DSN configured
 
-### Linux
+The server has no auth store at all. Set the DSN and restart:
 
 ```bash
-# Stop the service so the file is closed.
-sudo systemctl stop yuzu-server
-
-# Archive the corrupt DB for forensics. Do NOT delete it without a copy;
-# support may need to inspect the corruption signature.
-sudo sqlite3 /var/lib/yuzu/auth.db ".backup /var/lib/yuzu/auth.db.corrupt-$(date +%s)"
-
-# Move the live file aside (NOT delete — keep one operator-recoverable
-# copy in case the corruption was actually a permission/ownership issue
-# that's reversible).
-sudo mv /var/lib/yuzu/auth.db /var/lib/yuzu/auth.db.broken
-sudo mv /var/lib/yuzu/auth.db-wal /var/lib/yuzu/auth.db-wal.broken 2>/dev/null || true
-sudo mv /var/lib/yuzu/auth.db-shm /var/lib/yuzu/auth.db-shm.broken 2>/dev/null || true
-
-# Reset the unit's restart counter so it can boot again.
-sudo systemctl reset-failed yuzu-server
-
-# Start it. The server re-seeds AuthDB from yuzu-server.cfg on first boot.
-sudo systemctl start yuzu-server
-sudo systemctl status yuzu-server
+# Either the flag, in /etc/yuzu/yuzu-server.cfg …
+--postgres-dsn postgresql://yuzu:...@db.internal:5432/yuzu
+# … or the environment variable (preferred for secrets — keeps the password
+# out of `ps` output and the config file).
+sudo systemctl edit yuzu-server   # Environment=YUZU_POSTGRES_DSN=postgresql://…
+sudo systemctl restart yuzu-server
 ```
 
-### Windows
+### Postgres substrate unreachable
+
+Yuzu is the symptom, not the cause. Confirm from the Yuzu host, as the service
+account, using the same DSN the server uses:
+
+```bash
+sudo -u _yuzu psql "$YUZU_POSTGRES_DSN" -c 'SELECT 1'
+```
+
+Work the usual causes in order: Postgres service down; `pg_hba.conf` rejecting
+the host/user; TLS requirement mismatch; network path (firewall, security
+group, DNS); credential rotation that did not reach Yuzu; connection limit
+exhausted (`FATAL: sorry, too many clients already`).
+
+Yuzu restarts cleanly once Postgres is reachable — no Yuzu-side repair is
+needed, and **no auth data is lost by the outage itself**. Sessions are
+durable rows in Postgres (see [Sessions](#sessions-are-durable)), so an
+operator whose session did not reach its absolute lifetime or idle timeout
+during the outage does not need to sign in again after the restart.
+
+### `auth` schema migration failure
+
+The database is reachable but the `auth` schema could not be created or
+opened. Usual causes, in likelihood order:
+
+1. **Insufficient privilege.** The DSN's role needs `CREATE` on the database
+   to run migrations. Verify:
+   ```bash
+   psql "$YUZU_POSTGRES_DSN" -c "\du"        # role attributes
+   psql "$YUZU_POSTGRES_DSN" -c "SELECT has_database_privilege(current_user, current_database(), 'CREATE');"
+   ```
+2. **Schema drift** — a partially-created `auth` schema from an interrupted
+   migration, or hand-made objects colliding with migration DDL. Inspect
+   before touching anything:
+   ```bash
+   psql "$YUZU_POSTGRES_DSN" -c "\dt auth.*"
+   psql "$YUZU_POSTGRES_DSN" -c "SELECT * FROM public.schema_meta WHERE store = 'auth';"
+   ```
+   The migration runner refuses to proceed on drift rather than guessing —
+   that refusal is the fail-closed behaviour working, not a bug. Resolve by
+   restoring from backup (preferred) or, on a deployment with no auth data
+   worth keeping, dropping the schema so it rebuilds from the seed config:
+   ```bash
+   # DESTRUCTIVE — every local account, MFA enrolment and enrollment token in
+   # this schema is discarded. Take a dump first even if you think it is empty.
+   pg_dump "$YUZU_POSTGRES_DSN" --schema=auth > /var/backups/yuzu/auth-before-drop-$(date +%s).sql
+   psql "$YUZU_POSTGRES_DSN" -c 'DROP SCHEMA auth CASCADE;'
+   psql "$YUZU_POSTGRES_DSN" -c "DELETE FROM public.schema_meta WHERE store = 'auth';"
+   sudo systemctl restart yuzu-server
+   ```
+   On restart the server re-seeds the admin account from `yuzu-server.cfg`.
+
+### KEK missing or unreadable
+
+`SecretCodec::init()` failed. The key-encryption key (KEK) that protects
+envelope-encrypted columns lives on the **filesystem, not in Postgres**:
+
+| | Path |
+|---|---|
+| Linux / macOS | `/etc/yuzu/certs/secrets-kek-v<N>.key` |
+| Windows | `C:\ProgramData\Yuzu\certs\secrets-kek-v<N>.key` |
+
+The directory is the one given by `--ca-dir`, falling back to the platform
+default above. Files are `0600`, the directory `0700`, owned by the service
+account (a restrictive DACL on Windows).
+
+Check, as the service account:
+
+```bash
+sudo -u _yuzu ls -l /etc/yuzu/certs/secrets-kek-v*.key
+```
+
+- **Present but unreadable** → ownership/permissions drifted (a restore that
+  did not preserve them, or a `chown -R` that overreached). Fix ownership to
+  the service account; leave the modes at `0600`/`0700`.
+- **Absent on a fresh install** → normal. The server generates
+  `secrets-kek-v1` on first boot and logs
+  `key_provider: generated KEK 'secrets-kek-v1' (0600, fsynced)`.
+- **Absent on an existing install** → the KEK has been lost. Do **not** let the
+  server generate a new one and consider it fixed: a new KEK cannot decrypt
+  existing blobs. Go to [KEK permanently lost](#kek-permanently-lost).
+
+## Backup — the KEK pairing rule
+
+**A Postgres dump alone is not a complete auth backup.** TOTP secrets in
+`auth.users.mfa_totp_secret` are envelope-encrypted (ADR-0010); the wrapped
+data key travels with the row, but the KEK that unwraps it is a file. Restore
+the dump next to a *different* KEK and every MFA decrypt fails closed — users
+are not silently downgraded to password-only, they are locked out of MFA with
+`SecretUnavailable` errors and a `yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}`
+counter climbing.
+
+So: **capture the database dump and the keys directory as a pair, from the same
+point in time, and restore them as a pair.**
+
+```bash
+# Linux — run both, keep them together, encrypt the pair at rest.
+STAMP=$(date +%Y%m%dT%H%M%SZ)
+sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
+     > /var/backups/yuzu/yuzu-$STAMP.dump
+sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
+     -C /etc/yuzu certs
+```
 
 ```powershell
-# Stop the service.
-Stop-Service Yuzu
-
-# Archive the corrupt DB.
-Copy-Item C:\ProgramData\Yuzu\auth.db `
-          C:\ProgramData\Yuzu\auth.db.corrupt-$(Get-Date -Format yyyyMMdd-HHmmss)
-
-# Move the live file aside.
-Move-Item C:\ProgramData\Yuzu\auth.db     C:\ProgramData\Yuzu\auth.db.broken
-Move-Item C:\ProgramData\Yuzu\auth.db-wal C:\ProgramData\Yuzu\auth.db-wal.broken -ErrorAction SilentlyContinue
-Move-Item C:\ProgramData\Yuzu\auth.db-shm C:\ProgramData\Yuzu\auth.db-shm.broken -ErrorAction SilentlyContinue
-
-# Start the service.
-Start-Service Yuzu
-Get-Service Yuzu
+# Windows
+$Stamp = Get-Date -Format yyyyMMddTHHmmssZ
+pg_dump $Env:YUZU_POSTGRES_DSN --format=custom > "C:\Backups\Yuzu\yuzu-$Stamp.dump"
+Compress-Archive -Path C:\ProgramData\Yuzu\certs -DestinationPath "C:\Backups\Yuzu\yuzu-keys-$Stamp.zip"
 ```
 
-After the server is back online:
+Rules that follow from the pairing:
 
-1. Log in with the admin credentials from `yuzu-server.cfg`.
-2. Re-create any user accounts that existed only in `auth.db` (i.e. created
-   via Settings > Users after the seed config was first written). Accounts
-   created via the seed config itself are restored automatically.
-3. Re-issue any enrollment tokens — token state lives in `auth.db`.
-4. File a support ticket with the archived `auth.db.corrupt-<timestamp>` file
-   attached so the corruption signature can be analysed.
+- **Encrypt the key archive at rest**, separately from the dump if your threat
+  model allows — an attacker with both has every stored secret.
+- **Never restore a dump onto a host whose keys directory came from a
+  different backup generation.** If you cannot prove they are paired, treat the
+  MFA enrolments as lost and plan a re-enrolment.
+- **Retain old KEK versions.** After a KEK rotation, older versions are still
+  needed to read any backup taken before the rotation completed. Do not prune
+  key files on a schedule that is shorter than your backup retention.
+- **Drill it.** A restore you have never rehearsed is a hypothesis. Restore
+  into a scratch database + scratch keys directory, start a throwaway server,
+  and verify a real TOTP login succeeds.
 
-## Prevention — routine backup
+Postgres backup mechanics (PITR/WAL archiving, base backups, retention) are
+your Postgres platform's concern and out of scope here; what is in scope is
+that the keys directory rides along with whatever you choose.
 
-`auth.db` should be backed up alongside the rest of `/var/lib/yuzu` (Linux)
-or `C:\ProgramData\Yuzu` (Windows) on the operator's existing backup
-schedule. The backup procedure must NOT rely on `cp` against the live
-file — SQLite's WAL means a naive `cp` can produce a torn copy that fails
-integrity checks on restore.
+## Post-restore verification
 
-Use the built-in `.backup` SQLite command, which is WAL-aware:
+After any restore, before declaring the incident closed:
 
 ```bash
-sudo sqlite3 /var/lib/yuzu/auth.db ".backup /var/backups/yuzu/auth.db.$(date +%s)"
+# 1. The server started and is serving. (/health and /readyz are on the web
+#    port — --web-port, default 8080; https:// if TLS is enabled.)
+systemctl status yuzu-server
+curl -fsS http://127.0.0.1:8080/health
+
+# 2. The auth schema is at the expected migration version.
+psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHERE store IN ('auth','scim_store');"
+
+# 3. The KEK resolved — this must be ZERO, or absent entirely. A non-zero
+#    kek_unresolvable count is the signature of a dump restored against the
+#    wrong keys directory. /metrics is on the same web port and is always
+#    unauthenticated over loopback.
+curl -fsS http://127.0.0.1:8080/metrics | grep secret_decrypt_failures_total
+
+# 4. A real MFA login works end-to-end (not just "the page loads").
 ```
 
-```powershell
-sqlite3 C:\ProgramData\Yuzu\auth.db `
-        ".backup C:\backups\yuzu\auth.db.$(Get-Date -Format yyyyMMdd-HHmmss)"
-```
+Step 3 is the one people skip. It is the only cheap check that distinguishes
+"restored correctly" from "restored, and every MFA user will be locked out the
+moment they try to log in".
 
-Run nightly on the same cadence as the rest of the data-directory backup.
-The backup file is itself a valid SQLite database — restore by stopping the
-service, copying the backup over `auth.db`, and starting the service.
+## Sessions are durable
 
-## Windows: Defender exclusion
+Operator sessions are rows in the Postgres `session_store.sessions` table
+(`SessionStore`, HA WS-1/1a, ADR-2002 §4). `AuthManager`'s in-memory
+`sessions_` map is only a per-replica validate cache in front of those rows:
+on a cache miss the server re-reads the row and rebuilds the session from it.
+So:
 
-On Windows production deploys, Defender's real-time scan can hold the
-`auth.db-wal` file open during agent enrollment storms (multiple concurrent
-writes from the cleanup thread + token validation). The symptom is
-sporadic `SQLITE_BUSY` returns in `[warn]` lines that recover after a
-retry. Adding the data directory to Defender's exclusion list eliminates
-this entirely.
+- **A server restart is NOT a revocation.** The restart empties the cache, and
+  the next request rebuilds each session from its row. The same holds for a
+  crash or a failover to another replica.
+- A row is removed only by an explicit revoke (sign-out, or the REST calls
+  below, which delete by token or by username) or by the reaper once the
+  session passes its absolute lifetime (8 hours). An idle-timed-out session
+  is refused on every replica, but its row stays until the reaper removes it.
 
-Path-based exclusion (Group Policy / `Set-MpPreference`):
-
-```powershell
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db-wal'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db-shm'
-```
-
-Or by glob if your policy syntax allows it:
-
-```powershell
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db*'
-```
-
-The exclusion is safe: `auth.db` is written only by `yuzu-server.exe`, the
-file is not user-editable, and password hashes are PBKDF2-SHA256 (salted)
-so a Defender bypass does not weaken credential storage.
-
-## Filesystem permissions
-
-`auth.db` is created with mode `0600` (owner read/write only) on Linux and
-the equivalent restricted ACL on Windows. If `ls -l` shows anything other
-than `-rw-------` for `auth.db` on Linux, fix it before doing anything else
-— a world-readable `auth.db` exposes the salt and hash for offline crack
-attempts:
+To revoke sessions, use the REST surface:
 
 ```bash
-sudo chmod 0600 /var/lib/yuzu/auth.db
-sudo chown yuzu:yuzu /var/lib/yuzu/auth.db
+# Revoke every session for one operator (admin).
+curl -fsS -X DELETE "https://yuzu.internal/api/v1/sessions?username=alice" \
+     -H "Authorization: Bearer $TOKEN"
+
+# Revoke your own (self-service).
+curl -fsS -X DELETE https://yuzu.internal/api/v1/sessions/me \
+     -H "Authorization: Bearer $TOKEN"
 ```
 
-## Emergency session revocation (dashboard unreachable)
+**Check that the revoke persisted.** Both calls delete the durable rows first,
+then clear this replica's cache. If the response body reports
+`db_persisted: false` (the audit row shows `result=partial` with
+`db_error=true`), only this replica's cache was cleared. The rows survive, and
+any replica that misses its cache, including this one after a restart, will
+rebuild those sessions from them. Retry the revoke once the database is
+healthy.
 
-When the dashboard is down or unreachable but you need to force-logout a
-compromised account immediately, you can clear sessions directly from
-the SQLite database. This is the recipe of last resort — the standard
-flow is **Settings > User Management > Revoke sessions** (admin) or
-**Sign out everywhere** (self), both of which produce audit rows and
-metrics. The manual flow below produces no audit row, so file an
-incident note recording the action.
+API tokens are a separate credential class. The admin `?username=` call does
+**not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
+everywhere") revokes the caller's API tokens as well as their sessions (check
+`api_tokens_db_persisted` in its response). Otherwise revoke tokens explicitly
+via the token endpoints.
+
+**Emergency fleet-wide revocation.** There is no single admin route that
+revokes every operator's sessions. The audited path is the admin
+`?username=` call above, once per operator. If that is not practical, delete
+the rows directly in Postgres. This is a direct database operation: it
+bypasses the server, **writes no audit row** (record it manually), and signs
+out every operator including you. Take a backup first (see
+[Backup — the KEK pairing rule](#backup--the-kek-pairing-rule)).
 
 ```bash
-# 1. Identify how many sessions exist for the target user.
-sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username, COUNT(*) FROM sessions GROUP BY username;"
-
-# 2. Wipe every session for the target user. Parameterise to avoid
-#    quoting accidents.
-sqlite3 /var/lib/yuzu/auth.db \
-  "DELETE FROM sessions WHERE username = 'alice';"
-
-# 3. Restart the server. The in-memory sessions_ map is rebuilt empty
-#    on startup; without a restart, in-memory cookie sessions remain
-#    valid until they hit the next validate_session check (cleanup
-#    sweeper has a finite window). Restart guarantees immediate effect.
-systemctl restart yuzu-server   # or service yuzu-server restart
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
+BEGIN;
+DELETE FROM session_store.sessions;
+-- Bump the write-generation exactly as SessionStore does, so every
+-- replica drops its cached sessions on its next generation poll (~1s).
+INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
+ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
+COMMIT;
+SQL
 ```
 
-After the restart, validate that the target user's previously-issued
-cookies return 401 and that they can re-authenticate normally. File a
-manual audit-log entry referencing the incident ticket so the
-unaudited DB-level action is traceable in the SOC 2 evidence chain.
+The generation bump is required. A running replica serves a cached session
+without re-reading its row, and clears its cache only when it sees the
+write-generation advance. A bare `DELETE` therefore leaves every cached
+session valid on the replica that holds it, until some later session change
+advances the generation, the session expires, or that replica restarts.
 
-## Account lockout recovery (locked out by failed-login lockout)
+`ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
+case the whole transaction has rolled back and nothing changed. Afterwards,
+confirm `SELECT count(*) FROM session_store.sessions;` returns 0 and that
+`write_generation` in `session_store.session_meta` went up. This revokes
+sessions only: API tokens stay valid and must be revoked through the token
+endpoints.
 
-Account lockout (SOC 2 CC6.3) locks a local-password account after
-`--auth-lockout-threshold` (default 5) consecutive failed `POST /login`
-attempts, for `--auth-lockout-window-secs` (default 900 s). A locked
-account returns the **same generic 401 as a bad password** — there is no
-"you are locked" message — so a confused user may not realise they are
-locked rather than mistyping. Escalation order:
+## Account lockout recovery
 
-1. **Standard path (preferred):** another admin clears it immediately via
-   `POST /api/v1/users/{username}/unlock` (`UserManagement:Write` + MFA
-   step-up). This produces the `auth.lockout.cleared` / `admin_unlock`
-   audit row. The dashboard equivalent is on the user's row in
-   Settings → Users.
-2. **Wait it out:** the lock auto-expires after the window (default 15 min)
-   with no action. A subsequent *successful* login also clears the counter.
-3. **Last resort — dashboard/REST unreachable, or the SOLE admin is locked
-   out** (the unlock endpoint needs a second privileged principal). Clear
-   the lockout columns directly in SQLite:
+An operator is locked out by failed-login lockout
+(`--auth-lockout-threshold`, default 5 within `--auth-lockout-window-secs`,
+default 900). The window auto-expires, so the first question is whether you
+need to act at all — waiting it out is the zero-risk path.
+
+**Preferred — admin API** (audited, no database access needed):
 
 ```bash
-# Inspect the lockout state for the target user.
-sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username, failed_login_count, locked_until FROM users WHERE username = 'alice';"
-
-# Clear the lock (single user).
-sqlite3 /var/lib/yuzu/auth.db \
-  "UPDATE users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE username = 'alice';"
-
-# Mass-unlock — ONLY after a threshold misconfiguration (e.g. accidentally
-# deploying --auth-lockout-threshold=1) locked many/all accounts:
-# sqlite3 /var/lib/yuzu/auth.db \
-#   "UPDATE users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
+curl -fsS -X POST "https://yuzu.internal/api/v1/users/alice/unlock" \
+     -H "Authorization: Bearer $TOKEN"
 ```
 
-A restart is **not** required — the lockout state is read from `auth.db`
-on the next `POST /login`, so the clear takes effect immediately. The
-SQL clear produces **no** `auth.lockout.cleared` audit row, so file a
-manual audit-log entry referencing the incident ticket (SOC 2 CC6.3
-evidence chain), and fix the misconfiguration (`--auth-lockout-threshold`)
-before restarting if a too-low threshold caused the mass lockout. There is
-no break-glass CLI for lockout today (unlike `--mfa-reset`); the auto-expiry
-window is the standing safety net.
+Requires `UserManagement:Write` (plus MFA step-up when the caller is enrolled).
+Self-target is allowed.
 
-## Verifying persistence after a Settings → Revoke sessions click
-
-The dashboard flow is dual-write (in-memory + `auth.db`). If the response
-body reports `db_persisted: false` or the audit row shows `result=partial`
-with `db_error=true`, the in-memory wipe succeeded but persisted rows
-remain. A server restart will resurrect them. Verify and remediate:
+**Fallback — direct SQL**, when every admin is locked out and no valid token
+exists. This writes no audit row; record it in your change-management system:
 
 ```bash
-sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username, expires_at FROM sessions WHERE username = 'alice';"
+# Inspect first.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username, failed_login_count, locked_until FROM auth.users WHERE username = 'alice';"
+
+# Clear one account.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL WHERE username = 'alice';"
 ```
 
-If rows are returned, repeat the **Revoke sessions** click after the DB
-lock clears (typically a minute), or use the manual flow above and
-restart.
+Mass-unlock is a threshold-misconfiguration remedy only (e.g. someone deployed
+`--auth-lockout-threshold=1`). Fix the flag in the same maintenance window, or
+you will be back:
 
-## Limit-of-blast-radius — what you CANNOT recover from
-
-- **Lost `yuzu-server.cfg`.** This file is the seed for the AuthDB on first
-  boot. If both `auth.db` AND `yuzu-server.cfg` are lost, the recovery
-  procedure cannot rebuild the admin account. Run
-  `yuzu-server --first-run-setup` to interactively create a new admin and
-  write a fresh config, then restart normally.
-
-- **Encrypted backups whose key is also lost.** AuthDB's contents are
-  hashed (PBKDF2) but session tokens and enrollment-token raw values are
-  symmetric. If your backup encryption key is lost, the backup is not
-  recoverable.
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "UPDATE auth.users SET failed_login_count = 0, last_failed_login_at = NULL, locked_until = NULL;"
+```
 
 ## Emergency MFA disable (break-glass)
 
-**When to use.** An operator (typically an admin) has lost both their
-authenticator device AND every recovery code they were issued — or has
-been locked out by MFA enforcement (the IdP not asserting `amr`, a sole
-admin who could not enroll). They cannot log in, and the Settings →
-Multi-Factor Authentication panel is gated behind login so the dashboard
-path is unreachable.
+**When to use.** An operator has lost both their authenticator device *and*
+every recovery code — or has been locked out by MFA enforcement (the IdP not
+asserting `amr`, a sole admin who could not enroll). The Settings → MFA panel
+is behind login, so the dashboard path is unreachable.
 
-### Preferred: the `--mfa-reset` CLI (audited, #1226)
+### The `--mfa-reset` CLI (audited)
 
-`yuzu-server --mfa-reset <username>` clears the user's MFA enrollment and
-exits **without starting the server**. Unlike the manual SQL below it
-**writes an audit row** (`mfa.reset.breakglass`, principal = the OS
-account that ran it) — so the break-glass is captured in `audit.db`, not
-just your change-management system.
+`yuzu-server --mfa-reset <username>` clears the user's MFA enrolment and exits
+**without starting the server**. It writes an audit row
+(`mfa.reset.breakglass`, principal = the OS account that ran it).
 
-**Authorisation — read the threat model.** `--mfa-reset` is a deliberate
-break-glass primitive: it strips a user's second factor with **no MFA,
-admin-password, or token check of its own**. The *only* enforced control
-is OS-level access — anyone who can execute a `yuzu-server` binary with
-**read access to `data-dir/auth.db`** can downgrade **any** user
-(including the sole admin) to password-only auth. It does not verify it is
-*actually* running as the service account; "run as the service account" is
-the operational expectation, not a code-enforced gate. Treat host access
-to `auth.db` as equivalent to MFA-reset authority for every account, and
-protect it accordingly:
-
-- Run on the server host as the service account that owns `auth.db`
-  (typically `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent`; see
-  `docs/agent-privilege-model.md`).
-- Keep `data-dir` (and `auth.db`) `0700`/`0600`, owned by the service
-  account, so unprivileged local users cannot read it and thus cannot
-  wield the primitive.
-- Gate the invocation behind a narrow `sudoers` entry (a dedicated
-  break-glass group, ideally with a separate approver) rather than broad
-  `sudo` — the audit principal is the real OS identity (`getpwuid` /
-  `GetUserNameA`, **not** the forgeable `$USER`/`$USERNAME` env var), so a
-  tight sudoers entry gives you trustworthy attribution.
-
-**Detective control — alert on the audit action.** Because the CLI exits
-without starting the server, it emits **no Prometheus metric** — the
-`audit.db` row is the detective signal. Configure your SIEM/log pipeline
-to raise a high-severity alert whenever an `mfa.reset.breakglass` action
-appears in `audit_events`; an unexpected one is an authentication-downgrade
-event and should page on-call.
-
-No TLS/HTTPS flags are required (the command never serves).
-
-**Audit is mandatory and fail-closed (#1226 hardening).** The CLI opens
-and verifies `audit.db` is **writable before** it clears any MFA; if the
-audit store is unavailable (disk full, permissions, corruption) it
-**refuses to proceed and exits non-zero** rather than silently clearing a
-second factor with no evidence. If the audit write fails *after* the clear
-(e.g. disk fills mid-operation) it also exits non-zero with a loud
-"record this reset manually NOW" message. A `{"status":"ok",...}` line on
-stdout with exit code 0 therefore means an audit row **did** persist.
+**It needs the Postgres DSN and the keys directory.** This changed with the
+Postgres migration and is the most common reason the command fails today:
 
 ```bash
 sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
-  --data-dir /var/lib/yuzu \
+  --postgres-dsn "$YUZU_POSTGRES_DSN" \
+  --ca-dir /etc/yuzu/certs \
   --mfa-reset alice
 # {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
 ```
 
-It is safe to run while the server is up: the CLI opens its **own**
-`auth.db` connection (it does not talk to the running server process), and
-the clear is a single atomic transaction — SQLite's WAL + FULLMUTEX
-serialise it against the server's concurrent reads/writes. The user can now
-sign in with their password alone;
-under MFA enforcement they will be walked through enrollment at next
-login. Still record the action (operator, time, reason) in your
-change-management system — the `audit.db` row plus that record form the
-SOC 2 CC6.6 break-glass evidence chain.
+- `--postgres-dsn` is **required** — without it the one-shot exits non-zero
+  with "requires the Postgres auth store". The mandatory audit row is written
+  through the SAME `--postgres-dsn` (ADR-0040: audit is Postgres-backed,
+  schema `audit_store`) — there is no `<data-dir>/audit.db` write path
+  anymore. Point `--postgres-dsn` at the real production database or the row
+  lands somewhere nobody is looking (SOC 2 CC6.6), same risk as before, wrong
+  flag.
+- `--data-dir` is not needed. There is no legacy `audit.db` backfill gate any
+  more (retired by the ADR-0009 hard cutover, 2026-09-04), so the one-shot also
+  works on a database that has never seen a server boot. If a data directory
+  is set (`--data-dir` or `YUZU_DATA_DIR`), it is still created and checked
+  writable, and a failure there aborts the command.
+- `--ca-dir` is required whenever the KEK is not in the platform default
+  location, because the command builds the full auth stack (pool → key
+  provider → codec → AuthDB) exactly as the server does.
+- No TLS/HTTPS flags are needed; the command never serves.
 
-### Fallback: direct SQL (no built binary available)
+**Authorisation — read the threat model.** `--mfa-reset` strips a second factor
+with **no MFA, admin-password, or token check of its own**. The only enforced
+control is OS-level access: anyone who can run a `yuzu-server` binary with the
+DSN and the keys directory can downgrade **any** account, including the sole
+admin. It does not verify it is running as the service account — that is an
+operational expectation, not a code-enforced gate. Treat *DSN + keys-directory
+access* as equivalent to MFA-reset authority over every account:
 
-If a `yuzu-server` binary is not available on the host, the equivalent
-DB surgery is below. **This path does NOT write an audit row** — record
-it manually.
+- Run on the server host as the service account (`_yuzu` / `yuzu` /
+  `NT SERVICE\YuzuAgent`; see `docs/agent-privilege-model.md`).
+- Keep the keys directory `0700` and its contents `0600`, service-account
+  owned. Keep the DSN out of world-readable config and out of `ps` (prefer
+  `YUZU_POSTGRES_DSN` in a `0600` environment file).
+- Gate the invocation behind a narrow `sudoers` entry — ideally a dedicated
+  break-glass group with a separate approver. The audit principal is the real
+  OS identity (`getpwuid`/`GetUserNameA`, **not** the forgeable `$USER`), so a
+  tight sudoers entry gives trustworthy attribution.
+
+**Audit is mandatory and fail-closed.** The CLI verifies the audit store is
+writable *before* clearing any MFA, and refuses to proceed if it is not — the
+whole point is to replace the unaudited SQL path. A `{"status":"ok",…}` line
+with exit code 0 means an audit row persisted.
+
+**Detective control.** Because the CLI exits without serving, it emits no
+Prometheus metric — the audit row is the only signal. Alert on
+`mfa.reset.breakglass` in `audit_events`; an unexpected one is an
+authentication-downgrade event and should page on-call.
+
+It is safe to run while the server is up: the one-shot opens its own pool and
+does not talk to the running process.
+
+### Fallback: direct SQL
+
+Only when no `yuzu-server` binary is available on the host. **Writes no audit
+row** — record it manually.
 
 ```bash
-# 1. Stop the server so SQLite is not contended (optional but safer).
-sudo systemctl stop yuzu-server
-
-# 2. Backup auth.db BEFORE the surgery.
-sudo cp /var/lib/yuzu/auth.db /var/lib/yuzu/auth.db.before-mfa-rescue.$(date +%s)
-
-# 3. Clear the MFA state for the locked-out user.
-sudo -u _yuzu sqlite3 /var/lib/yuzu/auth.db <<'SQL'
-UPDATE users
-   SET mfa_totp_secret = NULL,
-       mfa_enrolled_at = NULL,
-       mfa_disabled_at = CURRENT_TIMESTAMP,
+psql "$YUZU_POSTGRES_DSN" <<'SQL'
+UPDATE auth.users
+   SET mfa_totp_secret  = NULL,
+       mfa_enrolled_at  = NULL,
+       mfa_disabled_at  = now(),
        mfa_last_counter = 0
  WHERE username = 'alice';
-DELETE FROM mfa_recovery_codes WHERE username = 'alice';
-SELECT changes();
+DELETE FROM auth.mfa_recovery_codes WHERE username = 'alice';
 SQL
-
-# 4. Restart the server.
-sudo systemctl start yuzu-server
 ```
 
-The operator can now log in with their password alone and (optionally)
-re-enroll via Settings → Multi-Factor Authentication.
-
-**Procedure (Windows).** Same SQL, run from an elevated PowerShell as
-the service account against `C:\ProgramData\Yuzu\auth.db`. Stop the
-`YuzuServer` service first; restart with `Start-Service YuzuServer`.
-
-**Audit trail.** Because this bypasses the audit-emitting code path,
-manually record:
-
-- Operator name who performed the disable
-- Target username
-- Timestamp
-- Reason (lost device, locked out, etc.)
-- Approval reference (change ticket, on-call paging record)
-
-Per SOC 2 CC6.6 the break-glass procedure is itself an auditable event
-and the manual record is the evidence chain.
+Clearing the secret needs no KEK (you are writing NULL, not reading
+ciphertext), so this works even when the KEK is unavailable.
 
 ## Break-glass arm (IdP outage under `--auth-mode=sso-only`)
 
-When the server runs in hardened mode (`--auth-mode=sso-only`), local-password
-login is disabled fleet-wide and only OIDC SSO mints a session. If the IdP is
-**down**, the single configured `--break-glass-user` is the recovery path — but
-it is dormant until **armed**, and arming is an out-of-band host operation (it
-must NOT depend on a session, because the IdP being down is exactly why you need
-it). This is the analog of `--mfa-reset` and follows the same audited contract
-(#1226).
+Under `--auth-mode=sso-only` only an SSO provider (OIDC or SAML) mints a session. If the IdP is down, the
+`--break-glass-user` account is the way back in — but it is exempt **only while
+armed**, and arming is an out-of-band host CLI operation so it works when the
+IdP does not.
 
 ```bash
-# On the server host, as the service account (Linux example):
 sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
-  --data-dir /var/lib/yuzu \
+  --postgres-dsn "$YUZU_POSTGRES_DSN" \
+  --ca-dir /etc/yuzu/certs \
   --break-glass-user alice \
   --break-glass-arm
-# → arms `alice` for --break-glass-window-secs (default 24h, auto-expiring),
-#   prints {"status":"ok",...,"armed_until":"..."} and EXITS (does not serve).
+# → arms the named --break-glass-user for --break-glass-window-secs
+#   (default 24h, auto-expiring), prints {"status":"ok",…,"armed_until":"…"}
+#   and EXITS without serving.
 ```
 
-Contract / safeguards:
+`--break-glass-arm` **requires** `--break-glass-user` (or the
+`YUZU_BREAK_GLASS_USER` env var) to name the account. It is a CLI/env option
+only — it does not come from `yuzu-server.cfg`, so the one-shot must repeat
+whatever the running service passes in its unit file. Omit it and the command
+exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
+arming nothing.
 
-- **Prerequisite (enforced):** the break-glass account must exist and have **MFA
-  enrolled** — the arm refuses (exit non-zero) otherwise. A break-glass account
-  with no second factor is never allowed.
-- **Audited:** writes an `auth.breakglass.armed` audit row attributed to the
-  **kernel OS identity** that ran the CLI (not the forgeable `USER` env var),
-  `principal_role=break-glass`. The audit store is verified **writable before**
-  the arm mutates — if it isn't, the arm refuses, so the exemption is never
-  granted without a record.
-- **Login still needs MFA.** After arming, `alice` can log in locally under
-  sso-only, but the mandatory TOTP challenge still runs. There is **no metric**
-  for the arm itself — the `auth.breakglass.armed` audit row is the detective
-  signal; configure your SIEM to alert on it.
-- **Auto-expiry, no early-disarm command.** The window auto-expires (no
-  `--break-glass-disarm` yet — tracked follow-up). To close it early, you can
-  reduce exposure by restoring SSO; the exemption lapses on its own.
+Arming is fail-closed on audit: the audit store is checked reachable and
+migrated *before* the mutate, and if the row fails to persist afterwards the
+arm is rolled back (the account ends up NOT armed). If the rollback also fails,
+the command exits non-zero and says so on stderr: the account may still be
+armed, with no audit row. That makes the `--postgres-dsn` note above
+load-bearing here too — point it at the real production database, or you
+will arm the glass and record it somewhere nobody is looking.
 
-> **Availability — the break-glass account is exempt from lockout under
-> sso-only.** To stop an attacker who learns the break-glass username from
-> spraying wrong passwords to keep the account locked (and the escape hatch
-> unreachable) during the very outage it exists for, the configured
-> `--break-glass-user` is **not** subject to failed-login lockout while
-> `--auth-mode=sso-only` (governance Hermes-F / UP-13). This is safe because the
-> account still requires its **second factor** (a guessed password alone grants
-> nothing), and while *un-armed* the password is never even evaluated. Every
-> wrong attempt is still audited as `auth.login_failed` and per-IP rate-limited,
-> so brute-force activity stays visible. In **standard** mode the same account
-> keeps normal lockout. (Pick a non-guessable break-glass username regardless,
-> and alert on `yuzu_auth_local_disabled_total{target=break_glass}` +
-> `auth.login_failed` for it.)
+Same flag requirements and the same threat model as `--mfa-reset` above. The
+arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS
+identity; the subsequent login is audited as `auth.breakglass.login` and
+increments `yuzu_auth_break_glass_login_total`. The window auto-expires — you
+do not need to disarm.
 
-## Locked out by MFA enforcement misconfiguration (PR 3)
+The break-glass account **must** have MFA enrolled: boot fails closed if it
+does not, and an un-enrolled break-glass account is hard-denied at login
+(enrolment is never offered on that path, since that would defeat the second
+factor).
 
-`--mfa-enforcement=admin-only|required` (PR 3) can lock operators out in
-two ways that are NOT "lost device" — they are policy/IdP
-misconfigurations. The recovery is the same first move: **bring the server
-back up in `optional` mode**, fix the underlying state, then re-enable.
+To enrol the break-glass account, restart the server with `--auth-mode=standard`
+and sign in as that account. This re-enables local-password login for every local
+account, so keep the window short: on bare metal consider `--web-address
+127.0.0.1`; in a container, restrict the published port instead (the image binds
+0.0.0.0). The break-glass lockout exemption does not apply in standard mode, so
+failed password attempts can lock the account for `--auth-lockout-window-secs`.
+Only with the listener restricted as above, consider `--auth-lockout-threshold=0`
+for the window (it disables throttling for every local account); otherwise an SSO
+admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
+Under
+`--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
+Settings → Multi-Factor Authentication, which needs the admin role. For a
+non-admin break-glass account, also pass `--mfa-enforcement=required` for that
+restart, and note that it applies to every user for the window: un-enrolled local
+users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
+step-up. Then restore `--auth-mode=sso-only` and your usual `--mfa-enforcement`.
+If the arm has lapsed by then and you still need break-glass access (the IdP is
+still down), re-run `--break-glass-arm`; do not re-arm for a planned rotation.
+The mode switch itself writes no audit row, so record the window in a change
+ticket; the evidence is the startup WARN that `--break-glass-user` is ignored under
+standard mode, the missing sso-only boot banner, the
+`auth.login` and `mfa.enroll.verified` rows inside the window, and the banner
+returning on the final restart.
 
-**Symptom A — SSO users can't reach high-risk endpoints.** Your IdP does
-not assert an `amr` claim containing a recognized MFA method, so OIDC
-sessions are never seeded with an MFA proof. (Note: such sessions still
-*pass* the step-up gate — they are not blocked from normal operation — so
-this only bites if you expected SSO step-up to enforce MFA.) Fix the IdP's
-authorization-server policy to emit `amr` (Entra: `mfa`; others: `otp` /
-`hwk` / etc.), then re-test. No server surgery needed.
+To rotate the break-glass TOTP, clear it first with `--mfa-reset <user>` (an
+enrolled account gets a challenge at sign-in, not enrolment, and cannot re-enrol
+from Settings), then follow the enrolment sequence above. Do not restart under
+sso-only between the reset and the re-enrolment: boot refuses until the account
+is enrolled again.
 
-**Symptom B — the sole admin can't complete login-time enrollment.** A
-fresh single-admin deployment was started straight into `required`, and
-the admin's enrollment-pending token expired (default
-`--mfa-login-pending-secs=120`) before they scanned the QR, OR
-`mfa_init_enrollment` failed transiently. No session was minted and the
-dashboard is unreachable.
+## Locked out by MFA enforcement misconfiguration
 
-**Recovery procedure.**
+`--mfa-enforcement=required` (or `admin-only`) with no enrolled accounts locks
+everyone out. Enforcement is read from configuration at startup, not from the
+database, so the fix is a restart with the flag relaxed — no data surgery:
 
 ```bash
-# 1. Restart the server with enforcement relaxed. This re-seeds the
-#    in-memory config from the flag/env; auth.db is untouched.
-sudo systemctl stop yuzu-server
-sudo systemctl set-environment YUZU_MFA_ENFORCEMENT=optional   # or edit the unit's flag
-sudo systemctl start yuzu-server
+# 1. Relax enforcement and restart. The auth schema is untouched.
+sudo systemctl edit yuzu-server     # --mfa-enforcement=optional
+sudo systemctl restart yuzu-server
 
 # 2. Log in with password alone, enroll via Settings → Multi-Factor
-#    Authentication (this issues a fresh secret + recovery codes), and
-#    SAVE the recovery codes.
+#    Authentication, and SAVE the recovery codes.
 
-# 3. Once the required accounts are enrolled, restore enforcement and
-#    restart.
-sudo systemctl unset-environment YUZU_MFA_ENFORCEMENT          # back to the unit default
-sudo systemctl restart yuzu-server
+# 3. Restore enforcement and restart.
 ```
 
-On Windows, edit the service's `YUZU_MFA_ENFORCEMENT` environment variable
-(or the `--mfa-enforcement` argument in the service definition), then
-`Restart-Service YuzuServer`.
+## What you cannot recover from
 
-**Prevention.** Enroll the admin under `optional` *before* switching to
-`required`, and validate your IdP's `amr` assertion before relying on
-enforcement for SSO users. See `docs/user-manual/upgrading.md` §
-"⚠️ Breaking: `--mfa-enforcement` now enforces".
+- **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
+  for the admin account on first boot. If both are gone, run
+  `yuzu-server --first-run-setup` to create a new admin interactively and write
+  a fresh config.
 
-## Post-restore migration check
+- <a id="kek-permanently-lost"></a>**KEK permanently lost.** Painful, but not a
+  total lockout — the blast radius is narrower than it first looks:
+  - **Admin sign-in survives.** MFA recovery codes are verify-only PBKDF2
+    hashes and need no KEK. Sign in with a recovery code, then re-enroll TOTP.
+  - **Password login is unaffected** — password hashes are PBKDF2, not
+    envelope-encrypted.
+  - **TOTP secrets are unrecoverable.** Every enrolled user must re-enroll.
+    Clear the dead ciphertext with the [fallback SQL](#fallback-direct-sql)
+    above (writing NULL needs no key), then have users re-enroll.
+  - Any future envelope-encrypted column follows the same rule: re-enrollable
+    or re-issuable by design, which is why ADR-0010 requires it.
 
-If you restore `auth.db` from a backup taken before the v2 schema
-migration (the MFA migration), the binary will boot but every MFA
-column will be absent. The MigrationRunner runs the v2 migration on the
-first AuthDB open after the restore so the columns are added back, but
-any user who had MFA enrolled BEFORE the backup was taken loses their
-TOTP enrollment silently — the columns are re-created empty. After
-restoring a pre-v2 backup:
+  Do **not** delete the old key file until you are certain no backup you intend
+  to honour still contains blobs wrapped under it.
 
-```bash
-sudo -u _yuzu sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username FROM users WHERE mfa_enrolled_at IS NOT NULL;"
-```
-
-If the result is empty AND your pre-incident state had enrolled users,
-notify them to re-enroll. Document the data-loss event in the change
-record.
-
-## Backup encryption requirement
-
-`auth.db` contains the raw TOTP secret bytes (PR1 ships plaintext-at-
-rest with the 0600 file mode as the only compensating control;
-encryption-at-rest via AES-256-GCM is a planned follow-up). Backups MUST
-be encrypted at rest if the backup store has any threat model that
-includes exfiltration — restic, BorgBackup, or `gpg --symmetric` all
-satisfy this. SOC 2 CC6.1 audit will flag unencrypted backups of
-`auth.db` as a finding even though the file itself is 0600 on the live
-host.
+- **Backups whose encryption key is lost.** Standard; nothing Yuzu-specific.
 
 ## Cross-references
 
-- File location convention: `docs/user-manual/server-admin.md` §
-  Configuration Files.
-- AuthDB schema and migration policy: `docs/auth-architecture.md` § AuthDB.
-- MFA design: `docs/auth-mfa-design.md`.
-- systemd unit definition: `deploy/systemd/yuzu-server.service`.
+- `docs/auth-architecture.md` — auth model, hardened mode, break-glass design
+- `docs/user-manual/server-admin.md` — KEK lifecycle, rotation, secrets at rest
+- `docs/adr/0006-server-postgresql-substrate.md` — fail-closed substrate
+- `docs/adr/0010-secrets-at-rest-envelope-encryption.md` — envelope encryption
+- `docs/postgres-store-playbook.md` — store authoring contract
+- `docs/agent-privilege-model.md` — service accounts and sudoers
+- `docs/ops-runbooks/engine-principal-store-recovery.md` — `engine:` namespace

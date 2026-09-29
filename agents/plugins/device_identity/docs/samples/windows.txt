@@ -1,0 +1,14 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash fdf67a9b8831
+== action=device_name
+device_name|DESKTOP-04DNSIG
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=domain
+domain|WORKGROUP
+joined|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ou
+ou|N/A
+[result_status] UNDECLARED / UNKNOWN / 
+

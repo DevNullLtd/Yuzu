@@ -1,8 +1,14 @@
 /**
  * test_instruction_store_signing.cpp — #1073 / W7.4 sibling-gap closure.
  *
- * Covers the Ed25519 signature gate added to
- * `InstructionStore::import_definition_json`:
+ * Migrated-to-Postgres store (ADR-0058, ADR-0012 §1 authoritative/fail-hard). PG-gated: skips
+ * when YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp skip-vs-fail
+ * contract). Uses the pre-migrated PgTestTemplate variant (docs/postgres-store-playbook.md
+ * step 7) — these tests only exercise the signature gate, not migration/construction itself.
+ *
+ * Covers the Ed25519 signature gate on `InstructionStore::import_definition_json` — unchanged in
+ * intent and behaviour by the Postgres migration (the gate is pure/storage-independent,
+ * `ProductPackStore::verify_signature`); only the store harness changed:
  *
  *   - Signed import with valid signature is ACCEPTED (positive crypto proof).
  *   - Signed import with TAMPERED yaml_source is REJECTED.
@@ -26,6 +32,8 @@
 
 #include "instruction_store.hpp"
 
+#include "pg/pg_pool.hpp"
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -38,8 +46,19 @@
 #include <string_view>
 
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+yuzu::test::PgTestTemplate instruction_store_signing_tpl{
+    "instrstoresign", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("instruction_store_signing template: store failed to "
+                                     "migrate");
+    }};
 
 struct Ed25519Pair {
     std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> pkey{nullptr, &EVP_PKEY_free};
@@ -123,7 +142,10 @@ constexpr const char* kSampleYaml = "---\n"
 
 TEST_CASE("InstructionStore: signed import with valid signature is accepted",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     REQUIRE(store.require_signed_definitions()); // default
 
     auto kp = generate_ed25519();
@@ -137,14 +159,18 @@ TEST_CASE("InstructionStore: signed import with valid signature is accepted",
     // The definition is now persisted; yaml_source carried through.
     auto got = store.get_definition(*r);
     REQUIRE(got.has_value());
-    CHECK(got->yaml_source == kSampleYaml);
+    REQUIRE(got->has_value());
+    CHECK((*got)->yaml_source == kSampleYaml);
 }
 
 // ── Negative crypto proofs ───────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: signed import with tampered yaml_source is rejected",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     auto kp = generate_ed25519();
     // Sign the original yaml...
     auto sig = sign_hex(kp.pkey.get(), kSampleYaml);
@@ -159,7 +185,10 @@ TEST_CASE("InstructionStore: signed import with tampered yaml_source is rejected
 
 TEST_CASE("InstructionStore: signed import with wrong public key is rejected",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     auto signer = generate_ed25519();
     auto attacker = generate_ed25519();
 
@@ -174,7 +203,10 @@ TEST_CASE("InstructionStore: signed import with wrong public key is rejected",
 
 TEST_CASE("InstructionStore: signature without yaml_source is rejected",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     auto kp = generate_ed25519();
     auto sig = sign_hex(kp.pkey.get(), "");
     // Envelope with signature + publicKey but empty yaml_source — no signed
@@ -188,7 +220,10 @@ TEST_CASE("InstructionStore: signature without yaml_source is rejected",
 
 TEST_CASE("InstructionStore: incomplete signing metadata is rejected",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     auto kp = generate_ed25519();
     auto sig = sign_hex(kp.pkey.get(), kSampleYaml);
 
@@ -210,7 +245,10 @@ TEST_CASE("InstructionStore: incomplete signing metadata is rejected",
 
 TEST_CASE("InstructionStore: unsigned import rejected when signature enforcement is on",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     REQUIRE(store.require_signed_definitions()); // secure default
     auto env = build_envelope("def.unsigned", kSampleYaml);
     auto r = store.import_definition_json(env);
@@ -220,7 +258,10 @@ TEST_CASE("InstructionStore: unsigned import rejected when signature enforcement
 
 TEST_CASE("InstructionStore: unsigned import accepted when signature enforcement is off",
           "[instruction_store][1073]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     store.set_require_signed_definitions(false);
     CHECK_FALSE(store.require_signed_definitions());
 
@@ -234,7 +275,10 @@ TEST_CASE("InstructionStore: opt-out does NOT bypass active-signature verificati
     // Confirms `--allow-unsigned-definitions` only widens the unsigned-path
     // policy; a signed import with a BAD signature still fails. Mirrors
     // ProductPackStore's parallel guarantee from #802 governance.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     store.set_require_signed_definitions(false);
 
     auto kp = generate_ed25519();
@@ -254,7 +298,10 @@ TEST_CASE("InstructionStore: import_definition_json_trusted bypasses signature g
     // The bundled-content boot seed in server.cpp uses this variant — the
     // bytes are authenticated by build-time binary linkage, not runtime
     // signature, so the gate must not apply.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     REQUIRE(store.require_signed_definitions()); // gate is hot
 
     auto env = build_envelope("def.trusted.unsigned", kSampleYaml);
@@ -266,7 +313,10 @@ TEST_CASE("InstructionStore: import_definition_json_trusted bypasses signature g
 
 TEST_CASE("InstructionStore: set_require_signed_definitions is idempotent and round-trips",
           "[instruction_store][1073]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     store.set_require_signed_definitions(true);
     CHECK(store.require_signed_definitions());
 
@@ -285,7 +335,10 @@ TEST_CASE("InstructionStore: signature field wrong JSON type rejected with typed
     // because extract_str returned empty for non-strings. Now distinguished
     // as its own error so attacker-corrupted payloads surface the actual
     // type bug instead of a misleading "unsigned" rejection.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     nlohmann::json j;
     j["id"] = "def.badtype";
     j["name"] = "badtype";
@@ -299,7 +352,10 @@ TEST_CASE("InstructionStore: signature field wrong JSON type rejected with typed
 
 TEST_CASE("InstructionStore: publicKey field wrong JSON type rejected",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     nlohmann::json j;
     j["id"] = "def.badpub";
     j["name"] = "badpub";
@@ -316,7 +372,10 @@ TEST_CASE("InstructionStore: null signing field treated as absent (matches exist
     // null is semantically "no value present" — distinct from a wrong-type
     // scalar. Falls into the absent branch, then into the unsigned-policy
     // path. Pin the contract so a json-lib bump can't silently flip it.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     store.set_require_signed_definitions(false);
     // Use the full envelope helper so create_definition's name/type/plugin
     // requirements are satisfied — the test is about NULL signing fields,
@@ -338,7 +397,10 @@ TEST_CASE("InstructionStore: oversized signature_hex rejected before crypto veri
     // field and trigger a hex_decode allocation peak inside
     // ProductPackStore::verify_signature. The early length check returns
     // a typed error AND short-circuits the allocation.
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     nlohmann::json j;
     j["id"] = "def.oversize.sig";
     j["name"] = "oversize-sig";
@@ -352,7 +414,10 @@ TEST_CASE("InstructionStore: oversized signature_hex rejected before crypto veri
 
 TEST_CASE("InstructionStore: oversized publicKey_hex rejected before crypto verify",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     nlohmann::json j;
     j["id"] = "def.oversize.pub";
     j["name"] = "oversize-pub";
@@ -366,7 +431,10 @@ TEST_CASE("InstructionStore: oversized publicKey_hex rejected before crypto veri
 
 TEST_CASE("InstructionStore: short signature_hex rejected (catches truncation bugs)",
           "[instruction_store][1073][security]") {
-    InstructionStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_signing_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
     nlohmann::json j;
     j["id"] = "def.short.sig";
     j["name"] = "short-sig";

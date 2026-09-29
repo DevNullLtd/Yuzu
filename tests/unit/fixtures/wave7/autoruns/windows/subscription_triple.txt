@@ -1,0 +1,55 @@
+
+FilterCount=1 ConsumerCount=1 BindingCount=1
+
+
+CreatorSID            : {1, 2, 0, 0...}
+EventAccess           : 
+EventNamespace        : root\cimv2
+Name                  : SCM Event Log Filter
+Query                 : select * from MSFT_SCMEventLogEvent
+QueryLanguage         : WQL
+PSComputerName        : 
+CimClass              : ROOT/subscription:__EventFilter
+CimInstanceProperties : {CreatorSID, EventAccess, EventNamespace, Name...}
+CimSystemProperties   : Microsoft.Management.Infrastructure.CimSystemProperties
+
+
+
+
+
+CreatorSID               : {1, 2, 0, 0...}
+MachineName              : 
+MaximumQueueSize         : 
+Category                 : 0
+EventID                  : 0
+EventType                : 1
+InsertionStringTemplates : {}
+Name                     : SCM Event Log Consumer
+NameOfRawDataProperty    : 
+NameOfUserSIDProperty    : sid
+NumberOfInsertionStrings : 0
+SourceName               : Service Control Manager
+UNCServerName            : 
+PSComputerName           : 
+CimClass                 : ROOT/subscription:NTEventLogEventConsumer
+CimInstanceProperties    : {CreatorSID, MachineName, MaximumQueueSize, Category...}
+CimSystemProperties      : Microsoft.Management.Infrastructure.CimSystemProperties
+
+
+
+
+
+Consumer                : NTEventLogEventConsumer (Name = "SCM Event Log Consumer")
+CreatorSID              : {1, 2, 0, 0...}
+DeliverSynchronously    : False
+DeliveryQoS             : 
+Filter                  : __EventFilter (Name = "SCM Event Log Filter")
+MaintainSecurityContext : False
+SlowDownProviders       : False
+PSComputerName          : 
+CimClass                : ROOT/subscription:__FilterToConsumerBinding
+CimInstanceProperties   : {Consumer, CreatorSID, DeliverSynchronously, DeliveryQoS...}
+CimSystemProperties     : Microsoft.Management.Infrastructure.CimSystemProperties
+
+
+

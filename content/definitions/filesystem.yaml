@@ -49,10 +49,23 @@ spec:
     columns:
       - name: exists
         type: bool
+        description: Whether the path exists on the endpoint.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: type
         type: string
+        description: >
+          The kind of filesystem entry found. Only emitted when exists is
+          true.
+        values: [file, directory, other]
+        example: file
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: >-
+          Size in bytes for a file entry; 0 for a directory or an "other" entry. Only emitted when exists is true. Values: integer (bytes).
+        example: "1405"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Check if path exists: ${path}"
 
@@ -117,10 +130,20 @@ spec:
     columns:
       - name: entry_name
         type: string
+        description: 'Filename of one directory entry (not a full path). Values: free text.'
+        example: hosts
+        platforms: [windows, linux, darwin]
       - name: entry_type
         type: string
+        description: The entry's kind.
+        values: [file, directory, symlink, other]
+        example: file
+        platforms: [windows, linux, darwin]
       - name: entry_size
         type: int64
+        description: 'Size in bytes; 0 for directories and symlinks. Values: integer (bytes).'
+        example: "1405"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List directory: ${path}"
 
@@ -193,10 +216,20 @@ spec:
     columns:
       - name: hash
         type: string
+        description: "Hex-encoded digest of the file's contents. Values: free text (hex digest)."
+        example: "9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d"
+        platforms: [windows, linux, darwin]
       - name: algorithm
         type: string
+        description: The hash algorithm actually used.
+        values: [sha256, sha1]
+        example: sha256
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: 'File size in bytes at the time of hashing. Values: integer (bytes).'
+        example: "1405"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Compute ${algorithm} hash of ${path}"
 
@@ -280,12 +313,26 @@ spec:
     columns:
       - name: line_number
         type: int32
+        description: '1-based line number of this returned line. Values: integer.'
+        example: "1"
+        platforms: [windows, linux, darwin]
       - name: content
         type: string
+        description: >-
+          The line's text, with a trailing CRLF's carriage return stripped. Values: free text.
+        example: "# Copyright (c) 1993-2009 Microsoft Corp."
+        platforms: [windows, linux, darwin]
       - name: total_lines
         type: int32
+        description: >-
+          Total number of lines in the file, counted past the returned window. Values: integer.
+        example: "37"
+        platforms: [windows, linux, darwin]
       - name: file_size
         type: int64
+        description: 'File size in bytes. Values: integer (bytes).'
+        example: "1405"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Read file ${path} (offset=${offset}, limit=${limit})"
 
@@ -369,8 +416,14 @@ spec:
     columns:
       - name: path
         type: string
+        description: 'Full path to the created temporary file. Values: free text (path).'
+        example: "D:\\yuzu-dev\\tmp\\yuzu-964a901bfe197402d93f51a7653b0697.tmp"
+        platforms: [windows, linux, darwin]
       - name: persist
         type: bool
+        description: Echoes the persist parameter — whether the file was kept.
+        example: "true"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Create temporary file (prefix=${prefix}, suffix=${suffix})"
 
@@ -446,8 +499,15 @@ spec:
     columns:
       - name: path
         type: string
+        description: 'Full path to the created temporary directory. Values: free text (path).'
+        example: "D:\\yuzu-dev\\tmp\\yuzu-3849a33da8fc555d407ac0f2c67356f9"
+        platforms: [windows, linux, darwin]
       - name: persist
         type: bool
+        description: >
+          Echoes the persist parameter — whether the directory was kept.
+        example: "true"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Create temporary directory (prefix=${prefix})"
 
@@ -513,20 +573,51 @@ spec:
     columns:
       - name: sddl
         type: string
+        description: >-
+          Windows-only. SDDL string encoding the owner and DACL. Absent on POSIX. Values: free text (SDDL).
+        example: "O:BAD:AI(A;;FA;;;SY)(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
+        platforms: [windows]
       - name: ace_type
         type: string
+        description: >
+          Windows-only. One access-control-entry row's effect; the plugin
+          emits one ace row per DACL entry.
+        values: [allow, deny, other]
+        example: allow
+        platforms: [windows]
       - name: account
         type: string
+        description: >-
+          Windows-only. The DOMAIN\account the ACE names, or the SID string when the account cannot be resolved. Values: free text.
+        example: "NT AUTHORITY\\SYSTEM"
+        platforms: [windows]
       - name: access_mask
         type: string
+        description: "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer."
+        example: "0x001f01ff"
+        platforms: [windows]
       - name: owner
         type: string
+        description: >-
+          POSIX-only. The file's owning user name, or the numeric uid when it cannot be resolved. Values: free text.
+        example: root
+        platforms: [linux, darwin]
       - name: group
         type: string
+        description: >-
+          POSIX-only. The file's owning group name, or the numeric gid when it cannot be resolved. Values: free text.
+        example: wheel
+        platforms: [linux, darwin]
       - name: permissions
         type: string
+        description: 'POSIX-only. rwx permission string for owner/group/other. Values: 9-character rwx string.'
+        example: "rw-r--r--"
+        platforms: [linux, darwin]
       - name: mode
         type: string
+        description: 'POSIX-only. Octal permission bits. Values: 4-digit octal.'
+        example: "0644"
+        platforms: [linux, darwin]
 
   readablePayload: "Get ACL/permissions for ${path}"
 
@@ -552,18 +643,26 @@ apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
   id: device.filesystem.get_signature
-  displayName: Check Authenticode Signature
-  version: 0.3.0
+  displayName: Check Code Signature
+  version: 0.4.0
   description: >
-    Verify the Authenticode digital signature of a Windows executable
-    or DLL. Uses WinVerifyTrust to check the signature chain. Returns
-    the signature status (valid, unsigned, distrusted, untrusted).
-    Windows-only; returns error on Linux/macOS.
-  tags: [filesystem, security, compliance, authenticode]
+    Verify the code signature of an executable, DLL, or app bundle.
+    On Windows, uses WinVerifyTrust to check the Authenticode signature
+    chain (valid, unsigned, distrusted, untrusted). On macOS, runs
+    `codesign --verify --deep --strict` and reports an honest macOS
+    signature status (valid, unsigned, invalid, unknown) — a different
+    vocabulary from Authenticode, since codesign/Gatekeeper model trust
+    differently than WinVerifyTrust. On macOS, `valid` means the code
+    signature's seal is INTACT (integrity: the binary/bundle is unmodified
+    since signing) — it does NOT mean the signer is trusted, notarized, or
+    accepted by Gatekeeper; an ad-hoc or self-signed binary reports `valid`.
+    This is a weaker assurance than the Windows `valid`, which also validates
+    the certificate chain to a trusted root. Returns error on Linux.
+  tags: [filesystem, security, compliance, authenticode, codesign]
 
 spec:
   type: question
-  platforms: [windows]
+  platforms: [windows, darwin]
 
   execution:
     plugin: filesystem
@@ -577,7 +676,7 @@ spec:
       path:
         type: string
         displayName: File Path
-        description: The executable or DLL to verify.
+        description: The executable, DLL, or app bundle to verify.
         validation:
           maxLength: 4096
       base_dir:
@@ -592,8 +691,12 @@ spec:
     columns:
       - name: signature_status
         type: string
+        description: >-
+          Signature verdict. On Windows: valid/unsigned/distrusted/untrusted (Authenticode chain trust). On macOS: valid/unsigned/invalid/unknown — here `valid` means the code signature's seal is intact (INTEGRITY only: unmodified since signing), NOT that the code is trusted or notarized; an ad-hoc/self-signed binary reports `valid`. Values: windows: valid, unsigned, distrusted, untrusted, security_settings_blocked, error_0x<hex>; macos: valid, unsigned, invalid, unknown.
+        example: unsigned
+        platforms: [windows, darwin]
 
-  readablePayload: "Check Authenticode signature of ${path}"
+  readablePayload: "Check code signature of ${path}"
 
   gather:
     ttlSeconds: 300
@@ -606,7 +709,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: 0.3.0
+    minAgentVersion: 0.4.0
     requiredPlugins: [filesystem]
 
 status:
@@ -667,10 +770,20 @@ spec:
     columns:
       - name: path
         type: string
+        description: 'Full path of a file whose SHA-256 matches the target hash. Values: free text (path).'
+        example: "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: "Matching file's size in bytes. Values: integer (bytes)."
+        example: "1405"
+        platforms: [windows, linux, darwin]
       - name: matches_found
         type: int32
+        description: >-
+          Total number of matching files found, repeated on the trailing summary row. Values: integer.
+        example: "1"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Find files with SHA256 ${sha256} in ${directory}"
 
@@ -686,6 +799,131 @@ spec:
 
   compatibility:
     minAgentVersion: 0.3.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.get_version_info
+  displayName: Get File Version Info
+  version: 0.5.0
+  description: >
+    Extract version information from an executable or app bundle. On
+    Windows, reads the PE version resource (FileVersion, ProductVersion,
+    and descriptive fields such as CompanyName/FileDescription/ProductName)
+    and returns an error if the file carries no version resource. On
+    macOS, reads CFBundleVersion and CFBundleShortVersionString from the
+    bundle's Info.plist via `plutil -extract ... raw` — plutil handles both
+    binary and XML plists, so this works on any .app regardless of how its
+    Info.plist is encoded — and reports an honest version_status|not_available
+    when the target has no Info.plist or no version keys within it, rather
+    than failing. Returns error on Linux.
+  tags: [filesystem, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, darwin]
+
+  execution:
+    plugin: filesystem
+    action: get_version_info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: >
+          The executable, DLL, or app bundle to inspect. On macOS this may
+          be a .app bundle directory or an Info.plist file directly.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: file_version
+        type: string
+        description: >-
+          Windows: PE FileVersion (four-part). macOS: CFBundleVersion, the build number. Absent when not carried by the target. Values: free text (version string).
+        example: "6.2.26100.9278"
+        platforms: [windows, darwin]
+      - name: product_version
+        type: string
+        description: >-
+          Windows: PE ProductVersion (four-part). macOS: CFBundleShortVersionString, the marketing version. Absent when not carried by the target. Values: free text (version string).
+        example: "10.0.26100.9278"
+        platforms: [windows, darwin]
+      - name: company_name
+        type: string
+        description: 'Windows-only. PE CompanyName string resource, when present. Values: free text.'
+        example: "Microsoft Corporation"
+        platforms: [windows]
+      - name: file_description
+        type: string
+        description: >-
+          Windows-only. PE FileDescription string resource, when present. Values: free text.
+        example: Notepad
+        platforms: [windows]
+      - name: internal_name
+        type: string
+        description: 'Windows-only. PE InternalName string resource, when present. Values: free text.'
+        example: Notepad
+        platforms: [windows]
+      - name: original_filename
+        type: string
+        description: >-
+          Windows-only. PE OriginalFilename string resource, when present. Values: free text.
+        example: "NOTEPAD.EXE.MUI"
+        platforms: [windows]
+      - name: product_name
+        type: string
+        description: 'Windows-only. PE ProductName string resource, when present. Values: free text.'
+        example: "Microsoft® Windows® Operating System"
+        platforms: [windows]
+      - name: legal_copyright
+        type: string
+        description: >-
+          Windows-only. PE LegalCopyright string resource, when present. Values: free text.
+        example: "© Microsoft Corporation. All rights reserved."
+        platforms: [windows]
+      - name: version_status
+        type: string
+        description: >
+          macOS-only honest-empty marker: emitted as not_available when the
+          target has no Info.plist or no version keys within it; absent
+          otherwise (Windows never emits this field).
+        values: [not_available]
+        example: not_available
+        platforms: [darwin]
+
+  readablePayload: "Get version info for ${path}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
     requiredPlugins: [filesystem]
 
 status:

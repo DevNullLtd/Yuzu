@@ -1,0 +1,18 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 082db96f6e05
+== action=battery
+battery|0|unknown|-1|-1|-1|-1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=thermal
+thermal|ok|nominal
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=power_plan
+power_plan|-|-|0|unsupported_on_macos
+[result_status] UNAVAILABLE / PARTIAL / macOS has no named power schemes; IOPMSetPMPreferences is SPI, not adopted
+
+== action=set_power_plan
+set_power_plan|error|unsupported_on_macos|-|-
+[result_status] UNAVAILABLE / PARTIAL / macOS has no named power schemes; no mutation attempted
+[rc] 1
+

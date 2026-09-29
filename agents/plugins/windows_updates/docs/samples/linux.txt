@@ -1,0 +1,71 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 007b2e86015f
+== action=installed
+package|apt|3.0.3
+package|autoconf|2.72-3.1
+package|automake|1:1.17-4
+package|autotools-dev|20240727.1
+package|base-files|13.8+deb13u6
+package|base-passwd|3.6.7
+package|bash|5.2.37-2+b9
+package|binutils-aarch64-linux-gnu|2.44-3
+package|binutils-common|2.44-3
+package|binutils|2.44-3
+package|bison|2:3.8.2+dfsg-1+b2
+package|bsdutils|1:2.41.5-0+deb13u1
+package|ca-certificates|20250419
+package|cmake-data|3.31.6-2
+package|cmake|3.31.6-2
+package|coreutils|9.7-3
+package|cpp-13-aarch64-linux-gnu|13.3.0-16
+package|cpp-13|13.3.0-16
+package|cpp-14-aarch64-linux-gnu|14.2.0-19
+package|cpp-14|14.2.0-19
+package|cpp-aarch64-linux-gnu|4:14.2.0-1
+package|cpp|4:14.2.0-1
+package|curl|8.14.1-2+deb13u4
+package|dash|0.5.12-12
+package|debconf|1.5.91
+package|debian-archive-keyring|2025.1
+package|debianutils|5.23.2
+package|diffutils|1:3.10-4
+package|dpkg|1.22.22
+package|file|1:5.46-5
+package|findutils|4.10.0-3
+package|flex|2.6.4-8.2+b4
+package|g++-13-aarch64-linux-gnu|13.3.0-16
+package|g++-13|13.3.0-16
+package|gcc-13-aarch64-linux-gnu|13.3.0-16
+package|gcc-13-base|13.3.0-16
+package|gcc-13|13.3.0-16
+package|gcc-14-base|14.2.0-19
+package|git-man|1:2.47.3-0+deb13u1
+package|git|1:2.47.3-0+deb13u1
+package|grep|3.11-4+b1
+package|gzip|1.13-1
+package|hostname|3.25
+package|init-system-helpers|1.69~deb13u1
+package|libacl1|2.3.2-2+b1
+package|libapt-pkg7.0|3.0.3
+package|libarchive13t64|3.7.4-4+deb13u1
+package|libasan8|14.2.0-19
+package|libatomic1|14.2.0-19
+[result_status] OK / PARTIAL / subprocess_runner:line_limit
+
+== action=missing
+available|none|System is up to date
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=pending_reboot
+reboot_required_file|false|
+needs_restarting|false|
+reboot_required|false|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=patch_connectivity
+target|https://archive.ubuntu.com|dns_ok|true|dns_ms|37|ip|185.125.190.83
+target|https://archive.ubuntu.com|tcp_ok|true|tcp_ms|14
+target|https://security.ubuntu.com|dns_ok|true|dns_ms|12|ip|185.125.190.82
+target|https://security.ubuntu.com|tcp_ok|true|tcp_ms|19
+summary|targets_tested|2|targets_reachable|2|targets_failed|0
+[result_status] UNDECLARED / UNKNOWN / 
+

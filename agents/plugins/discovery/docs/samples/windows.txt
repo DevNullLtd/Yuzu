@@ -1,0 +1,7 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 77514adb726f
+== action=scan_subnet subnet=127.0.0.0/30
+host|127.0.0.1|unknown|kubernetes.docker.internal|unknown
+host|127.0.0.2|unknown|unknown|unknown
+scan_complete|2|2
+[result_status] UNDECLARED / UNKNOWN / 
+

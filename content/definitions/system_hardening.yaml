@@ -1,0 +1,104 @@
+## System Hardening Definitions
+## Reports exploit-mitigation and kernel-hardening posture. Read-only.
+## Plugin: system_hardening | Actions: posture
+##
+## Sources (all rung 1, no spawn): Linux allowlisted /proc/sys reads; macOS
+## sysctlbyname over a fixed allowlist; Windows Session Manager\kernel
+## mitigation registry values plus GetProcessMitigationPolicy (agent process).
+## The full allowlists are in agents/plugins/system_hardening/README.md.
+##
+## Every key reads as a value, `absent` (the key does not exist here) or
+## `unreadable` (the read failed) -- never one token for two causes.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.system_hardening.posture
+  displayName: System Hardening Posture
+  version: 1.0.0
+  description: >
+    Reports one row per allowlisted exploit-mitigation or kernel-hardening
+    key: which OS, which key, the raw value read, and a state token. Linux
+    reads eleven /proc/sys keys, macOS four sysctl keys, Windows the
+    system-wide mitigation registry values plus the agent process's own
+    DEP/ASLR/CFG policy. A key that does not exist on this host reads
+    `absent`, which is a normal answer and not a failure; a key that exists
+    but could not be read reads `unreadable` and downgrades the result to
+    CONSTRAINED/PARTIAL (PERMISSION_DENIED/PARTIAL when the read was refused)
+    rather than failing the command. A not-found only reads `absent` where
+    the surface itself is confirmed present: on Linux a hidden or unmounted
+    /proc/sys makes every key `unreadable`, and on Windows a missing Session
+    Manager\kernel key (present on every install) reads `unreadable`. One
+    Linux backstop is not a key's own row: all eleven keys `absent` on a
+    confirmed procfs adds the reason `proc_sys:not_visible` and reports
+    CONSTRAINED/PARTIAL with every row still `absent`. In a container the
+    Linux keys are those of the kernel the agent runs on (the host's under a
+    shared-kernel runtime).
+  tags: [system_hardening, security, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: system_hardening
+    action: posture
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # posture|<os>|<key>|<raw>|<state>   (also: constrained|<os>|internal_error|-|unreadable on an internal error)
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row family: `posture` (one per allowlisted key) or `constrained` (an internal-error row: `os` is the host leg, `key` is `internal_error`, `state` is `unreadable`).'
+        values: [posture, constrained]
+        example: posture
+        platforms: [windows, linux, darwin]
+      - name: os
+        type: string
+        description: 'The leg that produced the row.'
+        values: [linux, macos, windows]
+        example: linux
+        platforms: [windows, linux, darwin]
+      - name: key
+        type: string
+        description: 'Allowlisted key: a sysctl name (Linux, macOS) or a policy name (Windows: mitigation.<policy> and mitigation_audit.<policy> from the registry, self.<policy> from the agent process; a registry value that was not decoded (absent or unreadable) reports under mitigation_options or mitigation_audit_options, and a failed self policy under self.dep, self.aslr or self.cfg; the trailing QWORDs of a longer registry blob appear as ext_q<n> rows).'
+        example: kernel.randomize_va_space
+        platforms: [windows, linux, darwin]
+      - name: raw
+        type: string
+        description: 'The raw value read (integer, string, or 0x-prefixed hex on Windows); "-" when nothing was read (absent or unreadable). An empty macOS kern.bootargs is a successful read and an empty column.'
+        example: "2"
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'Linux and macOS: enabled/disabled/partial describe the hardening (enabled = protection on, partial = on at a weaker level), not the sysctl value. Windows: on/off/default, because a system-wide mitigation nibble is a tri-state override (not set / always on / always off), not a hardening level. unmodelled = a value was read that this table has no interpretation for. absent = the key does not exist here (only where the surface being read is confirmed present). unreadable = the read failed, or the surface itself (a hidden /proc/sys, a missing Session Manager\kernel key) was not there.'
+        values: [enabled, disabled, partial, 'on', 'off', default, unmodelled, absent, unreadable]
+        example: enabled
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "Report exploit-mitigation and kernel-hardening posture"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [system_hardening]
+
+status:
+  phase: active

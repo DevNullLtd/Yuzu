@@ -1,0 +1,9 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 08531a51b9d2
+== action=list_networks
+wifi|info|wi-fi scan unavailable; airport removed in macOS 14+ and system_profiler requires Location Services|0|0|none
+[result_status] CONSTRAINED / PARTIAL / wifi:macos_scan_requires_location_services
+
+== action=connected
+connected|none|Not connected|0|none|none
+[result_status] UNDECLARED / UNKNOWN / 
+

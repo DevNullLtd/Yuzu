@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg export "HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnceEx" HKLM_RunOnceEx.reg /y (failed - key absent); Test-Path confirmed absence
+date: 2026-09-06
+status: REAL CAPTURE (of absence - key does not exist on the-rig, documented not fabricated)

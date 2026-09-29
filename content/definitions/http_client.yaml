@@ -37,12 +37,24 @@ spec:
     columns:
       - name: status
         type: string
+        description: Literal "ok" on success; a failed download emits a separate error output instead of a non-ok status row.
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: path
         type: string
+        description: 'Absolute path the file was written to, after canonicalizing the parent directory and rejecting any ".." component. Values: absolute filesystem path.'
+        example: /tmp/yuzu_capture/yuzu_capture_download.html
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: 'Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes.'
+        example: 559
+        platforms: [windows, linux, darwin]
       - name: hash
         type: string
+        description: 'Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string.'
+        example: ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d
+        platforms: [windows, linux, darwin]
   approval:
     mode: role-gated
   permissions:
@@ -83,8 +95,14 @@ spec:
     columns:
       - name: status
         type: int32
+        description: 'HTTP status code returned by the GET request, or 0 if the request could not be made (invalid URL, SSRF block, or connection failure). Values: HTTP status code, or 0 on request failure.'
+        example: 200
+        platforms: [windows, linux, darwin]
       - name: body
         type: string
+        description: 'Response body text; a body over the 100 MiB cap is replaced with an error string, though the full response is already received over the wire before that check runs. Values: free text, or an error string on failure.'
+        example: '<!doctype html><html lang="en"><head><title>Example Domain</title>...'
+        platforms: [windows, linux, darwin]
   approval:
     mode: auto
   permissions:
@@ -126,10 +144,19 @@ spec:
     columns:
       - name: status
         type: int32
+        description: 'HTTP status code returned by the HEAD request, or 0 if the request could not be made (invalid URL, SSRF block, or connection failure). Values: HTTP status code, or 0 on request failure.'
+        example: 200
+        platforms: [windows, linux, darwin]
       - name: content_length
         type: int64
+        description: "Declared here but not populated by the current head leg, which writes one combined \"headers\" field (the full raw response header block) instead of parsed content_length/content_type fields — see the plugin README's Caveats section. Values: not emitted by current code."
+        example: "-"
+        platforms: []
       - name: content_type
         type: string
+        description: "Declared here but not populated by the current head leg, which writes one combined \"headers\" field (the full raw response header block) instead of parsed content_length/content_type fields — see the plugin README's Caveats section. Values: not emitted by current code."
+        example: "-"
+        platforms: []
   approval:
     mode: auto
   permissions:

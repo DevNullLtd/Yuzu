@@ -164,8 +164,11 @@ Therefore we **coexist, not replace**:
   enumerates every user profile + carries usernames. So no end-user PII and no
   works-council co-determination trigger. The Windows `HKCU` and the macOS
   user-domain context are benign **by run identity**: the agent runs as a service
-  account (`NT SERVICE\YuzuAgent` / `_yuzu`) or root, never the console user, so
-  neither crawls a logged-in user's hive / `~/Applications`. (If macOS ever moves
+  account or root, never the console user, so neither crawls a logged-in user's
+  hive / `~/Applications`. (On Windows the account is **LocalSystem** today, not
+  the intended virtual `NT SERVICE\YuzuAgent` — tracked as #1442. That deviation
+  does not weaken this argument: LocalSystem's own profile is no more an end
+  user's than the virtual account's. Linux/macOS are `_yuzu` / root as stated.) (If macOS ever moves
   to a console-scoped account, re-evaluate.) Per-user enumeration is a later,
   gated, pseudonymized addition if needed.
 - Reuse the existing `installed_apps` plugin (already 3-OS) **in-process via
@@ -195,6 +198,16 @@ Therefore we **coexist, not replace**:
 > only" until the admit-then-filter list gate lands. See **ADR-0017** (the decision +
 > gate design), **#1716** (doc-honesty), and **#1713/#1676** (the inventory
 > effective-vs-inert UAT).
+
+> **Update (2026-08-20, #3290):** the effective-vs-inert gap above is closed for both
+> read surfaces. `query_installed_software` and `GET /api/v1/inventory/software`
+> migrated onto `AuthRoutes::require_fleet_read` (ADR-0017's admit-then-filter
+> primitive, composed with service-scope confinement) as their sole authorization
+> gate — a management-group-confined operator now gets a genuinely filtered result
+> instead of a 403, and a service-scoped token gets a filtered result instead of a
+> blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 ## Consequences
 
@@ -392,7 +405,38 @@ Mechanics:
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
 - Collection is a new `installed_apps` action **`list_inventory`** (13-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
-  stable contract and is byte-unchanged (rpm `list` keeps VENDOR).
+  stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
+  VENDOR). On Windows, `get_installed_apps_windows()` feeds `list`, `query` AND
+  the hashed `inv|` rows, so any change to it must be checked against the
+  hashed rows. *Amended 2026-09-21:* `list` gained two trailing columns
+  (`install_location`, `bundle_id`) under ADR-0028's binding condition. Its
+  `app` tag, `name`, `version`, `publisher` and `install_date` keep their
+  position and value for every real value; every `list` field is now
+  escape-aware (`\`→`/`, `|`→`\|`, CR/LF→space, 4 KiB cut) — `list` rows are
+  never hashed. On macOS, the collector `list`/`query`/`list_per_user` share now
+  sorts same-named apps by (name, `install_location`) instead of an arbitrary
+  order; their row shape is otherwise unchanged. The `inv|` rows are unchanged
+  for real Location values (a relative or control-byte Location, which only a
+  hostile bundle produces, is now ignored rather than feeding the #2273
+  enrichment): the Windows name+version dedupe (`dedupe_uninstall_records`)
+  keeps the same survivor as before and sets that survivor's `install_location`
+  to the lexicographically smallest populated location in its run. Data
+  classification: `install_location` is
+  operator-tier — an ordinary stored Response (90-day default retention, no
+  per-subject erasure, not covered by `--inventory-disable`), never in this
+  blob — and can name an account's home directory
+  (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
+  sync neither crawls a logged-in user's hive nor `~/Applications` — is about
+  the sync and the Windows `HKCU` path specifically; it does not extend to
+  `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
+  both run CAN list entries under `/Users/<account>/Applications` (4 of the
+  323 rows in the committed macOS sample), so `list` may name a home
+  directory. Any change that puts `install_location` into a hashed or synced
+  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
+  §8's classification first. `list`/`list_inventory` keep their
+  `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
+  gate exists for profile enumeration, which `list` does not do (CC6.3
+  decision recorded here).
 - Store: migration v5 adds the 8 columns as `TEXT NOT NULL DEFAULT ''`
   (metadata-only on PG11+). REST/MCP rows carry all 12 fields.
 - Caps: unchanged (`kMaxEntries` 20k, `kMaxFieldLen` 1024, `kMaxBlobBytes`
@@ -423,4 +467,35 @@ Mechanics:
   (common on community/COPR-built packages) — that is third-party data-subject
   data, not the monitored end-user's, and is out of scope for the
   co-determination analysis above. `distro_id`/`distro_version` add no new
+
+### 2026-09-17 — source `app_usage` (machine-scope usage evidence) CATASTROPHIC clauses
+
+A new sync source, **`app_usage`**, ships the agent-side `app_usage` plugin's
+`last_used` projection to the server once a day. Its own plugin README and the
+header banner in `agents/plugins/app_usage/src/app_usage_parsers.hpp` are the
+per-file contracts; this entry is the routed-concerns.md pointer's full text
+(kept here, not duplicated inline in that file, to stay under its per-file
+character budget — see `docs/instruction-file-standard.md`'s placement
+ladder). The plugin reads TAR's `usage` fold read-only (`PRAGMA query_only`,
+`SQLITE_OPEN_READONLY`) — it never writes `tar.db`. Four clauses, all
+CATASTROPHIC-IF-VIOLATED:
+
+1. **No pid, command line or user name is ever emitted.** `usage_daily_user`
+   contributes only a distinct-user COUNT, never a name. A negative test greps
+   the plugin source for the raw process-event table name and `cmdline` and
+   must find zero hits.
+2. **`exe_key` pipe-escaping is a byte-for-byte contract.** Every emitted row
+   pipe-escapes `exe_key` via `yuzu::util::safe_output_field`, and this
+   source's `split_pipe` parser only splits on UNESCAPED pipes and unescapes
+   the producer's backslash-pipe escape sequence — changing one side without
+   the other silently corrupts or drops rows whose executable name contains a
+   delimiter character.
+3. **A `tar_config` read failure must map to `Errored`, never `Enabled`.**
+   `source_state_from_config`'s tri-state (Enabled/Disabled/Errored) mirrors
+   TAR's own `canonical_source_enabled` #560 fix; defaulting a read failure to
+   `Enabled` is the opposite of fail-closed.
+4. **Never send an empty blob for a constrained capture.** Skip the sync cycle
+   instead — an empty blob reads server-side as "genuinely zero usage" on a
+   host that is actually constrained or disabled, which is a false negative a
+   downstream consumer cannot distinguish from real data.
   exposure (already derivable from the existing `os_info` source).

@@ -60,6 +60,17 @@ failure — restore the schema or redeploy from a clean database. (A *transient*
 store error while the server is already running just degrades `/auto` to an
 "unavailable" note; it does not take the server down.)
 
+A **transient failure reading the response store** while a run is still going
+(separate from the run store above — this is the store holding each check's
+agent results) shows a "temporarily unavailable, retrying" banner on the result
+page and keeps showing the last state that was actually confirmed; it never
+shows a device as newly failed or incomplete just because a read hiccuped, and
+it retries automatically on the next poll. This matters because a device's
+result also feeds **Deploy**'s go/no-go cohort (see below): a device that has
+genuinely passed pre-flight stays counted as passed through a momentary read
+failure, rather than dropping out of the cohort until the run is manually
+re-checked.
+
 ## Verify — before / after performance
 
 The **Verify** stage at the bottom of `/auto` answers a different question from
@@ -133,8 +144,12 @@ Deploy** (the cohort is frozen then). On those devices it:
 The progress view is **aggregate-first**: a count strip (targeted / succeeded /
 executing / in-flight / failed / skipped) and a progress bar are the headline, with
 the per-device list below, problem-first. A device is **Succeeded** on exit 0,
-**Failed** on a stage error or a non-zero exit, and **Skipped** if you no longer
-have scope to it when the step is dispatched — it is never run.
+**Failed** on a stage error, a non-zero exit, being quarantined, or the dispatched
+plugin being absent from its reported inventory (the last two are permanent — a
+retry will not help), and **Skipped** if you no longer have scope to it when the
+step is dispatched — it is never run. A device is **not** shown as Failed for a
+device that was offline or unreachable at dispatch time, or for a transient
+containment-gate degradation — see below.
 
 Two safety properties matter because executing an installer changes the endpoint:
 
@@ -144,6 +159,15 @@ Two safety properties matter because executing an installer changes the endpoint
 - **Re-authorization.** Every tick re-checks the devices you can currently see. A
   device that has dropped out of your scope since the pre-flight run is **skipped**,
   not executed.
+
+**Approval governance (#1398).** The stage/execute dispatches this pipeline makes are
+`content_dist` actions — some of which a compiled per-pair gate marks as requiring an
+admin caller or a redeemed approval ticket on every OTHER dispatch surface (raw
+`/api/command`, MCP, schedules). Deploy is exempt from minting its own ticket: this
+pipeline's own re-authorization (above), run-once claim, and full audit trail are
+accepted as the equivalent control, so a non-admin operator with `SoftwareDeployment:Execute`
+can deploy without a separate approval step. This is a deliberate design choice, not a
+gap — see `docs/security-reviews/1398-dispatch-approval-gate-design.md`, Decision 5.
 
 **Deploying mid-run, and covering later devices.** Because you can deploy before
 the run finishes, a deployment only covers the devices that had cleared when you
@@ -160,9 +184,15 @@ after roughly ten minutes — **pauses** the deployment: its state is durably sa
 but it does not advance while no page is polling it. To **resume**, re-open the
 deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
 server detects the in-flight deployment and re-attaches to it rather than starting
-a second one. A device that is offline when its stage or execute step is dispatched
-is not retried in this slice; delete the deployment and re-deploy once it is back.
-The same engine is designed to be driven headless by an automation worker later.
+a second one. A device that is offline (or a fail-closed containment-gate read) when
+its stage or execute step is dispatched is retried automatically on a later tick,
+while the page keeps polling — no need to delete and re-deploy; the device is
+released back to in-flight (not Failed) so a later tick reclaims and redispatches
+it, until it either reaches the agent or you close the page. A device that is
+quarantined or is missing the `content_dist` plugin is a permanent condition and
+fails immediately instead — those need an operator action (release the
+quarantine, install the plugin) before a re-deploy will help. The same engine is
+designed to be driven headless by an automation worker later.
 
 ## Permissions
 
@@ -178,6 +208,16 @@ The same engine is designed to be driven headless by an automation worker later.
 | Open the Verify form | `Infrastructure:Read` |
 | Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
+The route-level permissions above gate *whether* you can open/advance a deployment at all. Each
+advance additionally dispatches per device through the same chokepoint every other operator
+surface uses, which applies **two further, per-action checks** you don't request directly: staging
+an artifact on a device requires `SoftwareDeployment:Write`, and executing it requires
+`Execution:Execute` — confined to your `Execution:Execute`-**visible** device set, the same
+per-device confinement `Execution:Execute` enforces everywhere else (e.g. running a pre-flight,
+above). A device outside that visible set is skipped, never executed on, regardless of whether
+it's in the go-cohort. A global `Execution:Execute` grant is unaffected; a management-group-scoped
+one confines deployment execution the same way it confines everything else.
+
 Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
 require you to be the creator; another operator's deployment reads as not-found).
 The result poll requires `Execute` as well as `Read` because the same request
@@ -192,3 +232,28 @@ Pre-flight runs and deletes are recorded in the [audit log](audit-log.md) as
 `dex.app_perf.compare.drill` verb so per-machine access stays separately countable.
 (Over MCP, `compare_app_perf_versions` is recorded under the generic
 `mcp.compare_app_perf_versions` tool-call audit.)
+
+## REST / MCP access
+
+The saved-runs rail (`GET /fragments/auto`'s runs half) and the deploy-config go/warn preview
+(`GET /fragments/auto/deploy`) are also reachable as versioned REST + MCP twins — see
+[`rest-api.md`](rest-api.md#pre-flight--deploy) and [`mcp-server.md`](../mcp-server.md) for the
+full request/response shapes. Both twins are **owner-scoped** (your own runs only) and read-only —
+they never create a run or a deployment.
+
+- `GET /api/v1/preflight/runs` / MCP `list_preflight_runs` — your saved runs. The config-options
+  half of the fragment (available management groups for the scope dropdown) is deliberately **not**
+  duplicated here — that catalogue already has its own twin, `GET /api/v1/management-groups` /
+  `list_management_groups`, gated `ManagementGroup:Read`. Denial of a service-scoped API token is
+  audited under `preflight.run.view` — a distinct verb from `preflight.run` (the run-**creation**
+  verb) so a denied list read can never be mistaken for a run being created.
+- `GET /api/v1/deployments/preview?run={id}` / MCP `get_deployment_preview` — the go/warn preview
+  for one pre-flight run, gated `SoftwareDeployment:Read`. Reuses the existing `deployment.config.view`
+  verb (already distinct from `deployment.create`).
+
+Both REST routes are unaudited on a successful read (the response is run scope/lifecycle metadata,
+not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
+denial under their own verb. Their MCP twins instead call the generic
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
+`docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.

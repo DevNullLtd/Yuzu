@@ -13,8 +13,9 @@ metadata:
   description: >
     Returns total and free bytes (and percent used) for a single volume.
     The "free" figure is the space usable by an ordinary caller —
-    FreeBytesAvailableToCaller on Windows (GetDiskFreeSpaceExW), f_bavail on
-    POSIX (statvfs) — the correct quota-aware figure for an installer-headroom
+    FreeBytesAvailableToCaller on Windows (GetDiskFreeSpaceExW), f_bavail from
+    statvfs on Linux and from statfs on macOS (Darwin's statvfs block counts are
+    32-bit and truncate volumes above ~16 TiB) — the correct quota-aware figure for an installer-headroom
     check. Param `path` selects the volume (default: C:\ on Windows, / on
     Linux/macOS). One volume per call; query each volume separately.
   tags: [storage, disk, capacity, health, preflight]
@@ -36,7 +37,9 @@ spec:
         displayName: Volume Path
         description: >
           Directory or volume root to measure (e.g. "C:\", "/", "/var").
-          Defaults to the platform root if omitted.
+          Defaults to the platform root if omitted (C:\ on Windows, / on
+          Linux and macOS); reported free space is the caller-usable figure,
+          not raw free blocks.
         validation:
           maxLength: 4096
 
@@ -49,12 +52,24 @@ spec:
     columns:
       - name: path
         type: string
+        description: 'The resolved path that was measured, echoed back verbatim from the request. Values: free text.'
+        example: "/"
+        platforms: [windows, linux, darwin]
       - name: total_bytes
         type: int64
+        description: 'Raw volume capacity in bytes. Values: integer.'
+        example: "494384795648"
+        platforms: [windows, linux, darwin]
       - name: free_bytes
         type: int64
+        description: 'Space usable by an ordinary caller, not raw free blocks (FreeBytesAvailableToCaller on Windows, f_bavail on POSIX). Values: integer.'
+        example: "313557938176"
+        platforms: [windows, linux, darwin]
       - name: percent_used
         type: int32
+        description: Percent of total_bytes currently used, truncated to an integer 0-100.
+        example: "36"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get free disk space for ${path}"
 

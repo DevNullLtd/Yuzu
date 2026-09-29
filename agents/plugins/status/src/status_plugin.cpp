@@ -152,6 +152,90 @@ long long get_memory_rss_kb() {
 #endif
 }
 
+// ABI4 capability declarations (#2204). "version"/"plugins"/"modules"/
+// "connection"/"switch"/"config" only ever read compiled-in constants or the
+// in-process agent config store (yuzu_ctx_get_config) — no OS call at all —
+// so those five are rung 1 uniformly across every OS. "info" and "health"
+// read native per-OS surfaces (uname(2)/gethostname(3) or the Win32
+// equivalents; /proc/self/status, Mach task_info, or K32GetProcessMemoryInfo)
+// — also rung 1 everywhere, never a subprocess.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "version",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process (compiled version constants)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process (compiled version constants)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process (compiled version constants)", nullptr},
+    },
+    {
+        /* .action      = */ "info",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2) + gethostname(3)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2) + gethostname(3)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "GetNativeSystemInfo + GetComputerNameA", nullptr},
+    },
+    {
+        /* .action      = */ "health",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/self/status VmRSS + steady_clock", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "task_info(MACH_TASK_BASIC_INFO) + steady_clock", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "K32GetProcessMemoryInfo + steady_clock", nullptr},
+    },
+    {
+        /* .action      = */ "plugins",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.plugins.*)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.plugins.*)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.plugins.*)", nullptr},
+    },
+    {
+        /* .action      = */ "modules",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.modules.*)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.modules.*)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.modules.*)", nullptr},
+    },
+    {
+        /* .action      = */ "connection",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls_enabled/*)",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls_enabled/*)",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls_enabled/*)",
+         nullptr},
+    },
+    {
+        /* .action      = */ "switch",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/session_id/*)",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/session_id/*)",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/session_id/*)",
+         nullptr},
+    },
+    {
+        /* .action      = */ "config",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.*)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.*)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.*)", nullptr},
+    },
+};
+
 } // namespace
 
 class StatusPlugin final : public yuzu::Plugin {
@@ -167,6 +251,14 @@ public:
         static const char* acts[] = {"version",    "info",   "health", "plugins", "modules",
                                      "connection", "switch", "config", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

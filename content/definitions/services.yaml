@@ -2,10 +2,13 @@
 ## Enumerates installed and running system services on all platforms.
 ## Plugin: services | Actions: list, running, set_start_mode
 ##
-## Note: Output columns vary by platform:
-##   Windows: name, display_name, status, startup_type
-##   Linux:   name, status, description
-##   macOS:   label, pid, status
+## Note: Output columns vary by platform. The shared `result.columns` schema
+## below is Windows-shaped; the second column ("display_name") holds an actual
+## display name on Windows/Linux but the launchd PID on macOS (see that
+## column's description) -- per-platform mapping:
+##   Windows: name, display_name,       status, startup_type
+##   Linux:   name, status,             description  (no startup_type)
+##   macOS:   label, pid,               status, startup_type
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -39,12 +42,28 @@ spec:
     columns:
       - name: name
         type: string
+        description: >-
+          The service's short identifier: a Win32 service name, a systemd unit name, or a launchd label. Values: free text.
+        example: ADPSvc
+        platforms: [windows, linux, darwin]
       - name: display_name
         type: string
+        description: >-
+          Column 2, whose meaning is OS-specific. On Windows it is the Service Control Manager's human-readable display name. On macOS it holds the launchd job's numeric PID as a string, or "-" when not running (the platform has no per-service display name in `launchctl list`). It is NOT emitted on Linux at all -- the Linux leg's row carries only 3 pipe fields (name, status, description), so this column is absent from the wire, not merely empty. Values: free text (windows) · integer PID or "-" (darwin) · field absent (linux).
+        example: "Aggregated Data Platform Service (windows) · 1111 (darwin)"
+        platforms: [windows, darwin]
       - name: status
         type: string
+        description: >-
+          Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state. On Linux it is systemd's SUB state from `systemctl list-units`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; use the display_name (PID) column to tell whether a macOS service is currently running. Values: stopped, start_pending, stop_pending, running, continue_pending, pause_pending, paused, unknown (windows) · free text systemd SUB state, e.g. running, dead, exited, failed (linux) · integer exit-status code as a string (darwin).
+        example: "stopped (windows) · 0 (darwin)"
+        platforms: [windows, linux, darwin]
       - name: startup_type
         type: string
+        description: >-
+          Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux).
+        example: "manual (windows) · unknown (darwin)"
+        platforms: [windows, darwin]
     aggregation:
       groupBy:
         - status
@@ -101,12 +120,28 @@ spec:
     columns:
       - name: name
         type: string
+        description: >-
+          The service's short identifier: a Win32 service name, a systemd unit name, or a launchd label. Values: free text.
+        example: AppXSvc
+        platforms: [windows, linux, darwin]
       - name: display_name
         type: string
+        description: >-
+          Column 2, whose meaning is OS-specific. On Windows it is the Service Control Manager's human-readable display name. On macOS it holds the launchd job's numeric PID as a string, or "-" when not running (the platform has no per-service display name in `launchctl list`). It is NOT emitted on Linux at all -- the Linux leg's row carries only 3 pipe fields (name, status, description), so this column is absent from the wire, not merely empty. Values: free text (windows) · integer PID or "-" (darwin) · field absent (linux).
+        example: "AppX Deployment Service (AppXSVC) (windows) · 1111 (darwin)"
+        platforms: [windows, darwin]
       - name: status
         type: string
+        description: >-
+          Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state (always "running" for this action's filtered result). On Linux it is systemd's SUB state from `systemctl list-units --state=running`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; this action's own running-filter is applied on the PID column, not this one. Values: running (windows, this action always filters to it) · free text systemd SUB state (linux) · integer exit-status code as a string (darwin).
+        example: "running (windows) · 0 (darwin)"
+        platforms: [windows, linux, darwin]
       - name: startup_type
         type: string
+        description: >-
+          Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux).
+        example: "automatic (windows) · unknown (darwin)"
+        platforms: [windows, darwin]
     aggregation:
       groupBy:
         - status
@@ -187,10 +222,22 @@ spec:
     columns:
       - name: status
         type: string
+        description: >-
+          Literal "ok" on a successful mode change. On any failure the plugin instead writes a single "error|<message>" line and this row does not appear at all. Values: ok (the only value ever emitted).
+        example: ok
+        platforms: [windows, linux, darwin]
       - name: service
         type: string
+        description: >-
+          The `name` parameter echoed back unmodified, on a successful mode change only. Values: free text — echoes the name parameter.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: mode
         type: string
+        description: >-
+          The `mode` parameter echoed back unmodified, on a successful mode change only. Values: automatic, disabled (all OS) · manual additionally on windows/linux (darwin rejects it before this row is ever written).
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Set service ${name} start mode to ${mode}"
 

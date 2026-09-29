@@ -20,7 +20,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: false,
-    args: ['--window-size=1400,900'],
+    args: ['--window-size=1400,900', '--no-sandbox'],
     defaultViewport: { width: 1400, height: 900 },
   });
 
@@ -171,7 +171,7 @@ async function main() {
 
   if (inputSelector.selector) {
     const input = await page.$(inputSelector.selector);
-    await input.click({ clickCount: 3 });
+    await input.click({ count: 3 });
     await input.type('os_info os_name');
 
     // Find and click Send

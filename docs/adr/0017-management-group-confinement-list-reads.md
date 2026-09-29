@@ -10,6 +10,35 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
 
+> **Update (2026-07-24) — #1715 resolved; PR-A foundation landed.** The global↔management-group
+> deny-precedence lattice the "Combining algorithm" section below left *undecided* has been decided:
+> **cross-boundary combining is additive/OR; deny-overrides applies only within a single group's
+> assignments.** Concretely — **(a)** a global explicit-**deny** does **not** override a management-group
+> **allow** (authority is additive — a row is readable *from* the group grant, per the #1634 ruling);
+> **(b)** a global **allow** **does** override a group deny (→ `AdmitAll`). This ratifies the shipped
+> `check_scoped_permission` behaviour, so PR-A's one-resolver refactor is behaviour-preserving for
+> per-device authz and carries no migration. Frozen in `RbacStore::resolve_perm_groups` — the single
+> INV-7 resolver behind `authorize_list_read`, `holds_permission_via_any_group`,
+> `visible_agents_for_permission`, and `check_scoped_permission`. **PR-A** (the `authorize_list_read`
+> chokepoint returning `DenyAll | AdmitAll | AdmitScoped(visible_set)` + the two primitives + the two
+> batched `ManagementGroupStore` queries + the set-equivalence property test + the INV-7 cross-check)
+> has landed; **no call site is switched yet** (PR-B…E do the per-surface wiring). The transport
+> wrappers (`require_list_read` etc.) land with their first caller in PR-B rather than uncalled here.
+> Ships alongside the decision-independent **#1717** fail-closed gate fix (`require_permission` /
+> `require_scoped_permission` gate on `rbac_enforcement_in_effect`).
+>
+> **Update (2026-08-15) — `AuthRoutes::require_list_read` has a live first caller, outside the
+> PR-B…E ladder.** `GET /api/v1/guaranteed-state/status` (#2298 item 6d / #3038) now gates via
+> `require_list_read` as its sole authorization primitive — the transport wrapper this ADR names
+> is no longer "uncalled." An earlier attempt (commit `9269b5636`) stacked a direct
+> `authorize_list_read` call behind the pre-existing flat `require_permission` gate instead of
+> replacing it, which does not compose (`require_permission`'s RBAC branch never consults
+> `ManagementGroupStore`); the corrected wiring (`369643caf`) replaced both with the single
+> `require_list_read` gate this ADR anticipated. This landed independently of the PR-B…E
+> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/TAR) —
+> update that list's own status per-surface as each one actually switches, don't infer this
+> route's completion applies to any of them.
+
 ## Context
 
 Management groups confine an operator to a subset of the fleet. For **per-device** routes this
@@ -208,12 +237,50 @@ gate.
 - **Responses** — `query_responses` (#1550), `aggregate_responses` (filter-before-aggregate),
   REST `/executions/{id}/visualization`, `/api/responses/{id}` (GET list) + `/export`, dashboard
   `/fragments/results` + the scan fragment, workflow execution-detail.
+  - **dashboard `/fragments/results` table + workflow execution-detail's responses section AND
+    status grid/table: DONE (#1712, #3290 Phase 2 continuation)** — migrated onto
+    `require_fleet_read`, replacing `perm_fn`/`perm_fn_` as the sole gate; confinement is now
+    effective on all four (the status grid/table was a same-PR adversarial-review finding: the gate
+    migration itself admits a confined caller class the old flat gate denied outright, so the grid
+    needed the same filter as the responses section, not just the table). The scan fragment,
+    `query_responses`, `aggregate_responses`, and the REST endpoints above remain on the older,
+    still-largely-inert `response_scope_fn` mechanism (#1634) — not touched by this migration.
+    **Update (#1634, closed):** `query_responses`, `aggregate_responses`, and the REST
+    `/executions/{id}/visualization` + `/api/responses/{id}` (+`/aggregate`/`/export`) family all
+    migrated onto `require_fleet_read` in a later PR, retiring `response_scope_fn` on these
+    surfaces entirely. The scan fragment is unaffected by this update and remains as described.
+    **NOT done, pre-existing (not introduced or worsened by #1712):** the SAME dashboard
+    results workflow's sidecar routes — `/fragments/results/filter-bar` (reads
+    `ResponseStore::facet_values`), `/fragments/create-group-form` (reads `facet_agent_count`), and
+    `POST /api/dashboard/group-from-results` (reads `facet_agent_ids` then adds every returned id as
+    a group member — a WRITE) — all still gate on flat `perm_fn_` and apply no scope predicate to
+    the underlying `response_store.response_facets` query. `filter-bar` is gated on the same
+    `Response:Read` securable as the now-migrated table, so a genuinely confined-only caller (the
+    `#1715(a)` additive-grant class) cannot reach it at all — latent, not active. `create-group-form`
+    /`group-from-results` gate on a *different* securable (`ManagementGroup:Write`), which has no
+    logical tie to a caller's `Response:Read` confinement — a real persona holding both (global
+    group-write + confined response-read) can use the unscoped facet query to discover and enroll
+    out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
+    (canonical; #3525 tracked the same finding and was closed as its duplicate).
+- **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
+  `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
+  (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
+  Gate 2 review and deliberately deferred to a dedicated issue rather than folded into that PR.
+  **DONE (#3789, closed):** all seven migrated onto `require_fleet_read`/`authz::in_scope`, matching
+  the `GET /api/v1/executions/{id}` shape documented in `docs/auth-architecture.md`'s "Fourth
+  migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
+  (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
+  visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
+  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
+  `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
+  allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).
-- **Inventory** — `query_installed_software` (MCP, `mcp_server.cpp:1377`),
-  `GET /api/v1/inventory/software` (`rest_api_v1.cpp:3026+`) — #1713 / #1676 (needs its own UAT to
-  settle effective-vs-inert; the born-on-PG `SoftwareInventoryStore` path may differ).
+- **Inventory** — `query_installed_software` (MCP) + `GET /api/v1/inventory/software` (REST):
+  **DONE (#3290, 2026-08-20)** — migrated onto `require_fleet_read`, the admit-then-filter gate
+  this ADR designed; confinement is now effective on both surfaces.
   - **`/inventory` dashboard FIND** (`InventoryRoutes`, `inventory_routes.cpp` find/results) shares
     the SAME per-row drop filter + omission audit as the REST/MCP siblings above — it converts the
     same way (swap its `Inventory:Read` gate to admit-then-filter; the per-row filter is already
@@ -235,6 +302,23 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+  - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
+    /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
+    check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
+    Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
+    `top_devices[]`/`top_apps[]`, etc.) is a query-time `GROUP BY` over agent-attributed rows —
+    **not** a precomputed rollup like `software_catalog`/`version_rollup` above, so the rationale
+    for pinning it global-only is different: it is simply **not yet confined per-caller** — an
+    INV-3-respecting per-caller SQL slice (a `WHERE agent_id IN (...)` narrowing derived from the
+    caller's visible set, applied INSIDE the aggregation, not a post-aggregate filter) has not been
+    built for these three queries yet; tracked as #5090. The `/fragments/dex/overview`, `/fragments/dex/app`, and
+    `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by this fix round: they also
+    gate on the SAME global `perm_fn` (a group-only operator is denied `403` there too, same as the
+    REST/MCP surfaces) — the residual is the OPPOSITE of a confined-caller leak: among callers who
+    DO hold the global grant, the fragments additionally narrow their device list by the
+    permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
+    row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
+    also owns deciding whether that narrowing is correct or itself a bug.
 
 ### Out of scope (global by design)
 
@@ -284,6 +368,72 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   under-restricted). It does **not** cover this fail-open, which discloses to *any* authenticated
   principal the moment `rbac.db` fails to load — independent of whether confined operators exist.
 
+  **RESOLVED, both halves, in two separate PRs:** the fail-open half closed codebase-wide (not
+  route-specific) via **#1717/#2472** — `require_permission`/`require_scoped_permission` now gate on
+  `rbac_enforcement_in_effect()` exactly as this finding proposed. The no-per-agent-filter half closed
+  for these two specific readers via **#1712/#3290 Phase 2 continuation** — both migrated onto
+  `require_fleet_read` (the admit-then-filter gate this ADR designed), replacing `perm_fn`/`perm_fn_`
+  outright rather than layering a filter under it: `dashboard_routes.cpp`'s `/fragments/results` and
+  `workflow_routes.cpp`'s executions-drawer detail route (`/fragments/executions/{id}/detail`'s
+  responses section AND its per-agent status grid/table, which reads a distinct store —
+  `ExecutionTracker`, not `ResponseStore` — and needed the identical filter for the same reason: the
+  gate migration itself admits a confined caller class the old flat gate denied outright, so leaving
+  the grid unfiltered would have widened disclosure rather than closing it). The other three items
+  under the "Responses" bullet below
+  (`query_responses`, `aggregate_responses`, the REST `/executions/{id}/visualization` +
+  `/api/responses` family, and the dashboard scan fragment) are **NOT** covered by either PR — they
+  still use the older, still-largely-inert `response_scope_fn`/`response_agent_in_scope` mechanism
+  (#1634), a distinct primitive from `require_fleet_read`; see `docs/user-manual/mcp.md`'s
+  `query_responses` row for that mechanism's current status.
+  **Update (#1634, closed):** `query_responses`, `aggregate_responses`, and the REST
+  `/executions/{id}/visualization` + `/api/responses` family all migrated onto `require_fleet_read`
+  in a later PR — `response_scope_fn`/`response_agent_in_scope` no longer computes scope on any
+  of these surfaces. "Retired" describes the MECHANISM (nothing calls it to decide visibility
+  anymore), not a completed code deletion: `ResponseScopeFn response_scope_fn` remains an unused
+  parameter accepted and threaded through `rest_api_v1.cpp`'s constructor call chain (found in PR
+  #3793's review, minor, not fixed) — dead plumbing, not a live second gate. The
+  dashboard scan fragment is unaffected by this update and remains as described.
+
+  **Also NOT covered by #1712, found during this PR's own governance re-review and previously
+  absent from this coverage map entirely — the live streaming twin of the exact data this PR just
+  confined on the request/response path:** the SSE channels `/sse/executions/{id}` (dashboard) and
+  `/api/v1/events` (REST), both backed by `ExecutionEventBus`, publish `agent-transition` events
+  (per-agent `agent_id`) and `execution-progress` events (unfiltered `agents_targeted`) for any
+  `execution_id` to any caller holding a flat `Execution:Read` grant — including a caller this PR's
+  own migration now narrows to `AdmitScoped` on the request/response drawer route. This is the
+  same data-shape test this ADR's methodology names above (does a returned row carry `agent_id`?
+  yes) reached via a route family the "grep every `perm_fn`/`require_permission` list-read site"
+  sweep did not enumerate, since a streaming `Server::Get` handler is not a request/response
+  list-read site in the shape the sweep was designed to find. Not introduced or worsened by #1712;
+  tracked as a follow-up — see #3699.
+  **Update (#1634, closed):** both SSE channels migrated onto `require_fleet_read` in a later PR,
+  sharing one event projector (`execution_event_scope.hpp`) that filters `agent-transition` by
+  `agent_id` and drops/sanitizes the execution-wide `execution-progress`/`execution-completed`
+  events for a confined subscriber. #3699 is closed.
+
+  **A WRITE-path sibling of the same shape, found during #1712's own governance re-review and
+  undisclosed in this coverage map until then — now CLOSED (#3700):** `GET`/`PUT`/
+  `DELETE /api/agents/:id/properties[/:key]` (`server.cpp`) read and wrote per-agent
+  custom-properties data behind bare `require_permission("Infrastructure","Read"/"Write")` with no
+  per-agent scope filter at all. Not introduced or worsened by #1712 — pre-existing, and absent from
+  every prior enumeration of this ADR's surface list. Fixed by migrating all three routes to
+  `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`, the same per-target gate
+  the Tag routes in `server.cpp` use — RBAC-off behavior is unchanged (`Infrastructure` is not in
+  `kTopologyFloor`, so the legacy fallback branch is identical to `require_permission`'s). **Precision
+  note (this fix's own PR review corrected an earlier draft of this bullet's framing):** the fix
+  restores confinement for a management-group-**scoped-only** operator, previously denied outright
+  on every agent (the flat gate never consulted management-group assignments) — not a narrowing of
+  a global grant, which was and remains unconditional fleet-wide access by design, identical to
+  every other `require_scoped_permission` caller. A THIRD caller class also changes: a
+  service-scoped API token whose `ITServiceOwner` role holds `Infrastructure` permissions (the
+  default seed) was previously blocked here by the flat gate's `kServiceScopeGlobalSafe`
+  allow-list check (seeded empty — nothing clears it), and is now admitted on agents matching the
+  token's own service tag via `require_scoped_permission`'s separate service-scoped branch, which
+  checks `ITServiceOwner`'s role grant directly rather than that allow-list — Tag-route parity,
+  working as intended. Coverage: `tests/unit/server/test_agent_properties_scope_authz.cpp`,
+  including a source-text tripwire proving the route handlers still call the scoped gate (a
+  primitive-level test alone cannot detect a handler reverted back to `require_permission`).
+
 ## Consequences
 
 - A new, named authorization pattern (the admit-then-filter list gate, expressed as the
@@ -329,8 +479,8 @@ ahead of PR-A.)
    callers, `get_visible_agents_json`; **delete** the role-existence narrower + its #1453 full-fleet
    fallback (INV-6), replace with the permission-specific set. Six callers across dashboard + server
    + json — consider splitting REST vs dashboard.
-4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` (#1713 /
-   #1676), after the dedicated inventory UAT settles effective-vs-inert.
+4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
+   **DONE (#3290)**. `/inventory` dashboard FIND remains open (its own conversion, see above).
 5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 

@@ -1,0 +1,58 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/mfa/disable",
+    "capability_id": "post.api-settings-mfa-disable",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/mfa/init",
+    "capability_id": "post.api-settings-mfa-init",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/mfa/recovery-codes",
+    "capability_id": "post.api-settings-mfa-recovery-codes",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/mfa/verify",
+    "capability_id": "post.api-settings-mfa-verify",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/oidc",
+    "capability_id": "post.api-settings-oidc",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/oidc/test",
+    "capability_id": "post.api-settings-oidc-test",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/mfa",
+    "capability_id": "get.fragments-settings-mfa",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

@@ -11,9 +11,10 @@ metadata:
   version: 1.0.0
   description: >
     Enumerates all running processes on the endpoint, returning each
-    process's PID and executable name. Uses native APIs on each
-    platform: CreateToolhelp32Snapshot (Windows), /proc filesystem
-    (Linux), ps (macOS).
+    process's PID and executable name. Uses native in-process APIs on
+    each platform: CreateToolhelp32Snapshot (Windows), the /proc
+    filesystem (Linux), sysctl(KERN_PROC_ALL) (macOS) — no subprocess
+    is spawned on any platform.
   tags: [processes, inventory, diagnostics]
 
 spec:
@@ -33,8 +34,16 @@ spec:
     columns:
       - name: pid
         type: int64
+        description: >-
+          The process's numeric identifier, as assigned by the OS kernel at process creation. Values: integer.
+        example: "1936"
+        platforms: [windows, linux, darwin]
       - name: name
         type: string
+        description: >-
+          The process's short name (Windows: PROCESSENTRY32W.szExeFile, the image filename only, no path; Linux: /proc/<pid>/status Name:, kernel-truncated to 15 bytes; macOS: the resolved on-disk executable path when it starts with '/', else the 16-byte-truncated p_comm). '|', CR and LF are replaced with a space before the row is emitted. Values: free text.
+        example: "svchost.exe"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - name
@@ -91,8 +100,10 @@ spec:
         type: string
         displayName: Process Name Filter
         description: >
-          Case-insensitive substring to match against process names.
-          All processes whose name contains this string are returned.
+          Case-insensitive substring to match against process names,
+          1-256 characters, e.g. "svchost" or "launchd". All processes
+          whose name contains this string are returned; an empty
+          string is rejected by the plugin as a missing parameter.
         validation:
           minLength: 1
           maxLength: 256
@@ -101,10 +112,22 @@ spec:
     columns:
       - name: found
         type: bool
+        description: >-
+          One leading row: true if at least one process name contains the filter (case-insensitive substring), false otherwise. Values: true, false.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: pid
         type: int64
+        description: >-
+          The matching process's numeric identifier. Absent (no row) when found=false. Values: integer.
+        example: "1936"
+        platforms: [windows, linux, darwin]
       - name: name
         type: string
+        description: >-
+          The matching process's short name, same format and truncation rules as processes.list's name column. Absent (no row) when found=false. Values: free text.
+        example: "svchost.exe"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - found

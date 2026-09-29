@@ -1,0 +1,5 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 16f60d46b82f
+== action=free
+disk|C:\|248158089216|20788936704|91
+[result_status] UNDECLARED / UNKNOWN / 
+

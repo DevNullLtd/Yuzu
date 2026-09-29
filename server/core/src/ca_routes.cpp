@@ -15,6 +15,18 @@
 
 namespace yuzu::server {
 
+std::string derive_cert_audit_target_type(CaStore& ca_store, const std::string& serial_hex) {
+    std::string target_type = "Certificate";
+    if (auto rec_or_err = ca_store.get_issued(serial_hex); rec_or_err && rec_or_err->has_value()) {
+        const std::string& purpose = (*rec_or_err)->purpose;
+        if (purpose == "agent")
+            target_type = "AgentCertificate";
+        else if (purpose == "code-signing")
+            target_type = "CodeSigningCertificate";
+    }
+    return target_type;
+}
+
 namespace {
 
 using detail::error_json_a4;
@@ -26,6 +38,22 @@ constexpr std::size_t kMaxRevokeBody = 64 * 1024; // bound the revoke POST body
 // + parent chain is a few KB; 256 KiB is generous headroom while still refusing
 // a multi-MB POST on this privileged trust-root-switching endpoint (PR6).
 constexpr std::size_t kMaxImportBody = 256 * 1024;
+// Bound the code-signing issuance POST body before parsing (gap-matrix #10).
+// The JSON body wraps a PEM CSR (server.cpp's issue_code_signing_leaf enforces
+// the same 16 KiB CSR-PEM ceiling sign_agent_csr uses) as an escaped JSON
+// string — each PEM newline costs 2 bytes escaped ("\n") — plus a <=64 byte
+// label and a small validity_days integer. 64 KiB is 4x the raw 16 KiB CSR
+// ceiling: generous headroom over the worst-case ~2x JSON-escaping cost, with
+// room to spare for the other two fields and JSON framing, while still three
+// orders of magnitude under httplib's 100 MiB backstop on this privileged
+// endpoint. Mirrored exactly by body_cap_policy.hpp's ca_issue_code_signing
+// row — same two-authority-split precedent as kMaxRevokeBody/kMaxImportBody.
+constexpr std::size_t kMaxIssueCodeSigningBody = 64 * 1024;
+// gov F6/UP-7: mirrors server.cpp's issue_code_signing_leaf ceiling exactly
+// (its own locally-declared constant — same per-signing-path style as
+// kMaxCsrPemBytes there) so REST rejects an out-of-range validity_days at the
+// door instead of deferring entirely to the server-side refusal.
+constexpr int kMaxCodeSigningValidityDaysRest = 730;
 
 int clamp_int(const httplib::Request& req, const char* key, int def, int lo, int hi) {
     auto it = req.params.find(key);
@@ -59,7 +87,7 @@ std::string fmt_epoch(int64_t epoch) {
     return std::string(buf);
 }
 
-/// Validate + normalise a serial to the canonical uppercase hex `ca.db` stores.
+/// Validate + normalise a serial to the canonical uppercase hex form `ca_store` stores.
 /// Returns empty if it is not 1–64 hex digits. Shared by the REST + dashboard
 /// revoke paths so both reject the same inputs and match the same stored serial.
 std::string normalize_serial(std::string s) {
@@ -74,7 +102,10 @@ std::string normalize_serial(std::string s) {
 /// Outcome of the shared revoke_core (replaces a tri-state int — cpp-expert
 /// PR4b). `audit_ok` is false when any audit row failed to persist, so both
 /// revoke surfaces can raise Sec-Audit-Failed (#1240 M1/M2).
-enum class RevokeOutcome { NotFound, RevokedCrlStale, RevokedCrlPublished };
+// ADR-0053: StoreError is a NEW, distinct outcome from NotFound — a genuine ca_store DB/lease
+// failure must never be audited/reported as "serial not found or already revoked" (a false
+// compliance record; a 503 outage misreported as a 404/idempotent-denial).
+enum class RevokeOutcome { NotFound, StoreError, RevokedCrlStale, RevokedCrlPublished };
 struct RevokeResult {
     RevokeOutcome outcome;
     bool audit_ok;
@@ -87,7 +118,10 @@ struct RevokeResult {
 std::string render_ca_fragment(CaStore* ca_store) {
     if (!ca_store || !ca_store->is_open())
         return "<span style=\"color:#484f58\">Certificate authority unavailable.</span>";
-    auto root = ca_store->get_root();
+    auto root_or_err = ca_store->get_root();
+    if (!root_or_err)
+        return "<span style=\"color:#f85149\">Certificate authority store error.</span>";
+    auto& root = *root_or_err;
     std::string html;
     if (!root) {
         html += "<p style=\"color:#484f58\">No internal CA on this install (operator-supplied "
@@ -154,7 +188,11 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "type=\"submit\">Import signed chain</button></form></details>";
 
     constexpr int kPanelLimit = 500;
-    auto issued = ca_store->list_issued(kPanelLimit, 0);
+    auto issued_or_err = ca_store->list_issued(kPanelLimit, 0);
+    if (!issued_or_err)
+        return html + "<p style=\"color:#f85149\">Certificate inventory unavailable "
+                      "(store error).</p>";
+    auto& issued = *issued_or_err;
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Serial</th><th>Subject</th><th>Purpose</th><th>Expires</th>"
             "<th>Status</th><th></th></tr></thead><tbody>";
@@ -181,7 +219,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
                 // see web_utils.hpp), so the double-quoted value="" is safe for any
                 // serial (and a single-quoted hx-vals would have been too) — the
                 // form is just the clearer, codebase-standard pattern. The serial
-                // is hex-only in practice; this renders whatever ca.db holds safely.
+                // is hex-only in practice; this renders whatever ca_store holds safely.
                 html += "<form hx-post=\"/api/settings/ca/revoke\" hx-target=\"#ca-section\" "
                         "hx-swap=\"innerHTML\" style=\"display:inline-flex;gap:0.3rem\" "
                         "hx-confirm=\"Revoke certificate for &quot;" +
@@ -224,16 +262,22 @@ std::string render_ca_fragment(CaStore* ca_store) {
 
 void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), ca_store,
-                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn));
+                    std::move(publish_crl_fn), std::move(export_csr_fn), std::move(import_chain_fn),
+                    std::move(issue_code_signing_fn));
 }
 
 void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
-                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn) {
-    (void)auth_fn; // principal is resolved inside audit_fn/perm_fn from the request
+                               ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
+                               IssueCodeSigningFn issue_code_signing_fn) {
+    // auth_fn is captured by the new /issue-code-signing handler below (to
+    // attribute IssuedCertRecord::issued_by to the calling operator); every
+    // other handler in this file still resolves its principal from
+    // audit_fn/perm_fn alone.
     spdlog::info("CA routes: registering /api/v1/ca/* + Settings CA panel");
 
     // Shared revoke core (REST + dashboard wrapper) over an ALREADY-normalised
@@ -243,26 +287,48 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     auto revoke_core = [ca_store, audit_fn, publish_crl_fn](
                            const httplib::Request& req, const std::string& serial,
                            const std::string& reason) -> RevokeResult {
-        if (!ca_store->revoke(serial, reason)) {
+        // gov B2 (F1: arch-1 + compliance HIGH; HIGH-1): derive the audit
+        // target_type from the cert's OWN recorded purpose — now that
+        // code-signing certs (gap-matrix #10) are revocable through this same
+        // route, hardcoding "AgentCertificate" would durably mis-audit a
+        // code-signing revocation. A read failure (genuine store error,
+        // distinct from "not found" — see get_issued()'s contract) and a
+        // genuine "no such serial" both fall back to the neutral
+        // "Certificate": the StoreError/NotFound outcomes below already carry
+        // the more specific signal for that case. Shared with MCP's
+        // revoke_certificate via derive_cert_audit_target_type (ca_routes.hpp)
+        // so both surfaces classify identically.
+        const std::string target_type = derive_cert_audit_target_type(*ca_store, serial);
+        auto revoked_or_err = ca_store->revoke(serial, reason);
+        if (!revoked_or_err) {
+            // ADR-0053: a genuine DB/lease failure — distinct from "not found or already
+            // revoked" (a business fact). Must NOT be folded into "denied": that would falsely
+            // audit a database outage as a rejected revoke attempt.
+            const bool ok = audit_fn(req, "ca.cert.revoked", "failure", target_type, serial,
+                                     revoked_or_err.error());
+            return {RevokeOutcome::StoreError, ok};
+        }
+        if (!*revoked_or_err) {
             // #1240: unknown/already-revoked is reject-without-state-change →
             // result="denied" (matches every destructive sibling + idempotent
             // retry-safe); "failure" is reserved for an authorized-but-errored op.
-            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", "AgentCertificate", serial,
+            const bool ok = audit_fn(req, "ca.cert.revoked", "denied", target_type, serial,
                                      "serial not found or already revoked");
             return {RevokeOutcome::NotFound, ok};
         }
-        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", "AgentCertificate", serial,
+        bool audit_ok = audit_fn(req, "ca.cert.revoked", "success", target_type, serial,
                                  reason);
         // publish_crl() now fails honestly (#1240 B-1): has_value() is true ONLY
         // when the new CRL was persisted, so crl_ok never falsely claims success.
         const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
         if (crl_ok)
-            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial, "") &&
+            audit_ok = audit_fn(req, "ca.crl.published", "success", "Security", serial,
+                                "reason=revoke") &&
                        audit_ok;
         else
             audit_ok = audit_fn(req, "ca.crl.published", "failure", "Security", serial,
-                                "CRL build/record failed after revocation; public CRL may be "
-                                "stale") &&
+                                "reason=revoke CRL build/record failed after revocation; public "
+                                "CRL may be stale") &&
                        audit_ok;
         return {crl_ok ? RevokeOutcome::RevokedCrlPublished : RevokeOutcome::RevokedCrlStale,
                 audit_ok};
@@ -277,7 +343,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             res.set_content(error_json_a4(503, "CA not available", make_correlation_id()), kJson);
             return;
         }
-        auto root = ca_store->get_root();
+        auto root_or_err = ca_store->get_root();
+        if (!root_or_err) {
+            res.status = 503;
+            res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                          make_correlation_id()),
+                            kJson);
+            return;
+        }
+        auto& root = *root_or_err;
         if (!root) {
             res.status = 404;
             res.set_content(error_json_a4(404, "no CA root", make_correlation_id(),
@@ -341,7 +415,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 // be able to tell when to stop, not guess from count<limit). The
                 // probe row is trimmed before render. list_issued clamps at 10000,
                 // so limit+1 (<=1001) is always in range.
-                auto records = ca_store->list_issued(limit + 1, offset);
+                auto records_or_err = ca_store->list_issued(limit + 1, offset);
+                if (!records_or_err) {
+                    res.status = 503;
+                    res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                auto records = std::move(*records_or_err);
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
@@ -378,7 +460,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
 
     // ── POST /api/v1/ca/revoke ── Security:Delete: revoke a serial. ───────────
     // Body: {"serial_hex": "...", "reason": "..."}. Revocation takes effect
-    // server-side immediately (the mTLS accept gate consults ca.db, not the CRL);
+    // server-side immediately (the mTLS accept gate consults ca_store, not the CRL);
     // republishing the CRL propagates it to external consumers.
     sink.Post("/api/v1/ca/revoke", [perm_fn, ca_store, revoke_core](
                                       const httplib::Request& req, httplib::Response& res) {
@@ -432,7 +514,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // inject newlines into the audit detail (log-injection defence in depth).
         std::erase_if(reason, [](char c) { return c == '\n' || c == '\r'; });
         // Hermes M4: validate + normalise serial_hex (1..64 hex, uppercase) so a
-        // lowercase-input revoke still matches the canonical ca.db form.
+        // lowercase-input revoke still matches the canonical ca_store form.
         const std::string serial = normalize_serial(body.value("serial_hex", ""));
         if (serial.empty()) {
             res.status = 400;
@@ -443,6 +525,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             return;
         }
         const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::StoreError) {
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 503;
+            res.set_content(error_json_a4(503, "CA store unavailable — try again",
+                                          make_correlation_id()),
+                            kJson);
+            return;
+        }
         if (rv.outcome == RevokeOutcome::NotFound) {
             // M1 (#1240): a dropped denied-row is the same evidence gap as a lost
             // success row — surface it.
@@ -464,6 +555,210 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                               {"meta", {{"api_version", "v1"}}}};
         res.set_content(out.dump(), kJson);
     });
+
+    // ── POST /api/v1/ca/issue-code-signing ── Security:Write: code-signing ────
+    // leaf issuance via CSR custody (gap-matrix #10). The operator holds the
+    // private key and submits a CSR; the server signs and returns ONLY the
+    // leaf + chain. Body: {"csr_pem","label","validity_days"?}. SAFE because
+    // the injected issue_code_signing_fn (ServerImpl) hard-pins usage to
+    // {.code_signing=true} and sets CN=label — see this file's ca_routes.hpp
+    // header for why that never reaches the #1118 agent-identity gate.
+    sink.Post(
+        "/api/v1/ca/issue-code-signing",
+        [perm_fn, audit_fn, auth_fn, ca_store, issue_code_signing_fn](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Write"))
+                return;
+            if (!ca_store || !ca_store->is_open() || !issue_code_signing_fn) {
+                res.status = 503;
+                res.set_content(error_json_a4(503, "CA not available", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (req.body.size() > kMaxIssueCodeSigningBody) {
+                res.status = 413;
+                res.set_content(
+                    error_json_a4(413, "request body too large", make_correlation_id()), kJson);
+                return;
+            }
+            nlohmann::json body;
+            try {
+                body = nlohmann::json::parse(req.body, nullptr, false);
+            } catch (...) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "invalid JSON body", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            // Mass-assignment guard (mirrors POST /ca/revoke above).
+            for (const auto& [k, v] : body.items()) {
+                if (k != "csr_pem" && k != "label" && k != "validity_days") {
+                    res.status = 400;
+                    res.set_content(
+                        error_json_a4(400, "unknown field in request body", make_correlation_id(),
+                                     "only csr_pem, label and validity_days are accepted"),
+                        kJson);
+                    return;
+                }
+            }
+            // gov F9 (cpp-1): a present-but-non-string csr_pem/label throws
+            // nlohmann's type_error.302 out of `.value<std::string>()` — an
+            // uncaught throw here is a bare 500 with no A4 envelope. Guard the
+            // same way the validity_days check below already does.
+            if (body.contains("csr_pem") && !body["csr_pem"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (body.contains("label") && !body["label"].is_string()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must be a string", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            const std::string csr_pem = body.value("csr_pem", "");
+            const std::string label = body.value("label", "");
+            if (csr_pem.empty()) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "csr_pem is required", make_correlation_id()),
+                                kJson);
+                return;
+            }
+            if (!is_valid_code_signing_label(label)) {
+                res.status = 400;
+                res.set_content(error_json_a4(400, "label must match ^[A-Za-z0-9._-]{1,64}$",
+                                              make_correlation_id()),
+                                kJson);
+                return;
+            }
+            std::optional<int> validity_days;
+            if (body.contains("validity_days") && !body["validity_days"].is_null()) {
+                if (!body["validity_days"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be an integer",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                // gov F6/UP-7: read as int64 and range-check BEFORE narrowing to
+                // int — get<int>() on an out-of-int-range JSON integer (e.g.
+                // 2^32+365) silently truncates, and a truncated value landing
+                // INSIDE [1,730] would sail past a post-narrowing check. Also
+                // makes REST reject >730 explicitly, matching MCP's schema
+                // maximum:730 (the two twins now reject identically) instead of
+                // deferring the ceiling entirely to the server-side refusal.
+                int64_t v64 = 0;
+                try {
+                    v64 = body["validity_days"].get<int64_t>();
+                } catch (...) {
+                    // A JSON integer outside int64_t range (e.g. an unsigned
+                    // value > INT64_MAX) — definitely outside [1,730].
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                if (v64 < 1 || v64 > kMaxCodeSigningValidityDaysRest) {
+                    res.status = 400;
+                    res.set_content(error_json_a4(400, "validity_days must be between 1 and 730",
+                                                  make_correlation_id()),
+                                    kJson);
+                    return;
+                }
+                validity_days = static_cast<int>(v64);
+            }
+            // Re-derive the session (perm_fn above already authenticated this
+            // request) ONLY to attribute IssuedCertRecord::issued_by to the
+            // calling operator — matches the discovery_routes.cpp/
+            // command_routes.cpp precedent for a post-perm_fn auth_fn re-read.
+            std::string issued_by = "operator:unknown";
+            if (auth_fn) {
+                if (auto session = auth_fn(req, res))
+                    issued_by = "operator:" + session->username;
+            }
+            auto issued = issue_code_signing_fn(csr_pem, label, validity_days, issued_by);
+            if (!issued) {
+                const std::string& err = issued.error();
+                const bool no_root = err.starts_with(kCodeSigningNoRootPrefix);
+                const bool bad_csr = err.starts_with(kCodeSigningBadCsrPrefix);
+                // gov B1 / F6/UP-5/UP-7: two more caller-attributable
+                // classifications, each with its own message so a weak key or a
+                // bad validity_days is never reported as "csr_pem is invalid".
+                const bool weak_key = err.starts_with(kCodeSigningWeakKeyPrefix);
+                const bool bad_validity = err.starts_with(kCodeSigningBadValidityPrefix);
+                int status = 500;
+                std::string result = "failure";
+                std::string msg = "code-signing issuance failed";
+                if (no_root) {
+                    status = 409;
+                    result = "denied";
+                    msg = "no CA root to issue from (generate default certs first)";
+                } else if (bad_csr) {
+                    status = 400;
+                    result = "denied";
+                    msg = "csr_pem is invalid or fails proof-of-possession";
+                } else if (weak_key) {
+                    status = 400;
+                    result = "denied";
+                    // Already caller-safe — crafted at the server.cpp call site.
+                    msg = err.substr(std::string_view(kCodeSigningWeakKeyPrefix).size());
+                } else if (bad_validity) {
+                    status = 400;
+                    result = "denied";
+                    msg = err.substr(std::string_view(kCodeSigningBadValidityPrefix).size());
+                }
+                const bool audit_ok = audit_fn(req, "ca.cert.issued", result,
+                                               "CodeSigningCertificate", label,
+                                               "purpose=code-signing reason=" + err);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
+                return;
+            }
+            const bool audit_ok =
+                audit_fn(req, "ca.cert.issued", "success", "CodeSigningCertificate",
+                         issued->serial_hex, "purpose=code-signing label=" + label);
+            if (!audit_ok) {
+                // gov HIGH-2 (ADR-1005 "mutations fail closed on audit
+                // failure", mirrors #2466/#2406's engine-credential-mint
+                // precedent above): the leaf IS already durably recorded in
+                // ca_store via record_issued — only the audit row failed to
+                // persist — so it is discoverable and reissuable rather than
+                // lost. WITHHOLD certificate_pem/chain_pem instead of
+                // returning them in an unaudited 200; Sec-Audit-Failed alone
+                // (the REVOKE convention, unchanged elsewhere in this file) is
+                // not enough here because that header is easy for a caller to
+                // miss while still consuming the 200 body's secret material.
+                res.status = 503;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    error_json_a4(503,
+                                 "code-signing certificate " + issued->serial_hex +
+                                     " was issued but its audit record could not be "
+                                     "persisted; the certificate was withheld. Check GET "
+                                     "/api/v1/ca/issued and reissue if the serial is not "
+                                     "recorded",
+                                 make_correlation_id()),
+                    kJson);
+                return;
+            }
+            nlohmann::json out = {{"certificate_pem", issued->certificate_pem},
+                                  {"chain_pem", issued->chain_pem},
+                                  {"serial_hex", issued->serial_hex},
+                                  {"not_after", issued->not_after},
+                                  {"purpose", "code-signing"},
+                                  {"meta", {{"api_version", "v1"}}}};
+            res.set_content(out.dump(), kJson);
+        });
 
     // ── GET /api/v1/ca/root-csr ── Security:Read: export the install CA's CSR ──
     // (PR6) for an enterprise root to sign into a subordinate-CA intermediate.
@@ -603,11 +898,11 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                 result = "failure";
                 break;
             }
-            const bool audit_ok =
+            bool audit_ok =
                 audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
-            if (!audit_ok)
-                res.set_header("Sec-Audit-Failed", "true");
             if (!ok) {
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;
                 res.set_content(error_json_a4(status, msg, make_correlation_id()), kJson);
                 return;
@@ -615,6 +910,16 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             // Re-publish the CRL so the served CRL is signed under the new issuing
             // cert's identity (issuer_fingerprint refresh after the re-key).
             const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+            // #4829: was previously unaudited — the only publish_crl_fn caller in this file that
+            // wrote no ca.crl.published row at all, symmetric with revoke_core's own pair above.
+            audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                "Security", "root",
+                                crl_ok ? "reason=import_chain"
+                                       : "reason=import_chain CRL build/record failed after "
+                                         "import; public CRL may be stale under the new issuer") &&
+                       audit_ok;
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
             nlohmann::json out = {{"imported", true},
                                   {"mode", "subordinate"},
                                   {"crl_republished", crl_ok},
@@ -637,11 +942,30 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // Form-encoded (HTMX hx-vals); Security:Delete. Re-renders the panel fragment
     // so the HTMX swap shows the updated inventory. Shares revoke_core with the
     // JSON REST endpoint (same validation, audit, CRL republish).
-    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core](
+    // #2537: the trusted-origin allowlist is captured BY VALUE, not read through
+    // `this`. These handlers deliberately capture every dependency by value and
+    // never touch the owner, so copying the (small, boot-immutable) list keeps it
+    // that way and raises no question about CaRoutes outliving the sink.
+    const auto csrf_trusted = csrf_trusted_origins_;
+    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted](
                                              const httplib::Request& req, httplib::Response& res) {
-        // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone,
-        // and SameSite=Lax does not block a top-level cross-site form POST — so a
-        // CSRF gate is mandatory (a forged revoke = fleet-wide lockout DoS). Run it
+        // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone
+        // (a forged revoke = fleet-wide lockout DoS), so it carries a CSRF gate.
+        //
+        // What that gate is actually for, corrected on #2641 review: `SameSite=Lax`
+        // sends the cookie on a cross-site TOP-LEVEL NAVIGATION only for SAFE
+        // methods, and POST is not safe — so a purely cross-site form POST arrives
+        // with NO cookie and is already unauthenticated. (An earlier version of this
+        // comment said Lax "does not block" it. That is wrong. The likely source is
+        // Chrome's Lax+POST intervention, which applies only to cookies with NO
+        // SameSite attribute; `auth_routes.cpp` sets `SameSite=Lax` explicitly, so
+        // it does not apply here.)
+        //
+        // The residual the gate closes is a SAME-SITE sibling origin — subdomain
+        // takeover, XSS on a neighbour, a shared-domain deployment. Those are
+        // same-site for cookie purposes, so they DO carry the cookie, while being a
+        // different ORIGIN, which is exactly what Origin/Referer distinguishes.
+        // Getting this right matters because the next person reasons from it. Run it
         // FIRST, before perm_fn, so a cross-site probe cannot read a perm/role
         // oracle off the response (Hermes PR4b LOW). A browser HTMX POST always
         // carries Origin (or at least Referer); this DESTRUCTIVE cookie endpoint
@@ -650,8 +974,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // (Hermes PR4b MEDIUM). Token/Bearer automation uses the REST sibling.
         const std::string origin = req.get_header_value("Origin");
         const std::string referer = req.get_header_value("Referer");
-        const bool same_site = !(origin.empty() && referer.empty()) &&
-                               origin_is_same_site(req.get_header_value("Host"), origin, referer);
+        const bool same_site =
+            !(origin.empty() && referer.empty()) &&
+            origin_is_same_site(req.get_header_value("Host"), origin, referer, csrf_trusted);
         if (!same_site) {
             if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.revoke",
                           "cross-origin or header-less dashboard revoke refused"))
@@ -684,6 +1009,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
             return;
         }
         const RevokeResult rv = revoke_core(req, serial, reason);
+        if (rv.outcome == RevokeOutcome::StoreError) {
+            if (!rv.audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            error_panel(503, "Certificate authority store error — try again.");
+            return;
+        }
         if (rv.outcome == RevokeOutcome::NotFound) {
             // Don't render a success-looking panel for a no-op revoke (Hermes
             // PR4b INFO) — tell the operator the serial was unknown/already gone.
@@ -705,13 +1036,14 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // the new Trust mode badge shows. The submitted PEMs are NEVER echoed back
     // into the fragment, so this wrapper adds no HTML-injection surface.
     sink.Post("/api/settings/ca/import-chain",
-              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn](
+              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted](
                   const httplib::Request& req, httplib::Response& res) {
                   const std::string origin = req.get_header_value("Origin");
                   const std::string referer = req.get_header_value("Referer");
                   const bool same_site =
                       !(origin.empty() && referer.empty()) &&
-                      origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                      origin_is_same_site(req.get_header_value("Host"), origin, referer,
+                                          csrf_trusted);
                   if (!same_site) {
                       if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.import-chain",
                                     "cross-origin or header-less dashboard CA import refused"))
@@ -792,7 +1124,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                       emsg = "Failed to persist the imported chain.";
                       break;
                   }
-                  const bool audit_ok =
+                  bool audit_ok =
                       audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root",
                                ok ? "mode=subordinate via=dashboard" : "via=dashboard");
                   if (!ok) {
@@ -807,6 +1139,15 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                   // failure — the import succeeded but external CRL consumers stay
                   // on the old issuer until the next publish. Prepend a notice.
                   const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+                  // #4829: was previously unaudited, symmetric with the REST import-chain
+                  // handler's own ca.crl.published addition above.
+                  audit_ok = audit_fn(req, "ca.crl.published", crl_ok ? "success" : "failure",
+                                      "Security", "root",
+                                      crl_ok ? "reason=import_chain via=dashboard"
+                                             : "reason=import_chain via=dashboard CRL build/record "
+                                               "failed after import; public CRL may be stale under "
+                                               "the new issuer") &&
+                             audit_ok;
                   if (!audit_ok)
                       res.set_header("Sec-Audit-Failed", "true");
                   std::string body;

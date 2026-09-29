@@ -1,0 +1,228 @@
+## Disk Actions Definitions
+## Reports physical drive health and the mapping between physical drives and
+## the logical volumes they back.
+## Plugin: disk_actions | Actions: smart, volumes
+##
+## Sources by platform:
+##   Windows: IOCTL_STORAGE_QUERY_PROPERTY — StorageDeviceProperty (identity,
+##            bus type), StorageDeviceSeekPenaltyProperty (SSD vs HDD) and
+##            StorageDeviceProtocolSpecificProperty with NVMe log page 0x02
+##            (wear, spare, critical warning) for `smart`; FindFirstVolumeW +
+##            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS +
+##            GetVolumePathNamesForVolumeNameW for `volumes`. The device handle
+##            is opened with ZERO access rights, which an unprivileged service
+##            account may do.
+##   macOS:   IOKit IOBlockStorageDevice device characteristics (identity,
+##            medium type, NVMe-SMART capability) for `smart`; IOKit IOMedia
+##            provider walk + getmntinfo_r_np(3) MNT_NOWAIT for `volumes`.
+##   Linux:   not implemented in this release — no mechanism could be bound
+##            against real hardware, and shipping one written only from
+##            documentation is how a leg reaches production doing nothing.
+##
+## SCOPE NOTE. `volumes` is deliberately NOT a third volume inventory:
+## `hardware.disks` already enumerates physical devices and
+## `filesystem_posture.mounts` already enumerates mounts. This action carries
+## only the JOIN between them, which is what lets a failing-drive alert name
+## the volumes and drive letters it affects.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.smart
+  displayName: Drive Health
+  version: 1.0.0
+  description: >
+    Reports per-physical-drive health: model, transport, media type and, where
+    the operating system exposes them, wear indicators. On Windows the wear,
+    available-spare and critical-warning figures are read from the NVMe
+    SMART/Health log, so an NVMe drive reports them and a SATA or USB drive
+    reports identity and media type with health "unknown" rather than a guess —
+    IOCTL_STORAGE_PREDICT_FAILURE is deliberately not used as a substitute
+    because it fails on NVMe. On macOS the leg reports identity and whether the
+    device advertises NVMe SMART, but NOT the health attributes: those are
+    reachable only through a private, undocumented Apple interface, so health
+    reports "unknown" there on every device. The Linux leg is not implemented
+    in this release and says so.
+
+    Three columns carry FIXED vocabularies, emitted verbatim and safe to group
+    or alert on. health: ok, warning, failing, unknown (the device did not tell
+    us), unsupported (this OS leg cannot ask — every Linux row today).
+    bus: nvme, sata, usb, sas, virtual, unknown.
+    media: ssd, hdd, unknown. A value outside these sets is never emitted.
+  tags: [storage, disk, health, smart, hardware]
+
+spec:
+  type: question
+  platforms: [windows, darwin]
+
+  execution:
+    plugin: disk_actions
+    action: smart
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # The plugin emits one pipe row per physical drive:
+    # `smart|<device>|<model>|<bus>|<media>|<health>|<pct_used>|<spare_pct>|
+    # <detail>` — field 0 is the literal `smart` discriminator and the columns
+    # below map to fields 1-8. `bus`, `media` and `health` are FIXED
+    # vocabularies. A percentage that was not read renders as "-", never 0.
+    columns:
+      - name: device
+        type: string
+        description: OS device name of the physical drive
+        example: PhysicalDrive0
+        platforms: [windows, darwin]
+      - name: model
+        type: string
+        description: Drive model string as reported by the OS, escaped
+        example: Samsung SSD 970 EVO Plus 1TB
+        platforms: [windows, darwin]
+      - name: bus
+        type: string
+        description: Transport, a closed vocabulary
+        values: [nvme, sata, usb, sas, virtual, unknown]
+        example: nvme
+        platforms: [windows, darwin]
+      - name: media
+        type: string
+        description: Media type, a closed vocabulary
+        values: [ssd, hdd, unknown]
+        example: ssd
+        platforms: [windows, darwin]
+      - name: health
+        type: string
+        description: >-
+          Health verdict. unknown means the device did not say; unsupported
+          means this OS leg cannot ask. Windows reports a verdict for NVMe
+          drives only; macOS always reports unknown; Linux always unsupported.
+        values: [ok, warning, failing, unknown, unsupported]
+        example: ok
+        platforms: [windows]
+      - name: pct_used
+        type: string
+        description: >-
+          NVMe "Percentage Used" (0-255 by specification, never clamped), or
+          "-" when not read.
+        example: "5"
+        platforms: [windows]
+      - name: spare_pct
+        type: string
+        description: NVMe "Available Spare" (0-100), or "-" when not read.
+        example: "100"
+        platforms: [windows]
+      - name: detail
+        type: string
+        description: Free text, or "-".
+        example: "-"
+    aggregation:
+      groupBy:
+        - health
+      operations:
+        - count
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.volumes
+  displayName: Volume to Drive Mapping
+  version: 1.0.0
+  description: >
+    Reports which physical drive backs which logical volume and mount point.
+    This is deliberately not a general volume inventory — `hardware.disks`
+    already lists physical devices and `crossplatform.storage.mounts` already
+    lists mounts; this action carries the join between them, so a failing drive
+    can be named in terms of the volumes it serves. On Windows a volume spanning
+    several drives reports every drive it touches, and a volume with no drive
+    letter or mount point reports "-" for mount points rather than being
+    omitted. On macOS the physical drive is resolved by walking the IOKit
+    provider chain, so an APFS volume on a synthesized container correctly
+    reports the underlying physical disk rather than the container. The Linux
+    leg is not implemented in this release.
+
+    total_bytes here is RAW MEDIA CAPACITY, not filesystem capacity, and it is
+    NOT comparable with crossplatform.storage.mounts.total_bytes: on Windows it
+    is the sum of the volume's disk extents, on macOS the IOMedia size, while
+    the mounts action reports the filesystem's own total. fstype and total_bytes
+    are carried only to identify the volume in the join; for capacity reporting
+    use crossplatform.storage.mounts or crossplatform.storage.free.
+  tags: [storage, disk, volume, mapping]
+
+spec:
+  type: question
+  platforms: [windows, darwin]
+
+  execution:
+    plugin: disk_actions
+    action: volumes
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # The plugin emits one pipe row per volume:
+    # `volume|<volume>|<mount_points>|<device>|<fstype>|<total_bytes>|<detail>`
+    # — field 0 is the literal `volume` discriminator and the columns below map
+    # to fields 1-6. `mount_points` is comma-separated, or "-" when the volume
+    # serves none.
+    columns:
+      - name: volume
+        type: string
+        description: >-
+          Volume GUID path (Windows) or BSD name (macOS); "-" only on the
+          empty-result placeholder row.
+        example: disk3s1s1
+        platforms: [windows, darwin]
+      - name: mount_points
+        type: string
+        description: Comma-separated mount points or drive letters, or "-" when the volume serves none.
+        example: /System/Volumes/Data
+        platforms: [windows, darwin]
+      - name: device
+        type: string
+        description: Backing physical drive; several, comma-separated, on a spanned volume.
+        example: disk0
+        platforms: [windows, darwin]
+      - name: fstype
+        type: string
+        description: Filesystem of the volume (NTFS, FAT32, apfs, ...), or "-" when unmounted or unknown.
+        example: apfs
+        platforms: [windows, darwin]
+      - name: total_bytes
+        type: int64
+        description: >-
+          Raw media capacity (sum of disk extents on Windows, IOMedia size on
+          macOS), not filesystem capacity. Not comparable with
+          crossplatform.storage.mounts.total_bytes.
+        example: "494384795648"
+        platforms: [windows, darwin]
+      - name: detail
+        type: string
+        description: Free text, or "-".
+        example: "-"
+    aggregation:
+      groupBy:
+        - device
+      operations:
+        - count
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]

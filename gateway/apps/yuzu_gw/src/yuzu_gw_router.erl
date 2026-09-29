@@ -46,6 +46,11 @@ start_link() ->
 %% Returns a fanout reference. Responses are sent to the caller's mailbox as:
 %%   {command_response, FanoutRef, AgentId, Response}
 %%   {fanout_complete, FanoutRef, Summary}
+%%
+%% CommandReq is passed to yuzu_gw_agent:dispatch/3 as an opaque map — the
+%% router never extracts or rebuilds individual fields, so `dispatch_tag`
+%% (like `payload`) rides through untouched, the same as every other
+%% CommandRequest field. See agent.proto CommandRequest.dispatch_tag.
 -spec send_command([binary()], map(), map()) -> {ok, reference()} | {error, term()}.
 send_command(AgentIds, CommandReq, Opts) ->
     gen_server:call(?SERVER, {send_command, AgentIds, CommandReq, Opts}).
@@ -69,22 +74,35 @@ handle_call({send_command, AgentIds, CommandReq, Opts}, {CallerPid, _Tag}, State
     FanoutRef = make_ref(),
     StartedAt = erlang:monotonic_time(millisecond),
 
-    %% Dispatch to each agent process.
-    {Dispatched, Skipped} = lists:foldl(fun(AgentId, {D, S}) ->
+    %% Dispatch to each agent process. HA WS-4 4.3a: `yuzu_gw_registry:lookup/1`
+    %% may now resolve to a pid on a DIFFERENT node (the `pg`-backed
+    %% cross-node fallback — see that function's doc comment); `dispatch/3`
+    %% is a `gen_statem:cast` and dist-transparent either way, so the
+    %% dispatch call itself needs no branch. `RemoteDispatched` is counted
+    %% separately (not folded into `Dispatched`) purely for observability —
+    %% distinguishing "routed to a sibling node" from "resolved locally"
+    %% makes cross-node routing visible instead of indistinguishable from
+    %% the local case.
+    Self = node(),
+    {Dispatched, Skipped, RemoteDispatched} = lists:foldl(fun(AgentId, {D, S, R}) ->
         case yuzu_gw_registry:lookup(AgentId) of
             {ok, Pid} ->
                 yuzu_gw_agent:dispatch(Pid, CommandReq, {CallerPid, FanoutRef}),
-                {D + 1, S};
+                case node(Pid) of
+                    Self -> {D + 1, S, R};
+                    _    -> {D + 1, S, R + 1}
+                end;
             error ->
                 %% Agent not connected — notify caller immediately.
                 CallerPid ! {command_error, FanoutRef, AgentId, not_connected},
-                {D, S + 1}
+                {D, S + 1, R}
         end
-    end, {0, 0}, Targets),
+    end, {0, 0, 0}, Targets),
 
     telemetry:execute([yuzu, gw, command, fanout],
                       #{target_count => length(Targets),
-                        dispatched => Dispatched, skipped => Skipped},
+                        dispatched => Dispatched, skipped => Skipped,
+                        remote_dispatched => RemoteDispatched},
                       #{command_id => maps:get(command_id, CommandReq,
                                                maps:get(<<"command_id">>, CommandReq, undefined))}),
 

@@ -1,0 +1,6 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Copy-Item C:\Windows\Prefetch\REG.EXE-6A8B6960.pf (real prefetch file, one of the 3 smallest non-zero-byte .pf files on the-rig)
+date: 2026-09-06
+status: REAL CAPTURE
+note: MAM-compressed (first 4 bytes 4D 41 4D 04). See REG.EXE-6A8B6960.pf.decompressed.provenance.txt for the decompression probe result.
+run_count_note: selected as the "run count > 1" candidate because reg.exe was invoked 8+ times by earlier capture steps in this same session (multiple reg export / reg load / reg unload / reg query calls before this file's LastWriteTime of 18:23:47); the probe's job per spec is decompression evidence only, not full v31 header field parsing, so the exact RunCount integer is left for P31's parser to verify against these real decompressed bytes.

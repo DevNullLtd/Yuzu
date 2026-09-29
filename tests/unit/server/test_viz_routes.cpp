@@ -612,3 +612,39 @@ TEST_CASE("REST viz: host endpoint returns 404 for unknown agent + audit row", "
     CHECK(h.audit_log[0].target_id == "bogus-id");
     CHECK(h.audit_log[0].detail == "not_found");
 }
+
+TEST_CASE("REST viz: host endpoint rejects an oversize agent_id before it reaches "
+          "the audit trail",
+          "[viz][host]") {
+    // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review): an
+    // unfloored path-captured agent_id flowed into audit_fn_'s target_id on
+    // every branch; AuditStore's sanitizer scrubs invalid UTF-8/NUL but not
+    // other C0 control bytes. Mirrors the MCP twin's own regression test.
+    VizHarness h({mk_agent("a1", "host-1")});
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    auto res = h.sink.Get("/api/v1/viz/host/" + too_long + "/topology");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("too long") != std::string::npos);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST viz: host endpoint rejects a control-character agent_id before it "
+          "reaches the audit trail",
+          "[viz][host]") {
+    // TestRouteSink does NOT percent-decode (docs/CLAUDE.md caveat), so the
+    // raw control byte below reaches the handler exactly as httplib's own
+    // [^/]+ path regex would pass it through in production - a real request
+    // whose path segment happens to contain a raw control byte, not a
+    // percent-encoded one a decoder would have normalized.
+    VizHarness h({mk_agent("a1", "host-1")});
+    const std::string bad_id = std::string("agent-") + '\x01' + "id";
+    auto res = h.sink.Get("/api/v1/viz/host/" + bad_id + "/topology");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("control characters") !=
+          std::string::npos);
+    CHECK(h.audit_log.empty());
+}

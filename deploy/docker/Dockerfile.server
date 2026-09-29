@@ -22,7 +22,7 @@
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
 # ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
-FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS deps
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS deps
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; the default keeps the historical x64 build behaviour.
@@ -67,6 +67,13 @@ RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
 # ── Stage 2: build — configure + compile (reuses cached deps) ────────────
 FROM deps AS builder
 
+# An empty value preserves Meson/Ninja's platform default for local builds.
+# Big Tam CI passes 16 explicitly because Docker BuildKit workers are children
+# of dockerd, not of the L3-pinned GitHub runner service, and therefore do not
+# inherit its CPU affinity or environment. Ninja interprets `-j0` as unlimited,
+# so the compile command omits `-j` entirely when this argument is empty.
+ARG YUZU_BUILD_JOBS=
+
 ENV CC="ccache gcc-13" \
     CXX="ccache g++-13" \
     CCACHE_DIR=/root/.cache/ccache
@@ -77,20 +84,28 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         --native-file meson/native/linux-gcc13.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
+        -Dpkg_config_path=/src/vcpkg_installed/${TRIPLET}/lib/pkgconfig \
         -Dbuild_tests=false \
         -Dbuild_agent=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────
 #
 # RUNTIME INVARIANT: bash is required by docker-compose.uat.yml's healthcheck
-# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). debian:trixie-slim
-# does not ship /bin/bash; the apt install line below adds it explicitly.
-# If you switch this base image to a minimal/distroless variant, also update
+# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). debian:trixie-slim DOES
+# ship /bin/bash (5.2.x) — an earlier version of this comment claimed it did not
+# — but the apt line below installs it EXPLICITLY anyway, so the healthcheck's
+# dependency is declared rather than inherited from a base image that could drop
+# it. If you switch this base image to a minimal/distroless variant, also update
 # every compose file's healthcheck block to use a tool the new base provides
 # (busybox wget, nc, etc.). Governance Gate 7, architect SHOULD-2.
-FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+#
+# ENFORCED (#751): scripts/ci/verify-healthcheck-invariants.sh probes this image
+# for a WORKING bash + /dev/tcp (not merely a bash binary — a bash built without
+# net redirections is caught too) before release.yml pushes it, and on every PR
+# that touches this file.
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 # /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
 # (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs

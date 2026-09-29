@@ -93,6 +93,37 @@ TEST_CASE("ResponseTemplatesEngine: synthesise_default uses result_schema when p
     CHECK(t.filters.empty());
 }
 
+TEST_CASE("ResponseTemplatesEngine: synthesise_default handles the "
+          "object-wrapped 'columns' shape real content YAML produces "
+          "(PR1.7 dashboard-rendering fix)",
+          "[response_templates][engine][default]") {
+    // embed_content.py's `env["result_schema"] = json.dumps(spec["result"])`
+    // dumps the WHOLE `result:` YAML block, i.e. an object with a top-level
+    // "columns" key -- not the bare array the other synthesise_default
+    // tests above use (that bare-array shape is legacy_shim.cpp's
+    // auto-generated-definition form, never what a real content/*.yaml
+    // `result.columns:` list produces). This is registry.yaml's real
+    // list_profiles result_schema, byte-shaped as embed_content.py would
+    // emit it -- the object-form branch in columns_from_result_schema was
+    // reachable but had no test exercising it until this PR's dashboard-
+    // rendering remediation surfaced the gap.
+    ResponseTemplatesEngine eng;
+    auto schema = R"({"columns":[
+        {"name":"sid","type":"string"},
+        {"name":"profile_name","type":"string"},
+        {"name":"profile_path","type":"string"},
+        {"name":"hive_state","type":"string"}
+    ]})";
+    auto t = eng.synthesise_default(schema, "registry");
+    CHECK(t.id == ResponseTemplatesEngine::kDefaultId);
+    CHECK(t.is_default == true);
+    REQUIRE(t.columns.size() == 4);
+    CHECK(t.columns[0] == "sid");
+    CHECK(t.columns[1] == "profile_name");
+    CHECK(t.columns[2] == "profile_path");
+    CHECK(t.columns[3] == "hive_state");
+}
+
 TEST_CASE("ResponseTemplatesEngine: synthesise_default falls back to plugin schema",
           "[response_templates][engine][default]") {
     ResponseTemplatesEngine eng;

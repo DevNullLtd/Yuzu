@@ -10,10 +10,13 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <expected>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -273,6 +276,7 @@ struct InvHarness {
     bool degrade = false;            // make every store provider return nullopt
     bool audit_should_fail = false;  // simulate an audit-persist failure (Sec-Audit-Failed)
     bool unwire_devices = false;     // register with an empty DevicesFn{} (unwired closure)
+    bool service_scoped = false;     // simulate a service-scoped API token session
     std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
@@ -280,12 +284,23 @@ struct InvHarness {
     std::vector<std::string> audit_full;      // "action|result|target_type|target_id" (parity check)
     std::vector<std::string> audit_details;   // detail strings, parallel to `audits`
 
+    // Round-3 item 8 fixtures: agent_id -> hostname (HostnamesFn fake) for the
+    // SOFTWARE "devices ›" expansion, and the last query object each fleet-wide
+    // provider actually received (so a test can assert what the ROUTE forwarded,
+    // not just what the fake chose to return).
+    std::unordered_map<std::string, std::string> hostnames;
+    std::optional<SoftwareCatalogQuery> last_catalog_query;
+    std::optional<SoftwareFleetQuery> last_fleet_query; // shared by /find/results + /software/devices
+
     // `unwire_devices_` must be a constructor param, not a post-construction field write —
     // `register_routes` (below) runs once, here, so the DevicesFn choice is baked in at
     // construction time (unlike `degrade`, which every provider lambda re-checks per-call).
     explicit InvHarness(bool unwire_devices_ = false) : unwire_devices(unwire_devices_) {
-        auto auth = [](const httplib::Request&, httplib::Response&) {
-            return std::optional<auth::Session>(auth::Session{});
+        auto auth = [this](const httplib::Request&, httplib::Response&) {
+            auth::Session s;
+            if (service_scoped)
+                s.token_scope_service = "printers";
+            return std::optional<auth::Session>(s);
         };
         auto perm = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                            const std::string&) {
@@ -299,8 +314,9 @@ struct InvHarness {
                 res.status = 403;
             return allow_scoped;
         };
-        auto catalog = [this](const SoftwareCatalogQuery&)
+        auto catalog = [this](const SoftwareCatalogQuery& q)
             -> std::optional<std::vector<SoftwareCatalogRow>> {
+            last_catalog_query = q;
             if (degrade)
                 return std::nullopt;
             return std::vector<SoftwareCatalogRow>{cat_row("Chrome", "Google", 5, 2)};
@@ -316,8 +332,9 @@ struct InvHarness {
                 return std::nullopt;
             return std::vector<SoftwareVersionCount>{{"1.0", 5}};
         };
-        auto fleet = [this](const SoftwareFleetQuery&)
+        auto fleet = [this](const SoftwareFleetQuery& q)
             -> std::optional<std::vector<SoftwareFleetRow>> {
+            last_fleet_query = q;
             if (degrade)
                 return std::nullopt;
             return fleet_rows;
@@ -367,11 +384,14 @@ struct InvHarness {
             audit_details.push_back(detail);
             return !audit_should_fail;
         };
+        auto hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
+            return hostnames;
+        };
         InventoryRoutes::DevicesFn devices_fn = devices;
         if (unwire_devices)
             devices_fn = InventoryRoutes::DevicesFn{}; // empty closure — route treats as degraded
         routes.register_routes(sink, auth, perm, scoped, catalog, catalog_meta, versions, fleet,
-                               agent_sw, devices_fn, scope, stale, audit, ci_fn);
+                               agent_sw, devices_fn, scope, stale, audit, ci_fn, hostnames_fn);
     }
 };
 
@@ -537,6 +557,44 @@ TEST_CASE("route: find results apply the per-row management-group drop filter", 
     REQUIRE(ok);
 }
 
+// Governance finding (guardian-confinement-2298 Gate 2/4/6): the per-row
+// management-group drop filter above is the ONLY confinement this route had —
+// it never checks token_scope_service, so a service-scoped token still saw
+// every out-of-service device running the searched-for software fleet-wide
+// (this file's own /fragments/inventory/devices sibling, two routes above,
+// already closed this exact class). Blanket deny, matching that sibling.
+TEST_CASE("route: find results — service-scoped token denied, no data leaked, denial audited",
+          "[inventory][route][security]") {
+    InvHarness h;
+    h.service_scoped = true;
+    h.fleet_rows = {fleet_row("agent-alpha", "Chrome", "1.0")};
+
+    auto res = h.sink.Get("/fragments/inventory/find/results?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "agent-alpha"));
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    bool denied = false;
+    for (const auto& a : h.audits) {
+        if (a == "inventory.software.query|denied")
+            denied = true;
+        REQUIRE(a != "inventory.software.query|success");
+    }
+    REQUIRE(denied);
+    // Gate 8: pin target_id="fleet" to match the REST/MCP siblings and
+    // audit-log.md's documented uniform shape.
+    REQUIRE(std::find(h.audit_full.begin(), h.audit_full.end(),
+                      "inventory.software.query|denied|Inventory|fleet") != h.audit_full.end());
+}
+
 TEST_CASE("route: find results empty name short-circuits (no store read)", "[inventory][route]") {
     InvHarness h;
     auto res = h.sink.Get("/fragments/inventory/find/results?name=");
@@ -617,6 +675,37 @@ TEST_CASE("route: devices list — deny vs success (offline-inclusive, audited)"
     }
 }
 
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn
+// on /fragments/inventory/devices is username-keyed and does not confine a
+// service-scoped API token whose principal resolves to an unscoped grant —
+// the GDPR-personal-data roster (serial/system_uuid/primary_mac) would still
+// be fleet-wide.
+TEST_CASE("route: devices list — service-scoped token denied, denial audited",
+          "[inventory][route][security]") {
+    InvHarness h;
+    h.service_scoped = true;
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "WIN-1"));
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    bool denied = false;
+    for (const auto& a : h.audits) {
+        if (a == "inventory.devices|denied")
+            denied = true;
+        REQUIRE(a != "inventory.devices|success");
+    }
+    REQUIRE(denied);
+}
+
 TEST_CASE("route: devices list — CI enrichment degrade audits failure, roster still renders",
           "[inventory][route]") {
     // #1785 review HIGH-1: a CI-store degrade must never masquerade as "success" in the
@@ -667,4 +756,176 @@ TEST_CASE("route: find shell gates on Inventory:Read", "[inventory][route]") {
     auto res = h.sink.Get("/fragments/inventory/find");
     REQUIRE(res);
     REQUIRE(res->status == 403);
+}
+
+// ───────────────── Round-3 items 8/9: search, devices expansion, Find retired ──────
+
+TEST_CASE("route: software fragment results_only=1 returns only the #sw-results region",
+          "[inventory][route]") {
+    // Mirrors hardware_ui.cpp's results_only fix for the identical class of bug: the
+    // search box's own hx-get must swap ONLY #sw-results, never the full page (which
+    // would re-include the triggering <input> and destroy it mid-keystroke).
+    InvHarness h;
+    auto res = h.sink.Get("/fragments/inventory/software?results_only=1");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "id=\"sw-results\""));
+    REQUIRE(contains(res->body, "Chrome")); // the catalogue row itself still renders
+    // The full-page chrome (KPI strip / search box / sub-nav / <h1>) is excluded.
+    REQUIRE_FALSE(contains(res->body, "inv-kpis"));
+    REQUIRE_FALSE(contains(res->body, "id=\"sw-q\""));
+    REQUIRE_FALSE(contains(res->body, "inv-subnav"));
+    REQUIRE_FALSE(contains(res->body, "inv-h1"));
+}
+
+TEST_CASE("route: software fragment forwards q into the store's name_filter",
+          "[inventory][route]") {
+    InvHarness h;
+    auto res = h.sink.Get("/fragments/inventory/software?q=adobe");
+    REQUIRE(res);
+    REQUIRE(h.last_catalog_query.has_value());
+    REQUIRE(h.last_catalog_query->name_filter == "adobe");
+}
+
+TEST_CASE("route: software devices — hostname resolution, columns, filter-group id",
+          "[inventory][route]") {
+    InvHarness h;
+    h.in_scope_agents = {"agent-known", "agent-unknown"}; // else the scope filter drops both rows
+    h.hostnames = {{"agent-known", "HOST-A"}}; // agent-unknown carries no mapping
+    h.fleet_rows = {fleet_row("agent-known", "Chrome", "1.0"),
+                    fleet_row("agent-unknown", "Chrome", "1.0")};
+    auto res = h.sink.Get("/fragments/inventory/software/devices?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    // HostnamesFn resolution: a known mapping renders the HOSTNAME as the link
+    // text; a miss falls back to the bare agent_id — both still link to the
+    // per-device Hardware CI page (round-3 item 8).
+    REQUIRE(contains(res->body, "<a href=\"/hardware/ci?id=agent-known\">HOST-A</a>"));
+    REQUIRE(contains(res->body, "<a href=\"/hardware/ci?id=agent-unknown\">agent-unknown</a>"));
+
+    // Columns: Version/Publisher/Install date/Signature/Ecosystem/Arch — Signature
+    // and Ecosystem were previously unrendered anywhere (round-3 item 8 doc comment).
+    REQUIRE(contains(res->body, "<th>Version</th>"));
+    REQUIRE(contains(res->body, "<th>Publisher</th>"));
+    REQUIRE(contains(res->body, "<th>Install date</th>"));
+    REQUIRE(contains(res->body, "<th>Signature</th>"));
+    REQUIRE(contains(res->body, "<th>Ecosystem</th>"));
+    REQUIRE(contains(res->body, "<th>Arch</th>"));
+
+    // Client filter-group: data-gpf is derived from the software name (id_safe),
+    // matching the catalogue row's own hx-target for this expansion — the filter
+    // input and every data row carry the SAME group.
+    REQUIRE(contains(res->body, "data-gpf=\"swdev-nChrome-520456eb94564cdd\""));
+}
+
+TEST_CASE("route: software devices — service-scoped token denied, no data leaked, denial audited",
+          "[inventory][route][security]") {
+    InvHarness h;
+    h.service_scoped = true;
+    h.fleet_rows = {fleet_row("agent-alpha", "Chrome", "1.0")};
+
+    auto res = h.sink.Get("/fragments/inventory/software/devices?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "agent-alpha"));
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    bool denied = false;
+    for (const auto& a : h.audits) {
+        if (a == "inventory.software.query|denied")
+            denied = true;
+        REQUIRE(a != "inventory.software.query|success");
+    }
+    REQUIRE(denied);
+}
+
+TEST_CASE("route: software devices — per-row management-group drop count in pill and audit",
+          "[inventory][route]") {
+    InvHarness h;
+    h.fleet_rows = {fleet_row("agent-alpha", "Chrome", "1.0"),
+                    fleet_row("agent-bravo", "Chrome", "2.0")};
+    h.in_scope_agents = {"agent-alpha"}; // agent-bravo is out of the operator's scope
+
+    auto res = h.sink.Get("/fragments/inventory/software/devices?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "agent-alpha"));
+    REQUIRE_FALSE(contains(res->body, "agent-bravo")); // dropped, not leaked
+    REQUIRE(contains(res->body, "1 device(s) outside your scope")); // the rendered pill
+    bool denied = false, ok = false;
+    for (const auto& a : h.audits) {
+        denied = denied || a == "inventory.software.query|denied";
+        ok = ok || a == "inventory.software.query|success";
+    }
+    REQUIRE(denied);
+    REQUIRE(ok);
+    bool detail_ok = false;
+    for (const auto& d : h.audit_details)
+        if (contains(d, "scope: filtered 1 out-of-management-group device(s)"))
+            detail_ok = true;
+    REQUIRE(detail_ok); // the same drop count also lands in the audit row's detail
+}
+
+TEST_CASE("route: software devices — degraded fleet store renders an honest banner, "
+          "not an empty table",
+          "[inventory][route]") {
+    InvHarness h;
+    h.degrade = true;
+    auto res = h.sink.Get("/fragments/inventory/software/devices?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "unavailable"));
+    REQUIRE_FALSE(contains(res->body, "No devices run")); // never the "genuinely zero" wording
+    bool failed = false;
+    for (const auto& a : h.audits)
+        if (a == "inventory.software.query|failure")
+            failed = true;
+    REQUIRE(failed);
+}
+
+TEST_CASE("route: software devices — empty name is a no-op: no data read, no audit",
+          "[inventory][route]") {
+    // Unreachable from the UI (the catalogue row's "devices ›" link always carries
+    // ?name=); this is the renderer's precondition-miss short-circuit for a direct
+    // fetch — NOT a "type a title" prompt (that wording belongs to the separate Find
+    // results fragment). fleet_fn_ must never be called for an empty name.
+    InvHarness h;
+    auto res = h.sink.Get("/fragments/inventory/software/devices");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(res->body.empty());
+    REQUIRE_FALSE(h.last_fleet_query.has_value()); // no data read
+    REQUIRE(h.audits.empty());                     // → nothing to audit
+}
+
+TEST_CASE("route: software devices — fleet_fn_'s limit is clamped into the route's bound",
+          "[inventory][route]") {
+    InvHarness h;
+    auto over = h.sink.Get("/fragments/inventory/software/devices?name=Chrome&limit=999999");
+    REQUIRE(over);
+    REQUIRE(h.last_fleet_query.has_value());
+    REQUIRE(h.last_fleet_query->limit == 1000); // clamped down to the route's hard ceiling
+
+    auto within = h.sink.Get("/fragments/inventory/software/devices?name=Chrome&limit=50");
+    REQUIRE(within);
+    REQUIRE(h.last_fleet_query.has_value());
+    REQUIRE(h.last_fleet_query->limit == 50); // a value already inside the bound passes through
+}
+
+TEST_CASE("route: /fragments/inventory/find and /find/results stay registered for deep links",
+          "[inventory][route]") {
+    // Round-3 item 9 retired the Find TAB (inv_subnav no longer links here), but the
+    // routes themselves stay registered by explicit design (existing deep links;
+    // docs/user-manual/inventory.md's retirement follow-up) — a regression that
+    // accidentally deleted either route must fail this, not silently 404.
+    InvHarness h;
+    auto shell = h.sink.Get("/fragments/inventory/find");
+    REQUIRE(shell);
+    REQUIRE(shell->status == 200);
+
+    auto results = h.sink.Get("/fragments/inventory/find/results?name=Chrome");
+    REQUIRE(results);
+    REQUIRE(results->status == 200);
 }

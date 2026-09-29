@@ -32,10 +32,19 @@ spec:
     columns:
       - name: version
         type: string
+        description: 'Full agent version string, "<semver>+<build_number>" (yuzu::kFullVersionString). Values: free text (semver + build suffix).'
+        example: "0.13.1+5871"
+        platforms: [windows, linux, darwin]
       - name: build_number
         type: string
+        description: "The build's numeric build number, formatted as text (yuzu::kBuildNumber). Values: free text (integer as string)."
+        example: "5871"
+        platforms: [windows, linux, darwin]
       - name: git_commit
         type: string
+        description: 'Short git commit hash of the build (yuzu::kGitCommitHash), or "unknown" when the build did not set one. Values: free text (hex hash or "unknown").'
+        example: "4c377398e"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get agent version"
 
@@ -86,10 +95,19 @@ spec:
     columns:
       - name: os
         type: string
+        description: 'OS family name. "Darwin"/"Linux" from uname(2) on macOS/Linux, or the literal "Windows" on Windows. Values: "Darwin", "Linux", "Windows".'
+        example: "Darwin"
+        platforms: [windows, linux, darwin]
       - name: arch
         type: string
+        description: "CPU architecture. uname(2)'s machine field on Linux/macOS; mapped from GetNativeSystemInfo on Windows. Values: free text on Linux/macOS (whatever uname reports); on Windows one of \"x86_64\", \"aarch64\", \"x86\", \"arm\", \"unknown\"."
+        example: "arm64"
+        platforms: [windows, linux, darwin]
       - name: hostname
         type: string
+        description: "Agent host's configured hostname (gethostname(3) on Linux/macOS, GetComputerNameA on Windows); the row is simply not emitted if the call fails. Values: free text."
+        example: "workstation1.local"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get agent platform info"
 
@@ -120,7 +138,8 @@ metadata:
   description: >
     Returns agent health metrics: uptime in seconds since plugin init,
     current epoch timestamp in milliseconds, and process resident set
-    size (RSS) in kilobytes.
+    size (RSS) in kilobytes. The memory_rss_kb row is omitted, not
+    zeroed, if the platform read fails.
   tags: [agent, health, monitoring]
 
 spec:
@@ -140,10 +159,19 @@ spec:
     columns:
       - name: uptime_seconds
         type: int64
+        description: "Seconds since the plugin's init() ran, measured with steady_clock; only meaningful once init() has actually been called by the host. Values: non-negative integer (seconds)."
+        example: 49012
+        platforms: [windows, linux, darwin]
       - name: timestamp_epoch_ms
         type: int64
+        description: 'Wall-clock time the action ran, in epoch milliseconds (system_clock::now()). Values: integer (Unix epoch milliseconds).'
+        example: 1788774965076
+        platforms: [windows, linux, darwin]
       - name: memory_rss_kb
         type: int64
+        description: 'Process resident set size in kilobytes; the row is omitted entirely (not zeroed) if the platform read fails. Values: non-negative integer (kilobytes), or the row is absent.'
+        example: 31056
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get agent health metrics"
 
@@ -174,7 +202,8 @@ metadata:
   description: >
     Lists all plugins currently loaded by the agent, with their name,
     version, and description. Returns the total plugin count followed
-    by one row per plugin.
+    by one row per plugin. Reads the agent's in-process config
+    (agent.plugins.*), populated only after the plugin's init() has run.
   tags: [agent, inventory, plugins]
 
 spec:
@@ -194,12 +223,24 @@ spec:
     columns:
       - name: plugins_count
         type: int32
+        description: "Number of plugins currently loaded by the agent, from agent.plugins.count in the in-process config; 0 if the config context isn't yet populated. Values: non-negative integer."
+        example: 0
+        platforms: [windows, linux, darwin]
       - name: plugin_name
         type: string
+        description: "Loaded plugin's name; one \"plugin|name|version|description\" row is emitted per loaded plugin. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: plugin_version
         type: string
+        description: "Loaded plugin's declared version string. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: plugin_description
         type: string
+        description: "Loaded plugin's declared description. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List loaded plugins"
 
@@ -230,7 +271,9 @@ metadata:
   description: >
     Lists all modules currently loaded by the agent, with their name,
     version, status, and optional description. Returns the total module
-    count followed by one row per module.
+    count followed by one row per module. Reads the agent's in-process
+    config (agent.modules.*), populated only after the plugin's init()
+    has run.
   tags: [agent, inventory, modules]
 
 spec:
@@ -250,14 +293,29 @@ spec:
     columns:
       - name: modules_count
         type: int32
+        description: "Number of modules recorded in the agent's module roster (agent.modules.count), including both successful loads and rejected loads. Values: non-negative integer."
+        example: 0
+        platforms: [windows, linux, darwin]
       - name: module_name
         type: string
+        description: "Module's file stem name; one \"module|name|version|status\" row is emitted per module. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: module_version
         type: string
+        description: "Module's declared version; empty for a rejected load. Values: free text or empty."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: module_status
         type: string
+        description: "Load outcome for the module, as recorded by the agent's loader. Values: \"loaded\", \"init_failed\", \"load_failed\"."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: module_description
         type: string
+        description: 'Human-readable description, or the rejection reason for a failed load; emitted as a separate "module_description|name|description" row, and only when non-empty. Values: free text, or the row is absent.'
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List loaded modules"
 
@@ -288,7 +346,9 @@ metadata:
   description: >
     Returns the agent's server connection details: server address, TLS
     status, encryption status, debug mode, verbose logging flag, and
-    log level.
+    log level. All six fields are raw text from the agent's in-process
+    config, populated only after the plugin's init() has run; encrypted
+    defaults to "true" unless tls_enabled is literally "false".
   tags: [agent, connection, diagnostics]
 
 spec:
@@ -308,16 +368,34 @@ spec:
     columns:
       - name: server_address
         type: string
+        description: 'Configured server address the agent connects to, from agent.server_address. Values: free text (host:port), or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: tls_enabled
         type: bool
+        description: 'Raw config value of agent.tls_enabled as text; not validated or cast to bool at read time. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: encrypted
         type: bool
+        description: 'Derived field — "false" only when tls_enabled is literally "false"; "true" in every other case, including when tls_enabled is empty. Values: "true", "false".'
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: debug_mode
         type: bool
+        description: 'Raw config value of agent.debug_mode as text. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: verbose_logging
         type: bool
+        description: 'Raw config value of agent.verbose_logging as text. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: log_level
         type: string
+        description: 'Configured log level string, from agent.log_level. Values: free text (e.g. "info", "debug"), or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get server connection details"
 
@@ -348,6 +426,11 @@ metadata:
   description: >
     Returns the agent's switch state: the server address it is connected
     to, current session ID, connection timestamp, and reconnect count.
+    session_id, connected_since, and reconnect_count are written to the
+    agent's config only after plugin init(), and reconnect_count and
+    session_id are updated later still by the register/reconnect loop —
+    a value this action never observes, because the config sync into
+    plugin contexts is one-shot at plugin load.
   tags: [agent, connection, diagnostics]
 
 spec:
@@ -367,12 +450,24 @@ spec:
     columns:
       - name: switch_address
         type: string
+        description: 'Same value as connection.server_address, from agent.server_address. Values: free text (host:port), or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: session_id
         type: string
+        description: "The agent's live session id, the same value Register/Heartbeat use server-side to resolve identity; classified as a plugin secret, not plain inventory. Values: free text (opaque token), or empty."
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: connected_since
         type: string
+        description: 'Epoch milliseconds the current session connected, from agent.connected_since. Values: integer-as-string (Unix epoch milliseconds), or empty.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: reconnect_count
         type: int32
+        description: 'Number of reconnect attempts recorded by the register/reconnect loop, from agent.reconnect_count. Values: non-negative integer, or empty string when the config key is unset (despite the declared int32 type).'
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get switch / session state"
 
@@ -404,7 +499,8 @@ metadata:
     Returns the full agent configuration: agent ID, version, build
     number, git commit, server address, TLS status, heartbeat interval,
     plugin directory, data directory, log level, debug mode, and verbose
-    logging flag.
+    logging flag. All fields are raw text from the agent's in-process
+    config, populated only after the plugin's init() has run.
   tags: [agent, configuration, diagnostics]
 
 spec:
@@ -424,28 +520,64 @@ spec:
     columns:
       - name: agent_id
         type: string
+        description: "Agent's assigned id, from agent.id. Values: free text."
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: agent_version
         type: string
+        description: 'Full agent version string with build suffix, from agent.version (set from kFullVersionString). Values: free text.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: build_number
         type: string
+        description: 'Build number as text, from agent.build_number. Values: free text (integer as string).'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: git_commit
         type: string
+        description: 'Short git commit hash, from agent.git_commit. Values: free text.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: server_address
         type: string
+        description: 'Configured server address, from agent.server_address. Values: free text (host:port), or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: tls_enabled
         type: bool
+        description: 'Raw config value of agent.tls_enabled as text. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: heartbeat_interval
         type: string
+        description: 'Configured heartbeat interval in seconds, as text, from agent.heartbeat_interval. Values: free text (integer seconds as string).'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: plugin_dir
         type: string
+        description: 'Configured plugin directory path, from agent.plugin_dir. Values: free text (filesystem path).'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: data_dir
         type: string
+        description: 'Configured data directory path, from agent.data_dir. Values: free text (filesystem path).'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: log_level
         type: string
+        description: 'Configured log level, from agent.log_level. Values: free text (e.g. "info", "debug").'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: debug_mode
         type: bool
+        description: 'Raw config value of agent.debug_mode as text. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: verbose_logging
         type: bool
+        description: 'Raw config value of agent.verbose_logging as text. Values: "true", "false", or empty if unset.'
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get full agent configuration"
 

@@ -1,0 +1,191 @@
+﻿=== probe_wave9_dism: features mode ===
+DismInitialize(NULL log path, NULL scratch dir): 0x00000000
+  DismInitialize elapsed_ms=6.065
+DismOpenSession(DISM_ONLINE_IMAGE): 0x00000000
+  DismOpenSession elapsed_ms=49.889
+DismGetFeatures: 0x00000000
+  DismGetFeatures elapsed_ms=3917.857 count=137
+--- feature list (name<TAB>state_int) ---
+Printing-XPSServices-Features	4
+TelnetClient	2
+TFTP	2
+TIFFIFilter	2
+VirtualMachinePlatform	4
+Client-ProjFS	2
+SimpleTCP	2
+WorkFolders-Client	4
+NetFx3	4
+WCF-HTTP-Activation	2
+WCF-NonHTTP-Activation	2
+IIS-WebServerRole	2
+IIS-WebServer	2
+IIS-CommonHttpFeatures	2
+IIS-HttpErrors	2
+IIS-HttpRedirect	2
+IIS-ApplicationDevelopment	2
+IIS-Security	2
+IIS-RequestFiltering	2
+IIS-NetFxExtensibility	2
+IIS-NetFxExtensibility45	2
+IIS-HealthAndDiagnostics	2
+IIS-HttpLogging	2
+IIS-LoggingLibraries	2
+IIS-RequestMonitor	2
+IIS-HttpTracing	2
+IIS-URLAuthorization	2
+IIS-IPSecurity	2
+IIS-Performance	2
+IIS-HttpCompressionDynamic	2
+IIS-WebServerManagementTools	2
+IIS-ManagementScriptingTools	2
+IIS-IIS6ManagementCompatibility	2
+IIS-Metabase	2
+WAS-WindowsActivationService	2
+WAS-ProcessModel	2
+WAS-NetFxEnvironment	2
+WAS-ConfigurationAPI	2
+IIS-HostableWebCore	2
+WCF-Services45	4
+WCF-HTTP-Activation45	2
+WCF-TCP-Activation45	2
+WCF-Pipe-Activation45	2
+WCF-MSMQ-Activation45	2
+WCF-TCP-PortSharing45	4
+IIS-CertProvider	2
+IIS-WindowsAuthentication	2
+IIS-DigestAuthentication	2
+IIS-ClientCertificateMappingAuthentication	2
+IIS-IISCertificateMappingAuthentication	2
+IIS-ODBCLogging	2
+IIS-StaticContent	2
+IIS-DefaultDocument	2
+IIS-DirectoryBrowsing	2
+IIS-WebDAV	2
+IIS-WebSockets	2
+IIS-ApplicationInit	2
+IIS-ISAPIFilter	2
+IIS-ISAPIExtensions	2
+IIS-ASPNET	2
+IIS-ASPNET45	2
+IIS-ASP	2
+IIS-CGI	2
+IIS-ServerSideIncludes	2
+IIS-CustomLogging	2
+IIS-BasicAuthentication	2
+IIS-HttpCompressionStatic	2
+IIS-ManagementConsole	2
+IIS-ManagementService	2
+IIS-WMICompatibility	2
+IIS-LegacyScripts	2
+IIS-FTPServer	2
+IIS-FTPSvc	2
+IIS-FTPExtensibility	2
+MSMQ-Container	2
+MSMQ-DCOMProxy	2
+MSMQ-Server	2
+MSMQ-ADIntegration	2
+MSMQ-HTTP	2
+MSMQ-Multicast	2
+MSMQ-Triggers	2
+SMB1Protocol-Deprecation	2
+MediaPlayback	4
+WindowsMediaPlayer	4
+DirectoryServices-ADAM-Client	2
+SmbDirect	4
+AppServerClient	2
+Printing-PrintToPDFServices-Features	4
+Windows-Defender-Default-Definitions	0
+LegacyComponents	2
+DirectPlay	2
+MSRDC-Infrastructure	4
+NetFx4-AdvSrvs	4
+NetFx4Extended-ASPNET45	2
+HostGuardian	2
+DataCenterBridging	2
+ServicesForNFS-ClientOnly	2
+ClientForNFS-Infrastructure	2
+NFS-Administration	2
+SMB1Protocol	2
+SMB1Protocol-Client	2
+SMB1Protocol-Server	2
+Recall	3
+SearchEngine-Client-Package	4
+Sysmon	2
+Sysmon-Service	2
+Microsoft-RemoteDesktopConnection	4
+HypervisorPlatform	2
+Windows-Identity-Foundation	2
+Microsoft-Windows-Subsystem-Linux	4
+Printing-Foundation-Features	4
+Printing-Foundation-InternetPrinting-Client	4
+Printing-Foundation-LPDPrintService	2
+Printing-Foundation-LPRPortMonitor	2
+Microsoft-Hyper-V-All	2
+Microsoft-Hyper-V	2
+Microsoft-Hyper-V-Tools-All	2
+Microsoft-Hyper-V-Management-PowerShell	2
+Microsoft-Hyper-V-Hypervisor	2
+Microsoft-Hyper-V-Services	2
+Microsoft-Hyper-V-Management-Clients	2
+Client-DeviceLockdown	2
+Client-EmbeddedShellLauncher	2
+Client-EmbeddedBootExp	2
+Client-EmbeddedLogon	2
+Client-KeyboardFilter	2
+Client-UnifiedWriteFilter	2
+Containers-DisposableClientVM	2
+Containers-Server-For-Application-Guard	2
+HyperV-KernelInt-VirtualDevice	2
+HyperV-Guest-KernelInt	2
+Containers	2
+Containers-HNS	2
+Containers-SDN	2
+MultiPoint-Connector	2
+MultiPoint-Connector-Services	2
+MultiPoint-Tools	2
+--- end feature list ---
+--- DismGetFeatureInfo sample ---
+DismGetFeatureInfo(NetFx3): hr: 0x00000000
+  elapsed_ms=81.297
+  FeatureName=NetFx3
+  DisplayName=.NET Framework 3.5 (includes .NET 2.0 and 3.0)
+  Description=.NET Framework 3.5 (includes .NET 2.0 and 3.0)
+  FeatureState=4
+  RestartRequired=1
+  CustomPropertyCount=1
+DismGetFeatureInfo(SMB1Protocol): hr: 0x00000000
+  elapsed_ms=83.451
+  FeatureName=SMB1Protocol
+  DisplayName=SMB 1.0/CIFS File Sharing Support
+  Description=Support for the SMB 1.0/CIFS file sharing protocol and the Computer Browser protocol.
+  FeatureState=2
+  RestartRequired=1
+  CustomPropertyCount=6
+DismGetFeatureInfo(Microsoft-Hyper-V-All): hr: 0x00000000
+  elapsed_ms=80.270
+  FeatureName=Microsoft-Hyper-V-All
+  DisplayName=Hyper-V
+  Description=Provides services and management tools for creating and running virtual machines and their resources.
+  FeatureState=2
+  RestartRequired=1
+  CustomPropertyCount=0
+DismGetFeatureInfo(Microsoft-Windows-Subsystem-Linux): hr: 0x00000000
+  elapsed_ms=82.799
+  FeatureName=Microsoft-Windows-Subsystem-Linux
+  DisplayName=Windows Subsystem for Linux
+  Description=Provides services and environments for running native user-mode Linux shells and tools on Windows.
+  FeatureState=4
+  RestartRequired=1
+  CustomPropertyCount=6
+DismGetFeatureInfo(TelnetClient): hr: 0x00000000
+  elapsed_ms=85.552
+  FeatureName=TelnetClient
+  DisplayName=Telnet Client
+  Description=Allows you to connect to other computers remotely.
+  FeatureState=2
+  RestartRequired=1
+  CustomPropertyCount=8
+--- end DismGetFeatureInfo sample ---
+DismCloseSession: 0x00000000
+  DismCloseSession elapsed_ms=11.272
+DismShutdown: 0x00000000

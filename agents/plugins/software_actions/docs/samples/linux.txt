@@ -1,0 +1,9 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash c95c61957b6f
+== action=list_upgradable
+upgradable|none|System is up to date|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=installed_count
+count|206
+[result_status] UNDECLARED / UNKNOWN / 
+

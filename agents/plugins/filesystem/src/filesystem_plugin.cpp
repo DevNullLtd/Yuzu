@@ -8,7 +8,11 @@
  *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
  *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *   "search_dir"      — Find directories/files by name pattern (glob/regex).
- *   "get_version_info" — Extract PE version resource info (Windows only).
+ *   "get_signature"   — Verify a code signature: Authenticode on Windows
+ *                        (WinVerifyTrust), codesign on macOS.
+ *   "get_version_info" — Extract version info: PE version resource on
+ *                        Windows, Info.plist (CFBundleShortVersionString /
+ *                        CFBundleVersion) via plutil on macOS.
  *   "search"          — Search file contents for a pattern.
  *   "replace"         — Find/replace text in a file (atomic write).
  *   "write_content"   — Write or overwrite file contents.
@@ -32,9 +36,13 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp>
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -69,10 +77,14 @@
 #pragma comment(lib, "version.lib")
 #else
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (#2273)
+#endif
+
+#ifdef __APPLE__
+#include "filesystem_macos_sig.hpp" // yuzu::filesystem_macos classifiers
 #endif
 
 namespace {
@@ -235,62 +247,72 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 #else
 
 std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
-    // Use execvp-based approach to avoid shell injection via path
-    int pipe_fd[2];
-    if (pipe(pipe_fd) != 0)
-        return {};
+    // Route the hash through the shared bounded runner rather than a raw
+    // fork/exec/pipe/waitpid here. The runner (yuzu_agent_core) owns the
+    // BR-001 fork/pipe serialization lock, exec's argv[0] as an ABSOLUTE
+    // path (no PATH search, no shell), enforces a hard wall-clock deadline
+    // that SIGKILLs+reaps a wedged child (FIFO, stalled network mount, huge
+    // adversarial file), and polls the process-wide shutdown-cancel latch --
+    // none of which the old blocking `while(read>0)` drain + `waitpid(.,0)`
+    // could do. This is called per file inside do_find_by_hash's directory
+    // walk, so a single stalled hash must never wedge agent shutdown.
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        return {};
-    }
-
-    if (pid == 0) {
-        close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        close(pipe_fd[1]);
-
+    // Resolve the hash tool's ABSOLUTE path. macOS ships shasum at a fixed
+    // location; Linux coreutils live in /usr/bin on glibc distros but in
+    // /bin on Alpine/musl/busybox, so probe both and use whichever is
+    // executable instead of hard-coding one (which regressed such endpoints).
+    std::vector<std::string> argv;
 #ifdef __APPLE__
-        if (algorithm == "sha1") {
-            execlp("shasum", "shasum", "-a", "1", path.c_str(), nullptr);
-        } else {
-            execlp("shasum", "shasum", "-a", "256", path.c_str(), nullptr);
-        }
+    argv = {"/usr/bin/shasum", "-a", (algorithm == "sha1" ? std::string{"1"} : std::string{"256"}),
+            path};
 #else
-        if (algorithm == "sha1") {
-            execlp("sha1sum", "sha1sum", path.c_str(), nullptr);
-        } else {
-            execlp("sha256sum", "sha256sum", path.c_str(), nullptr);
+    const char* candidates[2];
+    if (algorithm == "sha1") {
+        candidates[0] = "/usr/bin/sha1sum";
+        candidates[1] = "/bin/sha1sum";
+    } else {
+        candidates[0] = "/usr/bin/sha256sum";
+        candidates[1] = "/bin/sha256sum";
+    }
+    std::string tool;
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) == 0) {
+            tool = candidate;
+            break;
         }
+    }
+    if (tool.empty())
+        return {}; // no coreutils hash tool present -> honest failure (empty)
+    argv = {tool, path};
 #endif
-        _exit(127);
+
+    // Deadline is generous enough for a legitimately large file
+    // (kMaxHashFileSize is 10 GB) while still bounding a truly wedged read;
+    // shutdown-cancel is honored regardless of its length via the runner's
+    // cancel latch, so this is only the hard backstop.
+    auto run = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(300)});
+
+    // Surface a hung/truncated hash tool to operators (sre S1) -- otherwise a
+    // wedged shasum/sha256sum is silent, visible only as an empty-hash error.
+    if (run.timed_out || run.output_truncated) {
+        spdlog::warn("filesystem file_hash: {} on '{}' (timed_out={}, output_truncated={})",
+                     run.timed_out ? "timed out" : "output truncated", path, run.timed_out,
+                     run.output_truncated);
+        return {};
     }
+    if (!run.tool_ran || run.exit_code != 0)
+        return {};
 
-    close(pipe_fd[1]);
-
-    std::string result;
-    std::array<char, 256> buf{};
-    ssize_t n;
-    while ((n = read(pipe_fd[0], buf.data(), buf.size())) > 0) {
-        result.append(buf.data(), static_cast<size_t>(n));
-    }
-    close(pipe_fd[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-
-    // Output format: "HASH  filename" or "HASH filename"
-    auto space = result.find(' ');
-    if (space != std::string::npos) {
-        return result.substr(0, space);
-    }
-    return result;
+    // Output format: "HASH  filename" or "HASH filename" -- take the leading
+    // hex digest (identical output contract to the previous raw-fork parse).
+    std::string_view out{run.output};
+    while (!out.empty() && (out.front() == '\n' || out.front() == '\r' || out.front() == ' '))
+        out.remove_prefix(1);
+    auto space = out.find_first_of(" \t\r\n");
+    if (space != std::string_view::npos)
+        return std::string{out.substr(0, space)};
+    return std::string{out};
 }
 
 #endif
@@ -392,6 +414,162 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
     return true;
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() above, same names/order. Legs reflect what
+// this TU does TODAY, read directly off the #ifdef structure above:
+//   - exists/list_dir/create_temp/create_temp_dir/read/search_dir/search/
+//     replace/write_content/append/delete_lines are pure std::filesystem /
+//     std::ifstream / std::ofstream / yuzu_create_temp_{file,dir} calls —
+//     native, in-process, every OS (rung 1).
+//   - file_hash/find_by_hash: BCryptHashData in-process on Windows (rung 1,
+//     compute_hash_win); on POSIX routed through
+//     yuzu::agent::run_bounded_subprocess exec'ing an ABSOLUTE-path
+//     shasum/sha256sum/sha1sum — argv, no shell (rung 2, compute_hash_unix).
+//   - get_acl: Windows uses GetNamedSecurityInfo/DACL enumeration (native,
+//     rung 1). The #else branch (Linux AND macOS both take it) is stat()-only
+//     basic owner/group/permission bits — no ACL/ACE enumeration — a real
+//     limitation, so CONSTRAINED rather than SUPPORTED on those two legs.
+//   - get_signature: Windows WinVerifyTrust (native, rung 1). macOS execs
+//     /usr/bin/codesign via run_bounded_subprocess (argv, no shell — rung 2,
+//     per the objective's reference point). Linux has no equivalent
+//     verification surface at all (do_get_signature's final #else) —
+//     UNSUPPORTED.
+//   - get_version_info: Windows GetFileVersionInfoW/VerQueryValueW (native,
+//     rung 1). macOS execs /usr/bin/plutil via run_bounded_subprocess (argv,
+//     no shell — rung 2). Linux has no PE-resource/Info.plist equivalent
+//     (final #else) — UNSUPPORTED.
+namespace {
+
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "exists",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+    },
+    {
+        "list_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+    },
+    {
+        "file_hash",
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:sha256sum/sha1sum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:shasum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "bcrypt", nullptr},
+    },
+    {
+        "create_temp",
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+    },
+    {
+        "create_temp_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+    },
+    {
+        "read",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+    },
+    {
+        "get_acl",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
+         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
+         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_acl", nullptr},
+    },
+    {
+        "get_signature",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:codesign", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "wintrust", nullptr},
+    },
+    {
+        "find_by_hash",
+        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:sha256sum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:shasum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+bcrypt", nullptr},
+    },
+    {
+        "search_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+    },
+    {
+        "get_version_info",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:plutil", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_version_info", nullptr},
+    },
+    {
+        "search",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+    },
+    {
+        "replace",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+    {
+        "write_content",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+    {
+        "append",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+    },
+    {
+        "delete_lines",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+};
+
+} // namespace
+
+#ifdef __APPLE__
+// ── get_version_info (macOS): Info.plist path selection ────────────────
+// `validated` is already base_dir-validated by the caller (validate_path
+// above) and may be a .app bundle directory or a direct Info.plist file.
+// Returns the FINAL path plutil will read, itself canonicalized and
+// re-validated against base_dir (PLAN-08) -- the caller only validated the
+// bundle directory, but the DERIVED Contents/Info.plist inside it can be a
+// symlink that resolves outside base_dir, and that escape must be caught
+// before plutil ever opens it. Empty return means "no plist to read"
+// (honest not_available), never a fabricated path.
+std::string select_info_plist(const std::string& validated, std::string_view base_dir) {
+    fs::path vpath(validated);
+    std::error_code ec;
+    std::string candidate;
+    if (fs::is_directory(vpath, ec) && vpath.extension() == ".app") {
+        candidate = (vpath / "Contents" / "Info.plist").string();
+    } else if (vpath.filename() == "Info.plist") {
+        candidate = validated;
+    } else {
+        return {};
+    }
+
+    return validate_path(candidate, base_dir);
+}
+#endif // __APPLE__
+
 } // namespace
 
 class FilesystemPlugin final : public yuzu::Plugin {
@@ -411,6 +589,14 @@ public:
                                      "search",          "replace",         "write_content",
                                      "append",          "delete_lines",    nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
@@ -1017,8 +1203,64 @@ private:
         WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
 
         return 0;
+#elif defined(__APPLE__)
+        // BR-006: re-run validate_path on the exact path about to be handed
+        // to codesign, immediately before building its argv. This narrows,
+        // but does not eliminate, the check(validate_path above)-to-use
+        // (codesign's own open()) TOCTOU window: an unprivileged writer
+        // inside base_dir who swapped `validated` for a symlink to an
+        // out-of-scope target between the earlier validate_path() call and
+        // here is caught. A swap landing in the remaining gap -- between
+        // this re-check and codesign's own open() -- is inherent to any
+        // path-based external tool (codesign takes a path, not an fd) and
+        // cannot be closed from here; base_dir must not be writable by
+        // lower-privileged principals (docs/agent-privilege-model.md).
+        if (validate_path(validated, base_dir) != validated) {
+            ctx.write_output(std::format("signature_status|{}",
+                yuzu::filesystem_macos::to_string(
+                    yuzu::filesystem_macos::SignatureStatus::unknown)));
+            return 0;
+        }
+
+        // codesign --verify --deep --strict is the macOS analogue of
+        // WinVerifyTrust: it walks the whole bundle (or a lone Mach-O) and
+        // fails on ANY broken seal, not just a missing top-level signature.
+        // Its status vocabulary is deliberately its OWN honest enum (see
+        // filesystem_macos_sig.hpp) -- reusing the Windows Authenticode
+        // strings here would misrepresent a codesign verdict as a
+        // WinVerifyTrust one.
+        auto run = yuzu::agent::run_bounded_subprocess(
+            {"/usr/bin/codesign", "--verify", "--deep", "--strict", validated},
+            yuzu::agent::SubprocessOptions{.merge_stderr = true});
+
+        // sre S1: surface a hung/truncated codesign to operators -- the
+        // unknown verdict below is honest but indistinguishable from a
+        // genuine unknown without this, so a wedged tool would otherwise be
+        // silent in the agent log.
+        if (run.timed_out || run.output_truncated) {
+            spdlog::warn("filesystem get_signature: codesign {} on '{}' (timed_out={}, "
+                         "output_truncated={})",
+                         run.timed_out ? "timed out" : "output truncated", validated, run.timed_out,
+                         run.output_truncated);
+        }
+
+        // PLAN-02: a codesign killed at the deadline can still have
+        // tool_ran=true, a nonzero exit_code, and partial stderr diagnostics
+        // captured before the SIGKILL -- classify_codesign_result would read
+        // that as a genuine "invalid" verdict. Short-circuit to unknown
+        // BEFORE classify so a timed-out run is never reported as a broken
+        // signature. Same reasoning for output_truncated: a 1MB-truncated
+        // capture is only a PREFIX of whatever codesign actually said, so
+        // classify_codesign_result must never see it either.
+        auto status = (run.timed_out || run.output_truncated)
+            ? yuzu::filesystem_macos::SignatureStatus::unknown
+            : yuzu::filesystem_macos::classify_codesign_result(run.tool_ran, run.exit_code,
+                                                                run.output);
+        ctx.write_output(
+            std::format("signature_status|{}", yuzu::filesystem_macos::to_string(status)));
+        return 0;
 #else
-        ctx.write_output("error|Authenticode signature verification is not supported on this platform");
+        ctx.write_output("error|code signature verification is not supported on this platform");
         return 1;
 #endif
     }
@@ -1209,8 +1451,104 @@ private:
         }
 
         return 0;
+#elif defined(__APPLE__)
+        // macOS has no PE version resource; the nearest equivalent is the
+        // bundle's Info.plist, read via `plutil -extract ... raw -o -`.
+        // plutil handles BOTH binary (bplist00) and XML plists natively, so
+        // no bplist parsing is needed here. `validated` must resolve to
+        // either a .app bundle directory or an Info.plist file directly --
+        // anything else, or a bundle whose derived Info.plist escapes
+        // base_dir (PLAN-08), honestly reports not_available rather than
+        // fabricating a version.
+        auto info_plist = select_info_plist(validated, base_dir);
+        if (info_plist.empty()) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // BR-006: re-run validate_path on the exact Info.plist path about to
+        // be handed to plutil, immediately before building its argv. This
+        // narrows, but does not eliminate, the check(select_info_plist
+        // above)-to-use (plutil's own open()) TOCTOU window: an unprivileged
+        // writer inside base_dir who swapped `info_plist` for a symlink to
+        // an out-of-scope target between select_info_plist()'s validation
+        // and here is caught. A swap landing in the remaining gap -- between
+        // this re-check and plutil's own open() -- is inherent to any
+        // path-based external tool (plutil takes a path, not an fd) and
+        // cannot be closed from here; base_dir must not be writable by
+        // lower-privileged principals (docs/agent-privilege-model.md).
+        if (validate_path(info_plist, base_dir) != info_plist) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // CFBundleShortVersionString is the user-visible "marketing"
+        // version (n.n.n) -- the closest analogue of Windows ProductVersion.
+        auto short_ver_run = yuzu::agent::run_bounded_subprocess(
+            {"/usr/bin/plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-",
+             info_plist},
+            yuzu::agent::SubprocessOptions{});
+
+        // CFBundleVersion is the machine-readable, monotonically increasing
+        // build number -- the closest analogue of Windows FileVersion.
+        auto build_ver_run = yuzu::agent::run_bounded_subprocess(
+            {"/usr/bin/plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist},
+            yuzu::agent::SubprocessOptions{});
+
+        // sre S1: surface a hung/truncated plutil to operators -- either run
+        // going honest-absent below is indistinguishable from a genuinely
+        // absent key without this, so a wedged tool would otherwise be silent.
+        if (short_ver_run.timed_out || short_ver_run.output_truncated) {
+            spdlog::warn("filesystem get_version_info: plutil CFBundleShortVersionString {} on "
+                         "'{}' (timed_out={}, output_truncated={})",
+                         short_ver_run.timed_out ? "timed out" : "output truncated", info_plist,
+                         short_ver_run.timed_out, short_ver_run.output_truncated);
+        }
+        if (build_ver_run.timed_out || build_ver_run.output_truncated) {
+            spdlog::warn("filesystem get_version_info: plutil CFBundleVersion {} on '{}' "
+                         "(timed_out={}, output_truncated={})",
+                         build_ver_run.timed_out ? "timed out" : "output truncated", info_plist,
+                         build_ver_run.timed_out, build_ver_run.output_truncated);
+        }
+
+        // PLAN-02: a plutil run killed at the deadline, or one whose capture
+        // hit the 1MB output_truncated cap, is honest-absent, never handed
+        // to classify_plutil_extract (which would otherwise trust a partial
+        // exit_code/output as if the run had actually finished cleanly).
+        yuzu::filesystem_macos::PlutilExtractResult short_ver;
+        if (!short_ver_run.timed_out && !short_ver_run.output_truncated) {
+            short_ver = yuzu::filesystem_macos::classify_plutil_extract(
+                short_ver_run.tool_ran, short_ver_run.exit_code, short_ver_run.output);
+        }
+        yuzu::filesystem_macos::PlutilExtractResult build_ver;
+        if (!build_ver_run.timed_out && !build_ver_run.output_truncated) {
+            build_ver = yuzu::filesystem_macos::classify_plutil_extract(
+                build_ver_run.tool_ran, build_ver_run.exit_code, build_ver_run.output);
+        }
+
+        if (!short_ver.available && !build_ver.available) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // plutil hands back the plist value verbatim -- an untrusted
+        // Info.plist can embed a pipe, a backslash, or a CR/LF into
+        // CFBundleShortVersionString/CFBundleVersion, which would otherwise
+        // corrupt the pipe-delimited output framing. yuzu::util::safe_output_field
+        // is the SDK-canonical escape: it folds a literal '\' to '/' (the
+        // shared server decoder only undoes "\|", so a raw backslash would
+        // survive as ambiguous data), folds CR/LF to spaces, and escapes
+        // pipes -- stronger than an inline pipe+CRLF-only escape.
+        if (short_ver.available)
+            ctx.write_output(
+                std::format("product_version|{}", yuzu::util::safe_output_field(short_ver.value)));
+        if (build_ver.available)
+            ctx.write_output(
+                std::format("file_version|{}", yuzu::util::safe_output_field(build_ver.value)));
+
+        return 0;
 #else
-        ctx.write_output("error|PE version info is only available on Windows");
+        ctx.write_output("error|version info extraction is not supported on this platform");
         return 1;
 #endif
     }

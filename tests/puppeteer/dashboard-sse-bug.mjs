@@ -28,7 +28,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: false,
-    args: ['--window-size=1400,900'],
+    args: ['--window-size=1400,900', '--no-sandbox'],
     defaultViewport: { width: 1400, height: 900 },
   });
 
@@ -51,7 +51,7 @@ async function main() {
     const cmd = COMMANDS[i];
     console.log(`[${i + 2}] Sending: "${cmd}"`);
 
-    await page.click('#instr-input', { clickCount: 3 });
+    await page.click('#instr-input', { count: 3 });
     await page.type('#instr-input', cmd);
     await page.click('#btn-send');
 

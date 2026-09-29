@@ -12,7 +12,6 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <optional>
@@ -448,14 +447,44 @@ std::int64_t parse_ts_param(const std::string& s) {
             v = v * 10 + (c - '0'); // bounded: ≤18 digits < INT64_MAX, no overflow
         return v;
     }
-    int Y = 0, Mo = 0, D = 0, H = 0, Mi = 0, Se = 0;
-    const int n = std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &Mo, &D, &H, &Mi, &Se);
+    // "YYYY-MM-DDTHH:MM[:SS]" — seconds optional, exactly the former
+    // sscanf("%d-%d-%dT%d:%d:%d") with its `n >= 5` acceptance (a missing or
+    // unconvertible seconds field leaves Se == 0). strtol instead of sscanf:
+    // glibc 2.38's __isoc23_sscanf redirect breaks older-glibc hosts. %d skipped
+    // leading whitespace and accepted a sign; strtol does the same, and the
+    // range checks below reject nonsense as before. Parsing into long (not int)
+    // makes an absurdly long year a defined reject rather than scanf UB.
+    const char* p = s.c_str();
+    long f[5]{};
+    constexpr char kDelim[4] = {'-', '-', 'T', ':'};
+    for (int i = 0; i < 5; ++i) {
+        char* end{};
+        f[i] = std::strtol(p, &end, 10);
+        if (end == p)
+            return 0;
+        p = end;
+        if (i < 4) {
+            if (*p != kDelim[i])
+                return 0;
+            ++p;
+        }
+    }
+    long Se = 0;
+    if (*p == ':') {
+        char* end{};
+        const long v = std::strtol(p + 1, &end, 10);
+        if (end != p + 1)
+            Se = v;
+    }
+    const long Y = f[0], Mo = f[1], D = f[2], H = f[3], Mi = f[4];
     // Bound the year so days_from_civil*86400 cannot overflow int64 and the result is
     // a sane wall-clock; reject out-of-range fields rather than fabricate a time.
-    if (n < 5 || Y < 1970 || Y > 9999 || Mo < 1 || Mo > 12 || D < 1 || D > 31 || H < 0 || H > 23 ||
+    if (Y < 1970 || Y > 9999 || Mo < 1 || Mo > 12 || D < 1 || D > 31 || H < 0 || H > 23 ||
         Mi < 0 || Mi > 59 || Se < 0 || Se > 60)
         return 0;
-    return days_from_civil(Y, static_cast<unsigned>(Mo), static_cast<unsigned>(D)) * 86400 +
+    return days_from_civil(static_cast<int>(Y), static_cast<unsigned>(Mo),
+                           static_cast<unsigned>(D)) *
+               86400 +
            H * 3600 + Mi * 60 + Se;
 }
 

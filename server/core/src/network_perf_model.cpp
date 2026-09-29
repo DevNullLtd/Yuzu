@@ -117,6 +117,7 @@ const char* net_perf_metric_token(NetPerfMetric m) {
 
 NetPerfFleetNow net_perf_fleet_now(const NetPerfSnapshot& snap) {
     NetPerfFleetNow out;
+    out.available_keys = snap.available_keys;
     std::vector<double> rtt, retrans, tput;
     for (const auto& d : snap.devices) {
         ++out.online;

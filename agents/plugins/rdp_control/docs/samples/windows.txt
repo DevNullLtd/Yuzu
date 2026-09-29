@@ -1,0 +1,13 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e17062cd8474
+== action=set_state
+error|invalid state (use enable or disable)
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=status
+deny_ts_connections|0
+firewall_group|enabled
+term_service|running
+rdp|on
+[result_status] UNDECLARED / UNKNOWN / 
+

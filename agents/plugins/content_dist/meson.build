@@ -24,7 +24,7 @@ else
   cd_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
 endif
 
-shared_library(
+content_dist_plugin_lib = shared_library(
   'content_dist',
   files('src/content_dist_plugin.cpp'),
   name_prefix: '',

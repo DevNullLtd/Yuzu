@@ -69,14 +69,29 @@ inline constexpr std::string_view kBackoffMaxMs = "backoff_max_ms";
 inline constexpr std::string_view kEventDebounceMs = "event_debounce_ms";
 } // namespace resilience_keys
 
+/// The implicit legacy event-debounce default every non-spark call site relies on
+/// (#3531: single-sourced so a future change here can't silently leave a stale copy
+/// behind — guardian_spark_bridge.hpp's own fallback for an unhandled SparkType
+/// reuses this constant rather than repeating the literal).
+inline constexpr std::uint64_t kGuardianLegacyDebounceMs = 1000;
+
 /// Build a ResilienceConfig from a param lookup (`get(key)` returns the value or ""
 /// when absent) and write the event-debounce window (ms) to `event_debounce_ms_out`.
 /// Proto-free by design — the agent passes a lookup over the proto map; tests pass a
 /// lookup over a plain map — so the key names + unit conversions + defaults are
 /// deterministically unit-testable. Unknown/garbage values fall back to the default.
+///
+/// `default_event_debounce_ms` (#3388): every LEGACY call site relies on the
+/// kGuardianLegacyDebounceMs implicit default, which suits legacy's notification-
+/// driven model (no scheduled re-evaluation) - leave it unset there. Spark's
+/// convergence scheduler re-evaluates every armed rule on a fixed per-type cadence,
+/// so that default expires before every sweep and a persistently-drifted rule
+/// re-emits on every one; the spark call site passes its own lane-aware default
+/// instead (`guardian_spark_bridge.hpp`).
 YUZU_EXPORT ResilienceConfig
 parse_resilience_params(const std::function<std::string(std::string_view)>& get,
-                        std::uint64_t& event_debounce_ms_out);
+                        std::uint64_t& event_debounce_ms_out,
+                        std::uint64_t default_event_debounce_ms = kGuardianLegacyDebounceMs);
 
 /// Outcome of decide(). The guard ALWAYS detects + emits; this only governs the
 /// remediation write/create and when the watch should wake itself next.

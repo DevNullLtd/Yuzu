@@ -42,7 +42,12 @@ spec:
 
   result:
     columns:
-      - { name: output, type: clob, description: "Dynamic columns returned by the SQL query" }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -87,12 +92,22 @@ spec:
       sql:
         type: string
         default: "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -137,12 +152,22 @@ spec:
       sql:
         type: string
         default: "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -187,12 +212,22 @@ spec:
       sql:
         type: string
         default: "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -237,12 +272,22 @@ spec:
       sql:
         type: string
         default: "SELECT hour_ts, name, start_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 168"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -287,12 +332,22 @@ spec:
       sql:
         type: string
         default: "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -344,7 +399,12 @@ spec:
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -389,12 +449,22 @@ spec:
       sql:
         type: string
         default: "SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -439,12 +509,22 @@ spec:
       sql:
         type: string
         default: "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -490,12 +570,22 @@ spec:
       sql:
         type: string
         default: "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -549,12 +639,22 @@ spec:
       sql:
         type: string
         default: "SELECT datetime(day_ts, 'unixepoch') AS day, name, user, start_count, stop_count FROM $Process_Daily WHERE day_ts > strftime('%s', 'now', '-30 days') ORDER BY day_ts DESC, start_count DESC LIMIT 1000"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 60
@@ -608,12 +708,22 @@ spec:
       sql:
         type: string
         default: "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   gather:
     ttlSeconds: 30
@@ -642,7 +752,9 @@ metadata:
   description: >
     Force an immediate rollup aggregation cycle (normally runs every 15 minutes).
     Aggregates live data into hourly, daily, and monthly summary tables and
-    enforces retention limits on each tier.
+    then permanently deletes rows older than each tier's retention limit.
+    Classified Destructive/Irreversible with no approval gate: an operator
+    who can dispatch it deletes history immediately and cannot undo it.
   tags: [tar, warehouse, rollup, aggregation]
 
 spec:
@@ -662,8 +774,16 @@ spec:
     columns:
       - name: status
         type: string
+        description: >-
+          Declared as a literal status token; the plugin's actual response line is `tar|rollup|<n>|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format.
+        example: "-"
+        platforms: []
       - name: rows_aggregated
         type: int32
+        description: >-
+          Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `tar|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Force TAR warehouse rollup aggregation"
 
@@ -712,12 +832,22 @@ spec:
       sql:
         type: string
         default: "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows]
 
   gather:
     ttlSeconds: 30
@@ -765,12 +895,22 @@ spec:
       sql:
         type: string
         default: "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows]
 
   gather:
     ttlSeconds: 30
@@ -821,12 +961,22 @@ spec:
       sql:
         type: string
         default: "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500"
+        description: >
+          The preset SQL text this canned query runs. Hidden from the
+          operator UI (not editable via the dashboard); see
+          metadata.description for what it returns. Edit this file to
+          change the query.
         hidden: true
     required: [sql]
 
   result:
     columns:
-      - { name: output, type: clob }
+      - name: output
+        type: clob
+        description: >-
+          One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.
+        example: "-"
+        platforms: [windows, linux]
 
   gather:
     ttlSeconds: 30

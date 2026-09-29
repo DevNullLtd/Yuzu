@@ -408,21 +408,24 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
     return out;
 }
 
-void DeviceInventoryStore::delete_agent(std::string_view agent_id) {
+bool DeviceInventoryStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
         spdlog::debug("DeviceInventoryStore: delete skipped for agent={}, no connection ({})",
                       agent_id, pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res =
         pg::exec_params(lease.get(), "DELETE FROM device_inventory_store.device_ci WHERE agent_id = $1",
                         std::vector<std::string>{std::string(agent_id)});
-    if (res.status() != PGRES_COMMAND_OK)
+    if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("DeviceInventoryStore: delete failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
 }
 
 } // namespace yuzu::server

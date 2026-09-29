@@ -4,6 +4,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_retention_guard.hpp"
 #include "pg/pg_raii.hpp"
 
 #include <libpq-fe.h>
@@ -65,9 +66,28 @@ const std::vector<pg::PgMigration>& migrations() {
          "  error         TEXT NOT NULL DEFAULT '',"
          "  updated_at_ms BIGINT NOT NULL DEFAULT 0,"
          "  PRIMARY KEY (deployment_id, agent_id));"},
+        // WS-10 (#2508): durable anchor + dedup state for the clock-guarded,
+        // single-writer retention prune (shared shape, see run_retention_prune).
+        {2, "CREATE TABLE IF NOT EXISTS retention_meta ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // WS-10 (#2508): leading `created_at_ms` index so the retention guard's
+        // EXISTS probe is index-eligible (deployments_owner_idx leads on created_by,
+        // not the timestamp). Small table (retention-pruned) → a plain in-txn CREATE
+        // INDEX is fine (no CONCURRENTLY needed).
+        {3, "CREATE INDEX IF NOT EXISTS deployments_created_at_idx ON deployments (created_at_ms);"},
     };
     return kMigrations;
 }
+
+// WS-10 retention-guard constants — PER-STORE. deployment runs are non-regenerable
+// records of a STATEFUL install on a device cohort; identical retention profile to
+// the sibling preflight store (ms column, ~60s prune cadence on the shared
+// preflight thread, 14-day retention), so these values are chosen the same way —
+// independently, for that profile, NOT copied from a mismatched store's constant.
+constexpr std::int64_t kPruneBigStepFloorMs = 86'400'000;      // 24h absolute
+constexpr std::int64_t kPruneImplausibilityMs = 86'400'000;    // created_at_ms is never future
+constexpr std::int64_t kPruneMinPlausibleMs = 946'684'800'000; // year 2000 in ms
+constexpr std::int64_t kPruneCapPerPass = 5'000;               // bounded drain per pass
 
 std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
@@ -471,20 +491,31 @@ bool DeploymentRunStore::complete_deployment(const std::string& deployment_id,
     return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
-int DeploymentRunStore::prune_older_than(std::int64_t cutoff_ms) {
+int DeploymentRunStore::run_retention_prune(std::int64_t retention_window_ms) {
     if (!open_)
         return -1;
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return -1;
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "DELETE FROM deployment_run_store.deployments WHERE created_at_ms < $1::bigint "
-        "RETURNING deployment_id",
-        std::vector<std::string>{std::to_string(cutoff_ms)});
-    if (res.status() != PGRES_TUPLES_OK)
-        return -1;
-    return PQntuples(res.get());
+    // WS-10 (#2508): clock-guarded, single-writer, capped retention. Part-6
+    // missing-anchor = Decline: a deployment run is a non-regenerable record of a
+    // stateful install; a from-boot skewed clock must not silently delete it.
+    const pg::ClockGuardedPruneSpec spec{
+        .store_label = kStoreName,
+        .target_table = "deployment_run_store.deployments",
+        .ts_column = "created_at_ms",
+        .now_expr = "(EXTRACT(EPOCH FROM now())*1000)::bigint",
+        .meta_table = "deployment_run_store.retention_meta",
+        .anchor_key = "deployments_prune_last_pass_now",
+        .settled_key = "deployments_prune_bootstrap_settled",
+        .facts_key = "deployments_prune_last_anomaly_facts",
+        .advisory_lock_key = "hashtext('deployment_run_store:deployments_prune')",
+        .retention_window = retention_window_ms,
+        .big_step_floor = kPruneBigStepFloorMs,
+        .implausibility_bound = kPruneImplausibilityMs,
+        .min_plausible_reading = kPruneMinPlausibleMs,
+        .cap_per_pass = kPruneCapPerPass,
+        .missing_anchor = pg::MissingAnchorPolicy::Decline,
+    };
+    const auto r = pg::run_clock_guarded_prune(pool_, spec, kWriteTimeout);
+    return r.error ? -1 : r.deleted;
 }
 
 bool DeploymentRunStore::delete_deployment(const std::string& deployment_id,

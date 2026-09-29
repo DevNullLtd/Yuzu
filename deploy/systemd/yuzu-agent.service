@@ -1,13 +1,43 @@
 [Unit]
 Description=Yuzu Endpoint Management Agent
-Documentation=https://github.com/Tr3kkR/Yuzu
+Documentation=https://github.com/DevNullLtd/Yuzu
 After=network-online.target
 Wants=network-online.target
+
+# Crash-loop backstop (ADR-0021 rung 7.7a). Restart=always + RestartSec=10 would
+# otherwise restart forever; paired with the Guardian F3 orphan-exit (hard_exit on a
+# wedged I/O worker), a permanently-wedged watched target could restart-wedge-exit
+# every 10s indefinitely. If 5 starts occur within 300s systemd stops retrying and
+# enters `failed` (which alerts) instead of looping. The primary defense against a
+# single wedged read is still degrade-and-skip-that-rule inside the agent (rung 7.7b);
+# this is the belt-and-braces so a regression pages rather than loops silently.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=yuzu-agent
 Group=yuzu-agent
+# Optional environment file (leading '-' = no error when absent). Deliberately under
+# /etc/yuzu-agent/, NOT the shared /etc/yuzu/ (docs/agent-privilege-model.md's existing
+# convention for agent-dedicated config, matching agent.cfg/cert/ - "dedicated", not
+# "owned": this file is root:root, tighter than those siblings' root:agent, see below):
+# on a host that also runs yuzu-server, the server .deb/.rpm postinst re-asserts
+# /etc/yuzu as 0750 yuzu:yuzu on every install/upgrade, and directory-write lets that
+# DIFFERENT service account unlink or replace any file inside regardless of the file's
+# own mode - a root:root 0600 file under /etc/yuzu is not actually confined against the
+# server account. /etc/yuzu-agent/ has no such collision. Not shipped by the .deb/.rpm -
+# create it by hand, root:root 0600 (protects at rest and stops the yuzu-agent account
+# altering its own boot posture too - stricter than agent.cfg/cert's root:agent 0640
+# because systemd reads this one as root pre-exec, so the agent process never needs
+# read access to it at all; not a secrets channel regardless - the agent still inherits
+# every value it sets). Persists deploy-time YUZU_* settings across
+# restarts and upgrades, chiefly YUZU_AGENT_SPARK_DISABLE=1, the prefer_spark rollback
+# lever (#3851; see docs/user-manual/guaranteed-state.md "SparkEngine"). A missing or
+# unreadable file is silently skipped - rollback then silently does NOT apply, verify
+# via /proc, don't trust file-presence alone. A present file with a malformed VALUE
+# makes the agent fail to start instead. Re-enable = remove the assignment.
+EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env
 ExecStart=/usr/local/bin/yuzu-agent \
     --server %H:50051 \
     --plugin-dir /usr/lib/yuzu/plugins \

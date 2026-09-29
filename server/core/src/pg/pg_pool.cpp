@@ -33,7 +33,9 @@ PgPool::PgPool(Options opts)
     : conninfo_(std::move(opts.conninfo)), size_(opts.size > 0 ? opts.size : 1),
       connect_timeout_s_(opts.connect_timeout_s), statement_timeout_ms_(opts.statement_timeout_ms),
       lock_timeout_ms_(opts.lock_timeout_ms), keepalives_idle_s_(opts.keepalives_idle_s),
-      observer_(std::move(opts.observer)), backoff_base_(opts.connect_backoff_base),
+      tcp_user_timeout_ms_(opts.tcp_user_timeout_ms),
+      saturated_fast_fail_(opts.saturated_fast_fail), observer_(std::move(opts.observer)),
+      backoff_base_(opts.connect_backoff_base),
       backoff_cap_(opts.connect_backoff_cap) {
     // Parse up front so a malformed conninfo is caught here, once, with a
     // sanitized error — NOT at first acquire with libpq's parse error, which
@@ -62,6 +64,9 @@ PgPool::PgPool(Options opts)
     conninfo_has_options_ = conninfo_sets(parsed, "options") ||
                             (env_options != nullptr && env_options[0] != '\0');
     conninfo_has_keepalives_ = conninfo_sets(parsed, "keepalives");
+    // No dedicated PG* env var exists for tcp_user_timeout (unlike
+    // connect_timeout/options above) — conninfo is the only source to check.
+    conninfo_has_tcp_user_timeout_ = conninfo_sets(parsed, "tcp_user_timeout");
     PQconninfoFree(parsed);
     valid_ = true;
 }
@@ -112,6 +117,36 @@ PgPool::Lease PgPool::acquire_internal(const std::chrono::steady_clock::time_poi
     std::unique_lock lk{mu_};
     if (!valid_)
         return {};
+
+    // Fast-fail-on-saturation (#2146 gov sre finding
+    // up-2146-a2r1-httplib-worker-cascade): checked ONCE, here, before the
+    // wait loop below -- `idle_.empty() && open_ + connecting_ >= size_` is
+    // exactly the condition the loop already requires before it will ever
+    // reach its `cv_.wait_until` branch, so this is equivalent to clamping
+    // the wait at that branch, without duplicating the branch's own
+    // bookkeeping. If a BOUNDED acquire (`deadline != nullptr`) observes the
+    // pool already in that state, the caller's own timeout is very unlikely
+    // to be honoured by an actual release in time -- clamp the wait to
+    // `saturated_fast_fail_` instead, so the calling thread (often an
+    // httplib worker for a REST route, but any caller of a bounded acquire
+    // backed by this pool) is freed almost immediately rather than pinned
+    // for the full timeout. Measured from `t0` (taken
+    // before the lock, above) rather than "now" here, so time already spent
+    // waiting on `mu_` counts against the budget too -- the caller's thread
+    // has been unavailable to its own caller since `t0`. Unbounded
+    // `acquire()` (`deadline == nullptr`) and a bounded acquire that is NOT
+    // already saturated at entry are both unaffected. See
+    // Options::saturated_fast_fail's doc comment for why its default is
+    // 500ms rather than a smaller "near-zero" value -- several existing
+    // callers already pick a deliberately short timeout for reasons
+    // unrelated to this finding, and 500ms is chosen to sit AT OR ABOVE every
+    // one of them (a few tie at exactly 500ms; see the doc comment for the
+    // full survey).
+    std::chrono::steady_clock::time_point fast_fail_deadline;
+    if (deadline && idle_.empty() && open_ + connecting_ >= size_) {
+        fast_fail_deadline = std::min(*deadline, t0 + saturated_fast_fail_);
+        deadline = &fast_fail_deadline;
+    }
 
     for (;;) {
         if (shutdown_) {
@@ -236,12 +271,16 @@ PGconn* PgPool::connect_one() {
     //    host would otherwise wedge the acquiring thread;
     //  - keepalives/keepalives_idle: surface a silently reaped connection as a
     //    failed statement rather than an indefinite hang;
+    //  - tcp_user_timeout: bounds how long UNACKED data may sit on a
+    //    genuinely dark network path, independent of the keepalive cycle
+    //    (see the Options doc comment for why this differs from keepalives);
     //  - options (-c statement_timeout / -c lock_timeout): bound a wedged
     //    query and the migration-runner advisory-lock wait server-side.
     // All locals below must outlive the PQconnectdbParams call (they do — the
     // call happens before this function returns).
     const std::string timeout = std::to_string(connect_timeout_s_);
     const std::string keepalives_idle = std::to_string(keepalives_idle_s_);
+    const std::string tcp_user_timeout = std::to_string(tcp_user_timeout_ms_);
     std::string options;
     if (!conninfo_has_options_) {
         if (statement_timeout_ms_ > 0)
@@ -266,6 +305,10 @@ PGconn* PgPool::connect_one() {
         vals.push_back("1");
         keys.push_back("keepalives_idle");
         vals.push_back(keepalives_idle.c_str());
+    }
+    if (!conninfo_has_tcp_user_timeout_ && tcp_user_timeout_ms_ > 0) {
+        keys.push_back("tcp_user_timeout");
+        vals.push_back(tcp_user_timeout.c_str());
     }
     if (!conninfo_has_options_ && !options.empty()) {
         keys.push_back("options");
@@ -342,6 +385,10 @@ bool PgPool::with_txn(const std::function<bool(PGconn*)>& fn) {
 bool PgPool::with_txn_for(std::chrono::milliseconds timeout,
                           const std::function<bool(PGconn*)>& fn) {
     return run_in_txn(try_acquire_for(timeout), fn);
+}
+
+bool PgPool::with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn) {
+    return run_in_txn(std::move(lease), fn);
 }
 
 bool PgPool::run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn) {

@@ -1,0 +1,10 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6e239e35ca05
+== action=get_log
+status|empty|agent log file not configured on this host
+line_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_key_files
+file|D:\yuzu-dev\Yuzu-worktrees\docs-plugin-readme-sweep\build-windows\tools\plugin-capture-tmp\plugin_capture.exe|64512|1788774930
+[result_status] UNDECLARED / UNKNOWN / 
+

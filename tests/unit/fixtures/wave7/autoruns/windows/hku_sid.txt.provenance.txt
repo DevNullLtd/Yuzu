@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Get-ChildItem Registry::HKEY_USERS filtered to ^S-1-5-21-[0-9-]+$ pattern, first match
+date: 2026-09-06
+status: REAL CAPTURE
+note: real logged-on user profile SID on the-rig (desktop-04dnsig\alex)

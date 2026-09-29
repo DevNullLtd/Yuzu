@@ -97,6 +97,18 @@ fi
 # shellcheck source=scripts/test/_portable.sh
 . "$HERE/_portable.sh"
 
+# The api_token_count helper decides whether a token list is EMPTY or UNREADABLE,
+# and fixtures-verify reads "empty" as a PASS on a cutover edge. If that helper is
+# wrong, this whole phase's verdict is meaningless — so prove it before standing
+# anything up. <1s, no docker. (Only tests/test_changelog_order.py is wired into a
+# workflow today, by explicit name in docs-lint.yml; proper CI wiring for this one
+# is filed separately.)
+if ! python3 "$YUZU_ROOT/tests/test_api_token_count.py" >/dev/null 2>&1; then
+    echo "test-upgrade-stack: api_token_count table test FAILED — refusing to run Phase 2" >&2
+    python3 "$YUZU_ROOT/tests/test_api_token_count.py" >&2
+    exit 1
+fi
+
 # Phase 2 fundamentally needs a working dockerd — every step is docker
 # compose. If docker is missing/down, soft-skip with a SKIP gate row so
 # the rest of /test continues. The skill prompt warns operators on macOS
@@ -117,7 +129,7 @@ fi
 # pipeline still runs on a fresh clone without gh configured.
 if [[ -z "$OLD_VERSION" ]]; then
     if command -v gh >/dev/null 2>&1; then
-        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-Tr3kkR/Yuzu}/releases/latest" \
+        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-DevNullLtd/Yuzu}/releases/latest" \
                       --jq '.tag_name' 2>/dev/null | sed 's/^v//') || resolved=""
     fi
     if [[ -n "${resolved:-}" ]]; then
@@ -241,7 +253,7 @@ if ! YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     exit 1
 fi
 record_timing "pull-old-images" "$(elapsed_ms "$T_START")"
-ok "pulled ghcr.io/tr3kkr/yuzu-server:${OLD_VERSION}"
+ok "pulled ghcr.io/devnullltd/yuzu-server:${OLD_VERSION}"
 
 # --- Step 2: stack up at OLD version --------------------------------------
 
@@ -321,7 +333,7 @@ fi
 phase "step: image swap to NEW ${NEW_VERSION}"
 if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
     info "pulling new image (--new-image-loaded 0)"
-    if ! docker pull "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
+    if ! docker pull "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
         fl "docker pull of new image failed"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image pull failed"
         exit 1
@@ -329,14 +341,14 @@ if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
 fi
 
 # Verify the new image is locally available
-if ! docker image inspect "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
+if ! docker image inspect "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
     # fall back: maybe the image is just `yuzu-server:test-${RUN_ID}` without ghcr prefix
     if docker image inspect "yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
         info "using local image yuzu-server:${NEW_VERSION} (no ghcr prefix)"
         # Tag it with the ghcr prefix so the compose file picks it up
-        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}"
+        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}"
     else
-        fl "new image ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION} not in local daemon"
+        fl "new image ghcr.io/devnullltd/yuzu-server:${NEW_VERSION} not in local daemon"
         warn "Phase 1 should have built it as 'yuzu-server:${NEW_VERSION}' or pulled it"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image missing"
         exit 1
@@ -392,7 +404,8 @@ if [[ $READY -ne 1 ]]; then
     else
         fl "/readyz never recovered after upgrade (waited ${WAITED}s)"
     fi
-    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
         --project-name "$PROJECT_NAME" logs server | tail -100 >> "$LOG_FILE"
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "post-upgrade not ready"
     exit 1
@@ -402,8 +415,15 @@ ok "/readyz ready after upgrade (waited ${WAITED}s)"
 # --- Step 6: count migration runner events --------------------------------
 
 phase "step: count MigrationRunner events in server log"
-MIGR_COUNT=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
-    --project-name "$PROJECT_NAME" logs server 2>/dev/null \
+# The env prefix is REQUIRED, not decorative: without YUZU_TEST_CONFIG the
+# compose file's cred bind-mount spec is `:/etc/yuzu/yuzu-server.cfg:ro`, which
+# compose rejects outright. `2>/dev/null` then swallows the error, `grep -c`
+# returns 0, and this step reports "no MigrationRunner events seen" having never
+# read a log line. That is the root cause of #2609's second, unexplained signal:
+# measured at 0 here, and 13 with the prefix restored against the same stack.
+MIGR_COUNT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" logs server \
     | grep -c "MigrationRunner: .* migrated to v" || true)
 if (( MIGR_COUNT > 0 )); then
     ok "MigrationRunner events: $MIGR_COUNT (expected ~30)"
@@ -411,6 +431,55 @@ if (( MIGR_COUNT > 0 )); then
         --name "phase2_migration_events" --value "$MIGR_COUNT" --unit "count" >/dev/null || true
 else
     warn "no MigrationRunner events seen — maybe DB was already at HEAD schema?"
+fi
+
+# --- Step 6b: did THIS upgrade edge cross the ApiTokenStore cutover? -------
+#
+# ADR-0030 moved ApiTokenStore from SQLite to Postgres as a fresh-start cutover
+# with no migration, so whether API tokens SHOULD survive depends entirely on
+# which edge is under test — and `--old-version` FLOATS to GitHub's current
+# "Latest release". Today v0.13.0 (2026-07-11) predates the cutover (4a05df88,
+# 2026-07-15), so tokens are correctly invalidated. The moment a release
+# CONTAINING the cutover becomes Latest, Phase 2 becomes a Postgres->Postgres
+# edge over a `postgres-data` volume this compose file deliberately preserves
+# across the image swap: tokens survive, and a hardcoded "expect invalidated"
+# would fail the gate while announcing something false.
+#
+# So derive the arm from an OBSERVABLE rather than a version table. The new
+# server warns at boot when it finds a legacy api-tokens.db in the surviving
+# data volume (server.cpp: "[auth] Legacy SQLite api-tokens.db found at").
+# That fires if and only if this edge crossed the cutover, and it keeps working
+# unedited as releases move.
+#
+# The default is `preserved` — the SAFE direction. If the observable is absent
+# or the grep fails, we assert the stronger, NON-inverted contract, so an
+# unknown edge reads as a loud failure rather than a silent pass.
+
+phase "step: classify the API-token upgrade edge"
+API_TOKENS_EXPECT="preserved"
+# Probe the FILESYSTEM, not the boot log. The server does log a "Legacy SQLite
+# api-tokens.db found at" warning on a crossing edge, and an earlier revision of
+# this step grepped for it — but `docker compose logs` lags the process, so the
+# line is reliably present minutes later and intermittently absent at the moment
+# this step runs. A log grep here is a race; the file either exists in the
+# preserved data volume or it does not.
+PROBE_ERR=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" exec -T server \
+    test -f /var/lib/yuzu/api-tokens.db 2>&1)
+PROBE_RC=$?
+if (( PROBE_RC == 0 )); then
+    API_TOKENS_EXPECT="invalidated"
+    ok "edge CROSSES the ADR-0030 cutover — API tokens must be invalidated"
+elif (( PROBE_RC == 1 )) && [[ -z "$PROBE_ERR" ]]; then
+    # `test -f` writes nothing and exits 1 for a genuinely absent file. Anything
+    # else — 125/126/127, or any stderr — is the PROBE failing, not an answer.
+    ok "edge does NOT cross the ADR-0030 cutover — API tokens must be preserved"
+else
+    # Distinguished deliberately: falling through to `preserved` here is still the
+    # safe direction, but reporting it as "the edge does not cross the cutover"
+    # would be a confident wrong diagnosis — the #2581 defect in miniature.
+    warn "cutover probe FAILED (rc=$PROBE_RC): ${PROBE_ERR:-no stderr} — assuming 'preserved' (safe direction); a red api_tokens below may be this probe, not the data"
 fi
 
 # --- Step 7: fixtures-verify ----------------------------------------------
@@ -422,6 +491,7 @@ if bash "$HERE/test-fixtures-verify.sh" \
     --dashboard "$DASHBOARD_URL" \
     --user "$USERNAME" --password "$PASSWORD" \
     --state-file "$STATE_FILE" \
+    --api-tokens-expect "$API_TOKENS_EXPECT" \
     --report-file "$REPORT_FILE" >> "$LOG_FILE" 2>&1; then
     ok "fixtures verified"
     FIXTURE_VERIFY_OK=1
@@ -461,7 +531,7 @@ GATE_DURATION=$((($(now_ms) - GATE_START) / 1000))
 if [[ $FIXTURE_VERIFY_OK -eq 1 && $UAT_OK -eq 1 ]]; then
     ok "Phase 2 PASS"
     record_gate "PASS" "$GATE_DURATION" \
-        "fixtures preserved, /readyz green, ${MIGR_COUNT} migrations stamped"
+        "fixtures upheld (api_tokens=${API_TOKENS_EXPECT}), /readyz green, ${MIGR_COUNT} migrations stamped"
     exit 0
 else
     fl "Phase 2 FAIL (fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK)"

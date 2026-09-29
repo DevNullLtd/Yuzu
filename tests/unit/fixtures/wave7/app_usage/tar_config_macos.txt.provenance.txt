@@ -1,0 +1,45 @@
+REAL CAPTURE
+
+File: tar_config_macos.txt
+Host: alex's Mac (Darwin 25.6.0), 2026-09-14
+DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner alex, WAL)
+Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
+  branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
+  merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
+Command:
+  sqlite3 -readonly "$DB" ".mode list" ".separator |" \
+    "SELECT key, value FROM tar_config WHERE key IN ('usage_enabled', \
+     'process_enabled','usage_feeder_enabled','usage_coverage_since', \
+     'usage_unmatched_stops','usage_clock_anomalies','usage_gap_count', \
+     'usage_gap_lost_events','usage_gap_last_ts','usage_lag_events', \
+     'usage_last_fold_ts') ORDER BY key" > tar_config_macos.txt
+
+Captured rows (4 of the 11 candidate keys — the other 7 are absent on this
+fresh host, which is itself the real, expected shape; see below):
+  usage_coverage_since|1788954914
+  usage_feeder_enabled|true
+  usage_lag_events|0
+  usage_last_fold_ts|1789411607
+
+Absent keys and why: usage_enabled/process_enabled are written only by
+usage_set_enabled()/operator toggles (tar_usage.cpp:233) — a fresh host
+that has never had the source toggled never gets a row, and
+source_state_from_config(nullopt) -> Enabled mirrors
+source_default_enabled("usage") = true (tar_schema_registry.cpp:1111).
+usage_unmatched_stops/usage_clock_anomalies/usage_gap_count/
+usage_gap_lost_events/usage_gap_last_ts are written only when non-zero
+(tar_usage.cpp:648-671) — this host's fold has produced none of those
+conditions, so read_meta's REAL CAPTURE case asserts the honest zero/'-'
+defaults for all five, not fixture-seeded non-zero values (a separate
+RECONSTRUCTION case covers the non-zero-counters-read-back path).
+
+read_meta's REAL CAPTURE expectations, derived from the rows above:
+  coverage_since   = "1788954914"
+  feeder_enabled   = true
+  lag_events       = 0
+  last_fold_ts     = "1789411607"
+  unmatched_stops  = 0   (key absent)
+  clock_anomalies  = 0   (key absent)
+  gap_count        = 0   (key absent)
+  gap_lost_events  = 0   (key absent)
+  gap_last_ts      = "-" (key absent)

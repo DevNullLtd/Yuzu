@@ -1,0 +1,17 @@
+host: the-rig (DESKTOP-04DNSIG, Windows 11)
+command: probe_wave9_dism.exe features, run via a scheduled task
+  (Register-ScheduledTask -Principal (New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType
+  ServiceAccount -RunLevel Highest); Enable-ScheduledTask then Start-ScheduledTask, per the
+  S4U/ServiceAccount recipe — LastTaskResult 0. Task unregistered after capture.)
+date: 2026-09-08
+status: REAL CAPTURE
+identity: nt authority\system, S-1-5-18 (whoami /all first section, see below)
+
+  USER INFORMATION
+  ----------------
+  User Name           SID
+  =================== ========
+  nt authority\system S-1-5-18
+
+notes: agrees with dism_features_admin.txt on the feature set and every state int (137 features,
+  same 191-line body shape). This is the acceptance-criteria comparison basis.

@@ -62,7 +62,7 @@ public:
     /// `<base>/<key_id>.key`) is a trust anchor — losing the CA root key without
     /// a backup forces a full fleet re-enrollment. Back it up to offline /
     /// encrypted storage; verify a restore by comparing `CaRoot::fingerprint_sha256`
-    /// (in ca.db) against `openssl x509 -fingerprint -sha256` on the restored cert.
+    /// (in ca_store) against `openssl x509 -fingerprint -sha256` on the restored cert.
     [[nodiscard]] virtual std::optional<std::string> store_key(std::string_view key_id,
                                                                std::string_view pem) = 0;
 

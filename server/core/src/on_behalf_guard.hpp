@@ -85,12 +85,51 @@ template <typename Range>
 // newline and would forge log lines in a security-tagged warn) are replaced
 // with '?', and the result is length-capped. Returns an owned string; only
 // called on the (throttled) rejection-log path, never per clean request.
+/// Drop a trailing INCOMPLETE UTF-8 sequence, and only an incomplete one.
+///
+/// The byte-wise cap below can sever a multi-byte character. That was harmless
+/// while this helper only fed a log line, but #2500 started routing audit-detail
+/// text through it, and an audit row holding a lone lead byte makes
+/// `/api/v1/audit` emit a response that is not valid UTF-8 JSON — `json_escape`
+/// passes bytes >= 0x20 through unvalidated — so a strict client cannot decode
+/// the whole page. One truncated device name would poison the audit list.
+///
+/// PRECONDITION, and the limit of what this gives you: it **preserves** UTF-8
+/// validity, it does not **establish** it. A caller passing already-invalid
+/// bytes gets invalid bytes back (minus control chars). On `/api/command` the
+/// inputs are valid by construction because they came through
+/// `nlohmann::json::parse`, which rejects ill-formed UTF-8 — that is the only
+/// reason the audit path is safe. Other callers pass httplib-percent-decoded
+/// `req.path` / `remote_addr` / `ctx->peer()`, which CAN carry raw high bytes;
+/// harmless while those only reach a log line, but a future caller routing one
+/// of them into a durable column reintroduces the undecodable-page bug under a
+/// name that reads as though it were covered.
+inline void drop_partial_utf8_tail(std::string& out) {
+    const size_t n = out.size();
+    for (size_t back = 1; back <= 4 && back <= n; ++back) {
+        const auto c = static_cast<unsigned char>(out[n - back]);
+        if ((c & 0xC0) == 0x80)
+            continue; // continuation byte - keep walking back to the lead
+        size_t need = 1;
+        if ((c & 0xE0) == 0xC0)
+            need = 2;
+        else if ((c & 0xF0) == 0xE0)
+            need = 3;
+        else if ((c & 0xF8) == 0xF0)
+            need = 4;
+        if (need > back)
+            out.erase(n - back); // the sequence is cut short - drop it whole
+        return;
+    }
+}
+
 [[nodiscard]] inline std::string sanitize_for_log(std::string_view s,
                                                   size_t max_len = 200) {
     std::string out;
     out.reserve(std::min(s.size(), max_len));
     for (char c : s) {
         if (out.size() >= max_len) {
+            drop_partial_utf8_tail(out);
             out += "...";
             break;
         }

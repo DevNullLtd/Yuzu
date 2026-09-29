@@ -280,4 +280,23 @@ inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
          {"machines", s.machines}};
 }
 
+// Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): clamp_field()
+// truncates agent-reported hostname/process-name/user/connection fields by
+// BYTE length (FleetTopologyStore::clamp_field), with no UTF-8 boundary
+// awareness - a multi-byte codepoint straddling the cap is silently split
+// into an invalid byte sequence. nlohmann::json::dump()'s strict default
+// throws an uncaught type_error.316 on that input, and no exception handler
+// is installed on web_server_ (documented at rest_api_v1.cpp and
+// mcp_server.cpp), so the result is a bare empty-body 500 - fleet-wide for
+// get_fleet_topology, per-host for get_host_topology - self-sustaining for as
+// long as the offending agent stays connected. error_handler_t::replace
+// substitutes U+FFFD for an invalid sequence instead of throwing, matching
+// execution_statistics_model.cpp's own fix for the identical defect class.
+// The ONE dump() call site every REST/MCP topology handler must route
+// through, so the fix cannot drift between transports the way the original
+// bug did.
+inline std::string dump_topology_safe(const nlohmann::json& j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 } // namespace yuzu::server

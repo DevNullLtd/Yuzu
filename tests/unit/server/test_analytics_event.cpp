@@ -1,23 +1,42 @@
 /**
- * test_analytics_event.cpp — Unit tests for AnalyticsEvent and AnalyticsEventStore
+ * test_analytics_event.cpp — Unit tests for AnalyticsEvent and
+ * AnalyticsEventStore (ADR-0049, Postgres-backed outbox spool).
  *
  * Covers: JSON serialization, severity enum, store lifecycle, emit/query,
- * drain to sinks, concurrent emit, schema version preservation.
+ * drain to sinks (claim/send/revert), concurrent emit, schema version
+ * preservation. The JSON/severity cases construct no store and stay
+ * untagged; every case that touches AnalyticsEventStore is [pg]-gated
+ * (SKIPs when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken —
+ * test_helpers.hpp's skip-vs-fail contract) and uses the pre-migrated
+ * "analytics" PgTestTemplate, shared with test_analytics_pg_helper.hpp's
+ * AnalyticsEventStorePg bundle used by other fixtures.
  */
 
 #include "analytics_event.hpp"
 #include "analytics_event_store.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
+
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 // ── Mock sink for testing ──────────────────────────────────────────────────
 
@@ -52,6 +71,32 @@ private:
     int send_count_{0};
     bool should_succeed_{true};
 };
+
+namespace {
+
+// Shared with test_analytics_pg_helper.hpp's AnalyticsEventStorePg (same
+// key, same single-store setup) — the registry builds "analytics" once per
+// suite run regardless of which TU asks first (PgTestTemplate contract,
+// docs/postgres-store-playbook.md).
+yuzu::test::PgTestTemplate analytics_tpl{"analytics", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AnalyticsEventStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("analytics template: store failed to migrate");
+}};
+
+// Run a raw SQL statement against the test database on a second connection —
+// lets a test simulate a corrupt row / hold the advisory lock directly.
+// Mirrors test_response_store.cpp's helper of the same name.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
+} // namespace
 
 // ── JSON Serialization ─────────────────────────────────────────────────────
 
@@ -157,15 +202,79 @@ TEST_CASE("Severity: serialization round-trip", "[analytics_event][severity]") {
     CHECK(severity_from_string("unknown") == Severity::kInfo); // default
 }
 
+TEST_CASE("AnalyticsEvent: schema_version preserved", "[analytics_event][json]") {
+    AnalyticsEvent event;
+    event.event_type = "test";
+    event.schema_version = 42;
+
+    nlohmann::json j = event;
+    auto restored = j.get<AnalyticsEvent>();
+    CHECK(restored.schema_version == 42);
+}
+
 // ── Store Lifecycle ────────────────────────────────────────────────────────
 
-TEST_CASE("AnalyticsEventStore: open in-memory", "[analytics_store][db]") {
-    AnalyticsEventStore store(":memory:");
+TEST_CASE("AnalyticsEventStore: migrates and opens", "[pg][analytics_store][db]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    AnalyticsEventStore store(pool);
     REQUIRE(store.is_open());
 }
 
-TEST_CASE("AnalyticsEventStore: emit and query_recent", "[analytics_store]") {
-    AnalyticsEventStore store(":memory:");
+TEST_CASE("AnalyticsEventStore: a failed open stays constructed-but-degraded, "
+          "not reset (ADR-0049 construction-posture regression guard)",
+          "[analytics_store][construction]") {
+    // Unroutable DSN (TEST-NET-1, RFC 5737) with a tight connect_timeout so
+    // this case fails fast instead of eating the default connect timeout
+    // (governance Gate 4 unhappy-path UP-9's fixture advisory) — matches
+    // the ResponseStore precedent (test_response_store.cpp, #1634 UP-2).
+    // No PgTestTemplate/real Postgres needed: this exercises the
+    // never-opens path, not real query behavior, so it is intentionally
+    // NOT [pg]-tagged and runs unconditionally.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    AnalyticsEventStore store(bad_pool);
+
+    // The regression this guards: an earlier version of ServerImpl's
+    // wiring code (server.cpp, not this store's own constructor) called
+    // analytics_store_.reset() on this exact failed-open path, which this
+    // test cannot observe directly since a caller here holds the object
+    // itself rather than through ServerImpl's unique_ptr — the contract
+    // under test is that the OBJECT ITSELF stays usable-but-degraded.
+    REQUIRE_FALSE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    AnalyticsEvent event;
+    event.event_type = "test.event";
+    store.emit(event); // must fail-soft, never throw/block
+
+    CHECK(metrics
+              .counter("yuzu_server_analytics_emit_dropped_total",
+                       {{"reason", "store_not_open"}})
+              .value() == 1);
+
+    auto pending = store.pending_count();
+    CHECK_FALSE(pending.has_value());
+    auto recent = store.query_recent();
+    CHECK_FALSE(recent.has_value());
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "pending_count"}, {"reason", "store_not_open"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "query_recent"}, {"reason", "store_not_open"}})
+              .value() == 1);
+}
+
+TEST_CASE("AnalyticsEventStore: emit and query_recent", "[pg][analytics_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
 
     AnalyticsEvent event;
     event.event_type = "agent.registered";
@@ -173,15 +282,22 @@ TEST_CASE("AnalyticsEventStore: emit and query_recent", "[analytics_store]") {
     store.emit(event);
 
     auto results = store.query_recent();
-    REQUIRE(results.size() == 1);
-    CHECK(results[0].event_type == "agent.registered");
-    CHECK(results[0].agent_id == "agent-001");
-    CHECK(results[0].ingest_time > 0);
+    REQUIRE(results.has_value()); // degrade-distinguishable seam: not nullopt
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].event_type == "agent.registered");
+    CHECK((*results)[0].agent_id == "agent-001");
+    CHECK((*results)[0].ingest_time > 0);
 }
 
-TEST_CASE("AnalyticsEventStore: pending_count and total_emitted", "[analytics_store]") {
-    AnalyticsEventStore store(":memory:");
-    REQUIRE(store.pending_count() == 0);
+TEST_CASE("AnalyticsEventStore: pending_count and total_emitted", "[pg][analytics_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto pending0 = store.pending_count();
+    REQUIRE(pending0.has_value());
+    REQUIRE(*pending0 == 0);
     REQUIRE(store.total_emitted() == 0);
 
     for (int i = 0; i < 5; ++i) {
@@ -190,15 +306,20 @@ TEST_CASE("AnalyticsEventStore: pending_count and total_emitted", "[analytics_st
         store.emit(event);
     }
 
-    CHECK(store.pending_count() == 5);
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 5);
     CHECK(store.total_emitted() == 5);
 }
 
-// ── Drain to Sink ──────────────────────────────────────────────────────────
+// ── Drain to Sink (claim / send / revert, ADR-0049) ────────────────────────
 
-TEST_CASE("AnalyticsEventStore: drain to mock sink", "[analytics_store][drain]") {
+TEST_CASE("AnalyticsEventStore: drain to mock sink", "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     // Use drain_interval=1 for fast test
-    AnalyticsEventStore store(":memory:", /*drain_interval=*/1, /*batch_size=*/100);
+    AnalyticsEventStore store(pool, /*drain_interval=*/1, /*batch_size=*/100);
+    REQUIRE(store.is_open());
 
     auto sink = std::make_unique<MockSink>();
     auto* sink_ptr = sink.get();
@@ -211,7 +332,9 @@ TEST_CASE("AnalyticsEventStore: drain to mock sink", "[analytics_store][drain]")
         store.emit(event);
     }
 
-    CHECK(store.pending_count() == 3);
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 3);
 
     store.start_drain();
     // Wait for drain cycle
@@ -220,11 +343,16 @@ TEST_CASE("AnalyticsEventStore: drain to mock sink", "[analytics_store][drain]")
 
     auto received = sink_ptr->received();
     REQUIRE(received.size() == 3);
-    CHECK(store.pending_count() == 0);
+    pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 0);
 }
 
-TEST_CASE("AnalyticsEventStore: drained events not re-sent", "[analytics_store][drain]") {
-    AnalyticsEventStore store(":memory:", 1, 100);
+TEST_CASE("AnalyticsEventStore: drained events not re-sent", "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
 
     auto sink = std::make_unique<MockSink>();
     auto* sink_ptr = sink.get();
@@ -245,11 +373,17 @@ TEST_CASE("AnalyticsEventStore: drained events not re-sent", "[analytics_store][
 
     // Total emitted is still 1
     CHECK(store.total_emitted() == 1);
-    CHECK(store.pending_count() == 0);
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 0);
 }
 
-TEST_CASE("AnalyticsEventStore: sink failure keeps events pending", "[analytics_store][drain]") {
-    AnalyticsEventStore store(":memory:", 1, 100);
+TEST_CASE("AnalyticsEventStore: sink failure reverts claim, event stays pending",
+          "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
 
     auto sink = std::make_unique<MockSink>();
     auto* sink_ptr = sink.get();
@@ -264,16 +398,115 @@ TEST_CASE("AnalyticsEventStore: sink failure keeps events pending", "[analytics_
     std::this_thread::sleep_for(std::chrono::seconds(3));
     store.stop_drain();
 
-    // Sink received the batch but failed — events should still be pending
+    // Sink received the batch but failed — phase C reverts the claim, so the
+    // event is still pending for the next tick to retry.
     CHECK(sink_ptr->send_count() > 0);
-    CHECK(store.pending_count() == 1);
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 1);
+}
+
+// Governance Gate 3 quality-engineer finding, 2026-08-16: a batch row whose
+// event_json fails to parse is claimed (drained=true) in phase A but never
+// added to the send/revert sets — it drains exactly once and is dropped,
+// unlike the SQLite predecessor which re-selected (and re-failed to parse)
+// the same poison-pill row every tick, forever. Emit two events, corrupt one
+// directly, and confirm: the sink receives only the valid one, and nothing
+// is left pending after one drain tick (the corrupt row is gone, not stuck).
+TEST_CASE("AnalyticsEventStore: a batch row with unparseable JSON drains once and is dropped",
+          "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    AnalyticsEvent good;
+    good.event_type = "test.valid";
+    store.emit(good);
+    AnalyticsEvent bad;
+    bad.event_type = "test.poison";
+    store.emit(bad);
+
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    REQUIRE(*pending == 2);
+
+    exec_sql(db.dsn(), "UPDATE analytics_event_store.analytics_buffer SET event_json = "
+                       "'{not valid json' WHERE event_json LIKE '%test.poison%'");
+
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    store.stop_drain();
+
+    auto received = sink_ptr->received();
+    REQUIRE(received.size() == 1);
+    CHECK(received[0].event_type == "test.valid");
+
+    pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 0); // the poison row is gone, not stuck retrying forever
+}
+
+// Governance Gate 3 quality-engineer finding, 2026-08-16 (copy of
+// test_response_store.cpp's "reap_expired skips quietly when a sibling holds
+// the advisory lock" — same primitive, different key). Single-sweeper
+// exclusion: a sibling replica already draining holds the fleet-wide
+// try-advisory-xact-lock, so this store's own drain tick must skip quietly —
+// never claim, never send, never revert.
+TEST_CASE("AnalyticsEventStore: drain skips quietly when a sibling holds the advisory lock",
+          "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    AnalyticsEvent event;
+    event.event_type = "test.locked";
+    store.emit(event);
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult begin{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        PgResult lock{PQexec(locker.get(),
+                             "SELECT pg_advisory_xact_lock(hashtextextended("
+                             "'analytics_event_store:drain', 0))")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+    }
+
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    store.stop_drain();
+
+    CHECK(sink_ptr->send_count() == 0); // never reached phase B — the lock was held
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 1); // nothing claimed — the sibling held the lock
+
+    PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
+    REQUIRE(rollback.status() == PGRES_COMMAND_OK);
 }
 
 TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads",
-          "[analytics_store][threads]") {
-    AnalyticsEventStore store(":memory:");
-
+          "[pg][analytics_store][threads]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
     constexpr int kThreads = 4;
+    // Pool sized above the writer thread count so bounded try_acquire_for
+    // never contends its way into a fail-soft drop under normal local-test
+    // latency — this test asserts an EXACT total_emitted count.
+    PgPool pool{{.conninfo = db.dsn(), .size = kThreads + 2}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
+
     constexpr int kPerThread = 25;
 
     std::vector<std::thread> threads;
@@ -294,8 +527,11 @@ TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads",
 }
 
 TEST_CASE("AnalyticsEventStore: concurrent emit and query_recent",
-          "[analytics_store][threads]") {
-    AnalyticsEventStore store(":memory:");
+          "[pg][analytics_store][threads]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
 
     std::atomic<bool> done{false};
     constexpr int kEmits = 100;
@@ -329,11 +565,17 @@ TEST_CASE("AnalyticsEventStore: concurrent emit and query_recent",
 }
 
 TEST_CASE("AnalyticsEventStore: stress test — high contention",
-          "[analytics_store][threads][stress]") {
-    AnalyticsEventStore store(":memory:");
-
+          "[pg][analytics_store][threads][stress]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
     constexpr int kWriterThreads = 8;
     constexpr int kReaderThreads = 4;
+    // Sized above writers + readers combined (advisor guidance) so bounded
+    // try_acquire_for never fail-soft-drops an emit under ordinary local-test
+    // contention — this test asserts an EXACT total_emitted count.
+    PgPool pool{{.conninfo = db.dsn(), .size = kWriterThreads + kReaderThreads + 4}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
+
     constexpr int kEventsPerWriter = 250;
     std::atomic<bool> writers_done{false};
     std::atomic<int> total_reads{0};
@@ -380,18 +622,11 @@ TEST_CASE("AnalyticsEventStore: stress test — high contention",
     CHECK(total_reads.load() > 0); // readers actually ran concurrently
 }
 
-TEST_CASE("AnalyticsEvent: schema_version preserved", "[analytics_event][json]") {
-    AnalyticsEvent event;
-    event.event_type = "test";
-    event.schema_version = 42;
-
-    nlohmann::json j = event;
-    auto restored = j.get<AnalyticsEvent>();
-    CHECK(restored.schema_version == 42);
-}
-
-TEST_CASE("AnalyticsEvent: event_time auto-stamped by emit", "[analytics_store]") {
-    AnalyticsEventStore store(":memory:");
+TEST_CASE("AnalyticsEvent: event_time auto-stamped by emit", "[pg][analytics_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool);
+    REQUIRE(store.is_open());
 
     AnalyticsEvent event;
     event.event_type = "test.autotime";
@@ -399,8 +634,74 @@ TEST_CASE("AnalyticsEvent: event_time auto-stamped by emit", "[analytics_store]"
     store.emit(event);
 
     auto results = store.query_recent();
-    REQUIRE(results.size() == 1);
-    CHECK(results[0].event_time > 0);
-    CHECK(results[0].ingest_time > 0);
-    CHECK(results[0].event_time == results[0].ingest_time);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].event_time > 0);
+    CHECK((*results)[0].ingest_time > 0);
+    CHECK((*results)[0].event_time == (*results)[0].ingest_time);
+}
+
+TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/start_drain refuse "
+          "pool_ access afterward, reads stay answerable "
+          "(PR #3350 review regression guard, fjarvis/security-guardian/cpp-safety/"
+          "architect, 2026-08-20)",
+          "[pg][analytics_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, /*drain_interval=*/1, /*batch_size=*/100);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    // A pre-shutdown emit must still work normally.
+    AnalyticsEvent before;
+    before.event_type = "test.pre_shutdown";
+    store.emit(before);
+    auto pending_before = store.pending_count();
+    REQUIRE(pending_before.has_value());
+    CHECK(*pending_before == 1);
+
+    // stop_drain() with no drain thread ever started is a plain latch-set —
+    // this is exactly the AnalyticsEventStore-internal half of what a real
+    // ServerImpl::stop() does (server.cpp calls stop_drain() long before
+    // pg_pool_.reset(); this test proves the latch's own contract without
+    // needing to construct a whole ServerImpl).
+    store.stop_drain();
+
+    // emit() must drop via the shutdown path, never touch pool_.
+    AnalyticsEvent after;
+    after.event_type = "test.post_shutdown";
+    store.emit(after);
+    CHECK(metrics
+              .counter("yuzu_server_analytics_emit_dropped_total",
+                       {{"reason", "store_not_open"}})
+              .value() == 1);
+
+    // Reads must stay answerable after stop_drain() -- they are NOT gated
+    // on shutting_down_ (a first cut of this fix gated them too, which
+    // broke this exact pattern: reading pending_count() right after
+    // stop_drain() to observe final state is this store's own established
+    // drain-test convention, exercised throughout this file). The pending
+    // event from before shutdown must still be visible.
+    auto pending_after = store.pending_count();
+    REQUIRE(pending_after.has_value());
+    CHECK(*pending_after == 1);
+    auto recent_after = store.query_recent();
+    REQUIRE(recent_after.has_value());
+    CHECK(recent_after->size() == 1);
+
+    // start_drain() is sticky-stop: a caller after shutdown must not spin up
+    // a fresh drain thread against a pool the owner may already be tearing
+    // down. Deliberately never called start_drain() before stop_drain()
+    // above (keeps this deterministic instead of racing a real drain
+    // cycle) — so the sink must still be empty: completing this call
+    // without hanging/crashing plus zero sink activity is the guard.
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    CHECK(sink_ptr->received().empty());
 }

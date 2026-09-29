@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,15 @@ using yuzu::server::AppPerfRollup;
 using yuzu::server::pg::PgPool;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): mirrors the
+// tests' store set (the reader carries no migration of its own).
+yuzu::test::PgTestTemplate apperf_group_tpl{"apperf_group", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AppPerfDailyStore b1{pool};
+    AppPerfGroupReader reader{pool};
+    if (!b1.is_open())
+        throw std::runtime_error("apperf_group template: store failed to migrate");
+}};
 std::int64_t today_utc() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -45,7 +55,7 @@ void seed(AppPerfDailyStore& b1, const std::string& agent, const std::string& ap
 } // namespace
 
 TEST_CASE("AppPerfGroupReader aggregates ONLY the group's members", "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_group_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore b1{pool};

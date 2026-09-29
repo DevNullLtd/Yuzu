@@ -49,6 +49,12 @@ services:
       postgres:
         condition: service_healthy
     restart: "no"
+    # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
+    # "Sizing"): a held-open SSE response's worst-case drain is the 120s
+    # response cap + 2x~3s pump ticks + the 30s socket write timeout
+    # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
+    # it mid-drain; 210s matches the systemd unit's existing margin.
+    stop_grace_period: 210s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ──────────────────
   # Not sanitizer-instrumented (upstream postgres + pgvector); built from
@@ -91,7 +97,8 @@ services:
       - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"
-      - "50063:50063"
+      # :50063 (mgmt/command fan-out) deliberately NOT published — plaintext
+      # unauthenticated plane, compose-network only (#1422).
       - "9568:9568"
       - "8081:8081"
     volumes:

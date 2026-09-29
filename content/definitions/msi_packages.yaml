@@ -1,5 +1,6 @@
-## MSI Package Inventory Definitions
-## Enumerates installed MSI packages and product codes (Windows only).
+## MSI / pkgutil Package Inventory Definitions
+## Enumerates installed packages and product codes: MSI products via
+## MsiEnumProducts on Windows, pkgutil receipts on macOS.
 ## Plugin: msi_packages | Actions: list, product_codes
 
 ---
@@ -10,16 +11,18 @@ metadata:
   displayName: List MSI Packages
   version: 1.0.0
   description: >
-    Enumerates all installed Windows Installer (MSI) packages using
-    the MsiEnumProducts API. Returns each package's product code GUID,
-    display name, version string, and install location. Useful for
-    software inventory, patch compliance, and license auditing on
-    Windows endpoints.
-  tags: [software, msi, inventory, windows]
+    Enumerates installed software packages: on Windows, Windows Installer
+    (MSI) products via the MsiEnumProducts API, returning each package's
+    product code GUID, display name, version string, and install location;
+    on macOS, `pkgutil` package receipts, returning each package's
+    reverse-domain identifier, a derived display name, version string, and
+    install location. Useful for software inventory, patch compliance, and
+    license auditing.
+  tags: [software, msi, inventory, windows, macos]
 
 spec:
   type: question
-  platforms: [windows]
+  platforms: [windows, darwin]
 
   execution:
     plugin: msi_packages
@@ -33,13 +36,29 @@ spec:
   result:
     columns:
       - name: product_code
-        type: guid
+        type: string
+        description: >-
+          The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).
+        example: "{90160000-008C-0000-1000-0000000FF1CE}"
+        platforms: [windows, darwin]
       - name: name
         type: string
+        description: >-
+          The package's display name — the Windows MsiGetProductInfoA `InstalledProductName` property, or a name derived from the last dot-segment of the macOS pkgutil identifier. Values: free text, or `-` when the underlying property is empty.
+        example: "Office 16 Click-to-Run Extensibility Component"
+        platforms: [windows, darwin]
       - name: version
         type: string
+        description: >-
+          The package's version string — the Windows MsiGetProductInfoA `VersionString` property, or the macOS pkgutil receipt's `version:` field. Values: free text version string, or `-` when unavailable.
+        example: "16.0.19822.20104"
+        platforms: [windows, darwin]
       - name: install_location
         type: string
+        description: >-
+          The package's install path — the Windows MsiGetProductInfoA `InstallLocation` property (frequently unset by the installer), or the macOS receipt's volume and location joined. Values: filesystem path, or `-` when the property is empty or absent.
+        example: "C:\\Program Files (x86)\\NordVPN network TAP\\"
+        platforms: [windows, darwin]
     aggregation:
       groupBy:
         - name
@@ -73,15 +92,17 @@ metadata:
   displayName: List MSI Product Codes
   version: 1.0.0
   description: >
-    Returns a compact list of installed MSI product code GUIDs with
-    their associated product names. This is a lightweight alternative
-    to the full MSI list when only product identification is needed,
-    such as for uninstall targeting or compliance matching.
-  tags: [software, msi, inventory, windows]
+    Returns a compact list of installed package identifiers with their
+    associated product names: MSI product code GUIDs on Windows,
+    reverse-domain pkgutil package identifiers on macOS. This is a
+    lightweight alternative to the full list when only product
+    identification is needed, such as for uninstall targeting or
+    compliance matching.
+  tags: [software, msi, inventory, windows, macos]
 
 spec:
   type: question
-  platforms: [windows]
+  platforms: [windows, darwin]
 
   execution:
     plugin: msi_packages
@@ -95,9 +116,17 @@ spec:
   result:
     columns:
       - name: product_code
-        type: guid
+        type: string
+        description: >-
+          The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).
+        example: "com.tailscale.ipn.macsys"
+        platforms: [windows, darwin]
       - name: name
         type: string
+        description: >-
+          The package's display name, matching the `list` action's `name` field (see `windows.software.msi.list`). Values: free text, or `-`.
+        example: "Tailscale"
+        platforms: [windows, darwin]
 
   readablePayload: "List MSI product codes"
 

@@ -16,8 +16,15 @@
 /// RTT needs ESTATS (GetPerTcpConnectionEStats: enable + admin + overhead), a
 /// deferred slice. NOTE the Windows retransmit MIB is whole-stack (includes
 /// loopback) and is measurement-first UNVALIDATED on Windows (the netem
-/// separation test was Linux-only). macOS later returns an all-invalid sample,
-/// so no tags ship — absent, never zero.
+/// separation test was Linux-only).
+/// macOS: THROUGHPUT ONLY in v1 — device throughput via a bounds-checked
+/// NET_RT_IFLIST2 routing-socket interface walk (non-loopback if_data64
+/// 64-bit octets, same coarse aggregate as Linux/Windows). Retransmit is
+/// DEFERRED: the global net.inet.tcp.stats OID (the only system-wide source)
+/// returns an all-zero struct on current macOS, so it cannot back a
+/// retransmit metric — a per-flow source (the NetworkStatistics/nstat client)
+/// is the roadmap 2.x follow-up. RTT is deferred as on Windows. Both tags stay
+/// absent on macOS in v1 — never shipped as zero.
 ///
 /// THE EDGE SHIPS FACTS, NEVER A VERDICT. The retransmit fact is an INTERVAL
 /// rate — ΔΣretrans / ΔΣsegs across heartbeats, smoothed over a short window —
@@ -38,6 +45,8 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+
+#include <yuzu/plugin.h>  // YUZU_EXPORT
 
 namespace yuzu::agent::netq {
 
@@ -120,16 +129,19 @@ struct RetransWindow {
     }
 };
 
-/// Read current non-loopback interface byte counters (Linux: /proc/net/dev).
-/// Returns invalid off Linux or on read failure.
-NetCounters read_net_counters();
+/// Read current non-loopback interface byte counters (Linux: /proc/net/dev;
+/// Windows: GetIfTable2; macOS: NET_RT_IFLIST2).
+/// Returns invalid on unsupported platforms or on read failure.
+YUZU_EXPORT NetCounters read_net_counters();
 
 /// Produce the heartbeat sample. Linux: a one-shot INET_DIAG dump for rtt/retrans
 /// + throughput from prev/cur counters. Windows: throughput from prev/cur +
-/// system-wide TCP retransmit counters (no rtt). `prev` invalid (first heartbeat)
-/// → throughput omitted this cycle. macOS/other → all-invalid. Called only from
-/// the heartbeat thread; all state is local or caller-owned (no shared state).
-NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
+/// system-wide TCP retransmit counters (no rtt). macOS: throughput from
+/// prev/cur only — retransmit + RTT deferred (see the header doc above).
+/// `prev` invalid (first heartbeat) → throughput omitted this cycle. Other
+/// platforms → all-invalid. Called only from the heartbeat thread; all state
+/// is local or caller-owned (no shared state).
+YUZU_EXPORT NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur);
 
 // ── Pure helpers (header-inline so they link into tests without DLL export,
 //    matching the dex_perf_breach pattern) ───────────────────────────────────

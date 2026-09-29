@@ -1,0 +1,146 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/cert-paste",
+    "capability_id": "post.api-settings-cert-paste",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/cert-upload",
+    "capability_id": "post.api-settings-cert-upload",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/mcp",
+    "capability_id": "post.api-settings-mcp",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/plugin-signing/clear",
+    "capability_id": "post.api-settings-plugin-signing-clear",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/plugin-signing/require",
+    "capability_id": "post.api-settings-plugin-signing-require",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/plugin-signing/upload",
+    "capability_id": "post.api-settings-plugin-signing-upload",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/tls",
+    "capability_id": "post.api-settings-tls",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/analytics",
+    "capability_id": "get.fragments-settings-analytics",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/analytics"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/data-retention",
+    "capability_id": "get.fragments-settings-data-retention",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/data-retention"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/gateway",
+    "capability_id": "get.fragments-settings-gateway",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/gateway"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/https",
+    "capability_id": "get.fragments-settings-https",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/https"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/mcp",
+    "capability_id": "get.fragments-settings-mcp",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/mcp"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/plugin-signing",
+    "capability_id": "get.fragments-settings-plugin-signing",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/agent/plugin-policy"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/server-config",
+    "capability_id": "get.fragments-settings-server-config",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/server-config"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/tls",
+    "capability_id": "get.fragments-settings-tls",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/settings/tls"
+    },
+    "mcp_twin": null,
+    "status": "exception:#520"
+  }
+]

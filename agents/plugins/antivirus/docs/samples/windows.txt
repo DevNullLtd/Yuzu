@@ -1,0 +1,16 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a4abf06e398d
+== action=products
+av|Windows Defender|snoozed|current
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=status
+realtime_protection|enabled
+definition_version|1.459.88.0
+last_update|20260906211522.000000+000
+last_quick_scan|20260906150800.885000+000
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=av_exclusions
+exclusion|path|local|D:\yuzu-dev
+[result_status] UNDECLARED / UNKNOWN / 
+

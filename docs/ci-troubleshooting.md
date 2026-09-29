@@ -23,6 +23,121 @@ Companion docs:
 
 ---
 
+## 1.1 Runner-control preflight fails or nightly opens `nightly-broken`
+
+**Symptom:**
+
+- `Preflight (runner health)` fails with `auth_error`, `rate_limit`,
+  `api_error`, or `malformed_response`.
+- Nightly preflight reports `Required runner pool unavailable: bigtam` or
+  `weetam`.
+- The nightly workflow opens or updates a `nightly-broken` issue.
+
+**Triage:**
+
+```bash
+gh api repos/Tr3kkR/Yuzu/actions/runners \
+  --jq '.runners[] | [.name, .status, (.labels | map(.name) | join(","))] | @tsv'
+gh run view <run-id> --log-failed
+```
+
+The runner-control query retries transient transport/API failures three times
+with bounded backoff. Authentication failures, rate limits, malformed JSON,
+and inventory configuration errors do not retry. A rate-limit response must
+not be remediated by creating a new PAT; wait for the limit to clear and check
+the failing run again.
+
+For an authentication failure, verify that the repository secret exists and
+that `RUNNER_INVENTORY_TOKEN` is a fine-grained token scoped to `Tr3kkR/Yuzu`
+with `Administration: read`. Do not put that token in a self-hosted job.
+
+For a pool outage, inspect the runner service and host directly using the
+platform-specific sections below. Required-pool outages are intentionally red
+and keep the repository's **no merge to main while `nightly-broken` is open**
+discipline until the next green nightly closes the issue.
+
+---
+
+## 1.2 Trusted execution of a fork pull request
+
+Fork PRs must not run automatically on self-hosted runners. After static
+analysis and maintainer review, cut a throwaway quarantine branch for the PR
+from its base (normally `origin/dev`) and use the hosted review workflow first
+on that branch. Both fork workflows refuse any ref other than
+`trusted-fork/pr-<N>[-<sha>]` for that PR (#4471): a `workflow_dispatch` run's
+GitHub Actions cache scope is its dispatch ref, and fork code must never write a
+scope that `main`, `dev`, or any PR restores from.
+
+```bash
+git push origin origin/dev:refs/heads/trusted-fork/pr-123
+gh workflow run fork-dynamic-review.yml --ref trusted-fork/pr-123 \
+  -f pr_number=123 -f head_sha=<40-character-head-sha>
+gh run watch <review-run-id>
+```
+
+Only after that run succeeds, dispatch the trusted full gate on the same
+branch, then delete the branch once the run has finished:
+
+```bash
+gh workflow run trusted-fork-ci.yml --ref trusted-fork/pr-123 \
+  -f pr_number=123 \
+  -f head_sha=<40-character-head-sha> \
+  -f review_run_id=<successful-review-run-id>
+git push origin --delete trusted-fork/pr-123
+```
+
+The trusted workflow validates that the PR is still open, the supplied SHA is
+still its current head, and the hosted review run matches the same PR and SHA.
+It passes only `TRUSTED_FORK_CI_GATE` and `RUNNER_INVENTORY_TOKEN` into the
+reusable matrix. The PAT is used by a hosted base-revision control step before
+the fork checkout; build steps do not receive it. The trusted self-hosted legs
+use clean workspaces and private, no-share caches, then purge the checkout. The
+wrapper's final `purge-quarantine-cache` job deletes every GitHub Actions cache
+entry in the quarantine scope (deleting the branch does not do that by itself).
+`fork-dynamic-review.yml` purges its own scope the same way immediately after
+it finishes, so a crafted cache entry from the (at that point still unapproved)
+review run can never be restored by the later trusted gate's canary leg on the
+same ref. When re-approving a newer head on a PR whose branch already ran,
+either name is safe, but a fresh suffixed branch
+(`trusted-fork/pr-123-<sha7>`, both guards accept an optional hex suffix) is
+still the clearer record of which SHA a given dispatch approved.
+If the dispatch is refused with `must be dispatched on
+refs/heads/trusted-fork/pr-<N>`, the `--ref` was wrong — never work around it
+by dispatching on `main`. Two `trusted-fork-ci` dispatches for the same PR
+number queue rather than run concurrently (workflow-level `concurrency:`), so
+a re-approval before the first run finishes waits its turn instead of racing
+its purge against the first run's gate. This is an explicit trust decision:
+do not dispatch it for a fork revision that has
+not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret is
+an additional wrapper-only guard and must not be exposed to build steps.
+
+**If `purge-quarantine-cache` itself fails** (the job after the gate, or the
+`linux` job in `fork-dynamic-review.yml`): the run shows red even though the
+PR's actual verdict — `trusted-gate`'s job in `trusted-fork-ci.yml`, or
+`linux`'s in `fork-dynamic-review.yml` — is unaffected and still authoritative;
+check that job's own status before assuming the whole dispatch failed. The
+error names the cause:
+
+- A transient `gh api` failure (rate limit, network blip) on the list or
+  delete calls aborts with an explicit `DELETE failed for cache id …`
+  message naming how many entries were already removed. Re-dispatch on the
+  **same** branch — the purge is idempotent and only removes what remains.
+- `$N cache entries still present … after purge` means the scope held more
+  than the 5-pass/100-per-page bound (500 entries) could drain in one run.
+  Re-dispatch on the same branch again rather than moving to a new
+  `-<sha>`-suffixed one — a new branch is a new, unpurged scope, and the old
+  one would otherwise sit unpurged until it ages out after seven days.
+- Use a fresh `gh workflow run` dispatch to retry, not GitHub's "Re-run failed
+  jobs" button — whether that button re-runs an `if: always()` downstream job
+  when only that job (not its `needs`) failed is not documented behavior.
+- A near-500-entry scope costs up to ~506 `gh api` calls to drain (5 list
+  passes + up to 500 deletes + 1 final recount) against the repo-shared
+  `GITHUB_TOKEN` REST budget (1,000/hour). Retrying a large purge repeatedly
+  in a short window is a real, if narrow, way to eat into that hour's headroom
+  alongside ordinary PR CI — space out retries rather than looping immediately.
+
+---
+
 ## 1. Linux runner `yuzu-wsl2-linux` shows offline / tmux is dying
 
 **Symptom:**

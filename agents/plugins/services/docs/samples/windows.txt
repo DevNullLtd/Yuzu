@@ -1,0 +1,416 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e724207e0989
+== action=list
+svc|ADPSvc|Aggregated Data Platform Service|stopped|manual
+svc|ALG|Application Layer Gateway Service|stopped|manual
+svc|AppIDSvc|Application Identity|stopped|manual
+svc|Appinfo|Application Information|stopped|manual
+svc|AppMgmt|Application Management|stopped|manual
+svc|AppReadiness|App Readiness|stopped|manual
+svc|AppVClient|Microsoft App-V Client|stopped|disabled
+svc|AppXSvc|AppX Deployment Service (AppXSVC)|running|automatic
+svc|ApxSvc|Windows Virtual Audio Device Proxy Service|stopped|manual
+svc|AssignedAccessManagerSvc|AssignedAccessManager Service|stopped|manual
+svc|AsusUpdateCheck|AsusUpdateCheck|stopped|automatic
+svc|AudioEndpointBuilder|Windows Audio Endpoint Builder|running|automatic
+svc|Audiosrv|Windows Audio|running|automatic
+svc|autotimesvc|Cellular Time|stopped|manual
+svc|AxInstSV|ActiveX Installer (AxInstSV)|stopped|manual
+svc|battlenet_helpersvc|Battle.net Update Helper Svc|stopped|manual
+svc|BDESVC|BitLocker Drive Encryption Service|stopped|manual
+svc|BEService|BattlEye Service|stopped|manual
+svc|BFE|Base Filtering Engine|running|automatic
+svc|BITS|Background Intelligent Transfer Service|stopped|manual
+svc|BrokerInfrastructure|Background Tasks Infrastructure Service|running|automatic
+svc|BTAGService|Bluetooth Audio Gateway Service|running|manual
+svc|BthAvctpSvc|AVCTP service|running|manual
+svc|bthserv|Bluetooth Support Service|running|manual
+svc|camsvc|Capability Access Manager Service|running|automatic
+svc|CCleaner7|CCleaner 7|running|automatic
+svc|CDPSvc|Connected Devices Platform Service|running|automatic
+svc|CertPropSvc|Certificate Propagation|running|manual
+svc|ClickToRunSvc|Microsoft Office Click-to-Run Service|stopped|disabled
+svc|ClipSVC|Client Licence Service (ClipSVC)|stopped|manual
+svc|cloudidsvc|Microsoft Cloud Identity Service|stopped|manual
+svc|com.docker.service|Docker Desktop Service|stopped|manual
+svc|COMSysApp|COM+ System Application|stopped|manual
+svc|CoreMessagingRegistrar|CoreMessaging|running|automatic
+svc|CryptSvc|Cryptographic Services|running|automatic
+svc|CscService|Offline Files|stopped|manual
+svc|DcomLaunch|DCOM Server Process Launcher|running|automatic
+svc|dcsvc|Declared Configuration(DC) service|stopped|manual
+svc|defragsvc|Optimise drives|stopped|manual
+svc|DeviceAssociationService|Device Association Service|running|automatic
+svc|DeviceInstall|Device Install Service|running|manual
+svc|DevQueryBroker|DevQuery Background Discovery Broker|running|manual
+svc|Dhcp|DHCP Client|running|automatic
+svc|diagsvc|Diagnostic Execution Service|stopped|manual
+svc|DiagTrack|Connected User Experiences and Telemetry|running|automatic
+svc|DialogBlockingService|DialogBlockingService|stopped|disabled
+svc|DispBrokerDesktopSvc|Display Policy Service|running|automatic
+svc|DisplayEnhancementService|Display Enhancement Service|stopped|manual
+svc|DmEnrollmentSvc|Device Management Enrollment Service|stopped|manual
+svc|dmwappushservice|Device Management Wireless Application Protocol (WAP) Push message Routing Service|stopped|manual
+svc|Dnscache|DNS Client|running|automatic
+svc|DoSvc|Delivery Optimization|running|automatic
+svc|dot3svc|Wired AutoConfig|stopped|manual
+svc|DPS|Diagnostic Policy Service|running|automatic
+svc|DsmSvc|Device Setup Manager|stopped|manual
+svc|DsSvc|Data Sharing Service|running|manual
+svc|DusmSvc|Data Usage|running|automatic
+svc|EapHost|Extensible Authentication Protocol|stopped|manual
+svc|EasyAntiCheat_EOS|Easy Anti-Cheat (Epic Online Services)|stopped|manual
+svc|edgeupdate|Microsoft Edge Update Service (edgeupdate)|stopped|automatic
+svc|edgeupdatem|Microsoft Edge Update Service (edgeupdatem)|stopped|manual
+svc|EFS|Encrypting File System (EFS)|stopped|manual
+svc|embeddedmode|Embedded Mode|stopped|manual
+svc|EntAppSvc|Enterprise App Management Service|stopped|manual
+svc|EventLog|Windows Event Log|running|automatic
+svc|EventSystem|COM+ Event System|running|automatic
+svc|Fax|Fax|stopped|manual
+svc|fdPHost|Function Discovery Provider Host|running|manual
+svc|FDResPub|Function Discovery Resource Publication|running|manual
+svc|fhsvc|File History Service|stopped|manual
+svc|FontCache|Windows Font Cache Service|running|automatic
+svc|FontCache3.0.0.0|Windows Presentation Foundation Font Cache 3.0.0.0|stopped|manual
+svc|FrameServer|Windows Camera Frame Server|stopped|manual
+svc|FrameServerMonitor|Windows Camera Frame Server Monitor|stopped|manual
+svc|FvSvc|NVIDIA FrameView SDK service|stopped|manual
+svc|GameInputRedistService|GameInput Redist Service|stopped|disabled
+svc|GameInputSvc|GameInput Service|running|manual
+svc|GamingServices|Gaming Services|running|automatic
+svc|GamingServicesNet|Gaming Services|running|automatic
+svc|GoogleChromeElevationService|Google Chrome Elevation Service (GoogleChromeElevationService)|stopped|manual
+svc|GoogleUpdaterInternalService148.0.7730.0|Google updater internal service (GoogleUpdaterInternalService148.0.7730.0)|stopped|disabled
+svc|GoogleUpdaterInternalService150.0.7863.0|Google updater internal service (GoogleUpdaterInternalService150.0.7863.0)|stopped|disabled
+svc|GoogleUpdaterInternalService150.0.7863.3|Google updater internal service (GoogleUpdaterInternalService150.0.7863.3)|stopped|disabled
+svc|GoogleUpdaterService148.0.7730.0|Google updater service (GoogleUpdaterService148.0.7730.0)|stopped|disabled
+svc|GoogleUpdaterService150.0.7863.0|Google updater service (GoogleUpdaterService150.0.7863.0)|stopped|disabled
+svc|gpsvc|Group Policy Client|stopped|automatic
+svc|GraphicsPerfSvc|GraphicsPerfSvc|stopped|manual
+svc|hidserv|Human Interface Device Service|running|manual
+svc|hns|Host Network Service|running|manual
+svc|hpatchmon|Hotpatch Monitoring Service|stopped|manual
+svc|HvHost|HV Host Service|running|manual
+svc|icssvc|Windows Mobile Hotspot Service|stopped|manual
+svc|IKEEXT|IKE and AuthIP IPsec Keying Modules|running|automatic
+svc|InstallService|Microsoft Store Install Service|running|manual
+svc|InventorySvc|Inventory and Compatibility Appraisal service|running|automatic
+svc|iphlpsvc|IP Helper|running|automatic
+svc|IpxlatCfgSvc|IP Translation Configuration Service|stopped|manual
+svc|IsoEnvBroker|Isolation Environment Broker|stopped|manual
+svc|IsolationSession|IsolationSession|stopped|manual
+svc|KeyIso|CNG Key Isolation|running|manual
+svc|KtmRm|KtmRm for Distributed Transaction Coordinator|stopped|manual
+svc|LanmanServer|Server|running|automatic
+svc|LanmanWorkstation|Workstation|running|automatic
+svc|lfsvc|Geolocation Service|running|manual
+svc|LicenseManager|Windows License Manager Service|running|manual
+svc|lltdsvc|Link-Layer Topology Discovery Mapper|stopped|manual
+svc|lmhosts|TCP/IP NetBIOS Helper|running|manual
+svc|LocalKdc|Kerberos Local Key Distribution Center|stopped|manual
+svc|LSM|Local Session Manager|running|automatic
+svc|LxpSvc|Language Experience Service|stopped|manual
+svc|MapsBroker|Downloaded Maps Manager|stopped|automatic
+svc|McmSvc|Mobile Connectivity Management Service|stopped|manual
+svc|McpManagementService|McpManagementService|stopped|manual
+svc|MDCoreSvc|Microsoft Defender Core Service|running|automatic
+svc|MicrosoftEdgeElevationService|Microsoft Edge Elevation Service (MicrosoftEdgeElevationService)|stopped|manual
+svc|midisrv|Windows MIDI Service|stopped|manual
+svc|MozillaMaintenance|Mozilla Maintenance Service|stopped|disabled
+svc|mpssvc|Windows Defender Firewall|running|automatic
+svc|MSDTC|Distributed Transaction Coordinator|stopped|manual
+svc|MSiSCSI|Microsoft iSCSI Initiator Service|stopped|manual
+svc|msiserver|Windows Installer|stopped|manual
+svc|MsKeyboardFilter|Microsoft Keyboard Filter|stopped|disabled
+svc|NahimicService|Nahimic service|running|automatic
+svc|NaturalAuthentication|Natural Authentication|stopped|manual
+svc|NcaSvc|Network Connectivity Assistant|stopped|manual
+svc|NcbService|Network Connection Broker|running|manual
+svc|NcdAutoSetup|Network Connected Devices Auto-Setup|running|manual
+svc|Netlogon|Netlogon|stopped|manual
+svc|Netman|Network Connections|stopped|manual
+svc|netprofm|Network List Service|running|manual
+svc|NetSetupSvc|Network Setup Service|stopped|manual
+svc|NetTcpPortSharing|Net.Tcp Port Sharing Service|stopped|disabled
+svc|NgcCtnrSvc|Microsoft Passport Container|stopped|manual
+svc|NgcSvc|Microsoft Passport|stopped|manual
+svc|NlaSvc|Network Location Awareness|stopped|manual
+svc|nordsec-threatprotection-service|nordsec-threatprotection-service|stopped|disabled
+svc|NordUpdaterService|NordSec Update Service|stopped|disabled
+svc|nordvpn-service|nordvpn-service|stopped|disabled
+svc|npggsvc|nProtect GameGuard Service|stopped|manual
+svc|nsi|Network Store Interface Service|running|automatic
+svc|nvagent|Network Virtualization Service|running|manual
+svc|NvContainerLocalSystem|NVIDIA LocalSystem Container|running|automatic
+svc|NVDisplay.ContainerLocalSystem|NVIDIA Display Container LS|running|automatic
+svc|OptionsPlusUpdaterService|Logi Options+|running|automatic
+svc|PcaSvc|Program Compatibility Assistant Service|running|automatic
+svc|PeerDistSvc|BranchCache|stopped|manual
+svc|perceptionsimulation|Windows Perception Simulation Service|stopped|manual
+svc|PerfHost|Performance Counter DLL Host|stopped|manual
+svc|PhoneSvc|Phone Service|running|manual
+svc|pla|Performance Logs & Alerts|stopped|manual
+svc|PlugPlay|Plug and Play|running|manual
+svc|PolicyAgent|IPsec Policy Agent|running|manual
+svc|postgresql-x64-18|postgresql-x64-18 - PostgreSQL Server 18|running|automatic
+svc|Power|Power|running|automatic
+svc|PrintDeviceConfigurationService|Print Device Configuration Service|stopped|manual
+svc|PrintNotify|Printer Extensions and Notifications|stopped|manual
+svc|PrintScanBrokerService|PrintScanBrokerService|stopped|manual
+svc|ProfSvc|User Profile Service|running|automatic
+svc|PushToInstall|Windows PushToInstall Service|stopped|manual
+svc|QWAVE|Quality Windows Audio Video Experience|stopped|manual
+svc|RasAuto|Remote Access Auto Connection Manager|stopped|manual
+svc|RasMan|Remote Access Connection Manager|running|automatic
+svc|Razer Game Manager Service|Razer Game Manager|running|automatic
+svc|Razer Synapse Service|Razer Synapse Service|running|automatic
+svc|Razer Update Service|Razer Update Service|running|automatic
+svc|refsdedupsvc|ReFS Dedup Service|stopped|manual
+svc|RemoteAccess|Routing and Remote Access|stopped|disabled
+svc|RemoteRegistry|Remote Registry|stopped|disabled
+svc|RetailDemo|Retail Demo Service|stopped|manual
+svc|RmSvc|Radio Management Service|running|manual
+svc|RpcEptMapper|RPC Endpoint Mapper|running|automatic
+svc|RpcLocator|Remote Procedure Call (RPC) Locator|stopped|manual
+svc|RpcSs|Remote Procedure Call (RPC)|running|automatic
+svc|RtkAudioUniversalService|Realtek Audio Universal Service|running|automatic
+svc|RzActionSvc|Razer Central Service|running|automatic
+svc|SamSs|Security Accounts Manager|running|automatic
+svc|SCardSvr|Smart Card|stopped|manual
+svc|ScDeviceEnum|Smart Card Device Enumeration Service|stopped|manual
+svc|Schedule|Task Scheduler|running|automatic
+svc|SCPolicySvc|Smart Card Removal Policy|stopped|manual
+svc|SDRSVC|Windows Backup|stopped|manual
+svc|seclogon|Secondary Log-on|stopped|manual
+svc|SecurityHealthService|Windows Security Service|stopped|manual
+svc|SEMgrSvc|Payments and NFC/SE Manager|stopped|manual
+svc|SENS|System Event Notification Service|running|automatic
+svc|Sense|Windows Defender Advanced Threat Protection Service|stopped|manual
+svc|SensorDataService|Sensor Data Service|stopped|manual
+svc|SensorService|Sensor Service|stopped|manual
+svc|SensrSvc|Sensor Monitoring Service|stopped|manual
+svc|SessionEnv|Remote Desktop Configuration|running|manual
+svc|SharedAccess|Internet Connection Sharing (ICS)|running|manual
+svc|ShellHWDetection|Shell Hardware Detection|running|automatic
+svc|shpamsvc|Shared PC Account Manager|stopped|disabled
+svc|smphost|Microsoft Storage Spaces SMP|stopped|manual
+svc|SmsRouter|Microsoft Windows SMS Router Service.|stopped|manual
+svc|SNMPTrap|SNMP Trap|stopped|manual
+svc|Spooler|Print Spooler|running|automatic
+svc|sppsvc|Software Protection|running|automatic
+svc|SSDPSRV|SSDP Discovery|running|manual
+svc|ssh-agent|OpenSSH Authentication Agent|stopped|disabled
+svc|sshd|OpenSSH SSH Server|running|automatic
+svc|SstpSvc|Secure Socket Tunneling Protocol Service|running|manual
+svc|StateRepository|State Repository Service|running|automatic
+svc|Steam Client Service|Steam Client Service|stopped|disabled
+svc|StiSvc|Windows Image Acquisition (WIA)|stopped|manual
+svc|StorSvc|Storage Service|running|automatic
+svc|svsvc|Spot Verifier|stopped|manual
+svc|swprv|Microsoft Software Shadow Copy Provider|running|manual
+svc|SysMain|SysMain|running|automatic
+svc|SystemEventsBroker|System Events Broker|running|automatic
+svc|Tailscale|Tailscale|running|automatic
+svc|TapiSrv|Telephony|stopped|manual
+svc|TermService|Remote Desktop Services|running|manual
+svc|TextInputManagementService|Text Input Management Service|running|automatic
+svc|Themes|Themes|running|automatic
+svc|TieringEngineService|Storage Tiers Management|stopped|manual
+svc|TimeBrokerSvc|Time Broker|running|manual
+svc|TokenBroker|Web Account Manager|running|manual
+svc|TrkWks|Distributed Link Tracking Client|running|automatic
+svc|TroubleshootingSvc|Recommended Troubleshooting Service|stopped|manual
+svc|TrustedInstaller|Windows Modules Installer|stopped|manual
+svc|tzautoupdate|Auto Time Zone Updater|stopped|manual
+svc|UevAgentService|User Experience Virtualization Service|stopped|disabled
+svc|UmRdpService|Remote Desktop Services UserMode Port Redirector|running|manual
+svc|upnphost|UPnP Device Host|stopped|manual
+svc|UserManager|User Manager|running|automatic
+svc|UsoSvc|Update Orchestrator Service|running|automatic
+svc|VaultSvc|Credential Manager|running|manual
+svc|vds|Virtual Disk|stopped|manual
+svc|vmcompute|Hyper-V Host Compute Service|stopped|manual
+svc|vmicguestinterface|Hyper-V Guest Service Interface|stopped|manual
+svc|vmicheartbeat|Hyper-V Heartbeat Service|stopped|manual
+svc|vmickvpexchange|Hyper-V Data Exchange Service|stopped|manual
+svc|vmicrdv|Hyper-V Remote Desktop Virtualization Service|stopped|manual
+svc|vmicshutdown|Hyper-V Guest Shutdown Service|stopped|manual
+svc|vmictimesync|Hyper-V Time Synchronization Service|stopped|manual
+svc|vmicvmsession|Hyper-V PowerShell Direct Service|stopped|manual
+svc|vmicvss|Hyper-V Volume Shadow Copy Requestor|stopped|manual
+svc|VSInstallerElevationService|Visual Studio Installer Elevation Service|stopped|manual
+svc|VSS|Volume Shadow Copy|running|manual
+svc|VSStandardCollectorService150|Visual Studio Standard Collector Service 150|stopped|manual
+svc|W32Time|Windows Time|stopped|manual
+svc|WaaSMedicSvc|WaaSMedicSvc|stopped|manual
+svc|WalletService|WalletService|stopped|manual
+svc|WarpJITSvc|Warp JIT Service|stopped|manual
+svc|wbengine|Block Level Backup Engine Service|stopped|manual
+svc|WbioSrvc|Windows Biometric Service|stopped|manual
+svc|Wcmsvc|Windows Connection Manager|running|automatic
+svc|wcncsvc|Windows Connect Now - Config Registrar|stopped|manual
+svc|WdiServiceHost|Diagnostic Service Host|stopped|manual
+svc|WdiSystemHost|Diagnostic System Host|stopped|manual
+svc|WdNisSvc|Microsoft Defender Antivirus Network Inspection Service|running|manual
+svc|WebClient|WebClient|stopped|manual
+svc|webthreatdefsvc|Web Threat Defense Service|stopped|manual
+svc|Wecsvc|Windows Event Collector|stopped|manual
+svc|WEPHOSTSVC|Windows Encryption Provider Host Service|stopped|manual
+svc|wercplsupport|Problem Reports Control Panel Support|stopped|manual
+svc|WerSvc|Windows Error Reporting Service|stopped|manual
+svc|WFDSConMgrSvc|Wi-Fi Direct Services Connection Manager Service|stopped|manual
+svc|whesvc|Windows Health and Optimized Experiences|running|automatic
+svc|WiaRpc|Still Image Acquisition Events|stopped|manual
+svc|WinDefend|Microsoft Defender Antivirus Service|running|automatic
+svc|WinHttpAutoProxySvc|WinHTTP Web Proxy Auto-Discovery Service|running|manual
+svc|Winmgmt|Windows Management Instrumentation|running|automatic
+svc|WinRM|Windows Remote Management (WS-Management)|stopped|manual
+svc|wisvc|Windows Insider Service|stopped|manual
+svc|WlanSvc|WLAN AutoConfig|running|automatic
+svc|wlidsvc|Microsoft Account Sign-in Assistant|stopped|manual
+svc|wlpasvc|Local Profile Assistant Service|stopped|manual
+svc|WManSvc|Windows Management Service|stopped|manual
+svc|wmiApSrv|WMI Performance Adapter|stopped|manual
+svc|WMPNetworkSvc|Windows Media Player Network Sharing Service|stopped|manual
+svc|workfolderssvc|Work Folders|stopped|manual
+svc|WpcMonSvc|Parental Controls|stopped|manual
+svc|WPDBusEnum|Portable Device Enumerator Service|stopped|manual
+svc|WpnService|Windows Push Notifications System Service|running|automatic
+svc|WSAIFabricSvc|Windows AI Components Host|running|automatic
+svc|wscsvc|Security Center|running|automatic
+svc|WSearch|Windows Search|running|automatic
+svc|WSLService|WSL Service|stopped|disabled
+svc|wuauserv|Windows Update|running|manual
+svc|wuqisvc|Microsoft Usage and Quality Insights|stopped|manual
+svc|WwanSvc|WWAN AutoConfig|stopped|manual
+svc|XblAuthManager|Xbox Live Auth Manager|stopped|manual
+svc|XblGameSave|Xbox Live Game Save|stopped|manual
+svc|XboxGipSvc|Xbox Accessory Management Service|stopped|manual
+svc|XboxNetApiSvc|Xbox Live Networking Service|stopped|manual
+svc|zksvc|Zakynthos Service|stopped|manual
+svc|ZTHELPER|ZTDNS Helper service|stopped|manual
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=running
+svc|AppXSvc|AppX Deployment Service (AppXSVC)|running|automatic
+svc|AudioEndpointBuilder|Windows Audio Endpoint Builder|running|automatic
+svc|Audiosrv|Windows Audio|running|automatic
+svc|BFE|Base Filtering Engine|running|automatic
+svc|BrokerInfrastructure|Background Tasks Infrastructure Service|running|automatic
+svc|BTAGService|Bluetooth Audio Gateway Service|running|manual
+svc|BthAvctpSvc|AVCTP service|running|manual
+svc|bthserv|Bluetooth Support Service|running|manual
+svc|camsvc|Capability Access Manager Service|running|automatic
+svc|CCleaner7|CCleaner 7|running|automatic
+svc|CDPSvc|Connected Devices Platform Service|running|automatic
+svc|CertPropSvc|Certificate Propagation|running|manual
+svc|CoreMessagingRegistrar|CoreMessaging|running|automatic
+svc|CryptSvc|Cryptographic Services|running|automatic
+svc|DcomLaunch|DCOM Server Process Launcher|running|automatic
+svc|DeviceAssociationService|Device Association Service|running|automatic
+svc|DeviceInstall|Device Install Service|running|manual
+svc|DevQueryBroker|DevQuery Background Discovery Broker|running|manual
+svc|Dhcp|DHCP Client|running|automatic
+svc|DiagTrack|Connected User Experiences and Telemetry|running|automatic
+svc|DispBrokerDesktopSvc|Display Policy Service|running|automatic
+svc|Dnscache|DNS Client|running|automatic
+svc|DoSvc|Delivery Optimization|running|automatic
+svc|DPS|Diagnostic Policy Service|running|automatic
+svc|DsSvc|Data Sharing Service|running|manual
+svc|DusmSvc|Data Usage|running|automatic
+svc|EventLog|Windows Event Log|running|automatic
+svc|EventSystem|COM+ Event System|running|automatic
+svc|fdPHost|Function Discovery Provider Host|running|manual
+svc|FDResPub|Function Discovery Resource Publication|running|manual
+svc|FontCache|Windows Font Cache Service|running|automatic
+svc|GameInputSvc|GameInput Service|running|manual
+svc|GamingServices|Gaming Services|running|automatic
+svc|GamingServicesNet|Gaming Services|running|automatic
+svc|hidserv|Human Interface Device Service|running|manual
+svc|hns|Host Network Service|running|manual
+svc|HvHost|HV Host Service|running|manual
+svc|IKEEXT|IKE and AuthIP IPsec Keying Modules|running|automatic
+svc|InstallService|Microsoft Store Install Service|running|manual
+svc|InventorySvc|Inventory and Compatibility Appraisal service|running|automatic
+svc|iphlpsvc|IP Helper|running|automatic
+svc|KeyIso|CNG Key Isolation|running|manual
+svc|LanmanServer|Server|running|automatic
+svc|LanmanWorkstation|Workstation|running|automatic
+svc|lfsvc|Geolocation Service|running|manual
+svc|LicenseManager|Windows License Manager Service|running|manual
+svc|lmhosts|TCP/IP NetBIOS Helper|running|manual
+svc|LSM|Local Session Manager|running|automatic
+svc|MDCoreSvc|Microsoft Defender Core Service|running|automatic
+svc|mpssvc|Windows Defender Firewall|running|automatic
+svc|NahimicService|Nahimic service|running|automatic
+svc|NcbService|Network Connection Broker|running|manual
+svc|NcdAutoSetup|Network Connected Devices Auto-Setup|running|manual
+svc|netprofm|Network List Service|running|manual
+svc|nsi|Network Store Interface Service|running|automatic
+svc|nvagent|Network Virtualization Service|running|manual
+svc|NvContainerLocalSystem|NVIDIA LocalSystem Container|running|automatic
+svc|NVDisplay.ContainerLocalSystem|NVIDIA Display Container LS|running|automatic
+svc|OptionsPlusUpdaterService|Logi Options+|running|automatic
+svc|PcaSvc|Program Compatibility Assistant Service|running|automatic
+svc|PhoneSvc|Phone Service|running|manual
+svc|PlugPlay|Plug and Play|running|manual
+svc|PolicyAgent|IPsec Policy Agent|running|manual
+svc|postgresql-x64-18|postgresql-x64-18 - PostgreSQL Server 18|running|automatic
+svc|Power|Power|running|automatic
+svc|ProfSvc|User Profile Service|running|automatic
+svc|RasMan|Remote Access Connection Manager|running|automatic
+svc|Razer Game Manager Service|Razer Game Manager|running|automatic
+svc|Razer Synapse Service|Razer Synapse Service|running|automatic
+svc|Razer Update Service|Razer Update Service|running|automatic
+svc|RmSvc|Radio Management Service|running|manual
+svc|RpcEptMapper|RPC Endpoint Mapper|running|automatic
+svc|RpcSs|Remote Procedure Call (RPC)|running|automatic
+svc|RtkAudioUniversalService|Realtek Audio Universal Service|running|automatic
+svc|RzActionSvc|Razer Central Service|running|automatic
+svc|SamSs|Security Accounts Manager|running|automatic
+svc|Schedule|Task Scheduler|running|automatic
+svc|SENS|System Event Notification Service|running|automatic
+svc|SessionEnv|Remote Desktop Configuration|running|manual
+svc|SharedAccess|Internet Connection Sharing (ICS)|running|manual
+svc|ShellHWDetection|Shell Hardware Detection|running|automatic
+svc|Spooler|Print Spooler|running|automatic
+svc|sppsvc|Software Protection|running|automatic
+svc|SSDPSRV|SSDP Discovery|running|manual
+svc|sshd|OpenSSH SSH Server|running|automatic
+svc|SstpSvc|Secure Socket Tunneling Protocol Service|running|manual
+svc|StateRepository|State Repository Service|running|automatic
+svc|StorSvc|Storage Service|running|automatic
+svc|swprv|Microsoft Software Shadow Copy Provider|running|manual
+svc|SysMain|SysMain|running|automatic
+svc|SystemEventsBroker|System Events Broker|running|automatic
+svc|Tailscale|Tailscale|running|automatic
+svc|TermService|Remote Desktop Services|running|manual
+svc|TextInputManagementService|Text Input Management Service|running|automatic
+svc|Themes|Themes|running|automatic
+svc|TimeBrokerSvc|Time Broker|running|manual
+svc|TokenBroker|Web Account Manager|running|manual
+svc|TrkWks|Distributed Link Tracking Client|running|automatic
+svc|UmRdpService|Remote Desktop Services UserMode Port Redirector|running|manual
+svc|UserManager|User Manager|running|automatic
+svc|UsoSvc|Update Orchestrator Service|running|automatic
+svc|VaultSvc|Credential Manager|running|manual
+svc|VSS|Volume Shadow Copy|running|manual
+svc|Wcmsvc|Windows Connection Manager|running|automatic
+svc|WdNisSvc|Microsoft Defender Antivirus Network Inspection Service|running|manual
+svc|whesvc|Windows Health and Optimized Experiences|running|automatic
+svc|WinDefend|Microsoft Defender Antivirus Service|running|automatic
+svc|WinHttpAutoProxySvc|WinHTTP Web Proxy Auto-Discovery Service|running|manual
+svc|Winmgmt|Windows Management Instrumentation|running|automatic
+svc|WlanSvc|WLAN AutoConfig|running|automatic
+svc|WpnService|Windows Push Notifications System Service|running|automatic
+svc|WSAIFabricSvc|Windows AI Components Host|running|automatic
+svc|wscsvc|Security Center|running|automatic
+svc|WSearch|Windows Search|running|automatic
+svc|wuauserv|Windows Update|running|manual
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_start_mode
+error|missing required parameter: name
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

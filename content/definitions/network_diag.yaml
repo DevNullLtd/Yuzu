@@ -16,12 +16,12 @@ metadata:
   version: 0.1.0
   description: >
     Lists all TCP ports in LISTEN state on the endpoint. Returns the
-    bind address, port number, and owning PID (or inode on Linux).
-    On Windows uses GetExtendedTcpTable with TCP_TABLE_OWNER_PID_LISTENER.
-    On Linux reads /proc/net/tcp and /proc/net/tcp6 filtering state 0x0A.
-    On macOS runs lsof -iTCP -sTCP:LISTEN and parses the NAME column.
-    Useful for security audits and compliance checks to detect
-    unexpected open ports.
+    bind address, port number, and owning PID (or, on Linux, the socket's
+    inode number rather than a PID). On Windows reads GetExtendedTcpTable
+    with TCP_TABLE_OWNER_PID_LISTENER, IPv4 only. On Linux reads
+    /proc/net/tcp and /proc/net/tcp6 filtering state 0x0A. On macOS walks
+    libproc via agents/shared/macos_socket_walk.hpp. Useful for security
+    audits and compliance checks to detect unexpected open ports.
   tags: [network, security, diagnostics, compliance]
 
 spec:
@@ -41,12 +41,29 @@ spec:
     columns:
       - name: proto
         type: string
+        description: >
+          The socket's transport protocol. Always the literal "tcp" today —
+          the plugin never distinguishes an IPv6 socket with "tcp6", even
+          though Linux and macOS both source rows from IPv6-capable tables.
+        example: "tcp"
+        platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
+        description: >-
+          The bound local address. Dotted IPv4 on all platforms; "*" for an unbound wildcard on macOS; on Linux an IPv6 address is emitted as raw undecoded hex, not text (hex_to_ip's IPv6 branch is a passthrough). Values: free text.
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
+        description: 'The bound local TCP port number. Values: integer.'
+        example: 5432
+        platforms: [windows, linux, darwin]
       - name: pid
         type: int32
+        description: >-
+          The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer.
+        example: 1533
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - local_port
@@ -81,13 +98,13 @@ metadata:
   version: 0.1.0
   description: >
     Lists all established TCP connections on the endpoint. Returns
-    local address/port, remote address/port, and owning PID (or inode
-    on Linux). On Windows uses GetExtendedTcpTable with
-    TCP_TABLE_OWNER_PID_CONNECTIONS and filters for MIB_TCP_STATE_ESTAB.
-    On Linux reads /proc/net/tcp and /proc/net/tcp6 filtering state 0x01.
-    On macOS runs lsof -iTCP -sTCP:ESTABLISHED and parses the connection
-    arrow notation. Useful for detecting unauthorized outbound connections
-    and lateral movement.
+    local address/port, remote address/port, and owning PID (or, on
+    Linux, the socket's inode number rather than a PID). On Windows
+    reads GetExtendedTcpTable with TCP_TABLE_OWNER_PID_CONNECTIONS and
+    filters for MIB_TCP_STATE_ESTAB, IPv4 only. On Linux reads
+    /proc/net/tcp and /proc/net/tcp6 filtering state 0x01. On macOS
+    walks libproc via agents/shared/macos_socket_walk.hpp. Useful for
+    detecting unauthorized outbound connections and lateral movement.
   tags: [network, security, diagnostics]
 
 spec:
@@ -107,16 +124,40 @@ spec:
     columns:
       - name: proto
         type: string
+        description: >
+          The socket's transport protocol. Always the literal "tcp" today —
+          the plugin never distinguishes an IPv6 socket with "tcp6", even
+          though Linux and macOS both source rows from IPv6-capable tables.
+        example: "tcp"
+        platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
+        description: >-
+          The local endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text.
+        example: "203.0.113.66"
+        platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
+        description: 'The local TCP port number. Values: integer.'
+        example: 52882
+        platforms: [windows, linux, darwin]
       - name: remote_addr
         type: string
+        description: >-
+          The remote endpoint address. Dotted IPv4 on all platforms; on Linux an IPv6 address is emitted as raw undecoded hex, not text. Values: free text.
+        example: "160.79.104.10"
+        platforms: [windows, linux, darwin]
       - name: remote_port
         type: int32
+        description: 'The remote TCP port number. Values: integer.'
+        example: 443
+        platforms: [windows, linux, darwin]
       - name: pid
         type: int32
+        description: >-
+          The owning process id on Windows and macOS. On Linux this is NOT a PID — the Linux leg never resolves /proc/[pid]/fd, so the value is the socket's raw /proc/net/tcp[6] inode number. Values: integer.
+        example: 9039
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - remote_addr

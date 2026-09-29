@@ -1,0 +1,15 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-15 · euid 0 · leg-hash pending
+== action=summary
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=last_used
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=foreground
+constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)
+[result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
+

@@ -1,0 +1,9 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 81838b2b5566
+== action=errors
+error|2026-09-06T14:55:55.0521384Z|6008|EventLog|16:11:31 ‎05/‎09/‎2026 105614
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=query log=System filter=error
+event|none|-|-|-|No match within the newest events examined (count window full; older events not searched)
+[result_status] CONSTRAINED / PARTIAL / event_logs_win:count_window_full
+

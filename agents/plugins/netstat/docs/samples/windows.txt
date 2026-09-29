@@ -1,0 +1,201 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f31d206bb2ee
+== action=netstat_list
+tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148
+tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148
+tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008
+tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4
+tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048
+tcp|0.0.0.0|5040|0.0.0.0|0|LISTEN|14216
+tcp|127.0.0.1|5432|0.0.0.0|0|LISTEN|6436
+tcp|127.0.0.1|5432|127.0.0.1|49748|ESTABLISHED|6436
+tcp|127.0.0.1|5432|127.0.0.1|49749|ESTABLISHED|6436
+tcp|127.0.0.1|5432|127.0.0.1|50169|ESTABLISHED|6436
+tcp|0.0.0.0|8080|0.0.0.0|0|LISTEN|13676
+tcp|127.0.0.1|8080|127.0.0.1|49754|ESTABLISHED|13676
+tcp|0.0.0.0|8099|0.0.0.0|0|LISTEN|13800
+tcp|0.0.0.0|49664|0.0.0.0|0|LISTEN|1740
+tcp|0.0.0.0|49665|0.0.0.0|0|LISTEN|1596
+tcp|0.0.0.0|49666|0.0.0.0|0|LISTEN|2448
+tcp|0.0.0.0|49667|0.0.0.0|0|LISTEN|3352
+tcp|0.0.0.0|49668|0.0.0.0|0|LISTEN|4512
+tcp|203.0.113.131|49673|34.141.96.57|7500|ESTABLISHED|5036
+tcp|0.0.0.0|49676|0.0.0.0|0|LISTEN|10096
+tcp|0.0.0.0|49706|0.0.0.0|0|LISTEN|1676
+tcp|203.0.113.131|49708|199.165.136.100|443|ESTABLISHED|5808
+tcp|127.0.0.1|49748|127.0.0.1|5432|ESTABLISHED|13676
+tcp|127.0.0.1|49749|127.0.0.1|5432|ESTABLISHED|13676
+tcp|127.0.0.1|49750|127.0.0.1|49751|ESTABLISHED|13800
+tcp|127.0.0.1|49751|127.0.0.1|49750|ESTABLISHED|13800
+tcp|127.0.0.1|49754|127.0.0.1|8080|ESTABLISHED|13800
+tcp|127.0.0.1|49759|127.0.0.1|50051|ESTABLISHED|13496
+tcp|203.0.113.131|49794|172.187.86.73|443|ESTABLISHED|5132
+tcp|127.0.0.1|50051|127.0.0.1|49759|ESTABLISHED|13676
+tcp|127.0.0.1|50169|127.0.0.1|5432|ESTABLISHED|13676
+tcp|203.0.113.131|50525|192.200.0.106|443|ESTABLISHED|12984
+tcp|203.0.113.131|50526|176.58.92.254|443|ESTABLISHED|12984
+tcp|203.0.113.131|50710|20.42.73.25|443|ESTABLISHED|5672
+tcp|198.51.100.121|54669|0.0.0.0|0|LISTEN|12984
+tcp|0.0.0.0|445|0.0.0.0|0|LISTEN|4
+tcp|0.0.0.0|5357|0.0.0.0|0|LISTEN|4
+tcp|0.0.0.0|5426|0.0.0.0|0|LISTEN|4
+tcp|0.0.0.0|7680|0.0.0.0|0|LISTEN|8948
+tcp|0.0.0.0|50051|0.0.0.0|0|LISTEN|13676
+tcp|0.0.0.0|50052|0.0.0.0|0|LISTEN|13676
+tcp6|::|22|::|0|LISTEN|5148
+tcp6|::|135|::|0|LISTEN|1008
+tcp6|::|445|::|0|LISTEN|4
+tcp6|::|3389|::|0|LISTEN|9048
+tcp6|::|5357|::|0|LISTEN|4
+tcp6|::|5426|::|0|LISTEN|4
+tcp6|::1|5432|::|0|LISTEN|6436
+tcp6|::|7680|::|0|LISTEN|8948
+tcp6|fd7a:115c:a1e0::1c32:357a|45688|::|0|LISTEN|12984
+tcp6|::|49664|::|0|LISTEN|1740
+tcp6|::|49665|::|0|LISTEN|1596
+tcp6|::|49666|::|0|LISTEN|2448
+tcp6|::|49667|::|0|LISTEN|3352
+tcp6|::|49668|::|0|LISTEN|4512
+tcp6|::|49676|::|0|LISTEN|10096
+tcp6|::|49706|::|0|LISTEN|1676
+tcp6|::|50051|::|0|LISTEN|13676
+tcp6|::|50052|::|0|LISTEN|13676
+udp|203.0.113.131|137|*|0||4
+udp|203.0.113.131|138|*|0||4
+udp|0.0.0.0|500|*|0||5044
+udp|198.51.100.121|1900|*|0||7728
+udp|127.0.0.1|1900|*|0||7728
+udp|203.0.113.131|1900|*|0||7728
+udp|0.0.0.0|3389|*|0||9048
+udp|0.0.0.0|3702|*|0||7604
+udp|0.0.0.0|3702|*|0||7604
+udp|0.0.0.0|4500|*|0||5044
+udp|0.0.0.0|5050|*|0||14216
+udp|0.0.0.0|5353|*|0||3304
+udp|0.0.0.0|5355|*|0||3304
+udp|0.0.0.0|41641|*|0||12984
+udp|198.51.100.121|52245|*|0||7728
+udp|203.0.113.131|52246|*|0||7728
+udp|127.0.0.1|52247|*|0||7728
+udp|0.0.0.0|53577|*|0||7604
+udp|127.0.0.1|58199|*|0||5052
+udp|0.0.0.0|53557|*|0||3304
+udp|0.0.0.0|65197|*|0||3304
+udp6|::|500|*|0||5044
+udp6|::1|1900|*|0||7728
+udp6|fe80::c5b0:bd45:79bc:bd97|1900|*|0||7728
+udp6|fe80::d459:2883:492c:f3fc|1900|*|0||7728
+udp6|::|3389|*|0||9048
+udp6|::|3702|*|0||7604
+udp6|::|3702|*|0||7604
+udp6|::|4500|*|0||5044
+udp6|::|5353|*|0||3304
+udp6|::|5355|*|0||3304
+udp6|::|41641|*|0||12984
+udp6|fe80::c5b0:bd45:79bc:bd97|52242|*|0||7728
+udp6|fe80::d459:2883:492c:f3fc|52243|*|0||7728
+udp6|::1|52244|*|0||7728
+udp6|::|53557|*|0||3304
+udp6|::|53578|*|0||7604
+udp6|::|65197|*|0||3304
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=attribution
+tcp|0.0.0.0|22|0.0.0.0|0|LISTEN|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
+tcp|198.51.100.121|22|198.51.100.77|53137|ESTABLISHED|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
+tcp|0.0.0.0|135|0.0.0.0|0|LISTEN|1008|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|203.0.113.131|139|0.0.0.0|0|LISTEN|4||
+tcp|0.0.0.0|3389|0.0.0.0|0|LISTEN|9048|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|0.0.0.0|5040|0.0.0.0|0|LISTEN|14216|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|127.0.0.1|5432|0.0.0.0|0|LISTEN|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+tcp|127.0.0.1|5432|127.0.0.1|50169|ESTABLISHED|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+tcp|127.0.0.1|5432|127.0.0.1|49749|ESTABLISHED|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+tcp|127.0.0.1|5432|127.0.0.1|49748|ESTABLISHED|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+tcp|0.0.0.0|8080|0.0.0.0|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|127.0.0.1|8080|127.0.0.1|49754|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|0.0.0.0|8099|0.0.0.0|0|LISTEN|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|0.0.0.0|49664|0.0.0.0|0|LISTEN|1740|lsass.exe|C:\Windows\System32\lsass.exe
+tcp|0.0.0.0|49665|0.0.0.0|0|LISTEN|1596|wininit.exe|C:\Windows\System32\wininit.exe
+tcp|0.0.0.0|49666|0.0.0.0|0|LISTEN|2448|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|0.0.0.0|49667|0.0.0.0|0|LISTEN|3352|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|0.0.0.0|49668|0.0.0.0|0|LISTEN|4512|spoolsv.exe|C:\Windows\System32\spoolsv.exe
+tcp|203.0.113.131|49673|34.141.96.57|7500|ESTABLISHED|5036|CCleaner_service.exe|C:\Program Files\Piriform\CCleaner 7\CCleaner_service.exe
+tcp|0.0.0.0|49676|0.0.0.0|0|LISTEN|10096|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|0.0.0.0|49706|0.0.0.0|0|LISTEN|1676|services.exe|C:\Windows\System32\services.exe
+tcp|203.0.113.131|49708|199.165.136.100|443|ESTABLISHED|5808|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp|127.0.0.1|49748|127.0.0.1|5432|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|127.0.0.1|49749|127.0.0.1|5432|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|127.0.0.1|49750|127.0.0.1|49751|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49751|127.0.0.1|49750|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49754|127.0.0.1|8080|ESTABLISHED|13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+tcp|127.0.0.1|49759|127.0.0.1|50051|ESTABLISHED|13496|yuzu-agent.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-agent.exe
+tcp|203.0.113.131|49794|172.187.86.73|443|ESTABLISHED|5132|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|127.0.0.1|50051|127.0.0.1|49759|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|127.0.0.1|50169|127.0.0.1|5432|ESTABLISHED|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|203.0.113.131|50525|192.200.0.106|443|ESTABLISHED|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp|203.0.113.131|50526|176.58.92.254|443|ESTABLISHED|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp|203.0.113.131|50710|20.42.73.25|443|ESTABLISHED|5672|vctip.exe|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe
+tcp|198.51.100.121|54669|0.0.0.0|0|LISTEN|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp|0.0.0.0|445|0.0.0.0|0|LISTEN|4||
+tcp|0.0.0.0|5357|0.0.0.0|0|LISTEN|4||
+tcp|0.0.0.0|5426|0.0.0.0|0|LISTEN|4||
+tcp|0.0.0.0|7680|0.0.0.0|0|LISTEN|8948|svchost.exe|C:\Windows\System32\svchost.exe
+tcp|0.0.0.0|50051|0.0.0.0|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp|0.0.0.0|50052|0.0.0.0|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp6|::|22|::|0|LISTEN|5148|sshd.exe|C:\Windows\System32\OpenSSH\sshd.exe
+tcp6|::|135|::|0|LISTEN|1008|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|::|445|::|0|LISTEN|4||
+tcp6|::|3389|::|0|LISTEN|9048|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|::|5357|::|0|LISTEN|4||
+tcp6|::|5426|::|0|LISTEN|4||
+tcp6|::1|5432|::|0|LISTEN|6436|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+tcp6|::|7680|::|0|LISTEN|8948|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|fd7a:115c:a1e0::1c32:357a|45688|::|0|LISTEN|12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+tcp6|::|49664|::|0|LISTEN|1740|lsass.exe|C:\Windows\System32\lsass.exe
+tcp6|::|49665|::|0|LISTEN|1596|wininit.exe|C:\Windows\System32\wininit.exe
+tcp6|::|49666|::|0|LISTEN|2448|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|::|49667|::|0|LISTEN|3352|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|::|49668|::|0|LISTEN|4512|spoolsv.exe|C:\Windows\System32\spoolsv.exe
+tcp6|::|49676|::|0|LISTEN|10096|svchost.exe|C:\Windows\System32\svchost.exe
+tcp6|::|49706|::|0|LISTEN|1676|services.exe|C:\Windows\System32\services.exe
+tcp6|::|50051|::|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+tcp6|::|50052|::|0|LISTEN|13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+udp|203.0.113.131|137|*|0||4||
+udp|203.0.113.131|138|*|0||4||
+udp|0.0.0.0|500|*|0||5044|svchost.exe|C:\Windows\System32\svchost.exe
+udp|198.51.100.121|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|127.0.0.1|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|203.0.113.131|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|3389|*|0||9048|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|3702|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|3702|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|4500|*|0||5044|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|5050|*|0||14216|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|5353|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|5355|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|41641|*|0||12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+udp|198.51.100.121|52245|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|203.0.113.131|52246|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|127.0.0.1|52247|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|53577|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp|127.0.0.1|58199|*|0||5052|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|53557|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp|0.0.0.0|65197|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|500|*|0||5044|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::1|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|fe80::c5b0:bd45:79bc:bd97|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|fe80::d459:2883:492c:f3fc|1900|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|3389|*|0||9048|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|3702|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|3702|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|4500|*|0||5044|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|5353|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|5355|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|41641|*|0||12984|tailscaled.exe|C:\Program Files\Tailscale\tailscaled.exe
+udp6|fe80::c5b0:bd45:79bc:bd97|52242|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|fe80::d459:2883:492c:f3fc|52243|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::1|52244|*|0||7728|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|53557|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|53578|*|0||7604|svchost.exe|C:\Windows\System32\svchost.exe
+udp6|::|65197|*|0||3304|svchost.exe|C:\Windows\System32\svchost.exe
+[result_status] UNDECLARED / UNKNOWN / 
+

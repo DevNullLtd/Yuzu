@@ -75,6 +75,34 @@ void save_tags() {
     }
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// All 7 actions are pure in-process reads/writes of <data_dir>/tags.json —
+// no subprocess on any OS (rung 1, "local_json_store" on all three legs).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"set", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"get", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"get_all", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"delete", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"check", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"clear", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"count", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+};
+
 } // namespace
 
 class TagsPlugin final : public yuzu::Plugin {
@@ -89,6 +117,13 @@ public:
         static const char* acts[] = {"set",   "get",   "get_all", "delete",
                                      "check", "clear", "count",   nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

@@ -104,6 +104,8 @@ std::string render_param_field(const std::string& type_ns, const std::string& ke
         h += is_int ? " type=\"number\"" : " type=\"text\"";
         if (is_int && prop.contains("minimum") && prop["minimum"].is_number_integer())
             h += " min=\"" + std::to_string(prop["minimum"].get<long long>()) + "\"";
+        if (is_int && prop.contains("maximum") && prop["maximum"].is_number_integer())
+            h += " max=\"" + std::to_string(prop["maximum"].get<long long>()) + "\"";
         if (!placeholder.empty())
             h += " placeholder=\"" + html_escape(placeholder) + "\"";
         if (required)

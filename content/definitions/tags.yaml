@@ -48,8 +48,14 @@ spec:
     columns:
       - name: key
         type: string
+        description: 'The tag key that was written, echoed back from the request. Values: free text.'
+        example: yuzu_capture_tmp
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: 'The tag value that was written, echoed back from the request. Values: free text.'
+        example: "1"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Set tag '${key}' = '${value}'"
 
@@ -106,8 +112,14 @@ spec:
     columns:
       - name: key
         type: string
+        description: 'The tag key that was looked up, echoed back from the request. Values: free text.'
+        example: yuzu_capture_tmp
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: "The tag's current value, or an empty string when the key is not set. Values: free text, empty when unset."
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get tag '${key}'"
 
@@ -158,10 +170,19 @@ spec:
     columns:
       - name: key
         type: string
+        description: "One stored tag's key. One row per tag currently in the store. Values: free text."
+        example: yuzu_capture_tmp
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: "That tag's value. Values: free text."
+        example: "1"
+        platforms: [windows, linux, darwin]
       - name: count
         type: int32
+        description: 'Total number of tags currently stored, on a trailing line after the tag rows. Values: integer >= 0.'
+        example: "0"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get all device tags"
 
@@ -219,8 +240,14 @@ spec:
     columns:
       - name: key
         type: string
+        description: 'The tag key that was deleted, echoed back from the request. Values: free text.'
+        example: yuzu_capture_tmp
+        platforms: [windows, linux, darwin]
       - name: found
         type: bool
+        description: 'Whether the key existed before this call. Values: true, false.'
+        example: "false"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Delete tag '${key}'"
 
@@ -277,8 +304,14 @@ spec:
     columns:
       - name: key
         type: string
+        description: 'The tag key that was checked, echoed back from the request. Values: free text.'
+        example: yuzu_capture_tmp
+        platforms: [windows, linux, darwin]
       - name: exists
         type: bool
+        description: 'Whether the key currently exists. Values: true, false.'
+        example: "false"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Check if tag '${key}' exists"
 
@@ -329,6 +362,9 @@ spec:
     columns:
       - name: cleared_count
         type: int32
+        description: "Number of tags that were removed by this call — the store's size immediately before clearing. Values: integer >= 0."
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Clear all device tags"
 
@@ -377,6 +413,9 @@ spec:
     columns:
       - name: count
         type: int32
+        description: 'Total number of tags currently stored. Values: integer >= 0.'
+        example: "0"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Count device tags"
 

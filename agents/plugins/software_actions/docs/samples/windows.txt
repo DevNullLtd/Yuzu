@@ -1,0 +1,9 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash c95c61957b6f
+== action=list_upgradable
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+[rc] 1
+
+== action=installed_count
+count|124
+[result_status] UNDECLARED / UNKNOWN / 
+

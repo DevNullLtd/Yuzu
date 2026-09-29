@@ -49,7 +49,7 @@
 
 namespace {
 
-using yuzu::installed_apps::reg_utf8::reg_sz_to_utf8;
+using yuzu::installed_apps::reg_utf8::read_reg_string;
 
 // RAII owner of a scratch key under the shared SOFTWARE\YuzuTest namespace (same
 // convention as test_guard_registry.cpp). The leaf is suffixed with the process
@@ -87,19 +87,15 @@ void set_sz(HKEY key, const wchar_t* name, const wchar_t* value) {
             ERROR_SUCCESS);
 }
 
-// Read back via the plugin's read path: RegQueryValueExW + the shared
-// reg_sz_to_utf8. The `size >= sizeof(wchar_t)` guard mirrors the plugin's
-// read_str lambda exactly.
-std::string read_utf8(HKEY key, const wchar_t* name) {
-    wchar_t buf[512]{};
-    DWORD size = sizeof(buf);
-    DWORD type = 0;
-    if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
-            ERROR_SUCCESS &&
-        type == REG_SZ && size >= sizeof(wchar_t)) {
-        return reg_sz_to_utf8(buf, size);
-    }
-    return {};
+void set_expand_sz(HKEY key, const wchar_t* name, const wchar_t* value) {
+    DWORD bytes = static_cast<DWORD>((wcslen(value) + 1) * sizeof(wchar_t));
+    REQUIRE(RegSetValueExW(key, name, 0, REG_EXPAND_SZ, reinterpret_cast<const BYTE*>(value),
+                           bytes) == ERROR_SUCCESS);
+}
+
+void set_dword(HKEY key, const wchar_t* name, DWORD value) {
+    REQUIRE(RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value),
+                           sizeof(value)) == ERROR_SUCCESS);
 }
 
 } // namespace
@@ -112,9 +108,10 @@ TEST_CASE("installed_apps #1662: non-ASCII REG_SZ round-trips as correct UTF-8",
     INFO("system ANSI code page (GetACP) = " << GetACP());
 
     struct Case {
-        const char* label;         // ASCII, for INFO (streaming wchar_t* into a
-                                   // narrow ostream is a deleted operator in C++20+)
-        const wchar_t* name;
+        const char* name;          // ASCII: the value name read_reg_string takes, and INFO
+                                   // (streaming wchar_t* into a narrow ostream is a deleted
+                                   // operator in C++20+)
+        const wchar_t* wide_name;  // the same name for set_sz
         const wchar_t* wide;       // stored UTF-16 (\u/\U escapes -> code-page independent)
         std::string expected_utf8; // correct UTF-8 the fix must produce (\x bytes)
     };
@@ -133,9 +130,9 @@ TEST_CASE("installed_apps #1662: non-ASCII REG_SZ round-trips as correct UTF-8",
     };
 
     for (const auto& c : cases) {
-        set_sz(scratch.key, c.name, c.wide);
-        const std::string got = read_utf8(scratch.key, c.name);
-        INFO("value " << c.label);
+        set_sz(scratch.key, c.wide_name, c.wide);
+        const std::string got = read_reg_string(scratch.key, c.name, false);
+        INFO("value " << c.name);
         CHECK(got == c.expected_utf8);
     }
 }
@@ -153,7 +150,7 @@ TEST_CASE("installed_apps #1662: a trailing-NUL-free REG_SZ is not truncated",
     REQUIRE(RegSetValueExW(scratch.key, L"NoNul", 0, REG_SZ,
                            reinterpret_cast<const BYTE*>(value), bytes_no_nul) == ERROR_SUCCESS);
 
-    CHECK(read_utf8(scratch.key, L"NoNul") == std::string("Caf\xC3\xA9"));
+    CHECK(read_reg_string(scratch.key, "NoNul", false) == std::string("Caf\xC3\xA9"));
 }
 
 TEST_CASE("installed_apps #1662: an empty REG_SZ reads back as empty",
@@ -163,7 +160,38 @@ TEST_CASE("installed_apps #1662: an empty REG_SZ reads back as empty",
     ScratchKey scratch;
     REQUIRE(scratch.ok);
     set_sz(scratch.key, L"Empty", L"");
-    CHECK(read_utf8(scratch.key, L"Empty").empty());
+    CHECK(read_reg_string(scratch.key, "Empty", false).empty());
+}
+
+TEST_CASE("installed_apps read_reg_string: REG_EXPAND_SZ is accepted only under the "
+          "InstallLocation policy, and returned raw",
+          "[installed_apps][registry][windows]") {
+    ScratchKey scratch;
+    REQUIRE(scratch.ok);
+    set_expand_sz(scratch.key, L"InstallLocation", L"%ProgramFiles%\\Yuzu\\");
+    CHECK(read_reg_string(scratch.key, "InstallLocation", true) == "%ProgramFiles%\\Yuzu\\");
+    // Mutation: ignoring accept_expand_sz (always true) fails this line -- the
+    // ADR-0016 hashed fields must never widen to REG_EXPAND_SZ.
+    CHECK(read_reg_string(scratch.key, "InstallLocation", false).empty());
+}
+
+TEST_CASE("installed_apps read_reg_string: a REG_DWORD reads as empty under either policy",
+          "[installed_apps][registry][windows]") {
+    ScratchKey scratch;
+    REQUIRE(scratch.ok);
+    set_dword(scratch.key, L"SystemComponent", 1);
+    CHECK(read_reg_string(scratch.key, "SystemComponent", false).empty());
+    CHECK(read_reg_string(scratch.key, "SystemComponent", true).empty());
+}
+
+TEST_CASE("installed_apps read_reg_string: a value over 511 WCHARs reads as empty, never "
+          "truncated (ERROR_MORE_DATA; a larger-buffer retry is a tracked follow-up)",
+          "[installed_apps][registry][windows]") {
+    ScratchKey scratch;
+    REQUIRE(scratch.ok);
+    const std::wstring big(600, L'a');
+    set_sz(scratch.key, L"Long", big.c_str());
+    CHECK(read_reg_string(scratch.key, "Long", true).empty());
 }
 
 #endif // _WIN32

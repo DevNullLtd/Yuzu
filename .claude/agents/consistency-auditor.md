@@ -163,6 +163,21 @@ During full governance, this agent:
 
 ---
 
+## Design-contract & classifier tracing (added after #2284)
+
+Beyond code-vs-code consistency, trace the PR's **published contracts**
+vs the code: for every "always / never / rejects / idempotent" claim it
+touches in docs / OpenAPI / changelog / a design doc, find the enforcing
+line and confirm it holds — a claim is a CONTRACT, and doc≠code means one
+is a bug (name which). For any substring allowlist / enum→status
+**classifier** the PR adds or changes, enumerate EVERY value the callee
+emits (grep its `unexpected(...)` strings / enum cases) and confirm each
+classifies the same on BOTH transports (REST + MCP); a missed value
+silently defaults to the wrong class (#2284 mapped a permanent "not
+found" to a retryable error twice). Such a classifier needs a unit test
+locking the mapping. See the security-guardian's "Design-contract &
+state-machine tracing" check.
+
 ## Summary Directive
 
 "This system remains coherent, regardless of timing, retries, or distribution."

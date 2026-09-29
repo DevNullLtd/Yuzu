@@ -1,0 +1,4 @@
+REAL CAPTURE
+host: braga.local, macOS 26.5.1 (Darwin 25.5.0, arm64)
+date: 2026-09-06
+command: cat /Library/LaunchDaemons/com.docker.socket.plist (XML plist, verbatim bytes)

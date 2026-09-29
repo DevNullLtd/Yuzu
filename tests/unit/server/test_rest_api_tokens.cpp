@@ -17,39 +17,47 @@
  * thread for TSan to fight with.
  */
 
+#include "agent_registry.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "event_bus.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "secure_random.hpp"
 #include "test_route_sink.hpp"
+
+#include "agent.pb.h"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include "../test_helpers.hpp"
 
-#include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::EventBus;
+// `pb` is already bound to `::yuzu::agent::v1` by agent_registry.hpp inside
+// `namespace yuzu::server::detail` — use `agent_pb` here to avoid
+// "redefinition of 'pb'" (same workaround as
+// test_agent_registry_token_revocation.cpp).
+namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
-
-// Delegates to the shared salt + atomic counter helper (#482). The prior
-// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to.
-static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
 
 struct AuditRecord {
     std::string action;
@@ -58,13 +66,44 @@ struct AuditRecord {
     std::string detail;
 };
 
+// Shares the "devicetokenstore" key with test_device_token_store.cpp's and
+// test_rest_api_t2.cpp's own templates (identical setup, replay-verified per
+// docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate device_token_store_tpl{
+    "devicetokenstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        DeviceTokenStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("device_token_store template: store failed to migrate");
+    }};
+
 struct RestTokensHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path db_path;
-    fs::path device_db_path;
-    std::unique_ptr<ApiTokenStore> token_store;
+    // ApiTokenStore ported to Postgres (PR 4.1). The happy-path arm clones an
+    // ephemeral database via the shared ApiTokenStorePg helper (SKIPs when
+    // YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken); the
+    // broken_token_db arm bypasses that helper entirely — see the ctor.
+    std::unique_ptr<yuzu::server::pg::PgPool> broken_pool;
+    std::optional<yuzu::test::ApiTokenStorePg> token_store_pg;
+    std::unique_ptr<ApiTokenStore> token_store_broken;
+
+    // DeviceTokenStore (ADR-0052) is Postgres-backed too, unconditionally —
+    // there is no "broken" arm for it (only ApiTokenStore's brokenness is
+    // under test in that arm); construction always needs a real reachable
+    // Postgres now, the same SKIP-if-unset/FAIL-if-broken posture as
+    // ApiTokenStorePg. Members declared in destruction-safe order (store
+    // closes before the pool, the pool closes before the ephemeral database
+    // is dropped) — mirrors ApiTokenStorePg's own private member order.
+    std::optional<yuzu::test::PostgresTestDb> device_token_db_;
+    std::optional<yuzu::server::pg::PgPool> device_token_pool_;
     std::unique_ptr<DeviceTokenStore> device_token_store;
+
+    /// Returns the ApiTokenStore under test regardless of which arm
+    /// constructed it.
+    ApiTokenStore* token_store() const {
+        return token_store_pg ? token_store_pg->get() : token_store_broken.get();
+    }
 
     // Mock session state — the caller sets these before calling any
     // endpoint; the auth_fn closure captures by reference and returns a
@@ -88,22 +127,43 @@ struct RestTokensHarness {
 
     RestApiV1 api;
 
-    /// `broken_token_db` points the ApiTokenStore at a path whose parent
-    /// directory does not exist, so sqlite3_open fails and db_ stays null —
-    /// the #347 CH-3 injection (storage down, routes still registered).
-    explicit RestTokensHarness(bool broken_token_db = false)
-        : db_path(broken_token_db
-                      ? unique_temp_path("rest-api-tokens") / "missing-dir" / "tokens.db"
-                      : unique_temp_path("rest-api-tokens")),
-          device_db_path(unique_temp_path("rest-api-device-tokens")) {
-        fs::remove(db_path);
-        fs::remove(device_db_path);
-        token_store = std::make_unique<ApiTokenStore>(db_path);
-        device_token_store = std::make_unique<DeviceTokenStore>(device_db_path);
-        if (broken_token_db)
-            REQUIRE_FALSE(token_store->is_open());
-        else
-            REQUIRE(token_store->is_open());
+    /// `broken_token_db` points the ApiTokenStore at a Postgres address
+    /// nothing listens on, so construction-time `pool_.acquire()` fails and
+    /// `is_open()` stays false — the PG-era equivalent of the pre-port
+    /// "sqlite3_open on a missing parent dir" #347 CH-3 injection (storage
+    /// down, routes still registered). Deliberately does NOT need
+    /// YUZU_TEST_POSTGRES_DSN — it never reaches a real database, so this
+    /// arm runs even in an environment with no Postgres configured. The
+    /// happy-path arm uses the shared ApiTokenStorePg helper like every
+    /// other fixture (SKIPs when unset, FAILs when set but broken).
+    explicit RestTokensHarness(bool broken_token_db = false) {
+        if (broken_token_db) {
+            broken_pool = std::make_unique<yuzu::server::pg::PgPool>(
+                yuzu::server::pg::PgPool::Options{
+                    .conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1});
+            token_store_broken = std::make_unique<ApiTokenStore>(*broken_pool);
+            REQUIRE_FALSE(token_store_broken->is_open());
+        } else {
+            token_store_pg.emplace();
+        }
+
+        // ADR-0052: DeviceTokenStore has no SQLite fallback any more — every
+        // fixture that needs a real, functional store now needs real
+        // Postgres, unconditionally (including the broken_token_db arm,
+        // which only fakes ApiTokenStore's own brokenness). Same
+        // SKIP-if-unset / FAIL-if-broken posture as ApiTokenStorePg's own
+        // ctor.
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        device_token_db_.emplace(device_token_store_tpl);
+        INFO("[RestTokensHarness] device_token_db status (blank == came up OK): "
+             << device_token_db_->error());
+        REQUIRE(device_token_db_->available());
+        device_token_pool_.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = device_token_db_->dsn(), .size = 4});
+        REQUIRE(device_token_pool_->valid());
+        device_token_store = std::make_unique<DeviceTokenStore>(*device_token_pool_);
         REQUIRE(device_token_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -146,7 +206,7 @@ struct RestTokensHarness {
         // POST /api/v1/device-tokens can be exercised by the same harness.
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
-                            /*mgmt_store=*/nullptr, token_store.get(),
+                            /*mgmt_store=*/nullptr, token_store(),
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr,
@@ -165,20 +225,13 @@ struct RestTokensHarness {
                             /*metrics_registry=*/&metrics);
     }
 
-    ~RestTokensHarness() {
-        token_store.reset();
-        device_token_store.reset();
-        fs::remove(db_path);
-        fs::remove(device_db_path);
-    }
-
     std::string create_token_for(const std::string& owner, const std::string& name) {
-        auto raw = token_store->create_token(name, owner);
+        auto raw = token_store()->create_token(name, owner);
         REQUIRE(raw.has_value());
         // list_tokens orders by `created_at DESC`, so the newest token is
         // front(). Using back() would return the oldest and break if a test
         // ever creates multiple tokens per owner on the same harness.
-        auto listing = token_store->list_tokens(owner);
+        auto listing = token_store()->list_tokens(owner).value();
         REQUIRE(!listing.empty());
         return listing.front().token_id;
     }
@@ -193,7 +246,7 @@ struct RestTokensHarness {
 
 } // namespace
 
-TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][token][owner]") {
+TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[pg][rest][token][owner]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -205,7 +258,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][toke
     CHECK(res->status == 200);
 
     // Store state: token is now revoked.
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -217,7 +270,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][toke
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)",
-          "[rest][token][owner][idor]") {
+          "[pg][rest][token][owner][idor]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -233,7 +286,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)"
     CHECK(res->status == 404);
 
     // Store state: token is NOT revoked.
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK_FALSE(looked_up->revoked);
 
@@ -249,7 +302,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)"
 
 TEST_CASE("REST DELETE /api/v1/tokens: response body is identical for "
           "unknown id and not-owner (enumeration oracle closed)",
-          "[rest][token][owner][idor]") {
+          "[pg][rest][token][owner][idor]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -268,7 +321,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: response body is identical for "
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
-          "[rest][token][owner][admin]") {
+          "[pg][rest][token][owner][admin]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -280,7 +333,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
     REQUIRE(res);
     CHECK(res->status == 200);
 
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -292,7 +345,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audit",
-          "[rest][token]") {
+          "[pg][rest][token]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -316,7 +369,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
 // ──────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)",
-          "[rest][token][csprng][audit]") {
+          "[pg][rest][token][csprng][audit]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -355,12 +408,12 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
 
     // Store contains no token for alice — the failure path must not leak
     // a half-created row.
-    auto listing = h.token_store->list_tokens("alice");
+    auto listing = h.token_store()->list_tokens("alice").value();
     CHECK(listing.empty());
 }
 
 TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (F-002)",
-          "[rest][token][csprng][audit]") {
+          "[pg][rest][token][csprng][audit]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -390,12 +443,13 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (
 
     // Store leak check.
     auto listing = h.device_token_store->list_tokens();
-    CHECK(listing.empty());
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty());
 }
 
 TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
           "audit row via AuditStore (F-002, site 3)",
-          "[rest][token][csprng][audit]") {
+          "[pg][rest][token][csprng][audit]") {
     // The settings_routes site logs via `audit_store_->log({...})` directly
     // (the HTMX dashboard surface bypasses the `audit_fn` lambda used by
     // /api/v1/ routes). Standing up the full SettingsRoutes harness here
@@ -414,24 +468,23 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
     // expected fields. Any divergence between this row and the one the
     // handler emits would be caught by the source-level edit pattern in
     // the same commit.
-    auto audit_db = unique_temp_path("rest-api-audit");
-    fs::remove(audit_db);
-    auto token_db = unique_temp_path("rest-api-csprng-store");
-    fs::remove(token_db);
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs when
+    // YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken. AuditStore
+    // (ADR-0006) now shares that same ephemeral database via a second pool
+    // (its own `audit_store` schema, no conflict with api_tokens).
+    yuzu::test::ApiTokenStorePg token_store;
 
     {
-        AuditStore audit_store(audit_db, /*retention_days=*/365,
+        yuzu::server::pg::PgPool audit_pool{{.conninfo = token_store.dsn(), .size = 2}};
+        AuditStore audit_store(audit_pool, /*retention_days=*/365,
                                /*cleanup_interval_min=*/0);
         REQUIRE(audit_store.is_open());
-
-        ApiTokenStore token_store(token_db);
-        REQUIRE(token_store.is_open());
 
         // Force CSPRNG failure on the next fill_random call (the one inside
         // generate_raw_token). This is the exact entropy-exhaustion failure
         // the production handler would observe.
         yuzu::server::test_hooks::force_next_failure_for_this_thread();
-        auto result = token_store.create_token("dashboard-token", "alice",
+        auto result = token_store->create_token("dashboard-token", "alice",
                                                /*expires_at=*/0, {}, {});
         REQUIRE_FALSE(result.has_value());
 
@@ -448,25 +501,23 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
                                  .result = "failure"}));
 
         auto rows = audit_store.query({});
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0].action == "api_token.create");
-        CHECK(rows[0].result == "failure");
-        CHECK(rows[0].target_type == "ApiToken");
-        CHECK(rows[0].target_id == "dashboard-token");
-        CHECK(rows[0].principal == "alice");
-        CHECK(rows[0].detail.find("csprng_unavailable") != std::string::npos);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].action == "api_token.create");
+        CHECK((*rows)[0].result == "failure");
+        CHECK((*rows)[0].target_type == "ApiToken");
+        CHECK((*rows)[0].target_id == "dashboard-token");
+        CHECK((*rows)[0].principal == "alice");
+        CHECK((*rows)[0].detail.find("csprng_unavailable") != std::string::npos);
 
         // Counter parity — events_failure_ must have incremented so /metrics
         // surfaces the security-relevant failure for SRE paging.
         CHECK(audit_store.events_written("failure") == 1);
     }
-
-    fs::remove(audit_db);
-    fs::remove(token_db);
 }
 
 TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard)",
-          "[rest][token][csprng][audit]") {
+          "[pg][rest][token][csprng][audit]") {
     // Defensive: confirm the new failure-path branch did not perturb the
     // success-path audit emission. A successful create must still emit a
     // single `success` row, with the F-002 marker absent.
@@ -515,7 +566,7 @@ TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard
 
 TEST_CASE("REST POST /api/v1/tokens: silent audit-drop on CSPRNG failure surfaces "
           "Sec-Audit-Failed header + audit_emitted=false body (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[pg][rest][token][csprng][audit][uph1]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -546,7 +597,7 @@ TEST_CASE("REST POST /api/v1/tokens: silent audit-drop on CSPRNG failure surface
 
 TEST_CASE("REST POST /api/v1/tokens: audit-pipeline exception is caught and surfaced "
           "via Sec-Audit-Failed (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[pg][rest][token][csprng][audit][uph1]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -566,7 +617,7 @@ TEST_CASE("REST POST /api/v1/tokens: audit-pipeline exception is caught and surf
 
 TEST_CASE("REST POST /api/v1/device-tokens: silent audit-drop surfaces Sec-Audit-Failed "
           "header + audit_emitted=false body (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[pg][rest][token][csprng][audit][uph1]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -590,7 +641,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: silent audit-drop surfaces Sec-Audit
 
 TEST_CASE("REST POST /api/v1/tokens: oversized name (>256 chars) rejected with 400 "
           "invalid_input_length and NO audit row (UP-H2)",
-          "[rest][token][csprng][audit][uph2]") {
+          "[pg][rest][token][csprng][audit][uph2]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -613,7 +664,7 @@ TEST_CASE("REST POST /api/v1/tokens: oversized name (>256 chars) rejected with 4
 
 TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rejected with "
           "400 invalid_input_length (UP-H2)",
-          "[rest][token][csprng][audit][uph2]") {
+          "[pg][rest][token][csprng][audit][uph2]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -632,7 +683,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rej
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
           "yuzu_secure_random_failure_total{site=api_token} (sre-1)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[pg][rest][token][csprng][metrics][sre1]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -661,7 +712,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
 
 TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
           "yuzu_secure_random_failure_total{site=device_token} (sre-1)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[pg][rest][token][csprng][metrics][sre1]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -679,9 +730,102 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
     CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 1.0);
 }
 
+// gov Gate 2 security-guardian + Gate 3 quality-engineer (ADR-0052 round 1, MEDIUM): every
+// existing 503 case above exercises the CSPRNG-failure branch, a DIFFERENT code path from the
+// new kDeviceTokenDbErrorPrefix branch device_token_error_status/the POST handler's db_error
+// split add. Mirrors test_rest_software_packages.cpp's "answer 503 (not 400), never leaking the
+// raw Postgres error" schema-drop technique — the established precedent for this exact gap on
+// the sibling SoftwareDeploymentStore migration (PR #3174).
+TEST_CASE("REST device-token routes answer correct status on a genuine store failure, never "
+          "leaking the raw Postgres error",
+          "[pg][rest][device_token]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::admin;
+
+    // Seed one token before dropping the schema — a pre-drop baseline confirming the store
+    // works normally, so the post-drop failures below are attributable to the schema drop, not
+    // to a fixture that was already broken. (DELETE's SECTION deliberately targets a HARDCODED
+    // id, not this seeded one — a genuine DB failure must preempt even a well-formed-looking
+    // request, and POST's own raw_token response never surfaces the seeded token_id to extract.)
+    auto seeded = h.sink.Post("/api/v1/device-tokens",
+                              R"({"name":"seed","device_id":"dev-seed","definition_id":""})");
+    REQUIRE(seeded);
+    REQUIRE(seeded->status == 201);
+
+    h.audit_log.clear(); // isolate the failures under test from the seed call's own audit row
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.device_token_db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA device_token_store CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    SECTION("GET /api/v1/device-tokens") {
+        auto res = h.sink.Get("/api/v1/device-tokens");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        // gov Gate 4 (consistency-auditor, C2): sibling parity with api_token's
+        // GET-list 503, which sets Retry-After: 2.
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+    }
+
+    SECTION("POST /api/v1/device-tokens") {
+        auto res = h.sink.Post(
+            "/api/v1/device-tokens",
+            R"({"name":"after-drop","device_id":"dev-002","definition_id":""})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "5");
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        // A genuine DB failure must never be mislabeled as CSPRNG exhaustion, and must never
+        // leak libpq's raw error text (relation/schema name) to the client.
+        CHECK(res->body.find("CSPRNG") == std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+        yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "device_token"}};
+        CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+        // gov Gate 8 quality-engineer: unlike the software-packages precedent (whose route never
+        // audits a store failure), this route's db_error branch DOES call audit_fn
+        // (rest_api_v1.cpp) — exercise its own Sec-Audit-Failed/audit_emitted try/catch, which
+        // was otherwise untested (only its CSPRNG twin had coverage, via audit_should_fail).
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "device_token.create");
+        CHECK(h.audit_log[0].result == "failure");
+        CHECK(h.audit_log[0].target_id == "dev-002");
+        CHECK(h.audit_log[0].detail.find("service unavailable") != std::string::npos);
+        CHECK(h.audit_log[0].detail.find("csprng_unavailable") == std::string::npos);
+        CHECK(res->get_header_value("Sec-Audit-Failed").empty()); // audit_fn succeeded here
+    }
+
+    SECTION("DELETE /api/v1/device-tokens/{id}: genuine failure is 503, distinct from 404") {
+        auto res = h.sink.Delete("/api/v1/device-tokens/deadbeef");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        // gov Gate 4 (consistency-auditor, C1/C2, round 3): this route's db_error
+        // branch now audits like POST's does and sets Retry-After like GET's does —
+        // previously it silently dropped both, the only device-token 503 branch that did.
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("not found") == std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+        REQUIRE(h.audit_log.size() == 1);
+        CHECK(h.audit_log[0].action == "device_token.revoke");
+        CHECK(h.audit_log[0].result == "failure");
+        CHECK(h.audit_log[0].target_id == "deadbeef");
+        CHECK(h.audit_log[0].detail.find("service unavailable") != std::string::npos);
+        CHECK(h.audit_log[0].detail.find("does not exist") == std::string::npos);
+        CHECK(h.audit_log[0].detail.find("device_token_store") == std::string::npos);
+    }
+}
+
 TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increment "
           "secure_random metric (sre-1 negative)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[pg][rest][token][csprng][metrics][sre1]") {
     // Negative case: confirm UP-H2's pre-CSPRNG rejection path doesn't
     // touch the CSPRNG metric. Same input as the UP-H2 oversized-name
     // test, but asserts on the metric.
@@ -703,7 +847,7 @@ TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increme
 }
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5 (sre-2)",
-          "[rest][token][csprng][sre2]") {
+          "[pg][rest][token][csprng][sre2]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -733,7 +877,10 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5
 // all store outages); the CH-3 signal is the 503-vs-404 status split.
 
 TEST_CASE("REST tokens: unopened token DB returns 503 on every route, never 404",
-          "[rest][token][issue347][ch3]") {
+          "[pg][rest][token][issue347][ch3]") {
+    // ADR-0052: [pg] added — this test's ApiTokenStore arm is still a fake
+    // unreachable pool (no real Postgres needed for THAT), but the harness's
+    // DeviceTokenStore member now needs a real one unconditionally.
     RestTokensHarness h(/*broken_token_db=*/true);
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
@@ -773,4 +920,67 @@ TEST_CASE("REST tokens: unopened token DB returns 503 on every route, never 404"
     // The guard runs before any token is touched — no audit rows, no
     // half-completed mutations to report.
     CHECK(h.audit_log.empty());
+}
+
+// #3401: end-to-end proof that the #823 re-registration defence actually closes the gap for a
+// REST-issued token — the shape every production issuance path produces (operator username in
+// principal_id, target device_id in device_id; rest_api_v1.cpp:8134). Constructs a real
+// AgentRegistry alongside the harness's DeviceTokenStore (the harness itself has no registry —
+// REST issuance and the registry sweep are independently-wired components in production too;
+// server.cpp wires both against the same store instance).
+TEST_CASE("REST-issued device token is revoked when the target device re-registers (#823/#3401 "
+          "end-to-end)",
+          "[pg][rest][token][823][3401]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    EventBus bus;
+    yuzu::MetricsRegistry registry_metrics;
+    AgentRegistry registry(bus, registry_metrics);
+    registry.set_device_token_store(h.device_token_store.get());
+
+    agent_pb::AgentInfo info;
+    info.set_agent_id("endpoint-99");
+    info.set_hostname("legit.local");
+    REQUIRE(registry.register_agent(info).has_value());
+
+    // Mint through the REST route, exactly as an operator would: principal_id becomes
+    // session->username ("alice"), NOT the agent_id — the shape #3401 was filed against.
+    auto res = h.sink.Post(
+        "/api/v1/device-tokens",
+        R"({"name":"ops-token","device_id":"endpoint-99","definition_id":""})");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("data"));
+    REQUIRE(body["data"].contains("raw_token"));
+    std::string raw_token = body["data"]["raw_token"];
+
+    // The REST-minted row carries the issuing operator as principal_id — no existing test pins
+    // this; assert it directly against the store rather than just the wire response.
+    auto listed = h.device_token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    auto it = std::find_if(listed->begin(), listed->end(),
+                           [](const DeviceAuthToken& t) { return t.name == "ops-token"; });
+    REQUIRE(it != listed->end());
+    CHECK(it->principal_id == "alice");
+    CHECK(it->device_id == "endpoint-99");
+
+    // The token validates for the device it names, before any re-registration.
+    REQUIRE(h.device_token_store->validate_token(raw_token, "endpoint-99").has_value());
+
+    // Target device re-registers (the #779 threat model — an attacker briefly impersonating
+    // endpoint-99 without mTLS). The #823 defence must revoke the REST-issued token here.
+    agent_pb::AgentInfo reinfo;
+    reinfo.set_agent_id("endpoint-99");
+    reinfo.set_hostname("attacker.local");
+    REQUIRE(registry.register_agent(reinfo).has_value());
+
+    auto reval = h.device_token_store->validate_token(raw_token, "endpoint-99");
+    REQUIRE_FALSE(reval.has_value());
+    CHECK(reval.error().error == DeviceTokenValidateError::revoked);
+    CHECK(reval.error().bound_principal_id == "alice");
+    CHECK(reval.error().bound_device_id == "endpoint-99");
 }

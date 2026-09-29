@@ -6,26 +6,15 @@
  */
 
 #include "execution_tracker.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server;
-
-// -- RAII wrapper for in-memory sqlite3 --
-
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
 
 // -- Helpers --
 
@@ -75,10 +64,9 @@ static void insert_agent_status(ExecutionTracker& tracker,
 // ============================================================================
 
 TEST_CASE("ExecutionStatistics: fleet summary empty DB returns zeros",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto summary = tracker.get_fleet_summary();
     CHECK(summary.total_executions == 0);
@@ -89,10 +77,9 @@ TEST_CASE("ExecutionStatistics: fleet summary empty DB returns zeros",
 }
 
 TEST_CASE("ExecutionStatistics: fleet summary after inserts",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -116,10 +103,9 @@ TEST_CASE("ExecutionStatistics: fleet summary after inserts",
 }
 
 TEST_CASE("ExecutionStatistics: fleet summary today count uses dispatched_at = now",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -137,10 +123,9 @@ TEST_CASE("ExecutionStatistics: fleet summary today count uses dispatched_at = n
 }
 
 TEST_CASE("ExecutionStatistics: fleet summary success rate calculation",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -159,10 +144,9 @@ TEST_CASE("ExecutionStatistics: fleet summary success rate calculation",
 }
 
 TEST_CASE("ExecutionStatistics: fleet summary avg duration",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -181,10 +165,9 @@ TEST_CASE("ExecutionStatistics: fleet summary avg duration",
 }
 
 TEST_CASE("ExecutionStatistics: fleet summary division safety with agents_targeted=0",
-          "[execution_statistics][fleet]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][fleet]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -203,10 +186,9 @@ TEST_CASE("ExecutionStatistics: fleet summary division safety with agents_target
 // ============================================================================
 
 TEST_CASE("ExecutionStatistics: agent stats grouped correctly",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -240,11 +222,47 @@ TEST_CASE("ExecutionStatistics: agent stats grouped correctly",
     CHECK(found_agent1);
 }
 
+TEST_CASE("ExecutionStatistics: a 'running' (in-flight) execution is excluded from "
+          "success/failure/total, not counted as a success (consistency-auditor Gate 4 finding, "
+          "PR #3784 fix round)",
+          "[pg][execution_statistics][agent_stats][adr1007]") {
+    // The keepalive thread (ADR-1007, agents/core/src/agent.cpp) sends a bare
+    // RUNNING response every 5 minutes for any long-running per-device
+    // command -- exit_code defaults to 0 on the wire for a non-terminal
+    // response, which used to satisfy this query's old success CASE
+    // (`exit_code = 0 AND status != 'pending'`), counting a still-executing
+    // command as a completed success. Turned this from a rare (only a
+    // plugin crossing the 64KB output-flush threshold) into a routine
+    // misclassification for any per-device dispatch running past 5 minutes.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = now_epoch();
+    auto e1 = make_exec("def-running", "running", 1, 0, 0, now - 100, 0);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+
+    // exit_code=0 mirrors the wire shape of a genuine RUNNING/keepalive
+    // response (unset, proto default) -- exactly the value that used to
+    // satisfy the old success CASE's `exit_code = 0` half.
+    insert_agent_status(tracker, *id1, "agent-running", "running", /*exit_code=*/0, now - 100);
+
+    auto stats = tracker.get_agent_statistics();
+    bool found = false;
+    for (const auto& s : stats) {
+        if (s.agent_id == "agent-running")
+            found = true;
+    }
+    // The running row must not appear at all -- WHERE excludes it, same as
+    // 'pending'/'dispatched'. If this regresses to counting it (success OR
+    // failure), `found` becomes true.
+    CHECK_FALSE(found);
+}
+
 TEST_CASE("ExecutionStatistics: agent stats with agent_id filter",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -264,10 +282,9 @@ TEST_CASE("ExecutionStatistics: agent stats with agent_id filter",
 }
 
 TEST_CASE("ExecutionStatistics: agent stats with since filter",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -291,10 +308,9 @@ TEST_CASE("ExecutionStatistics: agent stats with since filter",
 }
 
 TEST_CASE("ExecutionStatistics: agent stats limit",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -315,10 +331,9 @@ TEST_CASE("ExecutionStatistics: agent stats limit",
 }
 
 TEST_CASE("ExecutionStatistics: agent stats success rate with mixed results",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -351,10 +366,9 @@ TEST_CASE("ExecutionStatistics: agent stats success rate with mixed results",
 }
 
 TEST_CASE("ExecutionStatistics: agent stats avg duration",
-          "[execution_statistics][agent_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][agent_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -385,10 +399,9 @@ TEST_CASE("ExecutionStatistics: agent stats avg duration",
 // ============================================================================
 
 TEST_CASE("ExecutionStatistics: definition stats grouped correctly",
-          "[execution_statistics][definition_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][definition_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -415,10 +428,9 @@ TEST_CASE("ExecutionStatistics: definition stats grouped correctly",
 }
 
 TEST_CASE("ExecutionStatistics: definition stats with definition_id filter",
-          "[execution_statistics][definition_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][definition_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -434,10 +446,9 @@ TEST_CASE("ExecutionStatistics: definition stats with definition_id filter",
 }
 
 TEST_CASE("ExecutionStatistics: definition stats success rate",
-          "[execution_statistics][definition_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][definition_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -455,10 +466,9 @@ TEST_CASE("ExecutionStatistics: definition stats success rate",
 }
 
 TEST_CASE("ExecutionStatistics: definition stats avg duration",
-          "[execution_statistics][definition_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][definition_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 
@@ -476,10 +486,9 @@ TEST_CASE("ExecutionStatistics: definition stats avg duration",
 }
 
 TEST_CASE("ExecutionStatistics: definition stats skips pending/running executions",
-          "[execution_statistics][definition_stats]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_statistics][definition_stats]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto now = now_epoch();
 

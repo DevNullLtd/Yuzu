@@ -1,0 +1,42 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 93534d76a8aa
+== action=list
+lic|Office 16, Office16O365ProPlusR_Grace edition|Microsoft||retail|retail|unlicensed||os_licensing_api|authoritative|VMFTK||machine|
+lic|Windows(R), Professional edition|Microsoft||retail|retail|licensed||os_licensing_api|authoritative|3V66T||machine|
+lic|Microsoft Office (O365ProPlusRetail)|Microsoft|16.0.19822.20114|subscription||unknown||registry_probe|probable||winword.exe,excel.exe,outlook.exe,powerpnt.exe|machine|
+lic|Microsoft Visual Studio|Microsoft||unknown||unknown||registry_probe|heuristic||devenv.exe|machine|
+lic|7-Zip|Igor Pavlov||open_source||unknown||registry_probe|heuristic||7zfm.exe|machine|
+lic|Notepad++|Notepad++ Team||open_source||unknown||registry_probe|heuristic||notepad++.exe|machine|
+lic|Git for Windows|The Git Development Community||open_source||unknown||registry_probe|heuristic||git.exe|machine|
+probe_status|slp_wmi|ok|2
+probe_status|office_c2r|ok|1
+probe_status|sql_server|ok|0
+probe_status|exchange|ok|0
+probe_status|visual_studio|ok|1
+probe_status|autodesk_adsklicensing|ok|0
+probe_status|veeam|ok|0
+probe_status|acronis|ok|0
+probe_status|av_suites|ok|0
+probe_status|vmware_workstation|ok|0
+probe_status|winrar|ok|0
+probe_status|open_source_classification|ok|3
+probe_status|per_user_hives|ok|0
+probe_status|per_user_files|ok|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=surfaces
+probe_status|slp_wmi|ok|2
+probe_status|office_c2r|ok|1
+probe_status|sql_server|ok|0
+probe_status|exchange|ok|0
+probe_status|visual_studio|ok|1
+probe_status|autodesk_adsklicensing|ok|0
+probe_status|veeam|ok|0
+probe_status|acronis|ok|0
+probe_status|av_suites|ok|0
+probe_status|vmware_workstation|ok|0
+probe_status|winrar|ok|0
+probe_status|open_source_classification|ok|3
+probe_status|per_user_hives|ok|0
+probe_status|per_user_files|ok|0
+[result_status] UNDECLARED / UNKNOWN / 
+

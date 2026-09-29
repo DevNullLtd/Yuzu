@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file preflight_runner.hpp
 /// Background lifecycle driver for `/auto` pre-flight runs — the
 /// re-dispatch-on-reconnect loop. Mirrors PolicyEvaluator: this owns only the
@@ -35,7 +37,7 @@ class PreflightRunner {
 public:
     /// Same 6-param shape as the shared command_dispatch_fn (execution_id
     /// carried, so responses correlate via query_by_execution).
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
@@ -51,6 +53,16 @@ public:
         CommandDispatchFn dispatch_fn;
         NowFn now_ms_fn;
         int retention_days{14};
+        // #3495: lets a shutdown request stop tick() from STARTING further
+        // runs' dispatch once stop_requested_ flips — checked once per run,
+        // before that run's per-check dispatch_fn calls begin, so an
+        // already-in-flight run's dispatches still complete cleanly (this
+        // only stops the NEXT run from starting). Ports the same field
+        // QuarantineContainmentReconciler::Deps already carries (governance
+        // Gate 5, #3425) to the sibling this issue's design round named as
+        // still missing it. Unset (default) = never stop, matching every
+        // existing production/test Deps that predates this field.
+        std::function<bool()> should_stop;
     };
 
     explicit PreflightRunner(Deps deps);

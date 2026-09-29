@@ -57,6 +57,38 @@ bool exec_ok(PGconn* conn, const char* sql, std::string_view what) {
     return true;
 }
 
+// ── #2530 A1: SQLSTATE classification, entirely internal to the codec ──────
+// The raw SQLSTATE string never leaves this translation unit — only the
+// LifecycleError::Kind discriminant crosses the codec boundary.
+SecretCodec::LifecycleError::Kind classify_sqlstate(PGresult* res) {
+    if (res == nullptr)
+        return SecretCodec::LifecycleError::Kind::database;
+    const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+    if (sqlstate != nullptr && std::strcmp(sqlstate, "57014") == 0)
+        return SecretCodec::LifecycleError::Kind::query_canceled; // canceled OR
+                                                                   // statement_timeout
+    return SecretCodec::LifecycleError::Kind::database;
+}
+
+/// Build a LifecycleError from a failed query result: classifies via
+/// SQLSTATE (query_canceled vs generic database) and carries the raw
+/// PQerrorMessage text for server-side logging ONLY (LifecycleError doc).
+SecretCodec::LifecycleError pg_lifecycle_error(PGresult* res, PGconn* conn,
+                                               std::string_view what) {
+    return SecretCodec::LifecycleError{classify_sqlstate(res),
+                                       std::string{what} + ": " + PQerrorMessage(conn)};
+}
+
+SecretCodec::LifecycleError precondition_error(std::string msg) {
+    return SecretCodec::LifecycleError{SecretCodec::LifecycleError::Kind::precondition,
+                                       std::move(msg)};
+}
+
+SecretCodec::LifecycleError provider_error(std::string msg) {
+    return SecretCodec::LifecycleError{SecretCodec::LifecycleError::Kind::provider,
+                                       std::move(msg)};
+}
+
 void put_u32_be(std::uint8_t* out, std::uint32_t v) {
     out[0] = static_cast<std::uint8_t>(v >> 24);
     out[1] = static_cast<std::uint8_t>(v >> 16);
@@ -302,8 +334,25 @@ bool SecretCodec::register_secret_column(SecretColumn col) {
         return false;
     }
     std::lock_guard lock{mu_};
+    // #2530 A3: reject a duplicate (store, table, column) — a duplicate would
+    // multiply the rewrap_all scan and distort the registered-column
+    // trip-wire (test_secret_codec.cpp's production-wiring assertion).
+    for (const auto& existing : columns_) {
+        if (existing.store == col.store && existing.table == col.table &&
+            existing.column == col.column) {
+            spdlog::error("secret_codec: rejected duplicate secret-column registration: "
+                          "{}.{}.{}",
+                          col.store, col.table, col.column);
+            return false;
+        }
+    }
     columns_.push_back(std::move(col));
     return true;
+}
+
+std::vector<SecretCodec::SecretColumn> SecretCodec::registered_columns() const {
+    std::lock_guard lock{mu_};
+    return columns_;
 }
 
 SecretCodec::Error SecretCodec::fail(const SecretId& id, FailureClass cls,
@@ -734,17 +783,17 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
     return {};
 }
 
-std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) {
+std::expected<std::uint32_t, SecretCodec::LifecycleError> SecretCodec::rotate_kek(PGconn* conn) {
     std::uint32_t cur = 0;
     {
         std::lock_guard lock{mu_};
         cur = active_version_;
     }
     if (cur == 0)
-        return std::unexpected{"rotate: init() has not run"};
+        return std::unexpected{precondition_error("rotate: init() has not run")};
 
     if (cur == std::numeric_limits<std::uint32_t>::max())
-        return std::unexpected{"rotate: kek_version space exhausted"}; // UP-7
+        return std::unexpected{precondition_error("rotate: kek_version space exhausted")}; // UP-7
 
     const std::uint32_t next = cur + 1;
     const std::string key_id = kek_key_id(next);
@@ -757,13 +806,13 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
     // second rotation cannot even observe the winner's key file until the
     // winner's fingerprint row is committed.
     if (!exec_ok(conn, "BEGIN", "BEGIN (rotate)"))
-        return std::unexpected{"rotate: BEGIN failed"};
+        return std::unexpected{pg_lifecycle_error(nullptr, conn, "rotate: BEGIN failed")};
     PgTxn txn{conn};
     {
         PgResult lock{PQexec(conn, kKekLockSql)};
         if (lock.status() != PGRES_TUPLES_OK)
-            return std::unexpected{std::string{"rotate: advisory lock failed: "} +
-                                   PQerrorMessage(conn)};
+            return std::unexpected{pg_lifecycle_error(lock.get(), conn,
+                                                      "rotate: advisory lock failed")};
     }
     // Adopt-or-generate, mirroring first boot (sec-M3): a crash between a
     // prior rotation's generate_kek and its fingerprint INSERT leaves an
@@ -782,15 +831,15 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
     } else {
         ref = provider_.generate_kek(key_id);
         if (!ref)
-            return std::unexpected{"rotate: KEK generation failed for " + key_id};
+            return std::unexpected{provider_error("rotate: KEK generation failed for " + key_id)};
     }
     const auto kcv = provider_.kek_check_value(*ref, "sha256");
     if (!kcv)
-        return std::unexpected{
+        return std::unexpected{provider_error(
             "rotate: check-value computation failed for " + key_id +
             (adopted ? " (adopted orphan may be torn — deleting it and re-running rotation is "
                        "safe: nothing is encrypted under an unregistered KEK)"
-                     : "")};
+                     : ""))};
 
     const std::string kcv_hex = to_hex(std::span<const std::uint8_t>{*kcv});
     const std::string version_str = std::to_string(next);
@@ -801,8 +850,8 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
                               " ON CONFLICT (kek_version) DO NOTHING",
                               2, nullptr, values, nullptr, nullptr, 0)};
     if (!ins.ok())
-        return std::unexpected{std::string{"rotate: fingerprint INSERT failed: "} +
-                               PQerrorMessage(conn)};
+        return std::unexpected{
+            pg_lifecycle_error(ins.get(), conn, "rotate: fingerprint INSERT failed")};
     if (std::strcmp(PQcmdTuples(ins.get()), "1") != 0) {
         // A row for this version already exists (a rotation on ANOTHER
         // server committed before we took the lock — the unsupported
@@ -815,11 +864,11 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
         // no longer reach this branch with our file registered).
         if (!adopted)
             (void)provider_.delete_kek(*ref);
-        return std::unexpected{"rotate: kek_version v" + std::to_string(next) +
-                               " is already registered — re-run rotation"};
+        return std::unexpected{precondition_error("rotate: kek_version v" + std::to_string(next) +
+                                                  " is already registered — re-run rotation")};
     }
     if (!txn.commit())
-        return std::unexpected{"rotate: COMMIT failed"};
+        return std::unexpected{pg_lifecycle_error(nullptr, conn, "rotate: COMMIT failed")};
 
     {
         std::lock_guard lock{mu_};
@@ -831,14 +880,19 @@ std::expected<std::uint32_t, std::string> SecretCodec::rotate_kek(PGconn* conn) 
 
     const auto rewrapped = rewrap_all(conn);
     if (!rewrapped)
-        return std::unexpected{"rotate: minted v" + std::to_string(next) +
-                               " but rewrap_all failed (" + rewrapped.error() +
-                               ") — resume with rewrap_all(); completion signal is "
-                               "oldest_kek_version_in_use()"};
+        // Kind is PRESERVED from the rewrap_all() failure, never flattened
+        // to `database` (#2530 A1) — a canceled/timed-out rewrap must still
+        // classify as query_canceled to the caller.
+        return std::unexpected{SecretCodec::LifecycleError{
+            rewrapped.error().kind,
+            "rotate: minted v" + std::to_string(next) + " but rewrap_all failed (" +
+                rewrapped.error().internal_message +
+                ") — resume with rewrap_all(); completion signal is "
+                "oldest_kek_version_in_use()"}};
     return next;
 }
 
-std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
+std::expected<std::size_t, SecretCodec::LifecycleError> SecretCodec::rewrap_all(PGconn* conn) {
     std::uint32_t target = 0;
     std::vector<SecretColumn> columns;
     {
@@ -847,7 +901,7 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
         columns = columns_;
     }
     if (target == 0)
-        return std::unexpected{"rewrap_all: init() has not run"};
+        return std::unexpected{precondition_error("rewrap_all: init() has not run")};
 
     std::size_t rewrapped_count = 0;
     std::size_t cas_skipped = 0;
@@ -860,8 +914,9 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
         // the canonical 8-byte-BE encoding the AAD uses.
         PgResult rows{PQexecParams(conn, select.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)};
         if (rows.status() != PGRES_TUPLES_OK)
-            return std::unexpected{"rewrap_all: scan of " + rel_name(col) +
-                                   " failed: " + PQerrorMessage(conn)};
+            return std::unexpected{
+                pg_lifecycle_error(rows.get(), conn, "rewrap_all: scan of " + rel_name(col) +
+                                                         " failed")};
 
         const int n = PQntuples(rows.get());
         for (int i = 0; i < n; ++i) {
@@ -891,8 +946,10 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
                     ++malformed_skipped;
                     continue;
                 }
-                return std::unexpected{"rewrap_all: rewrap failed for a row of " + rel_name(col) +
-                                       " [" + std::string{to_string(new_blob.error().cls)} + "]"};
+                return std::unexpected{SecretCodec::LifecycleError{
+                    SecretCodec::LifecycleError::Kind::crypto,
+                    "rewrap_all: rewrap failed for a row of " + rel_name(col) + " [" +
+                        std::string{to_string(new_blob.error().cls)} + "]"}};
             }
 
             // Compare-and-swap (ADR §3): a plain write would silently revert
@@ -908,8 +965,8 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
             PgResult upd{
                 PQexecParams(conn, update.c_str(), 3, nullptr, values, lengths, formats, 0)};
             if (!upd.ok())
-                return std::unexpected{"rewrap_all: CAS update on " + rel_name(col) +
-                                       " failed: " + PQerrorMessage(conn)};
+                return std::unexpected{pg_lifecycle_error(
+                    upd.get(), conn, "rewrap_all: CAS update on " + rel_name(col) + " failed")};
             if (std::strcmp(PQcmdTuples(upd.get()), "1") == 0)
                 ++rewrapped_count;
             else
@@ -927,7 +984,7 @@ std::expected<std::size_t, std::string> SecretCodec::rewrap_all(PGconn* conn) {
     return rewrapped_count;
 }
 
-std::expected<std::optional<std::uint32_t>, std::string>
+std::expected<std::optional<std::uint32_t>, SecretCodec::LifecycleError>
 SecretCodec::oldest_kek_version_in_use(PGconn* conn) {
     std::vector<SecretColumn> columns;
     {
@@ -942,8 +999,9 @@ SecretCodec::oldest_kek_version_in_use(PGconn* conn) {
                                 rel_name(col) + " WHERE \"" + col.column + "\" IS NOT NULL";
         PgResult rows{PQexecParams(conn, sql.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)};
         if (rows.status() != PGRES_TUPLES_OK)
-            return std::unexpected{"oldest_kek_version_in_use: scan of " + rel_name(col) +
-                                   " failed: " + PQerrorMessage(conn)};
+            return std::unexpected{pg_lifecycle_error(
+                rows.get(), conn, "oldest_kek_version_in_use: scan of " + rel_name(col) +
+                                       " failed")};
         const int n = PQntuples(rows.get());
         for (int i = 0; i < n; ++i) {
             if (PQgetlength(rows.get(), i, 0) != 4)
@@ -957,15 +1015,16 @@ SecretCodec::oldest_kek_version_in_use(PGconn* conn) {
     return oldest;
 }
 
-std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint32_t version) {
+std::expected<void, SecretCodec::LifecycleError> SecretCodec::retire_kek(PGconn* conn,
+                                                                         std::uint32_t version) {
     {
         std::lock_guard lock{mu_};
         if (version == active_version_)
-            return std::unexpected{"retire: refusing to retire the ACTIVE KEK version v" +
-                                   std::to_string(version)};
+            return std::unexpected{precondition_error(
+                "retire: refusing to retire the ACTIVE KEK version v" + std::to_string(version))};
         if (!key_refs_.contains(version))
-            return std::unexpected{"retire: v" + std::to_string(version) +
-                                   " is not a live registered KEK version"};
+            return std::unexpected{precondition_error(
+                "retire: v" + std::to_string(version) + " is not a live registered KEK version")};
     }
 
     // Condition (a) (ADR §3): zero stored blobs may still reference it —
@@ -986,21 +1045,22 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
         const int formats[] = {1};
         PgResult res{PQexecParams(conn, sql.c_str(), 1, nullptr, values, lengths, formats, 0)};
         if (res.status() != PGRES_TUPLES_OK)
-            return std::unexpected{"retire: reference scan of " + rel_name(col) +
-                                   " failed: " + PQerrorMessage(conn)};
+            return std::unexpected{pg_lifecycle_error(
+                res.get(), conn, "retire: reference scan of " + rel_name(col) + " failed")};
         // Strict parse, refuse on garbage: this gate guards permanent key
         // destruction, so an unparseable count must fail CLOSED (CON-S3).
         const auto refs_count =
             PQntuples(res.get()) == 1 ? parse_u32(PQgetvalue(res.get(), 0, 0)) : std::nullopt;
         if (!refs_count)
-            return std::unexpected{"retire: unparseable reference count from " + rel_name(col) +
-                                   " — refusing"};
+            return std::unexpected{SecretCodec::LifecycleError{
+                SecretCodec::LifecycleError::Kind::database,
+                "retire: unparseable reference count from " + rel_name(col) + " — refusing"}};
         if (*refs_count > 0)
-            return std::unexpected{"retire: refusing — " + rel_name(col) +
-                                   " still holds blob(s) wrapped under v" +
-                                   std::to_string(version) +
-                                   "; run rewrap_all() and confirm with "
-                                   "oldest_kek_version_in_use() first"};
+            return std::unexpected{precondition_error(
+                "retire: refusing — " + rel_name(col) + " still holds blob(s) wrapped under v" +
+                std::to_string(version) +
+                "; run rewrap_all() and confirm with "
+                "oldest_kek_version_in_use() first")};
     }
 
     const std::string version_str = std::to_string(version);
@@ -1011,8 +1071,8 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
                               " RETURNING kek_version",
                               1, nullptr, values, nullptr, nullptr, 0)};
     if (upd.status() != PGRES_TUPLES_OK || PQntuples(upd.get()) != 1)
-        return std::unexpected{std::string{"retire: kek_meta update failed: "} +
-                               PQerrorMessage(conn)};
+        return std::unexpected{
+            pg_lifecycle_error(upd.get(), conn, "retire: kek_meta update failed")};
 
     std::string ref;
     {
@@ -1034,19 +1094,111 @@ std::expected<void, std::string> SecretCodec::retire_kek(PGconn* conn, std::uint
         spdlog::error("secret_codec: v{} marked retired in kek_meta but provider key deletion "
                       "FAILED — key material for '{}' remains; remove it manually",
                       version, kek_key_id(version));
-        return std::unexpected{"retire: v" + std::to_string(version) +
-                               " marked retired but provider key deletion FAILED — key material "
-                               "for '" +
-                               kek_key_id(version) +
-                               "' still exists; remove it manually. The version is already "
-                               "excluded from boot verification (no kek.retired event was emitted "
-                               "— destruction is unconfirmed)"};
+        return std::unexpected{provider_error(
+            "retire: v" + std::to_string(version) +
+            " marked retired but provider key deletion FAILED — key material "
+            "for '" +
+            kek_key_id(version) +
+            "' still exists; remove it manually. The version is already "
+            "excluded from boot verification (no kek.retired event was emitted "
+            "— destruction is unconfirmed)")};
     }
 
     emit_audit("kek.retired", nlohmann::json{{"kek_version", version}}.dump());
     spdlog::info("secret_codec: retired secrets-kek-v{} (key destroyed; recorded in kek_meta)",
                  version);
     return {};
+}
+
+std::expected<std::size_t, SecretCodec::LifecycleError>
+SecretCodec::live_kek_version_count(PGconn* conn) const {
+    PgResult res{PQexec(conn, "SELECT COUNT(*) FROM secrets.kek_meta WHERE retired_at IS NULL")};
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected{
+            pg_lifecycle_error(res.get(), conn, "live_kek_version_count: query failed")};
+    if (PQntuples(res.get()) != 1)
+        return std::unexpected{SecretCodec::LifecycleError{
+            SecretCodec::LifecycleError::Kind::database,
+            "live_kek_version_count: unexpected result shape (expected exactly one row)"}};
+    // Strict parse + overflow guard (#2530 A4): the value lands in a
+    // std::uint32_t status field downstream — parse_u32 both validates the
+    // parse and range-checks into uint32, so a malformed/oversized COUNT(*)
+    // never silently becomes 0.
+    const auto count = parse_u32(PQgetvalue(res.get(), 0, 0));
+    if (!count)
+        return std::unexpected{SecretCodec::LifecycleError{
+            SecretCodec::LifecycleError::Kind::database,
+            "live_kek_version_count: unparseable or out-of-range COUNT(*) result"}};
+    return static_cast<std::size_t>(*count);
+}
+
+std::expected<SecretCodec::RotateClock, SecretCodec::LifecycleError>
+SecretCodec::rotate_clock(PGconn* conn) const {
+    // Single statement, both timestamps from the SAME Postgres server clock
+    // (#2530 A5) — this is what makes the anomaly check sound: we are never
+    // comparing an app-host clock reading against the DB clock.
+    PgResult res{PQexec(conn, "SELECT EXTRACT(EPOCH FROM (now() - created_at))::bigint,"
+                              "       (created_at > now())"
+                              "  FROM secrets.kek_meta"
+                              " ORDER BY kek_version DESC"
+                              " LIMIT 1")};
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected{pg_lifecycle_error(res.get(), conn, "rotate_clock: query failed")};
+
+    RotateClock clock;
+    const int n = PQntuples(res.get());
+    if (n == 0)
+        return clock; // any_rows stays false — no kek_meta rows yet
+    if (n != 1)
+        return std::unexpected{SecretCodec::LifecycleError{
+            SecretCodec::LifecycleError::Kind::database,
+            "rotate_clock: unexpected result shape (expected at most one row)"}};
+
+    clock.any_rows = true;
+    const char* age_text = PQgetvalue(res.get(), 0, 0);
+    const bool age_is_null = PQgetisnull(res.get(), 0, 0) != 0;
+    std::int64_t age_seconds = 0;
+    if (age_is_null || age_text == nullptr) {
+        return std::unexpected{SecretCodec::LifecycleError{
+            SecretCodec::LifecycleError::Kind::database,
+            "rotate_clock: NULL age from EXTRACT(EPOCH FROM (now() - created_at))"}};
+    }
+    {
+        std::string_view sv{age_text};
+        const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), age_seconds);
+        if (ec != std::errc{} || ptr != sv.data() + sv.size())
+            return std::unexpected{SecretCodec::LifecycleError{
+                SecretCodec::LifecycleError::Kind::database,
+                "rotate_clock: unparseable age value"}};
+    }
+
+    const char* future_text = PQgetvalue(res.get(), 0, 1);
+    const bool future_is_null = PQgetisnull(res.get(), 0, 1) != 0;
+    if (future_is_null || future_text == nullptr) {
+        return std::unexpected{SecretCodec::LifecycleError{
+            SecretCodec::LifecycleError::Kind::database,
+            "rotate_clock: NULL future-dated flag from (created_at > now())"}};
+    }
+    // libpq text-format boolean is 't'/'f'. A negative age (age_seconds < 0)
+    // is the same underlying condition and is treated as a second, defensive
+    // confirmation — either signal alone is sufficient to flag the anomaly.
+    const bool future_dated = (future_text[0] == 't') || (age_seconds < 0);
+    clock.clock_anomaly = future_dated;
+    clock.since_newest = std::chrono::seconds{age_seconds < 0 ? 0 : age_seconds};
+    // #2530 G7-B6: capture the skew MAGNITUDE before it is discarded above.
+    // `age_seconds` is `EXTRACT(EPOCH FROM (now() - created_at))`, so a
+    // future-dated row makes it negative; its absolute value is exactly how
+    // many seconds into the future the row is dated. The boolean-only
+    // `future_text[0] == 't'` path (with a non-negative `age_seconds`,
+    // possible only from clock jitter at the exact now()/created_at
+    // boundary) has no usable magnitude — leave it at 0 rather than fabricate
+    // one.
+    // #2530 G8-S6: `-age_seconds` is signed-negation UB at INT64_MIN (no
+    // representable positive counterpart). `0ULL - static_cast<uint64_t>(...)`
+    // computes the same magnitude via well-defined unsigned wraparound instead.
+    clock.future_skew_secs =
+        (age_seconds < 0) ? (0ULL - static_cast<std::uint64_t>(age_seconds)) : 0;
+    return clock;
 }
 
 std::vector<std::pair<std::pair<std::string, SecretCodec::FailureClass>, std::uint64_t>>

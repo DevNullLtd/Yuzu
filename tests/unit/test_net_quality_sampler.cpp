@@ -1,9 +1,14 @@
 /**
  * test_net_quality_sampler.cpp — pure helpers of the network-quality sampler
- * (median, throughput delta, and the 4b.3 interval-retransmit-rate window). The
- * platform netlink INET_DIAG path is verified EMPIRICALLY on the Linux rig
- * (rtt_p50 matches `ss -ti`; the interval rate separates 0%/4%/12% netem loss),
- * not here — these are the cross-platform, deterministic bits.
+ * (median, throughput delta, and the 4b.3 interval-retransmit-rate window),
+ * plus the macOS syscall entry points (`read_net_counters()` /
+ * `sample_net_quality()`, both YUZU_EXPORT), which are live-tested below since
+ * the macOS suite runs on real macOS runners, and a Linux smoke test of the
+ * `/proc/net/dev` counter read (`read_net_counters()`). The Linux netlink
+ * INET_DIAG path is verified EMPIRICALLY on the Linux rig (rtt_p50 matches
+ * `ss -ti`; the interval rate separates 0%/4%/12% netem loss) and the Windows
+ * GetIfTable2 / GetTcpStatisticsEx path is exercised on its own live rig —
+ * neither here.
  */
 #include "net_quality_sampler.hpp"
 
@@ -30,6 +35,14 @@ TEST_CASE("throughput_bps: delta over interval, wrap-safe", "[netq]") {
     const auto bps = throughput_bps(prev, cur);
     REQUIRE(bps.has_value());
     CHECK(*bps == 2000.0);
+
+    // Non-integral quotient — pins DOUBLE division (an integer-division
+    // regression would truncate 33333.33… to 33333.0 exactly and still pass an
+    // exactly-divisible case like the one above).
+    const NetCounters cur3{true, 1000 + 60000, 2000 + 40000, t0 + seconds(3)}; // +100000 B / 3 s
+    const auto bps3 = throughput_bps(prev, cur3);
+    REQUIRE(bps3.has_value());
+    CHECK(*bps3 == Catch::Approx(100000.0 / 3.0));
 
     // First heartbeat (invalid prev) baselines — no rate.
     CHECK(throughput_bps(NetCounters{}, cur) == std::nullopt);
@@ -112,10 +125,78 @@ TEST_CASE("RetransWindow: counter decrease (DWORD wrap) clamps, never negative",
 
 // NOTE: the Windows platform reads (GetIfTable2 throughput + GetTcpStatisticsEx
 // retransmit counters) are deliberately NOT unit-tested here — like the Linux
-// netlink path, they are non-exported syscall functions. A live rig verifies only
-// the COUNTER PLUMBING (the heartbeat ships yuzu.net_throughput_bps +
-// net_retrans_pct → yuzu_fleet_net_* gauges); it does NOT validate the Windows
-// retransmit signal's separation-under-loss — that netem validation was run on
-// Linux only and is tracked for Windows in issue #1465. Only the cross-platform,
-// deterministic helpers above (median / throughput_bps / RetransWindow) are
-// unit-tested.
+// netlink path above, their live syscall path is exercised on its own
+// platform's rig, not in this cross-platform file (both `read_net_counters()`
+// and `sample_net_quality()` are YUZU_EXPORT on every platform, macOS included
+// — see the live macOS smoke tests below, which DO run here). A live rig
+// verifies only the COUNTER PLUMBING (the heartbeat ships
+// yuzu.net_throughput_bps + net_retrans_pct → yuzu_fleet_net_* gauges); it
+// does NOT validate the Windows retransmit signal's separation-under-loss —
+// that netem validation was run on Linux only and is tracked for Windows in
+// issue #1465. The cross-platform, deterministic helpers above (median /
+// throughput_bps / RetransWindow) are unit-tested everywhere.
+
+#ifdef __linux__
+// Linux smoke test: read_net_counters() is the /proc/net/dev read path — this
+// exercises the fgets + strtoull field walk (which replaced sscanf; glibc 2.38
+// __isoc23_* compatibility) end-to-end on the live procfs, mirroring the macOS
+// smoke test below.
+TEST_CASE("Linux: read_net_counters parses /proc/net/dev and finds live traffic",
+          "[netq][linux]") {
+    const NetCounters c = read_net_counters();
+    // A successful walk always sets valid=true (headers skipped, lines walked).
+    REQUIRE(c.valid);
+    // Every real Linux CI host has at least one non-loopback interface with
+    // since-boot traffic, so this forces the field walk to have actually
+    // converted the rx/tx byte counters — it fails if the parse always misses.
+    CHECK(c.rx_bytes + c.tx_bytes > 0);
+}
+#endif
+
+#ifdef __APPLE__
+// macOS smoke test: read_net_counters() is the NET_RT_IFLIST2 syscall path, so
+// this exercises the live routing-socket walk on this host rather than a pure
+// helper (mirrors the intent of the Linux/Windows live-rig notes above, but as
+// an automated CI check since the macOS suite runs on real macOS runners).
+TEST_CASE("macOS: read_net_counters walks NET_RT_IFLIST2 and finds live traffic",
+          "[netq][macos]") {
+    const NetCounters c = read_net_counters();
+    // A successful walk always sets valid=true (even a quiescent host has
+    // interfaces to enumerate); this forces the sysctl + bounds-checked walk to
+    // actually run end-to-end, not just compile.
+    REQUIRE(c.valid);
+    // Every real macOS host has at least one non-loopback interface with
+    // since-boot traffic, so this forces the walk to have found and summed a
+    // real RTM_IFINFO2 message — the test fails if the NET_RT_IFLIST2 path is
+    // broken (e.g. always skipping/mis-parsing messages).
+    CHECK(c.rx_bytes + c.tx_bytes > 0);
+}
+
+TEST_CASE("macOS: sample_net_quality omits retransmit and RTT (deferred in v1)",
+          "[netq][macos]") {
+    const NetCounters c1 = read_net_counters();
+    const NetCounters c2 = read_net_counters();
+    const NetQualitySample s = sample_net_quality(c1, c2);
+    // Both are deferred on macOS in v1 — absent, never a fabricated false/0.
+    // Deliberately NOT asserting throughput_bps>0: a quiescent interval between
+    // c1/c2 is legitimately absent (throughput_valid may be true or false).
+    CHECK_FALSE(s.rtt_valid);
+    CHECK_FALSE(s.retrans_valid);
+}
+
+TEST_CASE("macOS: sample_net_quality computes throughput_bps deterministically",
+          "[netq][macos]") {
+    using namespace std::chrono;
+    const auto t0 = steady_clock::now();
+    const NetCounters c1{true, 1000, 1000, t0};
+    const NetCounters c2{true, 51000, 26000, t0 + seconds(1)};
+    const NetQualitySample s = sample_net_quality(c1, c2);
+    // Mirrors throughput_bps's own arithmetic (see the cross-platform test
+    // above): (51000-1000) + (26000-1000) = 75000 bytes over 1 s.
+    REQUIRE(s.throughput_valid);
+    CHECK(s.throughput_bps == Catch::Approx(75000.0));
+    // macOS still omits both in v1 — deterministic, not just "may be false".
+    CHECK_FALSE(s.rtt_valid);
+    CHECK_FALSE(s.retrans_valid);
+}
+#endif

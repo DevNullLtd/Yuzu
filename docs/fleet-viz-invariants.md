@@ -8,8 +8,27 @@ invariants so they outlive any single PR description.
 Triggers for this doc: any change touching
 `viz_routes.{hpp,cpp}` / `fleet_topology_store.{hpp,cpp}` /
 `viz_page_ui.cpp` / `static/yuzu-viz.js` / `--viz-disable` /
-`Config::viz_disable`. Loaded by `security-guardian` + `docs-writer` during
-governance.
+`Config::viz_disable` / `McpServer::set_viz_deps` / the `get_fleet_topology`
+and `get_host_topology` MCP tool handlers in `mcp_server.cpp` (api-parity
+#2146 Batch B3 - a second implementation site for these same invariants:
+kill-switch-before-RBAC ordering, the `machines_max` DoS cap, the offline-merge
+rule). Loaded by `security-guardian` + `docs-writer` during governance.
+
+## MCP surface
+
+`get_fleet_topology`/`get_host_topology` (`mcp_server.cpp`) are the MCP twins
+of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
+SAME `fleet_topology_store_`/`offline_endpoint_store_`/`viz_disabled_`
+instances REST's `VizRoutes` registration uses, so the two surfaces cannot
+disagree about cache state). Every invariant in this doc (kill-switch
+ordering, the DoS cap, the offline-merge rule) applies identically to both
+surfaces - a change to one that doesn't preserve parity with the other is a
+regression, not a stylistic difference. That equal treatment does not extend
+to confinement: **neither surface confines results to the caller's
+management-group scope** - a caller with `Response:Read` sees every connected
+agent's process/connection/listener data fleet-wide on both REST and MCP
+alike (#4313, tracked parallel to #3526's identical gap on the
+execution/fleet-statistics tools).
 
 ## REST and routing surface
 
@@ -412,11 +431,12 @@ rules for the `viz_routes.cpp::handle_topology` merge:
   tracked follow-up). Do not "fix" this by hard-failing the request.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).
-- **`/readyz` brief-200 caveat.** The substrate `pg_pool` readyz check reads
-  the connect-breaker, which can momentarily read closed between backoff
-  windows during a sustained outage — a deliberate tradeoff (don't evict a
-  busy-but-healthy server); operators should page on `YuzuPgConnectFailing`,
-  not solely on `/readyz`.
+- **`/readyz` and a Postgres outage.** The substrate `pg_pool` readyz row
+  reads the connect-breaker, which can momentarily read closed between backoff
+  windows during a sustained outage (a deliberate tradeoff: don't evict a
+  busy-but-healthy server). Since HA WS-8 the `pg_reachable` row carries the
+  steady signal instead — a dedicated-connection probe, red within seconds of
+  an outage — and pages go out on `YuzuServerPostgresUnreachable`.
 
 ## Cross-references
 

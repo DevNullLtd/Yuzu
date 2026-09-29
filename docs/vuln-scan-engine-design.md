@@ -9,7 +9,7 @@
 | **Last grilled** | 2026-06-08 (`/grill-with-docs`, fresh context — graph layer added) |
 | **Supersedes** | the static PoC matcher in `agents/plugins/vuln_scan/` |
 | **Builds on** | PR #1206 (spike — proved the rule-delivery plumbing) |
-| **Decisions of record** | ADR [0001](adr/0001-observed-grounded-reachability.md) · [0002](adr/0002-reachability-graph-data-model.md) · [0003](adr/0003-telemetry-capture-model.md) · [0004](adr/0004-server-storage-substrate.md) · [0005](adr/0005-attack-path-and-chokepoint-scoring.md) · [1005](adr/1005-headless-platform-use-case-engines.md) · [0023](adr/0023-vulnerability-correlation-engine.md) · [4001](adr/4001-vulnerability-dashboard-attack-path-explorer.md) (placement — see reconciliation note below) |
+| **Decisions of record** | ADR [0001](adr/0001-observed-grounded-reachability.md) · [0002](adr/0002-reachability-graph-data-model.md) · [0003](adr/0003-telemetry-capture-model.md) · [0004](adr/0004-server-storage-substrate.md) · [0005](adr/0005-attack-path-and-chokepoint-scoring.md) · [1005](adr/1005-headless-platform-use-case-engines.md) · [0023](adr/0023-vulnerability-correlation-engine.md) · [4001](adr/4001-vulnerability-dashboard-attack-path-explorer.md) (placement — see reconciliation note below) · [4003](adr/4003-cavm-v20-adoption-on-reachability-graph.md) (§5.2's chokepoint formula, superseding ADR-0005's original) |
 | **Glossary** | `CONTEXT.md` — Reachability, Asset value (Crown jewel), Trust zone, Entry point, Attack path, Chokepoint |
 | **Plain-language version** | [`vulnerability-graph-explained.md`](vulnerability-graph-explained.md) — a non-technical intro to *why a graph*, for curious readers |
 | **Related** | `docs/capability-map.md` §9, `docs/fleet-viz-invariants.md`, `docs/scope-walking-design.md`, `docs/agent-privilege-model.md`, `docs/data-architecture.md` |
@@ -396,11 +396,9 @@ paths**; **depth-bounded** (`d ≈ 5`) because real breaches are 2–4 hops and 
 is both a tractability and a precision lever. Output: a **per-finding attack-path score
 that replaces raw CVSS as the default ranking.**
 
-### 5.2 Chokepoints — path-set frequency, not Brandes betweenness
+### 5.2 Chokepoints — unweighted chain centrality, not Brandes betweenness (ADR-4003)
 
-Generic betweenness is O(V·E) *and* wrong (weights all-pairs equally). A chokepoint is a
-node/edge appearing in many of the already-computed top-k entry→jewel paths, weighted by
-`crown-jewel value × path probability` — a direct **defender-ROI** number, nearly free.
+Generic betweenness is O(V·E) *and* wrong (weights all-pairs equally) — still rejected, unchanged. **Superseded formula (ADR-4003 Decision 5):** a chokepoint is a node appearing on the single least-complexity path for one or more `(entry point, crown jewel)` pairs; each pair contributes an equal, fixed share of credit (`1/(len(breach_points)·len(crown_jewels))`, split further across tied minimum paths for that pair) — a constant per-pair weight, not a per-node-participation-count normalization — bounded to the declared entry-point/crown-jewel surface, same complexity shape as §5.1's own Dijkstra search, still not Brandes betweenness. This is *not* a literal reuse of §5.1's output: chain centrality runs its own shortest-path search over the graph as extended by ADR-4003's host-privilege-state nodes, which §5.1's plain service-level search doesn't include. It replaces the original `crown-jewel value × path probability` defender-ROI sum (which undercounted a node touching several crown jewels relative to one touching a single valuable target) with equal credit per pair reached — value-weighting the credit was considered and reverted (crown-jewel membership is binary, so there's no gradient to weight by; see ADR-4003's Considered-and-rejected). Only the single lowest-complexity path per pair counts — a real, viable secondary route with strictly higher complexity earns zero credit, CAVM's own accepted design, not an approximation introduced here.
 
 ### 5.3 Segmentation — cost-weighted min-cut
 
@@ -488,10 +486,10 @@ Each phase is a shippable slice with an Andy-owned acceptance bar.
   *Acceptance (Andy): on a reference topology, the top-ranked findings are the ones the
   expert agrees are scariest; the ranking inverts at least one "critical-CVSS-but-isolated
   < medium-CVSS-on-pivot" case correctly.*
-- **Phase 8 — Chokepoints & segmentation.** §5.2 + §5.3 (path-set-frequency chokepoints,
-  cost-weighted min-cut recs); assume-breach as a second view; Kruskal/Steiner multi-jewel
-  campaign cost. *Acceptance (Andy): the #1 recommended segmentation actually breaks the
-  most at-risk value per unit effort on a reference topology.*
+- **Phase 8 — Chokepoints & segmentation.** §5.2 + §5.3 (chain-centrality chokepoints
+  (ADR-4003), cost-weighted min-cut recs); assume-breach as a second view; Kruskal/Steiner
+  multi-jewel campaign cost. *Acceptance (Andy): the #1 recommended segmentation actually
+  breaks the most at-risk value per unit effort on a reference topology.*
 
 ---
 
@@ -556,10 +554,15 @@ Each phase is a shippable slice with an Andy-owned acceptance bar.
 - **ADR-0004** — Server storage substrate (Postgres under the server; agent SQLite edge
   warehouse; secrets caveat).
 - **ADR-0005** — Attack-path & chokepoint scoring (depth-bounded max-probability paths;
-  path-set-frequency chokepoints; cost-weighted min-cut; two-matcher KEV pre-filter;
-  distributed-Pregel escape hatch).
+  cost-weighted min-cut; two-matcher KEV pre-filter; distributed-Pregel escape hatch).
+  Its original chokepoint formula (path-set-frequency, defender-ROI-weighted) is superseded
+  by ADR-4003 — see that ADR's own file for the amendment note.
 - **ADR-1005** — Headless platform / use-case engines (this doc's server-side placement is
   interim — grandfathered surface #2; see the reconciliation note at the top).
 - **ADR-0023** — Vulnerability correlation engine (in-server, absorbed-interim under ADR-1005).
+- **ADR-4003** — CAVM v20 adoption on the reachability graph (§5.2's chain-centrality
+  chokepoint formula, the host-privilege-state ladder, EUC, AMAPC/CPS — supersedes ADR-0005's
+  original chokepoint formula specifically; attack-path scoring §5.1 and segmentation §5.3
+  are unaffected).
 - **ADR-4001** — Vulnerability dashboard + Attack Path Explorer (in-server lens,
   absorbed-interim under ADR-1005; ADR-4002's scoring substrate not absorbed).

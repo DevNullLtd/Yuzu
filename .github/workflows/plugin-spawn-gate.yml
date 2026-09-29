@@ -1,0 +1,84 @@
+name: Plugin spawn lexical gate
+
+# Decision-10a (docs/adr/3002-acquisition-ladder.md:459-488): a per-PR lexical
+# gate that greps agents/plugins/* and agents/core for a raw process-spawn
+# token (fork/exec family/system/popen/CreateProcess family/...) outside the
+# registered allowlist -- see scripts/ci/check-plugin-spawn-lexical.sh's own
+# header for the full token/allowlist contract.
+#
+# Deliberately its OWN workflow, not folded into ci.yml: it greps source text
+# and needs no build (no meson/vcpkg/compiler setup at all), so it does not
+# share ci.yml's build-dependent PR fast-path or its `changes`-job path-filter
+# machinery (docker-healthcheck-invariants.yml's "Why no paths: filter" trap
+# does not apply here for the same reason it doesn't need to -- there is
+# nothing expensive to skip, so this workflow simply always runs).
+#
+# This is tier (a) of the ADR's two-tier enforcement; CodeQL (tier b,
+# scheduled, call-identity-aware) is the deep net -- see the ADR for why
+# neither tier alone is sufficient.
+#
+# A-2/compliance: like the #2204 capability-matrix gate, this gate's
+# pass/fail signal lives only in the workflow run log (Actions' default
+# 90-day retention, short of a 12-month SOC 2 evidence window). Accepted for
+# now -- the gate is an enforcement mechanism, not an evidence-retention
+# system; revisit with an artifact upload (retention-days) if a SOC 2
+# control is later scoped to require the raw scan output itself.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-spawn-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lexical-scan:
+    name: "Lexical spawn scan"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # BR-011: the grandfathered added-line check diffs each high-risk file
+          # against the PR/push base, so full history is needed to resolve it.
+          fetch-depth: 0
+
+      - name: Self-test the detector (fixtures) before trusting it on real source
+        run: bash scripts/ci/check-plugin-spawn-lexical.sh --selftest
+
+      - name: Determine base ref for the grandfathered added-line check
+        id: base
+        # build-ci B2: github.event.* is interpolated into env: (not spliced
+        # directly into the run: body) so the repo's enforcing zizmor.yml
+        # template-injection lint has nothing to flag -- these values are
+        # always SHAs with no practical injection surface, but github.event.
+        # before is not on zizmor's known-safe list. sec-LOW: BASE_BEFORE is
+        # quoted in the shell test below, so an unset/empty value (e.g. on
+        # workflow_dispatch) correctly falls through to the else branch
+        # instead of the unquoted `[ -n ${{ github.event.before }} ]` always
+        # evaluating true.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          elif [ -n "$BASE_BEFORE" ] && \
+               [ "$BASE_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            echo "ref=$BASE_BEFORE" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=origin/dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan agents/plugins + agents/core for raw spawn tokens
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
+        run: bash scripts/ci/check-plugin-spawn-lexical.sh --base "$BASE_REF"

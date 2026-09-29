@@ -2,41 +2,61 @@
  * test_oidc_principal_key.cpp — Unit tests for #1837: OIDC session principal
  * keyed on stable `iss`+`sub`, not the mutable display name.
  *
- * Covers: AuthManager::create_oidc_session stable-username construction,
+ * Covers: AuthManager::create_oidc_session stable-username construction and
  * RbacStore::reconcile_idp_memberships keyed on the stable principal shape
- * (`oidc:<iss>#<sub>`), and the
- * RbacStore v2 -> v3 migration that purges orphaned display-name-keyed IdP
- * memberships. Also covers the #1837 hardening-round sanitisation of
+ * (`oidc:<iss>#<sub>`). Also covers the #1837 hardening-round sanitisation of
  * IdP-supplied `display`/`email` values before they reach an audit `detail`
  * string (detail::sanitize_detail_value in auth_routes.hpp).
+ *
+ * (The RbacStore v2 -> v3 SQLite migration test that used to live here was
+ * removed when RbacStore moved to PostgreSQL — RbacStore no longer runs
+ * SQLite schema migrations; the reconcile-on-stable-key behaviour it
+ * exercised is covered by the cases in this file and test_rbac_store.cpp.)
  */
 
 #include <yuzu/server/auth.hpp>
 
 #include "auth_routes.hpp"
-#include "migration_runner.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
-#include <algorithm>
-#include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server::auth;
 using yuzu::server::RbacStore;
+namespace pg = yuzu::server::pg;
+using pg::PgPool;
+
+namespace {
+// Pre-migrated + seeded template (RbacStore construction runs the migration AND
+// seed_defaults). Every store-behaviour case clones this instead of
+// re-migrating/re-seeding per test (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                        PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        RbacStore store{pool};
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "rbac template: store failed to migrate/seed");
+                                    }};
+} // namespace
 
 // ── AuthManager::create_oidc_session — stable principal ─────────────────────
 
 TEST_CASE("AuthManager: two OIDC logins with same display name but different "
          "sub get distinct stable usernames, and roles do not leak between them",
-         "[auth][oidc][1837]") {
+         "[auth][oidc][1837][pg]") {
     AuthManager mgr;
-    RbacStore rbac(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
 
     const std::string iss = "https://idp.example.com/";
     // Same display name deliberately — this is exactly the collision #1837
@@ -79,9 +99,13 @@ TEST_CASE("AuthManager: two OIDC logins with same display name but different "
 
 TEST_CASE("AuthManager: OIDC rename (same sub, changed name) keeps the stable "
          "username stable and updates the minted session's display_name",
-         "[auth][oidc][1837]") {
+         "[auth][oidc][1837][pg]") {
     AuthManager mgr;
-    RbacStore rbac(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
     const std::string iss = "https://idp.example.com/";
 
     auto token1 = mgr.create_oidc_session("Pat Original", "pat@corp.example", "sub-PAT", iss);
@@ -125,8 +149,12 @@ TEST_CASE("AuthManager: OIDC rename (same sub, changed name) keeps the stable "
 
 TEST_CASE("AuthManager: reconcile add/remove/deprovision fires correctly "
          "keyed on the oidc:<iss>#<sub> principal shape",
-         "[auth][oidc][1837]") {
-    RbacStore rbac(":memory:");
+         "[auth][oidc][1837][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
     const std::string principal = "oidc:https://idp.example.com/#sub-DEPROV";
 
     // Add.
@@ -151,146 +179,6 @@ TEST_CASE("AuthManager: reconcile add/remove/deprovision fires correctly "
     REQUIRE(deprovisioned.has_value());
     CHECK(deprovisioned->removed == 1);
     CHECK(rbac.get_group_members("entra:g1").empty());
-}
-
-// ── RbacStore v2 -> v3 migration ─────────────────────────────────────────────
-
-namespace {
-bool row_exists(sqlite3* db, const char* group_name, const char* username) {
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(
-            db, "SELECT 1 FROM group_members WHERE group_name = ? AND username = ?;", -1, &stmt,
-            nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(stmt, 1, group_name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, username, -1, SQLITE_TRANSIENT);
-    bool found = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-    return found;
-}
-} // namespace
-
-TEST_CASE("RbacStore: v2 -> v3 migration purges orphaned display-name-keyed "
-         "IdP memberships but leaves local memberships and groups intact",
-         "[rbac_store][migration][1837]") {
-    const auto path = yuzu::test::unique_temp_path("rbac-migration-v3-");
-
-    // v1 + v2 schema only — duplicated here (not #include'd from
-    // rbac_store.cpp) so this test fails loudly if a future edit changes
-    // v1/v2's shape without updating this fixture, mirroring the existing
-    // "v1 -> v2 migration" test's pattern.
-    static const std::vector<yuzu::server::Migration> kUpToV2 = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS securable_types (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS operations (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS roles (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS role_permissions (
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
-                operation       TEXT NOT NULL REFERENCES operations(id),
-                effect          TEXT NOT NULL DEFAULT 'allow',
-                PRIMARY KEY (role_name, securable_type, operation)
-            );
-            CREATE TABLE IF NOT EXISTS principal_roles (
-                principal_type  TEXT NOT NULL,
-                principal_id    TEXT NOT NULL,
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                PRIMARY KEY (principal_type, principal_id, role_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
-                ON principal_roles(principal_type, principal_id);
-            CREATE TABLE IF NOT EXISTS groups (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                source      TEXT NOT NULL DEFAULT 'local',
-                external_id TEXT,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS group_members (
-                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-                username    TEXT NOT NULL,
-                PRIMARY KEY (group_name, username)
-            );
-            CREATE TABLE IF NOT EXISTS rbac_config (
-                key     TEXT PRIMARY KEY,
-                value   TEXT NOT NULL
-            );
-        )"},
-        {2, R"(
-            CREATE INDEX IF NOT EXISTS idx_groups_source ON groups(source);
-            CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username);
-        )"},
-    };
-
-    {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                                nullptr) == SQLITE_OK);
-        REQUIRE(yuzu::server::MigrationRunner::run(db, "rbac_store", kUpToV2));
-        REQUIRE(yuzu::server::MigrationRunner::current_version(db, "rbac_store") == 2);
-
-        // An IdP-sourced group with a membership row keyed on the OLD
-        // display-name username (pre-#1837 shape) — this is exactly what a
-        // real pre-upgrade deployment's data looks like.
-        // A local group + membership that must survive untouched.
-        sqlite3_exec(
-            db,
-            "INSERT INTO groups (name, description, source, external_id, created_at) "
-            "VALUES ('entra:g1', 'seed', 'entra', 'g1', 100);"
-            "INSERT INTO group_members (group_name, username) VALUES ('entra:g1', 'Alex Kim');"
-            "INSERT INTO groups (name, description, source, external_id, created_at) "
-            "VALUES ('local-team', 'seed', 'local', '', 100);"
-            "INSERT INTO group_members (group_name, username) VALUES ('local-team', 'bob');",
-            nullptr, nullptr, nullptr);
-        sqlite3_close(db);
-    }
-
-    // Reopen through the production constructor — runs the full migration
-    // list (v1/v2 adoption no-ops + v3 purge) and seed_defaults().
-    {
-        RbacStore store(path);
-        REQUIRE(store.is_open());
-
-        // Orphaned IdP-sourced membership is gone.
-        CHECK(store.get_group_members("entra:g1").empty());
-        // The GROUP itself is untouched (only the membership row was purged).
-        auto groups = store.list_groups();
-        auto entra_g1 = std::find_if(groups.begin(), groups.end(),
-                                     [](const auto& g) { return g.name == "entra:g1"; });
-        REQUIRE(entra_g1 != groups.end());
-        CHECK(entra_g1->source == "entra");
-
-        // Local membership survives untouched.
-        CHECK(store.get_group_members("local-team") == std::vector<std::string>{"bob"});
-
-        sqlite3* verify_db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &verify_db, SQLITE_OPEN_READONLY,
-                                nullptr) == SQLITE_OK);
-        CHECK_FALSE(row_exists(verify_db, "entra:g1", "Alex Kim"));
-        CHECK(row_exists(verify_db, "local-team", "bob"));
-        sqlite3_close(verify_db);
-    } // close `store` before deleting the file — Windows cannot delete an
-      // open file (Linux unlinks it lazily); use the non-throwing remove()
-      // overload for cleanup.
-
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
 }
 
 // ── detail::sanitize_detail_value — IdP-supplied detail-field sanitisation ──

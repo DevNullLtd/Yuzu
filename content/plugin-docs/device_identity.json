@@ -1,0 +1,500 @@
+{
+  "actions": [
+    {
+      "action": "device_name",
+      "definition_ids": [
+        "device.device_identity.device_name"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "gethostname(3)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "gethostname(3)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetComputerNameExA",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "domain",
+      "definition_ids": [
+        "device.device_identity.domain"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/etc/resolv.conf read + sd-bus org.freedesktop.sssd.infopipe ListDomains [fallback: run_bounded_subprocess(realm list); further fallback: /etc/sssd/sssd.conf read]",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "run_bounded_subprocess(dsconfigad -show) + native parser (device_identity_macos.hpp) [fallback: gethostname(3) + getaddrinfo(AI_CANONNAME)]",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "NetGetJoinInformation",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "ou",
+      "definition_ids": [
+        "device.device_identity.ou"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "run_bounded_subprocess(realm list) [fallback: /etc/sssd/sssd.conf read]",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "run_bounded_subprocess(dsconfigad -show) + native parser (device_identity_macos.hpp)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetComputerObjectNameA",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Linux AD-join detection can fail closed under the unprivileged agent account.** sssd's InfoPipe defaults to root-only access and `/etc/sssd/sssd.conf` ships mode 0600; the agent runs as the unprivileged `yuzu` account, so both paths can be denied on a stock SSSD host. `realm list` is kept as the confirmed-unprivileged fallback specifically to cover this gap (`device_identity_plugin.cpp:252-268`, BR-011).",
+    "**No typed result status.** Every sample shows `UNDECLARED / UNKNOWN /` — the plugin never calls a `set_result_status`-style API, so a permission failure and a genuine \"not joined\" answer are indistinguishable to a consumer.",
+    "**macOS runs `dsconfigad -show` twice per full identity read.** `domain` and `ou` each make their own independent bounded-subprocess call (`device_identity_plugin.cpp:368-370`, `:505-507`); there is no cross-action caching of the AD-bind check within one instruction batch.",
+    "**macOS AD lookups are capped at rung 2 (bounded subprocess), not native.** An OpenDirectory native implementation is explicitly deferred, coordinated with a parallel effort doing the same OpenDirectory work elsewhere (`device_identity_plugin.cpp:505-512`); do not reintroduce a raw `popen(dsconfigad)` in its place — that was already replaced by the bounded runner (`changelog.d/2380-hardware-device-identity-native-acquisition.changed.md`).",
+    "**The macOS and Linux samples were captured at the extremes of privilege, not the daemon's real identity.** The macOS sample ran unprivileged (euid 501); the Linux sample ran as root in a container (euid 0). Neither matches the daemon's actual runtime account (root on macOS, unprivileged `yuzu` on Linux) — see the Privileges table."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the machine hostname. Uses gethostname() on Linux/macOS and GetComputerNameExA(ComputerNamePhysicalDnsHostname) on Windows.",
+      "display_name": "Device Hostname",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.device_identity.device_name",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the DNS or Active Directory domain name and whether the device is domain-joined. On Windows, uses NetGetJoinInformation. On Linux, reads /etc/resolv.conf for the DNS domain and checks AD-join status via sssd's D-Bus InfoPipe, falling back to `realm list` and then /etc/sssd/sssd.conf. On macOS, runs `dsconfigad -show`, falling back to a native gethostname()+getaddrinfo(AI_CANONNAME) lookup if the device is not AD-bound.",
+      "display_name": "Domain Membership",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.device_identity.domain",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the Active Directory organizational unit (OU) path for the device. On Windows, uses GetComputerObjectNameA with NameFullyQualifiedDN and extracts the OU= components. On Linux, checks realm list and sssd.conf. On macOS, parses dsconfigad -show. Returns \"N/A\" if the device is not domain-joined.",
+      "display_name": "Active Directory OU",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.device_identity.ou",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Reports device hostname, domain membership, and AD organizational unit",
+  "how_it_works": "`device_name` is a single native call on every OS — `gethostname(3)` on Linux/macOS, `GetComputerNameExA` on Windows — with no fallback and no subprocess. `domain` and `ou` are AD-join lookups, and each platform has its own chain: Windows makes one native call each (`NetGetJoinInformation`, `GetComputerObjectNameA`) and trusts the result. Linux's `domain` first parses `/etc/resolv.conf` for the DNS domain, then asks sssd's D-Bus InfoPipe whether the host is AD-joined (zero subprocesses); on any InfoPipe failure it falls through to a bounded `realm list` call, then to reading `/etc/sssd/sssd.conf` directly. Linux's `ou` skips InfoPipe (it has no OU surface) and goes straight to `realm list`, falling back to the same `sssd.conf` file. macOS's `domain` and `ou` each independently run the bounded `dsconfigad -show` subprocess and parse it with the shared `device_identity_macos.hpp` parser; `domain` additionally falls back to a native `gethostname()` + `getaddrinfo(AI_CANONNAME)` lookup when the device isn't AD-bound.\n\nThe plugin deliberately never distinguishes \"not domain-joined\" from \"the AD lookup was refused or failed\" — every degraded path in `domain`/`ou` reports the same `N/A` / `joined=false` shape as a clean not-joined read, and the plugin never calls a typed result-status setter (see Caveats).",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "fdf67a9b8831",
+  "manifest_version": 1,
+  "name": "device_identity",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The device's hostname as reported by the OS. Values: free text.",
+          "example": "DESKTOP-04DNSIG",
+          "name": "device_name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.device_identity.device_name"
+    },
+    {
+      "columns": [
+        {
+          "description": "The DNS or Active Directory domain name the device reports, or \"N/A\" if none was found. Values: free text (or the literal \"N/A\").",
+          "example": "WORKGROUP",
+          "name": "domain",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the device is currently joined to a domain or realm.",
+          "example": "false",
+          "name": "joined",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.device_identity.domain"
+    },
+    {
+      "columns": [
+        {
+          "description": "The Active Directory organizational unit distinguished-name path, or \"N/A\" if the device is not domain-joined or the OU could not be read. Values: free text (AD DN fragment) or the literal \"N/A\".",
+          "example": "N/A",
+          "name": "ou",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.device_identity.ou"
+    }
+  ],
+  "outputs_note": "Each action writes one or more `key|value` lines via `write_output()` (`device_identity_plugin.cpp:9-10`); there is no shared multi-field row shape. `device_name` and `ou` each write exactly one line; `domain` writes two (`domain|...` then `joined|...`). A value of `N/A` (for `domain`/`ou`) means the lookup completed but found nothing to report — it is not distinguishable from a failed lookup (see Caveats).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None. All three calls are unprivileged native APIs.",
+      "if_refused": "`domain`/`ou` silently report `N/A` / `joined=false` (`device_identity_plugin.cpp:418-421`) — no distinct \"refused\" signal",
+      "measured": "2026-09-07, bare-metal, `SYSTEM` (sample stamp)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442 — `docs/agent-privilege-model.md:12`)"
+    },
+    {
+      "grant": "None. `dsconfigad -show` runs unprivileged (`docs/agent-spawn-sink-manifest.md:77-78`).",
+      "if_refused": "falls through to the `gethostname()`+`getaddrinfo` fallback (`device_identity_plugin.cpp:390-401`); `ou` reports `N/A`",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — i.e. captured unprivileged, not as the daemon's real root identity",
+      "os": "macOS",
+      "runs_as": "agent daemon, root (no `UserName` key in the LaunchDaemon — `docs/agent-privilege-model.md:8`)"
+    },
+    {
+      "grant": "None. The sd-bus call, `realm list`, and the `sssd.conf` read are all unprivileged (`docs/agent-spawn-sink-manifest.md:76,79`).",
+      "if_refused": "can fail closed on a stock host: sssd's InfoPipe defaults to root-only and `/etc/sssd/sssd.conf` ships mode 0600, so a genuinely joined host can report `joined=false` (`device_identity_plugin.cpp:252-268`, BR-011)",
+      "measured": "2026-09-06, container, euid 0 (root) — captured privileged, not as the daemon's real unprivileged identity",
+      "os": "Linux",
+      "runs_as": "unprivileged `yuzu` account (`docs/agent-privilege-model.md`, Linux account section)"
+    }
+  ],
+  "readme": "agents/plugins/device_identity/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "device_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "device_name|d7023653759f"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "domain",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "domain|N/A",
+            "joined|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "ou",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "ou|N/A"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "fdf67a9b8831",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "device_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "device_name|workstation1.local"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "domain",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "domain|local",
+            "joined|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "ou",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "ou|N/A"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "fdf67a9b8831",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "device_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "device_name|DESKTOP-04DNSIG"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "domain",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "domain|WORKGROUP",
+            "joined|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "ou",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "ou|N/A"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "fdf67a9b8831",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "device_name",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "domain",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "ou",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/device_identity.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/device_identity/src/device_identity_macos.hpp",
+      "agents/plugins/device_identity/src/device_identity_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_device_identity_macos.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, rendered as `Agent · Key · Value` (`device_identity` is in `kKeyValuePlugins`, `server/core/src/result_parsing.hpp:63`) for SSE, ResponseStore facet extraction, and dashboard fragments.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to `device_identity` or its definition ids was found outside the instruction-result path.",
+    "**Sensitivity.** `device_name` is the host's own hostname, and `domain`/`ou` report its AD domain membership and organizational-unit placement — all three directly identify the specific device (and, via the OU, the org unit it belongs to); nothing here names a person or installed software.",
+    "**Siblings:** `os_info`, `hardware`, `status` — other inventory/system plugins declared alongside `device_identity` in the same ABI4 capability pass (`changelog.d/2204-declarations-group-b.added.md`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.device_identity.domain\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

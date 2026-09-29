@@ -108,7 +108,7 @@ Capture the workflow run ID immediately:
 ```bash
 sleep 10  # give GitHub a moment to start the workflow
 RUN_ID=$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')
-echo "Release workflow: https://github.com/Tr3kkR/Yuzu/actions/runs/$RUN_ID"
+echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 ```
 
 ## Phase 2 — Monitor the workflow (~30-60 min)
@@ -219,7 +219,12 @@ Verify the GHCR images:
 
 ```bash
 # GHCR tags strip the leading `v` — git tag is vX.Y.Z, image tag is X.Y.Z.
-OWNER=$(echo "Tr3kkR" | tr '[:upper:]' '[:lower:]')
+# Post-transfer owner (repo moved to the DevNullLtd org 2026-09-28).
+# Verifying a release at v0.13.0 or earlier? Those images stayed at
+# ghcr.io/tr3kkr and carry a Tr3kkR/Yuzu signing identity -- use
+# OWNER=tr3kkr and --repo DevNullLtd/Yuzu for those, per
+# docs/user-manual/release-verification.md "Which owner applies".
+OWNER=$(echo "DevNullLtd" | tr '[:upper:]' '[:lower:]')
 docker pull "ghcr.io/$OWNER/yuzu-server:X.Y.Z"
 docker pull "ghcr.io/$OWNER/yuzu-gateway:X.Y.Z"
 docker image inspect "ghcr.io/$OWNER/yuzu-server:X.Y.Z" --format '{{.Config.Labels}}' | grep -E "version|revision"
@@ -268,12 +273,12 @@ fi
 
 # gh attestation: verifies SLSA build provenance bound to the exact workflow run
 if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
-  gh attestation verify yuzu-linux-x64.tar.gz --repo Tr3kkR/Yuzu
-  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo Tr3kkR/Yuzu
+  gh attestation verify yuzu-linux-x64.tar.gz --repo DevNullLtd/Yuzu
+  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu
 fi
 ```
 
-**Tighten the identity regex for an auditor-grade check** (optional but recommended once you trust the infra): replace `'.*'` with `'https://github\.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'` — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.
+**Tighten the identity regex for an auditor-grade check** (optional but recommended once you trust the infra): replace `'.*'` with `'https://github\.com/DevNullLtd/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'` — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.
 
 ## Phase 5 — Compose Wizard verification
 
@@ -299,10 +304,14 @@ After all verification passes:
 
 1. **Bump dev branch to next dev version.** On `dev`:
    ```bash
-   # Update meson.build version to X.Y.(Z+1)-dev or (X+1).Y.0-dev (operator's call)
+   # Update meson.build version to X.Y.(Z+1) or (X+1).Y.0 (operator's call).
+   # PLAIN version only — never a -dev/-rcN suffix. The suffix convention was
+   # tried at 0.13.1-dev and rejected (operator ruling 2026-07-13): it
+   # generated `int kVersionPatch = 1-dev;` via version.hpp.in and red-lined
+   # the entire C++ matrix on dev + every open PR (fixed in fca69e34).
    # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
    # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
-   git commit -m "chore(post-release): bump dev to X.Y.Z+1-dev"
+   git commit -m "chore(post-release): bump dev to X.Y.Z+1"
    git push origin dev
    ```
 2. **Reconcile main → dev** if the release tag was on a main commit not yet merged into dev (rare on this project — usually dev → main first).
@@ -317,8 +326,8 @@ End-of-skill output to the operator:
 ```
 Release vX.Y.Z
 
-Workflow:    https://github.com/Tr3kkR/Yuzu/actions/runs/<RUN_ID>
-Release page: https://github.com/Tr3kkR/Yuzu/releases/tag/vX.Y.Z
+Workflow:    https://github.com/DevNullLtd/Yuzu/actions/runs/<RUN_ID>
+Release page: https://github.com/DevNullLtd/Yuzu/releases/tag/vX.Y.Z
 
 Assets:      <N>/<expected> present
 GHCR:        ghcr.io/<owner>/yuzu-server:vX.Y.Z + :yuzu-gateway:vX.Y.Z (linux/amd64)
@@ -328,7 +337,7 @@ SHA256SUMS:  verified
 
 Compose Wizard: bundled (or absent — see Phase 5)
 
-Next dev version: X.Y.(Z+1)-dev (operator: bump on dev branch)
+Next dev version: X.Y.(Z+1) (operator: bump on dev branch — plain version, no -dev suffix)
 ```
 
 If anything failed, list the failures + the fix attempted + final status, and explicitly state whether the release is shippable as-is or requires a follow-up patch release.

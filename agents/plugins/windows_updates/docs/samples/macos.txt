@@ -1,0 +1,70 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 007b2e86015f
+== action=installed
+update|macOS 26.5.1|18/07/2026, 01:41
+update|MAContent10_AssetPack_0048_AlchemyPadsDigitalHolyGhost|18/07/2026, 01:44
+update|MAContent10_AssetPack_0310_UB_DrumMachineDesignerGB|18/07/2026, 01:44
+update|MAContent10_AssetPack_0312_UB_UltrabeatKitsGBLogic|18/07/2026, 01:44
+update|MAContent10_AssetPack_0314_AppleLoopsHipHop1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0315_AppleLoopsElectroHouse1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0316_AppleLoopsDubstep1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0317_AppleLoopsModernRnB1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0320_AppleLoopsChillwave1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0321_AppleLoopsIndieDisco|18/07/2026, 01:44
+update|MAContent10_AssetPack_0322_AppleLoopsDiscoFunk1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0323_AppleLoopsVintageBreaks|18/07/2026, 01:44
+update|MAContent10_AssetPack_0324_AppleLoopsBluesGarage|18/07/2026, 01:44
+update|MAContent10_AssetPack_0325_AppleLoopsGarageBand1|18/07/2026, 01:44
+update|MAContent10_AssetPack_0354_EXS_PianoSteinway|18/07/2026, 01:44
+update|MAContent10_AssetPack_0357_EXS_BassAcousticUprightJazz|18/07/2026, 01:44
+update|MAContent10_AssetPack_0358_EXS_BassElectricFingerStyle|18/07/2026, 01:44
+update|MAContent10_AssetPack_0371_EXS_GuitarsAcoustic|18/07/2026, 01:44
+update|MAContent10_AssetPack_0375_EXS_GuitarsVintageStrat|18/07/2026, 01:44
+update|MAContent10_AssetPack_0482_EXS_OrchWoodwindAltoSax|18/07/2026, 01:44
+update|MAContent10_AssetPack_0484_EXS_OrchWoodwindClarinetSolo|18/07/2026, 01:44
+update|MAContent10_AssetPack_0487_EXS_OrchWoodwindFluteSolo|18/07/2026, 01:44
+update|MAContent10_AssetPack_0491_EXS_OrchBrass|18/07/2026, 01:44
+update|MAContent10_AssetPack_0509_EXS_StringsEnsemble|18/07/2026, 01:44
+update|MAContent10_AssetPack_0536_DrummerClapsCowbell|18/07/2026, 01:44
+update|MAContent10_AssetPack_0537_DrummerShaker|18/07/2026, 01:44
+update|MAContent10_AssetPack_0538_DrummerSticks|18/07/2026, 01:44
+update|MAContent10_AssetPack_0539_DrummerTambourine|18/07/2026, 01:44
+update|MAContent10_AssetPack_0540_PlugInSettingsGB|18/07/2026, 01:45
+update|MAContent10_AssetPack_0554_AppleLoopsDiscoFunk2|18/07/2026, 01:45
+update|MAContent10_AssetPack_0557_IRsSharedAUX|18/07/2026, 01:45
+update|MAContent10_AssetPack_0560_LTPBasicPiano1|18/07/2026, 01:45
+update|MAContent10_AssetPack_0593_DrummerSoCalGBLogic|18/07/2026, 01:45
+update|MAContent10_AssetPack_0597_LTPChordTrainer|18/07/2026, 01:45
+update|MAContent10_AssetPack_0598_LTPBasicGuitar1|18/07/2026, 01:45
+update|MAContent10_AssetPack_0615_GBLogicAlchemyEssentials|18/07/2026, 01:45
+update|MAContent10_AssetPack_0637_AppleLoopsDrummerKyle|18/07/2026, 01:45
+update|MAContent10_AssetPack_0646_AppleLoopsDrummerElectronic|18/07/2026, 01:45
+update|MAContent10_AssetPack_0806_PlugInSettingsGBLogic|18/07/2026, 01:45
+update|MobileAssets|18/07/2026, 01:45
+update|Keynote|18/07/2026, 01:45
+update|Pages|18/07/2026, 01:46
+update|Numbers|18/07/2026, 01:46
+update|iMovie|18/07/2026, 01:47
+update|GarageBand|18/07/2026, 01:47
+update|XProtectCloudKitUpdate|19/08/2026, 15:56
+update|MRTConfigData|19/08/2026, 15:56
+update|XProtectPlistConfigData|19/08/2026, 15:56
+update|XProtectPayloads|19/08/2026, 15:56
+update|Gatekeeper Compatibility Data|19/08/2026, 15:56
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=missing
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=pending_reboot
+softwareupdate_restart|false|
+reboot_required|false|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=patch_connectivity
+target|https://swscan.apple.com|dns_ok|true|dns_ms|12|ip|2.16.176.247
+target|https://swscan.apple.com|tcp_ok|true|tcp_ms|22
+target|https://swdist.apple.com|dns_ok|true|dns_ms|2|ip|17.253.29.150
+target|https://swdist.apple.com|tcp_ok|true|tcp_ms|23
+summary|targets_tested|2|targets_reachable|2|targets_failed|0
+[result_status] UNDECLARED / UNKNOWN / 
+

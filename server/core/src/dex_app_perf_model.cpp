@@ -2,6 +2,8 @@
 
 #include "dex_perf_model.hpp" // kDexCohortFloor — the ONE cohort floor constant
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -9,6 +11,8 @@
 #include <utility>
 
 namespace yuzu::server {
+
+using json = nlohmann::json;
 
 bool app_perf_param_valid(std::string_view s) {
     if (s.size() > kAppPerfParamCap)
@@ -347,6 +351,35 @@ std::vector<AppPerfDeviceApp> app_perf_device_summaries(const std::vector<AppPer
                   return x.app_name < y.app_name;
               });
     return apps;
+}
+
+// ── MCP-only gap #2: per-device app-perf drill serializer (ADR-0031 WS-A4
+//    DexPerfApi seam, PR #4582 review — relocated here from the DEX signals
+//    seam's dex_read_builders.hpp/.cpp, which only ever parked it pending this
+//    seam's arrival) ────────────────────────────────────────────────────────
+
+std::string dex_device_app_perf_json(const std::string& agent_id, const std::string& app_filter,
+                                     const std::vector<AppPerfDailyRow>& rows,
+                                     bool audit_persisted) {
+    json arr = json::array();
+    for (const auto& r : rows) {
+        if (!app_filter.empty() && r.app_name != app_filter)
+            continue;
+        arr.push_back({{"app_name", r.app_name},
+                       {"version", r.version},
+                       {"day", r.day},
+                       {"samples", r.samples},
+                       {"instances_max", r.instances_max},
+                       {"cpu_avg", r.cpu_avg},
+                       {"cpu_max", r.cpu_max},
+                       {"ws_avg_bytes", r.ws_avg_bytes},
+                       {"ws_max_bytes", r.ws_max_bytes}});
+    }
+    json out{{"agent_id", agent_id}, {"app", app_filter}};
+    out["rows"] = std::move(arr);
+    if (!audit_persisted)
+        out["audit_persisted"] = false;
+    return out.dump();
 }
 
 } // namespace yuzu::server

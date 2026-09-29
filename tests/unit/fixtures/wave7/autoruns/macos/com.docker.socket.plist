@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>AssociatedBundleIdentifiers</key><array><string>com.docker.docker</string></array><key>KeepAlive</key><false/><key>Label</key><string>com.docker.socket</string><key>ProcessType</key><string>Background</string><key>Program</key><string>/Library/PrivilegedHelperTools/com.docker.socket</string><key>ProgramArguments</key><array><string>/Library/PrivilegedHelperTools/com.docker.socket</string><string>alex</string></array><key>RunAtLoad</key><true/><key>Version</key><string>1</string></dict></plist>

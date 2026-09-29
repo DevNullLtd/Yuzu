@@ -24,6 +24,7 @@
  */
 
 #include <yuzu/agent/dex_observer.hpp>
+#include <yuzu/agent/fork_lock.hpp> // global_fork_lock() — BR-001 popen guard (K-DEX-2)
 
 #if defined(__APPLE__)
 
@@ -135,7 +136,21 @@ std::string read_file(const std::string& path) {
 // escape the worker thread → std::terminate. The deleter is noexcept(pclose).
 using PipeHandle = std::unique_ptr<FILE, decltype(&::pclose)>;
 inline PipeHandle open_pipe(const std::string& cmd) {
-    return PipeHandle(::popen(cmd.c_str(), "r"), &::pclose);
+    // BR-001 (review K-DEX-2): popen() forks internally, so it is itself a
+    // launcher and must not overlap another launcher's non-CLOEXEC
+    // pipe-creation window. The hazard is CROSS-THREAD, not within this DEX
+    // worker: a concurrent run_bounded_subprocess() on another thread can fork
+    // while this popen()'s pipe fds are not yet CLOEXEC (or vice versa),
+    // wedging one side's read on a leaked fd. Take the process-global fork lock
+    // across JUST the popen() call — never across the read loop or pclose (see
+    // fork_lock.hpp's contract). Precedent: trigger_engine.cpp's macOS
+    // query_service_status uses exactly this guard.
+    FILE* fp = nullptr;
+    {
+        std::lock_guard<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+        fp = ::popen(cmd.c_str(), "r");
+    }
+    return PipeHandle(fp, &::pclose);
 }
 
 // Run a command and capture its full stdout (bounded — these are one-shot status
@@ -488,8 +503,11 @@ private:
     // filters server-side via the predicate, so the agent never sees the firehose.
     // `--start` is inclusive, so the boundary second can recur between polls — we
     // dedup it with the set of lines seen at exactly the checkpoint second.
-    // Runs on the worker thread only (timer-gated), so the ~0.7s popen never races
-    // anything; predicate + checkpoint are internally generated (no injection).
+    // Runs on the worker thread only (timer-gated). The popen() still forks, so
+    // it takes the process-global fork lock via open_pipe() to avoid the
+    // cross-thread BR-001 race with a concurrent run_bounded_subprocess launcher
+    // (timer-gating only rules out a race WITHIN this thread). Predicate +
+    // checkpoint are internally generated (no injection).
     void poll_oslog() {
         if (oslog_checkpoint_.empty())
             return;

@@ -1,0 +1,148 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/device/guardian",
+    "capability_id": "get.fragments-device-guardian",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/agents/{agent_id}/rules"
+    },
+    "mcp_twin": "get_guardian_device_guards",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/baseline-form",
+    "capability_id": "get.fragments-guardian-baseline-form",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-guardian-guards"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/baseline/{param}",
+    "capability_id": "post.fragments-guardian-baseline-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/baseline/{param}/delete",
+    "capability_id": "post.fragments-guardian-baseline-param-delete",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/baseline/{param}/deploy",
+    "capability_id": "post.fragments-guardian-baseline-param-deploy",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/baseline/{param}/edit",
+    "capability_id": "get.fragments-guardian-baseline-param-edit",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-guardian-guards,get.fragments-guardian-baseline-param-page"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/baseline/{param}/page",
+    "capability_id": "get.fragments-guardian-baseline-param-page",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#3266"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/baselines",
+    "capability_id": "get.fragments-guardian-baselines",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#3266"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/baselines",
+    "capability_id": "post.fragments-guardian-baselines",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/events",
+    "capability_id": "get.fragments-guardian-events",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/events"
+    },
+    "mcp_twin": "list_guardian_events",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/guard-form",
+    "capability_id": "get.fragments-guardian-guard-form",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/schemas"
+    },
+    "mcp_twin": "get_guardian_schemas",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/guard/{param}/enabled",
+    "capability_id": "post.fragments-guardian-guard-param-enabled",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/guard/{param}/page",
+    "capability_id": "get.fragments-guardian-guard-param-page",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/rules/{rule_id}/status"
+    },
+    "mcp_twin": "get_guardian_rule_status",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/guards",
+    "capability_id": "get.fragments-guardian-guards",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/rules"
+    },
+    "mcp_twin": "list_guardian_rules",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/guardian/guards",
+    "capability_id": "post.fragments-guardian-guards",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/guardian/status",
+    "capability_id": "get.fragments-guardian-status",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/guaranteed-state/status"
+    },
+    "mcp_twin": "get_guardian_status",
+    "status": "twinned"
+  }
+]

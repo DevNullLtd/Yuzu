@@ -1,0 +1,20 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 8ef7b004fc8a
+== action=state
+backend|appfirewall
+state|disabled
+pf|unknown
+ruleset|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=rules
+app|/usr/local/libexec/remotepairingdeviced|allow
+app|/usr/libexec/remoted|allow
+app|/usr/bin/python3|allow
+app|/usr/bin/ruby|allow
+app|/usr/sbin/cupsd|allow
+app|/usr/libexec/sharingd|allow
+app|/usr/libexec/sshd-keygen-wrapper|allow
+app|/usr/sbin/smbd|allow
+ruleset|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -6,15 +6,16 @@ analyze fleet-wide data without an external database.
 
 ## Storage
 
-Responses are stored in a dedicated SQLite database using WAL (Write-Ahead
-Logging) mode. Each response is recorded as a `StoredResponse` containing the
-agent identity, instruction metadata, execution status, result payload, and
-timing information.
+Responses are stored in the server's PostgreSQL substrate (schema
+`response_store`, ADR-0039 — see the "Storage substrate (PostgreSQL)" section
+below for the migration and retention details). Each response is recorded as a
+`StoredResponse` containing the agent identity, instruction metadata, execution
+status, result payload, and timing information.
 
 | Setting | Default | Description |
 |---|---|---|
-| Retention period | 90 days | Responses older than this are deleted by background cleanup |
-| Cleanup interval | 1 hour | How often the background thread prunes expired responses |
+| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`response_retention_days`) |
+| Reap cadence | ~1 hour | How often the shared maintenance thread runs the expired-response reap |
 
 ## Response structure
 
@@ -274,11 +275,31 @@ curl -s -b cookies.txt \
     done
 ```
 
+## Storage substrate (PostgreSQL, ADR-0039)
+
+Since the Postgres migration (ADR-0006/0039), responses live in the server's
+PostgreSQL database (schema `response_store`), not a local `responses.db`. Two
+operator-visible notes:
+
+- **History reset on cutover.** The legacy SQLite `responses.db` is **not**
+  migrated — response history is operational, TTL'd telemetry (skippable
+  backfill, ADR-0009), so on the upgrade to the Postgres substrate the
+  response history starts empty and refills as new commands run. The server
+  logs a one-time `response history reset on Postgres cutover` warning at
+  first boot. Executions-drawer and TAR views for commands issued before the
+  cutover will be empty; commands issued after are unaffected.
+- **Non-UTF-8 plugin output is sanitised.** A plugin can emit non-UTF-8 bytes
+  in its output/error; PostgreSQL `TEXT` requires valid UTF-8, so such bytes
+  are replaced with the Unicode replacement character (U+FFFD) at ingest. The
+  response row is still stored and still renders (defanged) — it is not
+  dropped or turned into a 500.
+
 ## Retention and cleanup
 
-Responses are retained for 90 days by default. A background thread runs every
-hour and deletes responses whose `timestamp` falls outside the retention
-window. Deletion is permanent.
+Responses are retained for 90 days by default. The server reaps responses
+whose TTL has expired on a periodic guarded sweep (clock-guarded and capped,
+so a skewed clock or a large backlog cannot mass-delete or stall — the same
+retention-guard shape the audit log uses). Deletion is permanent.
 
 To preserve data beyond the retention window, set up periodic exports using
 cron or a scheduled task:

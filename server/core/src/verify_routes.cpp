@@ -1,7 +1,7 @@
 #include "verify_routes.hpp"
 
-#include "app_perf_compare.hpp"   // build_comparison, PairedComparison
-#include "app_perf_daily_store.hpp" // kRetentionDays (window clamp)
+#include "app_perf_compare.hpp"  // app_perf_param_valid (PURE — no store dep)
+#include "http_route_sink.hpp"   // HttpRouteSink, HttplibRouteSink
 #include "rest_a4_envelope.hpp"   // detail::make_correlation_id
 #include "rest_audit.hpp"         // detail::emit_behavioral_audit (#1647 chokepoint)
 #include "verify_ui.hpp"
@@ -49,21 +49,28 @@ int parse_window(const httplib::Request& req) {
         if (end != w.c_str() && *end == '\0')
             window = static_cast<int>(v);
     }
-    return std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
+    return std::clamp(window, 1, kMaxWindowDays);
 }
 
 } // namespace
 
 void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                   GroupsFn groups_fn, AppPerfCohortFn cohort_fn, AuditFn audit_fn) {
+                                   GroupsFn groups_fn, AuditFn audit_fn, VerifyApiPtr api) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(groups_fn),
+                    std::move(audit_fn), std::move(api));
+}
+
+void VerifyRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                   GroupsFn groups_fn, AuditFn audit_fn, VerifyApiPtr api) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     groups_fn_ = std::move(groups_fn);
-    cohort_fn_ = std::move(cohort_fn);
     audit_fn_ = std::move(audit_fn);
+    api_ = std::move(api);
 
     // ── Config form — chrome; gates Infrastructure:Read like the /auto page ──
-    svr.Get("/fragments/auto/verify", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/auto/verify", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
@@ -75,7 +82,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     });
 
     // ── Aggregate result — reads DEX app-perf → GuaranteedState:Read ──
-    svr.Get("/fragments/auto/verify/run", [this](const httplib::Request& req,
+    sink.Get("/fragments/auto/verify/run", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;
@@ -106,21 +113,20 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
             return;
         }
         const int window = parse_window(req);
-        if (!cohort_fn_) {
+        if (!api_) {
             res.set_content(render_verify_note("The app-perf store is still warming up; retry."),
                             "text/html");
             return;
         }
-        auto cohort = cohort_fn_(group, app, baseline, candidate, window);
-        if (!cohort) { // AUTHORITATIVE degrade
+        VerifyCompareQuery q{group, app, baseline, candidate, window};
+        auto result = api_->compare(q);
+        if (!result) { // AUTHORITATIVE degrade
             res.set_content(
                 render_verify_note("The app-perf store could not be read just now; retry shortly."),
                 "text/html");
             return;
         }
-        const PairedComparison c =
-            build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                             yuzu::util::canon_version(candidate), window);
+        const PairedComparison& c = result->comparison;
         // OPERATIONAL audit, set-and-proceed (records who compared whose canary —
         // the accountability that stands in for the absent floor). The dashboard
         // proceeds even on a lost audit row (Sec-Audit-Failed header set); the
@@ -130,14 +136,14 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
         detail::emit_behavioral_audit(
             audit_fn_, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group,
             "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
-                audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                audit_token(candidate) + " cohort=" + std::to_string(result->member_count) +
                 " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
         const std::string drill_url =
             "/fragments/auto/verify/drill?group=" + url_encode(group) + "&app=" + url_encode(app) +
             "&baseline=" + url_encode(baseline) + "&candidate=" + url_encode(candidate) +
             "&window=" + std::to_string(window);
-        res.set_content(render_verify_result(c, cohort->member_count, cohort->truncated, app,
+        res.set_content(render_verify_result(c, result->member_count, result->truncated, app,
                                              baseline, candidate, window, drill_url),
                         "text/html");
     });
@@ -156,7 +162,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     // via the audited `GET /dex/devices/{id}/app-perf` — the cohort drill is a strict
     // subset, no NEW exposure. **If this surface is ever moved onto `scoped_perm_fn`,
     // the cohort here MUST be re-intersected with the caller's visible devices first.**
-    svr.Get("/fragments/auto/verify/drill", [this](const httplib::Request& req,
+    sink.Get("/fragments/auto/verify/drill", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;
@@ -182,13 +188,14 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
             return;
         }
         const int window = parse_window(req);
-        if (!cohort_fn_) {
+        if (!api_) {
             res.set_content(render_verify_note("The app-perf store is still warming up; retry."),
                             "text/html");
             return;
         }
-        auto cohort = cohort_fn_(group, app, baseline, candidate, window);
-        if (!cohort) {
+        VerifyCompareQuery q{group, app, baseline, candidate, window};
+        auto result = api_->compare(q);
+        if (!result) {
             res.set_content(
                 render_verify_note("The app-perf store could not be read just now; retry shortly."),
                 "text/html");
@@ -204,13 +211,10 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
                                       "GuaranteedState", group,
                                       "app=" + audit_token(app) + " base=" + audit_token(baseline) +
                                           " cand=" + audit_token(candidate) + " cid=" + cid);
-        const PairedComparison c =
-            build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                             yuzu::util::canon_version(candidate), window);
         // The drill is normally reached behind the /run banner, but a direct-URL hit
         // must carry the same truncation warning — a capped read drops machines here
         // too (gov round-2 consistency).
-        res.set_content(render_verify_drill(c, cohort->truncated), "text/html");
+        res.set_content(render_verify_drill(result->comparison, result->truncated), "text/html");
     });
 }
 

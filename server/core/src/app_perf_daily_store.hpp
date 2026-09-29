@@ -58,6 +58,8 @@
 /// A2-discoverable (openapi.json + tools/list), behind `GuaranteedState:Read` with
 /// per-device audit via `rest_audit.hpp` (fail-closed 503).
 
+#include "app_perf_types.hpp" // AppPerfVersionDeviceRow (ADR-0031 WS-A4 DexPerfApi split)
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -99,6 +101,17 @@ struct AppPerfDailyRow {
 /// (defense-in-depth — the agent canon+merges too, but the server is sole writer).
 [[nodiscard]] std::vector<AppPerfDailyRow> canon_merge_daily(std::vector<AppPerfDailyRow> rows);
 
+/// One device's MOST RECENT retained row for a specific `(app_name, version)` —
+/// backs `AppPerfDailyStore::list_devices_for_version`, the DEX app-perf trend's
+/// per-version "which devices" drill. Carries `agent_id` (unlike `AppPerfDailyRow`
+/// above, whose per-agent APIs make it implicit) because this is inherently a
+/// fan-out read across devices, not a per-agent one — same reason
+/// `AppPerfCohortRow` (app_perf_compare.hpp) is a distinct shape from
+/// `AppPerfDailyRow` rather than a reuse.
+// AppPerfVersionDeviceRow relocated to app_perf_types.hpp (ADR-0031 WS-A4
+// DexPerfApi split, PR #4582-review) — re-exported transitively via the
+// #include above, so every existing caller of this header is unaffected.
+
 class AppPerfDailyStore {
 public:
     /// Borrows the shared pool and runs the `app_perf_daily_store` schema
@@ -136,8 +149,46 @@ public:
     [[nodiscard]] std::optional<std::vector<AppPerfDailyRow>>
     get_agent_app_perf(std::string_view agent_id);
 
-    /// Drop one agent's daily rows (e.g. on agent removal). Best-effort.
-    void delete_agent(std::string_view agent_id);
+    /// Devices reporting `(app_name, version)` among their retained top-N daily
+    /// summaries, one row per device at its MOST RECENT reporting day for that
+    /// EXACT version — the version-row "which devices" drill for the DEX app-perf
+    /// trend (a fan-out read, distinct from `get_agent_app_perf`'s per-agent
+    /// shape). `version` is matched AS SUPPLIED — the caller canonicalizes it
+    /// first (same convention as `AppPerfCohortReader::get_cohort_rows`); `""` is
+    /// the valid "unknown version" bucket, NOT an "all versions" wildcard (unlike
+    /// `DexPerfApi::app_fleet_trend`'s `version` convention) — this drill is
+    /// always scoped to one exact version.
+    ///
+    /// `visible_agent_ids` mirrors the ADR-0017 admit-then-filter contract:
+    /// `nullopt` = no SQL filter (every reporting device); engaged (INCLUDING
+    /// empty) = restrict to exactly these agent_ids, pushed into the WHERE clause
+    /// so the filter applies BEFORE the row cap below — a post-fetch filter under
+    /// a capped query would silently drop in-scope rows sitting past the cap. A
+    /// present-but-empty set therefore yields zero rows (deny-all), never an
+    /// unfiltered read.
+    ///
+    /// Ordered by DESCENDING `cpu_avg` (the highest resource consumers first),
+    /// tiebreak `agent_id`, capped at a hard ceiling; `truncated` (out-param) is
+    /// set when the cap bit — the DROPPED rows are the LOWEST-cpu devices past the
+    /// cap, so a truncated read still surfaces the highest-consuming subset, never
+    /// an arbitrary one (mirrors `AppPerfCohortReader::get_cohort_rows`'s own
+    /// documented cap-drops-something contract, though that cap drops
+    /// alphabetically rather than by rank).
+    ///
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade, never a
+    /// silent empty. An empty `app_name` is a precondition miss -> empty value
+    /// (`version` alone may legitimately be `""`, so it is not itself a
+    /// precondition-miss signal).
+    [[nodiscard]] std::optional<std::vector<AppPerfVersionDeviceRow>>
+    list_devices_for_version(std::string_view app_name, std::string_view version,
+                             const std::optional<std::vector<std::string>>& visible_agent_ids,
+                             bool& truncated);
+
+    /// Drop one agent's daily rows (e.g. on agent removal). Returns true iff the
+    /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
+    /// a SQL failure — so the decommission cascade records Failed, not a false
+    /// "erased".
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// Retention horizon — rows with `day` older than this many days before the
     /// server's current UTC day are pruned on each `apply_daily`. Matches

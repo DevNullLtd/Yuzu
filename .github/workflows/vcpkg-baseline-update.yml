@@ -26,7 +26,7 @@ jobs:
       contents: write         # peter-evans/create-pull-request: commit + branch push
       pull-requests: write    # peter-evans/create-pull-request: open/update PR
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -74,13 +74,16 @@ jobs:
           set -euo pipefail
           old="$CURRENT_SHA"
           new="$LATEST_SHA"
-          # Every tracked reference of the baseline SHA. Keep in sync with
-          # the "grep -rl" check at the bottom of docs/dependency-updates.md.
+          # Every active tracked reference of the baseline SHA. Historical
+          # docs/reviews evidence is immutable. Keep this list covered by the
+          # hermetic toolchain-contract inventory test.
           files=(
             vcpkg.json
             vcpkg-configuration.json
-            CLAUDE.md
+            docs/build-guide.md
             .github/workflows/ci.yml
+            .github/workflows/fork-dynamic-review.yml
+            .github/workflows/nightly.yml
             .github/workflows/release.yml
             .github/workflows/codeql.yml
             .github/workflows/sanitizer-tests.yml
@@ -88,6 +91,8 @@ jobs:
             deploy/docker/Dockerfile.runner-linux
             deploy/docker/Dockerfile.ci
             deploy/windows/Provision-Windows-Runner.ps1
+            deploy/windows/toolchain-contract.json
+            deploy/macos/README.md
           )
           # sed -i works because SHAs are globally unique 40-char strings.
           sed -i "s/${old}/${new}/g" "${files[@]}"
@@ -117,11 +122,15 @@ jobs:
             - Old: `${{ steps.current.outputs.sha }}`
             - New: `${{ steps.latest.outputs.sha }}`
 
-            Updates every tracked reference of the baseline SHA:
+            Updates every active tracked reference of the baseline SHA
+            (historical `docs/reviews/` evidence remains frozen):
             - `vcpkg.json` `builtin-baseline`
             - `vcpkg-configuration.json` default registry `baseline`
+            - `AGENTS.md` vcpkg documentation line
             - `CLAUDE.md` vcpkg documentation line
             - `.github/workflows/ci.yml` `VCPKG_COMMIT`
+            - `.github/workflows/fork-dynamic-review.yml` `VCPKG_COMMIT`
+            - `.github/workflows/nightly.yml` `VCPKG_COMMIT`
             - `.github/workflows/release.yml` `VCPKG_COMMIT`
             - `.github/workflows/codeql.yml` `VCPKG_COMMIT`
             - `.github/workflows/sanitizer-tests.yml` `VCPKG_COMMIT`
@@ -129,6 +138,7 @@ jobs:
             - `deploy/docker/Dockerfile.runner-linux` `VCPKG_COMMIT` ARG
             - `deploy/docker/Dockerfile.ci` `VCPKG_COMMIT` ENV
             - `deploy/windows/Provision-Windows-Runner.ps1` `$VcpkgBaseline` param
+            - `deploy/windows/toolchain-contract.json` `vcpkg_baseline` pin
 
             CI will re-resolve every vcpkg port against the new baseline. If
             any downstream port now fails to build, **revert this PR** and

@@ -1,0 +1,23 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 25220299bc79
+== action=usb
+usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|7423J07|super+|1
+usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|7423J07|high|1
+[result_status] OK / FULL / 
+
+== action=pci
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(2:2)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge
+pci|0:2:0(1:1)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge
+pci|1:0:0|14e4|1682|020000|14e4|1682|BCM5701Enet|ethernet
+pci|2:0:0|14e4|4434|028000|106b|4388|IOUserService|pci14e4,4434
+pci|2:0:1|14e4|5f72|028000|106b|4388|AppleConvergedPCI|pci14e4,5f72
+[result_status] OK / FULL / 
+
+== action=thunderbolt
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-
+[result_status] OK / FULL / 
+

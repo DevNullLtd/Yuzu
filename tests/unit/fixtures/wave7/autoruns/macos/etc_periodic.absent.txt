@@ -1,0 +1,6 @@
+ABSENT: /etc/periodic (and /private/etc/periodic) does not exist on this host.
+Apple removed the periodic(8) daily/weekly/monthly script framework from
+recent macOS releases (verified absent on macOS 26.5.1 / Darwin 25.5.0,
+2026-09-06 — `ls /private/etc/periodic` returns "No such file or directory",
+and no /etc/defaults/periodic.conf or /etc/periodic.conf exists either).
+This is a genuinely absent case for this OS version, not a capture failure.

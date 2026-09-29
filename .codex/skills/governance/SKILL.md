@@ -24,7 +24,9 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 7. Findings resolution: consolidate findings and fix blocking items.
 8. Iteration and ledger: re-run affected gates, record deferrals, and make the blocking decision.
 
-Blocking contract: CRITICAL/HIGH security findings block. Any `BLOCKING` docs finding blocks user-facing changes. `BLOCKING` from Gate 4-6 blocks. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
+Blocking contract: **identical to the Claude runner — load it, do not restate it.** Read the "Shared preamble" severity block in `.claude/skills/governance/SKILL.md` and apply it verbatim: severity is DERIVED from TRIGGER + IMPACT + EXPOSURE + EPISTEMIC STATUS per that block's own closed lists (do not enumerate the IMPACT/EXPOSURE codes here — a second copy of the list is exactly the restatement the next line forbids), `BLOCKING` = a derived band of CRITICAL or HIGH, and the policy floors gate independently of the derivation. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
+
+This file MUST NOT carry its own copy of the severity rule. The two runners advertise parity; a second copy is how they drifted into enforcing different gates (found in #2623 re-review).
 
 ## Gate 1 Output
 
@@ -43,11 +45,11 @@ Include:
 
 Use compact role prompts and include the Gate 1 summary plus prior gate findings as context.
 
-- `security-guardian`: read every modified file; check authz, ownership, validation, audit, command execution, path handling, crypto, secret handling, sibling handler parity, and new error branches. For C++ diffs, also require an ownership proof for every raw resource boundary: fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL/BCrypt object, allocated C string, thread, callback context, subprocess, mapped library, and temp path must have exactly one owner; manual cleanup in new/touched code is blocking unless wrapped in a small RAII/scope guard or justified as impossible; every early return between acquire and release must be checked. Findings use CRITICAL/HIGH/MEDIUM/LOW/INFO with file:line and recommended fix.
+- `security-guardian`: read every modified file; check authz, ownership, validation, audit, command execution, path handling, crypto, secret handling, sibling handler parity, and new error branches. For C++ diffs, also require an ownership proof for every raw resource boundary: fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL/BCrypt object, allocated C string, thread, callback context, subprocess, mapped library, and temp path must have exactly one owner; manual cleanup must be wrapped in a small RAII/scope guard; every early return between acquire and release must be checked. Findings use CRITICAL/HIGH/MEDIUM/LOW/INFO with file:line and recommended fix. Gating is decided by the canonical derived band and policy floors, never by this prompt.
 - `docs-writer`: check REST docs, user manual, CHANGELOG, upgrade notes, permission/audit/error tables, and operator workflow docs. Findings use BLOCKING/SHOULD-FIX/NICE-TO-HAVE.
 - `architect`: public contracts, stores, REST boundaries, schema, lifecycle, coupling, and hard-to-reverse design.
 - `cpp-expert`: C++23 correctness, idioms, standard-library use, ABI boundaries, threading primitives, and cross-compiler portability across GCC, Clang, MSVC, and Apple Clang.
-- `cpp-safety`: RAII ownership, lifetime, move/copy semantics, C ABI boundaries, `std::string_view`/`std::span` validity, cast safety, thread lifetime, syscall/process boundaries, shell execution, and sanitizer coverage. BLOCKING for leaks, double-close risk, UAF risk, unjoined/detached thread ambiguity, unsafe shell construction, or borrowed data escaping its owner.
+- `cpp-safety`: RAII ownership, lifetime, move/copy semantics, C ABI boundaries, `std::string_view`/`std::span` validity, cast safety, thread lifetime, syscall/process boundaries, shell execution, and sanitizer coverage. Leaks, double-close risk, UAF risk, unjoined/detached thread ambiguity, unsafe shell construction and borrowed data escaping its owner are policy floors under the canonical rule — report them; the floor, not this prompt, is what gates.
 - `quality-engineer`: test seams, integration coverage, fixture isolation, flaky patterns, temp DB/path hygiene, weak assertions. For C++ safety-sensitive changes, require coverage for cleanup paths, partial failure, short read/write, EINTR, failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and concurrent teardown where relevant; for new RAII wrappers, require a test or compile-time assertion covering move-only/non-copyable behavior when feasible.
 - `build-ci`: Meson, vcpkg, workflows, release scripts, runner assumptions, cache behavior.
 - `plugin-developer`: plugin descriptors, SDK boundaries, YAML definitions, plugin execution behavior.
@@ -74,7 +76,13 @@ Use `$yuzu-proto`, `$yuzu-plugin-abi`, `$yuzu-meson`, `$yuzu-windows-msvc`, and 
 
 ## Ledger
 
-End with a governance ledger:
+Write the per-finding JSONL fragment exactly as the canonical skill specifies — the recipe
+and the field table both live in `.claude/skills/governance/SKILL.md` under Gate 8, and are
+deliberately not restated here. Default location `governance.d/`, committed with the work
+it reviews; `YUZU_GOV_LOG_DIR` redirects a throwaway local run outside the tree. A Codex
+governance pass that produces no fragment has not finished.
+
+Then end with a human-readable governance ledger:
 
 - Gate status table: role, result, blocking count, deferred count
 - Blocking findings with owner/fix status

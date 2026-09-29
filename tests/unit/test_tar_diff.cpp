@@ -230,6 +230,105 @@ TEST_CASE("TAR diff: removed service detected", "[tar][diff][service]") {
     CHECK(events[0].event_action == "stopped");
 }
 
+// ── Finding 3 (adversarial-review round 5): a Windows per-service
+// OpenServiceW/QueryServiceConfigW failure must never manufacture a
+// diffable startup_type change. ServiceInfo::startup_type_query_failed
+// marks a row whose startup_type came from a FAILED query rather than a
+// genuine observation; compute_service_diff/compute_service_events must
+// both exclude such a row's startup_type from the change comparison, in
+// both directions (the transient failure, and the recovery on the next
+// successful read).
+
+TEST_CASE("TAR diff: a startup_type-query-failure row does NOT produce a "
+          "state_changed event even though startup_type literally differs "
+          "(compute_service_diff)",
+          "[tar][diff][service][finding3]") {
+    ServiceInfo automatic;
+    automatic.name = "spooler";
+    automatic.display_name = "Print Spooler";
+    automatic.status = "running";
+    automatic.startup_type = "automatic";
+    automatic.startup_type_query_failed = false;
+
+    ServiceInfo query_failed = automatic;
+    query_failed.startup_type = "unknown";
+    query_failed.startup_type_query_failed = true; // transient per-service query failure
+
+    std::vector<ServiceInfo> prev = {automatic};
+    std::vector<ServiceInfo> curr = {query_failed};
+
+    auto events = compute_service_diff(prev, curr, 11000, 11);
+    CHECK(events.empty());
+}
+
+TEST_CASE("TAR diff: recovery from a startup_type-query-failure row does NOT "
+          "produce a false inverse state_changed event "
+          "(compute_service_diff)",
+          "[tar][diff][service][finding3]") {
+    ServiceInfo query_failed;
+    query_failed.name = "spooler";
+    query_failed.display_name = "Print Spooler";
+    query_failed.status = "running";
+    query_failed.startup_type = "unknown";
+    query_failed.startup_type_query_failed = true;
+
+    ServiceInfo automatic = query_failed;
+    automatic.startup_type = "automatic";
+    automatic.startup_type_query_failed = false; // the query succeeded this time
+
+    std::vector<ServiceInfo> prev = {query_failed};
+    std::vector<ServiceInfo> curr = {automatic};
+
+    auto events = compute_service_diff(prev, curr, 12000, 12);
+    CHECK(events.empty());
+}
+
+TEST_CASE("TAR diff: a status change still fires alongside a suppressed "
+          "startup_type-query-failure (compute_service_diff)",
+          "[tar][diff][service][finding3]") {
+    ServiceInfo running;
+    running.name = "spooler";
+    running.display_name = "Print Spooler";
+    running.status = "running";
+    running.startup_type = "automatic";
+    running.startup_type_query_failed = false;
+
+    ServiceInfo stopped_query_failed = running;
+    stopped_query_failed.status = "stopped";
+    stopped_query_failed.startup_type = "unknown";
+    stopped_query_failed.startup_type_query_failed = true;
+
+    std::vector<ServiceInfo> prev = {running};
+    std::vector<ServiceInfo> curr = {stopped_query_failed};
+
+    auto events = compute_service_diff(prev, curr, 13000, 13);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_action == "state_changed");
+    CHECK(events[0].detail_json.find("\"status\":\"stopped\"") != std::string::npos);
+}
+
+TEST_CASE("TAR diff: same startup_type_query_failed guard holds for "
+          "compute_service_events, the real production call site "
+          "do_snapshot uses",
+          "[tar][diff][service][finding3]") {
+    ServiceInfo automatic;
+    automatic.name = "spooler";
+    automatic.display_name = "Print Spooler";
+    automatic.status = "running";
+    automatic.startup_type = "automatic";
+    automatic.startup_type_query_failed = false;
+
+    ServiceInfo query_failed = automatic;
+    query_failed.startup_type = "unknown";
+    query_failed.startup_type_query_failed = true;
+
+    std::vector<ServiceInfo> prev = {automatic};
+    std::vector<ServiceInfo> curr = {query_failed};
+
+    auto events = compute_service_events(prev, curr, 14000, 14);
+    CHECK(events.empty());
+}
+
 // =============================================================================
 // User diff tests
 // =============================================================================

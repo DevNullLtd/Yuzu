@@ -1,0 +1,958 @@
+{
+  "actions": [
+    {
+      "action": "cleanup",
+      "definition_ids": [
+        "agent.content_dist.cleanup"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "execute_staged",
+      "definition_ids": [
+        "agent.content_dist.execute_staged"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec (execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script re-open; native executables only",
+          "mechanism": "subprocess_runner:staged_payload",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:staged_payload",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:staged_payload",
+          "rung": "2",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_staged",
+      "definition_ids": [
+        "agent.content_dist.list_staged"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "stage",
+      "definition_ids": [
+        "agent.content_dist.stage"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "requires OpenSSL to be found at build time; HTTPS unavailable if absent",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    },
+    {
+      "action": "upload_file",
+      "definition_ids": [
+        "agent.content_dist.upload_file"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "requires OpenSSL to be found at build time; HTTPS unavailable if absent",
+          "mechanism": "httplib_tls",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`cleanup`'s `filename` parameter is dead code.** The definition declares `filename` for targeted removal, but `do_cleanup` (`content_dist_plugin.cpp:1179-1209`) only ever reads an undeclared `hours` parameter and sweeps the whole staging directory by age (default 24h) — a single-file removal is not implemented today. The definition's description and the `filename` parameter now disclose this.",
+    "**`cleanup`'s declared result columns don't match its wire output.** `status` is never emitted — there is no `status|` line anywhere in `do_cleanup`, including on an hours-parse failure (silently ignored, not reported) — and the declared `files_removed` column is actually wired as `removed|<n>`.",
+    "**`execute_staged` rejects Linux shebang scripts by design — do not \"fix\" this.** B6 fd-exec (`execveat` with `AT_EMPTY_PATH`) gives the kernel no resolvable path for `binfmt_script` to build the interpreter's argv from; a `#!`-interpreted staged file is refused up front (`content_dist_exec_seam.hpp:81-105`) rather than spawn-failing opaquely. Stage a native executable instead.",
+    "**A residual hash-time-to-exec-time swap window is accepted, not closed (CDX-001).** The #808 KV hash re-verification and the seam's independent B6 open both target the same path but not the same fd; full closure needs the runner itself to accept a caller-supplied digest, deferred to a follow-up runner package (`content_dist_plugin.cpp:628-652`).",
+    "**Windows soft-terminate grace is configured but undeliverable.** `no_window=true` (restoring the deleted launcher's `CREATE_NO_WINDOW`) means a console-less child can never receive `GenerateConsoleCtrlEvent`/`CTRL_BREAK`, so the 30s grace is zeroed on the Windows path rather than claiming a grace the platform cannot deliver (`content_dist_exec_parsers.hpp:242-268`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Remove staged files older than an age cutoff (default 24 hours) from the agent's staging directory, evicting each removed file's KV-recorded hash alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only an \"hours\" value (undeclared below) to pick the cutoff — it never reads the filename parameter this definition declares, so a per-file targeted removal is not implemented today; see the plugin README's Caveats section.",
+      "display_name": "Cleanup Staged Files",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "agent.content_dist.cleanup",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Execute a previously staged file with optional arguments.",
+      "display_name": "Execute Staged File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "agent.content_dist.execute_staged",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "List all files in the agent's staging directory with size and hash.",
+      "display_name": "List Staged Files",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "agent.content_dist.list_staged",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Download a file to the agent's staging directory and verify its SHA256 hash.",
+      "display_name": "Stage Content",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "agent.content_dist.stage",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Upload a local file from the agent endpoint to the Yuzu server through the one-time upload-grant + authenticated chunked-receive protocol (PR1.6, CC-06): the operator mints a grant out of band (POST /api/v1/upload-grants) and passes its one-time grant_id/grant_secret here. The agent opens a session against that grant, streams the file in bounded chunks honouring the server's declared chunk size, and commits with a SHA-256 computed from the exact bytes acknowledged. There is no server_url parameter — the destination is derived entirely from the grant and the agent's own configured server transport (agent.server_web_url), and the connection is always TLS.",
+      "display_name": "Upload File to Server",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "agent.content_dist.upload_file",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Content staging — download, verify, execute, and manage staged files (no shell-out)",
+  "how_it_works": "`stage` downloads over a raw httplib socket it opens itself (no shell), verifies the SHA-256 against the caller-supplied `sha256`, and — only once verified — persists that hash into agent KV under `staged_hash:<filename>` so a later `execute_staged` has a source of truth the staging-dir attacker can't also rewrite (`content_dist_plugin.cpp:529-540`, #808). `execute_staged` re-verifies the hash from KV (never trusts a caller-supplied hash), rejects a shebang-interpreted script on Linux before it ever reaches the runner (B6 fd-exec has no resolvable path for `binfmt_script`), chmods the file `0700` on POSIX, then execs it directly — no shell — via `yuzu::agent::run_bounded_subprocess` with a fixed 30-minute deadline. `list_staged` and `cleanup` are plain `std::filesystem` walks of the same staging directory; `cleanup` removes files older than an age cutoff and evicts their KV hash entry alongside them. `upload_file` is an unrelated protocol: it drives a session-open/chunk/commit/cancel exchange against the agent's own configured server URL (never an operator-supplied one) using a one-time `grant_id`/`grant_secret`, hashing the exact bytes each chunk transmitted as it is acknowledged.\n\nDeliberately not: a shell. No action here ever invokes `/bin/sh`, `cmd.exe`, or any interpreter — downloads and uploads are direct socket clients, execution is a direct argv exec. Deliberately not: a general file manager — every filesystem action is scoped to the plugin's own `staging_dir()`.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.cleanup",
+      "description": "Declared but NOT read by the current implementation (content_dist_plugin.cpp's do_cleanup only reads \"hours\") — setting this parameter has no effect on which files are removed. Left in place for API compatibility; see the plugin README's Caveats section.\n",
+      "name": "filename",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.execute_staged",
+      "description": "Name of a previously staged file, e.g. pkg-1.2.3.msi. Must already have a verified hash on record from a prior stage action (agent KV key staged_hash:<filename>) — the hash is re-verified against that record, not against this parameter, before anything runs.\n",
+      "name": "filename",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.execute_staged",
+      "description": "Optional whitespace-separated argv tail, e.g. \"/quiet /norestart\". Never shell-parsed (no quoting/escaping); rejected outright if it contains a shell metacharacter such as ; | & ` $ ( ) { } < >.\n",
+      "name": "args",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.stage",
+      "description": "Source URL, e.g. https://cdn.example.com/pkg-1.2.3.msi. Must start with http:// or https://; downloaded directly over a socket the agent opens itself, never via a shell command.\n",
+      "name": "url",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.stage",
+      "description": "Destination filename inside the agent's staging directory, e.g. pkg-1.2.3.msi. Alphanumeric, dots, hyphens, and underscores only (no path separators or \"..\"); any other character is refused.\n",
+      "name": "filename",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.content_dist.stage",
+      "description": "Lowercase hex SHA-256 the downloaded file must hash to, e.g. \"a94a8fe5ccb19ba61c4c0873d391e987982fbbd3...\". A mismatch deletes the downloaded file and fails the action; the verified hash is what execute_staged later re-checks from agent KV, not this parameter.\n",
+      "name": "sha256",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "agent.content_dist.upload_file",
+      "description": "The local file path on the endpoint to upload.\n",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": null,
+      "definition_id": "agent.content_dist.upload_file",
+      "description": "The one-time upload grant's id, minted operator-side via POST /api/v1/upload-grants. Paired with grant_secret to authenticate the session; both are revealed by the mint response exactly once.\n",
+      "name": "grant_id",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 128
+      },
+      "default": null,
+      "definition_id": "agent.content_dist.upload_file",
+      "description": "The one-time upload grant's secret, minted alongside grant_id. Never logged or echoed back by the server after the mint response.\n",
+      "name": "grant_secret",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "agent.content_dist.upload_file",
+      "description": "If set, path must resolve (after symlink canonicalisation) inside this directory, or the upload is refused before anything is read.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 1000,
+        "minimum": 1
+      },
+      "default": 100,
+      "definition_id": "agent.content_dist.upload_file",
+      "description": "Maximum allowed file size in megabytes, checked locally before the session opens. Default: 100.\n",
+      "name": "max_size_mb",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "590399d7174c",
+  "manifest_version": 1,
+  "name": "content_dist",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Declared but never emitted — do_cleanup writes only a \"removed|<n>\" line, no \"status|\" line at all, on every run (including a hours-parse failure, which is silently ignored rather than reported).\n",
+          "example": "-",
+          "name": "status",
+          "platforms": [],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Declared column name does not match the wire field: the actual emitted line is \"removed|<n>\", not \"files_removed|<n>\" — the count of files whose last-write time was older than the cutoff. Values: non-negative integer.",
+          "example": "-",
+          "name": "files_removed",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.content_dist.cleanup"
+    },
+    {
+      "columns": [
+        {
+          "description": "\"ok\" when the staged file exited 0, \"error\" for any nonzero exit, spawn failure, or a deadline/cancel kill. On an early rejection (not staged, no trusted hash, hash mismatch, unsafe args) this column is never emitted at all — only an \"error|<message>\" line is.\n",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ok",
+            "error"
+          ]
+        },
+        {
+          "description": "The staged process's exit code, or -1 for a spawn failure or a deadline/cancel kill (subprocess_runner's sentinel, never a real process exit status in that case). Values: process exit code, or -1.",
+          "example": "-",
+          "name": "exit_code",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Combined stdout+stderr, capped at 16 MiB, with a \"[output truncated at 16 MiB]\" and/or \"[terminated: deadline exceeded]\"/\"[terminated: cancelled]\" annotation appended when applicable. Omitted entirely (no output| line at all) when the captured text is empty. Values: free text, truncated/terminated annotations, or omitted.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.content_dist.execute_staged"
+    },
+    {
+      "columns": [
+        {
+          "description": "Filename of one staged file (relative, no path). One row per file in the staging directory; a \"count|<n>\" summary line follows the last row and is not itself a declared column. An empty directory emits zero rows and count|0, never an error. Values: free text.",
+          "example": "-",
+          "name": "file",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "File size in bytes, from std::filesystem::file_size. Values: non-negative integer.",
+          "example": "-",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Lowercase hex SHA-256 of the file's current on-disk contents, recomputed on every list_staged call (not cached from stage time). Values: 64 lowercase hex characters.",
+          "example": "-",
+          "name": "sha256",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.content_dist.list_staged"
+    },
+    {
+      "columns": [
+        {
+          "description": "Literal \"ok\" on a verified download. content_dist never writes \"status|error\" — a failure instead replaces this whole line with a single unstructured \"error|<message>\" line, so a failed stage never populates this column at all.\n",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ok"
+          ]
+        },
+        {
+          "description": "Absolute filesystem path of the downloaded, hash-verified file under the agent's staging directory (content_dist_plugin.cpp's staging_dir(): <agent.data_dir>/staged, or a temp-dir fallback). Only present on success — no captured sample shows a populated value. Values: absolute path.",
+          "example": "-",
+          "name": "staged_path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.content_dist.stage"
+    },
+    {
+      "columns": [
+        {
+          "description": "Outcome of the upload; the only value the plugin emits on success (content_dist_plugin.cpp:1171).",
+          "example": "not observed in any capture (every capture failed at parameter validation, before this line could be reached)",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ok"
+          ]
+        },
+        {
+          "description": "Server-confirmed SHA-256 digest of the committed upload, computed from the exact bytes the server acknowledged. Values: hex digest.",
+          "example": "not observed in any capture (every capture failed at parameter validation, before this line could be reached)",
+          "name": "sha256",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Server-reported size in bytes of the committed upload (commit_result.actual_size), which must match the local file size. Values: integer (bytes).",
+          "example": "not observed in any capture (every capture failed at parameter validation, before this line could be reached)",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Server-assigned session id from the upload grant, used to address the /api/v1/uploads/{id}/... endpoints. Values: free text (opaque session id).",
+          "example": "not observed in any capture (every capture failed at parameter validation, before this line could be reached)",
+          "name": "upload_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.content_dist.upload_file"
+    }
+  ],
+  "outputs_note": "Every action writes independent `key|value` lines via `ctx.write_output` — not a fixed-width pipe row like a collector's table. A validation or transport failure typically replaces the whole declared line set with a single unstructured `error|<message>` line rather than filling the declared columns with a placeholder value; there is no `-`-for-unknown convention in this plugin.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None.** Every action stays inside the agent-owned staging directory or a socket the agent opens itself.",
+      "if_refused": "no typed status — a filesystem/network failure surfaces as an `error|<message>` line, not a `PERMISSION_DENIED` result status",
+      "measured": "2026-09-07, bare-metal, as `SYSTEM` (`windows.txt`)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442); `execute_staged` runs as `YuzuAgent` (`docs/agent-privilege-model.md:121`)"
+    },
+    {
+      "grant": "**None.** `staging_dir()` creates the directory owner-only (`fs::perms::owner_all`, `content_dist_plugin.cpp:72-75`).",
+      "if_refused": "same — an `error|` line, no typed status",
+      "measured": "2026-09-07, bare-metal, euid 501 (`macos.txt`)",
+      "os": "macOS",
+      "runs_as": "agent daemon, unprivileged (`_yuzu`)"
+    },
+    {
+      "grant": "**None.** Same owner-only staging directory.",
+      "if_refused": "same — an `error|` line, no typed status",
+      "measured": "2026-09-06, container, euid 0 (`linux.txt`) — captured as root, not the unprivileged `yuzu` identity `execute_staged` actually runs as in production",
+      "os": "Linux",
+      "runs_as": "agent daemon, unprivileged (`yuzu`)"
+    }
+  ],
+  "readme": "agents/plugins/content_dist/README.md",
+  "result_status": [
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "`execute_staged` only: the runner never confirmed exec (missing/non-executable staged file, or a Linux B6 exec_verify rejection)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:deadline`",
+      "status": "`CONSTRAINED`",
+      "when": "`execute_staged` only: the fixed 30-minute deadline fired and the process was killed"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:cancelled`",
+      "status": "`CONSTRAINED`",
+      "when": "`execute_staged` only: a cancellation reached the runner mid-run"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:signaled`",
+      "status": "`CONSTRAINED`",
+      "when": "`execute_staged` only: the staged process died of a signal it received itself"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:line_limit`",
+      "status": "`OK`",
+      "when": "never reached for this plugin — `content_dist` never sets `max_lines`/`stop_after_max_lines` (`content_dist_exec_parsers.hpp:288-291`)"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "stage",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: url, filename, sha256"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "execute_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameter: filename"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cleanup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "upload_file",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: path, grant_id, grant_secret"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "590399d7174c",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "stage",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: url, filename, sha256"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "execute_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameter: filename"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cleanup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "upload_file",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: path, grant_id, grant_secret"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "590399d7174c",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "stage",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: url, filename, sha256"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "execute_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameter: filename"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_staged",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cleanup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "upload_file",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|missing required parameters: path, grant_id, grant_secret"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "590399d7174c",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "stage",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "High",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "execute_staged",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Execute",
+      "risk_tier": "High",
+      "securable": "Execution"
+    },
+    {
+      "action": "list_staged",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "cleanup",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "upload_file",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "High",
+      "securable": "FileRetrieval"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_content_dist.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/content_dist.yaml",
+      "content/definitions/t2_capabilities.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/content_dist/src/content_dist_exec_parsers.hpp",
+      "agents/plugins/content_dist/src/content_dist_exec_seam.hpp",
+      "agents/plugins/content_dist/src/content_dist_plugin.cpp",
+      "agents/plugins/content_dist/src/content_dist_upload_parsers.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_content_dist_actions.cpp",
+      "tests/unit/test_content_dist_exec_parsers.cpp",
+      "tests/unit/test_content_dist_exec_seam.cpp",
+      "tests/unit/test_content_dist_exec_seam_win.cpp",
+      "tests/unit/test_content_dist_upload_parsers.cpp"
+    ]
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result, and the `/auto` Deploy engine.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore. `content_dist.stage`/`execute_staged` are additionally dispatched by the `/auto` Deploy engine (`server/core/src/deployment_engine.cpp:306,331`), which parses this exact wire contract via `server/core/src/deployment_parse.hpp:17-25` to drive its own per-device state machine — `content_dist` needed no new agent code for that surface.",
+    "**`upload_file`'s `grant_id`/`grant_secret` are redacted before any persisted audit/history copy** (`server/core/src/sensitive_instruction_params.hpp:6`) — never logged or stored beyond the upload store's own hashed record.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics.",
+    "**Sensitivity.** `execute_staged`'s `output` line is the combined stdout+stderr of whatever binary the caller staged and ran — it can carry anything that process prints, including usernames, hostnames, or credentials — but the plugin's own declared columns (`staged_path`, `file`, `sha256`, `upload_id`) carry only caller-chosen filenames and content hashes, nothing that independently identifies a device, a person, or installed software.",
+    "**Siblings:** none in this catalogue — `execute_staged` is the only \"run an arbitrary binary\" action here; compare `script_exec.exec` for ad hoc admin commands/scripts.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"agent.content_dist.execute_staged\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`; `content_dist.stage`/`execute_staged` results are also polled by the `/auto` Deploy engine's `deployment_run_store`."
+  ]
+}

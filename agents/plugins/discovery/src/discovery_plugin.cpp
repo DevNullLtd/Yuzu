@@ -7,17 +7,25 @@
  * Output is pipe-delimited via write_output():
  *   host|ip_address|mac_address|hostname|managed
  *
- * Platform support:
- *   Windows — arp -a parsing + ping sweep via subprocess
- *   Linux   — arp -n parsing + ping sweep via subprocess
- *   macOS   — arp -a parsing + ping sweep via subprocess
+ * Platform support (zero spawn sites, all native/rung 1):
+ *   Windows — GetIpNetTable2 ARP read + IcmpSendEcho ping sweep.
+ *   Linux   — /proc/net/arp read + unprivileged SOCK_DGRAM ICMP ping sweep
+ *             (net.ipv4.ping_group_range-gated; see the honest-degrade
+ *             branch in do_scan_subnet for the CONSTRAINED/UNAVAILABLE
+ *             fallback when the kernel refuses the socket).
+ *   macOS   — sysctl NET_RT_FLAGS/RTF_LLINFO ARP read + SOCK_DGRAM ICMP
+ *             ping sweep.
  *
- * Input validation: subnet parameter is validated as a CIDR block.
- * Only alphanumeric, dots, slashes, and colons are allowed to prevent
- * command injection.
+ * Input validation: the subnet parameter is validated as a CIDR block —
+ * digits, dots and a single slash only (is_valid_cidr), then re-parsed into
+ * octets and a prefix length. There is no longer a shell to inject into (the
+ * action spawns nothing at all); the validation is retained because every
+ * downstream step — host enumeration, inet_pton, the ICMP destination — is
+ * entitled to assume a well-formed dotted quad.
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (governance Gate 2)
 
 #include <algorithm>
 #include <array>
@@ -26,7 +34,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -44,10 +55,41 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 (tar_arp_collector.cpp precedent)
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
+
+#include "icmp_probe.hpp" // yuzu::shared::IcmpSession — shared unprivileged ping sweep
+
+#include "bounded_wait.hpp"        // yuzu::shared::bounded_call — uncancellable-call timeout
+#include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
+
+// Portable (no platform guard of its own): parse_proc_net_arp for the Linux
+// leg, format_mac48 + is_resolved_arp_row for the Windows leg.
+#include "discovery_parsers.hpp"
+
+#ifdef _WIN32
+// Pin discovery_parsers.hpp's portable ArpRowStateMirror values against the
+// real NL_NEIGHBOR_STATE enum (governance-deferred #3249) — is_resolved_arp_row
+// is fixture-tested off-Windows against literal ints because this header has
+// no <netioapi.h> dependency; these static_asserts are what makes that safe:
+// if a future Windows SDK ever renumbered the enum, this build breaks loudly
+// here rather than get_arp_table() silently misclassifying every row.
+static_assert(static_cast<int>(NlnsUnreachable) == yuzu::discovery::kNlnsUnreachable);
+static_assert(static_cast<int>(NlnsIncomplete) == yuzu::discovery::kNlnsIncomplete);
+static_assert(static_cast<int>(NlnsProbe) == yuzu::discovery::kNlnsProbe);
+static_assert(static_cast<int>(NlnsDelay) == yuzu::discovery::kNlnsDelay);
+static_assert(static_cast<int>(NlnsStale) == yuzu::discovery::kNlnsStale);
+static_assert(static_cast<int>(NlnsReachable) == yuzu::discovery::kNlnsReachable);
+static_assert(static_cast<int>(NlnsPermanent) == yuzu::discovery::kNlnsPermanent);
+static_assert(static_cast<int>(NlnsMaximum) == yuzu::discovery::kNlnsMaximum);
+#endif
+
+#ifdef __APPLE__
+#include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo — sysctl ARP read
 #endif
 
 namespace {
@@ -142,31 +184,27 @@ std::vector<std::string> enumerate_hosts(uint32_t base_ip, int prefix_len) {
     return result;
 }
 
-// ── subprocess helper ──────────────────────────────────────────────────────
-
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe) return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    return result;
-}
-
 struct ArpEntry {
     std::string ip;
     std::string mac;
+};
+
+/**
+ * An ARP-table read that reports its own health.
+ *
+ * `ok=false`  — the acquisition FAILED (GetIpNetTable2 error, /proc/net/arp
+ *               unopenable, sysctl error). NOT the same as an empty table.
+ * `complete=false` — the table was read but is known to be partial.
+ *
+ * Every leg previously returned a bare empty vector for all three of "no
+ * neighbours", "the API failed" and "the parse stopped early", so a scan whose
+ * ARP half never ran reported a clean result with no machine-readable reason
+ * (/adversarial-review Codex CDX-3, Kimi F6).
+ */
+struct ArpRead {
+    std::vector<ArpEntry> entries;
+    bool ok{true};
+    bool complete{true};
 };
 
 // ── ARP table parsing ─────────────────────────────────────────────────────
@@ -174,122 +212,112 @@ struct ArpEntry {
 #ifdef _WIN32
 
 /**
- * Parse Windows ARP table. Windows `arp -a` output format:
- *   Interface: 192.168.1.100 --- 0xb
- *     Internet Address      Physical Address      Type
- *     192.168.1.1           aa-bb-cc-dd-ee-ff     dynamic
+ * Read the Windows ARP table via GetIpNetTable2(AF_INET) — the neighbour
+ * cache, native (no popen). FreeMibTable is called on every exit path.
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
+ArpRead get_arp_table() {
+    ArpRead out;
 
-    // Use Win32 API for reliable ARP table access
-    DWORD size = 0;
-    GetIpNetTable(nullptr, &size, FALSE);
-    if (size == 0) return entries;
+    PMIB_IPNET_TABLE2 table = nullptr;
+    DWORD rc = GetIpNetTable2(AF_INET, &table);
+    // RAII: FreeMibTable runs on every exit path below, early returns
+    // included, without needing to remember to call it manually.
+    std::unique_ptr<MIB_IPNET_TABLE2, decltype(&FreeMibTable)> table_owner{
+        table, &FreeMibTable};
+    if (rc != NO_ERROR || table == nullptr) {
+        out.ok = false; // the API failed — NOT an empty neighbour cache
+        return out;
+    }
 
-    std::vector<BYTE> buffer(size);
-    if (GetIpNetTable(reinterpret_cast<MIB_IPNETTABLE*>(buffer.data()),
-                      &size, FALSE) != NO_ERROR)
-        return entries;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IPNET_ROW2& row = table->Table[i];
 
-    auto* table = reinterpret_cast<MIB_IPNETTABLE*>(buffer.data());
-    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        auto& row = table->table[i];
-        // Only dynamic and static entries
-        if (row.dwType != MIB_IPNET_TYPE_DYNAMIC && row.dwType != MIB_IPNET_TYPE_STATIC)
+        // is_resolved_arp_row (discovery_parsers.hpp) — extracted so this
+        // accept/reject decision is fixture-tested off-Windows (#3249); see
+        // the static_asserts above pinning its portable state mirror against
+        // the real NL_NEIGHBOR_STATE enum.
+        if (!yuzu::discovery::is_resolved_arp_row(
+                static_cast<int>(row.State), static_cast<int>(row.PhysicalAddressLength)))
             continue;
 
-        struct in_addr addr{};
-        addr.S_un.S_addr = static_cast<ULONG>(row.dwAddr);
         char ip[INET_ADDRSTRLEN]{};
-        inet_ntop(AF_INET, &addr, ip, sizeof(ip));
+        if (!inet_ntop(AF_INET, const_cast<IN_ADDR*>(&row.Address.Ipv4.sin_addr), ip, sizeof(ip)))
+            continue;
 
-        // Format MAC address
-        if (row.dwPhysAddrLen >= 6) {
-            char mac[18]{};
-            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                     row.bPhysAddr[0], row.bPhysAddr[1], row.bPhysAddr[2],
-                     row.bPhysAddr[3], row.bPhysAddr[4], row.bPhysAddr[5]);
-            entries.push_back({ip, mac});
-        }
+        // format_mac48, not snprintf: printf-family calls are on
+        // docs/cpp-conventions.md's "Forbidden in new code" list, and the
+        // shared helper is portable so this formatting is unit-tested on
+        // every leg rather than only on Windows.
+        out.entries.push_back({ip, yuzu::discovery::format_mac48(row.PhysicalAddress)});
     }
-    return entries;
+
+    return out;
 }
 
 #elif defined(__APPLE__)
 
 /**
- * Parse macOS ARP table. macOS `arp -a` output format:
- *   ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
+ * Read the macOS ARP table via the routing socket sysctl
+ * (route_sysctl_arp.hpp) — the same data `arp -a` reads, native (no popen).
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
-    std::string output = run_command("arp -a 2>/dev/null");
-    std::istringstream iss(output);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        // Find IP in parentheses
-        auto paren_start = line.find('(');
-        auto paren_end = line.find(')');
-        if (paren_start == std::string::npos || paren_end == std::string::npos)
-            continue;
-
-        std::string ip = line.substr(paren_start + 1, paren_end - paren_start - 1);
-
-        // Find MAC after " at "
-        auto at_pos = line.find(" at ");
-        if (at_pos == std::string::npos) continue;
-        auto mac_start = at_pos + 4;
-        auto mac_end = line.find(' ', mac_start);
-        if (mac_end == std::string::npos) mac_end = line.size();
-        std::string mac = line.substr(mac_start, mac_end - mac_start);
-
-        if (mac != "(incomplete)" && !mac.empty())
-            entries.push_back({ip, mac});
+ArpRead get_arp_table() {
+    ArpRead out;
+    auto fetched = yuzu::shared::fetch_rt_flags_llinfo();
+    if (!fetched.ok) {
+        out.ok = false; // the sysctl failed — NOT an empty neighbour table
+        return out;
     }
-    return entries;
+    auto parsed = yuzu::shared::parse_rt_flags_llinfo(fetched.blob);
+    out.complete = !parsed.truncated;
+    for (auto& rec : parsed.records)
+        out.entries.push_back({std::move(rec.ip), std::move(rec.mac)});
+    return out;
 }
 
 #elif defined(__linux__)
 
 /**
- * Parse Linux ARP table. Linux `arp -n` output format:
- *   Address         HWtype  HWaddress           Flags Mask  Iface
- *   192.168.1.1     ether   aa:bb:cc:dd:ee:ff   C           eth0
+ * Read the Linux ARP table from /proc/net/arp (discovery_parsers.hpp) —
+ * native, no `arp -n` subprocess.
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
-    std::string output = run_command("arp -n 2>/dev/null");
-    std::istringstream iss(output);
-    std::string line;
-
-    // Skip header
-    std::getline(iss, line);
-
-    while (std::getline(iss, line)) {
-        std::istringstream lss(line);
-        std::string ip, hwtype, mac;
-        if (!(lss >> ip >> hwtype >> mac)) continue;
-        if (mac != "(incomplete)" && !mac.empty() && hwtype == "ether")
-            entries.push_back({ip, mac});
+ArpRead get_arp_table() {
+    ArpRead out;
+    std::ifstream in("/proc/net/arp");
+    if (!in) {
+        out.ok = false; // procfs absent or denied — NOT an empty table
+        return out;
     }
-    return entries;
+
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    if (in.bad()) {
+        out.ok = false; // read error mid-stream
+        return out;
+    }
+
+    for (auto& e : yuzu::discovery::parse_proc_net_arp(contents.str()))
+        out.entries.push_back({std::move(e.ip), std::move(e.mac)});
+    return out;
 }
 
 #else
 
-std::vector<ArpEntry> get_arp_table() {
-    return {};
+ArpRead get_arp_table() {
+    // No native ARP mechanism on this platform. Honest: the read did not
+    // happen, so it must not present as an empty neighbour table.
+    ArpRead out;
+    out.ok = false;
+    return out;
 }
 
 #endif
 
 // ── Hostname resolution ───────────────────────────────────────────────────
 
-std::string resolve_hostname(const std::string& ip) {
+namespace detail {
+
+std::string resolve_hostname_blocking(const std::string& ip) {
 #ifdef _WIN32
-    // Use getnameinfo
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
@@ -299,7 +327,6 @@ std::string resolve_hostname(const std::string& ip) {
         return host;
     }
 #else
-    // Use getaddrinfo reverse lookup
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
@@ -312,26 +339,83 @@ std::string resolve_hostname(const std::string& ip) {
     return {};
 }
 
+} // namespace detail
+
+// getnameinfo(..., NI_NAMEREQD) has no caller-supplied timeout, and a
+// black-holing (not refusing) reverse-DNS path can block it for the OS
+// resolver's own retry/nameserver/TCP-fallback envelope — potentially
+// minutes. Plugin execute() runs synchronously on the agent's bounded
+// ThreadPool with no per-task cancellation (governance Gate 4 unhappy-path
+// finding), so an unbounded call here can permanently pin a worker and,
+// under repeated/concurrent scans, exhaust the pool and stall every other
+// command dispatched to this agent. bounded_call() bounds the WAIT (the call
+// itself can't be cancelled) — see bounded_wait.hpp.
+constexpr std::chrono::milliseconds kHostnameLookupTimeout{5000};
+
+// nullopt distinguishes "the lookup timed out or was throttled by
+// bounded_call's ceiling" from a present-but-empty string ("no PTR record" —
+// a genuine, non-degraded answer from getnameinfo). Gate 6 SRE finding: the
+// two were previously collapsed into the same empty string, so a lookup that
+// silently degraded looked identical to a host with no reverse-DNS entry —
+// the one place this plugin's otherwise-thorough honest-degrade reporting
+// didn't reach, because the degrade is per-item rather than per-scan. The
+// caller aggregates degrades across the whole hostname-resolution pass.
+std::optional<std::string> resolve_hostname(const std::string& ip) {
+    return yuzu::shared::bounded_call(
+        kHostnameLookupTimeout, [ip] { return detail::resolve_hostname_blocking(ip); });
+}
+
 // ── Ping sweep ────────────────────────────────────────────────────────────
 
 /**
- * Ping a single host with a short timeout.
- * Returns true if the host responds.
+ * Sample one host over the shared ICMP session. Builds the destination
+ * address from the (already-validated, dotted-quad) IP string and delegates
+ * to yuzu::shared::IcmpSession::sample — no subprocess, no per-host socket.
  */
-bool ping_host(const std::string& ip, int timeout_ms) {
 #ifdef _WIN32
-    std::string cmd = std::format("ping -n 1 -w {} {} >NUL 2>NUL", timeout_ms, ip);
-    return system(cmd.c_str()) == 0;
-#elif defined(__APPLE__)
-    int timeout_sec = std::max(1, timeout_ms / 1000);
-    std::string cmd = std::format("ping -c 1 -t {} {} >/dev/null 2>&1", timeout_sec, ip);
-    return system(cmd.c_str()) == 0;
-#else
-    int timeout_sec = std::max(1, timeout_ms / 1000);
-    std::string cmd = std::format("ping -c 1 -W {} {} >/dev/null 2>&1", timeout_sec, ip);
-    return system(cmd.c_str()) == 0;
-#endif
+yuzu::shared::ProbeOutcome icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                       int timeout_ms) {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1)
+        return {std::nullopt, yuzu::shared::ProbeFailure::TransmitFailed};
+    return session.sample(addr.S_un.S_addr, timeout_ms);
 }
+#else
+yuzu::shared::ProbeOutcome icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                       int timeout_ms) {
+    sockaddr_in sin{};
+    sin.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip.c_str(), &sin.sin_addr) != 1)
+        return {std::nullopt, yuzu::shared::ProbeFailure::TransmitFailed};
+    return session.sample(sin, timeout_ms);
+}
+#endif
+
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// scan_subnet combines an ARP-table read with an ICMP ping sweep, all
+// native now (zero spawn sites, rung 1 on every platform): Windows reads
+// GetIpNetTable2 and pings via IcmpSendEcho; macOS reads the routing socket
+// (sysctl NET_RT_FLAGS/RTF_LLINFO) and pings via an unprivileged SOCK_DGRAM
+// ICMP socket; Linux reads /proc/net/arp and pings the same way, but the
+// ICMP socket depends on net.ipv4.ping_group_range admitting the agent's
+// gid — see do_scan_subnet's honest-degrade branch for the CONSTRAINED /
+// UNAVAILABLE fallback this leg documents.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "scan_subnet",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "/proc/net/arp + unprivileged SOCK_DGRAM ICMP",
+         "the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; "
+         "ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or "
+         "UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink "
+         "RTM_GETNEIGH is a recorded future promotion over /proc/net/arp"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2 + IcmpSendEcho", nullptr},
+    },
+};
 
 } // namespace
 
@@ -346,6 +430,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"scan_subnet", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
@@ -378,14 +469,22 @@ private:
             return 1;
         }
 
+        // A non-numeric timeout_ms used to be discarded in silence, so an
+        // automation template typo simply scanned with the default. Say so.
+        // No clamp here: probe_budget_ms() owns the bound (a second clamp to
+        // [100,10000] was dead — nothing can observe a value above the
+        // per-host ceiling).
         int timeout_ms = 1000;
         if (!timeout_str.empty()) {
-            std::from_chars(timeout_str.data(),
-                            timeout_str.data() + timeout_str.size(),
-                            timeout_ms);
+            const auto [p_end, ec] = std::from_chars(
+                timeout_str.data(), timeout_str.data() + timeout_str.size(), timeout_ms);
+            if (ec != std::errc{} || p_end != timeout_str.data() + timeout_str.size()) {
+                timeout_ms = 1000;
+                ctx.write_output(std::format(
+                    "status|warning|ignoring invalid timeout_ms '{}', using default 1000ms",
+                    timeout_str));
+            }
         }
-        if (timeout_ms < 100) timeout_ms = 100;
-        if (timeout_ms > 10000) timeout_ms = 10000;
 
         uint32_t base_ip = 0;
         int prefix_len = 0;
@@ -396,7 +495,17 @@ private:
 
         auto hosts = enumerate_hosts(base_ip, prefix_len);
         if (hosts.empty()) {
-            ctx.write_output("status|error|subnet too large (max /24) or no valid hosts");
+            // Two different refusals: a /16 is not "too large" as a prefix, and
+            // a /31 has no host bits at all. One message for both told an
+            // operator the subnet was invalid when the scan simply declines it.
+            if (prefix_len < 24)
+                ctx.write_output(std::format(
+                    "status|error|subnet has too many hosts to scan (/{} requested, /24 is the "
+                    "widest supported)",
+                    prefix_len));
+            else
+                ctx.write_output(std::format(
+                    "status|error|/{} contains no usable host addresses", prefix_len));
             return 1;
         }
 
@@ -407,13 +516,31 @@ private:
         auto scan_start = std::chrono::steady_clock::now();
         bool timed_out = false;
 
+        // Every degrade condition below is a CANDIDATE, accumulated by
+        // severity rather than applied to the ABI4 result seam immediately:
+        // more than one can independently fire in a single scan (e.g. the
+        // ARP read fails AND the scan later hits its deadline), and
+        // yuzu_ctx_set_result_status is an unconditional overwrite — calling
+        // it once per condition would let only the LAST one survive
+        // (governance Gate 4 consistency-auditor finding). set_result_status
+        // is called exactly once, at the end, with the worst report seen.
+        yuzu::discovery::MaybeDegrade worst_degrade;
+
         // Step 1: Get current ARP table (fast, pre-populated entries)
-        auto arp_entries = get_arp_table();
+        auto arp_read = get_arp_table();
         std::set<std::string> arp_ips;
         std::map<std::string, std::string> ip_to_mac;
-        for (const auto& entry : arp_entries) {
+        for (const auto& entry : arp_read.entries) {
             arp_ips.insert(entry.ip);
             ip_to_mac[entry.ip] = entry.mac;
+        }
+
+        // An ARP half that did not run is a PARTIAL scan, not a quiet network.
+        if (const auto arp_degrade =
+                yuzu::discovery::degrade_for_arp(arp_read.ok, arp_read.complete);
+            arp_degrade.has_report) {
+            ctx.write_output(std::format("status|warning|{}", arp_degrade.report.message));
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, arp_degrade);
         }
 
         ctx.report_progress(10);
@@ -424,45 +551,101 @@ private:
         int done = 0;
         std::set<std::string> alive_ips;
 
-        for (const auto& ip : hosts) {
-            // Check overall scan timeout
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - scan_start).count();
-            if (elapsed >= kScanTimeoutSeconds) {
-                timed_out = true;
-                ctx.write_output(std::format("status|warning|scan timed out after {}s, "
-                                             "returning partial results ({}/{})",
-                                             elapsed, done, total));
-                break;
-            }
+        // ONE ICMP session per scan (never per host — a /24 must not open
+        // 254 sockets). Each probe gets a short per-host budget, capped
+        // independently of the caller's timeout_ms so the sweep stays finite;
+        // both bounds are decided by discovery_scan_plan.hpp (tested there).
+        yuzu::shared::IcmpSession session;
+        yuzu::discovery::SweepTally sweep_tally;
+        const int probe_timeout_ms = yuzu::discovery::probe_budget_ms(timeout_ms);
+        const auto availability =
+            yuzu::discovery::classify_icmp_session(session.ok(), session.permitted);
 
-            // If already in ARP table, it's alive
-            if (arp_ips.count(ip)) {
+        if (const auto degrade = yuzu::discovery::degrade_for(availability); degrade.has_report) {
+            // HONEST DEGRADE — resolved before any probe is attempted. Never
+            // probe through an invalid session; fall back to the ARP-derived
+            // host set, warn once, and stamp the ABI4 result so a machine
+            // consumer cannot read a dead network as a successful empty scan.
+            // Denied (Linux net.ipv4.ping_group_range refusing the
+            // unprivileged SOCK_DGRAM ICMP socket) and Unavailable
+            // (EMFILE/ENFILE/ENOMEM, or IcmpCreateFile failing on Windows)
+            // carry distinct statuses and reason tags.
+            ctx.write_output(std::format("status|warning|{}", degrade.report.message));
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, degrade);
+            // Confine the degrade fallback to the requested subnet — never
+            // surface unrelated cached ARP neighbors (other subnets,
+            // multicast/broadcast entries) as scan results.
+            for (const auto& ip : yuzu::discovery::arp_hosts_in_subnet(hosts, arp_ips))
                 alive_ips.insert(ip);
-            } else {
-                // Ping it
-                if (ping_host(ip, timeout_ms)) {
-                    alive_ips.insert(ip);
+        } else {
+            for (const auto& ip : hosts) {
+                // Check overall scan timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - scan_start).count();
+                if (elapsed >= kScanTimeoutSeconds) {
+                    timed_out = true;
+                    ctx.write_output(std::format("status|warning|scan timed out after {}s, "
+                                                 "returning partial results ({}/{})",
+                                                 elapsed, done, total));
+                    break;
                 }
-            }
 
-            ++done;
-            int progress = 10 + (done * 80 / total);
-            if (done % 10 == 0 || done == total) {
-                ctx.report_progress(progress);
-            }
+                // If already in ARP table, it's alive
+                if (arp_ips.count(ip)) {
+                    alive_ips.insert(ip);
+                } else {
+                    // Probe it. A non-reply is only "down" when the packet
+                    // actually left the machine — sweep_tally carries the
+                    // difference so a blocked sweep degrades instead of
+                    // reporting a dead network (see degrade_for_sweep).
+                    const auto outcome = icmp_sample(session, ip, probe_timeout_ms);
+                    ++sweep_tally.probed;
+                    if (outcome.replied()) {
+                        ++sweep_tally.replied;
+                        alive_ips.insert(ip);
+                    } else if (outcome.transmit_blocked()) {
+                        ++sweep_tally.transmit_blocked;
+                    }
+                }
 
-            // Progress reporting every 50 hosts
-            if (done % 50 == 0) {
-                ctx.write_output(std::format("progress|scanned {} of {} hosts, "
-                                             "{} alive so far",
-                                             done, total, alive_ips.size()));
+                ++done;
+                int progress = 10 + (done * 80 / total);
+                if (done % 10 == 0 || done == total) {
+                    ctx.report_progress(progress);
+                }
+
+                // Progress reporting every 50 hosts
+                if (done % 50 == 0) {
+                    ctx.write_output(std::format("progress|scanned {} of {} hosts, "
+                                                 "{} alive so far",
+                                                 done, total, alive_ips.size()));
+                }
             }
         }
 
-        // Step 3: Re-read ARP table after ping sweep to get MACs
+        // A sweep that constructed a session but could not transmit through it
+        // is NOT an empty network.
+        if (const auto blocked = yuzu::discovery::degrade_for_sweep(sweep_tally);
+            blocked.has_report) {
+            ctx.write_output(std::format("status|warning|{}", blocked.report.message));
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, blocked);
+        }
+
+        // A sweep cut short by its own deadline is PARTIAL, not a clean scan.
+        // The warning line above (in the sweep loop) says so to a human; this
+        // accumulates it for the ABI4 result seam, which is what a machine
+        // consumer reads — without it a scan that stopped at host 40 of 254 is
+        // indistinguishable from a complete one.
+        if (timed_out) {
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::timeout_degrade()});
+        }
+
+        // Step 3: Re-read ARP table after ping sweep to get MACs. A failure
+        // here is not separately reported: the pre-sweep read already
+        // classified the ARP half, and this pass only enriches MACs.
         auto fresh_arp = get_arp_table();
-        for (const auto& entry : fresh_arp) {
+        for (const auto& entry : fresh_arp.entries) {
             ip_to_mac[entry.ip] = entry.mac;
         }
 
@@ -470,14 +653,90 @@ private:
 
         // Step 4: Output results
         int found = 0;
+        int hostname_degraded = 0;
+        bool hostname_scan_timed_out = false;
         for (const auto& ip : alive_ips) {
             std::string mac = ip_to_mac.count(ip) ? ip_to_mac[ip] : "unknown";
-            std::string hostname = resolve_hostname(ip);
-            if (hostname.empty()) hostname = "unknown";
+            // The same kScanTimeoutSeconds budget that bounds the probe loop
+            // above must also bound this loop: reverse-DNS has no per-call
+            // timeout of its own, and up to |alive_ips| lookups against a
+            // slow/unreachable resolver could otherwise run far past the
+            // action's documented 300s bound (governance Gate 2 finding).
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - scan_start).count();
+            if (elapsed >= kScanTimeoutSeconds) {
+                hostname_scan_timed_out = true;
+                break;
+            }
+            // resolve_hostname returns nullopt when the lookup timed out or
+            // was throttled by bounded_call's ceiling, distinct from a
+            // present-but-empty answer (a genuine "no PTR record"). Without
+            // this distinction the two looked identical — the one place this
+            // scan's otherwise-thorough honest-degrade reporting didn't
+            // reach, because the degrade is per-item rather than per-scan
+            // (governance Gate 6 SRE finding).
+            auto resolved = resolve_hostname(ip);
+            std::string hostname;
+            if (resolved) {
+                // hostname is a reverse-DNS PTR result -- attacker-
+                // influenceable (the responding host/DNS infra controls it),
+                // unlike `ip`/`mac` which come from inet_ntop/fixed-hex
+                // formatters. safe_output_field it so a crafted PTR record
+                // containing '|' or CR/LF can't inject an extra column or
+                // forge an extra output row (same class as the sibling
+                // users/certificates plugins' output-escaping fixes this
+                // session; governance Gate 2 finding).
+                hostname = yuzu::util::safe_output_field(*resolved);
+                if (hostname.empty()) hostname = "unknown";
+            } else {
+                ++hostname_degraded;
+                hostname = "unknown";
+            }
             // managed status is always "unknown" from the agent side —
             // the server will correlate with known agent IPs
             ctx.write_output(std::format("host|{}|{}|{}|unknown", ip, mac, hostname));
             ++found;
+        }
+        if (hostname_degraded > 0) {
+            ctx.write_output(std::format(
+                "status|warning|{} of {} hostname lookups timed out or were throttled; "
+                "reported as unknown",
+                hostname_degraded, found));
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::hostname_lookup_degraded()});
+        }
+        if (hostname_scan_timed_out) {
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::timeout_degrade()});
+            // The probe loop already wrote its own "scan timed out" warning
+            // when `timed_out` is true, and the sweep already having consumed
+            // the whole budget means this loop trips on its very first
+            // iteration — a second, near-identical message here would be
+            // redundant and its "0 of N resolved" framing misleading (the
+            // hostname loop never got a real chance to run).
+            if (!timed_out) {
+                ctx.write_output(std::format(
+                    "status|warning|hostname resolution timed out after {}s, {} of {} alive "
+                    "hosts resolved",
+                    kScanTimeoutSeconds, found, static_cast<int>(alive_ips.size())));
+            }
+        }
+
+        // Every candidate degrade condition observed across the whole scan
+        // (ARP, ICMP session, sweep-blocked, probe-loop timeout, hostname-loop
+        // timeout) has been accumulated above by severity. Apply the worst one
+        // to the ABI4 result seam exactly once, here — never at the individual
+        // sites — so an earlier, more specific reason can't be silently
+        // overwritten by a later, less specific one. Two same-severity pairs
+        // are the deliberate exception, applied inside worst_of() by
+        // degrade_tie_prefers_candidate(): a later scan:timeout DOES displace
+        // an earlier arp:table_truncated or dns:hostname_lookup_degraded,
+        // because a scan-level timeout is the more actionable reason of the
+        // two, not the less (#3253). Every condition still writes its own
+        // status|warning line above regardless of which one wins here.
+        if (worst_degrade.has_report) {
+            ctx.set_result_status(worst_degrade.report.status, worst_degrade.report.completeness,
+                                  worst_degrade.report.reason);
         }
 
         ctx.write_output(std::format("scan_complete|{}|{}", found, total));

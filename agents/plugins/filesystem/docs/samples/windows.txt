@@ -1,0 +1,139 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 4db605b6c689
+== action=exists path=C:\Windows\System32\drivers\etc\hosts
+exists|true
+type|file
+size|1432
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_dir path=C:\Windows\System32\drivers\etc
+entry|hosts|file|1432
+entry|hosts.ics|file|444
+entry|lmhosts.sam|file|3683
+entry|networks|file|407
+entry|protocol|file|1358
+entry|services|file|17635
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=file_hash path=C:\Windows\System32\drivers\etc\hosts
+hash|904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35
+algorithm|sha256
+size|1432
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp
+path|D:\yuzu-dev\tmp\yuzu-14298277ed7220950c97d6a97a2e8180.tmp
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp_dir
+path|D:\yuzu-dev\tmp\yuzu-2342ff50ffda6cdc156dbde1418407c0
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=read path=C:\Windows\System32\drivers\etc\hosts
+line|1|﻿# Copyright (c) 1993-2009 Microsoft Corp.
+line|2|#
+line|3|# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.
+line|4|#
+line|5|# This file contains the mappings of IP addresses to host names. Each
+line|6|# entry should be kept on an individual line. The IP address should
+line|7|# be placed in the first column followed by the corresponding host name.
+line|8|# The IP address and the host name should be separated by at least one
+line|9|# space.
+line|10|#
+line|11|# Additionally, comments (such as these) may be inserted on individual
+line|12|# lines or following the machine name denoted by a '#' symbol.
+line|13|#
+line|14|# For example:
+line|15|#
+line|16|#      102.54.94.97     rhino.acme.com          # source server
+line|17|#       38.25.63.10     x.acme.com              # x client host
+line|18|
+line|19|# localhost name resolution is handled within DNS itself.
+line|20|#	127.0.0.1       localhost
+line|21|#	::1             localhost
+line|22|# Added by Docker Desktop
+line|23|203.0.113.131 host.docker.internal
+line|24|203.0.113.131 gateway.docker.internal
+line|25|# To allow the same kube context to work on the host and the container:
+line|26|127.0.0.1 kubernetes.docker.internal
+line|27|# End of section
+line|28|# TailscaleHostsSectionStart
+line|29|# This section contains MagicDNS entries for Tailscale.
+line|30|# Do not edit this section manually.
+line|31|
+line|32|198.51.100.77 workstation1.tail0a0a0a.ts.net. workstation1
+line|33|198.51.100.37 mobile1.tail0a0a0a.ts.net. mobile1
+line|34|198.51.100.98 laptop1.tail0a0a0a.ts.net. laptop1
+line|35|198.51.100.121 buildhost1.tail0a0a0a.ts.net. buildhost1
+line|36|
+line|37|# TailscaleHostsSectionEnd
+total_lines|37
+file_size|1432
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_acl path=C:\Windows\System32\drivers\etc\hosts
+sddl|O:BAD:AI(A;;FA;;;SY)(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)(A;ID;0x1200a9;;;AC)(A;ID;0x1200a9;;;S-1-15-2-2)
+ace|allow|NT AUTHORITY\SYSTEM|0x001f01ff
+ace|allow|NT AUTHORITY\SYSTEM|0x001f01ff
+ace|allow|BUILTIN\Administrators|0x001f01ff
+ace|allow|BUILTIN\Users|0x001200a9
+ace|allow|APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES|0x001200a9
+ace|allow|APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APP PACKAGES|0x001200a9
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_signature path=C:\Windows\System32\notepad.exe
+signature_status|unsigned
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=find_by_hash directory=C:\Windows\System32\drivers\etc sha256=904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35
+match|C:\Windows\System32\drivers\etc\hosts|1432
+matches_found|1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts*
+total_matches|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_version_info path=C:\Windows\System32\notepad.exe
+file_version|6.2.26100.9278
+product_version|10.0.26100.9278
+company_name|Microsoft Corporation
+file_description|Notepad
+internal_name|Notepad
+original_filename|NOTEPAD.EXE.MUI
+product_name|Microsoft® Windows® Operating System
+legal_copyright|© Microsoft Corporation. All rights reserved.
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=search path=C:\Windows\System32\drivers\etc\hosts pattern=localhost
+match|19|# localhost name resolution is handled within DNS itself.
+match|20|#	127.0.0.1       localhost
+match|21|#	::1             localhost
+total_matches|3
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=replace path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+replacements_made|2
+file_size_before|42
+file_size_after|18
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=write_content path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+status|ok
+bytes_written|20
+path|C:\Windows\Temp\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=append path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt content="yuzu-capture appended"
+status|ok
+bytes_appended|22
+total_size|20
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_lines path=C:\WINDOWS\TEMP\yuzu_capture_bs7ucomo\yuzu_capture_tmp.txt start_line=1 end_line=1
+lines_deleted|1
+total_lines_before|2
+total_lines_after|1
+[result_status] UNDECLARED / UNKNOWN / 
+

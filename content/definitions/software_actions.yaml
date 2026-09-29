@@ -34,10 +34,22 @@ spec:
     columns:
       - name: package_name
         type: string
+        description: >-
+          The package or application name; the literal 'none' on the clean-scan sentinel row when nothing is upgradable. Values: free text, or the literal `none`.
+        example: "none"
+        platforms: [windows, linux, darwin]
       - name: current_version
         type: string
+        description: >-
+          The currently installed version, or '-' when not read; on the up-to-date sentinel row this field carries the literal sentence 'System is up to date' instead of a version. Values: free text, or `-`, or the literal `System is up to date`.
+        example: "System is up to date"
+        platforms: [windows, linux, darwin]
       - name: available_version
         type: string
+        description: >-
+          The version available to upgrade to, or '-' when not applicable or not read. Values: free text, or `-`.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List upgradable packages"
 
@@ -88,6 +100,10 @@ spec:
     columns:
       - name: count
         type: int32
+        description: >-
+          Non-negative count of installed packages or applications; the line is omitted entirely (never emitted as 0) when the underlying query failed. Values: non-negative integer.
+        example: "124"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Count installed software packages"
 

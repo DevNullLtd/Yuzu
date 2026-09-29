@@ -1,0 +1,125 @@
+## Netstat Attribution Definitions
+## Enumerates active network connections and listening sockets, resolving
+## the owning process for each. Folds the retired `sockwho` plugin's
+## functionality into netstat as a new `attribution` action (#3403).
+## Plugin: netstat | Actions: attribution
+##
+## Sources by platform:
+##   Windows: IP Helper API + QueryFullProcessImageNameW for path resolution
+##   Linux:   /proc/net/* + /proc/[pid]/{comm,exe,fd} for inode-to-PID mapping
+##   macOS:   libproc (proc_listallpids, proc_name, proc_pidpath, proc_pidfdinfo)
+##            via the shared agents/shared/macos_socket_walk.hpp helper
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network.netstat_attribution
+  displayName: Network Connections with Process Attribution
+  version: 1.0.0
+  description: >
+    Enumerates all active TCP/UDP connections and listening sockets on
+    the endpoint, resolving the owning process for each and returning
+    protocol, local and remote addresses and ports, connection state,
+    owning PID, process name, and executable path. Covers TCP4, TCP6,
+    UDP4, and UDP6. On Windows uses the Extended TCP/UDP Table APIs and
+    resolves process paths via QueryFullProcessImageNameW with a per-PID
+    cache. On Linux scans /proc to build inode-to-PID and PID-to-process
+    maps in a single pass. On macOS uses libproc for per-process FD
+    enumeration with proc_name and proc_pidpath. Pipe characters in
+    process names and paths are escaped. Useful for security
+    investigations to identify which application owns a suspicious
+    connection.
+  tags: [network, security, forensics, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: netstat
+    action: attribution
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: proto
+        type: string
+        description: Transport protocol and IP version of the socket.
+        values: [tcp, tcp6, udp, udp6]
+        example: "tcp"
+        platforms: [windows, linux, darwin]
+      - name: local_addr
+        type: string
+        description: "The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address)."
+        example: "198.51.100.77"
+        platforms: [windows, linux, darwin]
+      - name: local_port
+        type: int32
+        description: "The connection's local TCP or UDP port number. Values: integer, 0-65535."
+        example: 52882
+        platforms: [windows, linux, darwin]
+      - name: remote_addr
+        type: string
+        description: >-
+          The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*".
+        example: "198.51.100.121"
+        platforms: [windows, linux, darwin]
+      - name: remote_port
+        type: int32
+        description: "The connection's remote port; always 0 for UDP (no fixed peer). Values: integer, 0-65535."
+        example: 22
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: >-
+          TCP connection state name; always empty for UDP rows (never a fabricated LISTEN). The exact name set differs slightly per OS. Values: ESTABLISHED, SYN_SENT, SYN_RECV, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSE_WAIT, LAST_ACK, LISTEN, CLOSING, UNKNOWN, CLOSE (Linux only), CLOSED/DELETE_TCB (Windows only), or empty (UDP).
+        example: "ESTABLISHED"
+        platforms: [windows, linux, darwin]
+      - name: pid
+        type: int32
+        description: >-
+          PID of the process holding the socket, or -1 (Linux only) when no matching /proc/[pid]/fd inode was found. Values: integer, or -1 on Linux.
+        example: 9653
+        platforms: [windows, linux, darwin]
+      - name: process_name
+        type: string
+        description: >-
+          Name of the process owning the socket (Linux: /proc/[pid]/comm; macOS: libproc proc_name, 16-char truncated; Windows: basename of the QueryFullProcessImageNameW path). Pipe and CR/LF characters are escaped/stripped. Empty when the owning process could not be resolved. Values: free text, or empty when unresolved.
+        example: "ssh"
+        platforms: [windows, linux, darwin]
+      - name: process_path
+        type: string
+        description: >-
+          Full executable path of the owning process (Linux: /proc/[pid]/exe symlink target; macOS: libproc proc_pidpath; Windows: QueryFullProcessImageNameW). Pipe and CR/LF characters are escaped/stripped. Empty when the owning process could not be resolved. Values: free text (absolute path), or empty when unresolved.
+        example: "/usr/bin/ssh"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - process_name
+        - proto
+      operations:
+        - count
+
+  readablePayload: "List network connections with owning process"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [netstat]
+
+status:
+  phase: active

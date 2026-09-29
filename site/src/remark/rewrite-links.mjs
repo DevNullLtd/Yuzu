@@ -6,7 +6,7 @@ import { BY_FILE } from '../nav.mjs';
 //   • target is in the manifest  -> rewrite to the site route   (/Yuzu/manual/<slug>/)
 //   • target is a real repo file -> rewrite to the GitHub blob  (so it still works)
 // Absolute URLs, anchors, and non-.md links are left untouched.
-const REPO_BLOB = 'https://github.com/Tr3kkR/Yuzu/blob/main';
+const REPO_BLOB = 'https://github.com/DevNullLtd/Yuzu/blob/main';
 const BASE = '/Yuzu';
 
 export default function rewriteLinks() {
@@ -33,6 +33,18 @@ export default function rewriteLinks() {
         const entry = BY_FILE.get(rel.replace(/\.md$/, ''));
         if (entry) {
           node.url = `${BASE}/manual/${entry.slug}/${hash}`;
+          return;
+        }
+      }
+
+      // Plugin READMEs (agents/plugins/<name>/README.md) are manifest entries
+      // too, keyed by their repo-relative path and routed under /plugins/.
+      const pluginsRoot = path.join(repoRoot, 'agents', 'plugins');
+      if (abs.startsWith(pluginsRoot + path.sep)) {
+        const rel = path.relative(repoRoot, abs).split(path.sep).join('/');
+        const entry = BY_FILE.get(rel.replace(/\.md$/, ''));
+        if (entry) {
+          node.url = `${BASE}/${entry.slug}/${hash}`;
           return;
         }
       }

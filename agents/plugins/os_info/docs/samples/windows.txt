@@ -1,0 +1,22 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 45e627d9dfa2
+== action=os_name
+os_name|Windows 11 Pro
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_version
+os_version|10.0.26200
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_build
+os_build|26200.9278
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_arch
+os_arch|x86_64
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=uptime
+uptime_seconds|69193
+uptime_display|0d 19h 13m
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -380,10 +380,9 @@
             <small>External port agents connect through the gateway. Maps to internal 50051.</small>
           </div>
 
-          <div class="field">
-            <label for="gw-mgmt-port">Management Port</label>
-            <input type="number" id="gw-mgmt-port" value="50063" min="1" max="65535">
-          </div>
+          <!-- #1422: no Management Port field — the gateway's mgmt/command plane
+               (:50063) is plaintext+unauthenticated in wizard stacks and is never
+               published to the host; the server reaches it on the compose network. -->
 
           <div class="field">
             <label for="gw-health-port">Health/Readiness Port</label>
@@ -460,7 +459,7 @@ docker compose logs -f yuzu-server</pre>
     </main>
 
     <footer>
-      <p>Yuzu Compose Wizard · Part of the <a href="https://github.com/Tr3kkR/Yuzu" target="_blank">Yuzu</a> project</p>
+      <p>Yuzu Compose Wizard · Part of the <a href="https://github.com/DevNullLtd/Yuzu" target="_blank">Yuzu</a> project</p>
     </footer>
   </div>
 

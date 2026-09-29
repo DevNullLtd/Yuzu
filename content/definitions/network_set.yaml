@@ -5,13 +5,14 @@ metadata:
   displayName: Network Configuration and Diagnostics
   version: 1.0.0
   description: >
-    Comprehensive network instruction definitions spanning five plugins:
-    network_config, netstat, network_diag, network_actions, and sockwho.
+    Comprehensive network instruction definitions spanning four plugins:
+    network_config, netstat, network_diag, and network_actions.
     Covers adapter inventory, IP addressing, DNS configuration, proxy
     settings, DNS cache inspection, full connection enumeration,
     listening port audits, established connection listing, DNS flush,
-    ping diagnostics, and socket-to-application forensic mapping across
-    Windows, Linux, and macOS.
+    ping diagnostics, and socket-to-application forensic mapping (netstat's
+    `attribution` action, which folded the retired sockwho plugin in,
+    #3403) across Windows, Linux, and macOS.
   platforms: [windows, linux, darwin]
 
   permissions:
@@ -29,14 +30,15 @@ metadata:
       - device.network_config.dns_cache
       # Full connection enumeration (netstat plugin)
       - device.network.netstat_list
+      # Socket-to-application mapping (netstat plugin, `attribution` action --
+      # folds the retired sockwho plugin in, #3403)
+      - device.network.netstat_attribution
       # Targeted diagnostics (network_diag plugin)
       - device.network_diag.listening
       - device.network_diag.connections
       # Active network operations (network_actions plugin)
       - device.network_actions.flush_dns
       - device.network_actions.ping
-      # Socket-to-application mapping (sockwho plugin)
-      - device.network.sockwho_list
 
   defaults:
     approvalMode: auto

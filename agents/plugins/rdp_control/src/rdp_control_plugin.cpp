@@ -20,7 +20,9 @@
  * as "state not confirmed" and retry — especially on the disable path,
  * which is the security-relevant direction.
  *
- * Windows-only. Returns error on Linux/macOS.
+ * Windows-only. Reports rdp_control|unsupported|... on Linux/macOS (no
+ * equivalent surface there — see the macOS parity notes for the flagged
+ * product decision).
  */
 
 #include <yuzu/plugin.hpp>
@@ -41,9 +43,23 @@
 
 #include <netfw.h>
 #include <oleauto.h> // SysAllocString / SysFreeString
+
+#include <win_com.hpp> // shared yuzu::shared::win ComInit / ComPtr<T> / BStr
 #endif
 
 namespace {
+
+// Strip pipe/newline/CR from a value echoed back into the pipe-delimited
+// protocol so a hostile action string cannot inject synthetic fields or rows.
+// Platform-agnostic; used by the unknown-action error paths on every platform.
+std::string sanitize_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    return out;
+}
 
 #ifdef _WIN32
 
@@ -61,26 +77,9 @@ bool is_valid_rdp_state(std::string_view state) {
     return state == "enable" || state == "disable";
 }
 
-class ComInit {
-public:
-    ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
-    ~ComInit() {
-        if (SUCCEEDED(hr_)) CoUninitialize();
-    }
-    // Non-copyable: a copy would duplicate hr_ and both destructors would call
-    // CoUninitialize (unbalanced). Parity with ScHandle below.
-    ComInit(const ComInit&) = delete;
-    ComInit& operator=(const ComInit&) = delete;
-    // RPC_E_CHANGED_MODE means COM was already initialised on this thread in a
-    // different apartment (e.g. an STA from a prior plugin on the pool thread).
-    // That is usable — in-proc COM works regardless of apartment — so treat it as
-    // ok. The dtor still only CoUninitialize()s when WE initialised (SUCCEEDED),
-    // which excludes RPC_E_CHANGED_MODE, so the ref count stays balanced.
-    bool ok() const { return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE; }
-
-private:
-    HRESULT hr_;
-};
+using yuzu::shared::win::BStr;
+using yuzu::shared::win::ComInit;
+using yuzu::shared::win::ComPtr;
 
 /// RAII owner for SC_HANDLE (service control manager / service handles).
 class ScHandle {
@@ -114,41 +113,6 @@ public:
 
 private:
     HKEY h_ = nullptr;
-};
-
-/// RAII owner for a COM interface pointer (Release on scope exit). `put()`
-/// yields the out-param for CoCreateInstance.
-template <class T>
-class ComPtr {
-public:
-    ComPtr() = default;
-    ~ComPtr() {
-        if (p_) p_->Release();
-    }
-    ComPtr(const ComPtr&) = delete;
-    ComPtr& operator=(const ComPtr&) = delete;
-    T** put() { return &p_; }
-    T* operator->() const { return p_; }
-    explicit operator bool() const { return p_ != nullptr; }
-
-private:
-    T* p_ = nullptr;
-};
-
-/// RAII owner for a BSTR (SysFreeString on scope exit).
-class BStr {
-public:
-    explicit BStr(const wchar_t* s) : b_(SysAllocString(s)) {}
-    ~BStr() {
-        if (b_) SysFreeString(b_);
-    }
-    BStr(const BStr&) = delete;
-    BStr& operator=(const BStr&) = delete;
-    BSTR get() const { return b_; }
-    explicit operator bool() const { return b_ != nullptr; }
-
-private:
-    BSTR b_;
 };
 
 /// Write fDenyTSConnections. Returns ERROR_SUCCESS or the Win32 error.
@@ -296,6 +260,32 @@ const char* derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
 }
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows-only, entirely native: the registry (RegSetValueExW/
+// RegGetValueW), the Windows Firewall via INetFwPolicy2 COM, and the
+// Service Control Manager (StartServiceW/QueryServiceStatusEx) — zero
+// subprocesses (rung 1). Linux/macOS have no implementation at all: both
+// actions on both platforms return the honest "rdp_control|unsupported|..."
+// sentinel without attempting anything (there is no macOS/Linux equivalent
+// surface this plugin targets — see the file header comment).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "set_state",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+    {
+        /* .action      = */ "status",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+};
+
 } // namespace
 
 class RdpControlPlugin final : public yuzu::Plugin {
@@ -311,19 +301,47 @@ public:
         return acts;
     }
 
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
+    }
+
     yuzu::Result<void> init(yuzu::PluginContext&) override { return {}; }
     void shutdown(yuzu::PluginContext&) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
-        ctx.write_output(std::format("error|rdp_control not available on this platform ({})",
-                                     action));
-        return 1;
+        // Validate against the full known action set FIRST, independent of
+        // platform support, so a misspelled/unknown action is never silently
+        // recorded as terminal SUCCESS.
+        if (action != "set_state" && action != "status") {
+            ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
+            return 1;
+        }
+
+#if defined(__APPLE__)
+        // macOS-specific honest sentinel (points at the real macOS alternative).
+        ctx.write_output("rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing");
+#else
+        // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+        // tools (Screen Sharing / com.apple.screensharing) on a Linux agent.
+        ctx.write_output("rdp_control|unsupported|Windows Remote Desktop is not available on this platform");
+#endif
+        // set_state is a STATE-CHANGING security-control action (enable/
+        // disable remote access). On non-Windows it never touches anything,
+        // so reporting rc=0 (terminal SUCCESS) would be a false success for
+        // an RDP posture change that did not happen (BR-03) -- exactly the
+        // kind of false "security control changed" report a ServiceNow
+        // change-window caller must not receive. "status" is a read-only
+        // action honestly reporting "unsupported" and may keep rc=0.
+        return (action == "set_state") ? 1 : 0;
 #else
         if (action == "set_state") return do_set_state(ctx, params);
         if (action == "status")    return do_status(ctx);
-        ctx.write_output(std::format("error|unknown action: {}", action));
+        ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
         return 1;
 #endif
     }

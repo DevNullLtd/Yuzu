@@ -108,8 +108,17 @@ extern "C" {
 
 YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, const char* directory,
                                       char* path_out, size_t path_out_size) {
-    if (!path_out || path_out_size == 0)
+    if (!path_out || path_out_size == 0) {
+#ifdef _WIN32
+        // This guard runs before the platform split below, so it isn't
+        // covered by any of that code's own SetLastError() calls -- without
+        // this, a caller relying on the "always meaningful on failure"
+        // contract documented in sdk/include/yuzu/plugin.h would read
+        // whatever stale, unrelated code happened to be left over.
+        SetLastError(ERROR_INVALID_PARAMETER);
+#endif
         return -1;
+    }
 
     const char* pfx = (prefix && prefix[0]) ? prefix : "yuzu-";
     const char* sfx = (suffix && suffix[0]) ? suffix : ".tmp";
@@ -117,35 +126,68 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
 #ifdef _WIN32
     wchar_t temp_dir_w[MAX_PATH];
     if (!get_temp_dir_w(directory, temp_dir_w, MAX_PATH))
-        return -1;
+        return -1; // MultiByteToWideChar/GetTempPathW already set a meaningful last-error
 
     char hex[33]{};
-    if (!generate_random_hex(hex, sizeof(hex)))
+    if (!generate_random_hex(hex, sizeof(hex))) {
+        // BCryptGenRandom returns an NTSTATUS, not a Win32 error — it never calls
+        // SetLastError, so a caller checking GetLastError() right after this
+        // function returns would otherwise see whatever unrelated code happened
+        // to be left over from an earlier, unrelated Win32 call on this thread.
+        SetLastError(ERROR_GEN_FAILURE);
         return -1;
+    }
 
     auto full_path = build_temp_path_w(temp_dir_w, pfx, hex, sfx);
-    if (full_path.size() >= MAX_PATH)
+    if (full_path.size() >= MAX_PATH) {
+        // A pure C++ string-length check — no Win32 call happened, so
+        // GetLastError() would otherwise be equally stale.
+        SetLastError(ERROR_BUFFER_OVERFLOW);
         return -1;
+    }
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
-    make_owner_only_sa(sa, sd);
+    if (!make_owner_only_sa(sa, sd)) {
+        // Fail closed rather than fall through to CreateFileW with a null
+        // lpSecurityDescriptor (the token's default, potentially-inheriting
+        // DACL instead of the intended owner-only one) -- mirrors
+        // updater.cpp's identical ConvertStringSecurityDescriptorTo
+        // SecurityDescriptorW call, which has always failed closed here.
+        // GetLastError() already carries the real failure from inside
+        // make_owner_only_sa's own Win32 call.
+        return -1;
+    }
 
     HANDLE hFile = CreateFileW(full_path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                0, // no sharing
                                &sa,
                                CREATE_NEW, // fail if exists — prevents TOCTOU race
                                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    // Capture CreateFileW's real failure code BEFORE LocalFree runs -- it is
+    // unconditional (success or failure) and, like every other cleanup call
+    // in this file, is not documented by MSDN as leaving GetLastError()
+    // untouched.
+    const DWORD create_file_err = GetLastError();
 
     if (sd)
         LocalFree(sd);
 
-    if (hFile == INVALID_HANDLE_VALUE)
+    if (hFile == INVALID_HANDLE_VALUE) {
+        SetLastError(create_file_err);
         return -1;
+    }
+
     CloseHandle(hFile);
 
     if (wide_to_utf8(full_path.c_str(), path_out, path_out_size) != 0) {
+        // Capture wide_to_utf8's real failure code BEFORE DeleteFileW can
+        // overwrite it — a successful cleanup call is not guaranteed to leave
+        // GetLastError() untouched (some Win32 APIs reset it to ERROR_SUCCESS
+        // on success, some don't; MSDN does not document this as reliable).
+        const DWORD saved_err = GetLastError();
         DeleteFileW(full_path.c_str());
+        SetLastError(saved_err);
         return -1;
     }
     return 0;
@@ -181,36 +223,61 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
 
 YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
                                      size_t path_out_size) {
-    if (!path_out || path_out_size == 0)
+    if (!path_out || path_out_size == 0) {
+#ifdef _WIN32
+        // See the identical guard/comment in yuzu_create_temp_file above.
+        SetLastError(ERROR_INVALID_PARAMETER);
+#endif
         return -1;
+    }
 
     const char* pfx = (prefix && prefix[0]) ? prefix : "yuzu-";
 
 #ifdef _WIN32
     wchar_t temp_dir_w[MAX_PATH];
     if (!get_temp_dir_w(directory, temp_dir_w, MAX_PATH))
-        return -1;
+        return -1; // MultiByteToWideChar/GetTempPathW already set a meaningful last-error
 
     char hex[33]{};
-    if (!generate_random_hex(hex, sizeof(hex)))
+    if (!generate_random_hex(hex, sizeof(hex))) {
+        // See yuzu_create_temp_file's identical comment above: BCryptGenRandom
+        // never calls SetLastError, so GetLastError() would otherwise be stale.
+        SetLastError(ERROR_GEN_FAILURE);
         return -1;
+    }
 
     auto full_path = build_temp_path_w(temp_dir_w, pfx, hex, nullptr);
-    if (full_path.size() >= MAX_PATH)
+    if (full_path.size() >= MAX_PATH) {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
         return -1;
+    }
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
-    make_owner_only_sa(sa, sd);
+    if (!make_owner_only_sa(sa, sd)) {
+        // See the identical fail-closed reasoning at the CreateFileW call
+        // site in yuzu_create_temp_file above.
+        return -1;
+    }
 
     BOOL ok = CreateDirectoryW(full_path.c_str(), &sa);
+    // Capture before LocalFree -- see the identical reasoning at the
+    // CreateFileW call site in yuzu_create_temp_file above.
+    const DWORD create_dir_err = GetLastError();
     if (sd)
         LocalFree(sd);
-    if (!ok)
+    if (!ok) {
+        SetLastError(create_dir_err);
         return -1;
+    }
 
     if (wide_to_utf8(full_path.c_str(), path_out, path_out_size) != 0) {
+        // Capture wide_to_utf8's real failure code before RemoveDirectoryW's
+        // (possibly successful) call can overwrite it -- see the identical
+        // reasoning in yuzu_create_temp_file above.
+        const DWORD saved_err = GetLastError();
         RemoveDirectoryW(full_path.c_str());
+        SetLastError(saved_err);
         return -1;
     }
     return 0;

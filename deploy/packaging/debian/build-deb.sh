@@ -4,7 +4,7 @@ set -euo pipefail
 # Build Yuzu .deb packages from pre-compiled binaries.
 # Usage: build-deb.sh --bin-dir DIR --version VERSION [--output DIR]
 #
-# Expects bin-dir to contain: yuzu-server, yuzu-agent, plugins/, content/
+# Expects bin-dir to contain: yuzu-server, yuzu-agent, plugins/
 
 BIN_DIR=""
 VERSION=""
@@ -65,7 +65,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management server
  Enterprise endpoint management platform — server component.
 EOF
@@ -121,7 +121,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management agent
  Enterprise endpoint management platform — agent component.
 EOF

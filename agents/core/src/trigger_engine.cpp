@@ -14,6 +14,8 @@
 #include <windows.h>
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <cstdio>
 #endif
 
@@ -153,10 +155,30 @@ void TriggerEngine::start() {
     spdlog::info("TriggerEngine started with 4 worker threads");
 }
 
+bool TriggerEngine::wait_for_stop(std::chrono::milliseconds d) {
+    std::unique_lock lock(stop_mu_);
+    return stop_cv_.wait_for(lock, d,
+                             [this] { return !running_.load(std::memory_order_acquire); });
+}
+
+void TriggerEngine::await_stop() {
+    std::unique_lock lock(stop_mu_);
+    stop_cv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire); });
+}
+
 void TriggerEngine::stop() {
-    if (!running_.exchange(false)) {
-        return; // already stopped or never started
+    {
+        // Clear running_ UNDER stop_mu_ — see the member's lost-wakeup note. Clearing it outside
+        // lets a worker read it as still-true, then block after the notify has already fired,
+        // and sleep out its whole interval.
+        std::lock_guard lock(stop_mu_);
+        if (!running_.exchange(false)) {
+            return; // already stopped or never started
+        }
     }
+    // Notify with the mutex RELEASED, and before the joins — never while holding stop_mu_ across
+    // them, or the join deadlocks against the workers that need it to wake.
+    stop_cv_.notify_all();
 
     spdlog::info("TriggerEngine stopping...");
 
@@ -233,9 +255,8 @@ void TriggerEngine::interval_loop() {
     std::map<std::string, std::chrono::steady_clock::time_point> last_fired;
 
     while (running_.load(std::memory_order_acquire)) {
-        // Sleep in 1-second increments for responsive shutdown
-        std::this_thread::sleep_for(std::chrono::seconds{1});
-        if (!running_.load(std::memory_order_acquire))
+        // Wakes the instant stop() is called, rather than sleeping out the tick.
+        if (wait_for_stop(std::chrono::seconds{1}))
             break;
 
         auto now = std::chrono::steady_clock::now();
@@ -293,11 +314,8 @@ void TriggerEngine::file_watch_loop() {
     spdlog::debug("TriggerEngine: file_watch_loop started");
 
     while (running_.load(std::memory_order_acquire)) {
-        // Poll every 5 seconds
-        for (int i = 0; i < 5 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
-        }
-        if (!running_.load(std::memory_order_acquire))
+        // Poll every 5 seconds — but wake at once on stop().
+        if (wait_for_stop(std::chrono::seconds{5}))
             break;
 
         // Take a snapshot of file change triggers
@@ -359,11 +377,8 @@ void TriggerEngine::service_watch_loop() {
     spdlog::debug("TriggerEngine: service_watch_loop started");
 
     while (running_.load(std::memory_order_acquire)) {
-        // Poll every 30 seconds
-        for (int i = 0; i < 30 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
-        }
-        if (!running_.load(std::memory_order_acquire))
+        // Poll every 30 seconds — but wake at once on stop().
+        if (wait_for_stop(std::chrono::seconds{30}))
             break;
 
         // Take a snapshot of service status triggers
@@ -552,10 +567,9 @@ void TriggerEngine::registry_watch_loop() {
             }
         }
 
-        // Sleep 2 seconds between polls
-        for (int i = 0; i < 2 && running_.load(std::memory_order_acquire); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{1});
-        }
+        // Poll every 2 seconds — but wake at once on stop().
+        if (wait_for_stop(std::chrono::seconds{2}))
+            break;
     }
 
     cleanup();
@@ -566,10 +580,13 @@ void TriggerEngine::registry_watch_loop() {
 
 void TriggerEngine::registry_watch_loop() {
     spdlog::debug("TriggerEngine: registry_watch_loop is a no-op on this platform");
-    // No registry on Linux/macOS — just wait for shutdown
-    while (running_.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::seconds{5});
-    }
+    // No registry on Linux/macOS: this thread has NOTHING to do but exit when asked. It used to
+    // poll `while (running_) sleep_for(5s)`, so it took up to 5 SECONDS to notice the stop flag
+    // — for a loop that does no work at all — and stop() joins the workers serially, making this
+    // the single largest contributor to an 8.6–13.5s agent shutdown. Docker's default stop grace
+    // is 10s, so that was getting containerised agents SIGKILLed mid-teardown. Park on the
+    // condvar instead: zero wakeups while running, and it returns the instant stop() notifies.
+    await_stop();
 }
 
 #endif
@@ -660,7 +677,16 @@ std::string TriggerEngine::query_service_status(const std::string& service_name)
 
     // On macOS, use launchctl to check if a service is loaded and running
     std::string cmd = "launchctl list " + service_name + " 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE* pipe;
+    {
+        // BR-001: popen() forks internally, so it is itself a launcher --
+        // hold the process-wide fork lock across the call so it can't land
+        // mid-window of another launcher's unprotected [pipe()..fork()]
+        // (see fork_lock.hpp's contract). Released as soon as popen()
+        // returns; never held across the read loop or pclose() below.
+        std::lock_guard<std::mutex> fork_pipe_lock(global_fork_lock());
+        pipe = popen(cmd.c_str(), "r");
+    }
     if (!pipe) {
         return {};
     }

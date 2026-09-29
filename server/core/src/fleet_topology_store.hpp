@@ -47,6 +47,8 @@ namespace yuzu::server {
 
 class NvdDatabase; ///< Forward-declare; vuln overlay only uses match_inventory.
 class AuditStore;  ///< Forward-declare; push audit (CC6.1/CC7.3 evidence).
+struct OfflineEndpoint; ///< Forward-declare (offline_endpoint_store.hpp); see
+                        ///< merge_offline_topology() below.
 
 class FleetTopologyStore {
 public:
@@ -237,6 +239,28 @@ public:
         return pushed_.size();
     }
 
+    /// Round-3 Hardware-merge accessor (item 10, IP column): a copy of the
+    /// full agent_id -> claimed-local-ips index, taken under pushed_mu_. Only
+    /// currently-connected agents that have pushed at least one
+    /// fleet_snapshot (TAR fleet source, 60 s cache) ever appear here — this
+    /// is NOT a durable device-CI field, so an offline or TAR-disabled agent
+    /// is simply absent (caller renders "—"). O(fleet) copy; call once per
+    /// list render, never per row.
+    std::unordered_map<std::string, std::vector<std::string>> claimed_ips() const {
+        std::lock_guard plk(pushed_mu_);
+        return agent_ips_;
+    }
+
+    /// Same data as claimed_ips(), narrowed to one agent (the Hardware CI
+    /// record's identity lookup) — avoids copying the whole fleet map for a
+    /// single-device open. Empty when the agent has never pushed / isn't
+    /// currently claimed.
+    std::vector<std::string> ips_for(const std::string& agent_id) const {
+        std::lock_guard plk(pushed_mu_);
+        auto it = agent_ips_.find(agent_id);
+        return it == agent_ips_.end() ? std::vector<std::string>{} : it->second;
+    }
+
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
     ///
@@ -385,5 +409,25 @@ private:
     /// MUST be called with pushed_mu_ held.
     void retract_ip_claims_locked(const std::string& agent_id);
 };
+
+/// Merge persisted-but-currently-offline endpoints into a live topology
+/// snapshot as `stale=true` placeholder `MachineNode`s (#1320 PR 3). Pure
+/// transform (no I/O, no locking) shared by `VizRoutes::handle_topology`
+/// (REST `GET /api/v1/viz/fleet/topology`) and the MCP `get_fleet_topology`
+/// tool so the merge rule -- copy-on-write, online-set dedup, empty stale
+/// placeholders -- cannot drift between the two surfaces
+/// (docs/api-twin-recipe.md Rule 1; docs/fleet-viz-invariants.md "Durable
+/// offline-host invariants").
+///
+/// Any `persisted` entry whose `agent_id` is already present in
+/// `snap->machines` is skipped (currently online -- already in the live
+/// snapshot). Every other entry becomes a stale placeholder carrying only
+/// `agent_id`/`hostname`/`os` (empty processes/connections/listeners,
+/// `ts=0`). Returns `snap` UNCHANGED (the same `shared_ptr`, no copy) when
+/// there is nothing to add -- the common all-online steady state pays no
+/// copy, matching the caller's own copy-on-write contract.
+std::shared_ptr<const TopologySnapshot>
+merge_offline_topology(std::shared_ptr<const TopologySnapshot> snap,
+                       const std::vector<OfflineEndpoint>& persisted);
 
 } // namespace yuzu::server

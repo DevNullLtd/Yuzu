@@ -7,6 +7,8 @@
 
 #include <yuzu/server/auto_approve.hpp>
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -196,8 +198,17 @@ TEST_CASE("set_enabled toggles rule", "[auto_approve][crud]") {
 // ── Config Persistence ───────────────────────────────────────────────────────
 
 TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_auto_approve.cfg";
-    fs::remove(tmp);
+    // Process-salted path: with the previous fixed name, a concurrent CI job
+    // on the same box could ingest THIS job's just-persisted rules (writer
+    // load() reads whatever exists at the path) or delete them mid-round-trip
+    // (#1883). Both engines must keep sharing the ONE path — the write→reload
+    // round-trip through the same file is the behaviour under test. The RAII
+    // guard replaces both manual fs::remove calls (unique_temp_path guarantees
+    // the path does not pre-exist). TempDbFile on a plain .cfg is deliberate:
+    // there is no generic TempFile guard, and its -wal/-shm removes are
+    // harmless no-ops here.
+    yuzu::test::TempDbFile cfg{"yuzu_test_auto_approve-"};
+    const auto& tmp = cfg.path;
 
     {
         AutoApproveEngine engine;
@@ -220,6 +231,4 @@ TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
         REQUIRE(rules[1].value == "10.0.0.0/8");
         REQUIRE(rules[1].enabled == false);
     }
-
-    fs::remove(tmp);
 }

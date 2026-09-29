@@ -51,7 +51,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -59,7 +59,11 @@ jobs:
       # input on `actions/cache`. The cache maintainers documented it as
       # "does not work as intended" and recommend a split
       # `actions/cache/restore` + `actions/cache/save` (gated on
-      # `if: always() && cache-hit != 'true'`) instead. This step fails
+      # `if: always() && cache-hit != 'true'`) instead. That gate is right
+      # for an ADDITIVE cache (ccache); a coherent-artifact tree such as
+      # `vcpkg_installed` must ALSO gate on the producing step's outcome,
+      # or a cancelled run saves a partial tree under an immutable key —
+      # see `.claude/skills/ci-cache/SKILL.md`. This step fails
       # the workflow if `save-always` reappears in any workflow YAML so
       # the non-use becomes structural rather than convention.
       # Reference: https://github.com/actions/cache/tree/main/save#always-save-cache
@@ -81,8 +85,41 @@ jobs:
           fi
           echo "save-always check: clean"
 
+      # Control-plane guard for the tracker close automation (ADR-3001 A1 §9:
+      # the deliberate replacement for the descoped CODEOWNERS gate). The
+      # tampering that matters is exactly three shapes: deleting the workflow,
+      # putting a `paths:` filter on it (a filtered close workflow silently
+      # stops closing), or moving it off the trusted `push:` trigger (a
+      # pull_request run for a fork/Dependabot PR gets a read-only token and
+      # the close job 403s -- see A1 §3). Deterministic, needs no admin.
+      - name: Guard — close-linked-issues control plane
+        run: |
+          set -eu
+          f=.github/workflows/close-linked-issues.yml
+          if [ ! -f "$f" ]; then
+            echo "::error::$f is missing — the tracker close automation must not be deleted (ADR-3001 A1 §9)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*paths(-ignore)?:' "$f"; then
+            echo "::error::$f carries a paths filter — a filtered close workflow silently stops closing (ADR-3001 A1 §9)"
+            exit 1
+          fi
+          if ! grep -qE '^[[:space:]]*push:' "$f"; then
+            echo "::error::$f is not push:-triggered — pull_request runs for fork/Dependabot PRs get a read-only token (ADR-3001 A1 §3)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*(pull_request|pull_request_target|workflow_call):' "$f"; then
+            echo "::error::$f gained a PR-context trigger — forbidden for the close automation (ADR-3001 A1 §3)"
+            exit 1
+          fi
+          if grep -nE '^[[:space:]]*(workflow_dispatch|schedule):' "$f"; then
+            echo "::error::$f gained a dispatch/cron trigger — dev-only workflows accept neither until promoted to main, and the close automation must stay push:-only (ADR-3001 Costs; A1 §3)"
+            exit 1
+          fi
+          echo "close-linked-issues control-plane check: clean"
+
       - name: Run zizmor
-        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
         with:
           # Audit everything under .github/workflows/ and reusable
           # composite actions. The action uploads SARIF itself.

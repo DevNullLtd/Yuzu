@@ -1,0 +1,57 @@
+## Yuzu — Gateway cluster-formation demo (HA WS-4 `#4555`, ADR-2002 §7b)
+##
+## Minimal, dedicated rig proving `yuzu_gw_cluster_discovery`'s redial loop
+## actually forms a mesh — the property no OTHER shipped Compose file could
+## demonstrate (every one of them pins `container_name:`, which Compose
+## refuses to scale, and host-publishes the gateway's ports, which would
+## collide across replicas). Deliberately does NOT include the C++ server,
+## Postgres, or an agent — those exercise the SEPARATE server<->gateway
+## upstream and agent<->gateway concerns this rig is not testing. A gateway
+## boots and serves fine with no reachable upstream (grpcbox client channels
+## connect lazily; a missing server just means repeated, logged, harmless
+## ProxyRegister/heartbeat failures) — this rig only proves gateway<->gateway
+## cluster formation in isolation.
+##
+## Usage:
+##   docker compose -f docker-compose.reference-gateway-cluster.yml \
+##       up -d --scale gateway=3
+##
+##   # Watch cluster-formation gauges converge (peers_resolved should reach
+##   # 2, peers_connected should reach 2, on every replica, within a few
+##   # redial-interval ticks):
+##   for p in $(docker compose -f docker-compose.reference-gateway-cluster.yml \
+##       ps -q gateway); do
+##     docker exec "$p" wget -qO- http://localhost:9568/metrics \
+##       | grep yuzu_gw_cluster_peers
+##   done
+##
+## No TLS, no custom sys.config mount — every replica boots the image's
+## SHIPPED DEFAULT config/sys.config (plaintext, no cert files required),
+## which already sets {connect_all, false} and the seed DNS name default
+## ("gateway", matching this file's own service name below) — zero extra
+## configuration needed for the cluster to form.
+services:
+  gateway:
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.0}
+    # NO container_name: (Compose refuses to scale a named service) and NO
+    # host-published ports (they would collide across replicas — nothing
+    # outside this Compose network needs to reach a specific replica by
+    # host port; use `docker exec` for the demo, as above).
+    restart: unless-stopped
+    environment:
+      # Demo-only: a real cluster needs a REAL cookie identical across every
+      # node (the boot guard's minimum-length floor, #4555, refuses a short
+      # or default one) — generate one once per rig, not per replica, and
+      # export it before `docker compose up` (`export
+      # YUZU_GW_COOKIE=$(openssl rand -hex 32)`). This is a Compose-file
+      # limitation, not a product one: every replica of ONE scaled service
+      # shares the SAME environment block, which is exactly the constraint
+      # HA WS-4 #4555 designed node identity around (fixed short name,
+      # address-only distinction) — the cookie is no different.
+      YUZU_GW_COOKIE: "${YUZU_GW_COOKIE:?set YUZU_GW_COOKIE to one shared openssl rand -hex 32 value before scaling this rig}"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

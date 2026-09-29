@@ -1,0 +1,177 @@
+captured: linux Ubuntu 26.04.1 LTS (x86_64) · bare-metal · 2026-09-10 · euid 1000 · leg-hash d105f619923a
+== action=catalog
+catalog|1
+source|win_run_hklm|unsupported|-|declared
+source|win_runonce_hklm|unsupported|-|declared
+source|win_runonceex_hklm|unsupported|-|declared
+source|win_run_hku|unsupported|-|declared
+source|win_runonce_hku|unsupported|-|declared
+source|win_startup_approved|unsupported|-|declared
+source|win_winlogon_shell|unsupported|-|declared
+source|win_winlogon_userinit|unsupported|-|declared
+source|win_appinit_dlls|unsupported|-|declared
+source|win_ifeo_debugger|unsupported|-|declared
+source|win_startup_folder_common|unsupported|-|declared
+source|win_startup_folder_user|unsupported|-|declared
+source|win_scheduled_tasks|unsupported|-|declared
+source|win_wmi_subscriptions|unsupported|-|declared
+source|lnx_etc_crontab|supported|-|declared
+source|lnx_cron_d|supported|-|declared
+source|lnx_cron_periodic|supported|-|declared
+source|lnx_user_crontabs|supported|-|declared
+source|lnx_anacrontab|supported|-|declared
+source|lnx_at_spool|supported|-|declared
+source|lnx_systemd_timers_system|supported|-|declared
+source|lnx_systemd_timers_user|constrained|-|declared
+source|lnx_xdg_autostart_system|supported|-|declared
+source|lnx_xdg_autostart_user|supported|-|declared
+source|lnx_rc_local|supported|-|declared
+source|lnx_init_d|constrained|-|declared
+source|mac_launchdaemons|unsupported|-|declared
+source|mac_launchagents|unsupported|-|declared
+source|mac_system_launchdaemons|unsupported|-|declared
+source|mac_system_launchagents|unsupported|-|declared
+source|mac_user_launchagents|unsupported|-|declared
+source|mac_login_items|unsupported|-|declared
+source|mac_periodic|unsupported|-|declared
+source|mac_emond|unsupported|-|declared
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list
+source|win_run_hklm|unsupported|0|foreign_os
+source|win_runonce_hklm|unsupported|0|foreign_os
+source|win_runonceex_hklm|unsupported|0|foreign_os
+source|win_run_hku|unsupported|0|foreign_os
+source|win_runonce_hku|unsupported|0|foreign_os
+source|win_startup_approved|unsupported|0|foreign_os
+source|win_winlogon_shell|unsupported|0|foreign_os
+source|win_winlogon_userinit|unsupported|0|foreign_os
+source|win_appinit_dlls|unsupported|0|foreign_os
+source|win_ifeo_debugger|unsupported|0|foreign_os
+source|win_startup_folder_common|unsupported|0|foreign_os
+source|win_startup_folder_user|unsupported|0|foreign_os
+source|win_scheduled_tasks|unsupported|0|foreign_os
+source|win_wmi_subscriptions|unsupported|0|foreign_os
+autorun|lnx_etc_crontab|1|/etc/crontab|17 * * * *|cd / && run-parts --report /etc/cron.hourly||enabled|system|root|not_checked|1762340267
+autorun|lnx_etc_crontab|1|/etc/crontab|25 6 * * *|test -x /usr/sbin/anacron ││ { cd / && run-parts --report /etc/cron.daily; }||enabled|system|root|not_checked|1762340267
+autorun|lnx_etc_crontab|1|/etc/crontab|47 6 * * 7|test -x /usr/sbin/anacron ││ { cd / && run-parts --report /etc/cron.weekly; }||enabled|system|root|not_checked|1762340267
+autorun|lnx_etc_crontab|1|/etc/crontab|52 6 1 * *|test -x /usr/sbin/anacron ││ { cd / && run-parts --report /etc/cron.monthly; }||enabled|system|root|not_checked|1762340267
+source|lnx_etc_crontab|supported|4|-
+autorun|lnx_cron_d|1|/etc/cron.d/e2scrub_all|30 3 * * 0|test -e /run/systemd/system ││ SERVICE_MODE=1 /usr/libexec/e2fsprogs/e2scrub_all_cron||enabled|system|root|not_checked|1770985020
+autorun|lnx_cron_d|1|/etc/cron.d/e2scrub_all|10 3 * * *|test -e /run/systemd/system ││ SERVICE_MODE=1 /sbin/e2scrub_all -A -r||enabled|system|root|not_checked|1770985020
+autorun|lnx_cron_d|1|/etc/cron.d/anacron|30 7-23 * * *|if [ -x /etc/init.d/anacron ] && ! [ -d /run/systemd/system ]; then exec /usr/sbin/invoke-rc.d anacron start >/dev/null; fi||enabled|system|root|not_checked|1761901846
+source|lnx_cron_d|supported|3|-
+autorun|lnx_cron_periodic|1|/etc/cron.daily|apport|/etc/cron.daily/apport||enabled|system|-|not_checked|1776081060
+autorun|lnx_cron_periodic|1|/etc/cron.daily|man-db|/etc/cron.daily/man-db||enabled|system|-|not_checked|1746192267
+autorun|lnx_cron_periodic|1|/etc/cron.daily|0anacron|/etc/cron.daily/0anacron||enabled|system|-|not_checked|1761901846
+autorun|lnx_cron_periodic|1|/etc/cron.daily|dpkg|/etc/cron.daily/dpkg||enabled|system|-|not_checked|1765846246
+autorun|lnx_cron_periodic|1|/etc/cron.daily|google-chrome|/etc/cron.daily/google-chrome||enabled|system|-|not_checked|1787598937
+autorun|lnx_cron_periodic|1|/etc/cron.daily|logrotate|/etc/cron.daily/logrotate||enabled|system|-|not_checked|1765017342
+autorun|lnx_cron_periodic|1|/etc/cron.daily|apt-compat|/etc/cron.daily/apt-compat||enabled|system|-|not_checked|1775552559
+autorun|lnx_cron_periodic|1|/etc/cron.weekly|man-db|/etc/cron.weekly/man-db||enabled|system|-|not_checked|1746192267
+autorun|lnx_cron_periodic|1|/etc/cron.weekly|0anacron|/etc/cron.weekly/0anacron||enabled|system|-|not_checked|1761901846
+autorun|lnx_cron_periodic|1|/etc/cron.monthly|0anacron|/etc/cron.monthly/0anacron||enabled|system|-|not_checked|1761901846
+source|lnx_cron_periodic|supported|10|-
+source|lnx_user_crontabs|constrained|0|permission_denied
+autorun|lnx_anacrontab|1|/etc/anacrontab|cron.daily|run-parts --report /etc/cron.daily|1 5|enabled|system|-|not_checked|1761901846
+autorun|lnx_anacrontab|1|/etc/anacrontab|cron.weekly|run-parts --report /etc/cron.weekly|7 10|enabled|system|-|not_checked|1761901846
+autorun|lnx_anacrontab|1|/etc/anacrontab|cron.monthly|run-parts --report /etc/cron.monthly|@monthly 15|enabled|system|-|not_checked|1761901846
+autorun|lnx_anacrontab|1|/etc/anacrontab|cron.yearly|run-parts --report /etc/cron.yearly|@yearly 20|enabled|system|-|not_checked|1761901846
+source|lnx_anacrontab|supported|4|-
+source|lnx_at_spool|supported|0|absent
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/man-db.timer|man-db.timer|man-db.service|OnCalendar=daily|enabled|system|-|not_checked|1770065371
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/logrotate.timer|logrotate.timer|logrotate.service|OnCalendar=daily|enabled|system|-|not_checked|1716576455
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/sysstat-rotate.timer|sysstat-rotate.timer|sysstat-rotate.service|OnCalendar=00:00|enabled|system|-|not_checked|1768171246
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/ua-timer.timer|ua-timer.timer|ua-timer.service|OnUnitActiveSec=6h|enabled|system|-|not_checked|1742242560
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/chrony-dnssrv@.timer|chrony-dnssrv@.timer|chrony-dnssrv@.service||disabled|system|-|not_checked|1699992153
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/update-notifier-download.timer|update-notifier-download.timer|update-notifier-download.service|OnUnitActiveSec=24h|enabled|system|-|not_checked|1742218299
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/systemd-tmpfiles-clean.timer|systemd-tmpfiles-clean.timer|systemd-tmpfiles-clean.service|OnBootSec=15min; OnUnitActiveSec=1d|enabled|system|-|not_checked|1773416108
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/apport-autoreport.timer|apport-autoreport.timer|apport-autoreport.service|OnUnitActiveSec=3h|enabled|system|-|not_checked|1783076336
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/snapd.snap-repair.timer|snapd.snap-repair.timer|snapd.snap-repair.service|OnCalendar=*-*-* 5,11,17,23:00|enabled|system|-|not_checked|1783411608
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/fstrim.timer|fstrim.timer|fstrim.service|OnCalendar=weekly|enabled|system|-|not_checked|1787149416
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/motd-news.timer|motd-news.timer|motd-news.service|OnCalendar=00,12:00:00|enabled|system|-|not_checked|1787567628
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/fwupd-refresh.timer|fwupd-refresh.timer|fwupd-refresh.service|OnCalendar=*-*-* *:00:00|enabled|system|-|not_checked|1773310113
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/apt-daily-upgrade.timer|apt-daily-upgrade.timer|apt-daily-upgrade.service|OnCalendar=*-*-* 6:00|enabled|system|-|not_checked|1775552559
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/update-notifier-motd.timer|update-notifier-motd.timer|update-notifier-motd.service|OnCalendar=Sun *-*-* 06:00:00|enabled|system|-|not_checked|1742218299
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/sysstat-summary.timer|sysstat-summary.timer|sysstat-summary.service|OnCalendar=00:07:00|enabled|system|-|not_checked|1768171246
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/apt-daily.timer|apt-daily.timer|apt-daily.service|OnCalendar=*-*-* 6,18:00|enabled|system|-|not_checked|1775552559
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/sysstat-collect.timer|sysstat-collect.timer|sysstat-collect.service|OnCalendar=*:00/10|enabled|system|-|not_checked|1768171246
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/dpkg-db-backup.timer|dpkg-db-backup.timer|dpkg-db-backup.service|OnCalendar=daily|enabled|system|-|not_checked|1765846246
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/anacron.timer|anacron.timer|anacron.service|OnCalendar=*-*-* 07..23:30|enabled|system|-|not_checked|1761901846
+autorun|lnx_systemd_timers_system|1|/usr/lib/systemd/system/e2scrub_all.timer|e2scrub_all.timer|e2scrub_all.service|OnCalendar=Sun *-*-* 03:10:00|enabled|system|-|not_checked|1770985020
+source|lnx_systemd_timers_system|supported|20|-
+autorun|lnx_systemd_timers_user|1|/etc/systemd/user/snap.firmware-updater.firmware-notifier.timer|snap.firmware-updater.firmware-notifier.timer|snap.firmware-updater.firmware-notifier.service|OnCalendar=*-*-* 21:00|enabled|user|-|not_checked|1776907313
+autorun|lnx_systemd_timers_user|1|/usr/lib/systemd/user/ubuntu-insights-upload.timer|ubuntu-insights-upload.timer|ubuntu-insights-upload.service|OnBootSec=8min; OnUnitActiveSec=1weeks|enabled|user|-|not_checked|1771024116
+autorun|lnx_systemd_timers_user|1|/usr/lib/systemd/user/ubuntu-insights-collect.timer|ubuntu-insights-collect.timer|ubuntu-insights-collect.service|OnBootSec=5min; OnUnitActiveSec=1months|enabled|user|-|not_checked|1771024116
+autorun|lnx_systemd_timers_user|1|/usr/lib/systemd/user/systemd-tmpfiles-clean.timer|systemd-tmpfiles-clean.timer|systemd-tmpfiles-clean.service|OnUnitActiveSec=1d|unknown|user|-|not_checked|1773416108
+autorun|lnx_systemd_timers_user|1|/usr/lib/systemd/user/launchpadlib-cache-clean.timer|launchpadlib-cache-clean.timer|launchpadlib-cache-clean.service|OnUnitActiveSec=1d|enabled|user|-|not_checked|1765018458
+source|lnx_systemd_timers_user|constrained|5|partial_permission_denied,wants_scan_incomplete,narrow_search_path_coverage
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/at-spi-dbus-bus.desktop|at-spi-dbus-bus.desktop|/usr/libexec/at-spi-bus-launcher --launch-immediately||enabled|system|-|not_checked|1773498563
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/xdg-user-dirs-kde.desktop|xdg-user-dirs-kde.desktop|xdg-user-dirs-update||enabled|system|-|not_checked|1761107745
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/orca-autostart.desktop|orca-autostart.desktop|orca --replace||enabled|system|-|not_checked|1776322902
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/update-notifier.desktop|update-notifier.desktop|update-notifier||enabled|system|-|not_checked|1776366879
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/localsearch-3.desktop|localsearch-3.desktop|/usr/libexec/localsearch-3||enabled|system|-|not_checked|1775641146
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/nvidia-settings-autostart.desktop|nvidia-settings-autostart.desktop|sh -c '/usr/bin/nvidia-settings --load-config-only'||enabled|system|-|not_checked|1769392385
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/xdg-user-dirs.desktop|xdg-user-dirs.desktop|xdg-user-dirs-update||enabled|system|-|not_checked|1758848733
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/polkit-mate-authentication-agent-1.desktop|polkit-mate-authentication-agent-1.desktop|/usr/libexec/polkit-mate-authentication-agent-1||enabled|system|-|not_checked|1767348934
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/gnome-keyring-secrets.desktop|gnome-keyring-secrets.desktop|/usr/bin/gnome-keyring-daemon --start --components=secrets||enabled|system|-|not_checked|1773740463
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/geoclue-demo-agent.desktop|geoclue-demo-agent.desktop|/usr/libexec/geoclue-2.0/demos/agent||enabled|system|-|not_checked|1770064771
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/gnome-keyring-pkcs11.desktop|gnome-keyring-pkcs11.desktop|/usr/bin/gnome-keyring-daemon --start --components=pkcs11||enabled|system|-|not_checked|1773740463
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/im-launch.desktop|im-launch.desktop|/usr/bin/true||enabled|system|-|not_checked|1773904513
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/ubuntu-advantage-notification.desktop|ubuntu-advantage-notification.desktop|/usr/lib/update-notifier/ubuntu-advantage-notification||enabled|system|-|not_checked|1776366879
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/xiccd.desktop|xiccd.desktop|xiccd||enabled|system|-|not_checked|1767351721
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/spice-vdagent.desktop|spice-vdagent.desktop|/usr/bin/spice-vdagent||enabled|system|-|not_checked|1760591377
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/org.gnome.SettingsDaemon.DiskUtilityNotify.desktop|org.gnome.SettingsDaemon.DiskUtilityNotify.desktop|/usr/libexec/gsd-disk-utility-notify||enabled|system|-|not_checked|1770064837
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/light-locker.desktop|light-locker.desktop|light-locker||enabled|system|-|not_checked|1772945033
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/xfsettingsd.desktop|xfsettingsd.desktop|xfsettingsd||enabled|system|-|not_checked|1769719990
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/ubuntu-report-on-upgrade.desktop|ubuntu-report-on-upgrade.desktop|/usr/bin/ubuntu-report send upgrade||enabled|system|-|not_checked|1739546398
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/org.gnome.Evolution-alarm-notify.desktop|org.gnome.Evolution-alarm-notify.desktop|/usr/libexec/evolution-data-server/evolution-alarm-notify||enabled|system|-|not_checked|1771438016
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/snap-userd-autostart.desktop|snap-userd-autostart.desktop|/usr/bin/snap userd --autostart||enabled|system|-|not_checked|1776151800
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/user-dirs-update-gtk.desktop|user-dirs-update-gtk.desktop|xdg-user-dirs-gtk-update||enabled|system|-|not_checked|1765668958
+autorun|lnx_xdg_autostart_system|1|/etc/xdg/autostart/xfce4-notifyd.desktop|xfce4-notifyd.desktop|sh -c "systemctl --user start xfce4-notifyd.service 2>/dev/null ││ exec /usr/lib/x86_64-linux-gnu/xfce4/notifyd/xfce4-notifyd"||enabled|system|-|not_checked|1769719954
+source|lnx_xdg_autostart_system|supported|23|-
+source|lnx_xdg_autostart_user|supported|0|-
+source|lnx_rc_local|supported|0|absent
+autorun|lnx_init_d|1|/etc/init.d|whoopsie|/etc/init.d/whoopsie||unknown|system|-|not_checked|1726759321
+autorun|lnx_init_d|1|/etc/init.d|cups|/etc/init.d/cups||unknown|system|-|not_checked|1764957599
+autorun|lnx_init_d|1|/etc/init.d|ubuntu-fan|/etc/init.d/ubuntu-fan||unknown|system|-|not_checked|1611258389
+autorun|lnx_init_d|1|/etc/init.d|sssd|/etc/init.d/sssd||unknown|system|-|not_checked|1759165015
+autorun|lnx_init_d|1|/etc/init.d|dbus|/etc/init.d/dbus||unknown|system|-|not_checked|1772531391
+autorun|lnx_init_d|1|/etc/init.d|apport|/etc/init.d/apport||unknown|system|-|not_checked|1776081060
+autorun|lnx_init_d|1|/etc/init.d|xrdp|/etc/init.d/xrdp||unknown|system|-|not_checked|1769887940
+autorun|lnx_init_d|1|/etc/init.d|uuidd|/etc/init.d/uuidd||unknown|system|-|not_checked|1773400163
+autorun|lnx_init_d|1|/etc/init.d|ssh|/etc/init.d/ssh||unknown|system|-|not_checked|1773324889
+autorun|lnx_init_d|1|/etc/init.d|bluetooth|/etc/init.d/bluetooth||unknown|system|-|not_checked|1774281612
+autorun|lnx_init_d|1|/etc/init.d|plymouth-log|/etc/init.d/plymouth-log||unknown|system|-|not_checked|1773325624
+autorun|lnx_init_d|1|/etc/init.d|ufw|/etc/init.d/ufw||unknown|system|-|not_checked|1707657632
+autorun|lnx_init_d|1|/etc/init.d|kdump-tools|/etc/init.d/kdump-tools||unknown|system|-|not_checked|1746600350
+autorun|lnx_init_d|1|/etc/init.d|chrony|/etc/init.d/chrony||unknown|system|-|not_checked|1699992153
+autorun|lnx_init_d|1|/etc/init.d|openvpn|/etc/init.d/openvpn||unknown|system|-|not_checked|1770885929
+autorun|lnx_init_d|1|/etc/init.d|alsa-utils|/etc/init.d/alsa-utils||unknown|system|-|not_checked|1771393251
+autorun|lnx_init_d|1|/etc/init.d|lightdm|/etc/init.d/lightdm||unknown|system|-|not_checked|1719004304
+autorun|lnx_init_d|1|/etc/init.d|gdm3|/etc/init.d/gdm3||unknown|system|-|not_checked|1774006072
+autorun|lnx_init_d|1|/etc/init.d|plymouth|/etc/init.d/plymouth||unknown|system|-|not_checked|1773325624
+autorun|lnx_init_d|1|/etc/init.d|saned|/etc/init.d/saned||unknown|system|-|not_checked|1775046994
+autorun|lnx_init_d|1|/etc/init.d|screen-cleanup|/etc/init.d/screen-cleanup||unknown|system|-|not_checked|1758284154
+autorun|lnx_init_d|1|/etc/init.d|spice-vdagent|/etc/init.d/spice-vdagent||unknown|system|-|not_checked|1760591361
+autorun|lnx_init_d|1|/etc/init.d|anacron|/etc/init.d/anacron||unknown|system|-|not_checked|1761901846
+autorun|lnx_init_d|1|/etc/init.d|rsync|/etc/init.d/rsync||unknown|system|-|not_checked|1764288115
+autorun|lnx_init_d|1|/etc/init.d|apparmor|/etc/init.d/apparmor||unknown|system|-|not_checked|1775669211
+autorun|lnx_init_d|1|/etc/init.d|x11-common|/etc/init.d/x11-common||unknown|system|-|not_checked|1749801776
+autorun|lnx_init_d|1|/etc/init.d|speech-dispatcher|/etc/init.d/speech-dispatcher||unknown|system|-|not_checked|1761839077
+autorun|lnx_init_d|1|/etc/init.d|procps|/etc/init.d/procps||unknown|system|-|not_checked|1764618623
+autorun|lnx_init_d|1|/etc/init.d|cron|/etc/init.d/cron||unknown|system|-|not_checked|1762340267
+autorun|lnx_init_d|1|/etc/init.d|console-setup.sh|/etc/init.d/console-setup.sh||unknown|system|-|not_checked|1772461316
+autorun|lnx_init_d|1|/etc/init.d|keyboard-setup.sh|/etc/init.d/keyboard-setup.sh||unknown|system|-|not_checked|1772460534
+autorun|lnx_init_d|1|/etc/init.d|unattended-upgrades|/etc/init.d/unattended-upgrades||unknown|system|-|not_checked|1774592557
+source|lnx_init_d|constrained|32|listing_only
+source|mac_launchdaemons|unsupported|0|foreign_os
+source|mac_launchagents|unsupported|0|foreign_os
+source|mac_system_launchdaemons|unsupported|0|foreign_os
+source|mac_system_launchagents|unsupported|0|foreign_os
+source|mac_user_launchagents|unsupported|0|foreign_os
+source|mac_login_items|unsupported|0|foreign_os
+source|mac_periodic|unsupported|0|foreign_os
+source|mac_emond|unsupported|0|foreign_os
+[result_status] CONSTRAINED / PARTIAL / autoruns:degraded
+

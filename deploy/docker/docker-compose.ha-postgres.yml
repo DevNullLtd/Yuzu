@@ -1,0 +1,173 @@
+# docker-compose.ha-postgres.yml — Yuzu HA-Postgres substrate (WS-7, ADR-2002 §11).
+#
+# An OPT-IN High-Availability replacement for the single `postgres` service in
+# the reference/uat composes: a 3-node Patroni-managed PostgreSQL cluster with
+# etcd as the DCS and HAProxy routing writes to the current primary. The server
+# needs NO code change — it connects to the `postgres` network alias (HAProxy)
+# exactly as before (YUZU_POSTGRES_DSN: postgresql://…@postgres:5432/yuzu).
+#
+# Bring up + prove failover:   bash scripts/ha/ha-pg-smoke.sh
+# Compose it with a server:     attach a server to the `yuzu-ha-pg` network and
+#                               point YUZU_POSTGRES_DSN at postgres:5432.
+#
+# STATIC IPs are load-bearing, not cosmetic. Patroni advertises each node by a
+# fixed address so that when a node dies its address stays RESOLVABLE (the
+# connection merely times out), and the surviving nodes detect it cleanly and
+# promote. Container HOSTNAMES are purged from Docker's embedded DNS the moment
+# a container stops, which turns the leader-race health probe into a DNS
+# resolution failure and can deadlock promotion ("not the healthiest node") in
+# quorum mode. Fixed addresses mirror how a real HA deployment is wired (stable
+# per-node addresses / DNS) and are Patroni best practice.
+#
+# ─────────────────────────── PRODUCTION NOTES ───────────────────────────────
+#  * This dev/test profile runs a SINGLE etcd node. A production deployment
+#    MUST run a 3-node etcd cluster (DCS quorum) — a single etcd is itself a
+#    SPOF. See docs/user-manual/ha-postgres.md.
+#  * The three pg nodes MUST be placed on DISTINCT hosts / failure domains for
+#    the RPO=0-across-host-failure guarantee (ADR-2002 §11). Compose pins
+#    containers, not hosts — co-locating all three quietly voids it.
+#  * Passwords are REQUIRED — there are no insecure defaults. The failover
+#    harness (scripts/ha/*.sh) exports dev values; a manual bring-up must set
+#    YUZU_SUPERUSER_PASSWORD / YUZU_PG_REPLICATION_PASSWORD / YUZU_DB_PASSWORD,
+#    all distinct. The app init refuses if the app password equals the superuser
+#    password. Prefer Docker secrets / an .env file over inline values in prod.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-pg-common: &pg-common
+  build:
+    context: ../..
+    dockerfile: deploy/docker/ha-postgres/Dockerfile.postgres-ha
+    args:
+      HA_BASE: ${YUZU_PG_HA_BASE:-yuzu-postgres:local}
+  image: yuzu-postgres-ha:local
+  restart: unless-stopped
+  healthcheck:
+    # Liveness (pg_isready) AND proof the app role/db that post_init creates
+    # exists — a bare pg_isready reports healthy even if the app init failed. The
+    # app SELECT 1 goes over the local socket with scram (matches the pg_hba).
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${YUZU_SUPERUSER_NAME:-postgres} -d postgres && PGPASSWORD=\"$${YUZU_DB_PASSWORD}\" psql -h /var/run/postgresql -U \"$${YUZU_DB_USER:-yuzu}\" -d \"$${YUZU_DB_NAME:-yuzu}\" -tAc 'SELECT 1' >/dev/null"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 40s
+  depends_on:
+    etcd:
+      condition: service_healthy
+
+x-pg-env: &pg-env
+  PATRONI_SCOPE: yuzu-ha
+  ETCD_HOSTS: 10.89.0.10:2379
+  YUZU_SUPERUSER_NAME: ${YUZU_SUPERUSER_NAME:-postgres}
+  POSTGRES_USER: ${YUZU_SUPERUSER_NAME:-postgres}
+  # Passwords are REQUIRED — no insecure defaults (matches the reference
+  # composes). The failover harness (scripts/ha/*.sh) exports dev values; for a
+  # manual bring-up set all three (distinct) in your environment or an .env file.
+  POSTGRES_PASSWORD: ${YUZU_SUPERUSER_PASSWORD:?set YUZU_SUPERUSER_PASSWORD (must differ from the app + replication passwords)}
+  YUZU_PG_REPLICATION_PASSWORD: ${YUZU_PG_REPLICATION_PASSWORD:?set YUZU_PG_REPLICATION_PASSWORD}
+  YUZU_DB_USER: ${YUZU_DB_USER:-yuzu}
+  YUZU_DB_NAME: ${YUZU_DB_NAME:-yuzu}
+  YUZU_DB_PASSWORD: ${YUZU_DB_PASSWORD:?set YUZU_DB_PASSWORD (must differ from the superuser password)}
+  YUZU_PG_DURABILITY: ${YUZU_PG_DURABILITY:-quorum3}
+  # Connection slots reserved for the app role ahead of every other client, so a
+  # backup job or ad-hoc psql can never take the slot a server's /readyz probe
+  # needs to reconnect (HA WS-8, #4943). Size: N_servers × (pool size + 2).
+  YUZU_PG_RESERVED_CONNECTIONS: ${YUZU_PG_RESERVED_CONNECTIONS:-40}
+  # Host (TCP) connections are scoped to this CIDR (the cluster subnet); see the entrypoint.
+  YUZU_PG_TRUST_CIDR: ${YUZU_PG_TRUST_CIDR:-10.89.0.0/24}
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16@sha256:d967d98a12dc220a1a290794711dba7eba04b8ce465e12b02383d1bfbb33e159
+    restart: unless-stopped
+    environment:
+      ETCDCTL_API: "3"
+    command:
+      - etcd
+      - --name=etcd0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://10.89.0.10:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://10.89.0.10:2380
+      - --initial-cluster=etcd0=http://10.89.0.10:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=yuzu-ha-etcd
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      hanet:
+        ipv4_address: 10.89.0.10
+
+  pg1:
+    <<: *pg-common
+    container_name: yuzu-ha-pg1
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg1
+      PATRONI_CONNECT_HOST: 10.89.0.11
+    volumes:
+      - pg1-data:/var/lib/postgresql
+    networks:
+      hanet:
+        ipv4_address: 10.89.0.11
+
+  pg2:
+    <<: *pg-common
+    container_name: yuzu-ha-pg2
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg2
+      PATRONI_CONNECT_HOST: 10.89.0.12
+    volumes:
+      - pg2-data:/var/lib/postgresql
+    networks:
+      hanet:
+        ipv4_address: 10.89.0.12
+
+  pg3:
+    <<: *pg-common
+    container_name: yuzu-ha-pg3
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg3
+      PATRONI_CONNECT_HOST: 10.89.0.13
+    volumes:
+      - pg3-data:/var/lib/postgresql
+    networks:
+      hanet:
+        ipv4_address: 10.89.0.13
+
+  haproxy:
+    image: haproxy:3.0.6-bookworm@sha256:fc519739752cc47c73fecc3ecb08d5b4b6671633a52819412a0fd0a94e2525f6
+    container_name: yuzu-ha-haproxy
+    restart: unless-stopped
+    volumes:
+      - ./ha-postgres/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      pg1: {condition: service_started}
+      pg2: {condition: service_started}
+      pg3: {condition: service_started}
+    # `postgres` alias: the server's existing DSN (…@postgres:5432/…) resolves
+    # here unchanged. HAProxy forwards :5432 to the current Patroni primary.
+    networks:
+      hanet:
+        aliases: [postgres]
+        ipv4_address: 10.89.0.20
+
+networks:
+  hanet:
+    name: yuzu-ha-pg
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+
+volumes:
+  etcd-data:
+  pg1-data:
+  pg2-data:
+  pg3-data:

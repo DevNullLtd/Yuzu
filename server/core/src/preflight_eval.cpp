@@ -67,7 +67,15 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         PreflightCheckResponses cr;
         cr.key = key;
         cr.label = label;
-        auto rows = store.query_by_execution(check_execution_id(run_id, key), q);
+        // #2691 finding 10: this DOES feed a gate — the persisted grid drives
+        // Deploy's go-cohort (deployment_routes.cpp filters to kPass/kWarnOnly)
+        // — so a degraded read must stay distinguishable from a genuinely
+        // empty one. `cr.degraded` lets every grid-persisting caller decline
+        // to persist this tick's (falsely-empty) result over an already-good
+        // stored verdict, rather than silently downgrading it to Incomplete.
+        auto rows_opt = store.query_by_execution(check_execution_id(run_id, key), q);
+        cr.degraded = !rows_opt.has_value();
+        auto rows = rows_opt.value_or(std::vector<StoredResponse>{});
         if (static_cast<int>(rows.size()) >= kResponseFetchCap)
             spdlog::warn("preflight: check '{}' response fetch hit the {}-row cap for run {} — "
                          "some agents' latest may be evicted (keyset-paging follow-up)",
@@ -91,6 +99,13 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         out.push_back(std::move(cr));
     }
     return out;
+}
+
+bool any_check_degraded(const std::vector<PreflightCheckResponses>& checks) {
+    for (const auto& c : checks)
+        if (c.degraded)
+            return true;
+    return false;
 }
 
 std::string checks_to_json(const std::vector<PreflightDeviceCheck>& checks) {

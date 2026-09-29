@@ -1,4 +1,4 @@
-shared_library(
+sccm_plugin_lib = shared_library(
   'sccm',
   files('src/sccm_plugin.cpp'),
   name_prefix: '',

@@ -20,6 +20,14 @@ name: Sanitizer tests
 # on the target ref. The gate passes --ref $(git rev-parse HEAD), so this
 # file must be committed and pushed before /test --full can dispatch
 # against a new commit.
+#
+# TODO(#4637): this workflow provisions no Postgres service and sets no
+# YUZU_TEST_POSTGRES_DSN. Every Postgres-touching test SKIPs silently via
+# YUZU_REQUIRE_PG_DB when that DSN is unset (tests/unit/test_helpers.hpp), so
+# today this workflow cannot be trusted as evidence that a PG-touching
+# sanitizer issue is actually exercised. Real fix is a separate, larger CI
+# change (adding a Postgres service + ensure-postgres.sh wiring, mirroring
+# ci.yml's server legs); out of scope here, tracked at #4637.
 
 on:
   workflow_dispatch:
@@ -46,6 +54,8 @@ env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   CCACHE_MAXSIZE: "500M"
   CCACHE_COMPRESS: "true"
+  # Big Tam allocates one 8C/16T L3 domain to each runner.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Preflight: Big Tam runner-health gate ─────────────────────────────
@@ -57,20 +67,22 @@ jobs:
   # than queueing 75 min into a stalled runner). Secrets are available on
   # workflow_dispatch (the /test --full dispatch path), so the PAT resolves.
   preflight:
-    name: "Preflight (runner health)"
+    name: "Sanitizer preflight (runner health)"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam
 
   asan-ubsan:
     name: "Sanitizers (ASan+UBSan)"
@@ -85,10 +97,18 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 75
     env:
-      # detect_odr_violation=0 mirrors ci.yml's sanitize-asan job: gRPC's
-      # libgpr.so embeds a static copy of abseil's kToUpper while the
-      # application links abseil dynamically (vcpkg port-linkage artefact),
-      # so ASan otherwise aborts before any Yuzu test runs.
+      # detect_odr_violation=0: kept as belt-and-braces post-#4019, not
+      # because the original trigger still applies. It was added because
+      # gRPC's libgpr.so embedded a static copy of abseil's kToUpper while
+      # the rest of the dep tree linked abseil dynamically -- #4019's
+      # triplets/x64-linux-asan.cmake switch to static linkage eliminated
+      # that specific split (confirmed: no separate libgpr.so in the built
+      # binaries). A narrower, still-live instance of the same ODR class
+      # survives at the libyuzu_agent_core.so/test-binary boundary (each
+      # independently embeds its own abseil kSeed) -- confirmed empirically
+      # NOT to trip this detector across a full agent-suite run, but not
+      # proven absent under every code path. Re-enabling is tracked
+      # separately; don't assume this line is dead weight.
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
       # Big Tam runs 4 runners on one host; a gateway eunit test that boots
@@ -98,7 +118,7 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -117,7 +137,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool gcc-15 g++-15
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool gcc-15 g++-15
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -217,7 +237,7 @@ jobs:
             -Db_sanitize=address,undefined
 
       - name: Build (ASan+UBSan)
-        run: meson compile -C build-linux-asan 2>&1 | tee sanitizer-asan-build.log
+        run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-asan-build.log
 
       - name: Test (ASan+UBSan)
         # Capture both stdout and the meson testlog as artifacts so the
@@ -226,7 +246,9 @@ jobs:
         # with the test harness output so the ERROR line is visible.
         run: |
           set -o pipefail
-          meson test -C build-linux-asan --print-errorlogs --no-stdsplit \
+          # --timeout-multiplier 2: same rationale as nightly.yml — the #2092
+          # server shards carry 600s budgets sized for uninstrumented runs.
+          meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs --no-stdsplit \
               2>&1 | tee sanitizer-asan.log
 
       - name: ccache stats
@@ -257,13 +279,17 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 75
     env:
+      # TSan suppressions are COMPILED INTO the test binaries
+      # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+      # there is deliberately no `suppressions=` file here. Read that comment
+      # before adding one.
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
       # See asan-ubsan: harmless gateway-eunit default-cookie defence on the
       # shared 4-runner Big Tam host (matches ci.yml).
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -279,7 +305,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool gcc-15 g++-15
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool gcc-15 g++-15
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -363,62 +389,26 @@ jobs:
             -Db_sanitize=thread
 
       - name: Build (TSan)
-        run: meson compile -C build-linux-tsan 2>&1 | tee sanitizer-tsan-build.log
+        run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-tsan-build.log
 
       - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
-        # Mirrors the same shim used by nightly.yml's TSan job — see #438
-        # for full context. cpp-httplib's non-blocking DNS path routes
-        # through getaddrinfo_a(), which glibc implements via a clone3-
-        # spawned helper thread that bypasses TSan's pthread_create
-        # interceptor. Without this shim, /test --full crashes the TSan
-        # suite the same way the nightly used to.
-        run: |
-          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
-          #define _GNU_SOURCE
-          #include <netdb.h>
-          #include <stddef.h>
-          #include <signal.h>
-          #include <time.h>
-
-          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
-                             struct sigevent *sig) {
-              (void)mode; (void)sig;
-              for (int i = 0; i < nitems; ++i) {
-                  if (!list[i]) continue;
-                  list[i]->ar_result = NULL;
-                  list[i]->__return = getaddrinfo(list[i]->ar_name,
-                                                    list[i]->ar_service,
-                                                    list[i]->ar_request,
-                                                    &list[i]->ar_result);
-              }
-              return 0;
-          }
-
-          int gai_suspend(const struct gaicb *const list[], int nitems,
-                           const struct timespec *timeout) {
-              (void)list; (void)nitems; (void)timeout;
-              return 0;
-          }
-
-          int gai_error(struct gaicb *req) {
-              return req ? req->__return : 0;
-          }
-
-          int gai_cancel(struct gaicb *req) {
-              (void)req;
-              return EAI_NOTCANCELED;
-          }
-          SHIM_EOF
-          gcc -shared -fPIC -O2 -Wall -Wextra \
-            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
-          file /tmp/libgai_sync_shim.so
+        # Same shim as nightly.yml's TSan job (#438): cpp-httplib's non-blocking
+        # DNS routes through getaddrinfo_a(), whose clone3-spawned helper thread
+        # bypasses TSan's pthread_create interceptor and crashes the suite the way
+        # the nightly used to. ONE shared build script, so this and nightly.yml
+        # can't drift (#1038 CS-03) — the glibc-private-ABI guard, gcc-15/-Werror,
+        # and the $RUNNER_TEMP-not-/tmp shared-path fix (#1038 R-15/CS-04) all live
+        # there and now apply here too.
+        run: bash scripts/ci/build-gai-sync-shim.sh "$RUNNER_TEMP/libgai_sync_shim.so"
 
       - name: Test (TSan)
         env:
-          LD_PRELOAD: /tmp/libgai_sync_shim.so
+          LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
         run: |
           set -o pipefail
-          meson test -C build-linux-tsan --print-errorlogs --no-stdsplit \
+          # --timeout-multiplier 2: same rationale as nightly.yml — the #2092
+          # server shards carry 600s budgets sized for uninstrumented runs.
+          meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs --no-stdsplit \
               2>&1 | tee sanitizer-tsan.log
 
       - name: ccache stats

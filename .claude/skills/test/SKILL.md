@@ -197,17 +197,32 @@ subprojects define the same name.
 # picks it up without a separate `docker tag` step in Phase 2.
 # Cross-platform: SKIP gracefully if docker is unavailable (macOS dev box
 # without OrbStack/Docker Desktop running). Linux CI always has docker.
+#
+# TRIPLET must match the BUILD HOST's architecture (#4546). Dockerfile.server
+# defaults `ARG TRIPLET=x64-linux`, so on an arm64 host an unqualified build
+# cross-compiles x64 under emulation and dies inside vcpkg with "unable to
+# detect the active compiler's information" (detect_compiler) — the image gate
+# then fails on EVERY branch on Apple Silicon, `dev` included, and cascades to
+# the Phase 2 upgrade test. Derive it from `uname -m` and pass --platform to
+# match, so an arm64 box builds arm64-linux natively and an x64 box is
+# byte-unchanged from the historical behaviour.
 if [[ "$MODE" != "quick" ]]; then
     (
         set -e
         BUILD_START=$(date +%s)
+        case "$(uname -m)" in
+            arm64|aarch64) HOST_DOCKER_ARCH=arm64; HOST_VCPKG_TRIPLET=arm64-linux ;;
+            *)             HOST_DOCKER_ARCH=amd64; HOST_VCPKG_TRIPLET=x64-linux ;;
+        esac
         if ! docker_available; then
             bash scripts/test/test-db-write.sh gate \
                 --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
                 --status SKIP --duration 0 \
                 --notes "docker not available — install/start OrbStack or Docker Desktop"
         elif docker build \
-            -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
+            --platform "linux/${HOST_DOCKER_ARCH}" \
+            --build-arg "TRIPLET=${HOST_VCPKG_TRIPLET}" \
+            -t "ghcr.io/devnullltd/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \
             > "$LOG_DIR/build-images.log" 2>&1; then
@@ -266,7 +281,7 @@ bash scripts/test/test-upgrade-stack.sh \
 ```
 
 `--old-version` is omitted so the script resolves it from GitHub's current
-"Latest release" at runtime (`gh api repos/Tr3kkR/Yuzu/releases/latest`).
+"Latest release" at runtime (`gh api repos/DevNullLtd/Yuzu/releases/latest`).
 This keeps the upgrade baseline tracking whatever the last published stable
 tag is without needing a pipeline edit each release. Pass `--old-version
 X.Y.Z` to pin an older baseline for debugging.
@@ -644,7 +659,8 @@ Overall: N FAIL, M WARN — <commit decision>
 
 ## Querying the test-runs DB
 
-The DB lives at `~/.local/share/yuzu/test-runs.db` and persists across runs. Common queries:
+The developer-local `/test` DB lives at `~/.local/share/yuzu/test-runs.db` and
+persists across runs. Common queries:
 
 ```bash
 # Most recent run with full gate detail
@@ -673,6 +689,34 @@ bash scripts/test/test-db-query.sh --prune 100
 ```
 
 Power users can `python3 scripts/test/test_db.py query ...` directly, or `python3 -c "import sqlite3; ..."` against the DB for ad-hoc analysis.
+
+Self-hosted CI uses the same schema but never shares one host-wide SQLite file.
+Each runner agent owns a durable database outside its checkout:
+
+- Big Tam: `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`
+- Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
+
+`ci.yml` initializes and finalizes the current runner's row automatically.
+Schema v3 keeps GitHub rerun attempts distinct and records the job result and
+duration, platform/runner/commit/event, ccache ratio, Meson test-entry
+result/duration/timeout, and known flakes recovered by isolated retry. Query a
+runner in place by setting `YUZU_TEST_DB`:
+
+```bash
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-flakes --since 30d
+```
+
+Provision or repair all runner DBs with
+`deploy/linux/Provision-BigTam-Runner-Telemetry.sh` or
+`deploy/windows/Provision-Windows-Runner.ps1`. The reviewed
+`tests/known-flaky.json` file remains the allowlist; database observations never
+change pass/fail policy. GitHub-hosted macOS runners are ephemeral, so their
+Meson logs remain Actions artifacts rather than runner-local history.
 
 ## Failure handling
 
@@ -703,8 +747,14 @@ Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catch
 4. **WSL2 + native dockerd** — preflight verifies `docker context show` is `default`, not `desktop-linux`.
 5. **Erlang rebar3 cache pollution** — gateway gates always source `scripts/ensure-erlang.sh` first; the `--dir apps/yuzu_gw/test` flag is mandatory per bug #337.
 6. **Fixture write race with migrations** — `test-fixtures-write.sh` polls `/readyz` for `{"status":"ready"}` (not `/livez`) before writing — uses the #339 compound-fix readiness contract.
-7. **Self-hosted runner availability** (PR2/PR3) — sanitizers and Windows OTA depend on `yuzu-wsl2-linux` and `yuzu-local-windows` runners being online; offline → WARN, not FAIL.
-8. **DB grows unbounded** — auto-prune kicks in after 100 runs by default (`YUZU_TEST_DB_RETENTION_RUNS`).
+7. **Self-hosted runner availability** — Linux jobs depend on the Big Tam
+   `yuzu-bigtam-linux-{0..3}` pool and Windows jobs on Wee Tam's
+   `yuzu-weetam-windows-{0..3}` pool; offline → WARN or fail-closed skip,
+   depending on the workflow gate.
+8. **DB retention is explicit** — local `/test` rows can be pruned with
+   `test-db-query.sh --prune N`; runner-local CI telemetry is intentionally
+   append-only for now so evidence is not silently aged out before a retention
+   and export policy is measured.
 
 ## Post-run follow-ups
 
@@ -712,7 +762,7 @@ After a successful run, the operator typically wants to:
 
 1. **Commit and push** — the green run is the gate. Reference `RUN_ID` in the commit message for traceability.
 2. **Compare to the prior run** — `test-db-query.sh --diff <prev> <current>` shows what changed in gate status and timings.
-3. **Investigate WARN gates** — these don't block but accumulate as tech debt. File issues if patterns emerge across runs.
+3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --repo DevNullLtd/Yuzu --state open --search "<gate name>" --json number,title` and `gh search issues --repo DevNullLtd/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
 4. **Bump the coverage baseline** if a legitimate drop or trade-off is intentional — `coverage-gate.sh --capture-baselines` and commit the updated `tests/coverage-baseline.json`. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against `tests/perf-baseline-provenance-N300.{jsonl,json}` and is not blocking.
 
 After a failed run:

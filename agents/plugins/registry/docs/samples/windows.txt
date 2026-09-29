@@ -1,0 +1,169 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6255117edeb8
+== action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
+value|Windows 10 Pro
+type|REG_SZ
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_value hive=HKCU key=Software\YuzuCaptureTmp name=probe value=1
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_value hive=HKCU key=Software\YuzuCaptureTmp name=probe
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_key hive=HKCU key=Software\YuzuCaptureTmp
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=key_exists hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+exists|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=enumerate_keys hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+subkey|Accessibility
+subkey|AdaptiveDisplayBrightness
+subkey|AeDebug
+subkey|AppCompatFlags
+subkey|ASR
+subkey|Audit
+subkey|BackgroundModel
+subkey|ClipSVC
+subkey|Compatibility32
+subkey|Console
+subkey|Containers
+subkey|CorruptedFileRecovery
+subkey|DefaultProductKey
+subkey|DefaultProductKey2
+subkey|DeviceDisplayObjects
+subkey|DiskDiagnostics
+subkey|drivers.desc
+subkey|Drivers32
+subkey|EFS
+subkey|Event Viewer
+subkey|Font Drivers
+subkey|Font Management
+subkey|FontDPI
+subkey|FontIntensityCorrection
+subkey|FontLink
+subkey|FontMapper
+subkey|FontMapperFamilyFallback
+subkey|Fonts
+subkey|FontSubstitutes
+subkey|GRE_Initialize
+subkey|HostComputeNetwork
+subkey|HostComputeService
+subkey|HumanPresence
+subkey|ICM
+subkey|Image File Execution Options
+subkey|IniFileMapping
+subkey|KnownFunctionTableDlls
+subkey|KnownManagedDebuggingDlls
+subkey|LanguagePack
+subkey|LicensingDiag
+subkey|MCI Extensions
+subkey|MCI32
+subkey|MiniDumpAuxiliaryDlls
+subkey|MsiCorruptedFileRecovery
+subkey|Multimedia
+subkey|NaAuth
+subkey|NetworkCards
+subkey|NetworkList
+subkey|NetworkList_Obsolete
+subkey|NoImeModeImes
+subkey|Notifications
+subkey|NowPlayingSessionManager
+subkey|NtVdm64
+subkey|OEM
+subkey|OpenGLDrivers
+subkey|PasswordLess
+subkey|PeerDist
+subkey|Perflib
+subkey|PerHwIdStorage
+subkey|Ports
+subkey|Prefetcher
+subkey|Print
+subkey|ProfileList
+subkey|ProfileNotification
+subkey|RemoteRegistry
+subkey|ResourceManager
+subkey|SBI
+subkey|Schedule
+subkey|SecEdit
+subkey|Sensor
+subkey|SoftwareProtectionPlatform
+subkey|SPP
+subkey|SRUM
+subkey|Subscriptions
+subkey|Superfetch
+subkey|Svchost
+subkey|SystemRestore
+subkey|Terminal Server
+subkey|TileDataModel
+subkey|Time Zones
+subkey|TokenBroker
+subkey|Tracing
+subkey|UAC
+subkey|UnattendSettings
+subkey|Update
+subkey|VersionsList
+subkey|Virtualization
+subkey|WbemPerf
+subkey|WiFiDirectAPI
+subkey|Windows
+subkey|Winlogon
+subkey|WinSAT
+subkey|WinSATAPI
+subkey|WirelessDocking
+subkey|WOF
+subkey|WorkloadManager
+subkey|WUDF
+subkey|ProfileService
+subkey|VolatileNotifications
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=enumerate_values hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+value|SystemRoot|REG_SZ
+value|BaseBuildRevisionNumber|REG_DWORD
+value|BuildBranch|REG_SZ
+value|BuildGUID|REG_SZ
+value|BuildLab|REG_SZ
+value|BuildLabEx|REG_SZ
+value|CompositionEditionID|REG_SZ
+value|CurrentBuild|REG_SZ
+value|CurrentBuildNumber|REG_SZ
+value|CurrentMajorVersionNumber|REG_DWORD
+value|CurrentMinorVersionNumber|REG_DWORD
+value|CurrentType|REG_SZ
+value|CurrentVersion|REG_SZ
+value|DisplayVersion|REG_SZ
+value|EditionID|REG_SZ
+value|EditionSubManufacturer|REG_SZ
+value|EditionSubstring|REG_SZ
+value|EditionSubVersion|REG_SZ
+value|InstallationType|REG_SZ
+value|InstallDate|REG_DWORD
+value|LCUVer|REG_SZ
+value|ProductName|REG_SZ
+value|ReleaseId|REG_SZ
+value|SoftwareType|REG_SZ
+value|UBR|REG_DWORD
+value|PathName|REG_SZ
+value|PendingInstall|REG_DWORD
+value|ProductId|REG_SZ
+value|DigitalProductId|REG_BINARY
+value|DigitalProductId4|REG_BINARY
+value|RegisteredOwner|REG_SZ
+value|InstallTime|REG_QWORD
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+username|jsmith
+value|1
+type|REG_DWORD
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_profiles
+S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\Users\Alex|loaded
+[result_status] UNDECLARED / UNKNOWN / 
+

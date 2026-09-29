@@ -1,0 +1,22 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash cc5994a9097a
+== action=set key=yuzu_capture_tmp value=1
+error|storage write failed
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=get key=yuzu_capture_tmp
+key|yuzu_capture_tmp|not_found
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete key=yuzu_capture_tmp
+status|ok
+key|yuzu_capture_tmp
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list
+count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=clear
+[not captured] Destructive/Irreversible: not executed on a live host
+

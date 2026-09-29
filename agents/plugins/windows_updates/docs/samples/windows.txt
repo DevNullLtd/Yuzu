@@ -1,0 +1,29 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 007b2e86015f
+== action=installed
+update|KB5122385|Update|9/1/2026
+update|KB5054156|Update|2/16/2026
+update|KB5120998|Update|9/1/2026
+update|KB5120997|Update|8/31/2026
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=missing
+available|Security Intelligence Update for Microsoft Defender Antivirus - KB2267602 (Version 1.459.91.0) - Current Channel (Broad)|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=pending_reboot
+windows_update_reboot|false|
+cbs_reboot|false|
+pending_file_rename|true|Non-empty value
+reboot_required|true|pending_file_rename
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=patch_connectivity
+target|https://windowsupdate.microsoft.com|dns_ok|true|dns_ms|3|ip|128.85.102.70
+target|https://windowsupdate.microsoft.com|tcp_ok|true|tcp_ms|160
+target|https://update.microsoft.com|dns_ok|true|dns_ms|0|ip|128.85.102.70
+target|https://update.microsoft.com|tcp_ok|true|tcp_ms|170
+target|https://download.windowsupdate.com|dns_ok|true|dns_ms|7|ip|199.232.54.172
+target|https://download.windowsupdate.com|tcp_ok|true|tcp_ms|14
+summary|targets_tested|3|targets_reachable|3|targets_failed|0
+[result_status] UNDECLARED / UNKNOWN / 
+

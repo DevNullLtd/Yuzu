@@ -1,0 +1,7 @@
+host: the-rig (desktop-04dnsig)
+os: Windows 11, MSVC 2022 BuildTools /std:c++latest
+identity: nt authority\system S-1-5-18 (scheduled task yuzu-wave9-bus-probe, ServiceAccount/Highest)
+command: probe_wave9_bus_win.exe USB (SetupDiGetClassDevsW(nullptr, L"USB", nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES))
+date: 2026-09-08
+status: REAL CAPTURE
+lines: 24 (budget 120)

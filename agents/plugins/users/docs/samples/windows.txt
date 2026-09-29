@@ -1,0 +1,84 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 5734018da5be
+== action=logged_on
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=sessions
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=local_users
+local_user|Administrator|false|2021-10-14 11:15:58|Built-in account for administering the computer/domain
+local_user|Alex|true|2026-09-07 11:08:37|-
+local_user|CodexSandboxOffline|true|Never|-
+local_user|CodexSandboxOnline|true|Never|-
+local_user|DefaultAccount|false|Never|A user account managed by the system.
+local_user|Guest|false|Never|Built-in account for guest access to the computer/domain
+local_user|WDAGUtilityAccount|false|Never|A user account managed and used by the system for Windows Defender Application Guard scenarios.
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=local_admins
+admin|Administrator|user|DESKTOP-04DNSIG
+admin|Alex|user|DESKTOP-04DNSIG
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=group_members group=Administrators
+group_member|Administrator|Administrators|user
+group_member|Alex|Administrators|user
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=primary_user
+primary_user|Alex|118|event_log_4624
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=session_history
+session_history|Alex|logoff|network|-|2026-09-07T10:08:37.8345208Z|4634
+session_history|sshd_6888|logoff|service|-|2026-09-07T10:08:37.8345130Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:37.5888936Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:37.5439466Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:37.5436517Z|4624
+session_history|sshd_6888|logon|service|-|2026-09-07T10:08:37.4636668Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:06.3059890Z|4634
+session_history|sshd_4452|logoff|service|-|2026-09-07T10:08:06.3059802Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:06.0444630Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:05.9047716Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:05.9044759Z|4624
+session_history|sshd_4452|logon|service|-|2026-09-07T10:08:05.8249284Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:05.7835346Z|4634
+session_history|sshd_11788|logoff|service|-|2026-09-07T10:08:05.7835247Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:05.5583828Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:05.4512396Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:05.4509261Z|4624
+session_history|sshd_11788|logon|service|-|2026-09-07T10:08:05.3642841Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:05.3146636Z|4634
+session_history|sshd_3088|logoff|service|-|2026-09-07T10:08:05.3146477Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:05.0730626Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:04.9175391Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:04.9172410Z|4624
+session_history|sshd_3088|logon|service|-|2026-09-07T10:08:04.8335760Z|4624
+session_history|Alex|logon|network|-|2026-09-07T10:08:02.2657272Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:02.1873193Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:02.1870161Z|4624
+session_history|sshd_10184|logon|service|-|2026-09-07T10:08:02.1082583Z|4624
+session_history|sshd_9348|logoff|service|-|2026-09-07T10:08:02.0658059Z|4634
+session_history|Alex|logoff|network|-|2026-09-07T10:08:02.0658058Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:01.8417585Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:08:01.7164289Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:08:01.7161356Z|4624
+session_history|sshd_9348|logon|service|-|2026-09-07T10:08:01.6317645Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:07:55.1801272Z|4634
+session_history|sshd_5792|logoff|service|-|2026-09-07T10:07:17.9958175Z|4634
+session_history|Alex|logoff|network|-|2026-09-07T10:07:17.9957175Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:07:17.7548542Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:07:17.7163997Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:07:17.7161093Z|4624
+session_history|sshd_5792|logon|service|-|2026-09-07T10:07:17.6230659Z|4624
+session_history|sshd_13788|logoff|service|-|2026-09-07T10:07:17.5667790Z|4634
+session_history|Alex|logoff|network|-|2026-09-07T10:07:17.5666883Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:07:17.3476835Z|4624
+session_history|Alex|logoff|network|-|2026-09-07T10:07:17.3173118Z|4634
+session_history|Alex|logon|network|-|2026-09-07T10:07:17.3170138Z|4624
+session_history|sshd_13788|logon|service|-|2026-09-07T10:07:17.2449053Z|4624
+session_history|sshd_11540|logoff|service|-|2026-09-07T10:07:17.1942416Z|4634
+session_history|Alex|logoff|network|-|2026-09-07T10:07:04.7374721Z|4634
+session_history|sshd_8928|logoff|service|-|2026-09-07T10:07:04.7374553Z|4634
+[result_status] UNDECLARED / UNKNOWN / 
+

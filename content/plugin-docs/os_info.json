@@ -1,0 +1,755 @@
+{
+  "actions": [
+    {
+      "action": "os_arch",
+      "definition_ids": [
+        "device.os_info.os_arch"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "uname(2)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "uname(2)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetNativeSystemInfo",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "os_build",
+      "definition_ids": [
+        "device.os_info.os_build"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc/version",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "SystemVersion.plist + sysctlbyname",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W CurrentBuildNumber + UBR",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "os_name",
+      "definition_ids": [
+        "device.os_info.os_name"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/etc/os-release",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "SystemVersion.plist + sysctlbyname",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Reg*W CurrentVersion\\\\ProductName + build-number correction",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "os_version",
+      "definition_ids": [
+        "device.os_info.os_version"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "uname(2)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "uname(2) + SystemVersion.plist + sysctlbyname",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "RtlGetVersion (ntdll)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "uptime",
+      "definition_ids": [
+        "device.os_info.uptime"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc/uptime",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sysctl(2) KERN_BOOTTIME",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetTickCount64",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**macOS product-name/version reads never shell out today.** Wave 3/PR31 (2026-08-19) moved `os_name`/`os_version`/`os_build` off `sw_vers` onto `SystemVersion.plist` + `sysctlbyname`, reaching ADR-3002 rung 1 with zero spawned processes (`changelog.d/20260819-wave3-pr31-syscall-promotion.changed.md`); the definition YAML's prose describing `sw_vers` for these three fields was stale and is fixed as part of this documentation pass.",
+    "**`uptime_seconds` can emit a non-numeric string despite its declared `int64` type.** When the platform read fails (`/proc/uptime` unreadable on Linux, the `KERN_BOOTTIME` sysctl failing on macOS), the leg writes the literal `unknown` instead of an integer (`os_info_plugin.cpp:371-377`); no sample in this capture set hit that path.",
+    "**`os_product_version` is macOS-only and conditionally emitted.** It rides a second `write_output` call inside `#ifdef __APPLE__` on the `os_version` action (`os_info_plugin.cpp:251-256`); Windows and Linux responses for `os_version` carry only one row.",
+    "**`os_arch` is not normalized on Linux/macOS.** Those legs return the raw `uname().machine` string verbatim (e.g. `aarch64` vs `arm64` — not the same token); only the Windows leg maps to a fixed `x86_64`/`aarch64`/`x86`/`arm`/`unknown` set (`os_info_plugin.cpp:311-343`).",
+    "**The plist parser is deliberately not a general XML parser.** `os_info_macos.hpp` scans for a flat `<dict>` of sibling `<key>/<string>` pairs only, because `SystemVersion.plist` is Apple-authored and not adversarial input; it returns `nullopt` on any nesting or a nearer sibling tag rather than guessing (`os_info_macos.hpp:14-19,48-55`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the CPU architecture of the endpoint (e.g. \"x86_64\", \"aarch64\", \"arm\"). On Windows, uses GetNativeSystemInfo. On Linux and macOS, uses uname().machine.",
+      "display_name": "CPU Architecture",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 86400
+      },
+      "id": "device.os_info.os_arch",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the OS build identifier. On Windows, reports CurrentBuildNumber.UBR from the registry (e.g. \"22631.4890\"). On Linux, extracts the kernel build version from /proc/version. On macOS, reads ProductBuildVersion from SystemVersion.plist, falling back to the kern.osversion sysctl -- no subprocess is spawned.",
+      "display_name": "OS Build Identifier",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.os_info.os_build",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the full OS product name (e.g. \"Windows 11 Pro\", \"Ubuntu 24.04.1 LTS\", \"macOS 26.6.2\"). On Windows, reads the registry ProductName and corrects the Windows 10/11 naming for builds >= 22000. On Linux, reads PRETTY_NAME from /etc/os-release. On macOS, reads ProductName and ProductVersion from SystemVersion.plist, falling back to the kern.osproductversion sysctl and then a literal if the plist is unreadable -- no subprocess is spawned.",
+      "display_name": "Operating System Name",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.os_info.os_name",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the OS version string. On Windows, reports Major.Minor.Build from RtlGetVersion (avoids manifest-dependent version lies). On Linux and macOS, reports the kernel release from uname. On macOS, also returns the user-facing product version (os_product_version) read from SystemVersion.plist's ProductVersion key, falling back to the kern.osproductversion sysctl -- no subprocess is spawned.",
+      "display_name": "OS Kernel / Version String",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.os_info.os_version",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the system uptime in seconds and a human-readable display string (e.g. \"12d 5h 23m\"). Uses /proc/uptime on Linux, kern.boottime sysctl on macOS, GetTickCount64 on Windows.",
+      "display_name": "System Uptime",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.os_info.uptime",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Reports OS name, version, build, architecture, and system uptime",
+  "how_it_works": "All five actions are single reads, no parameters. `os_name` builds the human-facing product name: Linux reads `PRETTY_NAME` from `/etc/os-release`; macOS reads `ProductName`/`ProductVersion` from `SystemVersion.plist` (sysctl and literal fallbacks); Windows reads the registry `ProductName` and corrects the Windows 10→11 naming lie for builds ≥ 22000. `os_version` reports the kernel/OS version — `uname(2)` release on Linux/macOS, `RtlGetVersion` on Windows (avoids `GetVersionEx`'s manifest-dependent lies) — and on macOS additionally emits a second row, the user-facing `os_product_version`. `os_build` reads `/proc/version` (Linux), `SystemVersion.plist`'s `ProductBuildVersion` (macOS), or `CurrentBuildNumber`+`UBR` from the registry (Windows). `os_arch` reads `uname(2).machine` on Linux/macOS (raw, unnormalized) or maps `GetNativeSystemInfo` to a fixed token set on Windows. `uptime` reads `/proc/uptime`, the `KERN_BOOTTIME` sysctl, or `GetTickCount64`, and always emits both a raw second count and a formatted display string.\n\nEvery leg is native in-process (ADR-3002 rung 1, zero subprocesses) — including macOS, which read `sw_vers` output until the Wave 3/PR31 syscall promotion moved it onto `SystemVersion.plist` + `sysctlbyname`. The plugin deliberately does not persist OS identity as a typed daily-sync inventory record; it is a live/on-demand read surface only, and it never sets a typed result status.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "45e627d9dfa2",
+  "manifest_version": 1,
+  "name": "os_info",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "CPU architecture. Linux and macOS report the raw uname(2) machine string unnormalized (e.g. \"aarch64\", \"arm64\" -- not the same token); Windows maps GetNativeSystemInfo to a fixed set: x86_64, aarch64, x86, arm, or unknown. Values: free text (Linux/macOS); \"x86_64\", \"aarch64\", \"x86\", \"arm\", \"unknown\" (Windows).",
+          "example": "x86_64",
+          "name": "os_arch",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.os_info.os_arch"
+    },
+    {
+      "columns": [
+        {
+          "description": "The OS build identifier: registry CurrentBuildNumber.UBR on Windows; the third whitespace field of /proc/version on Linux; SystemVersion.plist's ProductBuildVersion (sysctl kern.osversion fallback) on macOS. Values: free text.",
+          "example": "26200.9278",
+          "name": "os_build",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.os_info.os_build"
+    },
+    {
+      "columns": [
+        {
+          "description": "The OS product name as read by the platform-specific leg (registry ProductName on Windows, corrected for the Windows 11 naming quirk; PRETTY_NAME from /etc/os-release on Linux; ProductName + ProductVersion from SystemVersion.plist on macOS). Values: free text.",
+          "example": "Windows 11 Pro",
+          "name": "os_name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.os_info.os_name"
+    },
+    {
+      "columns": [
+        {
+          "description": "The kernel/version string: Major.Minor.Build from RtlGetVersion on Windows; the uname(2) kernel release on Linux and macOS. Values: free text.",
+          "example": "10.0.26200",
+          "name": "os_version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "macOS-only: the user-facing product version read from SystemVersion.plist's ProductVersion key (sysctl kern.osproductversion fallback); not emitted on Windows or Linux. Values: free text.",
+          "example": "26.6.2",
+          "name": "os_product_version",
+          "platforms": [
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.os_info.os_version"
+    },
+    {
+      "columns": [
+        {
+          "description": "Seconds since boot. Emitted as the literal string \"unknown\" instead of an integer if the platform read fails (/proc/uptime unreadable on Linux, the KERN_BOOTTIME sysctl failing on macOS) -- never observed in this capture set. Values: integer, or the literal \"unknown\".",
+          "example": "69193",
+          "name": "uptime_seconds",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Human-readable uptime formatted \"<days>d <hours>h <minutes>m\"; \"unknown\" if the platform read failed. Values: free text (\"<n>d <n>h <n>m\"), or the literal \"unknown\".",
+          "example": "0d 19h 13m",
+          "name": "uptime_display",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.os_info.uptime"
+    }
+  ],
+  "outputs_note": "Pipe-delimited `key|value` lines via `write_output()` — no row discriminator (unlike a multi-row action, each call emits one fixed set of known keys). A key is always present; when the underlying read fails the value is the literal `unknown` rather than the key being omitted.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — `os_info.*` row is `default` (`docs/agent-privilege-model.md:84`)",
+      "if_refused": "the affected field falls back to its literal (`unknown`, or the bare `Windows`/`macOS` name); no dedicated denial path — result status stays `UNDECLARED` regardless",
+      "measured": "2026-09-07, bare-metal, `SYSTEM` (windows.txt sample stamp)",
+      "os": "Windows",
+      "runs_as": "agent service account — registered as **LocalSystem** today (#1442; `docs/agent-privilege-model.md` Correction, 2026-07-03)"
+    },
+    {
+      "grant": "None — `os_info.*` row is `default`",
+      "if_refused": "same fallback-to-literal behavior",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — the capture ran **unprivileged**, not as the deployed root daemon (macos.txt sample stamp)",
+      "os": "macOS",
+      "runs_as": "agent LaunchDaemon — runs as **root** today (no `UserName` key; `docs/agent-privilege-model.md` TL;DR)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "same fallback-to-literal behavior",
+      "measured": "2026-09-06, container, euid 0 — the capture ran as **root**, not the intended unprivileged account (linux.txt sample stamp)",
+      "os": "Linux",
+      "runs_as": "agent daemon — unprivileged `yuzu` account by design (`docs/agent-privilege-model.md` TL;DR); `os_info.*` needs nothing beyond default"
+    }
+  ],
+  "readme": "agents/plugins/os_info/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "os_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_name|Debian GNU/Linux 13 (trixie)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_version|7.0.12-linuxkit"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_build",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_build|7.0.12-linuxkit"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_arch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_arch|aarch64"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "uptime",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "uptime_seconds|184116",
+            "uptime_display|2d 3h 8m"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "45e627d9dfa2",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "os_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_name|macOS 26.6.2"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "os_version|25.6.0",
+            "os_product_version|26.6.2"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_build",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_build|25G83"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_arch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_arch|arm64"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "uptime",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "uptime_seconds|48996",
+            "uptime_display|0d 13h 36m"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "45e627d9dfa2",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "os_name",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_name|Windows 11 Pro"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_version|10.0.26200"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_build",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_build|26200.9278"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "os_arch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "os_arch|x86_64"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "uptime",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "uptime_seconds|69193",
+            "uptime_display|0d 19h 13m"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "45e627d9dfa2",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "os_name",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "os_version",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "os_build",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "os_arch",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "uptime",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/os_info.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/os_info/src/os_info_macos.hpp",
+      "agents/plugins/os_info/src/os_info_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_os_info_macos.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Rows land in the ResponseStore over the agent's command-response channel; `os_info` is in the `kKeyValuePlugins` set (`server/core/src/result_parsing.hpp:63`), so SSE row rendering, ResponseStore facet extraction, and DashboardRoutes fragment rendering all render it as an `Agent · Key · Value` table.",
+    "**Live snapshot / device dashboard.** `uptime` is one of two allow-listed \"Get live info\" kinds (`server/core/src/live_kinds.hpp:43`, `resolve_kind(\"uptime\") → LiveKind{\"os_info\",\"uptime\",...}`), dispatched as a real, deliberately **untracked** instruction (no `ExecutionTracker` row — `server/core/src/server.cpp:19704`) and rendered as a KPI tile (`server/core/src/device_routes.hpp:130`). Reachable via `POST /api/v1/dex/devices/{id}/live?kind=uptime` (`server/core/src/rest_api_v1.cpp:10424-10437`).",
+    "**Pre-flight (`/auto`) gate.** `os_version` and `os_arch` are two of the five blocking Slice-1 checks, parsed by raw pipe-field index — bypassing `result.columns` entirely (`server/core/src/preflight_parse.hpp:13-15,51-52`).",
+    "**Not consumed by** daily-sync, the TAR warehouse, or typed inventory: `is_typed_inventory_source` (`server/core/src/typed_inventory_sources.hpp:22-26`) lists only `installed_software`, `app_perf`, `device_ci`, `software_licensing` — `os_info` is absent, so its result never lands in a typed daily-sync store.",
+    "**Sensitivity.** Rows carry only OS name/version/build/architecture and uptime — no device id, MAC, hostname, username, or installed-software identifier appears in any field.",
+    "**Siblings:** `device_identity` (the typed `device_ci` daily-sync source), `hardware.*` (also a `kKeyValuePlugins` entry).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.os_info.uptime\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}` for an instruction dispatch; `/api/v1/dex/devices/{id}/live?kind=uptime` for the live KPI path."
+  ]
+}

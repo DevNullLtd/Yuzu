@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Get-ScheduledTask -TaskPath "\Microsoft\Windows\*" filtered for the first task with an MSFT_TaskExecAction action
+date: 2026-09-06
+status: REAL CAPTURE

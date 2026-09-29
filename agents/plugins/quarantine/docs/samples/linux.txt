@@ -1,0 +1,17 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f4d514eecc28
+== action=quarantine
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=unquarantine
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=status
+state|uncertain|note|ipv6_unavailable — IPv6 stack is up but ip6tables is not installed
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+[rc] 1
+
+== action=whitelist
+error|missing required parameter: action (add/remove)
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

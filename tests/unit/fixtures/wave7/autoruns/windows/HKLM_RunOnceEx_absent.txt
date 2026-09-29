@@ -1,0 +1,6 @@
+HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnceEx does not exist on the-rig.
+
+Verified: Test-Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnceEx' -> False
+`reg export` of this path failed with "ERROR: The system was unable to find the specified registry
+key or value." RunOnceEx is a legacy XP/Server2003-era key that modern Windows 11 builds do not
+populate by default; its absence here is expected, not a capture failure.

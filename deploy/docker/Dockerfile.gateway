@@ -17,7 +17,7 @@
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:f36705c51f7c6d92d102234dfa6d85f8d2828e10f9adcfc98ff1931f87850787 AS deps
+FROM erlang:28-alpine@sha256:1ca511a6d4450c75e109f51362ecf2562e38b99cfca7471a502d47bf109410ec AS deps
 
 RUN apk add --no-cache git
 
@@ -67,9 +67,23 @@ RUN rebar3 as prod release
 # image to a wget-less variant or strip busybox without first updating every
 # compose file's healthcheck block to use a tool the new base provides.
 # Governance Gate 7, architect SHOULD-2.
+#
+# ENFORCED (#751): scripts/ci/verify-healthcheck-invariants.sh runs
+# `wget --spider` against a live listener inside this image before release.yml
+# pushes it, and on every PR that touches this file. NOTE: Alpine's busybox is
+# built WITHOUT the httpd applet, so it cannot serve the probe's listener — the
+# script uses the official busybox image for that.
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
+    # bind-tools (dig) + iproute2: HA WS-4 #4555 — gateway-entrypoint.sh
+    # resolves this node's own advertised distribution address by DNS-A-record
+    # lookup + local-interface intersection BEFORE the BEAM starts. Busybox's
+    # built-in `ip` applet output format is not guaranteed stable enough for
+    # this to parse reliably; `dig +short` is far easier to parse correctly
+    # than busybox nslookup's output. See gateway-entrypoint.sh's own header
+    # comment for the full resolution order.
+    && apk add --no-cache bind-tools iproute2 \
     && adduser -D -s /sbin/nologin yuzu-gw \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across server/
     # gateway/agent so the gateway (a different uid) reads the shared CA + its leaf
@@ -78,6 +92,7 @@ RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && addgroup yuzu-gw yuzu-pki
 
 COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /opt/yuzu_gw/
+COPY --chmod=755 deploy/docker/gateway-entrypoint.sh /opt/yuzu_gw/gateway-entrypoint.sh
 RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 
 USER yuzu-gw
@@ -85,5 +100,5 @@ WORKDIR /opt/yuzu_gw
 
 EXPOSE 50051 50063 8081 9568
 
-ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
+ENTRYPOINT ["/opt/yuzu_gw/gateway-entrypoint.sh"]
 CMD ["foreground"]

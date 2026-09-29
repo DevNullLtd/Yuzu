@@ -1,0 +1,23 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash d276d67e9d65
+== action=sync
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=status
+tag|role|
+tag|environment|
+tag|location|
+tag|service|
+last_sync|0
+stale|true
+check_interval|300
+change_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get key=role
+tag|role|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=changes
+changes|none
+[result_status] UNDECLARED / UNKNOWN / 
+

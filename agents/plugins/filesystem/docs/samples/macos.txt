@@ -1,0 +1,171 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4db605b6c689
+== action=exists path=/etc/hosts
+exists|true
+type|file
+size|213
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_dir path=/etc
+entry|manpaths|file|36
+entry|rc.common|file|1560
+entry|auto_master|file|195
+entry|csh.login|file|121
+entry|syslog.conf|file|96
+entry|krb5.keytab|file|1946
+entry|sudoers.d|directory|0
+entry|ssl|directory|0
+entry|csh.logout|file|39
+entry|aliases.db|file|16384
+entry|bashrc_Apple_Terminal|file|9293
+entry|yuzu|directory|0
+entry|racoon|directory|0
+entry|snmp|directory|0
+entry|zshrc_Apple_Terminal|file|9335
+entry|gettytab|file|5678
+entry|kern_loader.conf|file|0
+entry|paths.d|directory|0
+entry|asl|directory|0
+entry|rtadvd.conf|file|891
+entry|security|directory|0
+entry|group|file|3960
+entry|auto_home|file|149
+entry|manpaths.d|directory|0
+entry|ppp|directory|0
+entry|shells|file|189
+entry|ttys|file|1316
+entry|paths|file|75
+entry|rmtab|file|0
+entry|xtab|file|0
+entry|localtime|file|3664
+entry|pf.conf|file|1027
+entry|sudoers|file|1709
+entry|bashrc|file|265
+entry|newsyslog.d|directory|0
+entry|irbrc|file|1299
+entry|pam.d|directory|0
+entry|zshrc|file|3191
+entry|hosts.equiv|file|0
+entry|networks|file|53
+entry|find.codes|file|0
+entry|apache2|directory|0
+entry|autofs.conf|file|1932
+entry|ssh|directory|0
+entry|ftpusers|file|119
+entry|profile|file|189
+entry|csh.cshrc|file|189
+entry|ntp_opendirectory.conf|file|23
+entry|locate.rc|file|832
+entry|resolv.conf|file|434
+entry|nfs.conf|file|43
+entry|sudo_lecture|file|257
+entry|asl.conf|file|1051
+entry|rc.netboot|file|5264
+entry|hosts|file|213
+entry|postfix|directory|0
+entry|pf.os|file|28311
+entry|pf.anchors|directory|0
+entry|ntp.conf|file|22
+entry|rpc|file|1735
+entry|master.passwd|file|10004
+entry|openldap|directory|0
+entry|aliases|file|10086
+entry|com.apple.screensharing.agent.launchd|file|82
+entry|wfs|directory|0
+entry|protocols|file|6393
+entry|cups|directory|0
+entry|man.conf|file|2451
+entry|services|file|678260
+entry|uucp|directory|0
+entry|passwd|file|9344
+entry|zprofile|file|304
+entry|afpovertcp.cfg|file|515
+entry|newsyslog.conf|file|1318
+entry|mail.rc|file|106
+entry|notify.conf|file|557
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=file_hash path=/etc/hosts
+hash|c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da
+algorithm|sha256
+size|213
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-ayE16A.tmp
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp_dir
+path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-R7qEuY
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=read path=/etc/hosts
+line|1|##
+line|2|# Host Database
+line|3|#
+line|4|# localhost is used to configure the loopback interface
+line|5|# when the system is booting.  Do not change this entry.
+line|6|##
+line|7|127.0.0.1	localhost
+line|8|255.255.255.255	broadcasthost
+line|9|::1             localhost
+total_lines|9
+file_size|213
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_acl path=/etc/hosts
+owner|root
+group|wheel
+permissions|rw-r--r--
+mode|0644
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_signature path=/bin/ls
+signature_status|valid
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=find_by_hash directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da
+match|/private/etc/hosts|213
+matches_found|1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=search_dir root=/etc pattern=*hosts*
+total_matches|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_version_info path=/bin/ls
+version_status|not_available
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=search path=/etc/hosts pattern=localhost
+match|4|# localhost is used to configure the loopback interface
+match|7|127.0.0.1	localhost
+match|9|::1             localhost
+total_matches|3
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=replace path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+replacements_made|2
+file_size_before|40
+file_size_after|16
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=write_content path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+status|ok
+bytes_written|20
+path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=append path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content="yuzu-capture appended"
+status|ok
+bytes_appended|22
+total_size|20
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_lines path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt start_line=1 end_line=1
+lines_deleted|1
+total_lines_before|2
+total_lines_after|1
+[result_status] UNDECLARED / UNKNOWN / 
+

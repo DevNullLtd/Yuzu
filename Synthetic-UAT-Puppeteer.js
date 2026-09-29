@@ -210,7 +210,7 @@ const COMMANDS = [
 
   // ─── Process Fetch / Socket Who ───
   ['procfetch procfetch',   'Process fetch with hashes', 'any'],
-  ['sockwho sockwho_list',  'Socket-to-process map',     'any'],
+  ['netstat attribution',   'Socket-to-process map',     'any'],
 
   // ─── Diagnostics ───
   ['diagnostics log_level',       'Agent log level',       'rows'],
@@ -523,7 +523,7 @@ const { execSync } = require('child_process');
     // Execute the last command via the actual UI too, for a visual screenshot
     try {
       const input = await page.$('#instr-input');
-      await input.click({ clickCount: 3 });
+      await input.click({ count: 3 });
       await input.press('Backspace');
       await page.type('#instr-input', 'example ping');
       await page.keyboard.press('Escape');

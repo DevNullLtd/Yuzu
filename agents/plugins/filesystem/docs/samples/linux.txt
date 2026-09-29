@@ -1,0 +1,175 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4db605b6c689
+== action=exists path=/etc/hosts
+exists|true
+type|file
+size|172
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_dir path=/etc
+entry|nsswitch.conf|file|494
+entry|update-motd.d|directory|0
+entry|dpkg|directory|0
+entry|skel|directory|0
+entry|rc1.d|directory|0
+entry|xattr.conf|file|681
+entry|fstab|file|37
+entry|logrotate.d|directory|0
+entry|libaudit.conf|file|191
+entry|os-release|file|286
+entry|pam.d|directory|0
+entry|issue.net|file|20
+entry|rc5.d|directory|0
+entry|apt|directory|0
+entry|passwd-|file|839
+entry|resolv.conf|file|222
+entry|default|directory|0
+entry|group|file|434
+entry|gshadow|file|364
+entry|localtime|file|114
+entry|debconf.conf|file|2967
+entry|subuid|file|0
+entry|shadow|file|474
+entry|login.defs|file|5939
+entry|security|directory|0
+entry|ld.so.conf|file|34
+entry|passwd|file|839
+entry|cron.daily|directory|0
+entry|rc0.d|directory|0
+entry|opt|directory|0
+entry|gai.conf|file|2584
+entry|ld.so.conf.d|directory|0
+entry|bash.bashrc|file|1997
+entry|rc2.d|directory|0
+entry|subgid|file|0
+entry|profile|file|828
+entry|environment|file|0
+entry|.pwd.lock|file|0
+entry|issue|file|27
+entry|host.conf|file|9
+entry|debian_version|file|5
+entry|rc4.d|directory|0
+entry|shells|file|118
+entry|systemd|directory|0
+entry|rmt|file|68728
+entry|rc3.d|directory|0
+entry|profile.d|directory|0
+entry|rc6.d|directory|0
+entry|group-|file|434
+entry|alternatives|directory|0
+entry|terminfo|directory|0
+entry|bindresvport.blacklist|file|367
+entry|ld.so.cache|file|9187
+entry|motd|file|286
+entry|kernel|directory|0
+entry|hostname|file|13
+entry|selinux|directory|0
+entry|pam.conf|file|552
+entry|rcS.d|directory|0
+entry|mtab|file|0
+entry|hosts|file|172
+entry|ca-certificates.conf|file|6422
+entry|mime.types|file|78282
+entry|emacs|directory|0
+entry|python3.13|directory|0
+entry|rpc|file|911
+entry|ssl|directory|0
+entry|services|file|12990
+entry|networks|file|60
+entry|gprofng.rc|file|3986
+entry|magic|file|111
+entry|gss|directory|0
+entry|sysctl.d|directory|0
+entry|perl|directory|0
+entry|ethertypes|file|1936
+entry|bash_completion.d|directory|0
+entry|python3|directory|0
+entry|ca-certificates|directory|0
+entry|inputrc|file|1875
+entry|init.d|directory|0
+entry|magic.mime|file|111
+entry|protocols|file|3144
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=file_hash path=/etc/hosts
+hash|60aae00e788a173131b105d5694045ac736b668be86396d4991d1dbe3d70ef38
+algorithm|sha256
+size|172
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp
+path|/tmp/yuzu-UPhb03.tmp
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=create_temp_dir
+path|/tmp/yuzu-7OcS9w
+persist|true
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=read path=/etc/hosts
+line|1|127.0.0.1	localhost
+line|2|::1	localhost ip6-localhost ip6-loopback
+line|3|fe00::	ip6-localnet
+line|4|ff00::	ip6-mcastprefix
+line|5|ff02::1	ip6-allnodes
+line|6|ff02::2	ip6-allrouters
+line|7|172.17.0.3	5bd4336fc14e
+total_lines|7
+file_size|172
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_acl path=/etc/hosts
+owner|root
+group|root
+permissions|rw-r--r--
+mode|0644
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_signature path=/bin/ls
+error|code signature verification is not supported on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=find_by_hash directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da
+matches_found|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=search_dir root=/etc pattern=*hosts*
+total_matches|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_version_info path=/bin/ls
+error|version info extraction is not supported on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=search path=/etc/hosts pattern=localhost
+match|1|127.0.0.1	localhost
+match|2|::1	localhost ip6-localhost ip6-loopback
+total_matches|2
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=replace path=/tmp/yuzu_capture/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced
+replacements_made|2
+file_size_before|40
+file_size_after|16
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=write_content path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture written" overwrite=true
+status|ok
+bytes_written|20
+path|/tmp/yuzu_capture/yuzu_capture_tmp.txt
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=append path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content="yuzu-capture appended"
+status|ok
+bytes_appended|21
+total_size|40
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete_lines path=/tmp/yuzu_capture/yuzu_capture_tmp.txt start_line=1 end_line=1
+lines_deleted|1
+total_lines_before|2
+total_lines_after|1
+[result_status] UNDECLARED / UNKNOWN / 
+

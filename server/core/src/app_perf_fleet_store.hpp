@@ -43,6 +43,8 @@
 /// this slice — slice 2 (dashboard/REST/MCP) consumes it and ships REST+MCP
 /// lockstep (agentic-first A1–A4).
 
+#include "app_perf_types.hpp" // AppPerfAppSummary (ADR-0031 WS-A4 DexPerfApi split)
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -77,13 +79,8 @@ struct AppPerfFleetRow {
     int hist_version{0};
 };
 
-/// One row of the app picker: an app with retained fleet data, plus how many
-/// distinct versions it carries and the most recent UTC day it was seen.
-struct AppPerfAppSummary {
-    std::string app_name;
-    std::int64_t versions{0}; ///< distinct retained versions
-    std::int64_t last_day{0}; ///< most recent UTC-midnight epoch day with data
-};
+// AppPerfAppSummary relocated to app_perf_types.hpp (ADR-0031 WS-A4 DexPerfApi
+// split, PR #4582-review) — re-exported transitively via the #include above.
 
 class AppPerfFleetStore {
 public:
@@ -118,13 +115,22 @@ public:
     /// data yet. Capped (`truncated` set when the cap clipped the list).
     [[nodiscard]] std::optional<std::vector<AppPerfAppSummary>> list_apps(bool& truncated);
 
-    /// Delete rows with `day` strictly older than `before_day` (epoch seconds).
     /// Best-effort (called by the roll-up background thread). Uses the `(day)` index.
-    void prune(std::int64_t before_day);
+    /// WS-10 (#2508): clock-guarded, single-writer, capped retention prune.
+    /// Deletes day-buckets older than now - `retention_window_secs` (SECONDS; the
+    /// `day` column is day-floored unix-seconds), now read from Postgres itself.
+    /// Returns rows deleted this pass, or -1 on error.
+    int run_retention_prune(std::int64_t retention_window_secs);
 
     /// Long-retention horizon for the fleet aggregate (vs B1's 31 days) — the trend
-    /// window. The roll-up thread prunes `day < now_utc_day - kRetentionDays`.
+    /// window. The roll-up thread calls `run_retention_prune(kRetentionDays*86400)`,
+    /// deleting day-buckets older than now - this many days (seconds arithmetic).
     static constexpr int kRetentionDays = 180;
+
+    /// Per-pass bounded-drain cap for `run_retention_prune` (day×app rows). Public
+    /// so the roll-up thread can detect a cap-hit (deleted == this) and re-arm on a
+    /// short floor instead of waiting a full hour with a backlog (WS-10 S3).
+    static constexpr std::int64_t kPruneCapPerPass = 5'000;
 
 private:
     pg::PgPool& pool_;

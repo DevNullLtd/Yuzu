@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, MSVC 2022 BuildTools, /std:c++latest)
+command: cl /std:c++latest /EHsc /nologo /W3 probe_wave7.cpp /Fe:probe_wave7.exe   (compiled clean, no warnings under /W3)
+date: 2026-09-06
+status: REAL CAPTURE
+note: single-TU probe with no repo dependencies, per spec. Run three ways -- admin SSH session, a SYSTEM scheduled task (S4U-less: LogonType ServiceAccount + RunLevel Highest, since SYSTEM does not need S4U), and STA vs MTA COM apartment variants for the ITaskService probe. Results for all runs are in the-rig-probe-findings.md.

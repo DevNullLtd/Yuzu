@@ -27,13 +27,25 @@ struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
     std::string publisher;    // rpm PACKAGER / deb Maintainer / Windows Publisher
-    std::string install_date;
-    std::string kind;         // "package" | "app"
-    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string install_date; // human-readable per ecosystem, EXCEPT macos_pkgutil,
+                              // whose receipts store only a UNIX epoch-seconds
+                              // integer -- carried through verbatim rather than
+                              // reformatted into a shape the receipt never had
+    std::string kind;         // "package" | "app" | "pkg" (macOS pkgutil receipt)
+    std::string ecosystem;    // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|homebrew
     std::string epoch;
     std::string release;      // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
+    std::string signature_status; // "signed"|"unsigned"; empty where unknown.
+                                  // PRESENCE of a signature, never its validity:
+                                  // rpm's STORED header tags, and (macOS `app`
+                                  // rows) the presence of SecStaticCode signing
+                                  // metadata. A bundle whose signature has been
+                                  // broken still reads "signed" -- and its
+                                  // `publisher` is then the ORIGINAL vendor's CN,
+                                  // so publisher is unverified attribution. Not a
+                                  // Gatekeeper/notarization verdict, and not
+                                  // tamper detection.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
 };
@@ -205,7 +217,8 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 
 // One dpkg-query line:
 //   ${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}
-// Status-Abbrev is <want><status> (2 chars); the 2nd char 'i' == installed --
+// Status-Abbrev is <want><status><eflag> (3 chars -- dpkg emits a trailing
+// space for the usual empty eflag, e.g. "ii "); the 2nd char 'i' == installed --
 // matches vuln_identity.hpp::parse_dpkg_line (PR #1804) exactly. Covers "ii"
 // (want=install) AND "hi" (want=hold: apt-mark hold / kernel pin), so a
 // held-but-installed package is present and scannable -- the legacy `list`

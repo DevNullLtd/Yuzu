@@ -1,0 +1,264 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-alerts/blast",
+    "capability_id": "post.api-settings-dex-alerts-blast",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-alerts/cohort-export",
+    "capability_id": "post.api-settings-dex-alerts-cohort-export",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-alerts/routing",
+    "capability_id": "post.api-settings-dex-alerts-routing",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/dex",
+    "capability_id": "get.fragments-device-dex",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}"
+    },
+    "mcp_twin": "get_dex_device_score",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/app",
+    "capability_id": "get.fragments-dex-app",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/app"
+    },
+    "mcp_twin": "get_dex_app",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/apps",
+    "capability_id": "get.fragments-dex-apps",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/apps"
+    },
+    "mcp_twin": "list_dex_apps",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/catalogue",
+    "capability_id": "get.fragments-dex-catalogue",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/catalogue"
+    },
+    "mcp_twin": "get_dex_catalogue",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/catalogue/group",
+    "capability_id": "get.fragments-dex-catalogue-group",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/catalogue/group"
+    },
+    "mcp_twin": "get_dex_catalogue_group",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/catalogue/signal",
+    "capability_id": "get.fragments-dex-catalogue-signal",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/signals/{obs_type}"
+    },
+    "mcp_twin": "get_dex_signal_detail",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device",
+    "capability_id": "get.fragments-dex-device",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}/history"
+    },
+    "mcp_twin": "get_dex_device_history",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device/app-perf",
+    "capability_id": "get.fragments-dex-device-app-perf",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}/app-perf"
+    },
+    "mcp_twin": "get_dex_device_app_perf",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device/perf",
+    "capability_id": "get.fragments-dex-device-perf",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device/perf/result",
+    "capability_id": "get.fragments-dex-device-perf-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device/procperf",
+    "capability_id": "get.fragments-dex-device-procperf",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/device/procperf/result",
+    "capability_id": "get.fragments-dex-device-procperf-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/health",
+    "capability_id": "get.fragments-dex-health",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/health"
+    },
+    "mcp_twin": "get_dex_health",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/observation",
+    "capability_id": "get.fragments-dex-observation",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/devices/{id}/observations/{event_id}"
+    },
+    "mcp_twin": "get_dex_observation",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/overview",
+    "capability_id": "get.fragments-dex-overview",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/overview"
+    },
+    "mcp_twin": "get_dex_overview",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf",
+    "capability_id": "get.fragments-dex-perf",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/fleet"
+    },
+    "mcp_twin": "get_dex_perf_fleet",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf/app",
+    "capability_id": "get.fragments-dex-perf-app",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/app"
+    },
+    "mcp_twin": "get_dex_app_perf",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf/apps",
+    "capability_id": "get.fragments-dex-perf-apps",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/apps"
+    },
+    "mcp_twin": "list_dex_perf_apps",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf/app/devices",
+    "capability_id": "get.fragments-dex-perf-app-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/app/devices"
+    },
+    "mcp_twin": "list_dex_app_perf_devices",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf/cohort-diff",
+    "capability_id": "get.fragments-dex-perf-cohort-diff",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/cohort-diff"
+    },
+    "mcp_twin": "get_dex_perf_cohort_diff",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/perf/devices",
+    "capability_id": "get.fragments-dex-perf-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/devices"
+    },
+    "mcp_twin": "list_dex_perf_devices",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/trends",
+    "capability_id": "get.fragments-dex-trends",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/trends"
+    },
+    "mcp_twin": "get_dex_trends",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/dex-alerts",
+    "capability_id": "get.fragments-settings-dex-alerts",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

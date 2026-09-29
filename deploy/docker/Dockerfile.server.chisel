@@ -26,6 +26,7 @@ FROM ${BUILDER_IMAGE} AS builder
 # so a single multi-arch `docker buildx build --platform amd64,arm64` works.
 ARG TARGETARCH
 ARG TRIPLET=
+ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -68,18 +69,19 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         --native-file meson/native/linux-gcc13.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
+        -Dpkg_config_path=/src/vcpkg_installed/$T/lib/pkgconfig \
         -Dbuild_tests=false \
         -Dbuild_agent=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 RUN echo "=== ldd yuzu-server ===" && ldd builddir/server/core/yuzu-server || true
 
 # ── Stage 2: chisel — cut Ubuntu 26.04 rootfs + lay down the server ───────
-FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS chisel
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS chisel
 
 ARG TARGETARCH
-ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_VERSION=v1.4.2
 ARG CHISEL_RELEASE=ubuntu-26.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -91,8 +93,8 @@ ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chis
 # single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
-      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      amd64) want=3b3d86ea38045e54a13334e358ab8da12e6dd33342163c5c1ba13525f1070cfe ;; \
+      arm64) want=398050085cf32d7718ba1e2fad144b179e0943d0e0376b2a0614577c51d331e8 ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
@@ -136,6 +138,15 @@ RUN set -eux; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu; \
     install -d -m 0750 -o 1000 -g 1000 /rootfs/var/log/yuzu; \
+    # RUNTIME INVARIANT (#751): this busybox + its `wget` applet ARE the
+    # healthcheck. docker-compose.demo.yml probes this image with
+    # ["CMD", "/bin/busybox", "wget", "--spider", "-q", ...] — by ABSOLUTE path,
+    # which resolves here only via the usrmerge /bin -> usr/bin symlink. A slice
+    # change that drops busybox, or moves it, breaks nothing at build time and
+    # nothing at boot: it breaks only the healthcheck, so Compose parks the
+    # container `unhealthy` forever. ENFORCED by
+    # scripts/ci/verify-healthcheck-invariants.sh, which runs that exact probe
+    # against a live listener before release.yml pushes the image.
     BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
     test -n "$BB"; \
     for app in sh wget nc; do ln -sf busybox "$(dirname "$BB")/$app"; done

@@ -43,12 +43,32 @@
 /// the live CPU unit to B1's `cpu_avg` = share-of-machine-capacity % in that
 /// producer, or the paired delta is meaningless.)
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace yuzu::server {
+
+/// Max length of an operator-supplied app/version/group identifier across every
+/// app-perf surface (REST, MCP, dashboard) — one cap so the surfaces agree.
+/// Relocated here from `dex_app_perf_model.hpp` (ADR-0031 WS-A4 #4250) — it is
+/// PURE and belongs in the store-free header every app-perf-adjacent TU
+/// (including the VERIFY seam's `verify_routes.cpp`) can safely reach;
+/// `dex_app_perf_model.hpp` still re-exposes it transitively via its own
+/// `#include "app_perf_compare.hpp"`, so no existing caller's include changes.
+inline constexpr std::size_t kAppPerfParamCap = 512;
+
+/// PURE: validate an operator-supplied app/version/group identifier before it
+/// reaches a store binding. Rejects oversize (> `kAppPerfParamCap`) or any C0
+/// control byte INCLUDING NUL — a NUL truncates a libpq text parameter, so the
+/// store would silently query a DIFFERENT key than supplied (a cross-surface
+/// semantic divergence, not injection — everything is bound). Does NOT reject
+/// empty: `version=""` is the all-versions sentinel; callers reject an empty
+/// `app`/`group_id` themselves. The ONE validator the three surfaces share so they
+/// cannot drift on the accepted charset/cap.
+[[nodiscard]] bool app_perf_param_valid(std::string_view s);
 
 /// One B1 daily row with `agent_id` PRESERVED — what the cohort reader returns.
 /// (`AppPerfDailyRow` drops the id because its APIs are per-agent; pairing needs

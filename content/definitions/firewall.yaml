@@ -2,10 +2,16 @@
 ## Queries firewall state and enumerates rules across platforms.
 ## Plugin: firewall | Actions: state, rules
 ##
-## Sources by platform:
-##   Windows: netsh advfirewall (Domain/Private/Public profiles)
-##   Linux:   firewalld, ufw, or iptables (auto-detected)
-##   macOS:   pf (pfctl)
+## Sources by platform (see agents/plugins/firewall/README.md):
+##   Windows: INetFwPolicy2 COM (Domain/Private/Public profiles; INetFwRules
+##            enumeration for rules)
+##   Linux:   firewalld (sd-bus), else nftables (netlink), else ufw, else
+##            iptables (auto-detected in that order)
+##   macOS:   state: Application Firewall (socketfilterfw) primary, pf (pfctl)
+##            secondary, plus pf anchors/rule count (pfctl, root-only);
+##            rules: per-app allow/block list (socketfilterfw --listapps,
+##            unprivileged), pf rule lines (pfctl), plus the same pf
+##            anchors/rule count
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,13 +19,19 @@ kind: InstructionDefinition
 metadata:
   id: security.firewall.state
   displayName: Firewall State
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Query the firewall state on the endpoint. On Windows, reports the
     enabled/disabled status of each Windows Firewall profile (Domain,
     Private, Public). On Linux, auto-detects the active firewall backend
-    (firewalld, ufw, or iptables) and reports its state. On macOS,
-    queries pf (pfctl) for enabled/disabled status.
+    (firewalld, nftables, ufw or iptables) and reports its state. On macOS, reports
+    the Application Firewall global state (socketfilterfw --getglobalstate)
+    as the primary signal — with a mode row when block-all is set — and the
+    pf packet filter state as a secondary pf row, plus the pf anchor list and
+    rule count (root-only; unknown/empty without it); unreadable checks report
+    unknown, never a false-safe value. Older agents report pf as the sole
+    macOS state source (backend|pf), so a mixed fleet shows several shapes
+    until fully upgraded.
   tags: [security, firewall, compliance, network]
 
 spec:
@@ -39,8 +51,40 @@ spec:
     columns:
       - name: profile_or_backend
         type: string
+        description: >-
+          Row key. Windows: "profile" rows carry the profile name in the next
+          field (Domain, Private, Public). Linux and macOS: "backend", "state",
+          "mode" and "pf" rows, one key each. Linux additionally emits "error"
+          rows (a refused or fd-exhausted backend read), "fallthrough" rows (the
+          nftables leg handing off to the next backend after a dump failure),
+          and "ruleset" rows (the rule count, or unknown when that count could
+          not be trusted). macOS additionally emits "anchor" rows (one pf
+          anchor name each, root-only) and its own "ruleset" row (the pf rule
+          count, or unknown when the read was refused or incomplete).
+        values: [profile, backend, state, mode, pf, anchor, error, fallthrough, ruleset]
+        example: profile
       - name: state
         type: string
+        description: >-
+          The remainder of the row after the key (the server clamps this plugin
+          to two fields). Windows "profile" rows: the profile name (Domain,
+          Private, Public), then its state (enabled, disabled, unknown or
+          error:<hresult>). Linux "state" rows: running (firewalld), active, inactive or
+          unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows
+          the same; "mode" row is block_all; "anchor" rows carry one pf anchor
+          name each (root-only, omitted when the read is refused or
+          incomplete). "backend" rows name the backend (appfirewall,
+          firewalld, nftables, ufw, iptables, none). "ruleset" rows carry the
+          rule count as an integer, or unknown whenever the backend's read
+          was incomplete or refused rather than a fabricated 0 — on Linux
+          this is the nftables/ufw/iptables rule count; on macOS it is the pf
+          rule count (root-only). Linux "error" rows:
+          nftables:<table|chain|rule>:<eperm|timeout|foreign_flood|...> for a
+          refused/failed dump, or fd_exhausted for EMFILE/ENFILE on the
+          nftables socket. Linux "fallthrough" rows:
+          nftables:<table|chain|rule>:<reason>, written when a dump fails and
+          the leg hands off to the next backend.
+        example: enabled
     aggregation:
       groupBy: [state]
       operations: [count]
@@ -90,11 +134,17 @@ metadata:
   displayName: List Firewall Rules
   version: 1.0.0
   description: >
-    List firewall rules on the endpoint. On Windows, enumerates inbound
-    rules via netsh (capped at 100 rules) with rule name, enabled state,
-    direction, action, and profiles. On Linux, uses the detected backend
-    (firewall-cmd --list-all, ufw status numbered, or iptables -L). On
-    macOS, lists pf rules via pfctl -s rules.
+    List firewall rules on the endpoint. On Windows, enumerates the
+    Windows Firewall rule set through the INetFwPolicy2 COM interface
+    (capped at 100 rules, with a truncated marker row only when a genuine 101st rule exists)
+    with rule name, enabled state, direction, action, and profile mask. On
+    Linux, uses the detected backend: firewalld zones and services over
+    D-Bus, nftables chains and rule handles over netlink, or the structured
+    parse of ufw status numbered / iptables -S. On macOS, lists the
+    per-app Application Firewall allow/block decisions (socketfilterfw
+    --listapps, unprivileged), the pf rules via pfctl -s rules and the
+    pf anchor list (root required to read /dev/pf; unprivileged runs list
+    no pf rows, but the app list still populates).
   tags: [security, firewall, compliance, network, audit]
 
 spec:
@@ -114,14 +164,48 @@ spec:
     columns:
       - name: rule_name
         type: string
+        description: >-
+          The row key, and the field after it for "rule" rows. Windows:
+          "rule" rows with the rule's display name, plus a trailing
+          "ruleset" row (the count of rules actually emitted this call,
+          capped at 100) and "truncated" (present only past that cap).
+          Linux: "rule" rows
+          only — backend literal "firewalld" (then zone, "service", service
+          name) or "nftables" (then family, table, chain, hook and policy —
+          or "handle" and the handle number); the numbered index for ufw; the
+          entry kind for iptables (policy, new_chain, append; then chain and
+          rule spec). macOS: "rule" rows carry the raw pf rule line; "app"
+          rows carry the per-app path and allow/block/unknown decision
+          (unprivileged, from socketfilterfw --listapps); "anchor" rows carry
+          one pf anchor name each; "ruleset" is the pf rule count, or unknown
+          when the pf read was refused or incomplete — anchor and ruleset are
+          both root-only. The server clamps the row to two fields, so the
+          remainder lands in the value column.
+        values: [rule, app, anchor, ruleset, truncated]
+        example: Core Networking - DNS (UDP-Out)
       - name: enabled
         type: string
+        description: Windows only; enabled or disabled.
+        values: [enabled, disabled]
+        example: enabled
+        platforms: [windows]
       - name: direction
         type: string
+        description: Windows only; in, out or unknown.
+        values: [in, out, unknown]
+        example: out
+        platforms: [windows]
       - name: action
         type: string
+        description: Windows only; allow, block or unknown.
+        values: [allow, block, unknown]
+        example: allow
+        platforms: [windows]
       - name: profiles
         type: string
+        description: Windows only; the NET_FW_PROFILE_TYPE2 bitmask as an integer (1 domain, 2 private, 4 public, 2147483647 all).
+        example: "2147483647"
+        platforms: [windows]
 
   readablePayload: "List firewall rules"
 

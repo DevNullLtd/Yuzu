@@ -126,9 +126,11 @@ bool MigrationRunner::run(sqlite3* db, std::string_view store_name,
                           err ? err : "unknown");
             sqlite3_free(err);
             // Explicit ROLLBACK even though a failed COMMIT already aborts
-            // the transaction in WAL mode — required so shared-connection
-            // callers (InstructionDbPool) don't inherit a half-open
-            // transaction state on the next store's BEGIN IMMEDIATE.
+            // the transaction in WAL mode — required so a shared-connection
+            // caller (`InstructionDbPool`'s trio deleted it in ADR-0065; any
+            // remaining SQLite store sharing a connection across migrations
+            // is the same concern) doesn't inherit a half-open transaction
+            // state on the next store's BEGIN IMMEDIATE.
             sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
             return false;
         }

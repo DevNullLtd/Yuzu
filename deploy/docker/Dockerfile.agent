@@ -3,11 +3,12 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS builder
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS builder
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; default keeps the historical x64 build path.
 ARG TRIPLET=x64-linux
+ARG YUZU_BUILD_JOBS=
 
 # Base: debian:trixie-slim (Debian 13). gcc-13 13.3.0 ships in main; CDN
 # (deb.debian.org) is reliably reachable when Canonical's archive.ubuntu.com /
@@ -16,7 +17,7 @@ COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex libsystemd-dev \
+    bison flex libsystemd-dev libblkid-dev \
     autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
@@ -48,15 +49,16 @@ RUN meson setup builddir \
     --native-file meson/native/linux-gcc13.ini \
     --buildtype=release \
     -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
+    -Dpkg_config_path=/src/vcpkg_installed/${TRIPLET}/lib/pkgconfig \
     -Dbuild_tests=false \
     -Dbuild_server=false \
-    && meson compile -C builddir
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"}
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libsqlite3-0 libsystemd0 ca-certificates bash \
+    libssl3 libsqlite3-0 libsystemd0 libblkid1 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu-agent \
     # Shared cert group (PKI #1289): FIXED gid 2000, identical across server/

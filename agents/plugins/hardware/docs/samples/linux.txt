@@ -1,0 +1,41 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash fc050dca8530
+== action=manufacturer
+manufacturer|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=model
+model|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=bios
+bios_vendor|unknown
+bios_version|unknown
+bios_date|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=processors
+cpu|0|unknown|0|0|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=memory
+dimm|total|7934|unknown|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=disks
+disk|0|vdb|0|HDD|virtio
+disk|1|vda|460|HDD|virtio
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=drivers
+driver|0|selfowner|||kernel|module
+driver|1|shiftfs|||kernel|module
+driver|2|rosetta|||kernel|module
+driver|3|grpcfuse|||kernel|module
+driver|4|fakeowner|||kernel|module
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=system
+serial|unknown
+system_uuid|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg export "HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" HKLM_StartupApproved_Run.reg /y
+date: 2026-09-06
+status: REAL CAPTURE
+note: binary approval blobs (12-byte StartupApproved status values) exported verbatim

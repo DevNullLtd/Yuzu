@@ -43,6 +43,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -69,6 +70,45 @@ struct InventoryDeviceRow {
     std::string ci_cpu_cores;   ///< decimal string
     std::string ci_cpu_threads; ///< decimal string
     std::string ci_ram_bytes;   ///< decimal string (bytes)
+
+    // Hardware CI list/record fields (feat/hardware-ci-view). Same sentinel
+    // semantics as the fields above: empty or the literal "unknown" when the
+    // agent hasn't synced yet — render via ci_disp(), never raw.
+    std::int64_t last_seen_ms = -1; ///< server receipt epoch ms; -1 = unknown (sort key).
+                                    ///< An online row carries "now" at render time.
+    std::string ci_manufacturer;
+    std::string ci_cpu_model;
+    std::string ci_os_name;
+    std::string ci_os_version;
+    std::string ci_os_build;
+    std::string ci_arch;
+    std::string ci_domain;
+    std::string ci_primary_mac;
+
+    // Round-3 merge fields (the retired /devices list + /device entity page folded
+    // into Hardware — nothing left duplicated between the two surfaces):
+    /// Online: the live session's self-reported agent_version (registry, identity
+    /// field, lock-free). Offline: the last value a session of this agent reported,
+    /// persisted in endpoint_state (empty until that migration lands). "" = unknown.
+    std::string agent_version;
+    /// Same online/offline provenance as agent_version. Prefer this over ci_arch
+    /// when both are present — it is the agent's own self-report, not a device-CI
+    /// sync cycle that may be up to 24h stale.
+    std::string arch;
+    /// Claimed IPs from the live TAR fleet-snapshot cache (FleetTopologyStore,
+    /// 60s TTL) — ONLINE-ONLY, evicted on deregistration. Empty is honest for an
+    /// offline row, not a degrade: there is no durable IP source today (round-3
+    /// item 10; a device-CI blob field is the tracked follow-up).
+    std::vector<std::string> ips;
+    /// Key-sorted tags (TagStore, bulk-preloaded once per roster build — never a
+    /// per-row store read). Empty is a genuine "no tags", not a degrade; see
+    /// InventoryDevicesResult::tags_degraded for the degrade case.
+    std::vector<std::pair<std::string, std::string>> tags;
+    /// DEX experience score 0-100, scored ONLY for rows the caller is about to
+    /// render (device_routes.cpp's "score only rendered rows" rule — a GROUP-BY
+    /// per device is too costly to run over the whole roster). -1 = not scored /
+    /// no GuaranteedStateStore wired.
+    int dex_score = -1;
 };
 
 /// Result of the device-CI roster read. `rows` is the roster and is ALWAYS populated
@@ -81,6 +121,10 @@ struct InventoryDeviceRow {
 struct InventoryDevicesResult {
     std::vector<InventoryDeviceRow> rows;
     bool ci_degraded = false;
+    /// True when the bulk tag preload failed (TagStore degrade / unwired) — every
+    /// row's `tags` is then genuinely empty-because-degraded, not empty-because-
+    /// no-tags; the Tags column renders an honest note instead of a blank column.
+    bool tags_degraded = false;
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────
@@ -96,10 +140,16 @@ struct InventoryDevicesResult {
 /// `name_filter` is echoed into the search box; `capped` flags the row-cap; `stale_count`
 /// feeds the stale KPI (nullopt → "—"); `now_secs` lets the pure renderer format the
 /// "as of" relative time without calling the clock itself.
+/// `results_only=true` (round-3 item 8, mirrors hardware_ui.cpp's `results_only`
+/// pattern) renders ONLY the `#sw-results` region (search results table + drill
+/// container) — used by the search box's own hx-get so a re-render never destroys
+/// the input mid-keystroke. `false` renders the full page (sub-nav + KPIs + the
+/// same region).
 std::string render_inventory_software_fragment(
     const std::optional<std::vector<SoftwareCatalogRow>>& catalogue,
     const std::optional<CatalogRollupMeta>& meta, const std::string& name_filter,
-    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs);
+    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs,
+    bool results_only = false);
 
 /// SOFTWARE drill: installs-per-version for one title (the catalogue row click target).
 std::string render_inventory_versions_fragment(
@@ -132,6 +182,19 @@ std::string render_inventory_find_fragment(const std::string& initial_name);
 std::string render_inventory_find_results_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
     std::size_t devices_omitted);
+
+/// SOFTWARE "devices ›" expansion (round-3 item 8): the same "which devices run
+/// this title" data as the (now-unlinked) Find tab, but rendered as an inline
+/// expansion under a catalogue row instead of a standalone page — Signature and
+/// Ecosystem columns (both already on `SoftwareEntry`, previously unrendered
+/// anywhere) plus a client-side `gpSearch` filter box, since a popular title can
+/// have hundreds of installs. `hostnames` resolves `agent_id -> hostname` (best-
+/// effort; a miss renders the bare agent_id, never blocks the row). `nullopt` rows
+/// = store degrade; `devices_omitted` mirrors the Find results' management-group
+/// drop count.
+std::string render_inventory_software_devices_fragment(
+    const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
+    std::size_t devices_omitted, const std::unordered_map<std::string, std::string>& hostnames);
 
 /// /inventory routes — the page shell + the read-only HTMX fragments. Providers are
 /// injected closures (store-decoupled) so the handlers are unit-testable via
@@ -193,12 +256,20 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// Best-effort agent_id -> hostname resolution for the SOFTWARE "devices ›"
+    /// expansion (round-3 item 8) — a hostname is friendlier than a raw agent_id
+    /// in a devices-per-package table. Whole-map read (not per-agent) so a
+    /// hundred-row expansion costs one call, not N; a miss for a given agent_id
+    /// renders the bare id, never blocks the row. Empty closure = no resolution
+    /// (every row shows its agent_id).
+    using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
+
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {});
+                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
@@ -207,7 +278,7 @@ public:
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {});
+                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -223,6 +294,7 @@ private:
     ScopeFn scope_fn_;
     StaleFn stale_fn_;
     AuditFn audit_fn_;
+    HostnamesFn hostnames_fn_;
 };
 
 } // namespace yuzu::server

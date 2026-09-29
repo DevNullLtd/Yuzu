@@ -19,7 +19,8 @@ Use this skill for the high-level Yuzu validation pipeline. Route low-level buil
 
 ## Run State
 
-Every full pipeline run records gate results and timings in `~/.local/share/yuzu/test-runs.db`, overrideable with `YUZU_TEST_DB`. Query with:
+Every local `/test` pipeline run records gate results and timings in
+`~/.local/share/yuzu/test-runs.db`, overrideable with `YUZU_TEST_DB`. Query with:
 
 ```bash
 bash scripts/test/test-db-query.sh --latest
@@ -28,6 +29,38 @@ bash scripts/test/test-db-query.sh --diff RUN_A RUN_B
 bash scripts/test/test-db-query.sh --trend timing=phase7.perf
 bash scripts/test/test-db-query.sh --flaky
 ```
+
+The self-hosted CI pools also keep a **persistent database per runner agent**;
+they do not share one host-wide SQLite file:
+
+- Big Tam: `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`
+- Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
+
+`ci.yml`'s Linux and Windows jobs initialize and write these databases
+automatically. Schema v3 preserves GitHub rerun attempts separately and stores
+job outcome/duration, platform, runner, commit/branch/event, ccache hit ratio,
+Meson suite result/duration/timeout, and recovered known-flake events. Query one
+on its host by setting `YUZU_TEST_DB`, for example:
+
+```bash
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-flakes --since 30d
+```
+
+Provision/repair paths are `deploy/linux/Provision-BigTam-Runner-Telemetry.sh`
+and `deploy/windows/Provision-Windows-Runner.ps1`. GitHub-hosted macOS runners
+are ephemeral and therefore cannot satisfy the runner-local persistence
+contract; their Meson logs remain Actions artifacts. `ci-ingest` is a coarse
+workflow-level backfill for older GitHub history, not a replacement for direct
+runner recording.
+
+`tests/known-flaky.json` remains the reviewed allowlist. A listed case only
+passes CI if an isolated retry recovers; each recovery is also persisted in
+`ci_flake_events` so recurrence can be measured instead of inferred from logs.
 
 Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$RUN_ID`, `LOG_DIR=$HOME/.local/share/yuzu/test-runs/$RUN_ID`, `COMMIT`, `BRANCH`, and `BUILDDIR=$(build_dir)` from `scripts/test/_portable.sh`. Record gates with `scripts/test/test-db-write.sh`.
 

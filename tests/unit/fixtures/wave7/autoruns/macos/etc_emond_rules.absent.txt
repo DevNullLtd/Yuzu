@@ -1,0 +1,5 @@
+ABSENT: /etc/emond.d/rules (and /private/etc/emond.d) does not exist on this
+host. Apple deprecated and removed the emond(8) event-monitor daemon and its
+rule directory in recent macOS releases (verified absent on macOS 26.5.1 /
+Darwin 25.5.0, 2026-09-06). This is a genuinely absent case for this OS
+version, not a capture failure.

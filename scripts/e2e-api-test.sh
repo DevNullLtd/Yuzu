@@ -71,7 +71,16 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    # A here-string, not `echo "$haystack" | grep -q "$needle"`: that pipeline can
+    # spuriously report no-match under `set -o pipefail` when the needle is found
+    # early in a large multi-line haystack — grep(1) exits the instant it matches,
+    # closing the pipe while echo(1) is still mid-write of the remaining bytes,
+    # SIGPIPE kills echo, and pipefail surfaces THAT non-zero exit rather than
+    # grep's success (this exact failure was already hand-worked-around once, at
+    # the openapi.json check below, but every other large-body assert_contains
+    # call site — e.g. GET /metrics — stayed exposed). A here-string has no writer
+    # process to SIGPIPE.
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -257,6 +266,24 @@ assert_eq "GET /health returns 200" "200" "$HTTP_STATUS"
 http_get_noauth "$SERVER_URL/metrics"
 assert_eq "GET /metrics returns 200" "200" "$HTTP_STATUS"
 assert_contains "GET /metrics body contains 'yuzu_'" "yuzu_" "$HTTP_BODY"
+
+# L9 (wave1 remediation): these deny counters are PRE-REGISTERED at boot
+# (server.cpp) with a concrete zero-value series, deliberately never left to
+# spring into existence on first increment — for a fail-closed check, "absent"
+# (never ran) and "zero" (ran, denied nothing) are different facts, and only
+# pre-registration keeps them distinguishable on a fresh dashboard. This is
+# the one place that boot-time wiring is provable: the counters are set on a
+# private ServerImpl member with no live-Session-free construction path, so a
+# unit test cannot reach them — only a real boot, which this e2e run against a
+# freshly-started stack (no schedule/dispatch/gateway denial has fired yet) is.
+assert_contains "GET /metrics pre-registers yuzu_schedule_arming_denied_total at boot" \
+    "yuzu_schedule_arming_denied_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_dispatch_denied_total at boot" \
+    "yuzu_server_dispatch_denied_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_dispatch_tag_invalid_total at boot" \
+    "yuzu_server_dispatch_tag_invalid_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_gateway_capability_denied_total at boot" \
+    "yuzu_server_gateway_capability_denied_total" "$HTTP_BODY"
 
 log ""
 
@@ -479,9 +506,36 @@ assert_eq "GET /api/v1/definitions returns 200" "200" "$HTTP_STATUS"
 http_get "$SERVER_URL/api/v1/audit"
 assert_eq "GET /api/v1/audit returns 200" "200" "$HTTP_STATUS"
 
-# GET /api/v1/openapi.json (no auth required) -> 200
+# #2057: /api/v1/openapi.json now gates Infrastructure:Read — unauthenticated
+# gets a 401, authenticated (the session logged in above) gets 200. A caller
+# with NO session at all never reaches the route's own perm_fn/A4 gate: the
+# pre-routing chokepoint's session-resolution check (server.cpp, "if
+# (!session)") short-circuits every unauthenticated /api/* request with its
+# own pre-existing, non-A4 401 body ({"error":{"code","message"},"meta"} —
+# no correlation_id) BEFORE routing — verified identical on GET /api/v1/me
+# unauthenticated too, so this is a uniform pre-existing gap across every
+# /api/v1/* route, not something #2057 introduced or scoped to fix.
 http_get_noauth "$SERVER_URL/api/v1/openapi.json"
-assert_eq "GET /api/v1/openapi.json returns 200" "200" "$HTTP_STATUS"
+assert_eq "GET /api/v1/openapi.json (unauthenticated) returns 401" "401" "$HTTP_STATUS"
+assert_contains "GET /api/v1/openapi.json (unauthenticated) body contains error code 401" \
+    '"code":401' "$HTTP_BODY"
+
+http_get "$SERVER_URL/api/v1/openapi.json"
+assert_eq "GET /api/v1/openapi.json (authenticated) returns 200" "200" "$HTTP_STATUS"
+# Not assert_contains: that helper's `echo "$haystack" | grep -q "$needle"`
+# pipeline can spuriously report no-match under `pipefail` when the needle
+# is found on an early line of a large multi-line haystack — grep(1) exits
+# the instant it matches, echo(1) is still mid-write of the remaining
+# ~200KB spec body, SIGPIPE kills echo, and pipefail surfaces THAT non-zero
+# exit rather than grep's success. The pretty-printed OpenAPI doc (its
+# "openapi" key is on line 2) triggers this every time. Plain bash glob
+# match has no subshell/pipe to race.
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *openapi* ]]; then
+    pass "GET /api/v1/openapi.json (authenticated) body contains openapi"
+else
+    fail "GET /api/v1/openapi.json (authenticated) body contains openapi (expected to contain 'openapi')"
+fi
 
 # GET /api/v1/tag-compliance -> 200
 http_get "$SERVER_URL/api/v1/tag-compliance"

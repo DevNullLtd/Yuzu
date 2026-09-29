@@ -45,6 +45,7 @@
 #include "fleet_topology_types.hpp"
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <yuzu/metrics.hpp>
 
@@ -54,7 +55,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,13 +62,12 @@ namespace yuzu::server {
 
 namespace {
 
-/// Build a uniform JSON error envelope. Status code mirrors HTTP status.
-/// Schema is stable so MCP / SDK clients can parse without ambiguity --
-/// matches the shape used by `/api/responses/...` etc.
-std::string error_envelope(int code, std::string_view message) {
-    nlohmann::json j = {{"error", {{"code", code}, {"message", message}}},
-                        {"meta", {{"api_version", "v1"}}}};
-    return j.dump();
+/// A4 JSON error envelope (`detail::a4_error`, `rest_a4_envelope_http.hpp`).
+/// `code` derives from `res.status`, which every call site sets immediately
+/// before calling this — kept as a thin file-local wrapper rather than
+/// inlining `detail::a4_error` at all 13 call sites.
+std::string error_envelope(httplib::Response& res, std::string_view message) {
+    return detail::a4_error(res, message);
 }
 
 bool parse_bool_param(const httplib::Request& req, std::string_view key, bool default_value) {
@@ -167,7 +166,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;
         res.set_content(
-            error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
+            error_envelope(res, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "kill_switch");
@@ -177,7 +176,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // ── 2. Store availability ────────────────────────────────────────────
     if (!store_) {
         res.status = 503;
-        res.set_content(error_envelope(503, "fleet topology store not available"),
+        res.set_content(error_envelope(res, "fleet topology store not available"),
                         "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "store_null");
@@ -199,7 +198,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
             machines_max = std::stoi(req.get_param_value("machines_max"));
             if (machines_max <= 0 || machines_max > kMachinesMaxCeiling) {
                 res.status = 400;
-                res.set_content(error_envelope(400, "machines_max must be in [1, 100000]"),
+                res.set_content(error_envelope(res, "machines_max must be in [1, 100000]"),
                                 "application/json");
                 if (audit_fn_)
                     audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
@@ -211,7 +210,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         // std::stoi throws std::invalid_argument on non-numeric and
         // std::out_of_range on overflow; both land here.
         res.status = 400;
-        res.set_content(error_envelope(400, "invalid machines_max"), "application/json");
+        res.set_content(error_envelope(res, "invalid machines_max"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "bad_machines_max");
         return;
@@ -234,7 +233,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     } catch (const std::exception& ex) {
         spdlog::error("VizRoutes: store->get threw: {}", ex.what());
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch failed"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "fetch_threw");
         return;
@@ -242,7 +241,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // PR 2 invariant UP-9: get() never returns null. Defensive belt anyway.
     if (!snap) {
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch returned null"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "snap_null");
         return;
@@ -258,48 +257,29 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // ── 6b. Merge persisted offline endpoints (#1320 PR 3) ────────────────
     // Hosts whose fleet_snapshot aged out of the in-memory 60 s cache vanish
     // from snap->machines. The durable last-known store lets them render as
-    // stale-flagged cubes instead of disappearing. Copy-on-write: only when
-    // there are stale rows to add do we materialise a merged snapshot (the
-    // common steady state — all hosts online — pays nothing). Null store
-    // (tests, or a legacy binary) = exactly the prior behavior. Done BEFORE the
-    // DoS gate so the machines_max cap counts the merged total.
+    // stale-flagged cubes instead of disappearing. merge_offline_topology
+    // (fleet_topology_store.{hpp,cpp}) is the SHARED pure transform the MCP
+    // get_fleet_topology tool also calls (api-twin-recipe.md Rule 1) — the
+    // copy-on-write / online-set-dedup rule cannot drift between the two
+    // surfaces. Null store (tests, or a legacy binary) = exactly the prior
+    // behavior (no query, snap unchanged). Done BEFORE the DoS gate so the
+    // machines_max cap counts the merged total.
     if (offline_store_) {
-        auto persisted = offline_store_->query_stale_within(
-            std::chrono::seconds(kOfflineStaleWindowSecs));
-        if (!persisted.empty()) {
-            std::unordered_set<std::string> online;
-            online.reserve(snap->machines.size());
-            for (const auto& m : snap->machines)
-                online.insert(m.agent_id);
-            std::vector<MachineNode> stale_nodes;
-            for (auto& ep : persisted) {
-                if (online.count(ep.agent_id) != 0U)
-                    continue; // currently online — already in the live snapshot
-                MachineNode n;
-                n.agent_id = std::move(ep.agent_id);
-                n.hostname = std::move(ep.hostname);
-                n.os = std::move(ep.os);
-                n.stale = true; // dimmed "offline" cube; ts stays 0
-                stale_nodes.push_back(std::move(n));
-            }
-            if (!stale_nodes.empty()) {
-                auto merged = std::make_shared<TopologySnapshot>(*snap);
-                for (auto& n : stale_nodes)
-                    merged->machines.push_back(std::move(n));
-                snap = merged;
-                if (metrics_)
-                    metrics_->counter("yuzu_viz_offline_hosts_total")
-                        .increment(static_cast<double>(stale_nodes.size()));
-            }
-        }
+        auto persisted =
+            offline_store_->query_stale_within(std::chrono::seconds(kOfflineStaleWindowSecs));
+        const auto before = snap->machines.size();
+        snap = merge_offline_topology(std::move(snap), persisted);
+        const auto merged_count = snap->machines.size() - before;
+        if (merged_count > 0 && metrics_)
+            metrics_->counter("yuzu_viz_offline_hosts_total")
+                .increment(static_cast<double>(merged_count));
     }
 
     // ── 7. machines_max DoS gate (M-1) ────────────────────────────────────
     if (static_cast<int>(snap->machines.size()) > machines_max) {
         res.status = 413;
         res.set_content(
-            error_envelope(413,
-                           "fleet topology exceeds machines_max -- raise the cap or scope down"),
+            error_envelope(res, "fleet topology exceeds machines_max -- raise the cap or scope down"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
@@ -312,7 +292,14 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
 
     // ── 8. Serialise + respond ───────────────────────────────────────────
     nlohmann::json j = *snap;
-    auto body = j.dump();
+    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): dump_topology_safe()
+    // (fleet_topology_types.hpp) substitutes U+FFFD instead of throwing on a
+    // byte-clamped multi-byte codepoint - clamp_field() truncates by byte
+    // length with no UTF-8 boundary awareness, and strict dump()'s uncaught
+    // type_error.316 was a fleet-wide 500 triggerable by ordinary
+    // internationalized agent data. Shared with the MCP twin so the fix
+    // cannot drift between transports the way the original bug did.
+    auto body = dump_topology_safe(j);
 
     if (as_fragment) {
         // HTMX fragment: parser-recoverable script tag carrying the JSON.
@@ -352,11 +339,33 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     const auto t_start = std::chrono::steady_clock::now();
     const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
 
+    // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review): this
+    // path-captured agent_id (regex [^/]+, no length/charset constraint of
+    // its own) flows unchecked into audit_fn_'s target_id below on every
+    // branch - AuditStore's sanitizer scrubs invalid UTF-8/NUL but not other
+    // C0 control bytes, so an unfloored agent_id let any Response:Read
+    // holder write raw control bytes/CR-LF into the audit trail. Same floor
+    // as GET /guaranteed-state/events and this file's own MCP twin,
+    // get_host_topology (auth::kMaxAgentIdLength).
+    if (agent_id.size() > auth::kMaxAgentIdLength) {
+        res.status = 400;
+        res.set_content(error_envelope(res, "agent_id is too long"), "application/json");
+        return;
+    }
+    for (unsigned char c : agent_id) {
+        if (c < 0x20) {
+            res.status = 400;
+            res.set_content(error_envelope(res, "agent_id contains control characters"),
+                            "application/json");
+            return;
+        }
+    }
+
     // ── 1. Kill switch (tier-before-permission) ──────────────────────────
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;
         res.set_content(
-            error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
+            error_envelope(res, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "denied", "HostTopology", agent_id, "kill_switch");
@@ -366,7 +375,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     // ── 2. Store availability ─────────────────────────────────────────────
     if (!store_) {
         res.status = 503;
-        res.set_content(error_envelope(503, "fleet topology store not available"),
+        res.set_content(error_envelope(res, "fleet topology store not available"),
                         "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "store_null");
@@ -388,7 +397,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     } catch (const std::exception& ex) {
         spdlog::error("VizRoutes: store->get threw (host_topology): {}", ex.what());
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch failed"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "fetch_threw");
         return;
@@ -397,7 +406,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     // an unguarded deref here is a remotely reachable post-auth crash.
     if (!snap) {
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch returned null"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "snap_null");
         return;
@@ -415,7 +424,9 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
         if (m.agent_id == agent_id) {
             HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
             nlohmann::json j = wrapper;
-            auto body = j.dump();
+            // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): see
+            // handle_topology's identical fix above.
+            auto body = dump_topology_safe(j);
 
             if (as_fragment) {
                 escape_json_for_script(body);
@@ -441,7 +452,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
         }
     }
     res.status = 404;
-    res.set_content(error_envelope(404, "host not found"), "application/json");
+    res.set_content(error_envelope(res, "host not found"), "application/json");
     if (audit_fn_)
         audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "not_found");
 }

@@ -1,0 +1,6 @@
+identity: NT AUTHORITY\SYSTEM (WindowsIdentity.GetCurrent().Name)
+
+== EnumJobsW(level 2) against "Microsoft Print to PDF", paused, 2 jobs queued ==
+returned=2
+  JobId=7 user=SYSTEM document=document status=0x00000000 submitted=2026-09-08 size=43485
+  JobId=8 user=SYSTEM document=document status=0x00000000 submitted=2026-09-08 size=43677

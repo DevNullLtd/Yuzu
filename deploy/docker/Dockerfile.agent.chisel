@@ -36,12 +36,13 @@ FROM ${BUILDER_IMAGE} AS builder
 # so a single multi-arch `docker buildx build --platform amd64,arm64` works.
 ARG TARGETARCH
 ARG TRIPLET=
+ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates \
-    bison flex libsystemd-dev autoconf automake libtool \
+    bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
     python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -80,9 +81,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         --native-file meson/native/linux-gcc13.ini \
         --buildtype=release \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
+        -Dpkg_config_path=/src/vcpkg_installed/$T/lib/pkgconfig \
         -Dbuild_tests=false \
         -Dbuild_server=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 # Record the runtime shared-library closure of the agent + plugins so build
@@ -93,10 +95,10 @@ RUN echo "=== ldd yuzu-agent ===" \
     && ldd builddir/agents/core/libyuzu_agent_core.so || true
 
 # ── Stage 2: chisel — cut Ubuntu 26.04 rootfs + lay down the agent ────────
-FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS chisel
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS chisel
 
 ARG TARGETARCH
-ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_VERSION=v1.4.2
 ARG CHISEL_RELEASE=ubuntu-26.04
 
 # ca-certificates: chisel fetches the release definitions + .debs over HTTPS.
@@ -109,8 +111,8 @@ ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chis
 # single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
-      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      amd64) want=3b3d86ea38045e54a13334e358ab8da12e6dd33342163c5c1ba13525f1070cfe ;; \
+      arm64) want=398050085cf32d7718ba1e2fad144b179e0943d0e0376b2a0614577c51d331e8 ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
@@ -126,7 +128,14 @@ RUN set -eux; \
 #   libsqlite3-0_libs       agent KV / identity store.
 #   libsystemd0_libs        sd-bus, for the Linux Guardian systemd service guard
 #                           (libyuzu_agent_core.so DT_NEEDED libsystemd.so.0).
-#   busybox-static_bins     single static binary for the compose healthcheck
+#   libblkid1_libs          bitlocker plugin's in-process LUKS enumeration
+#                           (libbitlocker.so DT_NEEDED libblkid.so.1, wave-3
+#                           native/argv migration off `lsblk`/`cryptsetup`).
+#   busybox-static_bins     single static binary; PRE-EMPTIVE for a compose
+#                           healthcheck (no compose healthchecks an agent image
+#                           today — the agent has no HTTP endpoint). Gated anyway
+#                           by scripts/ci/verify-healthcheck-invariants.sh (#751)
+#                           so the demo stack can gain one without a silent break.
 #                           (no shell otherwise exists in the image).
 #   base-passwd_data        /etc/passwd + /etc/group base (NSS "files").
 #   netbase_config          /etc/protocols + /etc/services (getaddrinfo).
@@ -137,7 +146,7 @@ RUN set -eux; mkdir -p /rootfs; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
-      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs libsystemd0_libs zlib1g_libs \
+      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs libsystemd0_libs libblkid1_libs zlib1g_libs \
       busybox-static_bins"; \
     ok=0; for i in 1 2 3 4 5; do \
       if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \

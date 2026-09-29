@@ -29,6 +29,17 @@ struct ProcessInfo {
     std::string name;
     std::string cmdline;
     std::string user;
+    // Canonical on-disk executable path (P-004, cursor-model seam
+    // agents/plugins/tar/src/tar_cursor.hpp) -- used to correlate a running
+    // process to an `exec_from_removable` event by checking whether this path
+    // resolves under a removable volume's mount point. Empty when the path
+    // could not be resolved (permission denied, process already exited,
+    // platform API failure) -- NEVER guessed or derived from `cmdline` (argv[0]
+    // is attacker/user controlled and frequently relative or a bare basename).
+    // Linux: readlink("/proc/<pid>/exe") (empty on EACCES). Windows:
+    // QueryFullProcessImageNameW via PROCESS_QUERY_LIMITED_INFORMATION. macOS:
+    // the proc_pidpath result already fetched for `cmdline`.
+    std::string exec_path;
 };
 
 /**

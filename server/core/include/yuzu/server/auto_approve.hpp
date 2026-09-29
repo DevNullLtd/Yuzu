@@ -53,8 +53,17 @@ public:
     std::vector<AutoApproveRule> list_rules() const;
 
     /// Mode: false = any rule match approves, true = all rules must match.
-    bool require_all() const { return require_all_; }
-    void set_require_all(bool val) { require_all_ = val; }
+    /// Out-of-line (auto_approve.cpp), both locking `mu_` — the sole
+    /// exception to that discipline used to be these two inline bare
+    /// accesses, racing the (also unlocked) production POST
+    /// /api/settings/auto-approve/mode writer against #4031's REST v1
+    /// GET /api/v1/enrollment/auto-approve-rules reader, a genuine C++ data
+    /// race (unlocked write + unlocked read, no happens-before) on a field
+    /// every OTHER touch point (load/save_locked/evaluate) already reads
+    /// under `mu_`. Same bug class as the `oidc_mu_` race #4031 fixed
+    /// earlier in the same diff (967276a61) — this is its sibling instance.
+    bool require_all() const;
+    void set_require_all(bool val);
 
 private:
     bool match_rule(const AutoApproveRule& rule, const ApprovalContext& ctx) const;

@@ -138,7 +138,7 @@ init_per_suite(Config) ->
     %% Install a global upstream mock for all non-upstream-group tests.
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
-    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
+    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
@@ -213,7 +213,7 @@ end_per_group(upstream, Config) ->
     catch meck:unload(yuzu_gw_heartbeat_buffer),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
-    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
+    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
@@ -576,7 +576,8 @@ upstream_stream_status_notification(Config) ->
         end
     end),
 
-    yuzu_gw_upstream:notify_stream_status(<<"agent-1">>, <<"sess-1">>, connected, <<"127.0.0.1">>),
+    yuzu_gw_upstream:notify_stream_status(<<"agent-1">>, <<"sess-1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
 
     %% It's fire-and-forget via spawn, so wait a bit.
     timer:sleep(200),
@@ -690,7 +691,7 @@ upstream_disconnect_recovery(_Config) ->
     %% Test that upstream errors don't crash the gateway.
     Self = self(),
     Ref = make_ref(),
-    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) ->
+    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) ->
         Self ! {notify_called, Ref},
         ok
     end),

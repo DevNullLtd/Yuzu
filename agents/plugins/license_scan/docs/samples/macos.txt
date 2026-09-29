@@ -1,0 +1,18 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 93534d76a8aa
+== action=list
+lic|Pages Creator Studio|||retail||licensed||app_receipt|probable|||machine|
+lic|iMovie|||retail||licensed||app_receipt|probable|||machine|
+lic|Numbers Creator Studio|||retail||licensed||app_receipt|probable|||machine|
+lic|Keynote Creator Studio|||retail||licensed||app_receipt|probable|||machine|
+lic|uBlock Origin Lite||2026.901.1442|retail||licensed||app_receipt|probable|||machine|
+lic|GarageBand|||retail||licensed||app_receipt|probable|||machine|
+lic|Hush||1.0.19|retail||licensed||app_receipt|probable|||machine|
+probe_status|mas_receipt|ok|7
+probe_status|vendor_plists|ok|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=surfaces
+probe_status|mas_receipt|ok|7
+probe_status|vendor_plists|ok|0
+[result_status] UNDECLARED / UNKNOWN / 
+

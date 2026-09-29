@@ -1,0 +1,54 @@
+REAL CAPTURE
+
+File: usage_daily_macos.txt
+Host: alex's Mac (Darwin 25.6.0), 2026-09-14
+DB path: /private/tmp/yuzu-uat/agent-data/tar.db (mode 644, owner alex, WAL)
+Writing agent: pid 50138, `yuzu-agent --data-dir /tmp/yuzu-uat/agent-data`, built from
+  branch feat/wave7-pr72a-forensics-tar-usage (the usage fold dev carries as #4269,
+  merge 4ab9b9c83); live tar_config schema_version = 7 at capture time.
+Command:
+  sqlite3 -readonly "$DB" ".mode list" ".separator |" \
+    "SELECT day_ts, exe_key, run_count, total_seconds, first_seen, last_seen, \
+     superseded_runs, expired_runs FROM usage_daily ORDER BY day_ts, exe_key" \
+    > usage_daily_macos.txt
+
+Row count: 438 (REQUIRE'd equal to the seeded usage_daily row count in
+test_app_usage_parsers.cpp — a silently edited fixture fails that check loudly).
+
+Distinct day_ts values (6): 1788912000, 1788998400, 1789084800, 1789171200,
+1789257600, 1789344000.
+kFixtureLastDay (app_usage_test_seed.hpp) = MAX(day_ts) = 1789344000.
+
+Derivation queries run against the SAME snapshot at capture time (values
+hardcoded by test_app_usage_parsers.cpp):
+  SELECT COUNT(DISTINCT day_ts) FROM usage_daily WHERE day_ts >= 0;
+    -> days_present = 6
+  SELECT COUNT(DISTINCT exe_key) FROM usage_daily;
+    -> distinct_exe_keys = 266
+  SELECT exe_key, SUM(total_seconds) s FROM usage_daily GROUP BY exe_key
+    ORDER BY s DESC LIMIT 1;
+    -> top-1 by run_time = mtlcompilerservi, total_seconds = 6052482
+  SELECT exe_key, SUM(run_count) c FROM usage_daily GROUP BY exe_key
+    ORDER BY c DESC LIMIT 1;
+    -> top-1 by run_count = contactsd, run_count = 26955
+  SELECT MIN(first_seen), MAX(last_seen), COUNT(*) FROM usage_daily
+    WHERE exe_key = 'contactsd';
+    -> contactsd: first_seen = 1788957026, last_seen = 1789410339, across 6 days
+  SELECT COUNT(DISTINCT user) FROM usage_daily_user WHERE exe_key = 'contactsd';
+    -> contactsd distinct_users = 20
+  SELECT SUM(run_count), SUM(total_seconds), MIN(first_seen), MAX(last_seen)
+    FROM usage_daily WHERE day_ts >= 1789171200 AND exe_key = 'biomesyncd';
+    -> biomesyncd windowed (3 in-window days): run_count = 178,
+       total_seconds = 37556, first_seen = 1789172295, last_seen = 1789411063
+       (re-derived and corrected — a re-review round found the originally
+       committed test literals (179/37617/…607) did not match this query)
+
+Sanity (all held at capture time):
+  awk -F'|' 'NF!=8' usage_daily_macos.txt            -> empty
+  grep -c '\\' usage_daily_macos.txt                 -> 0
+  awk -F'|' 'length($2)>16 || $2 ~ /[A-Z]/' usage_daily_macos.txt -> empty
+    (real macOS exe_keys are kernel-truncated `comm` values: lowercase, <=16
+    chars, no path separator)
+
+No pid, cmdline, or user name appears in this table — usage_daily carries
+only exe_key + aggregate counters.

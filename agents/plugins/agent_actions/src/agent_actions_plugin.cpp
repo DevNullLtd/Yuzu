@@ -22,6 +22,20 @@ namespace {
 
 YuzuPluginContext* g_ctx = nullptr;
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Both actions are pure in-process calls (spdlog::set_level() /
+// yuzu_ctx_get_config()) -- no subprocess on any OS -- rung 1 on all three
+// legs.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"set_log_level", {YUZU_SUPPORT_SUPPORTED, 1, "spdlog_runtime", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "spdlog_runtime", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "spdlog_runtime", nullptr}},
+    {"info", {YUZU_SUPPORT_SUPPORTED, 1, "agent_config_read", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "agent_config_read", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "agent_config_read", nullptr}},
+};
+
 } // namespace
 
 class AgentActionsPlugin final : public yuzu::Plugin {
@@ -35,6 +49,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"set_log_level", "info", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

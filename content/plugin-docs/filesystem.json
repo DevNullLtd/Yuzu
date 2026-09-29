@@ -1,0 +1,3547 @@
+{
+  "actions": [
+    {
+      "action": "append",
+      "definition_ids": [
+        "device.filesystem.append"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::ofstream",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::ofstream",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::ofstream",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "create_temp",
+      "definition_ids": [
+        "device.filesystem.create_temp"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_file",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "create_temp_dir",
+      "definition_ids": [
+        "device.filesystem.create_temp_dir"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_dir",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_dir",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "yuzu_create_temp_dir",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "delete_lines",
+      "definition_ids": [
+        "device.filesystem.delete_lines"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "exists",
+      "definition_ids": [
+        "device.filesystem.exists"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "file_hash",
+      "definition_ids": [
+        "device.filesystem.file_hash"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:sha256sum/sha1sum",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:shasum",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "bcrypt",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "find_by_hash",
+      "definition_ids": [
+        "device.filesystem.find_by_hash"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::filesystem+subprocess_runner:sha256sum",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::filesystem+subprocess_runner:shasum",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::filesystem+bcrypt",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_acl",
+      "definition_ids": [
+        "device.filesystem.get_acl"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration",
+          "mechanism": "posix_stat",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration",
+          "mechanism": "posix_stat",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_acl",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_signature",
+      "definition_ids": [
+        "device.filesystem.get_signature"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:codesign",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wintrust",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_version_info",
+      "definition_ids": [
+        "device.filesystem.get_version_info",
+        "workflow.version_compliance_check"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "subprocess_runner:plutil",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_version_info",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_dir",
+      "definition_ids": [
+        "device.filesystem.list_dir"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::filesystem",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "read",
+      "definition_ids": [
+        "device.filesystem.read"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::ifstream",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::ifstream",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::ifstream",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "replace",
+      "definition_ids": [
+        "device.filesystem.replace",
+        "workflow.config_search_and_replace"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "search",
+      "definition_ids": [
+        "device.filesystem.search"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::ifstream+std::regex",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::ifstream+std::regex",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::ifstream+std::regex",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "search_dir",
+      "definition_ids": [
+        "device.filesystem.search_dir"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::filesystem+std::regex",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std::filesystem+std::regex",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std::filesystem+std::regex",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "write_content",
+      "definition_ids": [
+        "device.filesystem.write_content"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "atomic_write_file",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`executeRoles` in the YAML is advisory, not enforced.** Since #1398, raw dispatch authorizes on the compiled `(plugin,action)` pair's securable/operation plus its `ExecuteGate` — `permissions.executeRoles` in `InstructionDefinition` YAML is retired to documentation only (`changelog.d/1398-dispatch-approval-gate.security.md`). Do not treat the Roles row above as an access-control guarantee; the real gate is the Security row.",
+    "**`delete_lines`'s output field names don't match its own YAML.** The plugin emits `lines_deleted|total_lines_before|total_lines_after` (`filesystem_plugin.cpp:1997-1999`), but `content/definitions/t2_capabilities.yaml:571-576` declares `lines_deleted`/`lines_before`/`lines_after` — a genuine drift between the shipped result and its own schema. This README's Outputs table uses the runtime field names; `t2_capabilities.yaml` is out of this PR's ownership scope, so the mismatch is flagged here rather than silently \"corrected\" in either direction.",
+    "**`filesystem` and `filesystem_posture` are two different plugins with confusingly similar names.** `filesystem_posture` (`changelog.d/wave6-pr61b-filesystem-posture.added.md`) is a separate, read-only plugin for `mounts`/`quotas`/`snapshots`; two of its test files (`test_filesystem_posture_local_dispatcher.cpp`, `test_filesystem_posture_parsers.cpp`) sit alongside this plugin's own tests in `tests/unit/` and are easy to mistake for filesystem's own coverage. They are not — see *Source and tests*.",
+    "**No test loads the real built plugin through `LocalDispatcher`.** Unlike `filesystem_posture`'s dispatcher test, `test_filesystem_actions.cpp` and `test_filesystem_read.cpp` both replicate the plugin's helper logic (`validate_path`, `glob_match`, `atomic_write_file`, etc.) in the test TU's own anonymous namespace rather than linking or loading `filesystem.dylib`/`.so`/`.dll` (`tests/unit/test_filesystem_actions.cpp:12-13`, `tests/unit/test_filesystem_read.cpp:5-6`) — a regression in the real `.cpp` that the replica doesn't share would not be caught by these suites.",
+    "**macOS/Linux `get_signature`/`get_version_info`'s TOCTOU re-check is a narrowing, not a fix.** The BR-006 comments in the code say so explicitly: an unprivileged writer inside `base_dir` can still win a race between the re-validate call and codesign's/plutil's own `open()`, because both are path-based external tools (`filesystem_plugin.cpp:1206-1223`, `:1469-1483`). `base_dir` must not be writable by lower-privileged principals."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Append text content to the end of an existing file. Optionally adds a newline separator if the file does not end with one. The file must already exist and be a regular file. Paths are canonicalized; optional base_dir restricts access.",
+      "display_name": "Append to File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.append",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Create a secure temporary file on the endpoint with restrictive permissions (mode 0600 on POSIX, owner-only DACL on Windows). Uses mkstemps/CreateFile+CREATE_NEW to prevent TOCTOU races. Optionally deletes the file immediately (persist=false) for use as a unique path generator.",
+      "display_name": "Create Temporary File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.create_temp",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Create a secure temporary directory on the endpoint with restrictive permissions (mode 0700 on POSIX, owner-only DACL on Windows). Optionally deletes the directory immediately (persist=false) for use as a unique path generator.",
+      "display_name": "Create Temporary Directory",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.create_temp_dir",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a range of lines (1-based, inclusive) from a text file. Reads the entire file, removes the specified lines, and writes it back atomically. Files larger than 100 MB are rejected. The start_line must not exceed the total number of lines; end_line is clamped if it goes past the end.",
+      "display_name": "Delete Line Range from File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.delete_lines",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Check whether a filesystem path exists on the endpoint. Reports the existence, type (file, directory, other), and size. Paths are canonicalized via std::filesystem::canonical() to resolve symlinks. An optional base_dir parameter restricts access to a subtree.",
+      "display_name": "Check Path Exists",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.exists",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Compute the SHA-256 (default) or SHA-1 hash of a file on the endpoint. Uses BCrypt on Windows and sha256sum/shasum on POSIX. Files larger than 10 GB are rejected. Returns the hex digest, algorithm used, and file size in bytes.",
+      "display_name": "Compute File Hash",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.filesystem.file_hash",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Search a directory tree for files matching a specific SHA256 hash. Useful for IOC hunting, malware detection, and file integrity verification. Walks the directory recursively up to the specified depth limit. Returns matching file paths and sizes.",
+      "display_name": "Find File By SHA256 Hash",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "device.filesystem.find_by_hash",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve access control list (ACL) or permissions for a file or directory. On Windows, returns the SDDL representation and individual ACE entries (allow/deny, account, access mask). On Linux/macOS, returns POSIX owner, group, and permission mode (rwxrwxrwx).",
+      "display_name": "Get File ACL / Permissions",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.filesystem.get_acl",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Verify the code signature of an executable, DLL, or app bundle. On Windows, uses WinVerifyTrust to check the Authenticode signature chain (valid, unsigned, distrusted, untrusted). On macOS, runs `codesign --verify --deep --strict` and reports an honest macOS signature status (valid, unsigned, invalid, unknown) — a different vocabulary from Authenticode, since codesign/Gatekeeper model trust differently than WinVerifyTrust. On macOS, `valid` means the code signature's seal is INTACT (integrity: the binary/bundle is unmodified since signing) — it does NOT mean the signer is trusted, notarized, or accepted by Gatekeeper; an ad-hoc or self-signed binary reports `valid`. This is a weaker assurance than the Windows `valid`, which also validates the certificate chain to a trusted root. Returns error on Linux.",
+      "display_name": "Check Code Signature",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.filesystem.get_signature",
+      "platforms": [
+        "windows",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Extract version information from an executable or app bundle. On Windows, reads the PE version resource (FileVersion, ProductVersion, and descriptive fields such as CompanyName/FileDescription/ProductName) and returns an error if the file carries no version resource. On macOS, reads CFBundleVersion and CFBundleShortVersionString from the bundle's Info.plist via `plutil -extract ... raw` — plutil handles both binary and XML plists, so this works on any .app regardless of how its Info.plist is encoded — and reports an honest version_status|not_available when the target has no Info.plist or no version keys within it, rather than failing. Returns error on Linux.",
+      "display_name": "Get File Version Info",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.filesystem.get_version_info",
+      "platforms": [
+        "windows",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "List the contents of a directory on the endpoint, up to 1000 entries. Reports each entry's filename, type (file, directory, symlink, other), and size. Paths are canonicalized; optional base_dir restricts access.",
+      "display_name": "List Directory Contents",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.filesystem.list_dir",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Read lines from a text file on the endpoint with pagination support. Returns lines with 1-based line numbers, total line count, and file size. Binary files are detected and rejected. Maximum file size is 100 MB, maximum lines per request is 10000. Paths are canonicalized; optional base_dir restricts access.",
+      "display_name": "Read File Contents",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.filesystem.read",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Find and replace text in a file using literal string matching or regex. Supports case-insensitive mode, dry-run (preview without writing), and a maximum replacement count. The write is atomic (temp file + rename) to prevent corruption. Files larger than 100 MB are rejected. Regex patterns with nested quantifiers are rejected for safety.",
+      "display_name": "Find and Replace in File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.replace",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Search a text file's contents for lines matching a literal string or regex pattern. Returns matching line numbers and content. Supports case-insensitive search, regex mode with backtracking protection, and configurable maximum match count. Files larger than 100 MB are rejected.",
+      "display_name": "Search File Contents",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.filesystem.search",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Search a directory tree for files or directories matching a name pattern. Supports both glob matching (default) and regex. Walks the tree recursively up to max_depth with configurable result limits. Paths are canonicalized; optional base_dir restricts the search scope.",
+      "display_name": "Search Directories by Name Pattern",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.filesystem.search_dir",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Write or create a file with the specified content. If the file exists, overwrite must be true. If the file does not exist, create must be true. Content is written atomically for existing files (temp + rename) to prevent corruption. Maximum content size is 100 MB. Paths are canonicalized; optional base_dir restricts access.",
+      "display_name": "Write File Contents",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.filesystem.write_content",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Two-step workflow that first searches for lines matching a pattern in a configuration file to confirm the current value, then performs a find/replace operation to update it. The search step uses dry-run semantics (no changes), and the replace step performs the actual modification with an atomic write. Designed for configuration drift remediation.",
+      "display_name": "Workflow: Search Config and Replace Value",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "workflow.config_search_and_replace",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Compliance workflow that retrieves the PE version information of a Windows executable and evaluates it against a minimum required version. Designed to be chained with inventory evaluation: the get_version_info result populates inventory data, then a PolicyFragment with a version_gte condition triggers remediation if the version is below the threshold. On non-Windows platforms, uses the filesystem.exists action as a fallback check.",
+      "display_name": "Workflow: Software Version Compliance Check",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "workflow.version_compliance_check",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only)",
+  "how_it_works": "Every action funnels its `path`/`root`/`directory` parameter through `validate_path` or `validate_path_or_parent`, which resolve symlinks via `fs::canonical` and, when `base_dir` is set, refuse anything that resolves outside it (`filesystem_plugin.cpp:101-184`). Reads never touch the target; the four write actions (`replace`, `write_content` on an existing file, `delete_lines`) go through `atomic_write_file` — write to a same-directory temp file, then rename (`filesystem_plugin.cpp:391-415`) — while `append`, `create_temp`, `create_temp_dir`, and a fresh `write_content` open the target directly. `file_hash`/`find_by_hash` hash in-process via BCrypt on Windows (`compute_hash_win`, `filesystem_plugin.cpp:188-245`) and by exec'ing an absolute-path `sha256sum`/`sha1sum`/`shasum` through the bounded subprocess runner on POSIX, never a shell (`compute_hash_unix`, `filesystem_plugin.cpp:249-316`). `get_signature`/`get_version_info` are Windows/macOS-only: native `WinVerifyTrust`/`GetFileVersionInfoW` calls on Windows (`filesystem_plugin.cpp:1154-1206`, `:1389-1453`), `/usr/bin/codesign`/`/usr/bin/plutil` exec'd through the same runner on macOS, each preceded by a BR-006 immediate re-validate-before-exec check that narrows (but does not eliminate) a TOCTOU window (`filesystem_plugin.cpp:1206-1223`, `:1463-1483`); both report an honest unsupported/`not_available` result on Linux (`filesystem_plugin.cpp:1262-1265`, `:1550-1553`). `search_dir`/`search`/`replace` share a ReDoS guard that rejects nested-quantifier regexes (`has_nested_quantifiers`, `filesystem_plugin.cpp:322-345`); `search_dir`'s glob mode uses a hand-rolled matcher (`glob_match`, `filesystem_plugin.cpp:349-387`).\n\nThe plugin deliberately never calls a typed result-status setter — no `set_result_status`/`yuzu_ctx_set_result_status` call exists anywhere in `filesystem_plugin.cpp` — so every action's outcome is carried entirely in its pipe-delimited rows and return code; see *Result status* below. It also deliberately stops at line-range deletion and ACL *reads*: there is no whole-file delete, no rename, and no ACL/DACL *write* action anywhere in the action list.",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.append",
+      "description": "The existing file to append content to.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.filesystem.append",
+      "description": "The text content to append to the file.",
+      "name": "content",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "device.filesystem.append",
+      "description": "If \"true\" (default), adds a newline before appended content when the file does not end with a newline character. Prevents content from being joined to the last existing line.\n",
+      "name": "newline",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.append",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": "yuzu-",
+      "definition_id": "device.filesystem.create_temp",
+      "description": "Prefix for the temp file name.",
+      "name": "prefix",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 32
+      },
+      "default": ".tmp",
+      "definition_id": "device.filesystem.create_temp",
+      "description": "Suffix/extension for the temp file name.",
+      "name": "suffix",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.create_temp",
+      "description": "Optional. Create the temp file in this directory instead of the system default temp directory.\n",
+      "name": "directory",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "device.filesystem.create_temp",
+      "description": "If \"true\" (default), the file is kept. If \"false\", the file is deleted after creation (useful for generating unique paths).\n",
+      "name": "persist",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": "yuzu-",
+      "definition_id": "device.filesystem.create_temp_dir",
+      "description": "Prefix for the temp directory name.",
+      "name": "prefix",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.create_temp_dir",
+      "description": "Optional. Create the temp directory inside this parent instead of the system default temp directory.\n",
+      "name": "directory",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "device.filesystem.create_temp_dir",
+      "description": "If \"true\" (default), the directory is kept. If \"false\", deleted after creation.\n",
+      "name": "persist",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.delete_lines",
+      "description": "The text file to delete lines from.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "minimum": 1
+      },
+      "default": null,
+      "definition_id": "device.filesystem.delete_lines",
+      "description": "The first line to delete (1-based, inclusive).\n",
+      "name": "start_line",
+      "required": true,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "minimum": 1
+      },
+      "default": null,
+      "definition_id": "device.filesystem.delete_lines",
+      "description": "The last line to delete (1-based, inclusive). Clamped to total line count if it exceeds file length.\n",
+      "name": "end_line",
+      "required": true,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.delete_lines",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.exists",
+      "description": "The filesystem path to check.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.exists",
+      "description": "Optional. If set, the path must resolve within this directory. Prevents directory traversal outside the allowed subtree.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.file_hash",
+      "description": "The file to hash.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "sha256",
+          "sha1"
+        ]
+      },
+      "default": "sha256",
+      "definition_id": "device.filesystem.file_hash",
+      "description": "The hash algorithm to use.",
+      "name": "algorithm",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.file_hash",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.find_by_hash",
+      "description": "The root directory to search.",
+      "name": "directory",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64,
+        "minLength": 64
+      },
+      "default": null,
+      "definition_id": "device.filesystem.find_by_hash",
+      "description": "The SHA256 hex digest to search for (case-insensitive).\n",
+      "name": "sha256",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 10,
+        "minimum": 1
+      },
+      "default": 3,
+      "definition_id": "device.filesystem.find_by_hash",
+      "description": "Maximum directory recursion depth. Default: 3, max: 10.\n",
+      "name": "max_depth",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_acl",
+      "description": "The file or directory to inspect.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_acl",
+      "description": "Optional. Restricts access to paths within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_signature",
+      "description": "The executable, DLL, or app bundle to verify.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_signature",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_version_info",
+      "description": "The executable, DLL, or app bundle to inspect. On macOS this may be a .app bundle directory or an Info.plist file directly.\n",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.get_version_info",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.list_dir",
+      "description": "The directory to list.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.list_dir",
+      "description": "Optional. Restricts access to paths within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.read",
+      "description": "The text file to read.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "minimum": 1
+      },
+      "default": 1,
+      "definition_id": "device.filesystem.read",
+      "description": "1-based line number to start reading from. Default: 1.\n",
+      "name": "offset",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maximum": 10000,
+        "minimum": 1
+      },
+      "default": 100,
+      "definition_id": "device.filesystem.read",
+      "description": "Maximum number of lines to return. Default: 100, max: 10000.\n",
+      "name": "limit",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.read",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.replace",
+      "description": "The file to perform find/replace on.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "device.filesystem.replace",
+      "description": "The literal string or regex to search for.\n",
+      "name": "search",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "",
+      "definition_id": "device.filesystem.replace",
+      "description": "The text to replace matches with. Empty string removes matches.\n",
+      "name": "replacement",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.replace",
+      "description": "If \"true\", interpret search as an ECMAScript regex. Default: \"false\".\n",
+      "name": "regex",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "device.filesystem.replace",
+      "description": "If \"true\" (default), match is case-sensitive.\n",
+      "name": "case_sensitive",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.replace",
+      "description": "If \"true\", count replacements without modifying the file. Default: \"false\".\n",
+      "name": "dry_run",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "minimum": 0
+      },
+      "default": 0,
+      "definition_id": "device.filesystem.replace",
+      "description": "Maximum number of replacements to perform. 0 = unlimited. Default: 0.\n",
+      "name": "max_replacements",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.replace",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search",
+      "description": "The text file to search.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search",
+      "description": "The literal string or regex to search for in each line.\n",
+      "name": "pattern",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.search",
+      "description": "If \"true\", interpret the pattern as an ECMAScript regex. Patterns with nested quantifiers are rejected to prevent catastrophic backtracking. Default: \"false\".\n",
+      "name": "regex",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "device.filesystem.search",
+      "description": "If \"true\" (default), match is case-sensitive. If \"false\", performs case-insensitive matching.\n",
+      "name": "case_sensitive",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 10000,
+        "minimum": 1
+      },
+      "default": 100,
+      "definition_id": "device.filesystem.search",
+      "description": "Maximum number of matching lines to return. Default: 100, max: 10000.\n",
+      "name": "max_matches",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search_dir",
+      "description": "The root directory to search from.",
+      "name": "root",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search_dir",
+      "description": "Glob pattern (default) or regex to match against entry names. Examples: \"*.log\", \"config*\", \"^backup-\\d+$\" (with regex=true).\n",
+      "name": "pattern",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.search_dir",
+      "description": "If \"true\", interpret the pattern as an ECMAScript regex instead of a glob. Default: \"false\".\n",
+      "name": "regex",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "directories",
+          "files",
+          "both"
+        ]
+      },
+      "default": "directories",
+      "definition_id": "device.filesystem.search_dir",
+      "description": "What to match: \"directories\" (default), \"files\", or \"both\".\n",
+      "name": "match_type",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 20,
+        "minimum": 1
+      },
+      "default": 5,
+      "definition_id": "device.filesystem.search_dir",
+      "description": "Maximum directory recursion depth. Default: 5, max: 20.\n",
+      "name": "max_depth",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maximum": 1000,
+        "minimum": 1
+      },
+      "default": 100,
+      "definition_id": "device.filesystem.search_dir",
+      "description": "Maximum number of matching entries to return. Default: 100, max: 1000.\n",
+      "name": "max_results",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.search_dir",
+      "description": "Optional. Restricts the search root to paths within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.write_content",
+      "description": "The file path to write to. If the file does not exist, it will be created if create=true.\n",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.filesystem.write_content",
+      "description": "The text content to write to the file.",
+      "name": "content",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.write_content",
+      "description": "If \"true\", create the file if it does not exist. Default: \"false\".\n",
+      "name": "create",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "device.filesystem.write_content",
+      "description": "If \"true\", overwrite an existing file. Default: \"false\".\n",
+      "name": "overwrite",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "device.filesystem.write_content",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "Full path to the configuration file to update. Example: \"/etc/myapp/config.ini\" or \"C:\\ProgramData\\MyApp\\config.ini\"\n",
+      "name": "config_path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "The current configuration value to search for. Matched literally (not regex) unless search_regex=true.\n",
+      "name": "old_value",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "The new configuration value to replace matches with.\n",
+      "name": "new_value",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "If \"true\", interpret old_value as a regex pattern. Default: \"false\".\n",
+      "name": "search_regex",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "workflow.version_compliance_check",
+      "description": "Full path to the Windows executable to check. Example: \"C:\\Program Files\\MyApp\\myapp.exe\"\n",
+      "name": "executable_path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": null,
+      "definition_id": "workflow.version_compliance_check",
+      "description": "The minimum acceptable product version string (e.g. \"2.5.0.0\"). Used by downstream PolicyFragment conditions for compliance evaluation. The check itself returns the raw version; the comparison happens in the policy layer using version_gte.\n",
+      "name": "minimum_version",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "workflow.version_compliance_check",
+      "description": "Optional. Restricts access to files within this directory.\n",
+      "name": "base_dir",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "4db605b6c689",
+  "manifest_version": 1,
+  "name": "filesystem",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Outcome of the append; the only value the plugin emits on success.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ok"
+          ]
+        },
+        {
+          "description": "Number of bytes appended, including an inserted newline separator when newline=true and the file did not already end with one. Values: integer (bytes).",
+          "example": 21,
+          "name": "bytes_appended",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Total file size in bytes after the append. Values: integer (bytes).",
+          "example": 40,
+          "name": "total_size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.append"
+    },
+    {
+      "columns": [
+        {
+          "description": "Full path to the created temporary file. Values: free text (path).",
+          "example": "D:\\yuzu-dev\\tmp\\yuzu-964a901bfe197402d93f51a7653b0697.tmp",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Echoes the persist parameter — whether the file was kept.",
+          "example": "true",
+          "name": "persist",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.create_temp"
+    },
+    {
+      "columns": [
+        {
+          "description": "Full path to the created temporary directory. Values: free text (path).",
+          "example": "D:\\yuzu-dev\\tmp\\yuzu-3849a33da8fc555d407ac0f2c67356f9",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Echoes the persist parameter — whether the directory was kept.\n",
+          "example": "true",
+          "name": "persist",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.create_temp_dir"
+    },
+    {
+      "columns": [
+        {
+          "description": "Count of lines removed (end_line - start_line + 1, after end_line is clamped to the file's length). Values: integer.",
+          "example": 1,
+          "name": "lines_deleted",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Declared here as lines_before, but the plugin's actual wire field is total_lines_before (filesystem_plugin.cpp:1998) — the file's total line count before the deletion. The emitted key does not match this column's declared name; see the filesystem plugin README Caveats. Values: integer.",
+          "example": 2,
+          "name": "lines_before",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Declared here as lines_after, but the plugin's actual wire field is total_lines_after (filesystem_plugin.cpp:1999) — the file's total line count after the deletion. Same name mismatch as lines_before. Values: integer.",
+          "example": 1,
+          "name": "lines_after",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.delete_lines"
+    },
+    {
+      "columns": [
+        {
+          "description": "Whether the path exists on the endpoint.",
+          "example": "true",
+          "name": "exists",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The kind of filesystem entry found. Only emitted when exists is true.\n",
+          "example": "file",
+          "name": "type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "file",
+            "directory",
+            "other"
+          ]
+        },
+        {
+          "description": "Size in bytes for a file entry; 0 for a directory or an \"other\" entry. Only emitted when exists is true. Values: integer (bytes).",
+          "example": "1405",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.exists"
+    },
+    {
+      "columns": [
+        {
+          "description": "Hex-encoded digest of the file's contents. Values: free text (hex digest).",
+          "example": "9321feab332edbba521c7ea3eb978d9844cb4f62a4730dab9cf60fb79649037d",
+          "name": "hash",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The hash algorithm actually used.",
+          "example": "sha256",
+          "name": "algorithm",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "sha256",
+            "sha1"
+          ]
+        },
+        {
+          "description": "File size in bytes at the time of hashing. Values: integer (bytes).",
+          "example": "1405",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.file_hash"
+    },
+    {
+      "columns": [
+        {
+          "description": "Full path of a file whose SHA-256 matches the target hash. Values: free text (path).",
+          "example": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Matching file's size in bytes. Values: integer (bytes).",
+          "example": "1405",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Total number of matching files found, repeated on the trailing summary row. Values: integer.",
+          "example": "1",
+          "name": "matches_found",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.find_by_hash"
+    },
+    {
+      "columns": [
+        {
+          "description": "Windows-only. SDDL string encoding the owner and DACL. Absent on POSIX. Values: free text (SDDL).",
+          "example": "O:BAD:AI(A;;FA;;;SY)(A;ID;FA;;;SY)(A;ID;FA;;;BA)",
+          "name": "sddl",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. One access-control-entry row's effect; the plugin emits one ace row per DACL entry.\n",
+          "example": "allow",
+          "name": "ace_type",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "allow",
+            "deny",
+            "other"
+          ]
+        },
+        {
+          "description": "Windows-only. The DOMAIN\\account the ACE names, or the SID string when the account cannot be resolved. Values: free text.",
+          "example": "NT AUTHORITY\\SYSTEM",
+          "name": "account",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. The ACE's access mask, hex-formatted. Values: hex integer.",
+          "example": "0x001f01ff",
+          "name": "access_mask",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "POSIX-only. The file's owning user name, or the numeric uid when it cannot be resolved. Values: free text.",
+          "example": "root",
+          "name": "owner",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "POSIX-only. The file's owning group name, or the numeric gid when it cannot be resolved. Values: free text.",
+          "example": "wheel",
+          "name": "group",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "POSIX-only. rwx permission string for owner/group/other. Values: 9-character rwx string.",
+          "example": "rw-r--r--",
+          "name": "permissions",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "POSIX-only. Octal permission bits. Values: 4-digit octal.",
+          "example": "0644",
+          "name": "mode",
+          "platforms": [
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.get_acl"
+    },
+    {
+      "columns": [
+        {
+          "description": "Signature verdict. On Windows: valid/unsigned/distrusted/untrusted (Authenticode chain trust). On macOS: valid/unsigned/invalid/unknown — here `valid` means the code signature's seal is intact (INTEGRITY only: unmodified since signing), NOT that the code is trusted or notarized; an ad-hoc/self-signed binary reports `valid`. Values: windows: valid, unsigned, distrusted, untrusted, security_settings_blocked, error_0x<hex>; macos: valid, unsigned, invalid, unknown.",
+          "example": "unsigned",
+          "name": "signature_status",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.get_signature"
+    },
+    {
+      "columns": [
+        {
+          "description": "Windows: PE FileVersion (four-part). macOS: CFBundleVersion, the build number. Absent when not carried by the target. Values: free text (version string).",
+          "example": "6.2.26100.9278",
+          "name": "file_version",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows: PE ProductVersion (four-part). macOS: CFBundleShortVersionString, the marketing version. Absent when not carried by the target. Values: free text (version string).",
+          "example": "10.0.26100.9278",
+          "name": "product_version",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE CompanyName string resource, when present. Values: free text.",
+          "example": "Microsoft Corporation",
+          "name": "company_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE FileDescription string resource, when present. Values: free text.",
+          "example": "Notepad",
+          "name": "file_description",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE InternalName string resource, when present. Values: free text.",
+          "example": "Notepad",
+          "name": "internal_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE OriginalFilename string resource, when present. Values: free text.",
+          "example": "NOTEPAD.EXE.MUI",
+          "name": "original_filename",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE ProductName string resource, when present. Values: free text.",
+          "example": "Microsoft® Windows® Operating System",
+          "name": "product_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows-only. PE LegalCopyright string resource, when present. Values: free text.",
+          "example": "© Microsoft Corporation. All rights reserved.",
+          "name": "legal_copyright",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "macOS-only honest-empty marker: emitted as not_available when the target has no Info.plist or no version keys within it; absent otherwise (Windows never emits this field).\n",
+          "example": "not_available",
+          "name": "version_status",
+          "platforms": [
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "not_available"
+          ]
+        }
+      ],
+      "definition_id": "device.filesystem.get_version_info"
+    },
+    {
+      "columns": [
+        {
+          "description": "Filename of one directory entry (not a full path). Values: free text.",
+          "example": "hosts",
+          "name": "entry_name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The entry's kind.",
+          "example": "file",
+          "name": "entry_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "file",
+            "directory",
+            "symlink",
+            "other"
+          ]
+        },
+        {
+          "description": "Size in bytes; 0 for directories and symlinks. Values: integer (bytes).",
+          "example": "1405",
+          "name": "entry_size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.list_dir"
+    },
+    {
+      "columns": [
+        {
+          "description": "1-based line number of this returned line. Values: integer.",
+          "example": "1",
+          "name": "line_number",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "The line's text, with a trailing CRLF's carriage return stripped. Values: free text.",
+          "example": "# Copyright (c) 1993-2009 Microsoft Corp.",
+          "name": "content",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Total number of lines in the file, counted past the returned window. Values: integer.",
+          "example": "37",
+          "name": "total_lines",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "File size in bytes. Values: integer (bytes).",
+          "example": "1405",
+          "name": "file_size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.read"
+    },
+    {
+      "columns": [
+        {
+          "description": "Count of replacements performed (or that would be performed, when dry_run=true). Values: integer.",
+          "example": 2,
+          "name": "replacements_made",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "File size in bytes before the replace. Values: integer (bytes).",
+          "example": 42,
+          "name": "file_size_before",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "File size in bytes after the replace. Values: integer (bytes).",
+          "example": 18,
+          "name": "file_size_after",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Present and true only when dry_run=true was requested; the plugin omits this line entirely otherwise. Values: true (field absent when dry_run=false).",
+          "example": "not observed in any capture (every capture ran with dry_run=false)",
+          "name": "dry_run",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.replace"
+    },
+    {
+      "columns": [
+        {
+          "description": "1-based line number of a matching line. Values: integer.",
+          "example": 19,
+          "name": "line_number",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Full text of the matching line, with a trailing carriage return stripped. Values: free text.",
+          "example": "# localhost name resolution is handled within DNS itself.",
+          "name": "content",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Count of matching lines returned in this result, capped by max_matches. Values: integer.",
+          "example": 3,
+          "name": "total_matches",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.search"
+    },
+    {
+      "columns": [
+        {
+          "description": "Absolute path of a matched file or directory.",
+          "example": "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the matched entry is a file or a directory, as classified by match_type.",
+          "example": "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)",
+          "name": "entry_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "file",
+            "directory"
+          ]
+        },
+        {
+          "description": "Count of matching entries returned in this result, capped by max_results. Values: integer.",
+          "example": 0,
+          "name": "total_matches",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.search_dir"
+    },
+    {
+      "columns": [
+        {
+          "description": "Outcome of the write; the only value the plugin emits on success.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ok"
+          ]
+        },
+        {
+          "description": "Number of bytes written to the file. Values: integer (bytes).",
+          "example": 20,
+          "name": "bytes_written",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Canonicalized path that was written.",
+          "example": "C:\\Windows\\Temp\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.filesystem.write_content"
+    },
+    {
+      "columns": [
+        {
+          "description": null,
+          "example": null,
+          "name": "replacements_made",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "file_size_before",
+          "platforms": null,
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "file_size_after",
+          "platforms": null,
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "workflow.config_search_and_replace"
+    },
+    {
+      "columns": [
+        {
+          "description": null,
+          "example": null,
+          "name": "file_version",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "product_version",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "company_name",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "product_name",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "file_description",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "workflow.version_compliance_check"
+    }
+  ],
+  "outputs_note": "Every action writes pipe-delimited `key|value` lines via `ctx.write_output()`. A *repeating* row (`list_dir`'s entries, Windows `get_acl`'s ACEs, `search`/`search_dir`/`find_by_hash`'s matches, `read`'s lines) is prefixed with a literal discriminator word naming the row's kind, then its fields; a single-value field is its own `key|value` line with no discriminator. There is no shared placeholder row for \"found nothing\" — a zero-hit action reports only its trailing count (`total_matches|0`, `matches_found|0`) with no rows above it. Failure is always a single `error|<message>` line plus a non-zero return code, never a placeholder success row (see *Result status*).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None for any read action. `write_content`/`replace`/`append`/`delete_lines` against a path the running account cannot already write need that account to be an `Administrators` member; default install grants nothing (`docs/agent-privilege-model.md:118`)",
+      "if_refused": "a single `error|<message>` line + return code 1 (e.g. `error|GetNamedSecurityInfo failed (error N)`) — no typed status is set",
+      "measured": "2026-09-07, bare metal, as `SYSTEM` (`docs/samples/windows.txt:1`)",
+      "os": "Windows",
+      "runs_as": "**LocalSystem today** (`docs/agent-privilege-model.md:70`, tracked #1442; target is the virtual service account `NT SERVICE\\YuzuAgent`)"
+    },
+    {
+      "grant": "None for any read action. Write actions against a path with no operator-authored per-path sudo entry are refused by the OS itself at `open()`/`rename()`; default install grants nothing (`docs/agent-privilege-model.md:118`)",
+      "if_refused": "same `error|<message>` + rc 1 shape",
+      "measured": "2026-09-07, bare metal, **unprivileged** at euid 501 (jsmith) — the capture ran through `LocalDispatcher`/`PluginHandle::load`, not the real root daemon (`docs/samples/macos.txt:1`)",
+      "os": "macOS",
+      "runs_as": "**root** — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
+    },
+    {
+      "grant": "None for any read action. Write actions against system paths need an operator-authored per-path sudo entry; default install grants nothing (`docs/agent-privilege-model.md:118`)",
+      "if_refused": "same `error|<message>` + rc 1 shape",
+      "measured": "2026-09-07, container, as euid 0 (root) (`docs/samples/linux.txt:1`) — also not the least-privilege `yuzu` account",
+      "os": "Linux",
+      "runs_as": "`yuzu` unprivileged system account (`docs/agent-privilege-model.md:12,52`)"
+    }
+  ],
+  "readme": "agents/plugins/filesystem/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "exists",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "exists|true",
+            "type|file",
+            "size|172"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_dir",
+          "not_captured": null,
+          "params": "path=/etc",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 82,
+          "rows": [
+            "entry|nsswitch.conf|file|494",
+            "entry|update-motd.d|directory|0",
+            "entry|dpkg|directory|0",
+            "entry|skel|directory|0",
+            "entry|rc1.d|directory|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "file_hash",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "hash|60aae00e788a173131b105d5694045ac736b668be86396d4991d1dbe3d70ef38",
+            "algorithm|sha256",
+            "size|172"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|/tmp/yuzu-UPhb03.tmp",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp_dir",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|/tmp/yuzu-7OcS9w",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "read",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 9,
+          "rows": [
+            "line|1|127.0.0.1\tlocalhost",
+            "line|2|::1\tlocalhost ip6-localhost ip6-loopback",
+            "line|3|fe00::\tip6-localnet",
+            "line|4|ff00::\tip6-mcastprefix",
+            "line|5|ff02::1\tip6-allnodes"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_acl",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "owner|root",
+            "group|root",
+            "permissions|rw-r--r--",
+            "mode|0644"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_signature",
+          "not_captured": null,
+          "params": "path=/bin/ls",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|code signature verification is not supported on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "find_by_hash",
+          "not_captured": null,
+          "params": "directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "matches_found|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search_dir",
+          "not_captured": null,
+          "params": "root=/etc pattern=*hosts*",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "total_matches|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_version_info",
+          "not_captured": null,
+          "params": "path=/bin/ls",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|version info extraction is not supported on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search",
+          "not_captured": null,
+          "params": "path=/etc/hosts pattern=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "match|1|127.0.0.1\tlocalhost",
+            "match|2|::1\tlocalhost ip6-localhost ip6-loopback",
+            "total_matches|2"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "replace",
+          "not_captured": null,
+          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "replacements_made|2",
+            "file_size_before|40",
+            "file_size_after|16"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "write_content",
+          "not_captured": null,
+          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_written|20",
+            "path|/tmp/yuzu_capture/yuzu_capture_tmp.txt"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "append",
+          "not_captured": null,
+          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_appended|21",
+            "total_size|40"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_lines",
+          "not_captured": null,
+          "params": "path=/tmp/yuzu_capture/yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "lines_deleted|1",
+            "total_lines_before|2",
+            "total_lines_after|1"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "container",
+        "leg_hash": "4db605b6c689",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "exists",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "exists|true",
+            "type|file",
+            "size|213"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_dir",
+          "not_captured": null,
+          "params": "path=/etc",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 76,
+          "rows": [
+            "entry|manpaths|file|36",
+            "entry|rc.common|file|1560",
+            "entry|auto_master|file|195",
+            "entry|csh.login|file|121",
+            "entry|syslog.conf|file|96"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "file_hash",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "hash|c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da",
+            "algorithm|sha256",
+            "size|213"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-ayE16A.tmp",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp_dir",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T//yuzu-R7qEuY",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "read",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 11,
+          "rows": [
+            "line|1|##",
+            "line|2|# Host Database",
+            "line|3|#",
+            "line|4|# localhost is used to configure the loopback interface",
+            "line|5|# when the system is booting.  Do not change this entry."
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_acl",
+          "not_captured": null,
+          "params": "path=/etc/hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "owner|root",
+            "group|wheel",
+            "permissions|rw-r--r--",
+            "mode|0644"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_signature",
+          "not_captured": null,
+          "params": "path=/bin/ls",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "signature_status|valid"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "find_by_hash",
+          "not_captured": null,
+          "params": "directory=/etc sha256=c7dd0e2ed261ce76d76f852596c5b54026b9a894fa481381ffd399b556c0e2da",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "match|/private/etc/hosts|213",
+            "matches_found|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search_dir",
+          "not_captured": null,
+          "params": "root=/etc pattern=*hosts*",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "total_matches|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_version_info",
+          "not_captured": null,
+          "params": "path=/bin/ls",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "version_status|not_available"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search",
+          "not_captured": null,
+          "params": "path=/etc/hosts pattern=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "match|4|# localhost is used to configure the loopback interface",
+            "match|7|127.0.0.1\tlocalhost",
+            "match|9|::1             localhost",
+            "total_matches|3"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "replace",
+          "not_captured": null,
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "replacements_made|2",
+            "file_size_before|40",
+            "file_size_after|16"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "write_content",
+          "not_captured": null,
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_written|20",
+            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "append",
+          "not_captured": null,
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_appended|22",
+            "total_size|20"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_lines",
+          "not_captured": null,
+          "params": "path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_8s9wf1vr/yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "lines_deleted|1",
+            "total_lines_before|2",
+            "total_lines_after|1"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "4db605b6c689",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "exists",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "exists|true",
+            "type|file",
+            "size|1432"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_dir",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "entry|hosts|file|1432",
+            "entry|hosts.ics|file|444",
+            "entry|lmhosts.sam|file|3683",
+            "entry|networks|file|407",
+            "entry|protocol|file|1358"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "file_hash",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "hash|904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
+            "algorithm|sha256",
+            "size|1432"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|D:\\yuzu-dev\\tmp\\yuzu-14298277ed7220950c97d6a97a2e8180.tmp",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "create_temp_dir",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "path|D:\\yuzu-dev\\tmp\\yuzu-2342ff50ffda6cdc156dbde1418407c0",
+            "persist|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "read",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 39,
+          "rows": [
+            "line|1|﻿# Copyright (c) 1993-2009 Microsoft Corp.",
+            "line|2|#",
+            "line|3|# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.",
+            "line|4|#",
+            "line|5|# This file contains the mappings of IP addresses to host names. Each"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_acl",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 7,
+          "rows": [
+            "sddl|O:BAD:AI(A;;FA;;;SY)(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)(A;ID;0x1200a9;;;AC)(A;ID;0x1200a9;;;S-1-15-2-2)",
+            "ace|allow|NT AUTHORITY\\SYSTEM|0x001f01ff",
+            "ace|allow|NT AUTHORITY\\SYSTEM|0x001f01ff",
+            "ace|allow|BUILTIN\\Administrators|0x001f01ff",
+            "ace|allow|BUILTIN\\Users|0x001200a9"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_signature",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\notepad.exe",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "signature_status|unsigned"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "find_by_hash",
+          "not_captured": null,
+          "params": "directory=C:\\Windows\\System32\\drivers\\etc sha256=904287aa347ca8218ad8b694c173b038ff2faf684e94deeb6094ce4b43e40d35",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "match|C:\\Windows\\System32\\drivers\\etc\\hosts|1432",
+            "matches_found|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search_dir",
+          "not_captured": null,
+          "params": "root=C:\\Windows\\System32\\drivers\\etc pattern=*hosts*",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "total_matches|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_version_info",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\notepad.exe",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "file_version|6.2.26100.9278",
+            "product_version|10.0.26100.9278",
+            "company_name|Microsoft Corporation",
+            "file_description|Notepad",
+            "internal_name|Notepad"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "search",
+          "not_captured": null,
+          "params": "path=C:\\Windows\\System32\\drivers\\etc\\hosts pattern=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "match|19|# localhost name resolution is handled within DNS itself.",
+            "match|20|#\t127.0.0.1       localhost",
+            "match|21|#\t::1             localhost",
+            "total_matches|3"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "replace",
+          "not_captured": null,
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt search=yuzu-capture replace=yuzu-replaced",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "replacements_made|2",
+            "file_size_before|42",
+            "file_size_after|18"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "write_content",
+          "not_captured": null,
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt content=\"yuzu-capture written\" overwrite=true",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_written|20",
+            "path|C:\\Windows\\Temp\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "append",
+          "not_captured": null,
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt content=\"yuzu-capture appended\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "status|ok",
+            "bytes_appended|22",
+            "total_size|20"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_lines",
+          "not_captured": null,
+          "params": "path=C:\\WINDOWS\\TEMP\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt start_line=1 end_line=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "lines_deleted|1",
+            "total_lines_before|2",
+            "total_lines_after|1"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "4db605b6c689",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "exists",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "list_dir",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "file_hash",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "create_temp",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "create_temp_dir",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "read",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "get_acl",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "get_signature",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "find_by_hash",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "search_dir",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "get_version_info",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "search",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "replace",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "write_content",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "append",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "delete_lines",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "FileRetrieval"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/filesystem.yaml",
+      "content/definitions/t2_capabilities.yaml",
+      "content/definitions/t2_chaining_examples.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/filesystem/src/filesystem_macos_sig.hpp",
+      "agents/plugins/filesystem/src/filesystem_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_filesystem_actions.cpp",
+      "tests/unit/test_filesystem_macos_sig.cpp",
+      "tests/unit/test_filesystem_posture_local_dispatcher.cpp",
+      "tests/unit/test_filesystem_posture_parsers.cpp",
+      "tests/unit/test_filesystem_read.cpp"
+    ]
+  },
+  "version": "0.4.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server tree for `device.filesystem.` and for the plugin name outside the capability catalogue and generic result-parsing table (`server/core/src/result_parsing.hpp:66`) finds no sync-source, TAR, or DEX consumer. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its 16 definitions.",
+    "**Sensitivity.** `get_acl` rows carry local account names (POSIX `owner`/`group`, Windows ACE `account` — potentially real usernames, not just built-in principals) and `get_version_info`/`get_signature` rows name specific installed software (`company_name`, `product_name`, `file_description`) — an installed-software inventory by another route; every action's `path`/`content` fields carry whatever the operator pointed at, which can include usernames embedded in home-directory paths or arbitrary personal data in file contents.",
+    "**Siblings:** `filesystem_posture.mounts`/`.quotas`/`.snapshots` — a separate, similarly-named, read-only plugin (mount/quota/snapshot inventory only; no read-file, hash, or write actions) — do not confuse the two (see Caveats). Two shipped workflow definitions chain this plugin's actions: `workflow.config_search_and_replace` (`content/definitions/t2_chaining_examples.yaml:15`) searches a config file then dispatches `filesystem.replace`, and `workflow.version_compliance_check` (`content/definitions/t2_chaining_examples.yaml:206`) dispatches `filesystem.get_version_info` and compares the result against a minimum version.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.filesystem.file_hash\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

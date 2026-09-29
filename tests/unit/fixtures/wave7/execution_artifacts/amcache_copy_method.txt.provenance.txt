@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Copy-Item -Path C:\Windows\appcompat\Programs\Amcache.hve -Destination amcache_copy\Amcache.hve (admin session, SeBackupPrivilege already Enabled)
+date: 2026-09-06
+status: REAL CAPTURE
+note: plain Copy-Item SUCCEEDED (no sharing violation) -- the CreateFile+FILE_FLAG_BACKUP_SEMANTICS fallback path was not needed on this host. Amcache.hve.LOG1/.LOG2 did not exist alongside the live hive (SilentlyContinue, no error). The hive copy itself was used only as scratch input to reg load / RegLoadAppKeyW and is NOT committed to the repo (spec: "do NOT commit the hive").

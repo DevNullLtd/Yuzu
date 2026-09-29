@@ -74,6 +74,12 @@ public:
     /// step N leaves 1..N-1 applied and recorded — same contract as the
     /// SQLite runner. Returns true if all migrations succeeded (or none were
     /// needed).
+    ///
+    /// #3013: `migrations` must be strictly increasing by `version` with no
+    /// duplicates, checked up front — a duplicate or out-of-order version
+    /// (e.g. two independent branches both allocating the next number) fails
+    /// the WHOLE call closed rather than silently skipping whichever one
+    /// loses the `<= current` race in the apply loop below.
     [[nodiscard]] static bool run(PGconn* conn, std::string_view store_name,
                                   const std::vector<PgMigration>& migrations);
 

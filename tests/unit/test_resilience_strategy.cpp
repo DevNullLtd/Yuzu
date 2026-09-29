@@ -206,4 +206,23 @@ TEST_CASE("parse_resilience_params: canonical keys, seconds->ms, defaults",
         CHECK(c.quiet_reset_ms == 60'000);
         CHECK(debounce == 1'000);
     }
+
+    SECTION("a caller-supplied default_event_debounce_ms overrides the implicit 1000ms "
+            "fallback (#3388) - every existing 2-arg call site above is unaffected") {
+        (void)parse_resilience_params(get, debounce, 72'000);
+        CHECK(debounce == 72'000);
+    }
+
+    SECTION("a caller-supplied default is still overridden by an explicit "
+            "event_debounce_ms param") {
+        p = {{"event_debounce_ms", "250"}};
+        (void)parse_resilience_params(get, debounce, 72'000);
+        CHECK(debounce == 250); // the author's value wins over EITHER default
+    }
+
+    SECTION("garbage event_debounce_ms falls back to the caller-supplied default, not 1000") {
+        p = {{"event_debounce_ms", "x"}};
+        (void)parse_resilience_params(get, debounce, 72'000);
+        CHECK(debounce == 72'000);
+    }
 }

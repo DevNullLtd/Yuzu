@@ -16,7 +16,7 @@ Yuzu is a well-structured C++23 agent/server framework with a solid foundation. 
 This review was cross-checked against:
 
 - `docs/roadmap.md` (GitHub issue index / backlog)
-- `github-issues/26-enterprise-storage-migration-plugin.md` (local issue export)
+- `github-issues/26-enterprise-storage-migration-plugin.md` (local issue export; the `github-issues/` staging directory was retired 2026-07-14 per ADR-3001 — its one draft is refiled to the GitHub tracker as a `roadmap` issue at PR-1 push; recoverable meanwhile via `git show <retirement-commit>^:github-issues/26-enterprise-storage-migration-plugin.md`)
 - current server/agent/auth code paths
 
 > Note: direct GitHub issue state queries were not available from this environment, so this section compares local issue references and the live code in-repo.

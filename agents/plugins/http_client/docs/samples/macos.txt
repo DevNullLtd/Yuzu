@@ -1,0 +1,27 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6e02e2f89c34
+== action=download url=https://www.example.com/ path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_download.html
+status|ok
+path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_download.html
+size|559
+hash|ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get url=https://www.example.com/
+status|200
+body|<!doctype html><html lang="en"><head><title>Example Domain</title><link rel="icon" href="data:,"><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></div></body></html>
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=head url=https://www.example.com/
+status|200
+headers|CF-RAY: a374d6c43e292214-MAN
+cf-cache-status: HIT
+Age: 4039
+Content-Encoding: br
+last-modified: Sun, 30 Aug 2026 04:11:49 GMT
+Server: cloudflare
+Content-Type: text/html
+Connection: close
+allow: GET, HEAD
+Date: Mon, 07 Sep 2026 09:55:38 GMT
+[result_status] UNDECLARED / UNKNOWN / 
+

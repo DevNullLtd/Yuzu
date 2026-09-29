@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file deployment_engine.hpp
 /// The deployment state-machine driver — ONE standalone callable that advances a
 /// deployment one tick. Operator-driven today (the `/auto` deploy poll handler
@@ -23,6 +25,7 @@
 /// a lease is NEVER held across a dispatch or a poll.
 
 #include "deployment_parse.hpp" // DeploymentConfig
+#include "dispatch_caller.hpp"  // DispatchCaller
 
 #include <functional>
 #include <string>
@@ -55,12 +58,31 @@ best_response_per_agent(const std::vector<StoredResponse>& rows);
 /// ResponseStore::query_by_execution + latest_per_agent; tests pass a fake).
 using PollFn = std::function<std::unordered_map<std::string, AgentResponse>(const std::string&)>;
 
-/// The shared 6-param command dispatch (execution_id carried for correlation).
-using DispatchFn = std::function<std::pair<std::string, int>(
+/// The shared command dispatch (execution_id carried for correlation).
+///
+/// The trailing parameter carries the CALLER (identity + visible set), not
+/// merely a visible set — the same PLAN-006 widening `RestApiV1`,
+/// `WorkflowRoutes`, and `BundleOrchestrator` already carry.
+/// `ServerImpl::build_classified_command` is the single chokepoint every
+/// dispatch resolves through, and it authorizes against the CLASSIFIED
+/// capability's declared securable/operation for the CALLER it is given;
+/// `DeploymentRoutes` used to feed it the background-dispatcher closure
+/// (`DispatchCaller{.system = true}`), which the chokepoint's
+/// `caller.system` early-return admits unconditionally — so an
+/// operator-triggered, MUTATING stage dispatch (`content_dist.stage`,
+/// declared `SoftwareDeployment:Write`) never had its RBAC operation
+/// checked at all. The route's own `Infrastructure:Read` +
+/// `SoftwareDeployment:Execute` gate and its per-tick
+/// `devices_fn(viewer)∩cohort` re-authorization are real, but neither is a
+/// substitute for the capability's own declared operation — a role holding
+/// Execute without Write must still be refused before `content_dist.stage`
+/// dispatches, and only a caller-carrying seam lets the chokepoint enforce
+/// that as it does for every other operator surface.
+using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
     const std::string& plugin, const std::string& action,
     const std::vector<std::string>& agent_ids, const std::string& scope_expr,
     const std::unordered_map<std::string, std::string>& parameters,
-    const std::string& execution_id)>;
+    const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
 
 struct EngineDeps {
     DeploymentRunStore* store = nullptr;
@@ -79,11 +101,18 @@ inline std::string exec_execution_id(const std::string& deployment_id) {
 }
 
 /// Advance one deployment one tick. `authorized` = the live caller's
-/// devices_fn(principal) ∩ cohort. Safe to call concurrently / repeatedly: the
-/// store's guarded transitions + the execute CAS make every step idempotent at the
+/// devices_fn(principal) ∩ cohort — the TARGETING confinement. `caller` is the
+/// same live session's DISPATCH identity, threaded to the chokepoint so
+/// `content_dist.stage`/`execute_staged` are authorized against the declared
+/// `SoftwareDeployment:Write` operation rather than dispatched as SYSTEM
+/// (see `DispatchFn`'s doc comment above — targeting and dispatch
+/// authorization are two different questions and neither substitutes for
+/// the other). Safe to call concurrently / repeatedly: the store's guarded
+/// transitions + the execute CAS make every step idempotent at the
 /// state-machine level.
 void advance(const EngineDeps& deps, const std::string& deployment_id, const DeploymentConfig& cfg,
-             const std::unordered_set<std::string>& authorized);
+             const std::unordered_set<std::string>& authorized,
+             const yuzu::server::DispatchCaller& caller);
 
 } // namespace deployment
 } // namespace yuzu::server

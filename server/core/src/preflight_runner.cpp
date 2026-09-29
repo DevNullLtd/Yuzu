@@ -1,8 +1,12 @@
 #include "preflight_runner.hpp"
 
+#include "background_jobs.hpp" // WS-10 YUZU_ASSERT_BACKGROUND_JOB gate
+
 #include "preflight_eval.hpp"
 #include "preflight_parse.hpp"
 #include "preflight_run_store.hpp"
+
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 
@@ -27,11 +31,21 @@ void PreflightRunner::tick() {
         return;
     const std::int64_t t = now_ms();
 
-    // Retention prune (best-effort; cascades run_device).
-    const std::int64_t cutoff = t - static_cast<std::int64_t>(d_.retention_days) * 86400000LL;
-    d_.run_store->prune_older_than(cutoff);
+    // Retention prune (best-effort; cascades run_device). WS-10: the store reads
+    // Postgres now() itself (single shared clock, skew-safe) and clock-guards the
+    // delete — pass the retention WINDOW, not a replica-clock cutoff.
+    YUZU_ASSERT_BACKGROUND_JOB("preflight_run_store.run_retention_prune");
+    d_.run_store->run_retention_prune(static_cast<std::int64_t>(d_.retention_days) * 86400000LL);
 
     for (auto& run : d_.run_store->list_running()) {
+        // #3495: bounds how many MORE runs a single tick() call starts once
+        // shutdown begins — a run already in progress still finishes its own
+        // dispatch + persist below cleanly, this only stops the next one.
+        if (d_.should_stop && d_.should_stop()) {
+            spdlog::info("preflight_runner: tick stopping early on shutdown - "
+                         "remaining run(s) deferred");
+            break;
+        }
         const auto cfg = preflight::config_from_json(run.config_json);
         auto targets = d_.run_store->get_targets(run.run_id);
         if (targets.empty()) {
@@ -47,6 +61,15 @@ void PreflightRunner::tick() {
         std::vector<preflight::PreflightCheckResponses> checks;
         if (d_.response_store)
             checks = preflight::collect_check_responses(*d_.response_store, run.run_id, applicable);
+
+        if (preflight::any_check_degraded(checks)) {
+            // #2691 finding 10: a degraded read must not overwrite an
+            // already-persisted grid with a false "every device incomplete"
+            // verdict, and must not re-dispatch to devices that already
+            // answered on a prior tick — skip this run's tick entirely and
+            // retry next tick, same shape as the empty-targets skip above.
+            continue;
+        }
 
         bool any_pending = false;
         auto grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);

@@ -1,6 +1,8 @@
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -44,20 +46,25 @@ TEST_CASE("create_temp_file respects prefix and suffix", "[temp_file]") {
 }
 
 TEST_CASE("create_temp_file respects custom directory", "[temp_file]") {
-    auto custom_dir = fs::temp_directory_path() / "yuzu_test_custom_dir";
-    fs::create_directories(custom_dir);
+    // Process-salted scratch dir: the old fixed yuzu_test_custom_dir was
+    // shared cross-job on the shared-identity CI pools — another job's
+    // cleanup remove_all could delete this job's just-created file between
+    // the create and the checks below (#1883). Fully qualified: this file
+    // also exercises the PRODUCT yuzu::TempFile / yuzu::TempDir classes, so
+    // never add `using namespace yuzu::test` here.
+    yuzu::test::TempDir custom_dir{"yuzu_test_custom_dir-"};
+    fs::create_directories(custom_dir.path);
 
     char path[512]{};
-    int rc =
-        yuzu_create_temp_file("custom-", ".tmp", custom_dir.string().c_str(), path, sizeof(path));
+    int rc = yuzu_create_temp_file("custom-", ".tmp", custom_dir.path.string().c_str(), path,
+                                   sizeof(path));
     REQUIRE(rc == 0);
 
     fs::path p(path);
     REQUIRE(fs::exists(p));
-    REQUIRE(fs::canonical(p.parent_path()) == fs::canonical(custom_dir));
+    REQUIRE(fs::canonical(p.parent_path()) == fs::canonical(custom_dir.path));
 
     fs::remove(p);
-    fs::remove_all(custom_dir);
 }
 
 TEST_CASE("create_temp_file creates unique files", "[temp_file]") {

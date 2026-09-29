@@ -14,6 +14,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::DeploymentDeviceRow;
@@ -26,6 +27,17 @@ using yuzu::server::pg::PgResult;
 using yuzu::server::preflight::PreflightTarget;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_deployment_engine.cpp (identical setup — first build wins). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate deprun_tpl{"deprun", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    DeploymentRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("deprun template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -61,7 +73,7 @@ std::string step_of(DeploymentRunStore& s, const std::string& id, const std::str
 
 TEST_CASE("DeploymentRunStore execute-once CAS + guarded transitions",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -157,7 +169,7 @@ TEST_CASE("DeploymentRunStore execute-once CAS + guarded transitions",
 }
 
 TEST_CASE("DeploymentRunStore owner-scope + cascade", "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -186,7 +198,7 @@ TEST_CASE("DeploymentRunStore owner-scope + cascade", "[pg][deployment][store]")
 
 TEST_CASE("DeploymentRunStore allows one running deployment per source run",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -221,7 +233,7 @@ TEST_CASE("DeploymentRunStore allows one running deployment per source run",
 
 TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeploymentRunStore store{pool};
@@ -246,11 +258,39 @@ TEST_CASE("DeploymentRunStore succeeded_agents_for_run (cross-deployment dedup)"
     CHECK(store.succeeded_agents_for_run("other", "alice").empty()); // run-scoped
 }
 
+// WS-10 10.2 (#2508): run_retention_prune is the shared clock-guarded, single-writer,
+// capped prune (pg::run_clock_guarded_prune). This binds the store's own wiring of it:
+// it takes the retention WINDOW (not a cutoff), reads Postgres now() itself, and the
+// part-6 Decline policy makes the FIRST pass on a store with data but no persisted
+// anchor DECLINE (records the anchor + settled marker, deletes nothing); the next
+// pass proceeds. The catastrophic-code details are exercised in test_pg_retention_guard.
+TEST_CASE("DeploymentRunStore prune removes old deployments (clock-guarded, bootstrap-declines once)",
+          "[pg][deployment][store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(store.create_deployment(make_dep("dNew", "carol", t), {tgt("n1")}));
+    REQUIRE(store.create_deployment(make_dep("dOld", "carol", t - 100000), {tgt("o1")})); // 100s ago
+
+    // 75s window sits between dOld (100s) and dNew (~now). dNew keeps this from being
+    // would_wipe, so the ONLY first-pass decline is the part-6 bootstrap NoAnchor.
+    CHECK(store.run_retention_prune(75000) == 0); // bootstrap decline
+    int n = store.run_retention_prune(75000);
+    CHECK(n >= 1);
+    CHECK_FALSE(store.get_deployment("dOld").has_value()); // pruned
+    CHECK(store.get_devices("dOld").empty());              // FK ON DELETE CASCADE
+    CHECK(store.get_deployment("dNew").has_value());       // newer deployment survives
+}
+
 // ADR-0012 §1: construction must be fail-CLOSED — a reachable DB whose schema can't
 // migrate leaves the store !is_open() (server.cpp → startup_failed_).
 TEST_CASE("DeploymentRunStore reports !is_open on a migration failure",
           "[pg][deployment][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

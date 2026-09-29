@@ -12,12 +12,14 @@ metadata:
   description: >
     Check one or more Indicators of Compromise against the local endpoint
     state. Supports five IOC types: IP addresses (checked against active
-    TCP/UDP connections), domains (checked against DNS cache on Windows or
-    /etc/hosts on Linux/macOS), file hashes (SHA-256 compared against
-    specified file paths), file paths (existence and size), and ports
-    (checked for listening services). All parameters are optional but at
-    least one must be provided. Values within each parameter are
-    comma-separated.
+    connections — TCP and UDP on Windows and macOS, TCP only on Linux),
+    domains (checked against the DNS resolver cache on Windows, or a
+    substring match against /etc/hosts on Linux/macOS), file hashes
+    (SHA-256 compared against specified file paths), file paths (existence
+    and size), and ports (checked against the same connection table as IP
+    addresses). All parameters are optional but at least one must be
+    provided, or the plugin returns rc 1 with no result rows. Values within
+    each parameter are comma-separated.
   tags: [security, ioc, threat-hunting, incident-response]
 
 spec:
@@ -36,44 +38,71 @@ spec:
         type: string
         displayName: IP Addresses
         description: >
-          Comma-separated list of IP addresses to check against active
-          network connections (TCP and UDP).
+          Comma-separated list of IP addresses (e.g. `192.168.1.100`) to
+          check against active connections' local and remote addresses.
+          Windows and macOS enumerate TCP and UDP; Linux enumerates TCP
+          only (no /proc/net/udp read).
       domains:
         type: string
         displayName: Domain Names
         description: >
-          Comma-separated list of domain names to check against the DNS
-          resolver cache (Windows) or /etc/hosts (Linux/macOS).
+          Comma-separated list of domain names (e.g. `evil.example.com`)
+          to check. On Windows this queries the DNS resolver cache; on
+          Linux/macOS it is a substring search over /etc/hosts lines
+          (comments stripped), so a short domain can match more than
+          intended.
       file_hashes:
         type: string
         displayName: File Hashes (SHA-256)
         description: >
-          Comma-separated list of SHA-256 hashes to compare against files
-          specified in file_paths. Both parameters should be provided for
-          hash matching.
+          Comma-separated list of SHA-256 hashes (e.g.
+          `2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae`),
+          lower- or upper-case. Compared against every file in file_paths;
+          without file_paths every hash reports unmatched with "No target
+          file paths specified for hash comparison".
       file_paths:
         type: string
         displayName: File Paths
         description: >
-          Comma-separated list of file paths to check for existence and
-          size. Also used as the target set for file_hashes comparison.
+          Comma-separated list of file paths (e.g. `C:\bad.exe` or
+          `/tmp/bad.bin`) to check for existence and size. Also used as
+          the target set for file_hashes comparison.
       ports:
         type: string
         displayName: Ports
         description: >
-          Comma-separated list of port numbers to check for listening
-          or established services.
+          Comma-separated list of port numbers (e.g. `4444`) to check
+          against the same connection table as ip_addresses — Linux sees
+          TCP listeners only, Windows and macOS see TCP and UDP.
 
   result:
     columns:
       - name: type
         type: string
+        description: >
+          Which IOC category this row checked. `error` appears only once,
+          in place of all rows, when no IOC parameter was provided at all.
+        values: [ip, domain, hash, file, port, error]
+        example: ip
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: >-
+          The IOC value that was checked, copied from the input parameter with any literal `|` escaped to `\|`. Values: free text.
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: matched
         type: bool
+        description: >-
+          Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: >-
+          Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text.
+        example: Found in /etc/hosts
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [type, matched]
       operations: [count]

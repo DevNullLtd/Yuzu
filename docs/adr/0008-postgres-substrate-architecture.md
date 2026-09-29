@@ -111,6 +111,14 @@ Three refinements from the grill-with-docs session that fixed the author-facing 
   is **renamed to `offline_endpoint_store`** (implementation follow-up; safe pre-alpha — its data
   reconstructs from heartbeats).
 
+  **Extension (2026-08-28, ADR-0062) — non-`*Store`-suffixed classes.** The 7-component "Wave 4"
+  ladder blind spot found 2026-08-27 (`docs/postgres-migration-ladder.md`) includes components
+  whose C++ class was never `*Store`-suffixed (`PatchManager`, `UpdateRegistry`,
+  `WorkflowEngine`, …). For these, the rule above does not add a suffix that was never there: the
+  schema is the name already passed to `MigrationRunner::run` in the pre-migration SQLite code
+  (`PatchManager` → `patch_manager`, not `patch_manager_store`) — `snake_case(FullClassName)`,
+  literally, with no suffix to append because none exists on the class.
+
 - **Migrations stay transactional; the non-transactional kind is deferred, its rule pinned.** The
   Future-evolution note in `pg_migration_runner.hpp` stands: statements that cannot run in a
   transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`, `ALTER TYPE ADD VALUE`) cannot be a

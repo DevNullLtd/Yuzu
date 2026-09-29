@@ -21,8 +21,11 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
@@ -34,13 +37,24 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
+
+// AuditStore migrated to Postgres (ADR-0006) — the fixture below clones this
+// pre-migrated template instead of opening a SQLite path.
+yuzu::test::PgTestTemplate oidc_audit_tpl{"oidcaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("oidcaudit template: store failed to migrate");
+}};
 
 /// Fixture — stores + AuthRoutes wired against an in-process TestRouteSink,
 /// mirroring SamlRoutesFixture (test_saml_routes.cpp). `oidc_provider` is
@@ -52,9 +66,22 @@ struct OidcRoutesFixture {
     Config                                cfg{};
     yuzu::MetricsRegistry                 metrics; // wired so yuzu_auth_oidc_login_total fires
     auth::AuthManager                     auth_mgr{};
-    std::unique_ptr<ApiTokenStore>        api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool. This fixture has no other PG-backed member, so it
+    // self-skips explicitly (mirrors yuzu::test::AuthDbPg's own posture) —
+    // SKIPs the enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset,
+    // FAILs when set but broken.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool>   audit_pool;
     std::unique_ptr<AuditStore>           audit_store;
-    std::unique_ptr<AnalyticsEventStore>  analytics;
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone, matching audit_store's pattern above.
+    yuzu::test::AnalyticsEventStorePg     analytics;
     std::shared_mutex                     oidc_mu;
     std::unique_ptr<oidc::OidcProvider>   oidc_provider; // set by tests that need it enabled
     std::unique_ptr<AuthRoutes>           auth_routes;
@@ -63,17 +90,21 @@ struct OidcRoutesFixture {
     OidcRoutesFixture() {
         fs::create_directories(tmp.path);
         auth_mgr.set_metrics_registry(&metrics);
-        api_tokens  = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
-        analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
+
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(oidc_audit_tpl);
+        INFO("[OidcRoutesFixture] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         REQUIRE(audit_store->is_open());
-        REQUIRE(analytics->is_open());
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
             /*rbac_store=*/nullptr,
-            api_tokens.get(),
+            /*api_token_store=*/nullptr,
             audit_store.get(),
             /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr,
@@ -90,7 +121,9 @@ struct OidcRoutesFixture {
     std::vector<AuditEvent> audit_events(std::size_t limit = 10) const {
         AuditQuery q;
         q.limit = static_cast<int>(limit);
-        return audit_store->query(q);
+        auto rows = audit_store->query(q);
+        REQUIRE(rows.has_value());
+        return *rows;
     }
 };
 
@@ -113,7 +146,7 @@ oidc::OidcConfig make_minimal_oidc_config() {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_total{result=error}",
-          "[oidc][auth_routes]") {
+          "[pg][oidc][auth_routes]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -136,7 +169,7 @@ TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_
 
 TEST_CASE("OIDC callback — missing code/state increments "
           "yuzu_auth_oidc_login_total{result=error}",
-          "[oidc][auth_routes]") {
+          "[pg][oidc][auth_routes]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -159,7 +192,7 @@ TEST_CASE("OIDC callback — missing code/state increments "
 
 TEST_CASE("OIDC callback — unknown PKCE state increments "
           "yuzu_auth_oidc_login_total{result=error} (no network touched)",
-          "[oidc][auth_routes]") {
+          "[pg][oidc][auth_routes]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -183,7 +216,7 @@ TEST_CASE("OIDC callback — unknown PKCE state increments "
 }
 
 TEST_CASE("OIDC callback — 404 when provider not configured emits no login counter",
-          "[oidc][auth_routes]") {
+          "[pg][oidc][auth_routes]") {
     OidcRoutesFixture fix; // oidc_provider left null
     auto res = fix.sink.dispatch("GET", "/auth/callback?code=x&state=y");
     REQUIRE(res != nullptr);

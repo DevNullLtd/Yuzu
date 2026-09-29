@@ -1,0 +1,2 @@
+total 8
+-rw-r--r--@ 1 alex  staff  1078 Sep  4 11:00 homebrew.mxcl.postgresql@18.plist

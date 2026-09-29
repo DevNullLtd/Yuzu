@@ -50,7 +50,7 @@ Maintainer: Yuzu Team <noreply@yuzu.io>
 Depends: adduser
 Section: admin
 Priority: optional
-Homepage: https://github.com/Tr3kkR/Yuzu
+Homepage: https://github.com/DevNullLtd/Yuzu
 Description: Yuzu endpoint management gateway
  Erlang/OTP gateway node for scaling Yuzu agent connections.
  Routes commands from the server to agents and aggregates responses.

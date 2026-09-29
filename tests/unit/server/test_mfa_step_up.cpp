@@ -25,7 +25,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -54,17 +54,11 @@ struct AuditCapture {
 };
 
 struct StepUpFixture {
-    fs::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    yuzu::test::AuthDbPg db;
     std::vector<AuditCapture> audits;
     StepUpAuditFn audit_fn;
 
     StepUpFixture() {
-        data_dir = yuzu::test::unique_temp_path("mfa-stepup-");
-        fs::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         // Seed alice (MFA-enrolled) + bob (not enrolled).
         auto salt_a = AuthManager::random_bytes(16);
         auto hash_a = AuthManager::pbkdf2_sha256("pw", salt_a, 1000);
@@ -94,20 +88,30 @@ struct StepUpFixture {
         };
     }
 
-    ~StepUpFixture() {
-        db.reset();
-        std::error_code ec;
-        fs::remove_all(data_dir, ec);
-    }
-
     auth::Session make_session(const std::string& user, const std::string& source,
-                               std::chrono::steady_clock::time_point verified_at = {}) {
+                               std::chrono::system_clock::time_point verified_at = {}) {
         auth::Session s;
         s.username = user;
         s.role = (user == "alice") ? Role::admin : Role::user;
-        s.expires_at = std::chrono::steady_clock::now() + std::chrono::hours(1);
         s.auth_source = source;
-        s.mfa_verified_at = verified_at;
+        // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), require_mfa_step_up
+        // ages against the local monotonic `steady_mfa_verified` derived by
+        // AuthManager::derive_session_deadlines, not the raw wall `mfa_verified_at`
+        // — so populate through it (here the local wall clock is the authority).
+        // The total verified→check elapsed age is identical to the old wall path,
+        // and derive maps an epoch (no proof) / future-dated (backward step) proof
+        // to the {} sentinel exactly as the old `mfa_verified_at > now` guard did.
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+        const std::int64_t verified_ms =
+            verified_at.time_since_epoch().count() == 0
+                ? 0
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      verified_at.time_since_epoch())
+                      .count();
+        auth::AuthManager::derive_session_deadlines(s, now, now + 3600'000, now, verified_ms,
+                                                    /*elevated_until*/ 0, /*issued*/ 0, now);
         return s;
     }
 };
@@ -116,7 +120,7 @@ struct StepUpFixture {
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: window_secs <= 0 returns true (escape hatch)",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -136,7 +140,7 @@ TEST_CASE_METHOD(StepUpFixture,
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: SAML session is denied with honest 403 (not api-token "
                  "message, not mfa_status lookup) — gate stays CLOSED",
-                 "[mfa][stepup][saml]") {
+                 "[pg][mfa][stepup][saml]") {
     // F3 regression guard: SAML sessions have no local users row.  Before
     // this fix the gate fell through to mfa_status() which returned an
     // error (UserNotFound → fail-closed), producing a confusing
@@ -174,7 +178,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: api_token / mcp_token principals bypass the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -192,7 +196,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: non-enrolled user (bob) bypasses the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -207,7 +211,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: MFA-enrolled session with no proof yields 401",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -241,11 +245,11 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: fresh proof within window passes the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
-    auto session = make_session("alice", "local", std::chrono::steady_clock::now());
+    auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                               "POST /api/v1/tokens"));
@@ -255,13 +259,13 @@ TEST_CASE_METHOD(StepUpFixture,
 }
 
 TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window yields 401",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
     // 600 s old; window is 300 s → stale.
     auto session = make_session("alice", "local",
-                                std::chrono::steady_clock::now() - std::chrono::seconds(600));
+                                std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));
@@ -282,8 +286,61 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
 }
 
 TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: a proof older than the 24h hard ceiling fails CLOSED even "
+                 "under an oversized configured window",
+                 "[pg][mfa][stepup]") {
+    // Adversarial-round #2 C3 / PR #3702 blocker #1: the effective freshness
+    // window is min(window_secs, kMaxMfaStepUpWindowSecs=24h). A misconfigured or
+    // over-large window_secs cannot extend the step-up window past the hard
+    // ceiling (parity with JIT's kMaxElevationWindow).
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    // Proof aged 25h; configured window a (misconfigured) 30h. Without the
+    // ceiling, age(25h) <= window(30h) would PASS; the 24h ceiling rejects it.
+    auto session = make_session("alice", "local",
+                                std::chrono::system_clock::now() - std::chrono::hours(25));
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/30 * 3600, audit_fn,
+                                    "POST /api/v1/tokens"));
+    CHECK(res.status == 401);
+
+    // A proof just INSIDE the ceiling (23h) with the same oversized window passes
+    // — proving the ceiling is what rejects above, not the configured window.
+    httplib::Response res2;
+    res2.status = 200;
+    auto fresh = make_session("alice", "local",
+                              std::chrono::system_clock::now() - std::chrono::hours(23));
+    CHECK(require_mfa_step_up(req, res2, fresh, *db, /*window_secs=*/30 * 3600, audit_fn,
+                             "POST /api/v1/tokens"));
+    CHECK(res2.status == 200);
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: a future-dated proof (backward clock step) fails CLOSED",
+                 "[pg][mfa][stepup]") {
+    // HA WS-1/1a wall-clock reversal: mfa_verified_at is now system_clock. A
+    // proof timestamped AFTER now — a backward step on the issuing/holding
+    // replica — must be treated as NO proof (never a spurious-fresh window a
+    // rewind would otherwise hold open), so the gate requires step-up (401).
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    auto session = make_session("alice", "local",
+                                std::chrono::system_clock::now() + std::chrono::seconds(600));
+
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                                    "POST /api/v1/tokens"));
+    CHECK(res.status == 401);
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["meta"]["mfa_step_up_required"] == true);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].action == "mfa.step_up.required");
+}
+
+TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: mfa_status store error fails CLOSED (UP-4)",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     // Tear down auth_db so mfa_status() returns an error → helper must
     // emit a 401 with the mfa_status_unavailable detail, not silently
     // bypass the gate. Governance Gate 4 unhappy-path UP-4 / qe Gate 3
@@ -294,7 +351,7 @@ TEST_CASE_METHOD(StepUpFixture,
     // alice was enrolled in the fixture; we now drop her row to simulate
     // a deleted-mid-request user. mfa_status() returns an error.
     REQUIRE(db->remove_user("alice").has_value());
-    auto session = make_session("alice", "local", std::chrono::steady_clock::now());
+    auto session = make_session("alice", "local", std::chrono::system_clock::now());
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));
@@ -314,7 +371,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: empty audit_fn does not crash on the deny path",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -332,7 +389,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session with fresh amr-seeded proof passes",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     // PR3: OIDC sessions are no longer blanket-exempt. /auth/callback seeds
     // mfa_verified_at from the IdP `amr` claim. A session whose IdP login
     // attested MFA recently clears the gate WITHOUT a local users-row
@@ -341,7 +398,7 @@ TEST_CASE_METHOD(StepUpFixture,
     httplib::Response res;
     res.status = 200;
     REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row
-    auto session = make_session("carol", "oidc", std::chrono::steady_clock::now());
+    auto session = make_session("carol", "oidc", std::chrono::system_clock::now());
 
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                               "POST /api/v1/tokens"));
@@ -352,7 +409,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session WITHOUT MFA proof PASSES (UP-5 regression)",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     // GOVERNANCE UP-5 regression. An SSO login from an IdP that did not
     // attest MFA (no amr → mfa_verified_at default) has no second factor to
     // step up against — it must PASS, exactly like an un-enrolled local
@@ -377,7 +434,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC no-proof is GATED under enforcement (A4/B1)",
-                 "[mfa][stepup][oidc][enforce]") {
+                 "[pg][mfa][stepup][oidc][enforce]") {
     // Hermes adversarial + cyber A4/B1 + governance UP-6: under enforcement
     // that protects the principal's role, an SSO login the IdP did not MFA
     // must step up (re-SSO), symmetric with a local user being forced to
@@ -421,7 +478,7 @@ TEST_CASE_METHOD(StepUpFixture,
     {
         httplib::Response res;
         res.status = 200;
-        auto s = make_session("carol", "oidc", std::chrono::steady_clock::now());
+        auto s = make_session("carol", "oidc", std::chrono::system_clock::now());
         CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
         CHECK(res.status == 200);
     }
@@ -429,12 +486,12 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: window boundary — age == window passes, age > window fails",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     // The comparison is inclusive (`age <= window_secs`). A local enrolled
     // session proven exactly `window_secs` ago passes; one second past
     // fails. Guards the boundary against an off-by-one regression.
     httplib::Request req;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = std::chrono::system_clock::now();
 
     httplib::Response res_at;
     res_at.status = 200;
@@ -451,13 +508,13 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session with stale amr proof is gated",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
     // amr attested MFA, but 600s ago; window is 300s → stale.
     auto session = make_session("carol", "oidc",
-                                std::chrono::steady_clock::now() - std::chrono::seconds(600));
+                                std::chrono::system_clock::now() - std::chrono::seconds(600));
 
     CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
                                     "POST /api/v1/tokens"));
@@ -521,7 +578,7 @@ TEST_CASE("amr_asserts_mfa: MFA-bearing methods are recognised, password-only is
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: per-call correlation_id is unique across calls",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     auto session = make_session("alice", "local");
 

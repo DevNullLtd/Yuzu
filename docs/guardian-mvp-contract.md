@@ -222,12 +222,27 @@ used as-is — they aren't renames, so they create no split-brain.
     journal** (reuse the agent's SQLite/KV; table keyed by monotonic `event_seq` +
     `event_id` UUID; design §3.1): append off the hot path (MPSC + writer thread, §8.3),
     drain on `sync_with_server` + periodically when connected, **delete only after server
-    ack** (at-least-once; the server dedups by `event_id`). **Bounded** (ring-buffer
+    ack** (~~at-least-once~~; the server dedups by `event_id`). **Bounded** (ring-buffer
     eviction + an "N dropped" marker), pressure cut by Decision 10's audit/event
     debounce. Journal **HMAC integrity deferred** (PR 12). The **G2 event-sink is
     durability-agnostic**, so the first demo may use an in-memory queue and upgrade to
     the durable journal with **no wire/contract change** — the durable journal is the
     standing target.
+
+    **Superseded (2026-07-21):** this is a documentation correction, not a behaviour
+    change - delete-only-after-server-ack was never actually built this way; only the
+    struck-through delivery-guarantee framing above was ever wrong. The rest of this
+    decision (append-only log, bounded ring-buffer, HMAC-deferred, durability-agnostic
+    event-sink) stands as designed and built. The delivered journal's guarantee is
+    crash-durable, duplicate-tolerant, bounded-retry redelivery, not true at-least-once
+    (no server batch-ack); deletion is retention-driven instead, and an entry that ages
+    out unacknowledged is a rare, counted loss, not silent. The "N dropped" ring-buffer
+    marker referenced above has the same live-visibility gap as that counter - no
+    dashboard/REST/MCP surface exposes either today (tracked #2298). See [Reconnect
+    replay
+    traffic](user-manual/guaranteed-state.md#reconnect-replay-traffic-durable-lifecycle-journal)
+    and the `yuzu_server_guardian_events_redelivered_total` row in [Guardian
+    metrics](user-manual/metrics.md#guardian-metrics) for the shipped characterization.
 
 ## 5. Deltas / amendments to `yuzu-guardian-design-v1.1.md`
 
@@ -246,7 +261,9 @@ used as-is — they aren't renames, so they create no split-brain.
   server Subscribe read loop; binary payloads use `payload` (`bytes`), not `output`
   (`string`) — also fixes the existing `get_status` binary-in-string issue.
   **Also add `string event_id` to `GuaranteedStateEvent`** (agent-generated, stable
-  across retries) — required for G6's at-least-once dedup; the proto had no event id (N1).
+  across retries) — required for G6's ~~at-least-once~~ dedup; the proto had no event id (N1).
+  The dedup mechanism itself is unchanged; the "at-least-once" delivery-guarantee framing
+  was later narrowed - see the Decision 11 superseded-note above.
 - **New — status storage:** the design folded "fleet aggregation" into PR 4 but
   specified **no status storage**. This contract adds the `guaranteed_state_agent_rule_status`
   table + push-status reporting + real `/status` aggregation + staleness.
@@ -412,10 +429,16 @@ use the `frontend-design` plugin** (product UI, not marketing). Page pattern:
   grammar) Slice C, already observable via decision-5 status columns.
 - **G6 — offline durability (RESOLVED).** Status = snapshot, no buffer (recompute on
   reconnect; Decision 9 handles policy convergence). Events = **durable bounded local
-  journal** (agent SQLite/KV, `event_seq`+`event_id`, at-least-once, server dedups by
+  journal** (agent SQLite/KV, `event_seq`+`event_id`, ~~at-least-once~~, server dedups by
   `event_id`, ring-buffer bound, HMAC deferred PR 12). The G2 event-sink is
   durability-agnostic → in-memory queue allowed for the first demo, durable journal
   swaps in with no contract change. Decision 9 already closed the reconnect half.
+  **Superseded (2026-07-21):** only the struck-through delivery-guarantee framing above
+  is superseded - the rest of this resolution stands. Delivered as crash-durable,
+  duplicate-tolerant, bounded-retry, not true at-least-once; see Decision 11 above and
+  [Reconnect replay
+  traffic](user-manual/guaranteed-state.md#reconnect-replay-traffic-durable-lifecycle-journal)
+  for the shipped characterization.
 - **N2 — status reporting cadence (RESOLVED: transition-only + heartbeat liveness).**
   Rich `GuaranteedStateStatus` is sent at sync/reconnect then **only on transition** — no
   periodic resend (network-kind). Liveness/staleness derives from the **Heartbeat**, not

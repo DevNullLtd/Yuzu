@@ -1,0 +1,198 @@
+name: Trusted fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open fork PR number"
+        required: true
+        type: string
+      head_sha:
+        description: "Exact 40-character PR head SHA reviewed by a maintainer"
+        required: true
+        type: string
+      review_run_id:
+        description: "Successful Fork dynamic review run ID for this PR and SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+# #4471 (adversarial-review CDX-4471-04 / kimi K5): no group means two
+# dispatches on the same quarantine ref (a re-approval before the first run
+# finished) can run concurrently, letting one run's post-gate purge race the
+# other run's still-in-flight gate. Consequence is bounded to residue in an
+# already-unreadable scope (the runbook already says "run them one at a
+# time"), not a trust-boundary crossing -- but serialising costs nothing and
+# removes the race outright. Keyed on pr_number only (not the sha suffix)
+# so a same-PR re-approval on a differently-suffixed branch still queues
+# behind the one already running. Mirrors fork-dynamic-review.yml's group.
+concurrency:
+  group: trusted-fork-ci-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  # Quarantine-ref contract (#4471): this workflow may only be dispatched on a
+  # throwaway per-PR `trusted-fork/pr-<N>[-<sha>]` branch, because the dispatch
+  # ref is the run's GitHub Actions cache scope and the approved fork revision
+  # executes in it. That is enforced fail-closed in the callee's
+  # `trusted_inputs` step (ci.yml) — the single, hermetically tested
+  # chokepoint — and deliberately not repeated here. Runbook:
+  # docs/ci-troubleshooting.md 1.2.
+  validate-approval:
+    name: Validate explicit fork approval
+    runs-on: ubuntu-24.04
+    outputs:
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      head_sha: ${{ steps.validate.outputs.head_sha }}
+    steps:
+      - id: validate
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          APPROVED_SHA: ${{ inputs.head_sha }}
+          REVIEW_RUN_ID: ${{ inputs.review_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$REVIEW_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+
+          pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          state=$(jq -r '.state' <<<"$pr_json")
+          current_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")
+          [[ "$state" == "open" ]] || {
+            echo "::error::PR #$PR_NUMBER is not open."
+            exit 1
+          }
+          [[ "$current_sha" == "$APPROVED_SHA" ]] || {
+            echo "::error::PR #$PR_NUMBER moved; approved=$APPROVED_SHA current=$current_sha"
+            exit 1
+          }
+          [[ -n "$head_repo" && "$head_repo" != "$REPOSITORY" ]] || {
+            echo "::error::PR #$PR_NUMBER is not a fork PR."
+            exit 1
+          }
+
+          review_json=$(gh run view "$REVIEW_RUN_ID" --repo "$REPOSITORY" \
+            --json workflowName,displayTitle,status,conclusion,headBranch)
+          workflow_name=$(jq -r '.workflowName' <<<"$review_json")
+          display_title=$(jq -r '.displayTitle' <<<"$review_json")
+          status=$(jq -r '.status' <<<"$review_json")
+          conclusion=$(jq -r '.conclusion' <<<"$review_json")
+          review_head_branch=$(jq -r '.headBranch' <<<"$review_json")
+          expected_title="Fork review PR #$PR_NUMBER @ $APPROVED_SHA"
+          [[ "$workflow_name" == "Fork dynamic review" ]] || {
+            echo "::error::Review run is not Fork dynamic review."
+            exit 1
+          }
+          [[ "$display_title" == "$expected_title" ]] || {
+            echo "::error::Review run title does not bind it to PR #$PR_NUMBER @ $APPROVED_SHA"
+            exit 1
+          }
+          # The title above binds (PR#, SHA) only, never the branch -- a
+          # quarantine branch is reused-or-fresh across approval rounds by
+          # design (docs/ci-troubleshooting.md 1.2), so a stale/reused branch
+          # name can otherwise cite a genuinely successful review run from a
+          # DIFFERENT quarantine branch and pass every check above. Since this
+          # workflow only ever runs via workflow_dispatch on a branch ref,
+          # GITHUB_REF is authoritative for "which branch is this run on".
+          dispatch_branch="${GITHUB_REF#refs/heads/}"
+          [[ "$review_head_branch" == "$dispatch_branch" ]] || {
+            echo "::error::Review run's branch ($review_head_branch) does not match the branch this gate is dispatched on ($dispatch_branch) -- see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+          [[ "$status" == "completed" && "$conclusion" == "success" ]] || {
+            echo "::error::Static fork review run did not succeed."
+            exit 1
+          }
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$APPROVED_SHA" >> "$GITHUB_OUTPUT"
+
+  trusted-gate:
+    name: Run trusted full CI gate
+    needs: [validate-approval]
+    uses: ./.github/workflows/ci.yml
+    with:
+      pr_number: ${{ needs.validate-approval.outputs.pr_number }}
+      head_sha: ${{ needs.validate-approval.outputs.head_sha }}
+    # Keep the called workflow's secret surface explicit. GITHUB_TOKEN is
+    # supplied automatically by Actions; the PAT is consumed only by the
+    # hosted, base-revision runner-control step before fork code is checked out.
+    secrets:
+      TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}
+      RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}
+
+  # #4471: whatever the approved fork revision wrote into this run's cache
+  # scope is deleted before anyone can dispatch a re-run on the same branch.
+  # Runs AFTER the reusable gate (needs), pass or fail (always()), and is the
+  # only job holding actions:write — a job-level grant on a job that checks
+  # nothing out and runs no fork code; it does not widen the token handed to
+  # `trusted-gate`. Deleting the branch afterwards (runbook housekeeping) does
+  # not remove cache entries by itself — unread entries linger seven days.
+  purge-quarantine-cache:
+    name: Purge quarantine cache scope
+    needs: [trusted-gate]
+    if: always()
+    runs-on: ubuntu-24.04
+    # 10 min, not 5: a scope near the 500-entry bound (5 pages x 100)
+    # under normal-to-slow gh-api latency could otherwise hit a bare
+    # GHA-level cancellation instead of the job's own designed
+    # "entries still present" failure message (governance Gate 4 UP-8).
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Delete every cache entry in this run's ref scope
+        env:
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Never purge outside a quarantine ref. A mis-scoped dispatch is
+          # already refused by the check right below; this keeps a future edit
+          # from turning the purge into a cold rebuild for every PR on dev/main.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::refusing to purge caches outside a trusted-fork/pr-<N> ref (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+          list_ids() {
+            gh api -X GET "repos/$REPOSITORY/actions/caches" -f ref="$GITHUB_REF" -F per_page=100 \
+              | jq -r --arg ref "$GITHUB_REF" '.actions_caches[] | select(.ref == $ref) | .id'
+          }
+          deleted=0
+          # Bounded re-list: one page per pass, so a scope holding more than a
+          # page drains over several passes instead of looping forever.
+          for _ in 1 2 3 4 5; do
+            ids=$(list_ids)
+            [[ -n "$ids" ]] || break
+            for id in $ids; do
+              # Report progress before failing -- under set -e a bare DELETE
+              # failure here would otherwise abort silently with no record of
+              # how many entries were already removed (docs/ci-troubleshooting.md
+              # 1.2 "purge job failed" covers the recovery: re-dispatch on the
+              # SAME branch, which is idempotent and finishes the job).
+              gh api -X DELETE "repos/$REPOSITORY/actions/caches/$id" >/dev/null || {
+                echo "::error::DELETE failed for cache id $id after removing $deleted entr$([ "$deleted" = 1 ] && echo y || echo ies) this run; re-dispatch on the same branch to retry (docs/ci-troubleshooting.md 1.2)."
+                exit 1
+              }
+              deleted=$((deleted + 1))
+            done
+          done
+          remaining=$(list_ids | wc -l | tr -d ' ')
+          [[ "$remaining" == "0" ]] || {
+            echo "::error::$remaining cache entries still present in $GITHUB_REF after purge; see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+          result="purged $deleted cache entries from scope $GITHUB_REF"
+          echo "$result"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi

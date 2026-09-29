@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <yuzu/version_string.hpp>
+
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -77,6 +79,21 @@ std::string faulting_image(const json& body) {
 }
 
 std::string non_empty(const std::string& a, const std::string& b) { return a.empty() ? b : a; }
+
+// The app's marketing version (CFBundleShortVersionString), canonicalised to the
+// shared 4-group quad so macOS crashes/hangs join the same per-(app,version)
+// reliability identity the Windows path builds. Prefer the .ips HEADER's
+// `app_version` (present for bundled/signed apps); fall back to the BODY's
+// `bundleInfo.CFBundleShortVersionString`. A bare/unsigned CLI binary has
+// neither, so this degrades to "" — the shared unknown bucket.
+std::string ips_app_version(const json& header, const json& body) {
+    std::string v = jstr(header, "app_version");
+    if (v.empty()) {
+        if (const json* bundle_info = jobj(body, "bundleInfo"))
+            v = jstr(*bundle_info, "CFBundleShortVersionString");
+    }
+    return yuzu::util::canon_version(v);
+}
 
 // ── `.diag` plain-text helpers ───────────────────────────────────────────────
 
@@ -168,6 +185,7 @@ std::optional<SignalObservation> parse_ips_report(const std::string& ips_content
         if (!o.reason.empty())
             o.sentence +=
                 " (" + o.reason + (o.symbolic.empty() ? "" : " / " + o.symbolic) + ")";
+        o.version = ips_app_version(header, body);
         return o;
     }
 
@@ -179,6 +197,7 @@ std::optional<SignalObservation> parse_ips_report(const std::string& ips_content
                               non_empty(jstr(header, "name"), jstr(header, "app_name")));
         o.pid = static_cast<std::uint32_t>(jint(body, "pid"));
         o.sentence = non_empty(o.subject, "A process") + " stopped responding";
+        o.version = ips_app_version(header, body);
         return o;
     }
 

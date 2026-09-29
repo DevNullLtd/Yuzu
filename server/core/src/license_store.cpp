@@ -1,11 +1,15 @@
 #include "license_store.hpp"
-#include "migration_runner.hpp"
+
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "utf8_sanitize.hpp"
 
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
-#include <chrono>
-#include <random>
+#include <libpq-fe.h>
+#include <spdlog/spdlog.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,113 +24,173 @@
 #include <openssl/sha.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <random>
+#include <string_view>
+
 namespace yuzu::server {
 
-// -- Helpers ------------------------------------------------------------------
+namespace {
 
-static int64_t now_epoch() {
+constexpr const char* kStoreName = "license_store";
+
+// Not a hot path — operator-driven (activate/remove/acknowledge) or periodic-background
+// (validate), same budget class as DeploymentStore (docs/adr/0043-...md).
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+// validate()'s pool-ACQUIRE-wait budget only (with_txn_for, per pg_pool.hpp) — NOT a bound on
+// the transaction body's own execution time, which is governed solely by the pool's
+// per-connection statement_timeout GUC (playbook: "Pool connection setup†" quick fact). Set
+// generously since validate() is a periodic background pass, not a request/response path.
+constexpr std::chrono::milliseconds kValidateTimeout{10000};
+
+// gov UP-5 precedent (every migrated store on this ladder): bounded materialization regardless
+// of table growth — an operator convenience list, not a paged feed.
+constexpr int kListRowCap = 10000;
+
+// ── Small helpers ────────────────────────────────────────────────────────────
+
+std::int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
-static const char* safe(const char* p) {
-    return p ? p : "";
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
 }
 
-static std::string generate_id() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static constexpr char hex_chars[] = "0123456789abcdef";
-    std::string id;
-    id.reserve(32); // 16 bytes = 32 hex chars
-    std::uniform_int_distribution<int> dist(0, 15);
-    for (int i = 0; i < 32; ++i)
-        id += hex_chars[dist(rng)];
-    return id;
+bool to_bool(const char* s) {
+    return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1');
 }
 
-// -- Construction / teardown --------------------------------------------------
+std::string text_col(PGresult* res, int row, int col) {
+    if (PQgetisnull(res, row, col))
+        return {};
+    return std::string(PQgetvalue(res, row, col),
+                       static_cast<std::size_t>(PQgetlength(res, row, col)));
+}
 
-LicenseStore::LicenseStore(const std::filesystem::path& db_path) {
-    auto canonical_path = db_path;
-    {
-        std::error_code ec;
-        auto parent = db_path.parent_path();
-        if (!parent.empty() && std::filesystem::exists(parent, ec)) {
-            auto canon_parent = std::filesystem::canonical(parent, ec);
-            if (!ec)
-                canonical_path = canon_parent / db_path.filename();
-        }
+// Applied to every free-text column reaching Postgres (organization/edition/features_json),
+// mirroring discovery_store.cpp's sanitize_pg_text — an operator-supplied organization/edition
+// string over REST is untrusted.
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
     }
-    int rc = sqlite3_open_v2(canonical_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("LicenseStore: failed to open {}: {}", canonical_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-        return;
-    }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("LicenseStore: opened {}", canonical_path.string());
+    return out;
 }
 
-LicenseStore::~LicenseStore() {
-    if (db_)
-        sqlite3_close(db_);
-}
+// ── Migration DDL ────────────────────────────────────────────────────────────
 
-bool LicenseStore::is_open() const {
-    return db_ != nullptr;
-}
-
-// -- DDL ----------------------------------------------------------------------
-
-void LicenseStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS licenses (
-                id              TEXT PRIMARY KEY,
-                license_key_hash TEXT NOT NULL UNIQUE,
-                organization    TEXT NOT NULL DEFAULT '',
-                seat_count      INTEGER NOT NULL DEFAULT 0,
-                issued_at       INTEGER NOT NULL DEFAULT 0,
-                expires_at      INTEGER NOT NULL DEFAULT 0,
-                edition         TEXT NOT NULL DEFAULT 'community',
-                features_json   TEXT NOT NULL DEFAULT '[]',
-                status          TEXT NOT NULL DEFAULT 'active',
-                activated_at    INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_license_status ON licenses(status);
-
-            CREATE TABLE IF NOT EXISTS license_alerts (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                license_id      TEXT NOT NULL,
-                alert_type      TEXT NOT NULL,
-                message         TEXT NOT NULL DEFAULT '',
-                triggered_at    INTEGER NOT NULL DEFAULT 0,
-                acknowledged    INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_license_alert_lic ON license_alerts(license_id);
-            CREATE INDEX IF NOT EXISTS idx_license_alert_ack ON license_alerts(acknowledged, triggered_at);
-        )"},
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
+    // Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE licenses ("
+         "  id                TEXT PRIMARY KEY,"
+         "  license_key_hash  TEXT NOT NULL UNIQUE,"
+         "  organization      TEXT NOT NULL DEFAULT '',"
+         "  seat_count        BIGINT NOT NULL DEFAULT 0,"
+         "  issued_at         BIGINT NOT NULL DEFAULT 0,"
+         "  expires_at        BIGINT NOT NULL DEFAULT 0,"
+         "  edition           TEXT NOT NULL DEFAULT 'community',"
+         "  features_json     TEXT NOT NULL DEFAULT '[]',"
+         "  status            TEXT NOT NULL DEFAULT 'active',"
+         "  activated_at      BIGINT NOT NULL DEFAULT 0);"
+         "CREATE INDEX idx_license_status ON licenses(status);"
+         "CREATE TABLE license_alerts ("
+         "  id              BIGSERIAL PRIMARY KEY,"
+         "  license_id      TEXT NOT NULL,"
+         "  alert_type      TEXT NOT NULL,"
+         "  message         TEXT NOT NULL DEFAULT '',"
+         "  triggered_at    BIGINT NOT NULL DEFAULT 0,"
+         "  acknowledged    BOOLEAN NOT NULL DEFAULT FALSE,"
+         // add_alert()'s ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING relies on
+         // this constraint to no-op a same-second race between two concurrent validate() calls
+         // (license_alerts.id is always freshly minted by Postgres, so it can never itself be an
+         // ON CONFLICT target).
+         "  UNIQUE (license_id, alert_type, triggered_at));"
+         "CREATE INDEX idx_license_alert_lic ON license_alerts(license_id);"
+         "CREATE INDEX idx_license_alert_ack ON license_alerts(acknowledged, triggered_at);"},
     };
-    if (!MigrationRunner::run(db_, "license_store", kMigrations)) {
-        spdlog::error("LicenseStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
+    return kMigrations;
 }
 
-// -- Hashing ------------------------------------------------------------------
+// ── Row readers ──────────────────────────────────────────────────────────────
 
-std::string LicenseStore::hash_key(const std::string& raw) const {
+constexpr const char* kLicensePublicCols =
+    "id, organization, seat_count, issued_at, expires_at, edition, features_json, status";
+
+License read_license_public(PGresult* res, int row) {
+    License lic;
+    int c = 0;
+    lic.id = text_col(res, row, c++);
+    lic.organization = text_col(res, row, c++);
+    lic.seat_count = to_i64(PQgetvalue(res, row, c++));
+    lic.issued_at = to_i64(PQgetvalue(res, row, c++));
+    lic.expires_at = to_i64(PQgetvalue(res, row, c++));
+    lic.edition = text_col(res, row, c++);
+    lic.features_json = text_col(res, row, c++);
+    lic.status = text_col(res, row, c++);
+    return lic;
+}
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+
+// Caller must already be inside an active transaction (`conn` is a transaction-pinned
+// connection — never a plain pool lease; nesting a second acquire here inside validate()'s
+// with_txn would deadlock a size-1 pool). Returns false only on a genuine DB error; a skip due
+// to the 24h dedup window is success (true), matching the pre-migration store's silent-skip
+// semantics exactly.
+bool add_alert(PGconn* conn, const std::string& license_id, const std::string& alert_type,
+               const std::string& message) {
+    const std::int64_t now = now_epoch();
+
+    pg::PgResult chk = pg::exec_params(
+        conn,
+        "SELECT id FROM license_store.license_alerts "
+        "WHERE license_id = $1 AND alert_type = $2 AND triggered_at > $3::bigint LIMIT 1",
+        std::vector<std::string>{license_id, alert_type, std::to_string(now - 86400)});
+    if (chk.status() != PGRES_TUPLES_OK) {
+        spdlog::error("LicenseStore::add_alert: dedup check failed for '{}'/{}: {}", license_id,
+                      alert_type, PQerrorMessage(conn));
+        return false;
+    }
+    if (PQntuples(chk.get()) > 0)
+        return true; // already alerted recently — same silent-skip as the original
+
+    // ON CONFLICT DO NOTHING: the UNIQUE(license_id, alert_type, triggered_at) constraint
+    // exists for backfill dedup (ADR-0048), but a same-second race between two concurrent
+    // validate() calls could in principle hit it too — treated as a benign no-op either way.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "INSERT INTO license_store.license_alerts "
+        "(license_id, alert_type, message, triggered_at) VALUES ($1,$2,$3,$4::bigint) "
+        "ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING",
+        std::vector<std::string>{license_id, alert_type, sanitize_pg_text(message),
+                                 std::to_string(now)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("LicenseStore::add_alert: insert failed for '{}'/{}: {}", license_id,
+                      alert_type, PQerrorMessage(conn));
+        return false;
+    }
+    spdlog::info("LicenseStore: alert [{}] for license '{}': {}", alert_type, license_id,
+                 message);
+    return true;
+}
+
+// ── License-key hashing (kept cross-platform-identical to the pre-migration store) ─────────
+
+std::string hash_key(const std::string& raw) {
     unsigned char hash[32]{};
 
 #ifdef _WIN32
@@ -157,452 +221,446 @@ std::string LicenseStore::hash_key(const std::string& raw) const {
     return result;
 }
 
-// -- License CRUD -------------------------------------------------------------
+// 32 lowercase-hex-char id (16 random bytes via mt19937_64) — the ORIGINAL pre-migration
+// format, deliberately kept (not DeploymentStore's 16-hex/8-byte format): ADR-0048 "pre-
+// migration ID contracts are kept exactly", which is about preserving THIS store's existing
+// format, not converging every migrated store onto the same one.
+std::string generate_id() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    static constexpr char hex_chars[] = "0123456789abcdef";
+    std::string id;
+    id.reserve(32);
+    std::uniform_int_distribution<int> dist(0, 15);
+    for (int i = 0; i < 32; ++i)
+        id += hex_chars[dist(rng)];
+    return id;
+}
+
+} // namespace
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+LicenseStore::LicenseStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("LicenseStore: no database connection at construction ({}) — license "
+                      "persistence disabled",
+                      pool_.last_error());
+        return;
+    }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("LicenseStore: schema migration failed — license persistence disabled");
+        return;
+    }
+    open_ = true;
+}
+
+
+// ── Operations ───────────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string>
 LicenseStore::activate_license(const License& license, const std::string& license_key) {
-    if (!db_)
-        return std::unexpected("database not open");
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
     if (license_key.empty())
         return std::unexpected("license key cannot be empty");
     if (license.organization.empty())
         return std::unexpected("organization cannot be empty");
 
-    std::unique_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    auto key_hash = hash_key(license_key);
-    auto id = license.id.empty() ? generate_id() : license.id;
-    auto now = now_epoch();
+    const std::string key_hash = hash_key(license_key);
+    const std::string id = license.id.empty() ? generate_id() : license.id;
+    const std::int64_t now = now_epoch();
+    const std::int64_t issued_at = license.issued_at > 0 ? license.issued_at : now;
+    const std::string edition = license.edition.empty() ? "community" : license.edition;
+    const std::string features = license.features_json.empty() ? "[]" : license.features_json;
 
-    // Check for duplicate key
-    {
-        sqlite3_stmt* chk = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT id FROM licenses WHERE license_key_hash = ?;",
-                               -1, &chk, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(chk, 1, key_hash.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(chk) == SQLITE_ROW) {
-                sqlite3_finalize(chk);
-                return std::unexpected("license key already activated");
-            }
-            sqlite3_finalize(chk);
-        }
-    }
+    // Atomic upsert (ADR-0048 hardening over the pre-migration check-then-insert): the conflict
+    // itself, not a separate SELECT, detects a duplicate key — closes the TOCTOU window a
+    // check-then-act pair leaves open.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO license_store.licenses "
+        "(id, license_key_hash, organization, seat_count, issued_at, expires_at, edition, "
+        " features_json, status, activated_at) "
+        "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,$7,$8,'active',$9::bigint) "
+        "ON CONFLICT (license_key_hash) DO NOTHING RETURNING id",
+        std::vector<std::string>{id, key_hash, sanitize_pg_text(license.organization),
+                                 std::to_string(license.seat_count), std::to_string(issued_at),
+                                 std::to_string(license.expires_at), sanitize_pg_text(edition),
+                                 sanitize_pg_text(features), std::to_string(now)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "activate_license failed: " +
+                               PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected("license key already activated");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO licenses "
-                           "(id, license_key_hash, organization, seat_count, issued_at, "
-                           "expires_at, edition, features_json, status, activated_at) "
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, key_hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, license.organization.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 4, license.seat_count);
-    sqlite3_bind_int64(s, 5, license.issued_at > 0 ? license.issued_at : now);
-    sqlite3_bind_int64(s, 6, license.expires_at);
-    sqlite3_bind_text(s, 7, license.edition.empty() ? "community" : license.edition.c_str(),
-                      -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 8, license.features_json.empty() ? "[]" : license.features_json.c_str(),
-                      -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 9, now);
-
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("failed to activate license: ") + sqlite3_errmsg(db_));
-
-    spdlog::info("LicenseStore: activated license '{}' for org '{}' (edition={}, seats={})",
-                 id, license.organization, license.edition, license.seat_count);
+    spdlog::info("LicenseStore: activated license '{}' for org '{}' (edition={}, seats={})", id,
+                 license.organization, edition, license.seat_count);
     return id;
 }
 
-std::vector<License> LicenseStore::list_licenses() const {
-    std::vector<License> result;
-    if (!db_)
-        return result;
+std::expected<std::vector<License>, std::string> LicenseStore::list_licenses() {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
 
-    std::shared_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    const char* sql =
-        "SELECT id, organization, seat_count, issued_at, expires_at, "
-        "edition, features_json, status "
-        "FROM licenses ORDER BY activated_at DESC;";
+    std::string sql = std::string("SELECT ") + kLicensePublicCols +
+                      " FROM license_store.licenses ORDER BY activated_at DESC LIMIT $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{std::to_string(kListRowCap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "list_licenses failed: " +
+                               PQerrorMessage(lease.get()));
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
-        return result;
-
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        License lic;
-        lic.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        lic.organization = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        lic.seat_count = sqlite3_column_int64(s, 2);
-        lic.issued_at = sqlite3_column_int64(s, 3);
-        lic.expires_at = sqlite3_column_int64(s, 4);
-        lic.edition = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        lic.features_json = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        lic.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 7)));
-        result.push_back(std::move(lic));
-    }
-    sqlite3_finalize(s);
-    return result;
+    const int rows = PQntuples(res.get());
+    std::vector<License> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_license_public(res.get(), i));
+    return out;
 }
 
-std::optional<License> LicenseStore::get_active_license() const {
-    if (!db_)
-        return std::nullopt;
+std::expected<std::optional<License>, std::string> LicenseStore::get_active_license() {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
 
-    std::shared_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    const char* sql =
-        "SELECT id, organization, seat_count, issued_at, expires_at, "
-        "edition, features_json, status "
-        "FROM licenses WHERE status = 'active' "
-        "ORDER BY activated_at DESC LIMIT 1;";
+    std::string sql = std::string("SELECT ") + kLicensePublicCols +
+                      " FROM license_store.licenses WHERE status = 'active' "
+                      "ORDER BY activated_at DESC LIMIT 1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "get_active_license failed: " + PQerrorMessage(lease.get()));
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
-
-    std::optional<License> result;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        License lic;
-        lic.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        lic.organization = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        lic.seat_count = sqlite3_column_int64(s, 2);
-        lic.issued_at = sqlite3_column_int64(s, 3);
-        lic.expires_at = sqlite3_column_int64(s, 4);
-        lic.edition = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        lic.features_json = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        lic.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 7)));
-        result = std::move(lic);
-    }
-    sqlite3_finalize(s);
-    return result;
+    if (PQntuples(res.get()) == 0)
+        return std::optional<License>{std::nullopt};
+    return std::optional<License>{read_license_public(res.get(), 0)};
 }
 
-bool LicenseStore::remove_license(const std::string& id) {
-    if (!db_ || id.empty())
-        return false;
+std::expected<void, std::string> LicenseStore::remove_license(const std::string& id) {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
+    if (id.empty())
+        return std::unexpected("id cannot be empty");
 
-    std::unique_lock lock(mtx_);
-
-    // Remove associated alerts first
-    {
-        sqlite3_stmt* da = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "DELETE FROM license_alerts WHERE license_id = ?;",
-                               -1, &da, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(da, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(da);
-            sqlite3_finalize(da);
+    bool deleted = false;
+    std::string db_err;
+    // One transaction: delete the license's alerts, then the license itself — never a partial
+    // delete (the pre-migration version ran these as two independent best-effort statements).
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult da = pg::exec_params(
+            conn, "DELETE FROM license_store.license_alerts WHERE license_id = $1",
+            std::vector<std::string>{id});
+        if (da.status() != PGRES_COMMAND_OK) {
+            db_err = PQerrorMessage(conn);
+            return false;
         }
+        pg::PgResult dl = pg::exec_params(
+            conn, "DELETE FROM license_store.licenses WHERE id = $1 RETURNING id",
+            std::vector<std::string>{id});
+        if (dl.status() != PGRES_TUPLES_OK) {
+            db_err = PQerrorMessage(conn);
+            return false;
+        }
+        deleted = PQntuples(dl.get()) > 0;
+        return true;
+    });
+    if (!ok) {
+        // db_err stays empty when with_txn_for fails before the lambda ever runs (lease
+        // acquire timeout) or after it returns true (a failed COMMIT) — never leave the
+        // message with a dangling "failed: " tail in either case.
+        if (db_err.empty())
+            db_err = "transaction failed (lease timeout or begin/commit failure)";
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "remove_license failed: " + db_err);
     }
+    if (!deleted)
+        return std::unexpected("not_found: license '" + id + "'");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM licenses WHERE id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    bool removed = sqlite3_changes(db_) > 0;
-    if (removed)
-        spdlog::info("LicenseStore: removed license '{}'", id);
-    return removed;
+    spdlog::info("LicenseStore: removed license '{}'", id);
+    return {};
 }
 
-// -- Validation ---------------------------------------------------------------
+std::expected<void, std::string> LicenseStore::validate(std::int64_t current_agent_count) {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
 
-void LicenseStore::validate(int64_t current_agent_count) {
-    if (!db_)
-        return;
-
-    std::unique_lock lock(mtx_);
-
-    auto now = now_epoch();
-
-    // Fetch all active licenses
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT id, seat_count, expires_at, status "
-                           "FROM licenses WHERE status = 'active';",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return;
-
-    struct LicenseRow {
-        std::string id;
-        int64_t seat_count{0};
-        int64_t expires_at{0};
-        std::string status;
-    };
-    std::vector<LicenseRow> active;
-
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        LicenseRow row;
-        row.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        row.seat_count = sqlite3_column_int64(s, 1);
-        row.expires_at = sqlite3_column_int64(s, 2);
-        row.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        active.push_back(std::move(row));
-    }
-    sqlite3_finalize(s);
-
-    for (const auto& lic : active) {
-        std::string new_status = "active";
-
-        // Check expiry
-        if (lic.expires_at > 0 && now > lic.expires_at) {
-            new_status = "expired";
-            add_alert(lic.id, "expired",
-                      std::string("License '") + lic.id + "' has expired");
-        } else if (lic.expires_at > 0) {
-            int64_t days = (lic.expires_at - now) / 86400;
-            if (days <= 30) {
-                add_alert(lic.id, "expiry_warning",
-                          std::string("License '") + lic.id + "' expires in " +
-                              std::to_string(days) + " days");
-            }
+    std::string db_err;
+    // One transaction for the whole pass (ADR-0048 hardening over the pre-migration version,
+    // which processed each license independently and ignored write failures): every status
+    // transition and the alerts it produces commit atomically, or none do.
+    //
+    // FOR UPDATE (gov Gate 4 unhappy-path UP-1, HIGH): without a row lock, two overlapping
+    // validate() transactions (e.g. two server replicas sharing this Postgres) each read the
+    // same pre-transition status under their own snapshot, independently compute a new status,
+    // and the later COMMIT silently clobbers the earlier one's write with no error — the
+    // UPDATE below has no re-check against what was read. FOR UPDATE makes the second
+    // transaction's SELECT block until the first commits, so it re-reads the already-updated
+    // row instead of racing against it.
+    bool ok = pool_.with_txn_for(kValidateTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "SELECT id, seat_count, expires_at, status FROM license_store.licenses "
+            // gov Gate 8 architect (SHOULD): PK order — two overlapping validate() passes
+            // locking more than one row now acquire Postgres row locks in the same order,
+            // closing the same deadlock class as the backfill loops' ORDER BY above.
+            "WHERE status = 'active' ORDER BY id ASC FOR UPDATE",
+            std::vector<std::string>{});
+        if (res.status() != PGRES_TUPLES_OK) {
+            db_err = PQerrorMessage(conn);
+            return false;
         }
 
-        // Check seat usage
-        if (lic.seat_count > 0 && current_agent_count > lic.seat_count) {
-            new_status = "exceeded";
-            add_alert(lic.id, "exceeded",
-                      std::string("License '") + lic.id + "' seat limit exceeded (" +
-                          std::to_string(current_agent_count) + "/" +
-                          std::to_string(lic.seat_count) + ")");
-        } else if (lic.seat_count > 0) {
-            double usage = static_cast<double>(current_agent_count) /
-                           static_cast<double>(lic.seat_count);
-            if (usage >= 0.9) {
-                add_alert(lic.id, "seat_limit_warning",
-                          std::string("License '") + lic.id + "' at " +
-                              std::to_string(static_cast<int>(usage * 100)) + "% seat capacity (" +
-                              std::to_string(current_agent_count) + "/" +
-                              std::to_string(lic.seat_count) + ")");
-            }
-        }
+        const int rows = PQntuples(res.get());
+        const std::int64_t now = now_epoch();
+        for (int i = 0; i < rows; ++i) {
+            const std::string id = text_col(res.get(), i, 0);
+            const std::int64_t seats = to_i64(PQgetvalue(res.get(), i, 1));
+            const std::int64_t expires_at = to_i64(PQgetvalue(res.get(), i, 2));
+            const std::string status = text_col(res.get(), i, 3);
 
-        // Update status if changed
-        if (new_status != lic.status) {
-            sqlite3_stmt* upd = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "UPDATE licenses SET status = ? WHERE id = ?;",
-                                   -1, &upd, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(upd, 1, new_status.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(upd, 2, lic.id.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(upd);
-                sqlite3_finalize(upd);
-                spdlog::warn("LicenseStore: license '{}' status changed to '{}'",
-                             lic.id, new_status);
-            }
-        }
-    }
-}
+            std::string new_status = "active";
 
-std::string LicenseStore::get_status() const {
-    if (!db_)
-        return "no_database";
-
-    std::shared_lock lock(mtx_);
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT status FROM licenses "
-                           "ORDER BY activated_at DESC LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return "unknown";
-
-    std::string status = "unlicensed";
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        auto val = sqlite3_column_text(s, 0);
-        if (val)
-            status = reinterpret_cast<const char*>(val);
-    }
-    sqlite3_finalize(s);
-    return status;
-}
-
-// -- Alerts -------------------------------------------------------------------
-
-void LicenseStore::add_alert(const std::string& license_id, const std::string& type,
-                              const std::string& message) {
-    // Caller must hold the write lock (unique_lock on mtx_).
-    auto now = now_epoch();
-
-    // Deduplicate: do not create another alert of the same type for the same
-    // license within the last 24 hours.
-    {
-        sqlite3_stmt* chk = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT id FROM license_alerts "
-                               "WHERE license_id = ? AND alert_type = ? AND triggered_at > ?;",
-                               -1, &chk, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(chk, 1, license_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(chk, 2, type.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(chk, 3, now - 86400);
-            bool exists = (sqlite3_step(chk) == SQLITE_ROW);
-            sqlite3_finalize(chk);
-            if (exists)
-                return; // already alerted recently
-        }
-    }
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO license_alerts "
-                           "(license_id, alert_type, message, triggered_at) "
-                           "VALUES (?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(s, 1, license_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 4, now);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-
-    spdlog::info("LicenseStore: alert [{}] for license '{}': {}", type, license_id, message);
-}
-
-std::vector<LicenseAlert> LicenseStore::list_alerts(bool unacknowledged_only) const {
-    std::vector<LicenseAlert> result;
-    if (!db_)
-        return result;
-
-    std::shared_lock lock(mtx_);
-
-    std::string sql =
-        "SELECT id, license_id, alert_type, message, triggered_at, acknowledged "
-        "FROM license_alerts";
-    if (unacknowledged_only)
-        sql += " WHERE acknowledged = 0";
-    sql += " ORDER BY triggered_at DESC;";
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
-        return result;
-
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        LicenseAlert alert;
-        alert.id = sqlite3_column_int64(s, 0);
-        alert.license_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        alert.alert_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        alert.message = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        alert.triggered_at = sqlite3_column_int64(s, 4);
-        alert.acknowledged = sqlite3_column_int(s, 5) != 0;
-        result.push_back(std::move(alert));
-    }
-    sqlite3_finalize(s);
-    return result;
-}
-
-bool LicenseStore::acknowledge_alert(int64_t alert_id) {
-    if (!db_)
-        return false;
-
-    std::unique_lock lock(mtx_);
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE license_alerts SET acknowledged = 1 WHERE id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_int64(s, 1, alert_id);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    return sqlite3_changes(db_) > 0;
-}
-
-// -- Feature checks -----------------------------------------------------------
-
-bool LicenseStore::has_feature(const std::string& feature) const {
-    if (!db_ || feature.empty())
-        return false;
-
-    std::shared_lock lock(mtx_);
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT features_json FROM licenses "
-                           "WHERE status = 'active' "
-                           "ORDER BY activated_at DESC LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return false;
-
-    bool found = false;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        auto json_str = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        // Simple substring search in the JSON array for the feature string.
-        // Parse features_json as a JSON array and check for exact match
-        auto parsed = nlohmann::json::parse(json_str, nullptr, false);
-        if (parsed.is_array()) {
-            for (const auto& elem : parsed) {
-                if (elem.is_string() && elem.get<std::string>() == feature) {
-                    found = true;
-                    break;
+            if (expires_at > 0 && now > expires_at) {
+                new_status = "expired";
+                if (!add_alert(conn, id, "expired", "License '" + id + "' has expired")) {
+                    db_err = "failed to record expiry alert for '" + id + "'";
+                    return false;
+                }
+            } else if (expires_at > 0) {
+                const std::int64_t days = (expires_at - now) / 86400;
+                if (days <= 30) {
+                    if (!add_alert(conn, id, "expiry_warning",
+                                   "License '" + id + "' expires in " + std::to_string(days) +
+                                       " days")) {
+                        db_err = "failed to record expiry warning for '" + id + "'";
+                        return false;
+                    }
                 }
             }
+
+            if (seats > 0 && current_agent_count > seats) {
+                new_status = "exceeded";
+                if (!add_alert(conn, id, "exceeded",
+                               "License '" + id + "' seat limit exceeded (" +
+                                   std::to_string(current_agent_count) + "/" +
+                                   std::to_string(seats) + ")")) {
+                    db_err = "failed to record seat-exceeded alert for '" + id + "'";
+                    return false;
+                }
+            } else if (seats > 0) {
+                const double usage =
+                    static_cast<double>(current_agent_count) / static_cast<double>(seats);
+                if (usage >= 0.9) {
+                    if (!add_alert(conn, id, "seat_limit_warning",
+                                   "License '" + id + "' at " +
+                                       std::to_string(static_cast<int>(usage * 100)) +
+                                       "% seat capacity (" +
+                                       std::to_string(current_agent_count) + "/" +
+                                       std::to_string(seats) + ")")) {
+                        db_err = "failed to record seat-warning alert for '" + id + "'";
+                        return false;
+                    }
+                }
+            }
+
+            if (new_status != status) {
+                pg::PgResult upd = pg::exec_params(
+                    conn, "UPDATE license_store.licenses SET status = $1 WHERE id = $2",
+                    std::vector<std::string>{new_status, id});
+                if (upd.status() != PGRES_COMMAND_OK) {
+                    db_err = PQerrorMessage(conn);
+                    return false;
+                }
+                spdlog::warn("LicenseStore: license '{}' status changed to '{}'", id, new_status);
+            }
         }
+        return true;
+    });
+    if (!ok) {
+        // Same empty-db_err gap as remove_license: with_txn_for can fail before the lambda runs
+        // (lease timeout) or after it returns true (a failed COMMIT).
+        if (db_err.empty())
+            db_err = "transaction failed (lease timeout or begin/commit failure)";
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "validate failed: " + db_err);
     }
-    sqlite3_finalize(s);
-    return found;
+    return {};
 }
 
-int64_t LicenseStore::seat_count() const {
-    if (!db_)
-        return 0;
+std::expected<std::string, std::string> LicenseStore::get_status() {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
 
-    std::shared_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT seat_count FROM licenses "
-                           "WHERE status = 'active' "
-                           "ORDER BY activated_at DESC LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return 0;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT status FROM license_store.licenses ORDER BY activated_at DESC LIMIT 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "get_status failed: " + PQerrorMessage(lease.get()));
 
-    int64_t count = 0;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        count = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return count;
+    if (PQntuples(res.get()) == 0)
+        return std::string("unlicensed");
+    return text_col(res.get(), 0, 0);
 }
 
-int64_t LicenseStore::days_remaining() const {
-    if (!db_)
-        return 0;
+std::expected<std::vector<LicenseAlert>, std::string>
+LicenseStore::list_alerts(bool unacknowledged_only) {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
 
-    std::shared_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT expires_at FROM licenses "
-                           "WHERE status = 'active' "
-                           "ORDER BY activated_at DESC LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return 0;
+    std::string sql = "SELECT id, license_id, alert_type, message, triggered_at, acknowledged "
+                      "FROM license_store.license_alerts";
+    if (unacknowledged_only)
+        sql += " WHERE acknowledged = false";
+    sql += " ORDER BY triggered_at DESC LIMIT $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{std::to_string(kListRowCap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "list_alerts failed: " + PQerrorMessage(lease.get()));
 
-    int64_t days = 0;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        int64_t expires = sqlite3_column_int64(s, 0);
-        if (expires == 0) {
-            // Perpetual license — return 0 to signal "no expiry"
-            days = 0;
-        } else {
-            int64_t remaining = expires - now_epoch();
-            days = remaining > 0 ? remaining / 86400 : 0;
-        }
+    const int rows = PQntuples(res.get());
+    std::vector<LicenseAlert> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        LicenseAlert a;
+        int c = 0;
+        a.id = to_i64(PQgetvalue(res.get(), i, c++));
+        a.license_id = text_col(res.get(), i, c++);
+        a.alert_type = text_col(res.get(), i, c++);
+        a.message = text_col(res.get(), i, c++);
+        a.triggered_at = to_i64(PQgetvalue(res.get(), i, c++));
+        a.acknowledged = to_bool(PQgetvalue(res.get(), i, c++));
+        out.push_back(std::move(a));
     }
-    sqlite3_finalize(s);
-    return days;
+    return out;
+}
+
+std::expected<void, std::string> LicenseStore::acknowledge_alert(std::int64_t alert_id) {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE license_store.license_alerts SET acknowledged = true WHERE id = $1 RETURNING id",
+        std::vector<std::string>{std::to_string(alert_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "acknowledge_alert failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected("not_found: alert " + std::to_string(alert_id));
+    return {};
+}
+
+std::expected<bool, std::string> LicenseStore::has_feature(const std::string& feature) {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
+    if (feature.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT features_json FROM license_store.licenses WHERE status = 'active' "
+        "ORDER BY activated_at DESC LIMIT 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "has_feature failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return false;
+
+    auto parsed = nlohmann::json::parse(PQgetvalue(res.get(), 0, 0), nullptr, false);
+    if (!parsed.is_array())
+        return false;
+    for (const auto& elem : parsed) {
+        if (elem.is_string() && elem.get<std::string>() == feature)
+            return true;
+    }
+    return false;
+}
+
+std::expected<std::int64_t, std::string> LicenseStore::seat_count() {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT seat_count FROM license_store.licenses WHERE status = 'active' "
+        "ORDER BY activated_at DESC LIMIT 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "seat_count failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::int64_t{0};
+    return to_i64(PQgetvalue(res.get(), 0, 0));
+}
+
+std::expected<std::int64_t, std::string> LicenseStore::days_remaining() {
+    if (!open_)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) + "database not open");
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT expires_at FROM license_store.licenses WHERE status = 'active' "
+        "ORDER BY activated_at DESC LIMIT 1",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kLicenseDbErrorPrefix) +
+                               "days_remaining failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::int64_t{0};
+
+    const std::int64_t expires = to_i64(PQgetvalue(res.get(), 0, 0));
+    if (expires == 0)
+        return std::int64_t{0}; // perpetual
+    const std::int64_t remaining = expires - now_epoch();
+    return remaining > 0 ? remaining / 86400 : std::int64_t{0};
 }
 
 } // namespace yuzu::server

@@ -106,3 +106,18 @@ stories, and a forever "is this store Pg or SQLite?" question for every contribu
 trivial config stores last); the ordered queue is `docs/postgres-migration-ladder.md`. What
 changed is that **completeness is no longer optional**. The author-facing store contract is
 ADR-0012; the how-to is `docs/postgres-store-playbook.md`.
+
+## Update (2026-07-16) — auth store (`AuthDB`) + SCIM migrated; last major SQLite server store gone
+
+`AuthDB` (schema `auth`) and `ScimStore` (schema `scim_store`) shipped, out of Wave-3 order
+(pulled forward as the last major server SQLite store — every operator credential, MFA
+enrollment, and SCIM token now lives on the same substrate as everything else). Fresh-start, no
+backfill (matches the `ApiTokenStore` 4.1 precedent, ADR-0009's "backfill is per-store, not
+universal" allowance): the legacy SQLite `auth.db` is never read on upgrade — a first boot
+against an empty `auth.users` re-seeds the config-file admin, existing accounts/roles/MFA
+enrollments are lost, and SCIM self-heals on the IdP's next sync. `mfa_totp_secret` is
+`SecretCodec`'s (ADR-0010) **first production consumer**. The SQLite-era `sessions` table (a
+permanent v1 dead-write — sessions were always in-memory-authoritative) and the unused `auth_kv`
+scaffolding were dropped, not migrated. Full record: `docs/auth-architecture.md` "AuthDB —
+persistent authentication store" and `.claude/agents/authdb.md`; ladder entry:
+`docs/postgres-migration-ladder.md` "Done".

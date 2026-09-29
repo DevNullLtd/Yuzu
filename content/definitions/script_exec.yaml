@@ -12,8 +12,9 @@ metadata:
   version: 1.1.0
   description: >
     Execute a command with arguments directly on the endpoint. No shell
-    interpretation is applied — the program is invoked via CreateProcess
-    (Windows) or execvp (POSIX). Stdout and stderr are streamed back
+    interpretation is applied — the resolved program path and its
+    arguments are run as a direct argv exec through the agent's shared
+    bounded subprocess runner. Stdout and stderr are streamed back
     line-by-line. Enforces a configurable timeout (default 300 seconds,
     max 3600). Returns the process exit code and final status.
   tags: [scripting, execution, admin, remediation]
@@ -35,16 +36,24 @@ spec:
         type: string
         displayName: Command
         description: >
-          Full path or name of the program to execute. Resolved via PATH
-          on POSIX systems.
+          Full path or name of the program to execute. A path-like value
+          (contains '/', or on Windows '\' or a drive prefix) must already
+          be absolute, or is resolved against a fixed safe directory; a
+          bare name is searched across the app directory, the Windows
+          system directory, then PATH (Windows), or PATH alone (POSIX).
+          Example: "/usr/bin/id" or "notepad.exe".
         validation:
           maxLength: 4096
       args:
         type: string
         displayName: Arguments
         description: >
-          Space-separated arguments passed to the command. Supports
-          single and double quoting for arguments containing spaces.
+          Space-separated arguments passed to the command. On Linux/macOS,
+          single or double quotes delimit an argument containing spaces
+          (quote characters stripped, no escaping). On Windows, only
+          double quotes are meaningful, with CRT/CommandLineToArgvW
+          backslash-escaping rules — a single quote has no special
+          meaning there. Example: "-la /tmp" or "\"two words\" --flag".
         validation:
           maxLength: 8192
       timeout:
@@ -52,7 +61,7 @@ spec:
         displayName: Timeout (seconds)
         description: >
           Maximum execution time in seconds. Process is terminated if
-          this threshold is exceeded. Range: 1-3600.
+          this threshold is exceeded. Range: 1-3600. Example: 600.
         default: 300
         validation:
           minimum: 1
@@ -62,12 +71,28 @@ spec:
     columns:
       - name: stream
         type: string
+        description: >-
+          Which output line this row represents: stdout for a captured output line, exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error.
+        example: "stdout"
+        platforms: [windows, linux, darwin]
       - name: content
         type: string
+        description: >-
+          The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text.
+        example: "yuzu-capture"
+        platforms: [windows, linux, darwin]
       - name: exit_code
         type: int32
+        description: >-
+          The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error or the command could not be resolved. Values: any int32; -1 = spawn/resolve failure.
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: >-
+          The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit, spawn error, or an early parameter/resolution failure), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout.
+        example: "ok"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Execute command '${command}' with args '${args}'"
 
@@ -99,7 +124,10 @@ metadata:
     Execute a PowerShell script on a Windows endpoint. The script is
     Base64-encoded as UTF-16LE and passed via -EncodedCommand to prevent
     shell metacharacter injection. Runs with -NoProfile -NonInteractive.
-    Output is streamed line-by-line with timeout enforcement.
+    Output is streamed line-by-line with timeout enforcement. Because the
+    process runs headless with no console, PowerShell's own progress-
+    stream serialization can appear as a leading "#< CLIXML" stdout line
+    ahead of real output — this is expected and does not indicate failure.
   tags: [scripting, powershell, windows, admin, remediation]
 
 spec:
@@ -120,14 +148,15 @@ spec:
         displayName: PowerShell Script
         description: >
           The PowerShell script body to execute. Automatically encoded
-          as UTF-16LE Base64 for safe transport.
+          as UTF-16LE Base64 for safe transport. Example:
+          "Get-Service | Where-Object Status -eq 'Running'".
         validation:
           maxLength: 65536
       timeout:
         type: int32
         displayName: Timeout (seconds)
         description: >
-          Maximum execution time in seconds. Range: 1-3600.
+          Maximum execution time in seconds. Range: 1-3600. Example: 600.
         default: 300
         validation:
           minimum: 1
@@ -137,12 +166,28 @@ spec:
     columns:
       - name: stream
         type: string
+        description: >-
+          Which output line this row represents: stdout for a captured output line (including PowerShell's own progress-stream CLIXML text on a headless run), exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error.
+        example: "stdout"
+        platforms: [windows]
       - name: content
         type: string
+        description: >-
+          The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text.
+        example: "yuzu-capture"
+        platforms: [windows]
       - name: exit_code
         type: int32
+        description: >-
+          The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error or the Windows system directory could not be resolved. Values: any int32; -1 = spawn/resolve failure.
+        example: "0"
+        platforms: [windows]
       - name: status
         type: string
+        description: >-
+          The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit, spawn error, or an early resolution failure), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout.
+        example: "ok"
+        platforms: [windows]
 
   readablePayload: "Run PowerShell script (${timeout}s timeout)"
 
@@ -172,9 +217,10 @@ metadata:
   version: 1.1.0
   description: >
     Execute a bash script on a Linux or macOS endpoint. The script body
-    is passed as a single argument to /bin/bash -c via execvp (no shell
-    expansion of the outer wrapper). Output is streamed line-by-line
-    with timeout enforcement.
+    is passed as a single argument to /bin/bash -c, run through the
+    agent's shared bounded subprocess runner (no shell expansion of the
+    outer wrapper — only bash itself interprets the script). Output is
+    streamed line-by-line with timeout enforcement.
   tags: [scripting, bash, linux, macos, admin, remediation]
 
 spec:
@@ -195,13 +241,14 @@ spec:
         displayName: Bash Script
         description: >
           The bash script body to execute. Passed to /bin/bash -c.
+          Example: "echo yuzu-capture".
         validation:
           maxLength: 65536
       timeout:
         type: int32
         displayName: Timeout (seconds)
         description: >
-          Maximum execution time in seconds. Range: 1-3600.
+          Maximum execution time in seconds. Range: 1-3600. Example: 600.
         default: 300
         validation:
           minimum: 1
@@ -211,12 +258,28 @@ spec:
     columns:
       - name: stream
         type: string
+        description: >-
+          Which output line this row represents: stdout for a captured output line, exit_code for the final numeric exit code, status for the final ok/error/timeout verdict, or error for an early, pre-execution failure. Values: stdout, exit_code, status, error.
+        example: "stdout"
+        platforms: [linux, darwin]
       - name: content
         type: string
+        description: >-
+          The value paired with stream: the captured line text for stdout, the numeric exit code as a string for exit_code, the verdict string for status, or a human-readable failure message for error. Stdout and stderr are merged into this same stream. Values: free text.
+        example: "yuzu-capture"
+        platforms: [linux, darwin]
       - name: exit_code
         type: int32
+        description: >-
+          The process exit code, present on the row where stream is exit_code; -1 when the runner reports a spawn error. Values: any int32; -1 = spawn/resolve failure.
+        example: "0"
+        platforms: [linux, darwin]
       - name: status
         type: string
+        description: >-
+          The terminal verdict, present on the row where stream is status: ok (exit code 0), error (nonzero exit or spawn error), or timeout (the runner's deadline or a cancellation fired). Values: ok, error, timeout.
+        example: "ok"
+        platforms: [linux, darwin]
 
   readablePayload: "Run bash script (${timeout}s timeout)"
 

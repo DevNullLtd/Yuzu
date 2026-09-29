@@ -28,11 +28,14 @@
 param(
   [Parameter(Mandatory)][ValidateRange(0,3)][int]$Index,
   [string]$RunnerRoot = "C:\actions-runner\r$Index",
+  [string]$RunnerWork = "D:\ci\work-$Index",
   # Shared CI tool cache (P0): all runners point RUNNER_TOOL_CACHE at ONE
   # machine-level dir so ${{ runner.tool_cache }} (hence VCPKG_DEFAULT_BINARY_CACHE
   # in ci.yml) is shared, not fragmented per-runner. Mirrors CCACHE_DIR=D:\ci\ccache.
   [string]$ToolCache  = 'D:\ci\tool_cache',
-  [int]   $BuildJobs  = 16          # threads per CCD; caps ninja -j (see below)
+  # Persistent CI telemetry is deliberately per runner (no cross-agent SQLite
+  # writer contention) and outside every checkout/branch-clean boundary.
+  [string]$TelemetryRoot = 'D:\ci\test-runs'
 )
 $ErrorActionPreference = 'Continue'
 
@@ -60,6 +63,17 @@ $userPath = [Environment]::GetEnvironmentVariable('Path','User')
 $env:Path = 'C:\msys64\usr\bin;' + [Environment]::GetEnvironmentVariable('Path','Machine') + $(if($userPath){ ";$userPath" } else { '' })
 Write-Host "[r$Index] env refreshed (MSYS2 /usr/bin + machine registry)"
 
+# Route native MSVC/CMake/Python TEMP+TMP and MSYS2 TMPDIR into this runner's
+# own GitHub work temp directory. Its parent work root is the narrow Defender
+# exclusion; using the profile-wide or system-wide temp directory would both
+# restore scan overhead and mix temporary files from all four CCD runners.
+$runnerTemp = Join-Path $RunnerWork '_temp'
+New-Item -ItemType Directory -Force $runnerTemp | Out-Null
+[Environment]::SetEnvironmentVariable('TEMP', $runnerTemp, 'Process')
+[Environment]::SetEnvironmentVariable('TMP', $runnerTemp, 'Process')
+[Environment]::SetEnvironmentVariable('TMPDIR', ($runnerTemp -replace '\\','/'), 'Process')
+Write-Host "[r$Index] TEMP/TMP/TMPDIR = $runnerTemp (per-runner, Defender-excluded)"
+
 # Shared vcpkg binary cache (P0). The runner reads RUNNER_TOOL_CACHE at Listener
 # startup; this is belt-and-suspenders alongside the runner's .env. Pointing all
 # four runners here means ONE warm vcpkg binary cache, not four per-runner copies
@@ -69,10 +83,23 @@ Write-Host "[r$Index] env refreshed (MSYS2 /usr/bin + machine registry)"
 New-Item -ItemType Directory -Force $ToolCache | Out-Null
 Write-Host "[r$Index] RUNNER_TOOL_CACHE = $ToolCache (shared)"
 
-# Cap build parallelism to this CCD's thread count so ninja doesn't oversubscribe
-# the pinned threads (ninja sizes -j from the 64-CPU system count, ignoring the
-# affinity mask). ci.yml's Windows Build step honors -j $YUZU_BUILD_JOBS when set.
-[Environment]::SetEnvironmentVariable('YUZU_BUILD_JOBS', "$BuildJobs", 'Process')
+# One durable test-runs.db per runner agent. Provision-Windows-Runner.ps1
+# initializes all four schemas; ci-telemetry.py idempotently initializes as a
+# recovery net and appends one job + suite record on every ci.yml leg.
+$runnerName = "yuzu-weetam-windows-$Index"
+$telemetryDb = Join-Path (Join-Path $TelemetryRoot $runnerName) 'test-runs.db'
+New-Item -ItemType Directory -Force (Split-Path $telemetryDb) | Out-Null
+[Environment]::SetEnvironmentVariable('YUZU_TEST_DB', $telemetryDb, 'Process')
+Write-Host "[r$Index] YUZU_TEST_DB = $telemetryDb (persistent, per-runner)"
+
+# Provisioning owns the build-width contract. Consume the refreshed machine
+# value rather than carrying a second wrapper default that can silently drift.
+# This wrapper is specific to the 9970X's fixed 16-thread CCD envelope.
+if($env:YUZU_BUILD_JOBS -ne '16'){
+  Write-Error "[r$Index] YUZU_BUILD_JOBS must be provisioned as 16 (got '$($env:YUZU_BUILD_JOBS ?? '<unset>')')"
+  exit 1
+}
+Write-Host "[r$Index] YUZU_BUILD_JOBS = $env:YUZU_BUILD_JOBS (provisioned machine contract)"
 
 # Registration-time self-test: assert the toolchain manifest (if present) before
 # taking jobs, so a mis-provisioned box is flagged loudly at startup instead of

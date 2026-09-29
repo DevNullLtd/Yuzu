@@ -1,0 +1,633 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/agents",
+    "capability_id": "get.api-agents",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/agents/{param}/properties",
+    "capability_id": "get.api-agents-param-properties",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/agents/{param}/properties/{param}",
+    "capability_id": "delete.api-agents-param-properties-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/agents/{param}/properties/{param}",
+    "capability_id": "put.api-agents-param-properties-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/analytics/recent",
+    "capability_id": "get.api-analytics-recent",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/analytics/status",
+    "capability_id": "get.api-analytics-status",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/approvals",
+    "capability_id": "get.api-approvals",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/approvals"
+    },
+    "mcp_twin": "list_pending_approvals",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/approvals/pending/count",
+    "capability_id": "get.api-approvals-pending-count",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/approvals/pending/count"
+    },
+    "mcp_twin": "get_pending_approval_count",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/approvals/{param}/approve",
+    "capability_id": "post.api-approvals-param-approve",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/approvals/{param}/reject",
+    "capability_id": "post.api-approvals-param-reject",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/audit",
+    "capability_id": "get.api-audit",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/chargen/start",
+    "capability_id": "post.api-chargen-start",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/chargen/status",
+    "capability_id": "get.api-chargen-status",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/chargen/stop",
+    "capability_id": "post.api-chargen-stop",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/command",
+    "capability_id": "post.api-command",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/config",
+    "capability_id": "get.api-config",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/config/{param}",
+    "capability_id": "put.api-config-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/executions",
+    "capability_id": "get.api-executions",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/executions/{param}",
+    "capability_id": "get.api-executions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/executions/{param}/agents",
+    "capability_id": "get.api-executions-param-agents",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/executions/{param}/cancel",
+    "capability_id": "post.api-executions-param-cancel",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/executions/{param}/children",
+    "capability_id": "get.api-executions-param-children",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}/children"
+    },
+    "mcp_twin": "get_execution_children",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/executions/{param}/rerun",
+    "capability_id": "post.api-executions-param-rerun",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/executions/{param}/summary",
+    "capability_id": "get.api-executions-param-summary",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-executions-param-detail"
+  },
+  {
+    "method": "POST",
+    "path": "/api/export/json-to-csv",
+    "capability_id": "post.api-export-json-to-csv",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/health",
+    "capability_id": "get.api-health",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/help",
+    "capability_id": "get.api-help",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/help/autocomplete",
+    "capability_id": "get.api-help-autocomplete",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/help/html",
+    "capability_id": "get.api-help-html",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/help/palette",
+    "capability_id": "get.api-help-palette",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/instruction-sets",
+    "capability_id": "get.api-instruction-sets",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instruction-sets",
+    "capability_id": "post.api-instruction-sets",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/instruction-sets/{param}",
+    "capability_id": "delete.api-instruction-sets-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/inventory/query",
+    "capability_id": "post.api-inventory-query",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/inventory/tables",
+    "capability_id": "get.api-inventory-tables",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/inventory/{param}/{param}",
+    "capability_id": "get.api-inventory-param-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/me",
+    "capability_id": "get.api-me",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/notifications",
+    "capability_id": "get.api-notifications",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/notifications/{param}/dismiss",
+    "capability_id": "post.api-notifications-param-dismiss",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/notifications/{param}/read",
+    "capability_id": "post.api-notifications-param-read",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/nvd/match",
+    "capability_id": "post.api-nvd-match",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/nvd/status",
+    "capability_id": "get.api-nvd-status",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/nvd/sync",
+    "capability_id": "post.api-nvd-sync",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/procfetch/fetch",
+    "capability_id": "post.api-procfetch-fetch",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/procfetch/status",
+    "capability_id": "get.api-procfetch-status",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/property-schemas",
+    "capability_id": "get.api-property-schemas",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/property-schemas",
+    "capability_id": "post.api-property-schemas",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/responses/{param}",
+    "capability_id": "get.api-responses-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}"
+    },
+    "mcp_twin": "query_responses",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/responses/{param}/aggregate",
+    "capability_id": "get.api-responses-param-aggregate",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}/aggregate"
+    },
+    "mcp_twin": "aggregate_responses",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/responses/{param}/export",
+    "capability_id": "get.api-responses-param-export",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}/export"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/schedules",
+    "capability_id": "get.api-schedules",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/schedules",
+    "capability_id": "post.api-schedules",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/schedules/{param}",
+    "capability_id": "delete.api-schedules-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/schedules/{param}/enable",
+    "capability_id": "post.api-schedules-param-enable",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/scope/validate",
+    "capability_id": "post.api-scope-validate",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/scope/validate"
+    },
+    "mcp_twin": "validate_scope",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tags",
+    "capability_id": "get.api-tags",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tags/delete",
+    "capability_id": "post.api-tags-delete",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tags/query",
+    "capability_id": "post.api-tags-query",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tags/set",
+    "capability_id": "post.api-tags-set",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/webhooks",
+    "capability_id": "get.api-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/webhooks",
+    "capability_id": "post.api-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/webhooks/{param}",
+    "capability_id": "delete.api-webhooks-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/webhooks/{param}/deliveries",
+    "capability_id": "get.api-webhooks-param-deliveries",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/approvals",
+    "capability_id": "get.fragments-approvals",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/health/summary",
+    "capability_id": "get.fragments-health-summary",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/instructions",
+    "capability_id": "get.fragments-instructions",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/instructions/editor",
+    "capability_id": "get.fragments-instructions-editor",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/instructions/yaml-preview",
+    "capability_id": "post.fragments-instructions-yaml-preview",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/result-sets/create",
+    "capability_id": "post.fragments-result-sets-create",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets"
+    },
+    "mcp_twin": "create_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/result-sets/sidebar",
+    "capability_id": "get.fragments-result-sets-sidebar",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets"
+    },
+    "mcp_twin": "list_result_sets",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/result-sets/{param}/delete",
+    "capability_id": "post.fragments-result-sets-param-delete",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/result-sets/{param}"
+    },
+    "mcp_twin": "delete_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/result-sets/{param}/detail",
+    "capability_id": "get.fragments-result-sets-param-detail",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/result-sets/{param}"
+    },
+    "mcp_twin": "get_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/result-sets/{param}/pin",
+    "capability_id": "post.fragments-result-sets-param-pin",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets/{param}/pin"
+    },
+    "mcp_twin": "pin_result_set",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/result-sets/{param}/unpin",
+    "capability_id": "post.fragments-result-sets-param-unpin",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/result-sets/{param}/unpin"
+    },
+    "mcp_twin": "unpin_result_set",
+    "status": "twinned"
+  }
+]

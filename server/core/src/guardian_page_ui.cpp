@@ -23,6 +23,7 @@ extern const char* const kGuardianDetailPageHtml =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{TITLE}}</title>
   <link rel="stylesheet" href="/static/yuzu.css">
+  <meta name="htmx-config" content='{"allowEval":false}'>
   <script src="/static/htmx.js"></script>
   <style>
     .gp-wrap { max-width: 1100px; margin: 1.5rem auto; padding: 0 1.5rem; }
@@ -43,6 +44,17 @@ extern const char* const kGuardianDetailPageHtml =
                color: var(--muted); font-weight: 700; margin: 1.3rem 0 0.5rem; }
     .gp-note { font-size: 0.74rem; color: var(--muted); margin-top: 0.5rem; }
     .gp-note b { color: #a5d6ff; }
+
+    /* #2691 finding 10: an honest "store degraded, retrying" banner on a
+       running /auto Pre-flight page — distinct from a plain empty state so
+       it doesn't read as "these devices are done". Amber, not alarm-red
+       (#2691 Gate 6 enterprise-readiness): a transient retrying blip, not a
+       confirmed failure — matches the dashboard sibling banner. */
+    .result-degrade-banner {
+      color: var(--yellow, #ffcc00); background: rgba(255, 204, 0, 0.08);
+      border: 1px solid rgba(255, 204, 0, 0.4); border-radius: 0.5rem;
+      padding: 0.6rem 0.9rem; font-size: 0.8rem; margin-bottom: 0.75rem;
+    }
 
     /* lifecycle / severity / mode pills */
     .gp-pill { font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
@@ -237,7 +249,8 @@ extern const char* const kGuardianDetailPageHtml =
     <a href="/guardian" class="nav-link active">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
@@ -345,11 +358,32 @@ extern const char* const kGuardianDetailPageHtml =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
+    /* htmx.config.allowEval=false (meta tag above) means an `[expr]` event filter
+       or hx-on mistake fires htmx:evalDisallowedError instead of just silently
+       always-matching; a raw CSP throw inside htmx's own eval attempt is caught
+       internally and re-fired as htmx:syntax:error. Neither reaches window.onerror
+       on its own — without these listeners the failure is invisible in the console,
+       which is exactly how the round-2 search-box bug went unnoticed until a human
+       hit tab+backspace enough times to see the input clear (round-3 item 5). */
+    document.body.addEventListener('htmx:evalDisallowedError', function (e) {
+      console.error('htmx eval disallowed (CSP) at', e.target, e.detail);
+      showToast('A page control tried to run disallowed script — please report this.', 'error');
+    });
+    document.body.addEventListener('htmx:syntax:error', function (e) {
+      console.error('htmx syntax/eval error at', e.target, e.detail);
+    });
+
     /* ── Device live-snapshot helpers (feat/device-live-snapshot). Plain functions
        called from inline onclick/oninput (CSP-safe — 'unsafe-inline' allows attribute
        handlers; only hx-on/new Function is blocked). ── */
     function lsToggleAll(btn) {
-      var cards = document.querySelectorAll('.ls-card');
+      // Scoped to the button's OWN group (device_ui.cpp wraps "Live cards" and
+      // "Physical" each in their own [data-lsgroup] container) so this never
+      // reaches into the OTHER group's cards -- a document-wide query here would
+      // snap open the lazy Physical cards as a side effect of the Live-cards
+      // button (or vice-versa), firing every one of their dispatches at once.
+      var group = btn.closest('[data-lsgroup]');
+      var cards = (group || document).querySelectorAll('.ls-card');
       var anyClosed = Array.prototype.some.call(cards, function (c) { return !c.open; });
       cards.forEach(function (c) { c.open = anyClosed; });
       btn.textContent = anyClosed ? 'Collapse all' : 'Expand all';
@@ -412,6 +446,360 @@ extern const char* const kGuardianDetailPageHtml =
       }
     }).catch(function () {});
   </script>
+)HTM"
+    // Chunk 3: the Hardware CI record's generic action runner. Split into its own
+    // literal because chunk 2 above sits at ~14.5 KiB and MSVC caps a single
+    // string literal at 16 KiB (C2026) -- see the sibling warning in
+    // instruction_ui.cpp. Keep prose OUT of this literal; explain here instead.
+    //
+    // hwRunAction(btn): reads the enclosing <form>'s data-plugin/data-action/
+    // data-agent/data-host/data-class + its p_*/kv inputs, confirms (message
+    // keyed by data-class), then POSTs straight to the EXISTING /api/command
+    // route (no new dispatch endpoint -- that route's classify/authorize/
+    // destructive-gate/audit/executions-tracking all apply unmodified). On
+    // success it swaps the form's .hw-result sibling for the poll fragment
+    // /fragments/hardware/ci/result and calls htmx.process() so the injected
+    // hx-get actually fires (htmx only wires attributes it has already scanned).
+    R"HTM(
+  <script>
+    function hwRunAction(btn) {
+      var form = btn.closest('form');
+      if (!form) return;
+      var plugin = form.getAttribute('data-plugin');
+      var action = form.getAttribute('data-action');
+      var agent = form.getAttribute('data-agent');
+      var host = form.getAttribute('data-host') || agent;
+      var cls = form.getAttribute('data-class') || 'Read-only';
+      var msg = 'Run ' + plugin + '.' + action + ' on ' + host + '?';
+      if (cls === 'Destructive') {
+        msg = 'DESTRUCTIVE — may be irreversible on ' + host + '. Run ' + plugin + '.' + action + '?';
+      } else if (cls === 'Mutating') {
+        msg = 'This changes state on ' + host + '. Run ' + plugin + '.' + action + '?';
+      }
+      if (!window.confirm(msg)) return;
+
+      var params = {};
+      form.querySelectorAll('input[name^="p_"],select[name^="p_"]').forEach(function (inp) {
+        var key = inp.name.replace(/^p_/, '');
+        if (inp.value !== '') params[key] = inp.value;
+      });
+      var kv = form.querySelector('textarea[name="kv"]');
+      if (kv && kv.value) {
+        kv.value.split('\n').forEach(function (line) {
+          var i = line.indexOf('=');
+          if (i > 0) {
+            var k = line.slice(0, i).trim();
+            var v = line.slice(i + 1).trim();
+            if (k && !k.startsWith('#')) params[k] = v;
+          }
+        });
+      }
+
+      btn.disabled = true;
+      fetch('/api/command', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plugin: plugin, action: action, agent_ids: [agent], params: params })
+      }).then(function (r) {
+        return r.json().then(function (d) { return { status: r.status, data: d }; });
+      }).then(function (resp) {
+        btn.disabled = false;
+        var resultDiv = form.querySelector('.hw-result');
+        if (resp.status >= 400) {
+          var msg2 = (resp.data.error && resp.data.error.message) || ('Dispatch failed (' + resp.status + ')');
+          if (typeof showToast === 'function') showToast(msg2, 'error');
+          return;
+        }
+        var reached = resp.data.agents_reached || 0;
+        if (reached === 0) {
+          // Mirror device_routes.cpp's sent==0 handling for /fragments/device/live/run
+          // (governance Gate 6 enterprise-readiness finding): a 0-agent dispatch used
+          // to show a green "Sent to 0 agent(s)" toast and still start the up-to-28s
+          // result poll, which can only ever time out — an honest warning and no poll
+          // instead.
+          if (typeof showToast === 'function')
+            showToast('Device offline — action needs a connected agent', 'warning');
+          return;
+        }
+        if (resultDiv) {
+          var commandId = resp.data.command_id;
+          resultDiv.innerHTML = '<div hx-get="/fragments/hardware/ci/result?id=' + encodeURIComponent(agent) +
+            '&command_id=' + encodeURIComponent(commandId) + '&plugin=' + encodeURIComponent(plugin) +
+            '&n=1" hx-trigger="load" hx-swap="outerHTML"><span class="gp-mute">Waiting for the device to respond&hellip;</span></div>';
+          if (window.htmx) window.htmx.process(resultDiv);
+        }
+        if (typeof showToast === 'function') {
+          showToast('Sent to ' + reached + ' agent(s)', 'success');
+        }
+      }).catch(function () {
+        btn.disabled = false;
+        if (typeof showToast === 'function') showToast('Network error — the action may not have applied', 'error');
+      });
+    }
+  </script>
+)HTM"
+    // Chunk 4: Hardware CI record helpers (round 2). Own literal for the same
+    // MSVC 16 KiB reason as chunk 3. Prose stays here, not in the literal.
+    //
+    // hwSyncNow(btn, source): POST /api/v1/hardware/{id}/sync, then swap the
+    // lens body for the 2s poll fragment (await_since = the SERVER's requested_at).
+    // hwTagSet / hwTagDelete: JSON to the EXISTING /api/tags/set and
+    // /api/tags/delete, then reload the whole CI record (header chips + lens).
+    // hwFilterResult(el): free-text or regex filter over a result's table rows
+    // / pre lines, with a hit counter; an invalid regex marks the box red and
+    // filters nothing. hwExportCsv(btn): RFC 4180 CSV of the VISIBLE rows
+    // (pre output → one "line" column) via a Blob + temporary <a download>.
+    // hwCopyResult(btn): visible text to the clipboard.
+    R"HTM(
+  <script>
+    function hwReloadCi(agent, lens) {
+      var mount = document.getElementById('guardian-detail'); if (!mount || !window.htmx) return;
+      window.htmx.ajax('GET', '/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens || 'overview'), { target: '#guardian-detail', swap: 'innerHTML' });
+    }
+    function hwSyncNow(btn, source) {
+      var agent = btn.getAttribute('data-agent'), lens = btn.getAttribute('data-lens') || 'overview';
+      btn.disabled = true;
+      fetch('/api/v1/hardware/' + encodeURIComponent(agent) + '/sync', { method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: source }) })
+      .then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); })
+      .then(function (resp) {
+        if (resp.status >= 400) { btn.disabled = false;
+          showToast((resp.data.error && resp.data.error.message) || ('Sync request failed (' + resp.status + ')'), 'error'); return; }
+        var d = resp.data.data; showToast('Sync requested (' + d.source + ')', 'success');
+        // The header instance of this button lives OUTSIDE #hw-ci-lens and is never
+        // replaced by the lens re-render below, so it needs its own explicit
+        // re-enable here (governance Gate 4 happy-path finding: it was stuck
+        // disabled after every successful header sync). The two in-lens instances
+        // get a fresh, already-enabled button when the poll below replaces their
+        // markup, so this is a harmless no-op for them.
+        btn.disabled = false;
+        var lensDiv = document.getElementById('hw-ci-lens'); if (!lensDiv) return;
+        // Round-3 item 4: first poll at 1s (was a flat 2s) \u2014 the poll ladder's
+        // 1s/1s/2s\u2026 cadence continues from render_hardware_sync_pending
+        // (hardware_ui.cpp) once this first pending div's own request lands.
+        lensDiv.innerHTML = '<div hx-get="/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens) +
+          '&lens_only=1&await_since=' + d.requested_at + '&n=1&command_id=' + encodeURIComponent(d.command_id) +
+          '" hx-trigger="load delay:1s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026 usually a couple of seconds on Linux/Windows, up to ~15s on macOS the first time.</span></div>';
+        if (window.htmx) window.htmx.process(lensDiv);
+      }).catch(function () { btn.disabled = false; showToast('Sync request failed', 'error'); });
+    }
+    function hwPostJson(url, body, ok) {
+      return fetch(url, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (r) { return r.text().then(function (t) { return { status: r.status, text: t }; }); })
+        .then(function (resp) {
+          if (resp.status >= 400) {
+            var msg = 'Request failed (' + resp.status + ')';
+            try { var j = JSON.parse(resp.text); msg = (j.error && j.error.message) || j.error || msg; } catch (e) { if (resp.text && resp.text.length < 200) msg = resp.text; }
+            showToast(msg, 'error'); return;
+          }
+          ok();
+        }).catch(function () { showToast('Network error', 'error'); });
+    }
+    function hwTagSet(btn) {
+      var form = btn.closest('form'); if (!form) return;
+      var agent = form.getAttribute('data-agent');
+      var key = (form.querySelector('input[name="key"]').value || '').trim();
+      var value = (form.querySelector('input[name="value"]').value || '').trim();
+      if (!key) { showToast('Tag key is required', 'error'); return; }
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
+      btn.disabled = true;
+      hwPostJson('/api/tags/set', { agent_id: agent, key: key, value: value }, function () {
+        showToast('Tag ' + key + ' set', 'success'); hwReloadCi(agent, 'tags');
+      }).then(function () { btn.disabled = false; });
+    }
+    function hwTagDelete(a) {
+      var agent = a.getAttribute('data-agent'), key = a.getAttribute('data-key');
+      if (!window.confirm('Remove tag ' + key + '?')) return;
+      hwPostJson('/api/tags/delete', { agent_id: agent, key: key }, function () {
+        showToast('Tag ' + key + ' removed', 'success'); hwReloadCi(agent, 'tags');
+      });
+    }
+    function hwFilterResult(el) {
+      var tool = el.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var input = tool.querySelector('input[type="text"]');
+      var useRe = tool.querySelector('input[type="checkbox"]').checked;
+      var q = (input.value || '').trim(), test = null;
+      input.classList.remove('bad');
+      if (q) {
+        if (useRe) { try { var re = new RegExp(q, 'i'); test = function (t) { return re.test(t); }; } catch (e) { input.classList.add('bad'); } }
+        else { var lq = q.toLowerCase(); test = function (t) { return t.toLowerCase().indexOf(lq) !== -1; }; }
+      }
+      var items = body.querySelectorAll('tbody tr, .hw-line'), shown = 0;
+      for (var i = 0; i < items.length; i++) {
+        var hit = !test || test(items[i].textContent || '');
+        items[i].style.display = hit ? '' : 'none';
+        if (items[i].classList.contains('hw-line')) items[i].classList.toggle('hit', !!(test && hit));
+        if (hit) shown++;
+      }
+      var cnt = tool.querySelector('.cnt'); if (cnt) cnt.textContent = shown + ' / ' + items.length + (items[0] && items[0].tagName === 'TR' ? ' rows' : ' lines');
+    }
+    function hwCsvCell(v) { v = String(v == null ? '' : v); return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+    function hwExportCsv(btn) {
+      var tool = btn.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var rows = [], table = body.querySelector('table');
+      if (table) {
+        var ths = table.querySelectorAll('thead th'); var hdr = [];
+        for (var h = 0; h < ths.length; h++) hdr.push(hwCsvCell(ths[h].textContent));
+        rows.push(hdr.join(','));
+        var trs = table.querySelectorAll('tbody tr');
+        for (var i = 0; i < trs.length; i++) { if (trs[i].style.display === 'none') continue;
+          var tds = trs[i].querySelectorAll('td'), cells = [];
+          for (var j = 0; j < tds.length; j++) cells.push(hwCsvCell(tds[j].textContent));
+          rows.push(cells.join(',')); }
+      } else {
+        rows.push('line');
+        var lines = body.querySelectorAll('.hw-line');
+        for (var k = 0; k < lines.length; k++) { if (lines[k].style.display === 'none') continue; rows.push(hwCsvCell(lines[k].textContent)); }
+      }
+      var csv = rows.join('\r\n'), name = (btn.getAttribute('data-name') || 'result') + '.csv';
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+      showToast('Exported ' + (rows.length - 1) + ' row(s)', 'success');
+    }
+    function hwCopyResult(btn) {
+      var tool = btn.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var parts = [], items = body.querySelectorAll('tbody tr, .hw-line');
+      for (var i = 0; i < items.length; i++) if (items[i].style.display !== 'none') parts.push(items[i].textContent);
+      var text = parts.length ? parts.join('\n') : (body.textContent || '');
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () { showToast('Copied', 'success'); }, function () { showToast('Copy failed', 'error'); });
+      else showToast('Clipboard unavailable', 'error');
+    }
+  </script>
+)HTM"
+    // Chunk 5: Hardware list bulk tagging (round 3 item 7) — ServiceNow/Intune-
+    // style checkbox selection + a sticky action bar (markup already emitted by
+    // hardware_ui.cpp's render_hardware_results_region / row_html). Own literal
+    // for the same MSVC 16 KiB reason as chunks 3-4.
+    //
+    // hwSel: the live selection, keyed by agent_id — a plain Set, not DOM state,
+    // so it survives a #hw-results outerHTML swap (pagination/sort/filter/search
+    // all replace the whole div). hwSelToggle/hwSelAll/hwSelClear mutate it and
+    // call hwSelRender to show/hide the sticky bar and update its count. The
+    // htmx:afterSwap listener re-checks boxes from the Set after any #hw-results
+    // re-render so a selection made on page 1 is still reflected if the operator
+    // re-sorts without clearing it.
+    //
+    // hwBulkTag(btn, mode): validates the key with the SAME regex hwTagSet uses,
+    // then fans the selection out over the EXISTING single-agent /api/tags/set or
+    // /api/tags/delete (never a new bulk route — each call still runs its own
+    // per-target scoped Tag:Write gate + tag.set/.delete audit row, so a bulk
+    // apply produces the identical audit trail N individual edits would have).
+    // kHwBulkWorkers bounds concurrency so a large selection doesn't fire
+    // hundreds of simultaneous requests; a 403 is counted as "denied" (reported
+    // separately from other failures) rather than folded into a generic error.
+    R"HTM(
+  <script>
+    var hwSel = new Set();
+    function hwSelRender() {
+      var bar = document.getElementById('hw-selbar');
+      var count = document.getElementById('hw-selcount');
+      if (!bar || !count) return;
+      count.textContent = hwSel.size + ' selected';
+      bar.classList.toggle('show', hwSel.size > 0);
+    }
+    function hwSelToggle(cb) {
+      if (cb.checked) hwSel.add(cb.value); else hwSel.delete(cb.value);
+      hwSelRender();
+    }
+    function hwSelAll(cb) {
+      var boxes = document.querySelectorAll('#hw-results .hw-sel');
+      for (var i = 0; i < boxes.length; i++) {
+        boxes[i].checked = cb.checked;
+        if (cb.checked) hwSel.add(boxes[i].value); else hwSel.delete(boxes[i].value);
+      }
+      hwSelRender();
+    }
+    function hwSelClear() {
+      hwSel.clear();
+      var boxes = document.querySelectorAll('#hw-results .hw-sel');
+      for (var i = 0; i < boxes.length; i++) boxes[i].checked = false;
+      var all = document.querySelector('#hw-results thead input[type="checkbox"]');
+      if (all) all.checked = false;
+      hwSelRender();
+    }
+    document.body.addEventListener('htmx:afterSwap', function (e) {
+      if (!e.detail || !e.detail.target || e.detail.target.id !== 'hw-results') return;
+      var boxes = e.detail.target.querySelectorAll('.hw-sel');
+      for (var i = 0; i < boxes.length; i++) boxes[i].checked = hwSel.has(boxes[i].value);
+      hwSelRender();
+    });
+    var kHwBulkWorkers = 4;
+    function hwBulkRun(ids, run, done) {
+      if (!ids.length) { done(0, 0, []); return; }
+      var next = 0, ok = 0, denied = 0, failed = [], active = 0;
+      function pump() {
+        while (active < kHwBulkWorkers && next < ids.length) {
+          (function (id) {
+            active++;
+            run(id).then(function (r) {
+              active--;
+              if (r === true) ok++;
+              else if (r === 'denied') { denied++; failed.push(id); }
+              else failed.push(id);
+              if (next >= ids.length && active === 0) done(ok, denied, failed);
+              else pump();
+            });
+          })(ids[next++]);
+        }
+      }
+      pump();
+    }
+    function hwBulkFetchTag(url, body) {
+      return fetch(url, { method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (r) {
+          if (r.status === 200 || r.status === 204) return true;
+          if (r.status === 403) return 'denied';
+          return false;
+        }).catch(function () { return false; });
+    }
+    function hwBulkRefresh() {
+      var results = document.getElementById('hw-results');
+      if (!results || !window.htmx) return;
+      var url = results.getAttribute('data-url');
+      if (!url) return;
+      window.htmx.ajax('GET', url, { target: '#hw-results', swap: 'outerHTML' });
+    }
+    function hwBulkTag(btn, mode) {
+      var ids = Array.from(hwSel);
+      if (!ids.length) { showToast('No devices selected', 'error'); return; }
+      var key, value;
+      if (mode === 'set') {
+        key = (document.getElementById('hw-bulk-key').value || '').trim();
+        value = (document.getElementById('hw-bulk-value').value || '').trim();
+      } else {
+        key = (document.getElementById('hw-bulk-rkey').value || '').trim();
+        value = '';
+      }
+      if (!key) { showToast('Tag key is required', 'error'); return; }
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
+      btn.disabled = true;
+      var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
+      hwBulkRun(ids, function (id) {
+        var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
+        return hwBulkFetchTag(url, body);
+      }, function (ok, denied, failed) {
+        btn.disabled = false;
+        var verb = mode === 'set' ? 'Tagged' : 'Untagged';
+        if (!failed.length) {
+          showToast(verb + ' ' + ok + '/' + ids.length, 'success');
+        } else {
+          var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
+          var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
+          showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
+        }
+        hwBulkRefresh();
+      });
+    }
+  </script>
+)HTM"
+    R"HTM(
 </body>
 </html>
 )HTM";

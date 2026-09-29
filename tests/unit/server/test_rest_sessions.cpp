@@ -168,7 +168,7 @@ struct RestSessionsHarness {
                             /*result_set_store=*/nullptr,
                             /*command_dispatch_fn=*/{},
                             /*step_up_fn=*/{},
-                            /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+                            /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
                             std::move(lockout_clear_fn));
     }
 

@@ -1,0 +1,4 @@
+REAL CAPTURE
+host/image: docker run --rm ubuntu:24.04 (Docker Desktop on macOS, host braga.local)
+date: 2026-09-06
+command: cp /etc/xdg/autostart/at-spi-dbus-bus.desktop /home/ubuntu/.config/autostart/user-example.desktop (copied verbatim into a user autostart dir to demonstrate the per-user autostart location; content identical to the system-level source file)

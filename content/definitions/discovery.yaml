@@ -1,12 +1,12 @@
 ## Device Discovery Plugin Definitions
-## Network device discovery via ARP table lookup and ping sweep.
-## Identifies managed and unmanaged endpoints on a subnet.
-## Plugin: discovery | Actions: scan_subnet
+## Network device discovery via native ARP/neighbour-table read + an
+## unprivileged ICMP ping sweep. Identifies managed and unmanaged endpoints
+## on a subnet. Plugin: discovery | Actions: scan_subnet
 ##
-## Sources by platform:
-##   Windows: Win32 GetIpNetTable API + ping -n
-##   Linux:   arp -n + ping -c
-##   macOS:   arp -a + ping -c
+## Sources by platform (no subprocess spawn on any leg, Wave 2):
+##   Windows: GetIpNetTable2 (iphlpapi) + IcmpSendEcho
+##   Linux:   /proc/net/arp + an unprivileged SOCK_DGRAM ICMP socket
+##   macOS:   sysctl NET_RT_FLAGS/RTF_LLINFO + an unprivileged SOCK_DGRAM ICMP socket
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -16,14 +16,18 @@ metadata:
   displayName: Subnet Discovery Scan
   version: 1.0.0
   description: >
-    Scans a subnet to discover devices on the network. Uses a combination
-    of ARP table lookups (for hosts already known to the OS) and ICMP ping
-    sweeps (for additional hosts). For each discovered host, returns the
-    IP address, MAC address (from ARP), hostname (via reverse DNS), and
-    managed status (correlated server-side with enrolled agents).
-    Supports subnets from /20 to /30 (max 4094 hosts per scan). On
-    Windows uses the Win32 GetIpNetTable API for ARP data; on Linux
-    uses arp -n; on macOS uses arp -a.
+    Scans a subnet to discover devices on the network by reading the OS
+    ARP/neighbour table and running an unprivileged ICMP ping sweep, with
+    no subprocess spawn on any platform (GetIpNetTable2 on Windows,
+    /proc/net/arp on Linux, the kernel routing-table sysctl on macOS). For
+    each discovered host, returns the IP address, MAC address (from ARP,
+    or "unknown" when absent), hostname (via reverse DNS, or "unknown"),
+    and a literal "unknown" managed flag the server correlates against
+    enrolled agents separately. Accepts /24 through /30 CIDR blocks (254
+    down to 2 usable hosts) — a wider prefix is refused rather than
+    scanned. On Linux the ICMP half additionally needs
+    net.ipv4.ping_group_range to admit the agent's gid, or the scan
+    degrades to ARP-only results with a CONSTRAINED/PARTIAL status.
   tags: [discovery, network, scan, inventory]
 
 spec:
@@ -44,9 +48,11 @@ spec:
         type: string
         displayName: Subnet (CIDR)
         description: >
-          Target subnet in CIDR notation (e.g., 192.168.1.0/24).
-          Minimum prefix length is /20 (4094 hosts), maximum is /30
-          (2 hosts). Only IPv4 is supported.
+          Target subnet in CIDR notation (e.g., 192.168.1.0/24). The
+          plugin accepts only /24 through /30 (254 down to 2 usable
+          hosts) — a request outside that range is refused with an
+          error ("too many hosts to scan" or "contains no usable host
+          addresses") rather than scanned. Only IPv4 is supported.
         validation:
           pattern: "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$"
           minLength: 9
@@ -55,9 +61,11 @@ spec:
         type: int32
         displayName: Ping Timeout (ms)
         description: >
-          Timeout in milliseconds for each ping probe. Lower values
-          scan faster but may miss hosts on slow networks. Minimum
-          100ms, maximum 10000ms.
+          Per-host ICMP probe timeout in milliseconds, validated to
+          100-10000. The effective per-host budget is separately
+          clamped to 100-300ms regardless of the requested value, so a
+          value above 300 has no further effect. This is not the
+          overall scan deadline, which is a fixed 300 seconds.
         default: 1000
         validation:
           minimum: 100
@@ -67,16 +75,50 @@ spec:
     columns:
       - name: host
         type: string
+        description: >
+          Literal row-type discriminator marking this line as a
+          discovered-host row, as opposed to a status/progress/
+          scan_complete line, which this schema does not separately
+          enumerate.
+        values: ["host"]
+        example: "host"
+        platforms: [windows, linux, darwin]
       - name: ip_address
         type: string
+        description: >-
+          IPv4 address of a host found in the target subnet, either already present in the OS ARP/neighbour table or reached by an ICMP probe. Values: free text (dotted-quad IPv4).
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: mac_address
         type: string
+        description: >-
+          Colon-separated lowercase MAC48 read from the ARP/neighbour table, or the literal "unknown" when the host has no ARP entry. Values: colon-hex MAC48, or "unknown".
+        example: "unknown"
+        platforms: [windows, linux, darwin]
       - name: hostname
         type: string
+        description: >-
+          Reverse-DNS (PTR) result for the IP, or the literal "unknown" when the lookup found nothing, timed out, or was throttled. Values: free text (PTR hostname), or "unknown".
+        example: "localhost"
+        platforms: [windows, linux, darwin]
       - name: managed
         type: string
+        description: >
+          Always the literal "unknown" from the agent — the server
+          correlates the IP/MAC against enrolled agents separately.
+        values: ["unknown"]
+        example: "unknown"
+        platforms: [windows, linux, darwin]
       - name: scan_complete
         type: string
+        description: >
+          Literal row-type discriminator for the scan's one summary
+          line, emitted once per run; the same line also carries
+          "found" and "total" host counts as two further pipe-fields
+          not enumerated as separate columns here.
+        values: ["scan_complete"]
+        example: "scan_complete"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Scan subnet {{subnet}} for devices"
 
@@ -84,7 +126,7 @@ spec:
     ttlSeconds: 600
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]

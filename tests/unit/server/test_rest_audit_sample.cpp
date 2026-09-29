@@ -10,8 +10,11 @@
  */
 
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -27,12 +30,28 @@ using namespace yuzu::server;
 
 namespace {
 
+// AuditStore migrated to Postgres (ADR-0006) — the harness below clones this
+// pre-migrated template instead of opening a SQLite path for its populated
+// (store_opens=true) arm.
+yuzu::test::PgTestTemplate rest_audit_sample_tpl{"sampleaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("sampleaudit template: store failed to migrate");
+}};
+
 struct AuditCall {
     std::string action, result, target_type, target_id, detail;
 };
 
 struct AuthSampleHarness {
     yuzu::server::test::TestRouteSink sink;
+    // AuditStore ported to Postgres (ADR-0006): `audit_db` (template clone)
+    // backs the populated (store_opens=true) arm only; `audit_pool` backs
+    // both arms — an unroutable pool for store_opens=false (no live PG
+    // needed), a real one from `audit_db` otherwise.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     bool perm_grant{true};
     bool audit_should_fail{false};  // audit_fn returns false (emission did not persist)
@@ -42,15 +61,24 @@ struct AuthSampleHarness {
     RestApiV1 api;
 
     // store_opens=false constructs a wired-but-closed store (is_open()==false)
-    // by pointing it at an unopenable path, to exercise the store-down 503 guard.
+    // by pointing it at an unroutable pool, to exercise the store-down 503
+    // guard — deliberately does NOT need YUZU_TEST_POSTGRES_DSN (mirrors
+    // test_audit_store.cpp's "bad-path constructor" fixture).
     explicit AuthSampleHarness(bool with_store = true, bool store_opens = true) {
         if (with_store && !store_opens) {
-            // SQLITE_CANTOPEN on a path whose parent directory does not exist —
-            // sqlite3_open_v2 fails, leaving db_ == nullptr → is_open() false.
-            audit_store =
-                std::make_unique<AuditStore>("/nonexistent-yuzu-test-dir/audit-closed.db");
+            audit_pool.emplace(yuzu::server::pg::PgPool::Options{
+                .conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1});
+            audit_store = std::make_unique<AuditStore>(*audit_pool);
         } else if (with_store) {
-            audit_store = std::make_unique<AuditStore>(":memory:");
+            if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+                SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+            }
+            audit_db.emplace(rest_audit_sample_tpl);
+            INFO("[AuthSampleHarness] audit db status (blank == ok): " << audit_db->error());
+            REQUIRE(audit_db->available());
+            audit_pool.emplace(
+                yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+            audit_store = std::make_unique<AuditStore>(*audit_pool);
             auto log = [&](const std::string& action, int64_t ts) {
                 AuditEvent e;
                 e.principal = "admin";
@@ -111,7 +139,7 @@ struct AuthSampleHarness {
 
 } // namespace
 
-TEST_CASE("auth-sample: scoped to the auth surface, noise excluded", "[auth-sample][rest]") {
+TEST_CASE("auth-sample: scoped to the auth surface, noise excluded", "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?limit=100");
     REQUIRE(res);
@@ -124,7 +152,7 @@ TEST_CASE("auth-sample: scoped to the auth surface, noise excluded", "[auth-samp
     CHECK(res->body.find("tag.create") == std::string::npos);
 }
 
-TEST_CASE("auth-sample: limit is honoured", "[auth-sample][rest]") {
+TEST_CASE("auth-sample: limit is honoured", "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?limit=2");
     REQUIRE(res);
@@ -142,7 +170,7 @@ TEST_CASE("auth-sample: limit is honoured", "[auth-sample][rest]") {
     CHECK(count_substr(res->body, "\"action\":") == 2);
 }
 
-TEST_CASE("auth-sample: exporting evidence is itself audited", "[auth-sample][rest][audit]") {
+TEST_CASE("auth-sample: exporting evidence is itself audited", "[pg][auth-sample][rest][audit]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
     REQUIRE(res);
@@ -157,7 +185,7 @@ TEST_CASE("auth-sample: exporting evidence is itself audited", "[auth-sample][re
     CHECK(emitted);
 }
 
-TEST_CASE("auth-sample: permission denied → 403", "[auth-sample][rest][perm]") {
+TEST_CASE("auth-sample: permission denied → 403", "[pg][auth-sample][rest][perm]") {
     AuthSampleHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
@@ -187,7 +215,7 @@ TEST_CASE("auth-sample: store wired but not open → 503, not 200-empty", "[auth
     CHECK(res->body.find("\"total\":0") == std::string::npos);
 }
 
-TEST_CASE("auth-sample: malformed from/to → 400", "[auth-sample][rest]") {
+TEST_CASE("auth-sample: malformed from/to → 400", "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?from=notanumber");
     REQUIRE(res);
@@ -198,14 +226,14 @@ TEST_CASE("auth-sample: malformed from/to → 400", "[auth-sample][rest]") {
     CHECK(res2->status == 400);
 }
 
-TEST_CASE("auth-sample: inverted window from>to → 400 (Hermes L-3)", "[auth-sample][rest]") {
+TEST_CASE("auth-sample: inverted window from>to → 400 (Hermes L-3)", "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?from=2000&to=1000");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
 
-TEST_CASE("auth-sample: malformed limit → 400 (Hermes L-2)", "[auth-sample][rest]") {
+TEST_CASE("auth-sample: malformed limit → 400 (Hermes L-2)", "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?limit=abc");
     REQUIRE(res);
@@ -213,7 +241,7 @@ TEST_CASE("auth-sample: malformed limit → 400 (Hermes L-2)", "[auth-sample][re
 }
 
 TEST_CASE("auth-sample: response excludes session_id/source_ip (Hermes M-2)",
-          "[auth-sample][rest]") {
+          "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
     REQUIRE(res);
@@ -224,7 +252,7 @@ TEST_CASE("auth-sample: response excludes session_id/source_ip (Hermes M-2)",
 }
 
 TEST_CASE("auth-sample: audit-emission failure surfaces Sec-Audit-Failed (Hermes M-1)",
-          "[auth-sample][rest][audit]") {
+          "[pg][auth-sample][rest][audit]") {
     SECTION("audit_fn returns false") {
         AuthSampleHarness h;
         h.audit_should_fail = true;
@@ -243,7 +271,7 @@ TEST_CASE("auth-sample: audit-emission failure surfaces Sec-Audit-Failed (Hermes
     }
 }
 
-TEST_CASE("auth-sample: clean export does NOT set Sec-Audit-Failed", "[auth-sample][rest][audit]") {
+TEST_CASE("auth-sample: clean export does NOT set Sec-Audit-Failed", "[pg][auth-sample][rest][audit]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
     REQUIRE(res);
@@ -252,7 +280,7 @@ TEST_CASE("auth-sample: clean export does NOT set Sec-Audit-Failed", "[auth-samp
 }
 
 TEST_CASE("auth-sample: response carries the sampling/recency_capped block",
-          "[auth-sample][rest]") {
+          "[pg][auth-sample][rest]") {
     AuthSampleHarness h; // only 4 in-window auth events, well under the scan cap
     auto res = h.sink.Get("/api/v1/audit/auth-sample");
     REQUIRE(res);
@@ -264,7 +292,7 @@ TEST_CASE("auth-sample: response carries the sampling/recency_capped block",
 }
 
 TEST_CASE("auth-sample: scoping returns exactly the 4 auth events (count bound)",
-          "[auth-sample][rest]") {
+          "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     auto res = h.sink.Get("/api/v1/audit/auth-sample?limit=100");
     REQUIRE(res);

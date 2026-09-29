@@ -28,7 +28,8 @@
 -export([start_link/1,
          dispatch/3,
          get_info/1,
-         disconnect/1]).
+         disconnect/1,
+         reannounce/2]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3, code_change/4]).
@@ -44,7 +45,14 @@
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
-    peer_addr   :: binary()
+    peer_addr   :: binary(),
+    %% Opaque random id minted ONCE per process instance (HA WS-4, #4324) —
+    %% stamped on both the CONNECTED (init/1) and DISCONNECTED (do_cleanup)
+    %% StreamStatusNotification this process ever sends, so the server can
+    %% fence a stale DISCONNECTED from a torn-down placement against a
+    %% newer re-home reusing the same session id. NOT a counter — must stay
+    %% collision-safe across gateway nodes and mixed-version clusters.
+    stream_home_id :: binary()
 }).
 
 %%%===================================================================
@@ -70,6 +78,28 @@ get_info(Pid) ->
 disconnect(Pid) ->
     gen_statem:cast(Pid, disconnect).
 
+%% @doc HA WS-4 4.4 (`#4246` #6): tell this agent process its upstream
+%% `ProxyRegister` replay was ADOPTED under `SessionId` (the server
+%% published S, never a fresh mint) — so this process should RE-SEND its
+%% own CONNECTED notification, republishing `gateway_node`/
+%% `wire_capabilities`/`stream_home_id` through the existing, session-
+%% guarded `NotifyStreamStatus` -> `set_gateway_route` path. This is the
+%% mechanism that converges the server's in-memory placement after
+%% `ProxyRegister` (which always installs a brand-new `AgentSession`,
+%% wiping that trio — see gateway_service_impl.cpp's ProxyRegister) —
+%% NOT a new state or a second `CONNECTED` for a DIFFERENT home; the
+%% `streaming` clause below only acts when `SessionId` still matches this
+%% process's OWN session, so a superseded/dead process ignores it (a cast
+%% to a dead pid is silently dropped by the runtime; a cast to a pid that
+%% has since moved on to a DIFFERENT session is dropped by the match
+%% guard below), and it always resends the SAME `stream_home_id` this
+%% process already holds — never a new one — so the standing invariant
+%% against a same-session `CONNECTED(S, home2)` (gateway_route_store.hpp's
+%% FORWARD NOTE) is not violated.
+-spec reannounce(pid(), binary()) -> ok.
+reannounce(Pid, SessionId) ->
+    gen_statem:cast(Pid, {upstream_reannounced, SessionId}).
+
 %%%===================================================================
 %%% gen_statem callbacks
 %%%===================================================================
@@ -84,6 +114,13 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% Defaulted so an agent started without it (older callers, tests)
     %% still works — replay just skips agents whose req is empty.
     RegisterReq = maps:get(register_req, Args, #{}),
+
+    %% Opaque per-process-instance id (HA WS-4, #4324): minted once here,
+    %% never regenerated, and reused verbatim on the DISCONNECTED
+    %% notification in do_cleanup/1. A CSPRNG value, not a counter —
+    %% erlang:unique_integer/1 was rejected as per-BEAM-node and therefore
+    %% collision-prone across gateway cluster nodes.
+    StreamHomeId = string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16))),
 
     %% Monitor the stream handler process.
     StreamMon = case StreamPid of
@@ -101,7 +138,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         plugins     = Plugins,
         pending     = #{},
         connected_at = erlang:system_time(millisecond),
-        peer_addr   = PeerAddr
+        peer_addr   = PeerAddr,
+        stream_home_id = StreamHomeId
     },
 
     %% Register in routing table and join pg groups. The RegisterRequest
@@ -126,7 +164,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
                 [AgentId, PeerAddr, SessionId]),
 
     %% Notify C++ server about the stream connection.
-    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                           StreamHomeId),
 
     case StreamPid of
         undefined -> {ok, connecting, Data};
@@ -165,7 +204,31 @@ connecting(info, {'DOWN', MonRef, process, _Pid, _Reason},
     {next_state, disconnected, Data};
 
 connecting(cast, disconnect, Data) ->
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+connecting(cast, {upstream_reannounced, SessionId},
+           #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+                stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 review fix (N1): init/1 sends this process's ONLY
+    %% CONNECTED before the state machine ever reaches `connecting`
+    %% (neither `connecting` nor `stream_ready`'s transition to
+    %% `streaming` sends a second one) — so an ADOPT landing in this
+    %% narrow window, before Subscribe's stream_pid arrives, must still
+    %% re-announce here, or the server's placement (wiped by
+    %% `register_agent`) stays unrecovered until this session eventually
+    %% disconnects and reconnects. Same payload, same mechanism as the
+    %% `streaming` clause below — only the state differs.
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED (still connecting) to converge server-side placement",
+                [AgentId, SessionId]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+connecting(cast, {upstream_reannounced, _OtherSessionId}, _Data) ->
+    %% A superseded session — same rationale as streaming's own mismatch
+    %% clause below.
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: streaming — the hot path
@@ -181,6 +244,11 @@ streaming(cast, {dispatch, CommandReq, {ReplyTo, FanoutRef}}, Data) ->
                       maps:get(plugin, CommandReq, <<"unknown">>)),
 
     %% Send command to the subscribe handler, which writes it to the HTTP/2 stream.
+    %% CommandReq is forwarded whole — `dispatch_tag` (field 9) rides through
+    %% untouched here exactly like `payload` (field 8) does: neither is read
+    %% or rebuilt on this path, so the stream handler's gpb re-encode is the
+    %% only place either field could be lost, and both are mirrored into the
+    %% gateway's vendored agent.proto for that reason.
     StreamPid ! {send_command, CommandReq},
 
     telemetry:execute([yuzu, gw, command, dispatched],
@@ -228,7 +296,32 @@ streaming(cast, disconnect, Data) ->
         undefined -> ok;
         _         -> StreamPid ! close_stream
     end,
-    {next_state, disconnected, Data}.
+    {next_state, disconnected, Data};
+
+streaming(cast, {upstream_reannounced, SessionId},
+          #data{session_id = SessionId, agent_id = AgentId, peer_addr = PeerAddr,
+               stream_home_id = StreamHomeId}) ->
+    %% HA WS-4 4.4 (`#4246` #6, reannounce/2's doc comment): SessionId still
+    %% matches this process's own session (the equality is enforced by the
+    %% pattern match, not a guard) — re-send the SAME CONNECTED payload this
+    %% process already advertised at init/1, republishing gateway_node/
+    %% wire_capabilities/stream_home_id through the ordinary session-guarded
+    %% path. Does not change `Data` (nothing about THIS process's own state
+    %% changed — only the server's independently-installed placement did).
+    logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
+                "CONNECTED to converge server-side placement", [AgentId, SessionId]),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                          StreamHomeId),
+    keep_state_and_data;
+
+streaming(cast, {upstream_reannounced, _OtherSessionId}, Data) ->
+    %% This process has since moved on to a DIFFERENT session than the one
+    %% the (now-stale) replay drip entry adopted — a benign race between the
+    %% drip and a genuine agent reconnect. Ignore; the reconnect's own
+    %% CONNECTED already carries the correct, current placement.
+    logger:debug("Agent ~s: ignoring stale upstream_reannounced for a superseded session",
+                [Data#data.agent_id]),
+    keep_state_and_data.
 
 %%--------------------------------------------------------------------
 %% State: disconnected — cleanup and terminate
@@ -283,11 +376,27 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
                                       #{agent_id => AgentId, plugin => Plugin, status => Status}),
-                    %% Notify router so it can complete the fanout.
-                    case whereis(yuzu_gw_router) of
-                        undefined  -> ok;
-                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-                    end,
+                    %% Notify the router that is actually TRACKING this
+                    %% fanout. HA WS-4 4.3a fix: that router lives on the
+                    %% DISPATCHING node, which — once cross-node routing
+                    %% exists (`yuzu_gw_registry:lookup/1`'s `pg` fallback)
+                    %% — is not necessarily THIS (the agent process's) node.
+                    %% `ReplyTo` is the fanout's `CallerPid` (mgmt-service
+                    %% handler process, `yuzu_gw_router.erl`'s `#fanout.from`),
+                    %% always co-located with its own node's `yuzu_gw_router`
+                    %% (`yuzu_gw_router.erl`'s `?SERVER` is a LOCAL-only
+                    %% `gen_server:start_link({local, ...})`) — so
+                    %% `node(ReplyTo)` names the right node. The prior local
+                    %% `whereis(yuzu_gw_router)` silently no-oped on a
+                    %% cross-node dispatch (this agent's OWN node's router,
+                    %% which was never tracking a fanout it didn't originate),
+                    %% stranding the fanout until the 300s `fanout_timeout`
+                    %% fallback — invisible until cross-node routing made this
+                    %% reachable. `{Name, Node} ! Msg` is fire-and-forget: an
+                    %% unreachable node or unregistered name is silently
+                    %% dropped, matching the previous local `undefined -> ok`
+                    %% no-op semantics exactly.
+                    {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId},
                     maps:remove(CmdId, Pending)
             end,
             {keep_state, Data#data{pending = Pending2}};
@@ -299,7 +408,7 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
 
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
-                  peer_addr = PeerAddr}) ->
+                  peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
     %% Deregister from routing table and pg groups.
     yuzu_gw_registry:deregister_agent(AgentId),
 
@@ -307,10 +416,9 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
     %% and notify router so it can complete fanout tracking.
     maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
         ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
-        case whereis(yuzu_gw_router) of
-            undefined -> ok;
-            RouterPid -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-        end
+        %% HA WS-4 4.3a fix: route to the DISPATCHING node's router, same
+        %% reasoning as handle_stream_response/2 above.
+        {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId}
     end, Pending),
 
     Duration = case ConnectedAt of
@@ -322,11 +430,14 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                       #{count => 1, duration_ms => Duration},
                       #{agent_id => AgentId, reason => normal}),
 
-    %% Notify C++ server.
+    %% Notify C++ server. Same StreamHomeId minted at CONNECTED (init/1) —
+    %% never a freshly-minted value — so the server can match this
+    %% DISCONNECTED to the placement it actually tears down (HA WS-4).
     yuzu_gw_upstream:notify_stream_status(AgentId,
                                            SessionId,
                                            disconnected,
-                                           PeerAddr),
+                                           PeerAddr,
+                                           StreamHomeId),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,

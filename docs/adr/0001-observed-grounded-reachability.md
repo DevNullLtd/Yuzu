@@ -8,6 +8,8 @@ owner: "@lesault (Andy Younie)"
 
 > **Implementation status (2026-06-18 conformance audit):** Accepted decision; the reachability/attack-path engine is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
 
+> **Re-verified (2026-09-07 ADR reconciliation):** still not built in mainline — zero hits for `reachability_graph`/`ReachabilityGraph`/`service_node`/`host_node` in `server/`, `agents/`. Deferred, not withdrawn: re-homes into a use-case engine under ADR-1005 Phase 7 (not started, #4099); NOT grandfathered — faces ADR-1005 Decision 2 at implementation.
+
 ## Context
 
 The vulnerability engine's differentiator is attack-path-aware prioritisation, which needs

@@ -8,7 +8,10 @@ metadata:
   displayName: Get Registry Value
   version: 1.0.0
   description: >
-    Read a value from the Windows registry.
+    Read a value from the Windows registry. Value data is decoded for
+    REG_SZ/REG_EXPAND_SZ/REG_DWORD/REG_QWORD; every other type, including
+    REG_MULTI_SZ and REG_LINK, is returned as hex-encoded bytes rather than
+    decoded (get_user_value decodes both of those). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: question
@@ -24,20 +27,34 @@ spec:
       hive:
         type: string
         displayName: Registry Hive
+        description: >
+          Registry hive to read from, e.g. "HKLM".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
         displayName: Key Path
+        description: >
+          Registry key path relative to the hive root, e.g.
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion".
       name:
         type: string
         displayName: Value Name
+        description: The value name to read, e.g. "ProductName".
   result:
     columns:
       - name: value
         type: string
+        description: >-
+          The value's data, decoded to a display string. Never truncated or fabricated; a value over the registry's own limits fails the action rather than returning a partial string. Values: free text.
+        example: "Windows 10 Pro"
+        platforms: [windows]
       - name: type
         type: string
+        description: >-
+          The registry value type, named via the shared type table shared with get_user_value and enumerate_values. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.
+        example: "REG_SZ"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:
@@ -55,12 +72,15 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.get_user_value
   displayName: Get Per-User Registry Value
-  version: 1.0.0
+  version: 1.2.0
   description: >
-    Read a registry value from a specific user's NTUSER.DAT hive.
-    Loads the user's hive via RegLoadKey if the user is not logged in.
-    Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges (i.e., run
-    as SYSTEM or elevated admin). Windows-only.
+    Read a registry value from a specific user's registry hive. Resolves
+    the target profile via ProfileList (by username or an explicit SID),
+    then reads the live HKEY_USERS\<SID> hive if the user is logged in,
+    or loads that profile's NTUSER.DAT via RegLoadKey as a fallback.
+    SeBackupPrivilege and SeRestorePrivilege are required only for the
+    offline fallback when the target user is not logged in; reading an
+    already-loaded live hive needs no elevated privilege. Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: question
@@ -71,21 +91,35 @@ spec:
     concurrency: per-device
   parameters:
     type: object
-    required: [username, key]
+    required: [key]
     properties:
       username:
         type: string
         displayName: Username
         description: >
-          Windows username whose NTUSER.DAT hive to read from.
-          The user profile must exist at C:\Users\<username>.
+          Windows profile folder name to resolve via ProfileList (see
+          list_profiles), matched case-insensitively. This is not always
+          the same as the account name (renamed accounts, domain profiles).
+          Either username or sid is required; sid takes precedence if both
+          are given.
+        validation:
+          maxLength: 256
+      sid:
+        type: string
+        displayName: User SID
+        description: >
+          Windows security identifier (e.g.,
+          "S-1-5-21-...-1001") of the target profile, as an alternative to
+          username. Must match one of the profiles list_profiles would
+          report; a sid not found there is rejected. Either username or sid
+          is required.
         validation:
           maxLength: 256
       key:
         type: string
         displayName: Key Path
         description: >
-          Registry key path relative to the user's HKCU root
+          Registry key path relative to the resolved user's hive root
           (e.g., "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer").
         validation:
           maxLength: 1024
@@ -99,10 +133,21 @@ spec:
     columns:
       - name: username
         type: string
+        description: >-
+          The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text.
+        example: "alex"
+        platforms: [windows]
       - name: value
         type: string
+        description: >-
+          The value's data, decoded the same way get_value decodes it, plus REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target string) — the two types get_value leaves hex-encoded — both sanitised against '|'/CR/LF so a value cannot forge a column or row. Values: free text.
+        example: "1"
+        platforms: [windows]
       - name: type
         type: string
+        description: 'The registry value type, named via the shared type table. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.'
+        example: "REG_DWORD"
+        platforms: [windows]
   readablePayload: "Read registry value '${name}' from user '${username}' key '${key}'"
   approval:
     mode: role-gated
@@ -110,7 +155,68 @@ spec:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
   compatibility:
-    minAgentVersion: 0.3.0
+    minAgentVersion: 0.13.1
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.list_profiles
+  displayName: List User Profiles
+  version: 1.0.0
+  description: >
+    Enumerate local Windows user profiles from
+    HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList: SID,
+    resolved profile name, profile path, and whether the profile's
+    registry hive is currently loaded under HKEY_USERS. System profiles
+    (LocalSystem, LocalService, NetworkService) are excluded. Windows-only.
+  tags: [registry, windows, users, per-user]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: list_profiles
+    concurrency: per-device
+  parameters:
+    type: object
+    required: []
+    properties: {}
+  result:
+    columns:
+      - name: sid
+        type: string
+        description: "The profile's Windows security identifier. Values: free text (a Windows SID string)."
+        example: "S-1-5-21-571721511-16201247-3531262703-1001"
+        platforms: [windows]
+      - name: profile_name
+        type: string
+        description: >-
+          The resolved profile folder name (the last path component of ProfileImagePath); rendered "-" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or "-".
+        example: "Alex"
+        platforms: [windows]
+      - name: profile_path
+        type: string
+        description: >-
+          The profile's ProfileImagePath, environment-expanded; rendered "-" when it is absent or unreadable. Values: free text or "-".
+        example: "C:\\Users\\Alex"
+        platforms: [windows]
+      - name: hive_state
+        type: string
+        description: "Whether the profile's registry hive is reachable right now. Values: loaded, loaded_classes_only, not_loaded."
+        example: "loaded"
+        platforms: [windows]
+  readablePayload: "List local user profiles"
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.13.1
     requiredPlugins: [registry]
 status:
   phase: active
@@ -123,7 +229,9 @@ metadata:
   displayName: Set Registry Value
   version: 1.0.0
   description: >
-    Write a value to the Windows registry. Creates the key if it does not exist.
+    Write a value to the Windows registry, creating the key if it does not
+    exist. Value data is written as REG_SZ (a UTF-16 string) or REG_DWORD (a
+    32-bit integer) per `type`. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -138,22 +246,37 @@ spec:
     properties:
       hive:
         type: string
+        description: >
+          Registry hive to write to, e.g. "HKCU".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
+        description: >
+          Registry key path relative to the hive root; created if it does
+          not already exist, e.g. "Software\\MyApp".
       name:
         type: string
+        description: The value name to write, e.g. "InstallPath".
       value:
         type: string
+        description: >
+          The value data to write, as text; interpreted per `type` (decimal
+          digits for REG_DWORD, literal text for REG_SZ).
       type:
         type: string
+        description: >
+          Registry value type to write. Defaults to REG_SZ when omitted.
         validation:
           enum: ["REG_SZ", "REG_DWORD"]
   result:
     columns:
       - name: status
         type: string
+        description: >-
+          Confirms the write succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
+        example: "ok"
+        platforms: [windows]
   approval:
     mode: role-gated
   permissions:
@@ -173,7 +296,8 @@ metadata:
   displayName: Enumerate Registry Subkeys
   version: 1.0.0
   description: >
-    List all subkeys under a registry key.
+    List all immediate subkeys under a registry key, one row per subkey.
+    Windows-only.
   tags: [registry, windows]
 spec:
   type: question
@@ -188,14 +312,23 @@ spec:
     properties:
       hive:
         type: string
+        description: >
+          Registry hive to enumerate, e.g. "HKLM".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
+        description: >
+          Registry key path relative to the hive root, e.g.
+          "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion".
   result:
     columns:
       - name: subkey
         type: string
+        description: >-
+          One immediate subkey name under the given key; zero rows means the key has no subkeys. Values: free text.
+        example: "ProfileList"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:
@@ -215,7 +348,8 @@ metadata:
   displayName: Delete Registry Value
   version: 1.0.0
   description: >
-    Delete a specific value from a Windows registry key.
+    Delete a specific value from a Windows registry key; the key itself is
+    left in place. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -231,18 +365,28 @@ spec:
       hive:
         type: string
         displayName: Registry Hive
+        description: >
+          Registry hive containing the value, e.g. "HKCU".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
         displayName: Key Path
+        description: >
+          Registry key path containing the value, relative to the hive
+          root.
       name:
         type: string
         displayName: Value Name
+        description: The value name to delete.
   result:
     columns:
       - name: status
         type: string
+        description: >-
+          Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
+        example: "ok"
+        platforms: [windows]
   approval:
     mode: role-gated
   permissions:
@@ -262,7 +406,8 @@ metadata:
   displayName: Delete Registry Key
   version: 1.0.0
   description: >
-    Delete a Windows registry key and all its values.
+    Delete a Windows registry key and every value and subkey beneath it in
+    one call. Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -278,15 +423,23 @@ spec:
       hive:
         type: string
         displayName: Registry Hive
+        description: >
+          Registry hive containing the key, e.g. "HKCU".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
         displayName: Key Path
+        description: >
+          Registry key path to delete, relative to the hive root.
   result:
     columns:
       - name: status
         type: string
+        description: >-
+          Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.
+        example: "ok"
+        platforms: [windows]
   approval:
     mode: role-gated
   permissions:
@@ -306,7 +459,8 @@ metadata:
   displayName: Check Registry Key Exists
   version: 1.0.0
   description: >
-    Check whether a Windows registry key exists.
+    Check whether a registry key exists, without reading any of its values.
+    Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: question
@@ -322,15 +476,22 @@ spec:
       hive:
         type: string
         displayName: Registry Hive
+        description: >
+          Registry hive to check, e.g. "HKLM".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
         displayName: Key Path
+        description: >
+          Registry key path relative to the hive root.
   result:
     columns:
       - name: exists
         type: bool
+        description: 'Whether the key could be opened for read. Values: true, false.'
+        example: "true"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:
@@ -350,7 +511,9 @@ metadata:
   displayName: Enumerate Registry Values
   version: 1.0.0
   description: >
-    List all value names and types under a Windows registry key.
+    List all value names and types under a Windows registry key, one row
+    per value. Value data itself is not returned — use get_value to read a
+    specific value. Windows-only.
   tags: [registry, windows]
 spec:
   type: question
@@ -366,17 +529,29 @@ spec:
       hive:
         type: string
         displayName: Registry Hive
+        description: >
+          Registry hive to enumerate, e.g. "HKLM".
         validation:
           enum: ["HKLM", "HKCU", "HKCR", "HKU"]
       key:
         type: string
         displayName: Key Path
+        description: >
+          Registry key path relative to the hive root.
   result:
     columns:
       - name: name
         type: string
+        description: >-
+          The value's name; zero rows means the key has no values. Values: free text.
+        example: "ProductName"
+        platforms: [windows]
       - name: type
         type: string
+        description: >-
+          The value's registry type, named via the shared type table shared with get_value and get_user_value. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.
+        example: "REG_SZ"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:

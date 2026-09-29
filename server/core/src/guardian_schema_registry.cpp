@@ -4,6 +4,8 @@
 
 #include "guardian_resilience_schema.hpp"
 
+#include <yuzu/guardian_file_hash_limits.hpp> // kMaxFileHashBytes (#2233 item 6)
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -172,9 +174,17 @@ json file_hash_equals_params() {
         {"max_bytes",
          {{"type", json::array({"integer", "string"})},
           {"minimum", 1},
+          {"maximum", yuzu::guardian::kMaxFileHashBytes},
           {"default", 67108864},
           {"description", "Hashing-DoS cap (bytes). A file larger than this reports <oversize> "
-                          "rather than being hashed."}}},
+                          "rather than being hashed. A non-negative-integer value above the "
+                          "maximum, in either JSON form, is rejected at authoring time; a "
+                          "other numeric value (a float, or a negative number) is rejected as "
+                          "malformed, the same as an unparseable string. A rule already stored "
+                          "above the ceiling before this check existed is not retroactively "
+                          "rejected - the agent silently clamps to the ceiling on arm, with a "
+                          "warning re-logged on each arm/reconcile while it stays over the "
+                          "ceiling."}}},
         {"settle_ms",
          {{"type", json::array({"integer", "string"})},
           {"minimum", 0},

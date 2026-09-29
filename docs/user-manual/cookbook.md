@@ -473,20 +473,27 @@ wait_for(exec_id)
 responses = get_responses("crossplatform.software.inventory", exec_id)
 
 # Find machines with outdated Java
+# `output` holds many newline-joined rows, each app|name|version|publisher|install_date|
+# install_location|bundle_id (seven escape-aware tokens on plugin >= 1.2.0; an older
+# agent emits five and does not escape `|`, so only 5- or 7-token lines are accepted).
+import re
+def split_row(line):
+    return [t.replace("\\|", "|") for t in re.split(r"(?<!\\)\|", line)]
 for row in responses:
-    name = row["output"].get("name", "")
-    version = row["output"].get("version", "")
-    if "java" in name.lower() and version < "21.0":
-        print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
+    for line in row["output"].splitlines():
+        if not line:
+            continue
+        tokens = split_row(line)
+        if tokens[0] != "app" or len(tokens) not in (5, 7):
+            continue
+        name, version = tokens[1], tokens[2]
+        if "java" in name.lower() and version < "21.0":
+            print(f"OUTDATED JAVA: {row['agent_id']} has {name} {version}")
 ```
 
 #### CEL Compliance Expression
 
-Policy: Java Runtime must be version 21+:
-
-```cel
-result.name.contains('Java') && result.version.startsWith('21.')
-```
+CEL sees this definition's result as one raw `output` string (no `name`/`version` fields), so a version comparison is not expressible there; use the Python route above, or a substring test on `output` with the caveat that it also matches the publisher, install path and bundle identifier.
 
 ---
 
@@ -855,7 +862,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |
-| `device.network.sockwho_list` | sockwho | Q | WLM | *(none)* | pid:int32, process_name:string, proto:string, local_addr:string, remote_addr:string, state:string |
+| `device.network.netstat_attribution` | attribution | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32, process_name:string, process_path:string |
 | `device.network_actions.flush_dns` | flush_dns | A | WLM | *(none)* | status:string, output:string |
 | `device.network_actions.ping` | ping | A | WLM | host:string (req) | output:string |
 | `device.wifi.list_networks` | wifi scan | Q | WLM | *(none)* | ssid:string, signal:string, security:string |
@@ -867,7 +874,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
-| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string |
+| `crossplatform.software.inventory` | list | Q | WLM | *(none)* | name:string, version:string, publisher:string, install_date:string, install_location:string, bundle_id:string |
 | `crossplatform.software.query` | query | Q | WLM | name:string (req) | found:bool, name:string, version:string, publisher:string |
 | `device.software_actions.list_upgradable` | upgradable | Q | WLM | *(none)* | package_name:string, current_version:string, available_version:string |
 | `device.software_actions.installed_count` | count | Q | WLM | *(none)* | count:int32 |
@@ -883,6 +890,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 |---|---|---|---|---|---|
 | `security.antivirus.products` | products | Q | WLM | *(none)* | name:string, state:string |
 | `security.antivirus.defender_status` | defender | Q | W | *(none)* | realtime_protection:string, definition_version:string, last_update:string |
+| `security.antivirus.xprotect_status` | status | Q | M | *(none)* | definition_version:string, last_update:string, remediator_version:string, mrt_version:string |
 | `security.firewall.state` | state | Q | WLM | *(none)* | profile_or_backend:string, state:string |
 | `security.firewall.rules` | rules | Q | WLM | *(none)* | rule_name:string, enabled:string, direction:string, action:string |
 | `security.certificates.list` | list | Q | WLM | store:string, expiring_within_days:int32 | subject:string, issuer:string, thumbprint:string, not_after:string |
@@ -940,7 +948,8 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
 | `windows.registry.get_value` | get_value | Q | W | hive:enum (req), key:string (req), name:string (req) | value:string, type:string |
-| `windows.registry.get_user_value` | get_user_value | Q | W | username:string (req), key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.get_user_value` | get_user_value | Q | W | username:string, sid:string, key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
 | `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
 | `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string |

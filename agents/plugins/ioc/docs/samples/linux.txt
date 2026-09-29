@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4c1360bf4eef
+== action=check ip_addresses=127.0.0.1 domains=localhost ports=22
+type|value|matched|detail
+ip|127.0.0.1|false|Not found in active connections
+domain|localhost|true|Found in /etc/hosts
+port|22|false|No listening service on this port
+[result_status] UNDECLARED / UNKNOWN / 
+

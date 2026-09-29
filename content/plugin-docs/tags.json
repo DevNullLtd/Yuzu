@@ -1,0 +1,1079 @@
+{
+  "actions": [
+    {
+      "action": "check",
+      "definition_ids": [
+        "device.tags.check"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "clear",
+      "definition_ids": [
+        "device.tags.clear"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "count",
+      "definition_ids": [
+        "device.tags.count"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "delete",
+      "definition_ids": [
+        "device.tags.delete"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get",
+      "definition_ids": [
+        "device.tags.get"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_all",
+      "definition_ids": [
+        "device.tags.get_all"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "set",
+      "definition_ids": [
+        "device.tags.set"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:38-39,62-63`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:132-137`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.",
+    "**A persistence failure is silent.** `save_tags()`'s `ofstream` open and write are unchecked (`tags_plugin.cpp:72-75`); an unwritable `data_dir` or a full disk drops the write with no error returned to the caller or the operator.",
+    "**`clear` was never executed on a live host.** All three samples show `[not captured]` for `clear` — the mutator capture policy withholds Destructive/Irreversible actions. It is also the one action in this plugin whose dashboard dispatch now requires an explicit, in-scope target rather than a fleet broadcast (#3885).",
+    "**The `tests/unit` files matching \"tags\" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. No dedicated unit test exercises this plugin's `execute()`.",
+    "**`service` is the one key this plugin can set locally that the server will never honor.** A `tags.json` `service` entry is dropped both at Register ingest (`agent_registry.cpp:56-67`) and at TagStore sync (`tag_store.cpp:374-379`) — see #3289/#3295. Every other key set here reaches `tag:<key>` scope-DSL evaluation normally."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Check whether a free-form tag key exists on the device. Returns a boolean result. Useful for scope pre-checks and policy conditions.",
+      "display_name": "Check Tag Exists",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.check",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Remove all free-form tags from the device. Reports the number of tags that were cleared. This is a destructive action — all scope tags will be lost until re-applied.",
+      "display_name": "Clear All Device Tags",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.clear",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Return the number of free-form tags currently set on the device.",
+      "display_name": "Count Device Tags",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.count",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a free-form tag by key from the device. Reports whether the key existed before deletion. The change is persisted to tags.json immediately.",
+      "display_name": "Delete Device Tag",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.delete",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve the value of a single free-form tag by key. Returns an empty value if the key does not exist.",
+      "display_name": "Get Device Tag",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.get",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve all free-form tags on the device. Returns each tag as a key-value pair plus a total count. Useful for inventory and scope verification.",
+      "display_name": "Get All Device Tags",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.get_all",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Set a free-form tag on the device. Tags are key-value pairs stored locally in tags.json and reported to the server for scope evaluation. Key max 64 characters, value max 448 bytes. Allowed key characters: a-zA-Z0-9_-.:",
+      "display_name": "Set Device Tag",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.tags.set",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Device tagging — set, get, delete, list tags for scope evaluation",
+  "how_it_works": "All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,80-104); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:36-76). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:166-189); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:191-251). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).\n\nIt is deliberately not the channel that reaches the server. `tags.json` is separately read verbatim by the agent's Register RPC path (`agent.cpp:1701-1725`), independent of this plugin's own load path, and the server drops any self-reported `service` key at ingest (`agent_registry.cpp:56-67`, #3295) before persisting the rest to the Postgres-backed TagStore (`tag_store.cpp` `sync_agent_tags:345-433`). It is also not the structured 4-category tag store — that role belongs to the sibling `asset_tags` plugin (see Siblings below).",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": null,
+      "definition_id": "device.tags.check",
+      "description": "The tag key to check for existence.",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": null,
+      "definition_id": "device.tags.delete",
+      "description": "The tag key to delete.",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64
+      },
+      "default": null,
+      "definition_id": "device.tags.get",
+      "description": "The tag key to look up.",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 64,
+        "pattern": "^[a-zA-Z0-9_.:\\-]+$"
+      },
+      "default": null,
+      "definition_id": "device.tags.set",
+      "description": "The tag key. Max 64 characters, alphanumeric plus _-.:",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 448
+      },
+      "default": null,
+      "definition_id": "device.tags.set",
+      "description": "The tag value. Max 448 bytes.",
+      "name": "value",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "d55c173b7ddd",
+  "manifest_version": 1,
+  "name": "tags",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The tag key that was checked, echoed back from the request. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the key currently exists. Values: true, false.",
+          "example": "false",
+          "name": "exists",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.check"
+    },
+    {
+      "columns": [
+        {
+          "description": "Number of tags that were removed by this call — the store's size immediately before clearing. Values: integer >= 0.",
+          "example": "-",
+          "name": "cleared_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.clear"
+    },
+    {
+      "columns": [
+        {
+          "description": "Total number of tags currently stored. Values: integer >= 0.",
+          "example": "0",
+          "name": "count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.count"
+    },
+    {
+      "columns": [
+        {
+          "description": "The tag key that was deleted, echoed back from the request. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the key existed before this call. Values: true, false.",
+          "example": "false",
+          "name": "found",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.delete"
+    },
+    {
+      "columns": [
+        {
+          "description": "The tag key that was looked up, echoed back from the request. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The tag's current value, or an empty string when the key is not set. Values: free text, empty when unset.",
+          "example": "",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.get"
+    },
+    {
+      "columns": [
+        {
+          "description": "One stored tag's key. One row per tag currently in the store. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "That tag's value. Values: free text.",
+          "example": "1",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Total number of tags currently stored, on a trailing line after the tag rows. Values: integer >= 0.",
+          "example": "0",
+          "name": "count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.get_all"
+    },
+    {
+      "columns": [
+        {
+          "description": "The tag key that was written, echoed back from the request. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The tag value that was written, echoed back from the request. Values: free text.",
+          "example": "1",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.tags.set"
+    }
+  ],
+  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:200`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:169-172,180-183,193-196,217-220,230-233`).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — plain file I/O under `<data_dir>`, no OS API, no elevated right",
+      "if_refused": "No refusal path exists; a failed `save_tags()` write is silently swallowed (see below)",
+      "measured": "2026-09-07 on bare metal as SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account — LocalSystem today, not yet the intended `NT SERVICE\\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "Same as Windows",
+      "measured": "2026-09-07 on bare metal at euid 501 (jsmith) — unprivileged, not the production root daemon",
+      "os": "macOS",
+      "runs_as": "agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "Same as Windows",
+      "measured": "2026-09-06 in a container at euid 0 — more privileged than the production account",
+      "os": "Linux",
+      "runs_as": "dedicated unprivileged account (`_yuzu`/`yuzu`; `docs/agent-privilege-model.md:12`)"
+    }
+  ],
+  "readme": "agents/plugins/tags/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_set|yuzu_capture_tmp|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|yuzu_capture_tmp|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_all",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_deleted|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "check",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_exists|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "d55c173b7ddd",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_set|yuzu_capture_tmp|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|yuzu_capture_tmp|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_all",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_deleted|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "check",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_exists|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "d55c173b7ddd",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_set|yuzu_capture_tmp|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|yuzu_capture_tmp|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_all",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_deleted|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "check",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag_exists|yuzu_capture_tmp|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "d55c173b7ddd",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "set",
+      "dispatch_class": "Mutating",
+      "execute_gate": "None",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Tag"
+    },
+    {
+      "action": "get",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    },
+    {
+      "action": "get_all",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    },
+    {
+      "action": "delete",
+      "dispatch_class": "Mutating",
+      "execute_gate": "None",
+      "mutability": "Reversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Tag"
+    },
+    {
+      "action": "check",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    },
+    {
+      "action": "clear",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Tag"
+    },
+    {
+      "action": "count",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/tags.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/tags/src/tags_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`.",
+    "**`tags.json` is also read independently of this plugin, at agent Register time** (`agent.cpp:1701-1725`), populating `AgentInfo.scopable_tags` on the gRPC `Register` call; the server's handler syncs it into the Postgres-backed TagStore (`agent_service_impl.cpp:577-585` → `tag_store.cpp` `sync_agent_tags:345-433`) after dropping any self-reported `service` key (`agent_registry.cpp:56-67`, `tag_store.cpp:374-379`, #3289/#3295) — this happens whether or not an operator ever dispatches a `tags.*` action.",
+    "Every other key reaches `tag:<key>` scope-DSL evaluation via the store-first resolver (#3295) and management-group targeting.",
+    "`clear`'s dashboard dispatch is additionally subject to the Destructive-class targeting rule — no fleet broadcast, an explicit in-scope target is required (`changelog.d/3885-dashboard-destructive-targeting.security.md`, which names `tags.clear` directly).",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.",
+    "**Sensitivity.** `key`/`value` rows are free-form text chosen entirely by the caller (bounded only by the length limits in Inputs) — whether a given tag identifies a device, a person, or installed software depends on what was set, not on anything the plugin itself constrains. The `count`/`found`/`exists` fields carry nothing beyond the device id.",
+    "**Siblings:** `asset_tags` — the narrower, server-authoritative 4-category (`role`/`environment`/`location`/`service`) tag sync, which only reacts to a server-pushed `sync`; `tags` is the general-purpose, agent-authoritative free-form key/value store, and the only one of the two an agent can write to unprompted.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.tags.get_all\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

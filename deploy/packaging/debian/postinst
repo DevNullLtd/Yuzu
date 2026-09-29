@@ -27,6 +27,21 @@ case "$1" in
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
 
+        # Trust-anchor directory for OTA update signature verification
+        # (#416/#3807). Its OWN directory, deliberately NOT /etc/yuzu/certs:
+        # that path is the SERVER's --ca-dir (auth.cpp), owned and written by the
+        # yuzu user, and default_certs.cpp re-chmods it 0700 on every boot. An
+        # anchor placed there is either unwritable by the server (breaking CA
+        # creation) or unreadable by the agent (breaking every signed update),
+        # depending on who owns it — no single mode satisfies both.
+        #
+        # root-owned: on Linux the agent runs unprivileged, so it genuinely
+        # cannot rewrite the anchor that authorises its own updates.
+        if [[ "$COMPONENT" != "yuzu-server" ]]; then
+            install -d -m 0755 -o root -g root /etc/yuzu-agent
+            install -d -m 0755 -o root -g root /etc/yuzu-agent/certs
+        fi
+
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
 

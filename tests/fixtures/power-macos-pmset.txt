@@ -1,0 +1,33 @@
+# pmset -g log — capture provenance, stated honestly.
+#
+# REAL CAPTURE: every line below the marker is verbatim `pmset -g log` output
+# from macOS 26.5.1 arm64 on 2026-09-06, unedited.
+# It establishes the format the parser depends on: the 26-byte fixed-width
+# timestamp prefix, the padded Domain column, and the tab before the message.
+#
+# WHAT THIS HOST CANNOT PROVE: it is a desktop and never sleeps, so the log
+# contains 10,399 Assertions lines and ZERO Sleep/Wake/DarkWake domain lines.
+# The sleep/wake parsing in test_tar_power.cpp is therefore driven by
+# RECONSTRUCTED lines built to this same format — not a real capture — and
+# is unverified against a Mac that actually sleeps. A reviewer on a laptop
+# can close that gap; see the PR description.
+# ---------------------------- REAL CAPTURE BELOW ----------------------------
+PM ASL data store: /var/log/powermanagement
+
+Time stamp                Domain              	Message                                                                    	Duration  	Delay     
+2026-08-31 09:29:57 +0100 Assertions          	Summary- [System: No Assertions] Using AC          
+2026-08-31 09:30:00 +0100 Assertions          	Summary- [System: PrevIdle DeclUser SysAct kDisp] Using AC          
+2026-08-31 09:54:14 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IntPrevDisp NetAcc kCPU kDisp] Using AC          
+2026-08-31 09:54:21 +0100 Assertions          	Summary- [System: PrevIdle DeclUser SysAct IntPrevDisp kDisp] Using AC          
+2026-09-02 10:42:38 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IPushSrvc kCPU kDisp] Using AC          
+2026-09-02 10:45:23 +0100 Assertions          	Summary- [System: PrevIdle DeclUser kDisp] Using AC          
+2026-09-02 10:54:14 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IntPrevDisp IPushSrvc kCPU kDisp] Using AC          
+2026-09-02 10:57:47 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IntPrevDisp kDisp] Using AC          
+2026-09-02 21:12:58 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IPushSrvc kCPU kDisp] Using AC          
+2026-09-02 21:15:31 +0100 Assertions          	Summary- [System: PrevIdle DeclUser kDisp] Using AC          
+2026-09-03 13:54:32 +0100 Assertions          	Summary- [System: PrevIdle DeclUser NetAcc kCPU kDisp] Using AC          
+2026-09-03 14:00:15 +0100 Assertions          	Summary- [System: PrevIdle DeclUser kDisp] Using AC          
+2026-09-03 14:44:18 +0100 Assertions          	Summary- [System: PrevIdle DeclUser IPushSrvc kCPU kDisp] Using AC          
+2026-09-03 14:44:18 +0100 Assertions          	Summary- [System: PrevIdle DeclUser kDisp] Using AC          
+2026-09-04 17:47:20 +0100 Assertions          	Summary- [System: PrevIdle DeclUser SysAct NetAcc kCPU kDisp] Using AC          
+2026-09-04 17:55:23 +0100 Assertions          	Summary- [System: PrevIdle DeclUser kDisp] Using AC          

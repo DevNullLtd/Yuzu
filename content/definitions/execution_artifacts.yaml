@@ -1,0 +1,285 @@
+## Execution Artifacts Definitions
+## Windows-only execution-evidence sources: ShimCache (AppCompatCache),
+## Amcache InventoryApplicationFile, and Prefetch. Every action reports
+## paths, hashes, and timestamps only — never file contents. Read-only on
+## every platform; not implemented on linux/darwin (no equivalent artefact
+## exists).
+## Plugin: execution_artifacts | Actions: shimcache, amcache, prefetch
+##
+## Gated behind the Forensics securable, Administrator-only. execution_artifacts
+## and app_usage share the same enforced boundary (both Forensics:Read +
+## AdminOrApproval, Forensics seeded to Administrator only); the higher
+## RiskTier here is operator-triage metadata, not a wider authorization gap —
+## see this plugin's README (agents/plugins/execution_artifacts/README.md);
+## the docs/user-manual page is a separate follow-up. Every read
+## is SINGLE-TARGET (exactly one agent id) — fleet/scope dispatch is refused
+## with the forensic 400 body at the server layer, not enforced here. See
+## server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp.
+##
+## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
+## (`PluginConfigStore::seed_kill_switch_default_off`) — an operator must
+## explicitly `PUT /api/v1/plugin-config/execution_artifacts/kill-switch
+## {"enabled":true}` before any of these three actions will dispatch.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.execution_artifacts.shimcache
+  displayName: ShimCache (AppCompatCache)
+  version: 1.0.0
+  description: >
+    Application Compatibility Cache entries from
+    HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache —
+    evidence that a named executable path existed on disk at a given time,
+    commonly used to show program presence even when the program has since
+    been deleted. Windows 10/11 layout only. Never surfaces file contents;
+    this layout carries no execution-confirmation flag, so insert_flag is
+    always "-".
+  tags: [forensics, execution-artifacts, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: execution_artifacts
+    action: shimcache
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # shimcache|<path>|<last_modified_epoch_ms>|<data_size>|<insert_flag>
+    columns:
+      - name: path
+        type: string
+        description: Executable path recorded in the AppCompatCache entry, escaped.
+        example: "C:/Windows/System32/notepad.exe"
+        platforms: [windows]
+      - name: last_modified_epoch_ms
+        type: int64
+        description: Cached last-modified timestamp from the entry, epoch milliseconds.
+        example: 1690000000000
+        platforms: [windows]
+      - name: data_size
+        type: int64
+        description: Cached file size in bytes, from the entry.
+        example: 175616
+        platforms: [windows]
+      - name: insert_flag
+        type: string
+        description: >
+          Always "-": the Windows 10/11 AppCompatCache layout this plugin
+          decodes carries no execution-confirmation bit.
+        values: ["-"]
+        example: "-"
+        platforms: [windows]
+
+  readablePayload: "Read the AppCompatCache (ShimCache) entries"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [execution_artifacts]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.execution_artifacts.amcache
+  displayName: Amcache Inventory
+  version: 1.0.0
+  description: >
+    Root\InventoryApplicationFile entries from a private, process-scoped
+    copy of Amcache.hve (RegLoadAppKeyW) — per-executable SHA-1, size, link
+    date, publisher, and product identity. FileId is normalised to a plain
+    40-hex-character SHA-1 ("-" when absent or malformed). Never surfaces
+    file contents.
+  tags: [forensics, execution-artifacts, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: execution_artifacts
+    action: amcache
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # amcache|<lower_case_long_path>|<sha1>|<size>|<link_date>|<publisher>|
+    #   <binary_type>|<product_name>|<product_version>
+    columns:
+      - name: lower_case_long_path
+        type: string
+        description: Lower-cased full executable path from the InventoryApplicationFile subkey, escaped.
+        example: "c:/program files/app/app.exe"
+        platforms: [windows]
+      - name: sha1
+        type: string
+        description: >
+          Normalised 40-hex-character SHA-1 from the subkey's FileId; "-"
+          when absent or malformed.
+        example: "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        platforms: [windows]
+      - name: size
+        type: string
+        description: File size as recorded by Amcache (raw string form, not re-parsed).
+        example: "2048576"
+        platforms: [windows]
+      - name: link_date
+        type: string
+        description: Linker timestamp as recorded by Amcache.
+        example: "01/02/2026 03:04:05"
+        platforms: [windows]
+      - name: publisher
+        type: string
+        description: Publisher string as recorded by Amcache, escaped.
+        example: "Example Corp"
+        platforms: [windows]
+      - name: binary_type
+        type: string
+        description: Binary type as recorded by Amcache.
+        example: "pe32_amd64"
+        platforms: [windows]
+      - name: product_name
+        type: string
+        description: Product name as recorded by Amcache, escaped.
+        example: "Example App"
+        platforms: [windows]
+      - name: product_version
+        type: string
+        description: Product version as recorded by Amcache.
+        example: "1.2.3.4"
+        platforms: [windows]
+
+  readablePayload: "Read the Amcache application inventory"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [execution_artifacts]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.execution_artifacts.prefetch
+  displayName: Prefetch Execution History
+  version: 1.0.0
+  description: >
+    Per-executable run history decoded from C:\Windows\Prefetch .pf files
+    (decompressed with ntdll's RtlDecompressBufferEx where MAM-compressed):
+    executable name, file hash, prefetch format version, run count, up to 8
+    most-recent run timestamps, and volume/file-reference counts. Never
+    surfaces file contents.
+  tags: [forensics, execution-artifacts, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: execution_artifacts
+    action: prefetch
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # prefetch|<exe_name>|<hash_hex>|<version>|<run_count>|<last_runs csv>|
+    #   <volume_count>|<file_ref_count>
+    columns:
+      - name: exe_name
+        type: string
+        description: Executable name recorded in the Prefetch file's header, escaped.
+        example: "NOTEPAD.EXE"
+        platforms: [windows]
+      - name: hash_hex
+        type: string
+        description: 8-uppercase-hex-digit Prefetch hash from the filename/header.
+        example: "DDFD0A8D"
+        platforms: [windows]
+      - name: version
+        type: int32
+        description: >
+          Prefetch format version; only 23, 26, 30 and 31 decode — see
+          Caveats.
+        example: 31
+        platforms: [windows]
+      - name: run_count
+        type: int64
+        description: Recorded run count.
+        example: 42
+        platforms: [windows]
+      - name: last_runs_epoch_ms
+        type: string
+        description: >
+          Comma-separated last-run timestamps (up to 8 on versions
+          26/30/31, 1 on version 23), epoch milliseconds.
+        example: "1690000000000,1689999999000"
+        platforms: [windows]
+      - name: volume_count
+        type: int64
+        description: Number of volume entries in the file-information block.
+        example: 1
+        platforms: [windows]
+      - name: file_ref_count
+        type: int64
+        description: Total number of NTFS file references, summed across every
+          declared volume entry in the file-information block (not just the
+          first).
+        example: 12
+        platforms: [windows]
+
+  readablePayload: "Read Prefetch execution history"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [execution_artifacts]
+
+status:
+  phase: active

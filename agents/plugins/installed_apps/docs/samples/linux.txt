@@ -1,0 +1,633 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash 3690edc65cda
+== action=list
+app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-|-|-
+app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-|-|-
+app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-|-|-
+app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-|-|-
+app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-|-|-
+app|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
+app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-|-|-
+app|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|ca-certificates|20250419|Julien Cristau <jcristau@debian.org>|-|-|-
+app|cmake|3.31.6-2|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>|-|-|-
+app|cmake-data|3.31.6-2|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>|-|-|-
+app|coreutils|9.7-3|Michael Stone <mstone@debian.org>|-|-|-
+app|cpp|4:14.2.0-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|cpp-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|cpp-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|cpp-14|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|cpp-14-aarch64-linux-gnu|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|cpp-aarch64-linux-gnu|4:14.2.0-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|curl|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|dash|0.5.12-12|Andrej Shadura <andrewsh@debian.org>|-|-|-
+app|debconf|1.5.91|Debconf Developers <debconf-devel@lists.alioth.debian.org>|-|-|-
+app|debian-archive-keyring|2025.1|Debian Release Team <packages@release.debian.org>|-|-|-
+app|debianutils|5.23.2|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-|-|-
+app|diffutils|1:3.10-4|Santiago Vila <sanvila@debian.org>|-|-|-
+app|dpkg|1.22.22|Dpkg Developers <debian-dpkg@lists.debian.org>|-|-|-
+app|file|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-|-|-
+app|findutils|4.10.0-3|Andreas Metzler <ametzler@debian.org>|-|-|-
+app|flex|2.6.4-8.2+b4|Manoj Srivastava <srivasta@debian.org>|-|-|-
+app|g++-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|g++-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|gcc-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|gcc-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|gcc-13-base|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|gcc-14-base|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|git|1:2.47.3-0+deb13u1|Jonathan Nieder <jrnieder@gmail.com>|-|-|-
+app|git-man|1:2.47.3-0+deb13u1|Jonathan Nieder <jrnieder@gmail.com>|-|-|-
+app|grep|3.11-4+b1|Anibal Monsalve Salazar <anibal@debian.org>|-|-|-
+app|gzip|1.13-1|Milan Kupcevic <milan@debian.org>|-|-|-
+app|hostname|3.25|Michael Meskes <meskes@debian.org>|-|-|-
+app|init-system-helpers|1.69~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-|-|-
+app|libacl1|2.3.2-2+b1|Guillem Jover <guillem@debian.org>|-|-|-
+app|libapt-pkg7.0|3.0.3|APT Development Team <deity@lists.debian.org>|-|-|-
+app|libarchive13t64|3.7.4-4+deb13u1|Peter Pentchev <roam@debian.org>|-|-|-
+app|libasan8|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libatomic1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libattr1|1:2.5.2-3|Guillem Jover <guillem@debian.org>|-|-|-
+app|libaudit-common|1:4.0.2-2|Laurent Bigonville <bigon@debian.org>|-|-|-
+app|libaudit1|1:4.0.2-2+b2|Laurent Bigonville <bigon@debian.org>|-|-|-
+app|libbinutils|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|libblkid-dev|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libblkid1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libbrotli1|1.1.0-2+b7|Tomasz Buchert <tomasz@debian.org>|-|-|-
+app|libbsd0|0.12.2-2|Guillem Jover <guillem@debian.org>|-|-|-
+app|libbz2-1.0|1.0.8-6|Anibal Monsalve Salazar <anibal@debian.org>|-|-|-
+app|libc-bin|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|libc-dev-bin|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|libc6|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|libc6-dev|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|libcap-dev|1:2.75-10+deb13u1+b3|Christian Kastner <ckk@debian.org>|-|-|-
+app|libcap-ng0|0.8.5-4+b1|Håvard F. Aasen <havard.f.aasen@pfft.no>|-|-|-
+app|libcap2|1:2.75-10+deb13u1+b3|Christian Kastner <ckk@debian.org>|-|-|-
+app|libcc1-0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libcom-err2|1.47.2-3+b12|Theodore Y. Ts'o <tytso@mit.edu>|-|-|-
+app|libcrypt-dev|1:4.4.38-1|Marco d'Itri <md@linux.it>|-|-|-
+app|libcrypt1|1:4.4.38-1|Marco d'Itri <md@linux.it>|-|-|-
+app|libctf-nobfd0|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|libctf0|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|libcurl3t64-gnutls|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|libcurl4t64|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|libdb5.3t64|5.3.28+dfsg2-9|Debian QA Group <packages@qa.debian.org>|-|-|-
+app|libdebconfclient0|0.280|Debian Install System Team <debian-boot@lists.debian.org>|-|-|-
+app|liberror-perl|0.17030-1|Debian Perl Group <pkg-perl-maintainers@lists.alioth.debian.org>|-|-|-
+app|libexpat1|2.8.3-1~deb13u1|Laszlo Boszormenyi (GCS) <gcs@debian.org>|-|-|-
+app|libffi8|3.4.8-2|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libgcc-13-dev|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libgcc-s1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libgdbm-compat4t64|1.24-2|Nicolas Mora <babelouest@debian.org>|-|-|-
+app|libgdbm6t64|1.24-2|Nicolas Mora <babelouest@debian.org>|-|-|-
+app|libgmp10|2:6.3.0+dfsg-3|Debian Science Maintainers <debian-science-maintainers@lists.alioth.debian.org>|-|-|-
+app|libgnutls30t64|3.8.9-3+deb13u4|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-|-|-
+app|libgomp1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libgprofng0|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|libgssapi-krb5-2|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libhogweed6t64|3.10.1-1|Magnus Holmgren <holmgren@debian.org>|-|-|-
+app|libhwasan0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libidn2-0|2.3.8-2|Debian Libidn team <help-libidn@gnu.org>|-|-|-
+app|libisl23|0.27-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libitm1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libjansson4|2.14-2+b3|Alessandro Ghedini <ghedo@debian.org>|-|-|-
+app|libjsoncpp26|1.9.6-3|Timo Röhling <roehling@debian.org>|-|-|-
+app|libk5crypto3|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libkeyutils1|1.6.3-6|Christian Kastner <ckk@debian.org>|-|-|-
+app|libkrb5-3|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libkrb5support0|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-|-|-
+app|liblastlog2-2|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libldap2|2.6.10+dfsg-1|Debian OpenLDAP Maintainers <pkg-openldap-devel@lists.alioth.debian.org>|-|-|-
+app|liblsan0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|liblz4-1|1.10.0-4|Nobuhiro Iwamatsu <iwamatsu@debian.org>|-|-|-
+app|liblzma5|5.8.1-1+deb13u1|Sebastian Andrzej Siewior <sebastian@breakpoint.cc>|-|-|-
+app|libmagic-mgc|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-|-|-
+app|libmagic1t64|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-|-|-
+app|libmd0|1.1.0-2+b1|Guillem Jover <guillem@debian.org>|-|-|-
+app|libmount1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libmpc3|1.3.1-1+b3|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libmpfr6|4.2.2-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libncursesw6|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-|-|-
+app|libnettle8t64|3.10.1-1|Magnus Holmgren <holmgren@debian.org>|-|-|-
+app|libnghttp2-14|1.64.0-1.1+deb13u1|Tomasz Buchert <tomasz@debian.org>|-|-|-
+app|libnghttp3-9|1.8.0-1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|libngtcp2-16|1.11.0-1+deb13u1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|libngtcp2-crypto-gnutls8|1.11.0-1+deb13u1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-|-|-
+app|libp11-kit0|0.25.5-3|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-|-|-
+app|libpam-modules|1.7.0-5|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libpam-modules-bin|1.7.0-5|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libpam-runtime|1.7.0-5|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libpam0g|1.7.0-5|Sam Hartman <hartmans@debian.org>|-|-|-
+app|libpcre2-8-0|10.46-1~deb13u1|Matthew Vernon <matthew@debian.org>|-|-|-
+app|libperl5.40|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-|-|-
+app|libpkgconf3|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-|-|-
+app|libproc2-0|2:4.0.4-9|Craig Small <csmall@debian.org>|-|-|-
+app|libpsl5t64|0.21.2-1.1+b1|Tim Rühsen <tim.ruehsen@gmx.de>|-|-|-
+app|libpython3-stdlib|3.13.5-1|Matthias Klose <doko@debian.org>|-|-|-
+app|libpython3.13-minimal|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-|-|-
+app|libpython3.13-stdlib|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-|-|-
+app|libreadline8t64|8.2-6|Matthias Klose <doko@debian.org>|-|-|-
+app|librhash1|1.4.5-1|Debian Security Tools <team+pkg-security@tracker.debian.org>|-|-|-
+app|librtmp1|2.4+20151223.gitfa8646d.1-2+b5|Debian Multimedia Maintainers <debian-multimedia@lists.debian.org>|-|-|-
+app|libsasl2-2|2.1.28+dfsg1-9|Debian Cyrus Team <team+cyrus@tracker.debian.org>|-|-|-
+app|libsasl2-modules-db|2.1.28+dfsg1-9|Debian Cyrus Team <team+cyrus@tracker.debian.org>|-|-|-
+app|libseccomp2|2.6.0-2|Kees Cook <kees@debian.org>|-|-|-
+app|libselinux1|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-|-|-
+app|libsemanage-common|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-|-|-
+app|libsemanage2|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-|-|-
+app|libsepol2|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-|-|-
+app|libsframe1|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
+app|libsmartcols1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libsqlite3-0|3.46.1-7+deb13u1|Laszlo Boszormenyi (GCS) <gcs@debian.org>|-|-|-
+app|libssh2-1t64|1.11.1-1+deb13u2|Nicolas Mora <babelouest@debian.org>|-|-|-
+app|libssl3t64|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-|-|-
+app|libstdc++-13-dev|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libstdc++6|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libsystemd-dev|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-|-|-
+app|libsystemd0|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-|-|-
+app|libtasn1-6|4.20.0-2+deb13u1|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-|-|-
+app|libtinfo6|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-|-|-
+app|libtool|2.5.4-4|Alastair McKinstry <mckinstry@debian.org>|-|-|-
+app|libtsan2|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libubsan1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-|-|-
+app|libudev1|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-|-|-
+app|libunistring5|1.3-2|Jörg Frings-Fürst <debian@jff.email>|-|-|-
+app|libuuid1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|libuv1t64|1.50.0-2|Dominique Dumont <dod@debian.org>|-|-|-
+app|libxml2|2.12.7+dfsg+really2.9.14-2.1+deb13u3|Debian XML/SGML Group <debian-xml-sgml-pkgs@lists.alioth.debian.org>|-|-|-
+app|libxxhash0|0.8.3-2|Josue Ortega <josue@debian.org>|-|-|-
+app|libyaml-0-2|0.2.5-2|Florian Ernst <florian@debian.org>|-|-|-
+app|libzstd1|1.5.7+dfsg-1|RPM packaging team <team+pkg-rpm@tracker.debian.org>|-|-|-
+app|linux-libc-dev|6.12.107-1|Debian Kernel Team <debian-kernel@lists.debian.org>|-|-|-
+app|login|1:4.16.0-2+really2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|login.defs|1:4.17.4-2|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
+app|m4|1.4.19-8|Santiago Vila <sanvila@debian.org>|-|-|-
+app|make|4.4.1-2|Stephen Kitt <skitt@debian.org>|-|-|-
+app|mawk|1.3.4.20250131-1|Boyuan Yang <byang@debian.org>|-|-|-
+app|media-types|13.0.0|Mime-Support Packagers <team+debian-mimesupport-packagers@tracker.debian.org>|-|-|-
+app|mount|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|ncurses-base|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-|-|-
+app|ncurses-bin|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-|-|-
+app|netbase|6.5|Marco d'Itri <md@linux.it>|-|-|-
+app|ninja-build|1.12.1-1+b1|Felix Geyer <fgeyer@debian.org>|-|-|-
+app|openssl|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-|-|-
+app|openssl-provider-legacy|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-|-|-
+app|passwd|1:4.17.4-2|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
+app|perl|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-|-|-
+app|perl-base|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-|-|-
+app|perl-modules-5.40|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-|-|-
+app|pkg-config|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-|-|-
+app|pkgconf|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-|-|-
+app|pkgconf-bin|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-|-|-
+app|procps|2:4.0.4-9|Craig Small <csmall@debian.org>|-|-|-
+app|python3|3.13.5-1|Matthias Klose <doko@debian.org>|-|-|-
+app|python3-minimal|3.13.5-1|Matthias Klose <doko@debian.org>|-|-|-
+app|python3-packaging|25.0-1|Debian Python Team <team+python@tracker.debian.org>|-|-|-
+app|python3-pip|25.1.1+dfsg-1|Debian Python Team <team+python@tracker.debian.org>|-|-|-
+app|python3-pip-whl|25.1.1+dfsg-1|Debian Python Team <team+python@tracker.debian.org>|-|-|-
+app|python3-setuptools-whl|78.1.1-0.1|Matthias Klose <doko@debian.org>|-|-|-
+app|python3-venv|3.13.5-1|Matthias Klose <doko@debian.org>|-|-|-
+app|python3-wheel|0.46.1-2|Debian Python Team <team+python@tracker.debian.org>|-|-|-
+app|python3-yaml|6.0.2-1+b2|Debian Python Team <team+python@tracker.debian.org>|-|-|-
+app|python3.13|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-|-|-
+app|python3.13-minimal|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-|-|-
+app|python3.13-venv|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-|-|-
+app|readline-common|8.2-6|Matthias Klose <doko@debian.org>|-|-|-
+app|rpcsvc-proto|1.4.3-1+b1|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|sed|4.9-2+deb13u1|Clint Adams <clint@debian.org>|-|-|-
+app|sqv|1.3.0-3+b2|Debian Rust Maintainers <pkg-rust-maintainers@alioth-lists.debian.net>|-|-|-
+app|sysvinit-utils|3.14-4|Debian sysvinit maintainers <debian-init-diversity@chiark.greenend.org.uk>|-|-|-
+app|tar|1.35+dfsg-3.1|Janos Lenart <ocsi@debian.org>|-|-|-
+app|tzdata|2026b-0+deb13u1|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-|-|-
+app|unzip|6.0-29+deb13u1|Santiago Vila <sanvila@debian.org>|-|-|-
+app|util-linux|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|uuid-dev|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
+app|zip|3.0-15+deb13u1|Santiago Vila <sanvila@debian.org>|-|-|-
+app|zlib1g|1:1.3.dfsg+really1.3.1-1+b1|Mark Brown <broonie@debian.org>|-|-|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=query name=bash
+found|true
+app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_per_user
+user_app|system|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-
+user_app|system|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-
+user_app|system|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-
+user_app|system|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-
+user_app|system|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-
+user_app|system|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
+user_app|system|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-
+user_app|system|binutils|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-
+user_app|system|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|ca-certificates|20250419|Julien Cristau <jcristau@debian.org>|-
+user_app|system|cmake|3.31.6-2|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>|-
+user_app|system|cmake-data|3.31.6-2|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>|-
+user_app|system|coreutils|9.7-3|Michael Stone <mstone@debian.org>|-
+user_app|system|cpp|4:14.2.0-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|cpp-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|cpp-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|cpp-14|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|cpp-14-aarch64-linux-gnu|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|cpp-aarch64-linux-gnu|4:14.2.0-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|curl|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|dash|0.5.12-12|Andrej Shadura <andrewsh@debian.org>|-
+user_app|system|debconf|1.5.91|Debconf Developers <debconf-devel@lists.alioth.debian.org>|-
+user_app|system|debian-archive-keyring|2025.1|Debian Release Team <packages@release.debian.org>|-
+user_app|system|debianutils|5.23.2|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-
+user_app|system|diffutils|1:3.10-4|Santiago Vila <sanvila@debian.org>|-
+user_app|system|dpkg|1.22.22|Dpkg Developers <debian-dpkg@lists.debian.org>|-
+user_app|system|file|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-
+user_app|system|findutils|4.10.0-3|Andreas Metzler <ametzler@debian.org>|-
+user_app|system|flex|2.6.4-8.2+b4|Manoj Srivastava <srivasta@debian.org>|-
+user_app|system|g++-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|g++-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|gcc-13|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|gcc-13-aarch64-linux-gnu|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|gcc-13-base|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|gcc-14-base|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|git|1:2.47.3-0+deb13u1|Jonathan Nieder <jrnieder@gmail.com>|-
+user_app|system|git-man|1:2.47.3-0+deb13u1|Jonathan Nieder <jrnieder@gmail.com>|-
+user_app|system|grep|3.11-4+b1|Anibal Monsalve Salazar <anibal@debian.org>|-
+user_app|system|gzip|1.13-1|Milan Kupcevic <milan@debian.org>|-
+user_app|system|hostname|3.25|Michael Meskes <meskes@debian.org>|-
+user_app|system|init-system-helpers|1.69~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-
+user_app|system|libacl1|2.3.2-2+b1|Guillem Jover <guillem@debian.org>|-
+user_app|system|libapt-pkg7.0|3.0.3|APT Development Team <deity@lists.debian.org>|-
+user_app|system|libarchive13t64|3.7.4-4+deb13u1|Peter Pentchev <roam@debian.org>|-
+user_app|system|libasan8|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libatomic1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libattr1|1:2.5.2-3|Guillem Jover <guillem@debian.org>|-
+user_app|system|libaudit-common|1:4.0.2-2|Laurent Bigonville <bigon@debian.org>|-
+user_app|system|libaudit1|1:4.0.2-2+b2|Laurent Bigonville <bigon@debian.org>|-
+user_app|system|libbinutils|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|libblkid-dev|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libblkid1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libbrotli1|1.1.0-2+b7|Tomasz Buchert <tomasz@debian.org>|-
+user_app|system|libbsd0|0.12.2-2|Guillem Jover <guillem@debian.org>|-
+user_app|system|libbz2-1.0|1.0.8-6|Anibal Monsalve Salazar <anibal@debian.org>|-
+user_app|system|libc-bin|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|libc-dev-bin|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|libc6|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|libc6-dev|2.41-12+deb13u4|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|libcap-dev|1:2.75-10+deb13u1+b3|Christian Kastner <ckk@debian.org>|-
+user_app|system|libcap-ng0|0.8.5-4+b1|Håvard F. Aasen <havard.f.aasen@pfft.no>|-
+user_app|system|libcap2|1:2.75-10+deb13u1+b3|Christian Kastner <ckk@debian.org>|-
+user_app|system|libcc1-0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libcom-err2|1.47.2-3+b12|Theodore Y. Ts'o <tytso@mit.edu>|-
+user_app|system|libcrypt-dev|1:4.4.38-1|Marco d'Itri <md@linux.it>|-
+user_app|system|libcrypt1|1:4.4.38-1|Marco d'Itri <md@linux.it>|-
+user_app|system|libctf-nobfd0|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|libctf0|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|libcurl3t64-gnutls|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|libcurl4t64|8.14.1-2+deb13u5|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|libdb5.3t64|5.3.28+dfsg2-9|Debian QA Group <packages@qa.debian.org>|-
+user_app|system|libdebconfclient0|0.280|Debian Install System Team <debian-boot@lists.debian.org>|-
+user_app|system|liberror-perl|0.17030-1|Debian Perl Group <pkg-perl-maintainers@lists.alioth.debian.org>|-
+user_app|system|libexpat1|2.8.3-1~deb13u1|Laszlo Boszormenyi (GCS) <gcs@debian.org>|-
+user_app|system|libffi8|3.4.8-2|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libgcc-13-dev|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libgcc-s1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libgdbm-compat4t64|1.24-2|Nicolas Mora <babelouest@debian.org>|-
+user_app|system|libgdbm6t64|1.24-2|Nicolas Mora <babelouest@debian.org>|-
+user_app|system|libgmp10|2:6.3.0+dfsg-3|Debian Science Maintainers <debian-science-maintainers@lists.alioth.debian.org>|-
+user_app|system|libgnutls30t64|3.8.9-3+deb13u4|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-
+user_app|system|libgomp1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libgprofng0|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|libgssapi-krb5-2|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libhogweed6t64|3.10.1-1|Magnus Holmgren <holmgren@debian.org>|-
+user_app|system|libhwasan0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libidn2-0|2.3.8-2|Debian Libidn team <help-libidn@gnu.org>|-
+user_app|system|libisl23|0.27-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libitm1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libjansson4|2.14-2+b3|Alessandro Ghedini <ghedo@debian.org>|-
+user_app|system|libjsoncpp26|1.9.6-3|Timo Röhling <roehling@debian.org>|-
+user_app|system|libk5crypto3|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libkeyutils1|1.6.3-6|Christian Kastner <ckk@debian.org>|-
+user_app|system|libkrb5-3|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libkrb5support0|1.21.3-5+deb13u1|Sam Hartman <hartmans@debian.org>|-
+user_app|system|liblastlog2-2|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libldap2|2.6.10+dfsg-1|Debian OpenLDAP Maintainers <pkg-openldap-devel@lists.alioth.debian.org>|-
+user_app|system|liblsan0|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|liblz4-1|1.10.0-4|Nobuhiro Iwamatsu <iwamatsu@debian.org>|-
+user_app|system|liblzma5|5.8.1-1+deb13u1|Sebastian Andrzej Siewior <sebastian@breakpoint.cc>|-
+user_app|system|libmagic-mgc|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-
+user_app|system|libmagic1t64|1:5.46-5|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>|-
+user_app|system|libmd0|1.1.0-2+b1|Guillem Jover <guillem@debian.org>|-
+user_app|system|libmount1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libmpc3|1.3.1-1+b3|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libmpfr6|4.2.2-1|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libncursesw6|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-
+user_app|system|libnettle8t64|3.10.1-1|Magnus Holmgren <holmgren@debian.org>|-
+user_app|system|libnghttp2-14|1.64.0-1.1+deb13u1|Tomasz Buchert <tomasz@debian.org>|-
+user_app|system|libnghttp3-9|1.8.0-1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|libngtcp2-16|1.11.0-1+deb13u1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|libngtcp2-crypto-gnutls8|1.11.0-1+deb13u1|Debian Curl Maintainers <team+curl@tracker.debian.org>|-
+user_app|system|libp11-kit0|0.25.5-3|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-
+user_app|system|libpam-modules|1.7.0-5|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libpam-modules-bin|1.7.0-5|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libpam-runtime|1.7.0-5|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libpam0g|1.7.0-5|Sam Hartman <hartmans@debian.org>|-
+user_app|system|libpcre2-8-0|10.46-1~deb13u1|Matthew Vernon <matthew@debian.org>|-
+user_app|system|libperl5.40|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-
+user_app|system|libpkgconf3|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-
+user_app|system|libproc2-0|2:4.0.4-9|Craig Small <csmall@debian.org>|-
+user_app|system|libpsl5t64|0.21.2-1.1+b1|Tim Rühsen <tim.ruehsen@gmx.de>|-
+user_app|system|libpython3-stdlib|3.13.5-1|Matthias Klose <doko@debian.org>|-
+user_app|system|libpython3.13-minimal|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-
+user_app|system|libpython3.13-stdlib|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-
+user_app|system|libreadline8t64|8.2-6|Matthias Klose <doko@debian.org>|-
+user_app|system|librhash1|1.4.5-1|Debian Security Tools <team+pkg-security@tracker.debian.org>|-
+user_app|system|librtmp1|2.4+20151223.gitfa8646d.1-2+b5|Debian Multimedia Maintainers <debian-multimedia@lists.debian.org>|-
+user_app|system|libsasl2-2|2.1.28+dfsg1-9|Debian Cyrus Team <team+cyrus@tracker.debian.org>|-
+user_app|system|libsasl2-modules-db|2.1.28+dfsg1-9|Debian Cyrus Team <team+cyrus@tracker.debian.org>|-
+user_app|system|libseccomp2|2.6.0-2|Kees Cook <kees@debian.org>|-
+user_app|system|libselinux1|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-
+user_app|system|libsemanage-common|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-
+user_app|system|libsemanage2|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-
+user_app|system|libsepol2|3.8.1-1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>|-
+user_app|system|libsframe1|2.44-3|Matthias Klose <doko@debian.org>|-
+user_app|system|libsmartcols1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libsqlite3-0|3.46.1-7+deb13u1|Laszlo Boszormenyi (GCS) <gcs@debian.org>|-
+user_app|system|libssh2-1t64|1.11.1-1+deb13u2|Nicolas Mora <babelouest@debian.org>|-
+user_app|system|libssl3t64|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-
+user_app|system|libstdc++-13-dev|13.3.0-16|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libstdc++6|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libsystemd-dev|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-
+user_app|system|libsystemd0|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-
+user_app|system|libtasn1-6|4.20.0-2+deb13u1|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>|-
+user_app|system|libtinfo6|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-
+user_app|system|libtool|2.5.4-4|Alastair McKinstry <mckinstry@debian.org>|-
+user_app|system|libtsan2|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libubsan1|14.2.0-19|Debian GCC Maintainers <debian-gcc@lists.debian.org>|-
+user_app|system|libudev1|257.13-1~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>|-
+user_app|system|libunistring5|1.3-2|Jörg Frings-Fürst <debian@jff.email>|-
+user_app|system|libuuid1|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|libuv1t64|1.50.0-2|Dominique Dumont <dod@debian.org>|-
+user_app|system|libxml2|2.12.7+dfsg+really2.9.14-2.1+deb13u3|Debian XML/SGML Group <debian-xml-sgml-pkgs@lists.alioth.debian.org>|-
+user_app|system|libxxhash0|0.8.3-2|Josue Ortega <josue@debian.org>|-
+user_app|system|libyaml-0-2|0.2.5-2|Florian Ernst <florian@debian.org>|-
+user_app|system|libzstd1|1.5.7+dfsg-1|RPM packaging team <team+pkg-rpm@tracker.debian.org>|-
+user_app|system|linux-libc-dev|6.12.107-1|Debian Kernel Team <debian-kernel@lists.debian.org>|-
+user_app|system|login|1:4.16.0-2+really2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|login.defs|1:4.17.4-2|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
+user_app|system|m4|1.4.19-8|Santiago Vila <sanvila@debian.org>|-
+user_app|system|make|4.4.1-2|Stephen Kitt <skitt@debian.org>|-
+user_app|system|mawk|1.3.4.20250131-1|Boyuan Yang <byang@debian.org>|-
+user_app|system|media-types|13.0.0|Mime-Support Packagers <team+debian-mimesupport-packagers@tracker.debian.org>|-
+user_app|system|mount|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|ncurses-base|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-
+user_app|system|ncurses-bin|6.5+20250216-2|Ncurses Maintainers <ncurses@packages.debian.org>|-
+user_app|system|netbase|6.5|Marco d'Itri <md@linux.it>|-
+user_app|system|ninja-build|1.12.1-1+b1|Felix Geyer <fgeyer@debian.org>|-
+user_app|system|openssl|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-
+user_app|system|openssl-provider-legacy|3.5.7-1~deb13u2|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>|-
+user_app|system|passwd|1:4.17.4-2|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
+user_app|system|perl|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-
+user_app|system|perl-base|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-
+user_app|system|perl-modules-5.40|5.40.1-6+deb13u1|Niko Tyni <ntyni@debian.org>|-
+user_app|system|pkg-config|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-
+user_app|system|pkgconf|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-
+user_app|system|pkgconf-bin|1.8.1-4|Andrej Shadura <andrewsh@debian.org>|-
+user_app|system|procps|2:4.0.4-9|Craig Small <csmall@debian.org>|-
+user_app|system|python3|3.13.5-1|Matthias Klose <doko@debian.org>|-
+user_app|system|python3-minimal|3.13.5-1|Matthias Klose <doko@debian.org>|-
+user_app|system|python3-packaging|25.0-1|Debian Python Team <team+python@tracker.debian.org>|-
+user_app|system|python3-pip|25.1.1+dfsg-1|Debian Python Team <team+python@tracker.debian.org>|-
+user_app|system|python3-pip-whl|25.1.1+dfsg-1|Debian Python Team <team+python@tracker.debian.org>|-
+user_app|system|python3-setuptools-whl|78.1.1-0.1|Matthias Klose <doko@debian.org>|-
+user_app|system|python3-venv|3.13.5-1|Matthias Klose <doko@debian.org>|-
+user_app|system|python3-wheel|0.46.1-2|Debian Python Team <team+python@tracker.debian.org>|-
+user_app|system|python3-yaml|6.0.2-1+b2|Debian Python Team <team+python@tracker.debian.org>|-
+user_app|system|python3.13|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-
+user_app|system|python3.13-minimal|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-
+user_app|system|python3.13-venv|3.13.5-2+deb13u5|Matthias Klose <doko@debian.org>|-
+user_app|system|readline-common|8.2-6|Matthias Klose <doko@debian.org>|-
+user_app|system|rpcsvc-proto|1.4.3-1+b1|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|sed|4.9-2+deb13u1|Clint Adams <clint@debian.org>|-
+user_app|system|sqv|1.3.0-3+b2|Debian Rust Maintainers <pkg-rust-maintainers@alioth-lists.debian.net>|-
+user_app|system|sysvinit-utils|3.14-4|Debian sysvinit maintainers <debian-init-diversity@chiark.greenend.org.uk>|-
+user_app|system|tar|1.35+dfsg-3.1|Janos Lenart <ocsi@debian.org>|-
+user_app|system|tzdata|2026b-0+deb13u1|GNU Libc Maintainers <debian-glibc@lists.debian.org>|-
+user_app|system|unzip|6.0-29+deb13u1|Santiago Vila <sanvila@debian.org>|-
+user_app|system|util-linux|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|uuid-dev|2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
+user_app|system|zip|3.0-15+deb13u1|Santiago Vila <sanvila@debian.org>|-
+user_app|system|zlib1g|1:1.3.dfsg+really1.3.1-1+b1|Mark Brown <broonie@debian.org>|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_inventory
+inv|apt|3.0.3|APT Development Team <deity@lists.debian.org>||package|deb|||arm64||debian|13
+inv|autoconf|2.72|Alex Myczko <tar@debian.org>||package|deb||3.1|all||debian|13
+inv|automake|1.17|Eric Dorland <eric@debian.org>||package|deb|1|4|all||debian|13
+inv|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>||package|deb|||all||debian|13
+inv|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>||package|deb|||arm64||debian|13
+inv|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>||package|deb|||arm64||debian|13
+inv|bash|5.2.37|Matthias Klose <doko@debian.org>||package|deb||2+b9|arm64||debian|13
+inv|binutils|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|binutils-aarch64-linux-gnu|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|binutils-common|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|bison|3.8.2+dfsg|Chuan-kai Lin <cklin@debian.org>||package|deb|2|1+b2|arm64||debian|13
+inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u1|arm64||debian|13
+inv|ca-certificates|20250419|Julien Cristau <jcristau@debian.org>||package|deb|||all||debian|13
+inv|cmake|3.31.6|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>||package|deb||2|arm64||debian|13
+inv|cmake-data|3.31.6|Debian CMake Team <pkg-cmake-team@lists.alioth.debian.org>||package|deb||2|all||debian|13
+inv|coreutils|9.7|Michael Stone <mstone@debian.org>||package|deb||3|arm64||debian|13
+inv|cpp|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb|4|1|arm64||debian|13
+inv|cpp-13|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|cpp-13-aarch64-linux-gnu|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|cpp-14|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|cpp-14-aarch64-linux-gnu|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|cpp-aarch64-linux-gnu|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb|4|1|arm64||debian|13
+inv|curl|8.14.1|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|dash|0.5.12|Andrej Shadura <andrewsh@debian.org>||package|deb||12|arm64||debian|13
+inv|debconf|1.5.91|Debconf Developers <debconf-devel@lists.alioth.debian.org>||package|deb|||all||debian|13
+inv|debian-archive-keyring|2025.1|Debian Release Team <packages@release.debian.org>||package|deb|||all||debian|13
+inv|debianutils|5.23.2|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>||package|deb|||arm64||debian|13
+inv|diffutils|3.10|Santiago Vila <sanvila@debian.org>||package|deb|1|4|arm64||debian|13
+inv|dpkg|1.22.22|Dpkg Developers <debian-dpkg@lists.debian.org>||package|deb|||arm64||debian|13
+inv|file|5.46|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>||package|deb|1|5|arm64||debian|13
+inv|findutils|4.10.0|Andreas Metzler <ametzler@debian.org>||package|deb||3|arm64||debian|13
+inv|flex|2.6.4|Manoj Srivastava <srivasta@debian.org>||package|deb||8.2+b4|arm64||debian|13
+inv|g++-13|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|g++-13-aarch64-linux-gnu|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|gcc-13|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|gcc-13-aarch64-linux-gnu|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|gcc-13-base|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|gcc-14-base|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|git|2.47.3|Jonathan Nieder <jrnieder@gmail.com>||package|deb|1|0+deb13u1|arm64||debian|13
+inv|git-man|2.47.3|Jonathan Nieder <jrnieder@gmail.com>||package|deb|1|0+deb13u1|all||debian|13
+inv|grep|3.11|Anibal Monsalve Salazar <anibal@debian.org>||package|deb||4+b1|arm64||debian|13
+inv|gzip|1.13|Milan Kupcevic <milan@debian.org>||package|deb||1|arm64||debian|13
+inv|hostname|3.25|Michael Meskes <meskes@debian.org>||package|deb|||arm64||debian|13
+inv|init-system-helpers|1.69~deb13u1|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>||package|deb|||all||debian|13
+inv|libacl1|2.3.2|Guillem Jover <guillem@debian.org>||package|deb||2+b1|arm64||debian|13
+inv|libapt-pkg7.0|3.0.3|APT Development Team <deity@lists.debian.org>||package|deb|||arm64||debian|13
+inv|libarchive13t64|3.7.4|Peter Pentchev <roam@debian.org>||package|deb||4+deb13u1|arm64||debian|13
+inv|libasan8|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libatomic1|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libattr1|2.5.2|Guillem Jover <guillem@debian.org>||package|deb|1|3|arm64||debian|13
+inv|libaudit-common|4.0.2|Laurent Bigonville <bigon@debian.org>||package|deb|1|2|all||debian|13
+inv|libaudit1|4.0.2|Laurent Bigonville <bigon@debian.org>||package|deb|1|2+b2|arm64||debian|13
+inv|libbinutils|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|libblkid-dev|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libblkid1|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libbrotli1|1.1.0|Tomasz Buchert <tomasz@debian.org>||package|deb||2+b7|arm64||debian|13
+inv|libbsd0|0.12.2|Guillem Jover <guillem@debian.org>||package|deb||2|arm64||debian|13
+inv|libbz2-1.0|1.0.8|Anibal Monsalve Salazar <anibal@debian.org>||package|deb||6|arm64||debian|13
+inv|libc-bin|2.41|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||12+deb13u4|arm64||debian|13
+inv|libc-dev-bin|2.41|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||12+deb13u4|arm64||debian|13
+inv|libc6|2.41|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||12+deb13u4|arm64||debian|13
+inv|libc6-dev|2.41|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||12+deb13u4|arm64||debian|13
+inv|libcap-dev|2.75|Christian Kastner <ckk@debian.org>||package|deb|1|10+deb13u1+b3|arm64||debian|13
+inv|libcap-ng0|0.8.5|Håvard F. Aasen <havard.f.aasen@pfft.no>||package|deb||4+b1|arm64||debian|13
+inv|libcap2|2.75|Christian Kastner <ckk@debian.org>||package|deb|1|10+deb13u1+b3|arm64||debian|13
+inv|libcc1-0|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libcom-err2|1.47.2|Theodore Y. Ts'o <tytso@mit.edu>||package|deb||3+b12|arm64||debian|13
+inv|libcrypt-dev|4.4.38|Marco d'Itri <md@linux.it>||package|deb|1|1|arm64||debian|13
+inv|libcrypt1|4.4.38|Marco d'Itri <md@linux.it>||package|deb|1|1|arm64||debian|13
+inv|libctf-nobfd0|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|libctf0|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|libcurl3t64-gnutls|8.14.1|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|libcurl4t64|8.14.1|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|libdb5.3t64|5.3.28+dfsg2|Debian QA Group <packages@qa.debian.org>||package|deb||9|arm64||debian|13
+inv|libdebconfclient0|0.280|Debian Install System Team <debian-boot@lists.debian.org>||package|deb|||arm64||debian|13
+inv|liberror-perl|0.17030|Debian Perl Group <pkg-perl-maintainers@lists.alioth.debian.org>||package|deb||1|all||debian|13
+inv|libexpat1|2.8.3|Laszlo Boszormenyi (GCS) <gcs@debian.org>||package|deb||1~deb13u1|arm64||debian|13
+inv|libffi8|3.4.8|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||2|arm64||debian|13
+inv|libgcc-13-dev|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|libgcc-s1|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libgdbm-compat4t64|1.24|Nicolas Mora <babelouest@debian.org>||package|deb||2|arm64||debian|13
+inv|libgdbm6t64|1.24|Nicolas Mora <babelouest@debian.org>||package|deb||2|arm64||debian|13
+inv|libgmp10|6.3.0+dfsg|Debian Science Maintainers <debian-science-maintainers@lists.alioth.debian.org>||package|deb|2|3|arm64||debian|13
+inv|libgnutls30t64|3.8.9|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>||package|deb||3+deb13u4|arm64||debian|13
+inv|libgomp1|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libgprofng0|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|libgssapi-krb5-2|1.21.3|Sam Hartman <hartmans@debian.org>||package|deb||5+deb13u1|arm64||debian|13
+inv|libhogweed6t64|3.10.1|Magnus Holmgren <holmgren@debian.org>||package|deb||1|arm64||debian|13
+inv|libhwasan0|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libidn2-0|2.3.8|Debian Libidn team <help-libidn@gnu.org>||package|deb||2|arm64||debian|13
+inv|libisl23|0.27|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||1|arm64||debian|13
+inv|libitm1|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libjansson4|2.14|Alessandro Ghedini <ghedo@debian.org>||package|deb||2+b3|arm64||debian|13
+inv|libjsoncpp26|1.9.6|Timo Röhling <roehling@debian.org>||package|deb||3|arm64||debian|13
+inv|libk5crypto3|1.21.3|Sam Hartman <hartmans@debian.org>||package|deb||5+deb13u1|arm64||debian|13
+inv|libkeyutils1|1.6.3|Christian Kastner <ckk@debian.org>||package|deb||6|arm64||debian|13
+inv|libkrb5-3|1.21.3|Sam Hartman <hartmans@debian.org>||package|deb||5+deb13u1|arm64||debian|13
+inv|libkrb5support0|1.21.3|Sam Hartman <hartmans@debian.org>||package|deb||5+deb13u1|arm64||debian|13
+inv|liblastlog2-2|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libldap2|2.6.10+dfsg|Debian OpenLDAP Maintainers <pkg-openldap-devel@lists.alioth.debian.org>||package|deb||1|arm64||debian|13
+inv|liblsan0|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|liblz4-1|1.10.0|Nobuhiro Iwamatsu <iwamatsu@debian.org>||package|deb||4|arm64||debian|13
+inv|liblzma5|5.8.1|Sebastian Andrzej Siewior <sebastian@breakpoint.cc>||package|deb||1+deb13u1|arm64||debian|13
+inv|libmagic-mgc|5.46|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>||package|deb|1|5|arm64||debian|13
+inv|libmagic1t64|5.46|Christoph Biedl <debian.axhn@manchmal.in-ulm.de>||package|deb|1|5|arm64||debian|13
+inv|libmd0|1.1.0|Guillem Jover <guillem@debian.org>||package|deb||2+b1|arm64||debian|13
+inv|libmount1|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libmpc3|1.3.1|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||1+b3|arm64||debian|13
+inv|libmpfr6|4.2.2|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||1|arm64||debian|13
+inv|libncursesw6|6.5+20250216|Ncurses Maintainers <ncurses@packages.debian.org>||package|deb||2|arm64||debian|13
+inv|libnettle8t64|3.10.1|Magnus Holmgren <holmgren@debian.org>||package|deb||1|arm64||debian|13
+inv|libnghttp2-14|1.64.0|Tomasz Buchert <tomasz@debian.org>||package|deb||1.1+deb13u1|arm64||debian|13
+inv|libnghttp3-9|1.8.0|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||1|arm64||debian|13
+inv|libngtcp2-16|1.11.0|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||1+deb13u1|arm64||debian|13
+inv|libngtcp2-crypto-gnutls8|1.11.0|Debian Curl Maintainers <team+curl@tracker.debian.org>||package|deb||1+deb13u1|arm64||debian|13
+inv|libp11-kit0|0.25.5|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>||package|deb||3|arm64||debian|13
+inv|libpam-modules|1.7.0|Sam Hartman <hartmans@debian.org>||package|deb||5|arm64||debian|13
+inv|libpam-modules-bin|1.7.0|Sam Hartman <hartmans@debian.org>||package|deb||5|arm64||debian|13
+inv|libpam-runtime|1.7.0|Sam Hartman <hartmans@debian.org>||package|deb||5|all||debian|13
+inv|libpam0g|1.7.0|Sam Hartman <hartmans@debian.org>||package|deb||5|arm64||debian|13
+inv|libpcre2-8-0|10.46|Matthew Vernon <matthew@debian.org>||package|deb||1~deb13u1|arm64||debian|13
+inv|libperl5.40|5.40.1|Niko Tyni <ntyni@debian.org>||package|deb||6+deb13u1|arm64||debian|13
+inv|libpkgconf3|1.8.1|Andrej Shadura <andrewsh@debian.org>||package|deb||4|arm64||debian|13
+inv|libproc2-0|4.0.4|Craig Small <csmall@debian.org>||package|deb|2|9|arm64||debian|13
+inv|libpsl5t64|0.21.2|Tim Rühsen <tim.ruehsen@gmx.de>||package|deb||1.1+b1|arm64||debian|13
+inv|libpython3-stdlib|3.13.5|Matthias Klose <doko@debian.org>||package|deb||1|arm64||debian|13
+inv|libpython3.13-minimal|3.13.5|Matthias Klose <doko@debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|libpython3.13-stdlib|3.13.5|Matthias Klose <doko@debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|libreadline8t64|8.2|Matthias Klose <doko@debian.org>||package|deb||6|arm64||debian|13
+inv|librhash1|1.4.5|Debian Security Tools <team+pkg-security@tracker.debian.org>||package|deb||1|arm64||debian|13
+inv|librtmp1|2.4+20151223.gitfa8646d.1|Debian Multimedia Maintainers <debian-multimedia@lists.debian.org>||package|deb||2+b5|arm64||debian|13
+inv|libsasl2-2|2.1.28+dfsg1|Debian Cyrus Team <team+cyrus@tracker.debian.org>||package|deb||9|arm64||debian|13
+inv|libsasl2-modules-db|2.1.28+dfsg1|Debian Cyrus Team <team+cyrus@tracker.debian.org>||package|deb||9|arm64||debian|13
+inv|libseccomp2|2.6.0|Kees Cook <kees@debian.org>||package|deb||2|arm64||debian|13
+inv|libselinux1|3.8.1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>||package|deb||1|arm64||debian|13
+inv|libsemanage-common|3.8.1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>||package|deb||1|all||debian|13
+inv|libsemanage2|3.8.1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>||package|deb||1|arm64||debian|13
+inv|libsepol2|3.8.1|Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>||package|deb||1|arm64||debian|13
+inv|libsframe1|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
+inv|libsmartcols1|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libsqlite3-0|3.46.1|Laszlo Boszormenyi (GCS) <gcs@debian.org>||package|deb||7+deb13u1|arm64||debian|13
+inv|libssh2-1t64|1.11.1|Nicolas Mora <babelouest@debian.org>||package|deb||1+deb13u2|arm64||debian|13
+inv|libssl3t64|3.5.7|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>||package|deb||1~deb13u2|arm64||debian|13
+inv|libstdc++-13-dev|13.3.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||16|arm64||debian|13
+inv|libstdc++6|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libsystemd-dev|257.13|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>||package|deb||1~deb13u1|arm64||debian|13
+inv|libsystemd0|257.13|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>||package|deb||1~deb13u1|arm64||debian|13
+inv|libtasn1-6|4.20.0|Debian GnuTLS Maintainers <pkg-gnutls-maint@lists.alioth.debian.org>||package|deb||2+deb13u1|arm64||debian|13
+inv|libtinfo6|6.5+20250216|Ncurses Maintainers <ncurses@packages.debian.org>||package|deb||2|arm64||debian|13
+inv|libtool|2.5.4|Alastair McKinstry <mckinstry@debian.org>||package|deb||4|all||debian|13
+inv|libtsan2|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libubsan1|14.2.0|Debian GCC Maintainers <debian-gcc@lists.debian.org>||package|deb||19|arm64||debian|13
+inv|libudev1|257.13|Debian systemd Maintainers <pkg-systemd-maintainers@lists.alioth.debian.org>||package|deb||1~deb13u1|arm64||debian|13
+inv|libunistring5|1.3|Jörg Frings-Fürst <debian@jff.email>||package|deb||2|arm64||debian|13
+inv|libuuid1|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|libuv1t64|1.50.0|Dominique Dumont <dod@debian.org>||package|deb||2|arm64||debian|13
+inv|libxml2|2.12.7+dfsg+really2.9.14|Debian XML/SGML Group <debian-xml-sgml-pkgs@lists.alioth.debian.org>||package|deb||2.1+deb13u3|arm64||debian|13
+inv|libxxhash0|0.8.3|Josue Ortega <josue@debian.org>||package|deb||2|arm64||debian|13
+inv|libyaml-0-2|0.2.5|Florian Ernst <florian@debian.org>||package|deb||2|arm64||debian|13
+inv|libzstd1|1.5.7+dfsg|RPM packaging team <team+pkg-rpm@tracker.debian.org>||package|deb||1|arm64||debian|13
+inv|linux-libc-dev|6.12.107|Debian Kernel Team <debian-kernel@lists.debian.org>||package|deb||1|all||debian|13
+inv|login|4.16.0-2+really2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u1|arm64||debian|13
+inv|login.defs|4.17.4|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>||package|deb|1|2|all||debian|13
+inv|m4|1.4.19|Santiago Vila <sanvila@debian.org>||package|deb||8|arm64||debian|13
+inv|make|4.4.1|Stephen Kitt <skitt@debian.org>||package|deb||2|arm64||debian|13
+inv|mawk|1.3.4.20250131|Boyuan Yang <byang@debian.org>||package|deb||1|arm64||debian|13
+inv|media-types|13.0.0|Mime-Support Packagers <team+debian-mimesupport-packagers@tracker.debian.org>||package|deb|||all||debian|13
+inv|mount|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|ncurses-base|6.5+20250216|Ncurses Maintainers <ncurses@packages.debian.org>||package|deb||2|all||debian|13
+inv|ncurses-bin|6.5+20250216|Ncurses Maintainers <ncurses@packages.debian.org>||package|deb||2|arm64||debian|13
+inv|netbase|6.5|Marco d'Itri <md@linux.it>||package|deb|||all||debian|13
+inv|ninja-build|1.12.1|Felix Geyer <fgeyer@debian.org>||package|deb||1+b1|arm64||debian|13
+inv|openssl|3.5.7|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>||package|deb||1~deb13u2|arm64||debian|13
+inv|openssl-provider-legacy|3.5.7|Debian OpenSSL Team <pkg-openssl-devel@alioth-lists.debian.net>||package|deb||1~deb13u2|arm64||debian|13
+inv|passwd|4.17.4|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>||package|deb|1|2|arm64||debian|13
+inv|perl|5.40.1|Niko Tyni <ntyni@debian.org>||package|deb||6+deb13u1|arm64||debian|13
+inv|perl-base|5.40.1|Niko Tyni <ntyni@debian.org>||package|deb||6+deb13u1|arm64||debian|13
+inv|perl-modules-5.40|5.40.1|Niko Tyni <ntyni@debian.org>||package|deb||6+deb13u1|all||debian|13
+inv|pkg-config|1.8.1|Andrej Shadura <andrewsh@debian.org>||package|deb||4|arm64||debian|13
+inv|pkgconf|1.8.1|Andrej Shadura <andrewsh@debian.org>||package|deb||4|arm64||debian|13
+inv|pkgconf-bin|1.8.1|Andrej Shadura <andrewsh@debian.org>||package|deb||4|arm64||debian|13
+inv|procps|4.0.4|Craig Small <csmall@debian.org>||package|deb|2|9|arm64||debian|13
+inv|python3|3.13.5|Matthias Klose <doko@debian.org>||package|deb||1|arm64||debian|13
+inv|python3-minimal|3.13.5|Matthias Klose <doko@debian.org>||package|deb||1|arm64||debian|13
+inv|python3-packaging|25.0|Debian Python Team <team+python@tracker.debian.org>||package|deb||1|all||debian|13
+inv|python3-pip|25.1.1+dfsg|Debian Python Team <team+python@tracker.debian.org>||package|deb||1|all||debian|13
+inv|python3-pip-whl|25.1.1+dfsg|Debian Python Team <team+python@tracker.debian.org>||package|deb||1|all||debian|13
+inv|python3-setuptools-whl|78.1.1|Matthias Klose <doko@debian.org>||package|deb||0.1|all||debian|13
+inv|python3-venv|3.13.5|Matthias Klose <doko@debian.org>||package|deb||1|arm64||debian|13
+inv|python3-wheel|0.46.1|Debian Python Team <team+python@tracker.debian.org>||package|deb||2|all||debian|13
+inv|python3-yaml|6.0.2|Debian Python Team <team+python@tracker.debian.org>||package|deb||1+b2|arm64||debian|13
+inv|python3.13|3.13.5|Matthias Klose <doko@debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|python3.13-minimal|3.13.5|Matthias Klose <doko@debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|python3.13-venv|3.13.5|Matthias Klose <doko@debian.org>||package|deb||2+deb13u5|arm64||debian|13
+inv|readline-common|8.2|Matthias Klose <doko@debian.org>||package|deb||6|all||debian|13
+inv|rpcsvc-proto|1.4.3|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||1+b1|arm64||debian|13
+inv|sed|4.9|Clint Adams <clint@debian.org>||package|deb||2+deb13u1|arm64||debian|13
+inv|sqv|1.3.0|Debian Rust Maintainers <pkg-rust-maintainers@alioth-lists.debian.net>||package|deb||3+b2|arm64||debian|13
+inv|sysvinit-utils|3.14|Debian sysvinit maintainers <debian-init-diversity@chiark.greenend.org.uk>||package|deb||4|arm64||debian|13
+inv|tar|1.35+dfsg|Janos Lenart <ocsi@debian.org>||package|deb||3.1|arm64||debian|13
+inv|tzdata|2026b|GNU Libc Maintainers <debian-glibc@lists.debian.org>||package|deb||0+deb13u1|all||debian|13
+inv|unzip|6.0|Santiago Vila <sanvila@debian.org>||package|deb||29+deb13u1|arm64||debian|13
+inv|util-linux|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|uuid-dev|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb||0+deb13u1|arm64||debian|13
+inv|zip|3.0|Santiago Vila <sanvila@debian.org>||package|deb||15+deb13u1|arm64||debian|13
+inv|zlib1g|1.3.dfsg+really1.3.1|Mark Brown <broonie@debian.org>||package|deb|1|1+b1|arm64||debian|13
+[result_status] UNDECLARED / UNKNOWN / 
+

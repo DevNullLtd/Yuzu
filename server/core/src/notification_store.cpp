@@ -1,214 +1,237 @@
 #include "notification_store.hpp"
-#include "migration_runner.hpp"
 
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
 #include <chrono>
-#include <shared_mutex>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu::server {
 
-NotificationStore::NotificationStore(const std::filesystem::path& db_path) {
-    // M8: Canonicalize the path before opening to handle macOS /var -> /private/var
-    // symlink and other platform-specific path resolution issues.
-    auto canonical_path = db_path;
-    {
-        std::error_code ec;
-        auto parent = db_path.parent_path();
-        if (!parent.empty() && std::filesystem::exists(parent, ec)) {
-            auto canon_parent = std::filesystem::canonical(parent, ec);
-            if (!ec)
-                canonical_path = canon_parent / db_path.filename();
-        }
-    }
-    int rc = sqlite3_open_v2(canonical_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("NotificationStore: failed to open {}: {}", canonical_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+namespace {
+
+constexpr const char* kStoreName = "notification_store";
+
+// Bounded acquires (ADR-0012 §2). create() is called from agent-facing
+// gRPC/response-handling code (agent_service_impl.cpp) on enrollment and
+// execution-failure events — not a tight per-heartbeat hot path, but still
+// short enough that a saturated pool never stalls that thread. Reads/other
+// writes are dashboard HTTP handlers and can wait a little longer.
+constexpr std::chrono::milliseconds kCreateAcquireTimeout{500};
+constexpr std::chrono::milliseconds kReadAcquireTimeout{2000};
+constexpr std::chrono::milliseconds kWriteAcquireTimeout{2000};
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets `search_path` to the store schema for
+    // the migration transaction, so both tables land in `notification_store`.
+    // Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE notifications ("
+         "  id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+         "  ts_ms     BIGINT NOT NULL,"
+         "  level     TEXT NOT NULL DEFAULT 'info',"
+         "  title     TEXT NOT NULL,"
+         "  message   TEXT NOT NULL DEFAULT '',"
+         "  read      BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  dismissed BOOLEAN NOT NULL DEFAULT FALSE);"
+         "CREATE INDEX notifications_read_ts_idx ON notifications (read, ts_ms);"
+         "CREATE INDEX notifications_ts_id_idx ON notifications (ts_ms DESC, id DESC);"},
+        // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) —
+        // notification_meta's sole purpose was the backfill idempotency marker,
+        // which no longer has a writer. Version-bumped (not edited into v1)
+        // because v1 has actually run against real dev/UAT databases.
+        {2, "DROP TABLE IF EXISTS notification_meta;"},
+    };
+    return kMigrations;
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+Notification row_to_notification(PGresult* res, int row) {
+    Notification n;
+    int c = 0;
+    n.id = to_i64(PQgetvalue(res, row, c++));
+    n.timestamp = to_i64(PQgetvalue(res, row, c++));
+    n.level = PQgetvalue(res, row, c++);
+    n.title = PQgetvalue(res, row, c++);
+    n.message = PQgetvalue(res, row, c++);
+    n.read = to_bool(PQgetvalue(res, row, c++));
+    n.dismissed = to_bool(PQgetvalue(res, row, c++));
+    return n;
+}
+
+} // namespace
+
+NotificationStore::NotificationStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("NotificationStore: no database connection at construction ({})",
+                      pool_.last_error());
         return;
     }
-
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("NotificationStore: opened {}", canonical_path.string());
-}
-
-NotificationStore::~NotificationStore() {
-    if (db_)
-        sqlite3_close(db_);
-}
-
-bool NotificationStore::is_open() const {
-    return db_ != nullptr;
-}
-
-void NotificationStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS notifications (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp   INTEGER NOT NULL,
-                level       TEXT    NOT NULL DEFAULT 'info',
-                title       TEXT    NOT NULL,
-                message     TEXT    NOT NULL DEFAULT '',
-                read        INTEGER NOT NULL DEFAULT 0,
-                dismissed   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_notif_read_ts
-                ON notifications(read, timestamp);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "notification_store", kMigrations)) {
-        spdlog::error("NotificationStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("NotificationStore: schema migration failed");
+        return;
     }
+    open_ = true;
 }
 
 int64_t NotificationStore::create(const std::string& level, const std::string& title,
                                   const std::string& message) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return -1;
-
-    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-
-    const char* sql = "INSERT INTO notifications (timestamp, level, title, message) VALUES (?, ?, ?, ?)";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kCreateAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: create skipped, no connection in time ({})",
+                      pool_.last_error());
         return -1;
-
-    sqlite3_bind_int64(stmt, 1, now);
-    sqlite3_bind_text(stmt, 2, level.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, title.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, message.c_str(), -1, SQLITE_TRANSIENT);
-
-    int64_t result = -1;
-    if (sqlite3_step(stmt) == SQLITE_DONE) {
-        result = sqlite3_last_insert_rowid(db_);
     }
-    sqlite3_finalize(stmt);
-    return result;
-}
-
-static Notification row_to_notification(sqlite3_stmt* stmt) {
-    Notification n;
-    n.id = sqlite3_column_int64(stmt, 0);
-    n.timestamp = sqlite3_column_int64(stmt, 1);
-    auto lv = sqlite3_column_text(stmt, 2);
-    if (lv)
-        n.level = reinterpret_cast<const char*>(lv);
-    auto ti = sqlite3_column_text(stmt, 3);
-    if (ti)
-        n.title = reinterpret_cast<const char*>(ti);
-    auto msg = sqlite3_column_text(stmt, 4);
-    if (msg)
-        n.message = reinterpret_cast<const char*>(msg);
-    n.read = sqlite3_column_int(stmt, 5) != 0;
-    n.dismissed = sqlite3_column_int(stmt, 6) != 0;
-    return n;
-}
-
-std::vector<Notification> NotificationStore::list_unread(int limit) const {
-    std::shared_lock lock(mtx_);
-    std::vector<Notification> results;
-    if (!db_)
-        return results;
-
-    const char* sql = "SELECT id, timestamp, level, title, message, read, dismissed "
-                      "FROM notifications WHERE read = 0 AND dismissed = 0 "
-                      "ORDER BY timestamp DESC LIMIT ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return results;
-
-    sqlite3_bind_int(stmt, 1, limit);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(row_to_notification(stmt));
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO notification_store.notifications (ts_ms, level, title, message) "
+        "VALUES ($1::bigint, $2, $3, $4) RETURNING id",
+        std::vector<std::string>{std::to_string(now_ms), level, title, message});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        spdlog::debug("NotificationStore: create failed: {}", PQerrorMessage(lease.get()));
+        return -1;
     }
-    sqlite3_finalize(stmt);
-    return results;
+    return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
-std::vector<Notification> NotificationStore::list_all(int limit, int offset) const {
-    std::shared_lock lock(mtx_);
-    std::vector<Notification> results;
-    if (!db_)
-        return results;
-
-    const char* sql = "SELECT id, timestamp, level, title, message, read, dismissed "
-                      "FROM notifications ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return results;
-
-    sqlite3_bind_int(stmt, 1, limit);
-    sqlite3_bind_int(stmt, 2, offset);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(row_to_notification(stmt));
+std::vector<Notification> NotificationStore::list_unread(int limit) {
+    std::vector<Notification> out;
+    if (!open_)
+        return out;
+    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: list_unread skipped, no connection in time ({})",
+                      pool_.last_error());
+        return out;
     }
-    sqlite3_finalize(stmt);
-    return results;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, ts_ms, level, title, message, read, dismissed "
+        "FROM notification_store.notifications WHERE read = FALSE AND dismissed = FALSE "
+        "ORDER BY ts_ms DESC LIMIT $1::bigint",
+        std::vector<std::string>{std::to_string(limit)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("NotificationStore: list_unread failed: {}", PQerrorMessage(lease.get()));
+        return out;
+    }
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(row_to_notification(res.get(), i));
+    return out;
 }
 
-void NotificationStore::mark_read(int64_t id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
-
-    const char* sql = "UPDATE notifications SET read = 1 WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_int64(stmt, 1, id);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
+    std::vector<Notification> out;
+    if (!open_)
+        return out;
+    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: list_all skipped, no connection in time ({})",
+                      pool_.last_error());
+        return out;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, ts_ms, level, title, message, read, dismissed "
+        "FROM notification_store.notifications ORDER BY ts_ms DESC, id DESC "
+        "LIMIT $1::bigint OFFSET $2::bigint",
+        std::vector<std::string>{std::to_string(limit), std::to_string(offset)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("NotificationStore: list_all failed: {}", PQerrorMessage(lease.get()));
+        return out;
+    }
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(row_to_notification(res.get(), i));
+    return out;
 }
 
-void NotificationStore::dismiss(int64_t id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
-
-    const char* sql = "UPDATE notifications SET dismissed = 1 WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_int64(stmt, 1, id);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+bool NotificationStore::mark_read(int64_t id) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: mark_read skipped, no connection in time ({})",
+                      pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "UPDATE notification_store.notifications SET read = TRUE WHERE id = $1::bigint",
+        std::vector<std::string>{std::to_string(id)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::debug("NotificationStore: mark_read({}) failed: {}", id, PQerrorMessage(lease.get()));
+        return false;
+    }
+    // PQcmdTuples(), not the bare PGRES_COMMAND_OK check above: that status
+    // is identical whether the WHERE clause matched a row or not — the
+    // #1033-class mutate-then-count trap this codebase's sqlite3_changes()
+    // ban exists to close on the Postgres side too.
+    return std::string_view(PQcmdTuples(res.get())) != "0";
 }
 
-std::size_t NotificationStore::count_unread() const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+bool NotificationStore::dismiss(int64_t id) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: dismiss skipped, no connection in time ({})",
+                      pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE notification_store.notifications SET dismissed = TRUE WHERE id = $1::bigint",
+        std::vector<std::string>{std::to_string(id)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::debug("NotificationStore: dismiss({}) failed: {}", id, PQerrorMessage(lease.get()));
+        return false;
+    }
+    return std::string_view(PQcmdTuples(res.get())) != "0";
+}
+
+std::size_t NotificationStore::count_unread() {
+    if (!open_)
         return 0;
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM notifications WHERE read = 0 AND dismissed = 0",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("NotificationStore: count_unread skipped, no connection in time ({})",
+                      pool_.last_error());
         return 0;
-
-    std::size_t count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 0));
-    sqlite3_finalize(stmt);
-    return count;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*) FROM notification_store.notifications WHERE read = FALSE AND "
+        "dismissed = FALSE",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("NotificationStore: count_unread failed: {}", PQerrorMessage(lease.get()));
+        return 0;
+    }
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
 } // namespace yuzu::server

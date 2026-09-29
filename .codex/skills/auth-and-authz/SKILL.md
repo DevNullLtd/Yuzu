@@ -42,7 +42,7 @@ skill claims anything is "done."
 | Capability | Status | Source of truth |
 |---|---|---|
 | Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp:69` `pbkdf2_sha256()` (OpenSSL `PKCS5_PBKDF2_HMAC` + BCrypt path) |
-| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.codex/agents/authdb.md` |
+| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.claude/agents/authdb.md` |
 | Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
@@ -96,7 +96,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 ### Hard invariants that must NOT regress when adding any of the above
 
 These are pulled from `docs/auth-architecture.md` and
-`.codex/agents/authdb.md`. Every PR adding a feature in Section 2 above
+`.claude/agents/authdb.md`. Every PR adding a feature in Section 2 above
 must check them:
 
 - HTTPS by default; refuse to start without `--https-cert` + `--https-key`
@@ -233,7 +233,7 @@ For every feature in Section 3:
      invariants.
    - `docs/enterprise-readiness-soc2-first-customer.md` §3.2 for the
      enterprise/SOC 2 framing.
-   - `.codex/agents/authdb.md` if the feature touches `auth.db`.
+   - `.claude/agents/authdb.md` if the feature touches `auth.db`.
    - `docs/mcp-server.md` if the feature touches the MCP surface.
 
 2. **Plan.** Produce a short plan covering:
@@ -251,12 +251,14 @@ For every feature in Section 3:
    throughout.
 
 4. **Test.** Run `/test --quick` before commit. The
-   `tests/unit/test_auth_db.cpp` and `test_auth_routes.cpp` patterns are the
-   reference.
+   `tests/unit/server/test_auth_db_pg.cpp` and
+   `tests/unit/server/test_auth_routes.cpp` patterns are the reference. Their
+   Postgres cases need `YUZU_TEST_POSTGRES_DSN`; without it they report SKIP,
+   so set it before treating `/test --quick` as coverage.
 
 5. **Governance.** Run `/governance dev..HEAD` before pushing — Gate 2
    (security-guardian + docs-writer mandatory deep-dive) plus the AuthDB
-   review agent (`.codex/agents/authdb.md`) for any `auth_db.*` touch.
+   review agent (`.claude/agents/authdb.md`) for any `auth_db.*` touch.
    CRITICAL/HIGH findings block merge.
 
 6. **Docs.** docs-writer always picks up the user-manual + REST API
@@ -272,8 +274,8 @@ For every feature in Section 3:
 ## 5. Cross-references
 
 - **Routed reference doc:** `docs/auth-architecture.md`
-- **AuthDB review agent:** `.codex/agents/authdb.md`
-- **Security review agent:** `.codex/agents/security-guardian.md`
+- **AuthDB review agent:** `.claude/agents/authdb.md`
+- **Security review agent:** `.claude/agents/security-guardian.md`
 - **MCP token + tier policy:** `docs/mcp-server.md`
 - **Enterprise readiness plan:** `docs/enterprise-readiness-soc2-first-customer.md`
 - **SOC 2 evidence pattern:** `docs/security-reviews/*` and audit-log

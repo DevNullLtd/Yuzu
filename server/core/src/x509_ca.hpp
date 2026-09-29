@@ -218,6 +218,20 @@ struct CrlRevocation {
 /// (an accept-then-reject mismatch would hard-fail certificate generation).
 [[nodiscard]] bool is_valid_ip_literal(const std::string& s);
 
+/// gov B1: minimum subject-key strength for a code-signing leaf — the leaf
+/// becomes a trusted plugin-signing anchor, so an operator-submitted CSR
+/// carrying a factorable/weak key must be refused rather than signed. Parses
+/// `csr_pem` and inspects ONLY its embedded public key (the same key
+/// `sign_csr` later binds proof-of-possession against — this makes no claim
+/// about the CSR signature itself). Rule: RSA must be 2048–16384 bits (mirrors
+/// the SAML SP signing-key floor, `saml_provider.cpp`); an EC key must be on
+/// an approved NIST curve (P-256/P-384/P-521); Ed25519/Ed448 are allowed (no
+/// "bits" floor applies, and OpenSSL 3's CMS_verify accepts them). Any other
+/// key type, or a CSR that fails to parse, returns false — FAIL CLOSED, so an
+/// unrecognised key type is never silently waved through as "no floor
+/// applies". Pure inspection — does not touch the CA key or record anything.
+[[nodiscard]] bool subject_key_meets_code_signing_floor(std::string_view csr_pem);
+
 struct CertDetails {
     DistinguishedName subject;
     DistinguishedName issuer;

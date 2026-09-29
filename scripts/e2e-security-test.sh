@@ -235,9 +235,51 @@ assert_eq "GET /health → 200" "200" "$status"
 status=$(http_status "GET" "/metrics")
 assert_eq "GET /metrics → 200 (localhost)" "200" "$status"
 
-# /api/v1/openapi.json → 200
+# #2057: /api/v1/openapi.json now gates Infrastructure:Read — no longer an
+# unauthenticated endpoint. Unauthenticated → 401; authenticated (a scratch
+# login, since Category 3 runs before Category 4 establishes $COOKIE_JAR) →
+# 200 with the OpenAPI document. A caller with NO session at all never
+# reaches the route's own perm_fn/A4 gate — the pre-routing chokepoint's
+# session-resolution check (server.cpp, "if (!session)") short-circuits
+# every unauthenticated /api/* request with its own pre-existing, non-A4
+# 401 body ({"error":{"code","message"},"meta"} — no correlation_id) BEFORE
+# routing, identically on every /api/v1/* route (verified against
+# GET /api/v1/me too) — a uniform pre-existing gap, not something #2057
+# introduced or scoped to fix.
 status=$(http_status "GET" "/api/v1/openapi.json")
-assert_eq "GET /api/v1/openapi.json → 200" "200" "$status"
+assert_eq "GET /api/v1/openapi.json (unauthenticated) → 401" "401" "$status"
+OPENAPI_UNAUTH_BODY=$(curl -s "${SERVER_URL}/api/v1/openapi.json" 2>/dev/null || echo "")
+assert_contains "GET /api/v1/openapi.json (unauthenticated) body has error code 401" \
+    '"code":401' "$OPENAPI_UNAUTH_BODY"
+
+if [[ -n "$ADMIN_PASS" ]]; then
+    OPENAPI_COOKIE_JAR=$(mktemp /tmp/yuzu-sec-openapi-cookies.XXXXXX)
+    curl -s -o /dev/null -c "$OPENAPI_COOKIE_JAR" \
+        -X POST "${SERVER_URL}/login" \
+        -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" 2>/dev/null
+    OPENAPI_AUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -b "$OPENAPI_COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/openapi.json" 2>/dev/null || echo "000")
+    OPENAPI_AUTH_BODY=$(curl -s -b "$OPENAPI_COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/openapi.json" 2>/dev/null || echo "")
+    rm -f "$OPENAPI_COOKIE_JAR"
+    assert_eq "GET /api/v1/openapi.json (authenticated) → 200" "200" "$OPENAPI_AUTH_STATUS"
+    # Not assert_contains: that helper's `echo "$haystack" | grep -q "$needle"`
+    # pipeline can spuriously report no-match under `pipefail` when the needle
+    # is found on an early line of a large multi-line haystack — grep(1) exits
+    # the instant it matches, echo(1) is still mid-write of the remaining
+    # ~200KB spec body, SIGPIPE kills echo, and pipefail surfaces THAT
+    # non-zero exit rather than grep's success. The pretty-printed OpenAPI
+    # doc (its "openapi" key is on line 2) triggers this every time. Plain
+    # bash glob match has no subshell/pipe to race.
+    TESTS=$((TESTS + 1))
+    if [[ "$OPENAPI_AUTH_BODY" == *'"openapi"'* ]]; then
+        pass "GET /api/v1/openapi.json (authenticated) body has openapi"
+    else
+        fail "GET /api/v1/openapi.json (authenticated) body has openapi"
+    fi
+else
+    log "  SKIPPED authenticated openapi.json check (no admin credentials available)"
+fi
 
 # /static/yuzu.css → 200
 status=$(http_status "GET" "/static/yuzu.css")

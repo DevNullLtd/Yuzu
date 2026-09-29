@@ -311,6 +311,14 @@ struct PreflightCheckResponses {
     std::string key;
     std::string label;
     std::unordered_map<std::string, std::pair<int, std::string>> by_agent; ///< agent → (status, output)
+    /// #2691 finding 10: true when this check's ResponseStore read itself
+    /// failed (pool timeout / query error) — an empty `by_agent` then means
+    /// "the read failed", not "no responses yet". A caller that builds a grid
+    /// from a degraded check and persists it would silently overwrite an
+    /// already-good stored verdict with a false "incomplete" one, so every
+    /// grid-persisting caller MUST check this (via `any_check_degraded`)
+    /// before calling `compute_device_results`/`persist_and_maybe_complete`.
+    bool degraded = false;
 };
 
 // ── Verdict (threshold applied to the parsed fact) ───────────────────────────

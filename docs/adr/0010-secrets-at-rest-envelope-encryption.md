@@ -25,11 +25,17 @@ columns are elsewhere:
 
 | Secret | Store / column | Today |
 |---|---|---|
-| Session tokens | `auth.db` `sessions.session_token` | plaintext, TTL-cleaned |
-| MFA TOTP secrets | `auth.db` `users.mfa_totp_secret` | plaintext BLOB (v3 encryption deferred) |
+| MFA TOTP secrets | Postgres `auth.users.mfa_totp_secret` | **`SecretCodec`-encrypted (shipped 2026-07-16)** — see the Update below |
 | Webhook signing secrets | `webhooks.db` `webhooks.secret` | plaintext (omitted from `list()`) |
 | Offload-target credentials | `offload_targets.db` `auth_credential` | plaintext |
-| OIDC client secret | `runtime_config.db` (`oidc_client_secret` key) | plaintext |
+| OIDC client secret | Postgres `runtime_config_store.runtime_config_secrets.sealed_value` | **`SecretCodec`-encrypted (ADR-0060)** |
+
+> Historical note: the original table (2026-06-10) also listed a `sessions.session_token`
+> row against the then-SQLite `auth.db`. The `auth`/`scim_store` Postgres cutover (ADR-0006
+> Wave 3, 2026-07-16) **dropped** the `sessions` table outright rather than migrating it —
+> sessions are, and always were, in-memory-authoritative (`AuthManager::sessions_`); the
+> SQLite-era DB mirror was a permanent dead-write, never read back. There is no durable
+> session-token column on any substrate to encrypt.
 
 Verify-only material — operator password PBKDF2 hashes, API/device/enrollment token SHA-256
 hashes, MFA recovery-code hashes, license-key hashes — is not secret-recoverable and is fine
@@ -401,3 +407,41 @@ then INSERT the encrypted blob with that id) — never INSERT-then-UPDATE, which
 would transiently write a non-blob value to a secret column in violation of
 §Decision 4. The wiring PRs should also share ONE `Error → A4-envelope`
 mapping helper, not per-store ad hoc collapses.
+
+## Update (2026-07-16) — first production consumer shipped: `auth.users.mfa_totp_secret`
+
+`SecretCodec` had no production caller until the `AuthDB` Postgres cutover (ADR-0006). The auth
+store registers `mfa_totp_secret` (BYTEA) as a secret column from inside its own constructor
+(the row PK is `users.id`, a `BIGINT GENERATED ALWAYS AS IDENTITY`). The serial-PK-must-
+allocate-before-encrypting rule above is satisfied trivially here, not by an explicit two-step
+INSERT-then-UPDATE dance: a `users` row always already exists (created at account
+creation/seeding, `mfa_totp_secret` starting `NULL`) by the time MFA enrollment ever runs, so
+the id is always known before the first encrypt call — enrollment is inherently an `UPDATE ...
+WHERE id = $n`, never part of the row's initial `INSERT`. `server.cpp`'s boot sequence follows
+the ordering this ADR's Amendment implies but does not spell out: `SecretCodec` is constructed
+(`auth_secret_codec_`, `server.cpp`), then `AuthDB`'s own constructor registers `mfa_totp_secret`
+as a secret column, then `SecretCodec::init()` runs (verifies/generates the KEK-wrapped DEK for
+whatever is registered by that point — `AuthDB`'s column only). `ScimStore` is constructed
+**after** and takes **no `SecretCodec` reference at all** (`ScimStore(*pg_pool_)`) — it has no
+secret columns of its own (SCIM tokens stay a verify-only SHA-256 hash), so it is not a codec
+consumer and never receives one. A store/decrypt failure on `mfa_totp_secret` is treated as its
+own fail-closed `AuthDBError::SecretUnavailable` outcome by every MFA-state reader, never
+collapsed into "not enrolled" — see `docs/auth-architecture.md` "MFA / TOTP" and "MFA fails
+closed on secret-read failure". The worked construction-order recipe is captured in
+`docs/postgres-store-playbook.md` step 3, for the next store (`webhooks`/`offload_targets`/
+`runtime_config`) to follow.
+
+**Instance model (architect note, so the next consumer doesn't inherit an init-ordering
+trap).** `SecretCodec::init()` validates every column registered **so far** — it has no way to
+know whether more registrants are still to come. The shape this ADR and the playbook actually
+prescribe is therefore **one `SecretCodec` instance per consuming store**, not one shared
+instance fleet-wide: construct the codec → that store's own constructor registers its column(s)
+→ that same store's `init()` call runs (register-before-init, scoped to one store). `AuthDB` is
+the worked example (`auth_secret_codec_` in `server.cpp`) — it owns its codec instance
+exclusively; `ScimStore` does not share it (see above), and no other store references it. A
+**shared codec across multiple stores is possible in principle** (multiple stores' constructors
+all registering into the same instance before a single deferred `init()`), but it requires
+sequencing **every** registrant's construction ahead of that one `init()` call — a materially
+easier invariant to violate than "one store, one codec, register-then-init immediately." Unless
+a future change has a specific reason to share, give each new secret-bearing store its own
+`SecretCodec` instance.

@@ -48,6 +48,10 @@ spec:
     columns:
       - name: status
         type: string
+        description: >-
+          Outcome of the notification attempt: ok (shown, or handed to the OS successfully), suppressed|<reason> (Do Not Disturb was active), error|<reason> (missing/invalid parameter, or an unsupported platform), or unavailable|<reason> (macOS/Linux: no reachable GUI session). Values: ok, suppressed|<reason>, error|<reason>, unavailable|<reason> (reason is free text).
+        example: "error|missing required parameter: title"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show desktop notification: {{title}}"
 
@@ -55,7 +59,7 @@ spec:
     ttlSeconds: 30
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]
@@ -74,12 +78,17 @@ kind: InstructionDefinition
 metadata:
   id: device.interaction.message_box
   displayName: Message Box Dialog
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Shows a modal message box dialog on the endpoint desktop. On Windows
     uses MessageBoxW, on Linux uses zenity, and on macOS uses osascript
-    'display dialog'. Returns which button the user clicked (ok, cancel,
-    yes, or no). The dialog blocks until the user responds.
+    'display dialog'. On success returns which button the user clicked in
+    the `response` column (ok, cancel, yes, or no); the dialog blocks until
+    the user responds. On macOS, when the agent cannot reach a desktop
+    session (it runs as a GUI-less root LaunchDaemon, or the user is not
+    logged in), it reports `status|not_reachable` instead of a fabricated
+    button — earlier agents (interaction plugin < 0.3.0) wrongly reported
+    `response|ok` for an undelivered dialog.
   tags: [interaction, dialog, user]
 
 spec:
@@ -113,6 +122,17 @@ spec:
     columns:
       - name: response
         type: string
+        description: >-
+          The button the operator/user clicked on the dialog. Absent when the dialog could not be shown — see status. Values: ok, cancel, yes, no.
+        example: "ok"
+        platforms: [windows, linux, darwin]
+      - name: status # set on a validation failure (every platform), the macOS
+        type: string # not_reachable sentinel, or a Linux zenity delivery
+                     # failure. Empty on a normal button-press response.
+        description: >-
+          Set when no button could be returned: a validation failure (missing title/message or a bad buttons value — every platform), the macOS not_reachable sentinel (no GUI session), or a Linux zenity delivery failure. Empty on a normal button-press response. Values: not_reachable, error|<reason>, unavailable|<reason>.
+        example: "error|missing required parameter: title"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show message box: {{title}} ({{buttons}})"
 
@@ -120,13 +140,18 @@ spec:
     ttlSeconds: 300
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
     authorRoles: [content-author]
 
   compatibility:
+    # Gates the agent daemon version, NOT the interaction plugin's own version
+    # (0.3.0, InteractionPlugin::version()) — no minPluginVersion mechanism
+    # exists today. An agent running interaction plugin < 0.3.0 keeps the prior
+    # macOS behavior (a false response|ok when undeliverable) rather than being
+    # gated out here; the mixed-fleet blend is called out in the description.
     minAgentVersion: 0.1.0
     requiredPlugins: [interaction]
 
@@ -179,8 +204,23 @@ spec:
     columns:
       - name: response
         type: string
+        description: >-
+          The text the operator/user entered and confirmed. Absent when the dialog was cancelled or could not be shown. Values: free text.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: cancelled
         type: bool
+        description: >
+          true when the user dismissed the dialog without entering text
+          (Escape, Cancel, or AppleScript error -128); omitted otherwise.
+        example: "true"
+        platforms: [windows, linux, darwin]
+      - name: status
+        type: string
+        description: >-
+          Set instead of response/cancelled when the dialog never ran: a validation failure (every platform), or an unavailable/failed dialog on Windows, macOS, or Linux. Values: error|<reason>, unavailable|<reason>.
+        example: "error|missing required parameter: title"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show input dialog: {{title}}"
 
@@ -188,7 +228,7 @@ spec:
     ttlSeconds: 300
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -252,20 +292,53 @@ spec:
     columns:
       - name: cancelled
         type: bool
+        description: >
+          true when the user dismissed the survey (Cancel, Escape, or
+          AppleScript error -128) before answering every question.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: question_count
         type: int32
+        description: >-
+          The number of questions in the submitted survey. Only emitted when the survey completed without cancellation or failure. Values: integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: answer_0
         type: string
+        description: >-
+          The answer to question 0 (0-indexed): free text for a text question, yes/no for a yesno question, or the chosen item's text for a choice question. Omitted if the survey was cancelled or could not be shown. Values: free text, or yes/no for a yesno question.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: answer_1
         type: string
+        description: >-
+          The answer to question 1 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: answer_2
         type: string
+        description: >-
+          The answer to question 2 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: answer_3
         type: string
+        description: >-
+          The answer to question 3 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: answer_4
         type: string
+        description: >-
+          The answer to question 4 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: >-
+          Set instead of cancelled/answers when the survey never completed: a validation failure (every platform, e.g. missing title or unparseable questions), a suppressed Do Not Disturb, or an undeliverable/unrecognized-response dialog. Values: suppressed|<reason>, error|<reason>, unavailable|<reason>.
+        example: "error|missing required parameter: title"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show survey: {{title}}"
 
@@ -273,7 +346,7 @@ spec:
     ttlSeconds: 600
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -332,12 +405,29 @@ spec:
     columns:
       - name: dnd_enabled
         type: bool
+        description: >-
+          The DND state after this call — true when DND is now active, false when cleared. Values: true, false.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: dnd_duration_minutes
         type: int32
+        description: >-
+          The duration parameter echoed back, in minutes. Only emitted when DND was enabled with a positive duration_minutes. Values: integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: dnd_expires_at
         type: int64
+        description: >-
+          Unix epoch seconds when DND auto-clears. Only emitted alongside dnd_duration_minutes (enabled with a positive duration); 0 or omitted means indefinite. Values: epoch seconds, or omitted.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: >
+          Always ok — set_dnd is a local KV-store write with no external
+          dependency and no failure path once dispatched.
+        example: "ok"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Set Do Not Disturb: {{enabled}}"
 
@@ -345,7 +435,7 @@ spec:
     ttlSeconds: 30
 
   approval:
-    mode: none
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]

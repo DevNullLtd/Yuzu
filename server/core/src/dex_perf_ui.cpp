@@ -11,8 +11,17 @@
 /// absent metrics render "—" (never 0), aggregates carry their reporting
 /// population, sub-floor cohorts render "n too small", untagged devices are
 /// an explicit residual row.
+///
+/// #4626 Concern B: includes the PURE `dex_perf_model.hpp` directly rather
+/// than the httplib-coupled `dex_routes.hpp` (which still transitively pulls
+/// store headers via its own `#include "dex_read_builders.hpp"`; the former
+/// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` chain was severed in
+/// #4626). This TU's include-closure store-freedom is enforced by
+/// `scripts/ci/check-seam-closure.py`'s `dex_perf` family — a header-closure
+/// check over include basenames; it does not scan this file's text for store
+/// type names.
 
-#include "dex_routes.hpp"
+#include "dex_perf_model.hpp"
 
 #include "web_utils.hpp"
 
@@ -234,21 +243,21 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
          "aggregate carries its reporting population; click any card or cohort to open the "
          "devices behind it.</div></div></div>";
 
-    // ── Over-time entry (F2b) ── the retained per-app, per-version trend lives
-    // on its own fragment (Postgres-backed); the now-view links into it.
-    h += "<div class=\"gp-note\">Looking for performance <b>over time, by application &amp; "
-         "version</b>? " +
-         drill("/fragments/dex/perf/apps?window=" + w, "Open application performance over time "
-                                                       "&rarr;") +
-         " &mdash; the retained daily roll-up, per app and version, fleet-wide or by group.</div>";
+    // ── Over-time cross-reference (F2b) ── the retained per-app, per-version
+    // trend has its own top-level "App Performance" sub-nav tab (dex_subnav)
+    // now, so this is a plain pointer, not a special call-to-action — the tab
+    // itself is the primary path there.
+    h += "<div class=\"gp-note\">Performance <b>over time, by application &amp; version</b> is "
+         "on the <b>App Performance</b> tab above &mdash; the retained daily roll-up, per app "
+         "and version, fleet-wide or by group.</div>";
 
     // ── Fleet now ──
     h += "<div class=\"gp-sech\">Fleet now (last rollup cycle)</div>";
     if (now.reporting == 0) {
         h += placeholder("No perf telemetry yet",
                          "No device reported a perf heartbeat this cycle. Perf telemetry is "
-                         "collected by Windows agents (TAR perf capture source); devices appear "
-                         "here within a heartbeat of coming online.");
+                         "collected on Windows and Linux (TAR perf capture source; macOS support "
+                         "is planned); devices appear here within a heartbeat of coming online.");
     } else {
         h += "<div class=\"gp-tiles\">";
         if (now.cpu)
@@ -264,14 +273,19 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
                             stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
                             "worst devices by disk latency");
         h += fleet_card("Reporting", std::to_string(now.reporting),
-                        "of " + std::to_string(now.windows_online) + " Windows online",
+                        "of " + std::to_string(now.perf_capable_online) +
+                            " perf-capable online (Windows " + std::to_string(now.windows_online) +
+                            " &middot; Linux " + std::to_string(now.linux_online) + "; macOS " +
+                            std::to_string(now.macos_online) + " online, no collector yet)",
                         "filter=not_reporting&window=" + w, "devices not reporting");
         h += "</div>";
-        h += "<div class=\"gp-note\">Perf telemetry is collected by <b>Windows agents only</b> "
-             "today &mdash; macOS and Linux devices are absent from these numbers, not zero. "
-             "The Reporting card is the denominator for every stat above. The same numbers are "
-             "exported as the <span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> "
-             "Prometheus gauges.</div>";
+        h += "<div class=\"gp-note\">Perf telemetry is collected on <b>Windows and Linux</b> "
+             "today (macOS support is planned; macOS devices show as online above but never "
+             "reporting). The Reporting card is the denominator for every stat above. The same "
+             "numbers are exported as the "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> and per-OS "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_os_*</span> Prometheus "
+             "gauges.</div>";
     }
 
     // ── Cohort benchmarking ──
@@ -457,7 +471,7 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
     if (rows.empty())
         return h + placeholder(not_reporting ? "Everyone is reporting" : "No devices",
                                not_reporting
-                                   ? "Every online Windows agent contributed a perf sample "
+                                   ? "Every online Windows/Linux agent contributed a perf sample "
                                      "this cycle."
                                    : "No reporting devices match this view.");
 

@@ -1,0 +1,1334 @@
+{
+  "actions": [
+    {
+      "action": "bios",
+      "definition_ids": [
+        "device.hardware.bios"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/class/dmi/id/bios_vendor + bios_version + bios_date",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "run_bounded_subprocess(system_profiler SPHardwareDataType) + native parser (hardware_macos_bios.hpp)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_BIOS",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "disks",
+      "definition_ids": [
+        "device.hardware.disks"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/block/*/{size,device/model} native walk",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "run_bounded_subprocess(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) + native parser (hardware_disks_macos.hpp)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_DiskDrive",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "drivers",
+      "definition_ids": [
+        "device.hardware.drivers"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc/modules",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_PnPSignedDriver",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "manufacturer",
+      "definition_ids": [
+        "device.hardware.manufacturer"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/class/dmi/id/sys_vendor",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sysctlbyname(hw.manufacturer)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_ComputerSystem.Manufacturer",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "memory",
+      "definition_ids": [
+        "device.hardware.memory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when dmidecode is unavailable or unprivileged",
+          "mechanism": "run_bounded_subprocess(dmidecode -t memory)",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API)",
+          "mechanism": "sysctlbyname(hw.memsize)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_PhysicalMemory",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "model",
+      "definition_ids": [
+        "device.hardware.model"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/class/dmi/id/product_name",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sysctlbyname(hw.model)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_ComputerSystem.Model",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "processors",
+      "definition_ids": [
+        "device.hardware.processors"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc/cpuinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sysctlbyname(machdep.cpu.*, hw.*cpu*)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_Processor",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "system",
+      "definition_ids": [
+        "device.hardware.system"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/class/dmi/id/product_serial + product_uuid",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOServiceGetMatchingService(IOPlatformExpertDevice) + IORegistryEntryCreateCFProperty(kIOPlatformSerialNumberKey/kIOPlatformUUIDKey)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**This plugin never sets a typed result status.** Every sample line reads `UNDECLARED / UNKNOWN /` regardless of whether the underlying probe succeeded, partially failed, or hit an unsupported leg (e.g. Linux `manufacturer`/`model`/`bios`/`system` all read `unknown` in the sample, and get the same `UNDECLARED` status as a clean Windows read). A consumer must inspect the row content (`unknown` fields, the `drivers` action's `__truncated__` marker), not the status, to tell success from degradation.",
+    "**`drivers` is not implemented on macOS.** No public per-driver/kext enumeration API exists; the descriptor declares it `YUZU_SUPPORT_UNSUPPORTED` (`hardware_plugin.cpp:849`) and the macOS sample shows the house `unknown` row rather than a capture.",
+    "**`memory` is aggregate-only on Linux and macOS.** Linux needs `dmidecode` (typically root) for per-DIMM detail and falls back to `/proc/meminfo`'s total when unavailable or unprivileged; the Linux sample (captured as root/euid 0 in a container) still shows the aggregate `total` row, meaning `dmidecode` itself found nothing usable in that environment even with root. macOS has no public per-DIMM API at all and always reports the aggregate.",
+    "**A connected-but-empty WMI query now emits an explicit `unknown` row instead of silently emitting nothing** — a deliberate divergence from the plugin's pre-#3404 behavior, made so a consumer can distinguish \"the probe ran and found nothing\" from an unrelated dispatch failure (`hardware_plugin.cpp:183-198`). Do not revert this to match the old silent-gap behavior.",
+    "**Windows `disks.interface` reports the WMI-layer bus (`SCSI`), not the physical bus** — both drives in the Windows sample are NVMe/SATA but report `SCSI`, because `Win32_DiskDrive.InterfaceType` reports the storage stack layer WMI actually asks, not the physical connector. `disk_actions.smart` decodes the true bus (`nvme`/`sata`/`usb`) via a lower-level IOCTL and is the more accurate source when that distinction matters."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns BIOS or UEFI firmware details: vendor, version, and release date. Uses Win32_BIOS on Windows, /sys/class/dmi/id/bios_* on Linux, and system_profiler Boot ROM on macOS.",
+      "display_name": "BIOS / UEFI Information",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.bios",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists physical disk drives with model name, capacity in GB, media type (SSD/HDD/Removable), and interface type (SCSI, NVMe, SATA, USB). Uses Win32_DiskDrive on Windows, native /sys/block on Linux, system_profiler on macOS.",
+      "display_name": "Physical Disk Drives",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.disks",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists installed device drivers with name, version, date, provider, and device class. Uses Win32_PnPSignedDriver on Windows (the canonical signed-driver registry; the query can take several seconds) and a direct read of /proc/modules on Linux (module names only — version/date are not available without a per-module walk). Not supported on macOS (no public per-driver/kext enumeration API). Supports fleet queries like \"devices running driver X older than version Y\".",
+      "display_name": "Installed Driver Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 86400
+      },
+      "id": "device.hardware.drivers",
+      "platforms": [
+        "windows",
+        "linux"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the system manufacturer string (e.g. \"Dell Inc.\", \"Apple Inc.\", \"Lenovo\"). Uses Win32_ComputerSystem on Windows, /sys/class/dmi/id/sys_vendor on Linux, sysctlbyname(3) on macOS.",
+      "display_name": "Hardware Manufacturer",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.manufacturer",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists installed memory DIMMs with slot locator, capacity in MB, memory type (DDR3/DDR4/DDR5), and speed in MHz. Uses Win32_PhysicalMemory on Windows, dmidecode on Linux (falls back to /proc/meminfo total), sysctlbyname(3) hw.memsize on macOS.",
+      "display_name": "Installed Memory Modules",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.memory",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the system model or product name (e.g. \"OptiPlex 7090\", \"MacBookPro18,1\"). Uses Win32_ComputerSystem on Windows, /sys/class/dmi/id/product_name on Linux, sysctlbyname(3) hw.model on macOS.",
+      "display_name": "Hardware Model",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.model",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists installed CPUs with model name, physical core count, logical thread count, and clock speed in MHz. Uses Win32_Processor on Windows, /proc/cpuinfo on Linux, sysctlbyname(3) on macOS. Returns one row per physical CPU socket.",
+      "display_name": "Installed Processors",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "device.hardware.processors",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the machine's hardware serial number and system (SMBIOS / firmware) UUID — the stable CMDB correlation key (e.g. for ServiceNow reconciliation). Windows reads Win32_BIOS.SerialNumber and Win32_ComputerSystemProduct.UUID via WMI; Linux reads /sys/class/dmi/id/product_serial and product_uuid (0400, via the agent's cap_dac_read_search capability); macOS reads IOPlatformSerialNumber and IOPlatformUUID via native IOKit (IOServiceGetMatchingService + IORegistryEntryCreateCFProperty against IOPlatformExpertDevice). An absent value (e.g. a VM with no SMBIOS serial) returns the literal \"unknown\". This is the building block the device_ci daily-sync source (ADR-0016) collects in-process.",
+      "display_name": "System Identity (Serial + UUID)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 86400
+      },
+      "id": "device.hardware.system",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers",
+  "how_it_works": "Eight independent reads, dispatched by action name (`hardware_plugin.cpp:897`). `manufacturer`/`model`/`processors`/`system` are single native calls per OS (WMI, `sysctlbyname`/IOKit, or a `/sys`/`/proc` file read) with no subprocess. `bios` and `disks` need data no native API on macOS exposes, so those two legs shell out through the agent's bounded subprocess runner (`run_bounded_subprocess`, fixed deadline, no shell) to `system_profiler` and parse its output with a pure header-only parser (`hardware_macos_bios.hpp`, `hardware_disks_macos.hpp`). `memory` tries `dmidecode` on Linux (also via the bounded runner) and falls back to `/proc/meminfo`'s aggregate total when `dmidecode` is missing or fails. `drivers` enumerates `Win32_PnPSignedDriver` on Windows or reads `/proc/modules` on Linux; it is not implemented on macOS (no public per-driver/kext enumeration API).\n\nEvery action that can find nothing still emits one row carrying the literal `unknown` in place of an unread value (`hardware_plugin.cpp:236`, `:250`, `:335-337` and equivalents) — never a silent zero-row output — so a consumer can tell \"the probe ran and found nothing\" from \"this action produced no output for an unrelated reason.\" This plugin is deliberately not a live-monitoring feed: every action is a point-in-time read with no polling, no event stream, and (except `drivers`, whose WMI query can take several seconds) no expectation of taking more than a few milliseconds.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "fc050dca8530",
+  "manifest_version": 1,
+  "name": "hardware",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "BIOS/firmware vendor name; the fixed literal \"Apple\" on macOS, or \"unknown\" when unread. Values: free text, the literal \"Apple\" (macOS only), or the sentinel \"unknown\".",
+          "example": "American Megatrends Inc.",
+          "name": "bios_vendor",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "BIOS/firmware version string, or \"unknown\" when unread. Values: free text, or the sentinel \"unknown\".",
+          "example": "3801",
+          "name": "bios_version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "BIOS release date as YYYY-MM-DD on Windows/Linux; the fixed literal \"N/A\" on macOS (no BIOS date concept); \"unknown\" when unread. Values: YYYY-MM-DD format, the literal \"N/A\" (macOS only), or the sentinel \"unknown\".",
+          "example": "2021-07-30",
+          "name": "bios_date",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.bios"
+    },
+    {
+      "columns": [
+        {
+          "description": "Enumeration index (Windows Win32_DiskDrive.Index; macOS/Linux assigned during enumeration, not guaranteed stable across runs). Values: integer, 0-based.",
+          "example": "0",
+          "name": "index",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Disk model/device string, or \"unknown\" when nothing was found. Values: free text, or the sentinel \"unknown\".",
+          "example": "Samsung SSD 970 EVO Plus 1TB",
+          "name": "model",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Disk capacity in GB, integer-divided from raw bytes (Windows/macOS) or 512-byte sectors (Linux).",
+          "example": "931",
+          "name": "size_gb",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Media classification. Windows matches the WMI MediaType string; macOS treats every NVMe device as SSD and looks up SATA media from SPStorageDataType; Linux reads the removable/rotational sysfs attributes. Values: SSD, HDD, Removable, or the sentinel \"unknown\".",
+          "example": "SSD",
+          "name": "media_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Bus/interface label. Windows reports the WMI storage-stack InterfaceType (often \"SCSI\" even for NVMe/SATA disks, not the physical bus); macOS reports \"NVMe\"/\"SATA\"; Linux infers a transport from the /sys/block symlink target. Values: SCSI (Windows); NVMe or SATA (macOS); nvme, usb, virtio, mmc, sata, scsi, or unknown (Linux).",
+          "example": "SCSI",
+          "name": "interface",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.disks"
+    },
+    {
+      "columns": [
+        {
+          "description": "Enumeration order; on the truncation-marker row (Windows only), carries the reached row count instead of an index. Values: integer, 0-based, or the reached count on a truncation-marker row.",
+          "example": "0",
+          "name": "index",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Driver/module display name; \"unknown\" when nothing was found; the literal \"__truncated__\" marks a Windows WMI row-cap hit (512 rows, agents/shared/wmi_bounded.hpp). Values: free text, the sentinel \"unknown\", or the literal \"__truncated__\".",
+          "example": "Realtek Audio Universal Service",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver version string (Windows only; Linux /proc/modules carries no version, always empty). Values: free text, or empty.",
+          "example": "6.0.9977.1",
+          "name": "version",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver release date as YYYY-MM-DD, parsed from the WMI CIM datetime (Windows only; empty if malformed or on Linux). Values: YYYY-MM-DD format, or empty.",
+          "example": "2026-04-14",
+          "name": "date",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Driver publisher (Windows DriverProviderName; the fixed literal \"kernel\" on Linux). Values: free text, or the literal \"kernel\".",
+          "example": "Realtek Semiconductor Corp.",
+          "name": "provider",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows DeviceClass (e.g. NET, SYSTEM, MEDIA); the fixed literal \"module\" on Linux. Values: free text WMI device class, or the literal \"module\".",
+          "example": "MEDIA",
+          "name": "device_class",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.drivers"
+    },
+    {
+      "columns": [
+        {
+          "description": "The system manufacturer string, or \"unknown\" when the probe could not read one. Values: free text, or the sentinel \"unknown\".",
+          "example": "PCSpecialist",
+          "name": "manufacturer",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.manufacturer"
+    },
+    {
+      "columns": [
+        {
+          "description": "DIMM locator on Windows/Linux dmidecode, or the fixed literal \"total\" for an aggregate-only row (macOS always, Linux when dmidecode is unavailable or unprivileged). Values: free text locator, or the literal \"total\".",
+          "example": "DIMM_A2",
+          "name": "slot",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Module capacity in MB, or the aggregate total in MB on an aggregate-only row. Values: integer.",
+          "example": "8192",
+          "name": "size_mb",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Memory type (DDR2/DDR3/DDR4/DDR5); \"unknown\" on every aggregate-only row (macOS, and the Linux /proc/meminfo fallback carry no type). Values: DDR2, DDR3, DDR4, DDR5, or the sentinel \"unknown\".",
+          "example": "DDR4",
+          "name": "type",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Module speed in MHz; 0 on every aggregate-only row. Values: integer, or 0 on an aggregate-only row.",
+          "example": "3600",
+          "name": "speed_mhz",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.memory"
+    },
+    {
+      "columns": [
+        {
+          "description": "The system model or product name string, or \"unknown\" when the probe could not read one. Values: free text, or the sentinel \"unknown\".",
+          "example": "Amd Am4 Gen3",
+          "name": "model",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.model"
+    },
+    {
+      "columns": [
+        {
+          "description": "Physical socket index (Linux DMI \"physical id\"; always 0 on macOS; enumeration order on Windows). Values: integer, 0-based.",
+          "example": "0",
+          "name": "index",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "CPU brand/model string, or \"unknown\" when no CPU rows were found. Values: free text, or the sentinel \"unknown\".",
+          "example": "AMD Ryzen 9 5900X 12-Core Processor",
+          "name": "model",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Physical core count for this socket. Values: integer.",
+          "example": "12",
+          "name": "cores",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Logical thread count for this socket. Values: integer.",
+          "example": "24",
+          "name": "threads",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Reported/maximum clock speed in MHz; 0 when the OS exposes no frequency (e.g. Apple Silicon has no hw.cpufrequency). Values: integer, or 0 when unreadable.",
+          "example": "4200",
+          "name": "clock_mhz",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.processors"
+    },
+    {
+      "columns": [
+        {
+          "description": "Hardware serial number, or \"unknown\" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel \"unknown\".",
+          "example": "EXAMPLE0001",
+          "name": "serial",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "SMBIOS/firmware system UUID, or \"unknown\" when absent or unreadable. Values: free text UUID, or the sentinel \"unknown\".",
+          "example": "00000000-0000-0000-0000-000000000001",
+          "name": "system_uuid",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.hardware.system"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per record via `write_output()`. Scalar actions (`manufacturer`, `model`) emit `key|value`; the rest emit one or more `key|field1|field2|...` rows. A field the underlying probe could not read is the literal string `unknown` rather than an omitted field or an empty row — this applies to every action's identity/value fields (`manufacturer`, `model`, `bios`, `processors`, `memory`, `disks`, `system`); `drivers` additionally emits `__truncated__` in the name field when the Windows WMI row cap (512, `agents/shared/wmi_bounded.hpp`) is hit (`hardware_plugin.cpp:739-746`).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None documented for this plugin (`docs/agent-privilege-model.md:88`)",
+      "if_refused": "WMI query returns `error`, action falls back to its `unknown` sentinel row (`wmi_query`, `hardware_plugin.cpp:209-228`)",
+      "measured": "2026-09-07, bare-metal, `SYSTEM` (sample stamp)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None (`docs/agent-privilege-model.md:88`)",
+      "if_refused": "native call/subprocess fails, action emits `unknown`/sentinel row",
+      "measured": "2026-09-07, bare-metal, euid 501 (unprivileged, sample stamp)",
+      "os": "macOS",
+      "runs_as": "agent daemon, default (no extra entitlement)"
+    },
+    {
+      "grant": "`system` reads `/sys/class/dmi/id/product_serial` + `product_uuid` (mode `0400`); the agent binary carries `cap_dac_read_search+eip` by default install (`hardware_plugin.cpp:358-364`). Without it, or with `--no-setcap`, both fields read back `unknown`. `memory`'s `dmidecode` branch typically needs root and fails EPERM unprivileged, silently falling through to the `/proc/meminfo` total (`hardware_plugin.cpp:499-502`).",
+      "if_refused": "file read fails, action emits `unknown`",
+      "measured": "2026-09-06, container, euid 0 (sample stamp — root, so the `cap_dac_read_search` gate is not exercised by this capture)",
+      "os": "Linux",
+      "runs_as": "agent daemon, default, except `system` needs `cap_dac_read_search` (`docs/agent-privilege-model.md:89`)"
+    }
+  ],
+  "readme": "agents/plugins/hardware/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "manufacturer",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "manufacturer|unknown"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "model",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "model|unknown"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "bios",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "bios_vendor|unknown",
+            "bios_version|unknown",
+            "bios_date|unknown"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "processors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "cpu|0|unknown|0|0|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "memory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "dimm|total|7934|unknown|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "disks",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "disk|0|vdb|0|HDD|virtio",
+            "disk|1|vda|460|HDD|virtio"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "drivers",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 5,
+          "rows": [
+            "driver|0|selfowner|||kernel|module",
+            "driver|1|shiftfs|||kernel|module",
+            "driver|2|rosetta|||kernel|module",
+            "driver|3|grpcfuse|||kernel|module",
+            "driver|4|fakeowner|||kernel|module"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "system",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "serial|unknown",
+            "system_uuid|unknown"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "fc050dca8530",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "manufacturer",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "manufacturer|Apple Inc."
+          ],
+          "truncated": false
+        },
+        {
+          "action": "model",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "model|Mac16,10"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "bios",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "bios_vendor|Apple",
+            "bios_version|18000.161.10",
+            "bios_date|N/A"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "processors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "cpu|0|Apple M4|10|10|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "memory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "dimm|total|32768|unknown|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "disks",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "disk|0|APPLE SSD AP0512Z|465|SSD|NVMe"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "drivers",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "driver|0|unknown||||"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "system",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "serial|EXAMPLE0001",
+            "system_uuid|00000000-0000-0000-0000-000000000001"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "fc050dca8530",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "manufacturer",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "manufacturer|PCSpecialist"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "model",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "model|Amd Am4 Gen3"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "bios",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "bios_vendor|American Megatrends Inc.",
+            "bios_version|3801",
+            "bios_date|2021-07-30"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "processors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "cpu|0|AMD Ryzen 9 5900X 12-Core Processor            |12|24|4200"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "memory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "dimm|DIMM_A2|8192|DDR4|3600",
+            "dimm|DIMM_B2|8192|DDR4|3600"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "disks",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "disk|1|Samsung SSD 970 EVO Plus 1TB|931|HDD|SCSI",
+            "disk|0|Samsung SSD 970 EVO Plus 250GB|232|HDD|SCSI"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "drivers",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 252,
+          "rows": [
+            "driver|0|Tailscale Tunnel|0.14.0.0|2021-10-13|WireGuard LLC|NET",
+            "driver|1|Xvdd SCSI Miniport|10.0.22029.3|2026-07-16|Xbox|SCSIADAPTER",
+            "driver|2|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE",
+            "driver|3|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE",
+            "driver|4|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "system",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "serial|1234567890",
+            "system_uuid|00000000-0000-0000-0000-000000000002"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "fc050dca8530",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "manufacturer",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "model",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "bios",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "processors",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "memory",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "disks",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "drivers",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "system",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/hardware.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/hardware/src/hardware_disks_macos.hpp",
+      "agents/plugins/hardware/src/hardware_linux_parsers.hpp",
+      "agents/plugins/hardware/src/hardware_macos_bios.hpp",
+      "agents/plugins/hardware/src/hardware_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/server/test_hardware_list_model.cpp",
+      "tests/unit/server/test_hardware_routes.cpp",
+      "tests/unit/server/test_hardware_ui.cpp",
+      "tests/unit/test_hardware_device_identity_posix_actions.cpp",
+      "tests/unit/test_hardware_disks_macos.cpp",
+      "tests/unit/test_hardware_linux_parsers.cpp",
+      "tests/unit/test_hardware_macos_bios.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result, plus a daily-sync consumer for seven of the eight actions.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The `device_ci` daily-sync source (ADR-0016) additionally invokes `manufacturer`, `model`, `system`, `bios`, `processors`, `memory`, and `disks` in-process via `LocalDispatcher` and folds their output into its canonical CI record (`agents/core/src/sync_source_device_ci.hpp:62-68`), which the server reconstructs field-for-field (`server/core/src/device_ci_ingestion.cpp:94-115`). `drivers` is the only action not part of that record. `content/definitions/hardware.yaml:517-518` documents this for the `system` action specifically.",
+    "**Not consumed by** TAR, DEX, or metrics. `manufacturer`/`model`/`bios`/`processors`/`memory`/`disks` gather on a 3600s TTL; `drivers` and `system` on an 86400s TTL (`content/definitions/hardware.yaml`); nothing polls continuously.",
+    "**Sensitivity.** `system` rows carry the hardware serial number and SMBIOS/firmware UUID — direct, stable device identifiers; `manufacturer`/`model`/`bios`/`disks` name the specific hardware but not a person; `drivers` rows name installed driver software (`name`/`provider`) — a software inventory by another route. No row carries a username or account name.",
+    "**Siblings:** `device_identity` (domain/OU join state, same Wave 3 native-acquisition migration), `disk_actions` (SMART health and volume-to-drive mapping — `hardware.disks` reports the drive inventory, `disk_actions` reports its health and logical mounts).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.hardware.system\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

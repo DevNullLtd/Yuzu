@@ -1,0 +1,10 @@
+mechanism	os	status	notes
+file	windows	supported	real IOCP + ReadDirectoryChangesW (spark_file.cpp)
+file	linux	unsupported	make_file_mechanism() returns nullptr off-Windows
+file	macos	unsupported	make_file_mechanism() returns nullptr off-Windows
+registry	windows	supported	real TP_WAIT + RegNotifyChangeKeyValue (spark_registry.cpp)
+registry	linux	unsupported	make_registry_mechanism() returns nullptr off-Windows
+registry	macos	unsupported	make_registry_mechanism() returns nullptr off-Windows
+service	windows	supported	real SCM NotifyServiceStatusChangeW (spark_service.cpp)
+service	linux	constrained	real sd-bus only when built with YUZU_HAVE_LIBSYSTEMD (systemd_guard); else nullptr
+service	macos	unsupported	make_service_mechanism() returns nullptr on macOS

@@ -1,0 +1,8 @@
+RECONSTRUCTION
+reason: no .desktop file captured in the ubuntu:24.04 container image (nor
+  anywhere else available to this capture) ships both the Hidden and
+  OnlyShowIn keys, which the acceptance criteria require an example of.
+  Base entry is the real at-spi-dbus-bus.desktop captured above; Hidden=true
+  and OnlyShowIn=GNOME; lines were added by hand to demonstrate the XDG
+  Desktop Entry Specification keys the autoruns parser must handle.
+date: 2026-09-06

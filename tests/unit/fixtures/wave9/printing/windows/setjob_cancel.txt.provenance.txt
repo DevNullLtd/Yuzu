@@ -1,0 +1,18 @@
+REAL CAPTURE
+host: the-rig (desktop-04dnsig, Windows 10.0.26200)
+date: 2026-09-08
+command: probe_wave9_print_win.exe, run twice against "Microsoft Print to PDF": once directly
+         over the admin SSH session (DESKTOP-04DNSIG\Alex, BUILTIN\Administrators, High Mandatory
+         Level -- full whoami /all captured to whoami_admin.txt, not committed), once via the
+         yuzu-wave9-print-probe scheduled task (Principal -UserId SYSTEM -LogonType
+         ServiceAccount -RunLevel Highest; NT AUTHORITY\SYSTEM, S-1-5-18, System Mandatory Level
+         -- whoami /all captured to whoami_system.txt, not committed). Output sections
+         == SetJobW(JOB_CONTROL_CANCEL, ...) == / == GetJobW readback ... == for both runs.
+note: cl /std:c++latest /EHsc /nologo /W3 probe_wave9_print_win.cpp winspool.lib compiled clean,
+      no warnings. Both identities: SetJobW cancel succeeds (GetLastError=0) via a full-access
+      OpenPrinterW handle AND via a PRINTER_ACCESS_USE-only handle; the readback after cancel
+      fails ERROR_INVALID_PARAMETER (87) because the cancelled job is removed from the queue
+      immediately, not left in a cancelled state; SetJobW against a nonexistent JobId (99999)
+      fails ERROR_INVALID_PARAMETER (87). This capture is the evidence for the plugin's clear_queue
+      DesiredAccess (PRINTER_ACCESS_USE); both identities above are already elevated -- a
+      least-privileged identity was NOT measured.

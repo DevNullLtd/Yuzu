@@ -1,0 +1,321 @@
+{
+  "actions": [
+    {
+      "action": "list",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present",
+          "mechanism": "rpm/dpkg-query/openssl via bounded argv runner",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version",
+          "mechanism": "filesystem_probe(glob+plist)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wmi+win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "surfaces",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "declared-licence classification only (no lapse detection) for pkg_metadata; entitlement_certs' authoritative expiry still depends on the openssl CLI being present",
+          "mechanism": "rpm/dpkg-query/openssl via bounded argv runner",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version",
+          "mechanism": "filesystem_probe(glob+plist)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wmi+win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Linux legs are declared CONSTRAINED, not SUPPORTED, by deliberate decision.** `pkg_metadata` is a declared-licence classification only (no lapse detection); `entitlement_certs`' authoritative expiry still depends on the `openssl` CLI being present. Not a regression — the migration off `popen` to the bounded argv runner is what made the demotion visible, not what caused the gap.",
+    "**A binary macOS Info.plist is never decoded.** `bplist00` bundles fall back to the bundle name with an empty version, deliberately, because parsing binary plists without a Mac to verify against was ruled too risky to ship.",
+    "**Per-user Windows probes are never a primary surface.** A missing `SeBackup`/`SeRestore` privilege or a hive-unload failure degrades the `per_user_hives` probe status honestly but never blocks `list` or the daily-sync cycle — per-user licence state is additive, not authoritative.",
+    "**`ent|` entitlement records are explicitly out of scope.** FlexLM seat counts and KMS activation counts are PR2 scope (ADR-0024 D12); do not add seat-count emission here without that decision being revisited.",
+    "**An `rpm` execution failure — not absence — falls through to `dpkg-query`.** A stray/leftover `rpm` binary with an uninitialized database (seen live on a self-hosted CI runner) failed every query while `dpkg-query` worked fine as the host's real package manager; only rpm's *absence* is treated as \"try the next tool\" the same way, execution failure is now handled identically rather than reported as a terminal error. A truncated capture (`output_truncated`) is kept as a distinct, honest failure mode, never folded into a silent partial success."
+  ],
+  "definitions": [],
+  "description": "Detects software licences across OS, vendor and per-user surfaces",
+  "how_it_works": "Both actions call the same `collect_surfaces()` → `run_platform_surfaces()` per-OS entry point. `list` emits every detected `lic|` record first, then one `probe_status|<surface>|ok|<rows>` (or `|error|<message>`) diagnostic line per surface attempted, then returns rc 0 unconditionally — \"success\" is structural (the enumeration sweep completed), not a claim that every surface answered. `surfaces` runs the identical sweep but suppresses the `lic|` records, emitting only the `probe_status|` diagnostics; it is the live-diagnostics counterpart to `list`, not a cheaper version of it.\n\nPer OS, surfaces run in a fixed order, most-authoritative first: Windows queries WMI `SoftwareLicensingProduct` (`slp_wmi`, authoritative licence state), then Office ClickToRun config, then the machine-scope `ProbeSpec` table rows (SQL Server, Exchange, VMware, WinRAR, OSS presence, …), then per-user registry hives and profile files. Linux runs `pkg_metadata` (rpm, falling back to dpkg-query), then RHEL `entitlement_certs` (openssl-parsed, authoritative expiry), then FlexLM `.lic` files. macOS runs the Mac App Store receipt scan, then vendor-plist presence rows.\n\nThe plugin is deliberately not an entitlement tracker: FlexLM seat counts and KMS activation counts (`ent|` records) are explicit PR2 scope and are never emitted here. It is also not a general plist parser — a binary (`bplist00`) `Info.plist` on macOS falls back to the bundle name with an empty version rather than being decoded.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": false,
+    "mutating": false
+  },
+  "leg_hash": "93534d76a8aa",
+  "manifest_version": 1,
+  "name": "license_scan",
+  "outputs": [],
+  "outputs_note": "No definition YAML ships for this plugin, so these tables are derived from the plugin source and the sample captures rather than `spec.result.columns`. `list` emits two distinct row shapes on the same stream: `lic|` records (one per detected licence) followed by `probe_status|` diagnostics (one per surface attempted); `surfaces` emits only the `probe_status|` diagnostics. Every `lic` field is drawn from a closed vocabulary and is \"unknown-preserving\" — the plugin never fabricates a value it cannot justify; absence is empty, not a guess.",
+  "platforms": {
+    "linux": "constrained",
+    "macos": "constrained",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None.** Machine-scope surfaces need only the agent account's existing registry-read access. The per-user offline-hive fallback rides `SeBackupPrivilege` + `SeRestorePrivilege`, already held by the agent account for `tar.*`/certificate-store writes — no new privilege is introduced.",
+      "if_refused": "`slp_wmi` (authoritative) errors block the daily-sync cycle; `per_user_hives` degrades to `privilege_missing`/`hive_unload_failed`/`profile_list_unreadable` without blocking `list`, since per-user hives are never a primary surface",
+      "measured": "2026-09-07, bare-metal, as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "**None.** `mas_receipt`/`vendor_plists` are unprivileged filesystem glob + plist reads.",
+      "if_refused": "no coded refusal path: an unreadable file or absent glob match reports a structural zero-row success, never an error",
+      "measured": "2026-09-07, bare-metal, at euid 501 (unprivileged) — this plugin needs none of the daemon's root grant",
+      "os": "macOS",
+      "runs_as": "agent LaunchDaemon, runs as **root** today (no `UserName` key; required for TAR's Endpoint Security client, unrelated to this plugin)"
+    },
+    {
+      "grant": "**None.** `pkg_metadata` (rpm/dpkg-query) and FlexLM `.lic` files are world-readable; RHEL entitlement certs under `/etc/pki/entitlement/*.pem` are world-readable.",
+      "if_refused": "`entitlement_certs` reports `openssl_unavailable` when certs exist but the CLI is missing; `pkg_metadata` reports `dpkg_query_failed`/`output_truncated` on a query failure",
+      "measured": "2026-09-06, container, at euid 0 (root) — not representative of the unprivileged production account, but no privilege is required either way",
+      "os": "Linux",
+      "runs_as": "agent daemon, designed to run unprivileged as `yuzu`"
+    }
+  ],
+  "readme": "agents/plugins/license_scan/README.md",
+  "result_status": [
+    {
+      "completeness": "UNKNOWN",
+      "provenance": "—",
+      "status": "`UNDECLARED` (never explicitly set)",
+      "when": "every probe outcome in the run was `ok` — the case in all three sample captures"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`license_scan:surface_error`",
+      "status": "`CONSTRAINED`",
+      "when": "at least one probe surface outcome has `ok=false`, set identically after both `list` and `surfaces`"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 149,
+          "rows": [
+            "lic|apt||3.0.3|open_source||unknown||package_metadata|heuristic|||machine|",
+            "lic|autoconf||2.72-3.1|open_source||unknown||package_metadata|heuristic|||machine|",
+            "lic|automake||1:1.17-4|open_source||unknown||package_metadata|heuristic|||machine|",
+            "lic|base-files||13.8+deb13u6|open_source||unknown||package_metadata|heuristic|||machine|",
+            "lic|base-passwd||3.6.7|open_source||unknown||package_metadata|heuristic|||machine|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "surfaces",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "probe_status|pkg_metadata|ok|146",
+            "probe_status|entitlement_certs|ok|0",
+            "probe_status|flexlm_lic|ok|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "93534d76a8aa",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 9,
+          "rows": [
+            "lic|Pages Creator Studio|||retail||licensed||app_receipt|probable|||machine|",
+            "lic|iMovie|||retail||licensed||app_receipt|probable|||machine|",
+            "lic|Numbers Creator Studio|||retail||licensed||app_receipt|probable|||machine|",
+            "lic|Keynote Creator Studio|||retail||licensed||app_receipt|probable|||machine|",
+            "lic|uBlock Origin Lite||2026.901.1442|retail||licensed||app_receipt|probable|||machine|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "surfaces",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "probe_status|mas_receipt|ok|7",
+            "probe_status|vendor_plists|ok|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "93534d76a8aa",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 21,
+          "rows": [
+            "lic|Office 16, Office16O365ProPlusR_Grace edition|Microsoft||retail|retail|unlicensed||os_licensing_api|authoritative|VMFTK||machine|",
+            "lic|Windows(R), Professional edition|Microsoft||retail|retail|licensed||os_licensing_api|authoritative|3V66T||machine|",
+            "lic|Microsoft Office (O365ProPlusRetail)|Microsoft|16.0.19822.20114|subscription||unknown||registry_probe|probable||winword.exe,excel.exe,outlook.exe,powerpnt.exe|machine|",
+            "lic|Microsoft Visual Studio|Microsoft||unknown||unknown||registry_probe|heuristic||devenv.exe|machine|",
+            "lic|7-Zip|Igor Pavlov||open_source||unknown||registry_probe|heuristic||7zfm.exe|machine|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "surfaces",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 14,
+          "rows": [
+            "probe_status|slp_wmi|ok|2",
+            "probe_status|office_c2r|ok|1",
+            "probe_status|sql_server|ok|0",
+            "probe_status|exchange|ok|0",
+            "probe_status|visual_studio|ok|1"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "93534d76a8aa",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareLicensing"
+    },
+    {
+      "action": "surfaces",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareLicensing"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
+    ],
+    "changelog": [],
+    "definitions": [],
+    "plugin": [
+      "agents/plugins/license_scan/src/license_scan_plugin.cpp",
+      "agents/plugins/license_scan/src/licensing_linux.cpp",
+      "agents/plugins/license_scan/src/licensing_macos.cpp",
+      "agents/plugins/license_scan/src/licensing_parsers.hpp",
+      "agents/plugins/license_scan/src/licensing_probes.cpp",
+      "agents/plugins/license_scan/src/licensing_probes.hpp",
+      "agents/plugins/license_scan/src/licensing_record.hpp",
+      "agents/plugins/license_scan/src/licensing_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_license_scan_actions.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Daily-sync (`software_licensing` source).** `list` output feeds a 24 h scheduled sync: the empty-vs-error structural guard skips a cycle (keeps last good state) if a primary/authoritative surface (`slp_wmi`, `entitlement_certs`, `flexlm_lic`) errored, and caps at 10,000 records / 1 MiB blob / 2 MiB raw capture — an over-cap or over-budget cycle is skipped rather than sent truncated.",
+    "**Server store.** The blob is parsed and ingested into `SoftwareLicensingStore`.",
+    "**REST.** `GET /api/v1/sle/agents/{agent_id}` — per-device detected licences (product, type, channel, state, expiry, confidence, exe_hints, and the per-user `user_scope`/`user_ref` fields), gated `SoftwareLicensing:Read` scoped to the device, audited per open. `DELETE /api/v1/sle/agents/{agent_id}` — decommission erasure, requiring `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`.",
+    "**MCP.** The `query_software_licenses` tool, gated `SoftwareLicensing:Read`, confined scope — reads the same store, not a live dispatch.",
+    "**Not consumed by** the TAR warehouse or DEX/metrics pipelines — no reference to `license_scan` or `SoftwareLicensing` was found in those paths in this sweep.",
+    "**Sensitivity.** `lic` rows are an installed-software/licence inventory: `product`/`vendor`/`version` name specific installed software and versions, `exe_hints` names installed executables, and `key_hint` carries a partial OS-provided key or key-derived hash (never raw key material); `user_scope`/`user_ref` can carry a local profile name for a user-scoped licence (empty in every sample capture here). `probe_status` rows carry nothing beyond a surface name and row count.",
+    "**Siblings:** none shipped. `ent|` entitlement records (FlexLM seat counts, KMS activation counts) are explicitly out of scope for this plugin (PR2, ADR-0024 D12) — see Caveats.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` finds no definition for this plugin today — no `content/definitions/license_scan.yaml` exists, so `get_definition(...)` has no id to resolve. Run: once an `InstructionDefinition` is authored against `license_scan.list`/`license_scan.surfaces`, `execute_instruction {definition_id, parameters}`. Read: `GET /api/v1/sle/agents/{agent_id}` or the MCP `query_software_licenses` tool."
+  ]
+}

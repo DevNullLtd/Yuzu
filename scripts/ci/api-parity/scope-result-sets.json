@@ -1,0 +1,10 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/scope-list",
+    "capability_id": "get.fragments-scope-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

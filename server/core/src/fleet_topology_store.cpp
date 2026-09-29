@@ -11,6 +11,7 @@
 
 #include "audit_store.hpp"
 #include "nvd_db.hpp"
+#include "offline_endpoint_store.hpp" // OfflineEndpoint -- merge_offline_topology() below
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -318,8 +319,15 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
     bool oversize = false;
     if (result && max_snapshot_bytes_ > 0) {
         // dump() is O(N) on the snapshot; only run on cache miss (rare).
+        // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): a 5th
+        // call site missed by the original fix pass - dump_topology_safe()
+        // (fleet_topology_types.hpp) never throws on a byte-clamped
+        // multi-byte codepoint, unlike strict dump(). Every refill runs
+        // this sizing check, so a single poisoned agent snapshot crashed
+        // EVERY subsequent cache refill on ordinary internationalized data,
+        // not just a caller's own dump.
         nlohmann::json j = *result;
-        const auto serialised_size = j.dump().size();
+        const auto serialised_size = dump_topology_safe(j).size();
         if (serialised_size > max_snapshot_bytes_) {
             oversize = true;
             refill_oversize_drops_.fetch_add(1, std::memory_order_relaxed);
@@ -1029,6 +1037,34 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
     }
 
     return out;
+}
+
+std::shared_ptr<const TopologySnapshot>
+merge_offline_topology(std::shared_ptr<const TopologySnapshot> snap,
+                       const std::vector<OfflineEndpoint>& persisted) {
+    if (persisted.empty())
+        return snap;
+    std::unordered_set<std::string> online;
+    online.reserve(snap->machines.size());
+    for (const auto& m : snap->machines)
+        online.insert(m.agent_id);
+    std::vector<MachineNode> stale_nodes;
+    for (const auto& ep : persisted) {
+        if (online.count(ep.agent_id) != 0U)
+            continue; // currently online -- already in the live snapshot
+        MachineNode n;
+        n.agent_id = ep.agent_id;
+        n.hostname = ep.hostname;
+        n.os = ep.os;
+        n.stale = true; // dimmed "offline" cube; ts stays 0
+        stale_nodes.push_back(std::move(n));
+    }
+    if (stale_nodes.empty())
+        return snap;
+    auto merged = std::make_shared<TopologySnapshot>(*snap);
+    for (auto& n : stale_nodes)
+        merged->machines.push_back(std::move(n));
+    return merged;
 }
 
 } // namespace yuzu::server

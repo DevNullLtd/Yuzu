@@ -1,0 +1,66 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/api-tokens",
+    "capability_id": "post.api-settings-api-tokens",
+    "rest_v1_twin": "POST /api/v1/tokens",
+    "mcp_twin": "create_api_token",
+    "status": "exception:same ApiTokenStore write + same RBAC gate as its v1/MCP twins (#2146 B4), but this dashboard-form route does NOT call step_up_fn while POST /api/v1/tokens does -- a real gate mismatch (composed-of requires gate-match, not just data-match), recorded rather than smoothed into twinned"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/api-tokens/{param}",
+    "capability_id": "delete.api-settings-api-tokens-param",
+    "rest_v1_twin": "DELETE /api/v1/tokens/{id}",
+    "mcp_twin": "revoke_api_token",
+    "status": "exception:same ApiTokenStore delete + same RBAC gate as its v1/MCP twins (#2146 B4), but this dashboard-form route does NOT call step_up_fn while DELETE /api/v1/tokens/{id} does -- same gate-mismatch caveat as the sibling POST row above"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/users",
+    "capability_id": "post.api-settings-users",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/users/{param}",
+    "capability_id": "delete.api-settings-users-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/users/{param}/role",
+    "capability_id": "post.api-settings-users-param-role",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/api-tokens",
+    "capability_id": "get.fragments-settings-api-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/tokens",
+    "capability_id": "get.fragments-settings-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/users",
+    "capability_id": "get.fragments-settings-users",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

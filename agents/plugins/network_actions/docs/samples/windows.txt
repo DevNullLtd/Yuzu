@@ -1,0 +1,16 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a44c8631e3c1
+== action=flush_dns
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=ping host=127.0.0.1
+output|Pinging 127.0.0.1 with 32 bytes of data:
+output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128
+output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128
+output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128
+output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128
+output|Ping statistics for 127.0.0.1:
+output|    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+output|Approximate round trip times in milli-seconds:
+output|    Minimum = 0ms, Maximum = 0ms, Average = 0ms
+[result_status] UNDECLARED / UNKNOWN / 
+

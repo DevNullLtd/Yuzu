@@ -1,0 +1,801 @@
+{
+  "actions": [
+    {
+      "action": "dns",
+      "definition_ids": [
+        "network.probe.dns"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "getaddrinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "getaddrinfo",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "getaddrinfo",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "icmp",
+      "definition_ids": [
+        "network.probe.icmp"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise",
+          "mechanism": "SOCK_DGRAM ICMP ping socket",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "SOCK_DGRAM ICMP ping socket",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "IcmpSendEcho",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "tcp",
+      "definition_ids": [
+        "network.probe.tcp"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "non-blocking connect() timing",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "non-blocking connect() timing",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "non-blocking connect() timing",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`status: ok` means the probe ran to completion, not that every sample connected — read it together with `loss_pct`.** `tcp` (and `icmp`) write `status: ok` unconditionally once a session opened and the target resolved (`netprobe_plugin.cpp:359`, `:394`), regardless of how many samples actually succeeded. The Linux `tcp` capture against `127.0.0.1 port=22` (no sshd in the capture container) shows this directly: `rtt|127.0.0.1|tcp:22|5|0|0.0|0.0|0.0|0.0|100.0|ok` — all 5 connect attempts failed fast (`ok: 0`, `loss_pct: 100.0`), yet `status` still reads `ok`. Windows and macOS, which do have something listening on 22, show `ok: 5`/`loss_pct: 0.0` for the same capture (`rtt|127.0.0.1|tcp:22|5|5|0.3|0.3|0.4|0.0|0.0|ok` and `…|0.0|0.1|0.1|0.0|0.0|ok`). The `targets` grammar itself is comma-separated hostnames/IPv4 literals only — no embedded port (`valid_probe_target`, `netprobe_stats.hpp:83-93`, rejects `:`); the port is the separate `port` parameter (default 443), as all three samples now correctly demonstrate.",
+    "**The Linux `icmp` leg is honestly gated, never fakes loss.** When the kernel refuses the unprivileged `SOCK_DGRAM` ICMP socket (`net.ipv4.ping_group_range` doesn't admit the process group), the row reports `status: not-permitted` with `sent: 0`/`loss_pct: 100.0` rather than a fabricated 100% loss figure (`netprobe_plugin.cpp:9-11`, `:229-230`, `:332-337`). The Linux sample was captured as root (euid 0) and so did not exercise this path.",
+    "**`icmp` is IPv4-only; `tcp`/`dns` resolve any family.** `icmp` forces `AF_INET` (`netprobe_plugin.cpp:340`, comment \"IPv4 only this slice\"); `tcp` resolves `AF_UNSPEC` (`netprobe_plugin.cpp:381`). A target with only an IPv6 address succeeds on `tcp`/`dns` but fails `icmp` with `resolve-failed`. IPv6 for `icmp` is a tracked follow-up (`netprobe_plugin.cpp:11`).",
+    "**Windows ICMP RTT is whole-millisecond only.** `IcmpSendEcho`'s `RoundTripTime` is a whole-ms value by API design (`netprobe_plugin.cpp:184-186`) — a sub-millisecond LAN hop reads `0.0`; use `tcp` for sub-ms fidelity on Windows.",
+    "**No action-level deadline, only per-sample.** Each sample is bounded by `timeout_ms` (100-3000 ms) plus a fixed 200 ms inter-sample gap, run strictly sequentially (`netprobe_plugin.cpp:79`, `:346-348`, `:388-390`); worst case is about 2 minutes at maximum targets/samples/timeout (`netprobe_plugin.cpp:16-18`), but nothing bounds the sum beyond that arithmetic."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Measure name-resolution wall time (getaddrinfo) for up to 4 comma-separated names, reporting milliseconds, status, and the number of addresses returned. Failing or slow resolution is one of the highest-impact \"everything is broken\" employee experiences.",
+      "display_name": "DNS Resolution Timing",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "network.probe.dns",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Measure ICMP echo round-trip time, jitter (population stddev), and packet loss to up to 4 comma-separated targets. Native (no shell-out): IcmpSendEcho on Windows (unprivileged, whole-millisecond granularity), unprivileged ICMP datagram sockets on macOS/Linux (on Linux gated by net.ipv4.ping_group_range — a refused socket reports status \"not-permitted\", never fake loss). IPv4 targets only. Worst case with maximum parameters is about 2 minutes; defaults finish in seconds.",
+      "display_name": "ICMP RTT Probe",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "network.probe.icmp",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Measure TCP connect-time round-trip latency, jitter, and connection failure rate to up to 4 comma-separated targets on a chosen port (default 443). Sub-millisecond timing, unprivileged on every platform — the pragmatic probe for resources that drop ICMP (VPN gateways, SaaS edges, internal services).",
+      "display_name": "TCP Connect RTT Probe",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "network.probe.tcp",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Active network measurement: ICMP/TCP round-trip time, jitter, loss, and DNS resolution timing to operator-chosen targets",
+  "how_it_works": "All three actions are native in-process socket work — no shell-out, no subprocess (`netprobe_plugin.cpp:1-65`). `icmp` opens one ICMP session for the whole run, resolves each target to its first IPv4 address only (`netprobe_plugin.cpp:340`), and sends `count` echo requests spaced 200 ms apart (`netprobe_plugin.cpp:79`, `:346-348`); on Windows via `IcmpSendEcho`, on macOS/Linux via an unprivileged `SOCK_DGRAM` ICMP ping socket, which Linux additionally gates on `net.ipv4.ping_group_range` (`netprobe_plugin.cpp:6-11`, `matrix.md`). `tcp` resolves each target to any address family (`AF_UNSPEC`, `netprobe_plugin.cpp:381`) and times a non-blocking `connect()` per sample on the chosen port (default 443). `dns` times one `getaddrinfo` call per name and reports the resolved address count and status. Every action validates and caps the `targets` CSV first (max 4 — `netprobe_plugin.cpp:75`, `netprobe_stats.hpp:118-136`) and rejects each invalid entry individually rather than failing the whole call (`netprobe_plugin.cpp:308-313`).\n\nThe plugin deliberately does not schedule its own recurrence or keep history — that is the server scheduler's job against the response store (`content/definitions/netprobe.yaml:1-4`); nor does it shell out to the OS `ping` binary the way the sibling `device.network_actions.ping` does (`content/definitions/network_actions.yaml:74-82`).",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "network.probe.dns",
+      "description": "Comma-separated DNS names to resolve (max 4), e.g. \"example.com,internal.corp.local\".\n",
+      "name": "targets",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "network.probe.icmp",
+      "description": "Comma-separated hostnames or IPv4 literals (max 4), e.g. \"10.0.0.1,gateway.corp.example.com\".\n",
+      "name": "targets",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": 5,
+      "definition_id": "network.probe.icmp",
+      "description": "Echo samples per target (1-10, default 5), e.g. 5.",
+      "name": "count",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": 1000,
+      "definition_id": "network.probe.icmp",
+      "description": "Per-sample timeout in milliseconds (100-3000, default 1000), e.g. 1000.\n",
+      "name": "timeout_ms",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "network.probe.tcp",
+      "description": "Comma-separated hostnames or IP literals (max 4), e.g. \"10.0.0.1,vpn-gw.corp.example.com\". The port is a separate parameter — do not embed it in a target.\n",
+      "name": "targets",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": 443,
+      "definition_id": "network.probe.tcp",
+      "description": "TCP port to connect to (default 443; clamped 1-65535).",
+      "name": "port",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": 5,
+      "definition_id": "network.probe.tcp",
+      "description": "Connect samples per target (1-10, default 5), e.g. 5.",
+      "name": "count",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": 1000,
+      "definition_id": "network.probe.tcp",
+      "description": "Per-sample timeout in milliseconds (100-3000, default 1000), e.g. 1000.\n",
+      "name": "timeout_ms",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": false,
+    "mutating": false
+  },
+  "leg_hash": "e635d1fd4823",
+  "manifest_version": 1,
+  "name": "netprobe",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The DNS name as supplied in targets, or the sanitized value when it failed validation. Values: free text DNS name.",
+          "example": "localhost",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Wall-clock time for the getaddrinfo call, one decimal place. Values: 1-decimal milliseconds.",
+          "example": "2.9",
+          "name": "resolve_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Outcome of the resolution. Values: ok, invalid-target, error:<getaddrinfo return code>.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of addresses getaddrinfo returned; 0 on failure or invalid target. Values: integer, 0 or more.",
+          "example": "2",
+          "name": "addresses",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "network.probe.dns"
+    },
+    {
+      "columns": [
+        {
+          "description": "The probe target as supplied in targets, or the sanitized value when it failed validation. Values: free text (hostname or IPv4 literal).",
+          "example": "127.0.0.1",
+          "name": "target",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Literal protocol tag for this row; always \"icmp\".",
+          "example": "icmp",
+          "name": "proto",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of echo samples attempted (the clamped count parameter), or 0 when the target was invalid or no ICMP session could be opened. Values: integer 0-10.",
+          "example": "5",
+          "name": "sent",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Number of echo samples that received a reply within timeout_ms. Values: integer 0-sent.",
+          "example": "5",
+          "name": "ok",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Fastest successful sample's round-trip time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.",
+          "example": "0.1",
+          "name": "min_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Mean round-trip time of the successful samples, one decimal place. Values: 1-decimal milliseconds.",
+          "example": "0.1",
+          "name": "avg_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Slowest successful sample's round-trip time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.",
+          "example": "0.2",
+          "name": "max_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Population standard deviation of the successful samples' RTT in milliseconds; 0.0 with fewer than two successful samples. Values: 1-decimal milliseconds.",
+          "example": "0.0",
+          "name": "jitter_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Percentage of samples that did not receive a reply within timeout, one decimal place; 100.0 when the session could not be opened or the target failed validation. Values: 1-decimal percentage, 0.0-100.0.",
+          "example": "0.0",
+          "name": "loss_pct",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Outcome of this target's probe. Values: ok, invalid-target, resolve-failed, error, not-permitted (Linux only, ping socket refused).",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "network.probe.icmp"
+    },
+    {
+      "columns": [
+        {
+          "description": "The probe target as supplied in targets, or the sanitized value when it failed validation. Values: free text (hostname or IP literal).",
+          "example": "127.0.0.1",
+          "name": "target",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Literal protocol tag including the connect port. Values: tcp:<port>.",
+          "example": "tcp:22",
+          "name": "proto",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of connect samples attempted (the clamped count parameter), or 0 when the target was invalid or resolution failed. Values: integer 0-10.",
+          "example": "5",
+          "name": "sent",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Number of connect samples that succeeded within timeout_ms. Values: integer 0-sent.",
+          "example": "5",
+          "name": "ok",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Fastest successful connect time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.",
+          "example": "0.3",
+          "name": "min_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Mean connect time of the successful samples, one decimal place. Values: 1-decimal milliseconds.",
+          "example": "0.3",
+          "name": "avg_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Slowest successful connect time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.",
+          "example": "0.4",
+          "name": "max_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Population standard deviation of the successful samples' connect time in milliseconds; 0.0 with fewer than two successful samples. Values: 1-decimal milliseconds.",
+          "example": "0.0",
+          "name": "jitter_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Percentage of samples that did not connect within timeout, one decimal place; 100.0 when resolution failed or the target failed validation. Values: 1-decimal percentage, 0.0-100.0.",
+          "example": "0.0",
+          "name": "loss_pct",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Outcome of this target's probe. \"ok\" means the probe ran to completion, not that every sample connected — check loss_pct too. Values: ok, invalid-target, resolve-failed.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "network.probe.tcp"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows. `icmp` and `tcp` share one row shape with a literal `rtt` discriminator (the `proto` field, not the row prefix, tells them apart); `dns` uses its own `dns`-prefixed row. An invalid target still emits one row (never dropped silently) with the sanitized target string, zeroed timing fields, and a `status` naming why (`netprobe_plugin.cpp:294-306`).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — `IcmpSendEcho`, `connect()`, and `getaddrinfo` need no elevation",
+      "if_refused": "n/a — no netprobe action is privilege-gated on Windows",
+      "measured": "2026-09-07 as `SYSTEM` (`docs/samples/windows.txt:1`)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, `docs/agent-privilege-model.md:70`, #1442)"
+    },
+    {
+      "grant": "None — the ICMP ping socket, `connect()`, and `getaddrinfo` all work unprivileged",
+      "if_refused": "n/a — no netprobe action is privilege-gated on macOS",
+      "measured": "2026-09-07 at euid 501, `alex` (`docs/samples/macos.txt:1`)",
+      "os": "macOS",
+      "runs_as": "agent daemon, intended unprivileged `_yuzu` account (`docs/agent-privilege-model.md:12`)"
+    },
+    {
+      "grant": "`icmp` only: the kernel sysctl `net.ipv4.ping_group_range` must admit the agent's process group, or the ping-socket open fails (`matrix.md`, `netprobe_plugin.cpp:229-230`)",
+      "if_refused": "`icmp` row reports `status: not-permitted`, `sent: 0`, `ok: 0`, `loss_pct: 100.0` — never a fabricated loss figure (`netprobe_plugin.cpp:9-11`, `:332-337`); `tcp`/`dns` are unaffected",
+      "measured": "2026-09-07 at euid 0, root, container (`docs/samples/linux.txt:1`) — privileged, so this gate was not exercised",
+      "os": "Linux",
+      "runs_as": "agent daemon, intended unprivileged `yuzu` account (`docs/agent-privilege-model.md:12`)"
+    }
+  ],
+  "readme": "agents/plugins/netprobe/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "icmp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|icmp|5|5|0.0|0.1|0.2|0.0|0.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "tcp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1 port=22",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|tcp:22|5|0|0.0|0.0|0.0|0.0|100.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "dns",
+          "not_captured": null,
+          "params": "targets=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "dns|localhost|0.4|ok|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "container",
+        "leg_hash": "e635d1fd4823",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "icmp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|icmp|5|5|0.0|0.1|0.1|0.0|0.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "tcp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1 port=22",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|tcp:22|5|5|0.0|0.1|0.1|0.0|0.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "dns",
+          "not_captured": null,
+          "params": "targets=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "dns|localhost|0.9|ok|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "e635d1fd4823",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "icmp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|icmp|5|5|0.0|0.0|0.0|0.0|0.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "tcp",
+          "not_captured": null,
+          "params": "targets=127.0.0.1 port=22",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rtt|127.0.0.1|tcp:22|5|5|0.3|0.3|0.4|0.0|0.0|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "dns",
+          "not_captured": null,
+          "params": "targets=localhost",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "dns|localhost|2.8|ok|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "e635d1fd4823",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "icmp",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "tcp",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "dns",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/netprobe.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/netprobe/src/netprobe_plugin.cpp",
+      "agents/plugins/netprobe/src/netprobe_stats.hpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_netprobe_stats.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics (no reference to `netprobe` or `network.probe.*` anywhere under `server/` outside the plugin catalogue and descriptor summary map, `server/core/src/agent_registry.cpp:830-833`). Recurrence/trending is the server scheduler's job, not this plugin's (`content/definitions/netprobe.yaml:1-4`).",
+    "**Sensitivity.** Rows carry only the operator-supplied `target` (a hostname or IP literal the caller chose, not read from the probing host) plus timing/loss statistics; no field names the probing device, a person, or installed software.",
+    "**Siblings:** `device.network_actions.ping` — a one-shot ICMP reachability check that shells out to the OS `ping` binary and streams its raw text output (`content/definitions/network_actions.yaml:74-82`), unlike netprobe's native, structured, no-shell-out RTT/jitter/loss rows. Both ship in the same #2204 network/security plugin declaration group alongside `netstat`, `discovery`, `wifi`, `wol`, `http_client`, `certificates`, `firewall`, and `quarantine` (`changelog.d/2204-declarations-group-c.added.md`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"network.probe.icmp\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

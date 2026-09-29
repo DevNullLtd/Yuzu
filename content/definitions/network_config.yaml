@@ -4,8 +4,9 @@
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetAdaptersAddresses), WinHTTP proxy API, dnsapi.dll
-##   Linux:   ip(8), /etc/resolv.conf, resolvectl, sysfs, environment variables
-##   macOS:   ifconfig, scutil, networksetup, dscacheutil
+##   Linux:   rtnetlink (RTM_GETLINK/RTM_GETADDR/RTM_GETROUTE), /proc/net/arp,
+##            /etc/resolv.conf, sysfs, environment variables, resolvectl (dns_cache only)
+##   macOS:   getifaddrs, SIOCGIFMEDIA, PF_ROUTE sysctl, SCDynamicStore
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -16,9 +17,15 @@ metadata:
   version: 1.0.0
   description: >
     Lists network adapters with MAC address, link speed, and
-    operational status. Skips loopback and tunnel interfaces.
-    On Windows uses GetAdaptersAddresses, on Linux reads ip-link
-    and sysfs speed, on macOS parses ifconfig output.
+    operational status. On Windows uses GetAdaptersAddresses and skips
+    loopback and tunnel interfaces; on Linux reads rtnetlink
+    (RTM_GETLINK) plus sysfs speed and skips loopback; on macOS reads
+    getifaddrs and SIOCGIFMEDIA and reports loopback (lo0) as a real
+    adapter. The loopback difference between Linux and macOS is
+    long-standing behaviour, not an oversight. On Linux the adapter name is
+    the kernel interface name, so devices with a parent link (veth, VLAN,
+    tunnel) are reported as eth0 rather than iproute2's display form
+    eth0@if74.
   tags: [network, inventory, hardware]
 
 spec:
@@ -38,12 +45,24 @@ spec:
     columns:
       - name: name
         type: string
+        description: "Adapter's OS-reported display name (Windows friendly name; Linux/macOS kernel interface name). Values: free text."
+        example: "en0"
+        platforms: [windows, linux, darwin]
       - name: mac
         type: string
+        description: "Adapter's MAC address, colon-separated hex, or '-' when the leg could not resolve one (loopback, tunnel/utun interfaces)."
+        example: "00:00:5e:00:53:04"
+        platforms: [windows, linux, darwin]
       - name: speed_mbps
         type: int64
+        description: "Link speed reported by the OS, in megabits per second; 0 when unknown, inactive, or not applicable (loopback/tunnel). Values: integer Mbps, 0 for unknown/inactive (Linux/macOS); Windows emits the unclamped TransmitLinkSpeed sentinel (18446744073709) instead of 0 when the adapter reports no known speed — see Caveats."
+        example: "1000"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: "Adapter link state. Windows/Linux report the OS's OPERATIONAL state (IfOperStatus / IFLA_OPERSTATE); macOS reports the ADMINISTRATIVE IFF_UP flag instead, so a cable-unplugged Mac NIC can read 'up' where Windows/Linux would read 'down'. Values: up, down (Windows, macOS); up, down, unknown (Linux, when the kernel omits IFLA_OPERSTATE)."
+        example: "up"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - status
@@ -80,8 +99,11 @@ metadata:
     Lists assigned IP addresses per adapter with subnet prefix length
     and default gateway. Returns both IPv4 and IPv6 unicast addresses.
     On Windows uses GetAdaptersAddresses with GAA_FLAG_INCLUDE_GATEWAYS,
-    on Linux parses ip-addr and ip-route, on macOS parses ifconfig and
-    route output.
+    on Linux reads rtnetlink (RTM_GETADDR/RTM_GETROUTE), on macOS reads
+    getifaddrs plus a PF_ROUTE sysctl for the default route. Loopback is
+    excluded on Linux and macOS. The Linux default gateway is taken from the
+    main routing table only, matching ip route show default; policy-routing
+    tables installed by VPNs are ignored.
   tags: [network, inventory, addressing]
 
 spec:
@@ -101,12 +123,24 @@ spec:
     columns:
       - name: adapter
         type: string
+        description: "Adapter name the address belongs to (same name as the adapters action's name field). Values: free text."
+        example: "en0"
+        platforms: [windows, linux, darwin]
       - name: address
         type: string
+        description: "IPv4 or IPv6 unicast address assigned to the adapter; an IPv6 link-local zone suffix ('%ifname') is stripped on macOS. Values: IPv4 or IPv6 literal."
+        example: "203.0.113.131"
+        platforms: [windows, linux, darwin]
       - name: prefix_length
         type: int32
+        description: "CIDR prefix length of the address's subnet. Values: integer, 0-32 (IPv4) or 0-128 (IPv6)."
+        example: "24"
+        platforms: [windows, linux, darwin]
       - name: gateway
         type: string
+        description: "Default gateway address for this row. Windows resolves it per-adapter (FirstGatewayAddress); Linux/macOS resolve a single system-wide default gateway and repeat it on every row. Values: IPv4 literal, or '-' when none or unresolved."
+        example: "203.0.113.1"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - adapter
@@ -143,8 +177,10 @@ metadata:
     Lists configured DNS servers per adapter, including address
     family (IPv4/IPv6). On Windows enumerates per-adapter DNS
     server addresses via GetAdaptersAddresses. On Linux reads
-    /etc/resolv.conf nameserver entries. On macOS parses scutil
-    --dns output.
+    /etc/resolv.conf nameserver entries. On macOS reads SCDynamicStore,
+    unioning the global resolver key with every per-service resolver key
+    so supplemental (VPN split-DNS, secondary-interface) resolvers are
+    included, de-duplicated in first-seen order.
   tags: [network, inventory, dns]
 
 spec:
@@ -164,10 +200,19 @@ spec:
     columns:
       - name: adapter
         type: string
+        description: "Adapter owning this resolver on Windows; Linux and macOS report the system-wide resolver list under the literal value 'system' (resolv.conf and SCDynamicStore are not per-adapter). Values: adapter name (Windows), or the literal 'system' (Linux, macOS)."
+        example: "system"
+        platforms: [windows, linux, darwin]
       - name: server
         type: string
+        description: "Configured DNS server address. Values: IPv4 or IPv6 literal."
+        example: "192.0.2.100"
+        platforms: [windows, linux, darwin]
       - name: type
         type: string
+        description: "Address family of the server value. Values: IPv4, IPv6."
+        example: "IPv4"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - adapter
@@ -201,11 +246,19 @@ metadata:
   displayName: Proxy Configuration
   version: 1.0.0
   description: >
-    Returns the system proxy configuration including proxy type
-    (none, http, pac, auto_detect), proxy address, and bypass list.
-    On Windows reads WinHTTP IE proxy config. On Linux checks
-    http_proxy/https_proxy/all_proxy/no_proxy environment variables.
-    On macOS queries networksetup for web proxy and auto-proxy URL.
+    Returns the system proxy configuration including proxy type, proxy
+    address, and bypass list. On Windows reads WinHTTP IE proxy config and
+    reports a normalized proxy_type (none, http, pac, auto_detect). On Linux
+    checks the http_proxy/HTTP_PROXY/https_proxy/HTTPS_PROXY/all_proxy/
+    ALL_PROXY/no_proxy/NO_PROXY environment variables and reports the
+    LITERAL variable name as proxy_type (not a normalized type), emitting
+    one proxy_type/proxy_address row pair per variable that is set. On macOS
+    reads SCDynamicStoreCopyProxies, checking the primary network service
+    first and then each scoped per-interface service, so a proxy configured
+    on a service that is not currently active is still reported; only the
+    HTTP proxy and PAC URL are reported, so a host configured with only an
+    HTTPS, SOCKS or FTP proxy reads as none. macOS and Linux (no_proxy) also
+    emit a bypass row listing the proxy exception list.
   tags: [network, inventory, proxy, compliance]
 
 spec:
@@ -225,10 +278,19 @@ spec:
     columns:
       - name: proxy_type
         type: string
+        description: "Proxy mode. Windows and macOS emit a normalized type; Linux instead emits the literal environment-variable name it read (e.g. 'http_proxy', 'HTTPS_PROXY'), and can emit several proxy_type/proxy_address row pairs in one response if more than one variable is set — see Caveats. Values: none, http, pac, auto_detect (Windows); none, http, pac (macOS); none, or a literal *_proxy/ALL_PROXY variable name (Linux)."
+        example: "auto_detect"
+        platforms: [windows, linux, darwin]
       - name: proxy_address
         type: string
+        description: "The proxy host:port (http), the PAC URL (pac), or the raw environment-variable value (Linux). Row is omitted entirely when proxy_type is none/auto_detect. Values: 'host:port', a URL, or a raw environment-variable value."
+        example: "not observed in the captured samples — omitted whenever proxy_type is none or auto_detect"
+        platforms: [windows, linux, darwin]
       - name: bypass
         type: string
+        description: "Comma-separated proxy-exception/bypass list; the row is omitted entirely when the list is empty. Values: comma-separated free text."
+        example: "*.local,169.254/16"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - proxy_type
@@ -266,7 +328,10 @@ metadata:
     DnsGetCacheDataTable from dnsapi.dll and returns cached entries
     with record type (A, AAAA, CNAME, PTR, MX, SRV). On Linux reads
     resolvectl cache or falls back to systemd-resolve statistics. On
-    macOS invokes dscacheutil -cachedump.
+    macOS the OS does not expose resolver-cache contents to userspace
+    (dscacheutil -cachedump is defunct on modern macOS), so a single
+    dns_cache|unsupported sentinel is returned — a permanent capability
+    gap, not a transient failure.
   tags: [network, dns, diagnostics, security]
 
 spec:
@@ -286,10 +351,19 @@ spec:
     columns:
       - name: name
         type: string
+        description: "Resolved DNS name of the cached entry. Populated only on Windows — Linux emits opaque, unparsed resolvectl/systemd-resolve text under a different row shape, and macOS never populates this action at all. See Caveats. Values: free text (FQDN or reverse-lookup name)."
+        example: "windowsupdate.microsoft.com"
+        platforms: [windows]
       - name: record_type
         type: string
+        description: "DNS resource-record type of the cached entry, decoded from DnsGetCacheDataTable's wType. Populated only on Windows; an unrecognised wType value reports 'unknown'. Values: A, AAAA, CNAME, PTR, MX, SRV, unknown."
+        example: "PTR"
+        platforms: [windows]
       - name: ttl
         type: int32
+        description: "Always the literal 0 — the Windows leg does not decode a real time-to-live from DnsGetCacheDataTable's cache entry structure, so this is not a measured value."
+        example: "0"
+        platforms: [windows]
     aggregation:
       groupBy:
         - record_type
@@ -300,6 +374,87 @@ spec:
 
   gather:
     ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.arp
+  displayName: ARP / Neighbour Table
+  version: 1.0.0
+  description: >
+    Returns the host ARP / neighbour table (interface, IP, MAC address,
+    static/dynamic type). On Windows reads GetIpNetTable2 — IPv4 ARP and
+    IPv6 neighbours, including incomplete entries, capped at 20000 rows.
+    On Linux reads /proc/net/arp: IPv4 ARP only — IPv6 neighbours live in
+    a separate kernel table and are not reported, and non-Ethernet or
+    incomplete (non-ATF_COM) entries are skipped. On macOS reads a
+    PF_ROUTE RTF_LLINFO sysctl and de-duplicates; the dump carries no
+    interface name or static/dynamic type, so both fields are reported
+    as "-". Linux and macOS share Windows' 20000-row cap. This collects
+    the host's known neighbour identities (IP + MAC address) and is
+    tagged for compliance/inventory review on that basis.
+  tags: [network, inventory, arp, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: arp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: interface
+        type: string
+        description: "Owning network interface name; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no interface field. Values: interface name, or '-' (macOS, always)."
+        example: "Ethernet"
+        platforms: [windows, linux, darwin]
+      - name: ip_address
+        type: string
+        description: "Neighbour's IPv4 or IPv6 address. Values: IPv4 or IPv6 literal."
+        example: "203.0.113.61"
+        platforms: [windows, linux, darwin]
+      - name: mac_address
+        type: string
+        description: "Neighbour's MAC address, colon-separated hex; '-' for a Windows entry with no resolved hardware address yet (incomplete). Linux drops all-zero-MAC rows rather than emitting '-'. Values: colon-separated hex, or '-' (Windows incomplete entries only)."
+        example: "00:00:5e:00:53:0f"
+        platforms: [windows, linux, darwin]
+      - name: entry_type
+        type: string
+        description: "Static/dynamic/incomplete classification; always '-' on macOS, where the PF_ROUTE RTF_LLINFO dump carries no such distinction. Values: static, dynamic, incomplete (Windows only); static, dynamic (Linux); '-' (macOS, always)."
+        example: "dynamic"
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - entry_type
+      operations:
+        - count
+
+  readablePayload: "Get ARP / neighbour table"
+
+  gather:
+    ttlSeconds: 120
 
   approval:
     mode: auto

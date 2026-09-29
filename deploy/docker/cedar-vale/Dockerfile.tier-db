@@ -10,7 +10,7 @@
 
 FROM yuzu-agent-viz-uat:latest AS agentsrc
 
-FROM postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+FROM postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 libsqlite3-0 libstdc++6 ca-certificates tini \

@@ -1,0 +1,21 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 9139daeb45d2
+== action=list
+proc|1|sh
+proc|8|plugin-capture
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_hashed
+proc|1|sh|367967c823a0c391e5049b15a67c6a0a629c88b9b6dcdca75ef13ac9d65334b1|/usr/bin/dash
+proc|8|plugin-capture|e4afbc5e655b3942d6ee315b307eb4449358d82f0c86fe127bdd5312107cf889|/src/builddir/tools/plugin-capture/plugin-capture
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_tree
+proc|1|0|sh|367967c823a0c391e5049b15a67c6a0a629c88b9b6dcdca75ef13ac9d65334b1|/usr/bin/dash
+proc|8|1|plugin-capture|e4afbc5e655b3942d6ee315b307eb4449358d82f0c86fe127bdd5312107cf889|/src/builddir/tools/plugin-capture/plugin-capture
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=query name=sh
+found|true
+proc|1|sh
+[result_status] UNDECLARED / UNKNOWN / 
+

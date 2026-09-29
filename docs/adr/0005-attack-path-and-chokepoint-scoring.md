@@ -9,6 +9,10 @@ depends-on: 0006/0007/0008 (server-side Postgres substrate chain — accepted 20
 
 > **Implementation status (2026-06-18 conformance audit):** Accepted decision; attack-path/chokepoint scoring is **not yet built in mainline** — implementation is spike-grade (PR #1206). See `docs/reviews/codebase-conformance-2026-06-18`.
 
+> **Re-verified (2026-09-07 ADR reconciliation):** still not built in mainline — zero hits for `reachability_graph`/`ReachabilityGraph`/`service_node`/`host_node` in `server/`, `agents/`. Deferred, not withdrawn: re-homes into a use-case engine under ADR-1005 Phase 7 (not started, #4099); NOT grandfathered — faces ADR-1005 Decision 2 at implementation.
+
+> **Amendment (2026-07-16, ADR-4003).** The Chokepoints bullet below (`crown-jewel value × path probability`, defender ROI, not Brandes betweenness) is superseded by ADR-4003 Decision 5's unweighted chain centrality — the same bounded, declared-surface-scoped complexity shape described here (still not classical Brandes betweenness, still not O(V·E)), not a reopening of this ADR's rejection of generic all-pairs centrality. Implementation-level detail (the §5.1–§5.4 numbering, "wrong (weights all-pairs equally)" wording) lives in `docs/vuln-scan-engine-design.md`, not this ADR — see that doc's own amended §5.2 for the current formula. Attack-path scoring and segmentation (the other bullets below) are unaffected.
+
 ## Context
 
 Raw CVSS ranking is noise at fleet scale. We want findings ranked by their position on a

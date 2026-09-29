@@ -1,0 +1,812 @@
+{
+  "actions": [
+    {
+      "action": "clear",
+      "definition_ids": [
+        "agent.storage.clear"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "delete",
+      "definition_ids": [
+        "agent.storage.delete"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_delete)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_delete)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_delete)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get",
+      "definition_ids": [
+        "agent.storage.get"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_get)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_get)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_get)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list",
+      "definition_ids": [
+        "agent.storage.list"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_list)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "set",
+      "definition_ids": [
+        "agent.storage.set"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_set)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_set)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent KV store (yuzu_ctx_storage_set)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**The docs capture bypasses `init()`, and `set` is the only action that shows it.** The capture driver loads the plugin and dispatches through `LocalDispatcher` without calling `StoragePlugin::init()`, leaving the static `g_ctx` null (`storage_plugin.cpp:25,108`) and every `yuzu_ctx_storage_*` call on its `!ctx` early-return path (`agent.cpp:578,587,604,613,622`). Only `set` reports this as a visible failure; `get`/`delete`/`list` mask it as an empty result (see *How it works*).",
+    "**`delete` reports success unconditionally.** `do_delete` never inspects the bool `storage_delete()` returns (`storage_plugin.cpp:172-174`), so a failed delete — including the null-context case above — still emits `status|ok`.",
+    "**No typed result status.** Grep of `storage_plugin.cpp` finds no `set_result_status`/`yuzu_ctx_set_result_status` call; every response reads `UNDECLARED / UNKNOWN`, so a caller cannot distinguish \"wrote fine\" from \"silently no-opped\" without also checking the command's `rc`.",
+    "**`clear` is Destructive and was never captured live.** Per `plugin_action_catalogue_b.hpp:440-449`, `clear` is `DispatchClass::Destructive`/`Irreversible`; `changelog.d/3885-dashboard-destructive-targeting.security.md` names `storage.clear` explicitly as one of the actions a prior dashboard gap let fan across the whole fleet by omitting a target (now closed). The capture driver correspondingly never executes it against a live host — all three sample files show `[not captured]`.",
+    "**The YAML under-declares `get`'s row shape.** `get` writes a 3-field row, `key|<key>|<value-or-not_found>` (`storage_plugin.cpp:158-160`), but `content/definitions/storage.yaml`'s `agent.storage.get` declares only two `result.columns` (`key`, `value`) — the literal row-discriminator field has no column of its own. Left as-is rather than restructured, since this enrichment pass adds metadata to existing columns without renaming or reordering them."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete all keys from the storage plugin's namespace. Destructive and irreversible; requires an explicit, in-scope target (cannot be dispatched fleet-wide or with an omitted target). Identical behavior on Windows, macOS, and Linux. Not executed live by the docs capture driver — see the plugin README's Caveats section.",
+      "display_name": "Clear Storage",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "agent.storage.clear",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a key from the agent's persistent KV storage. Reports \"ok\" unconditionally once the delete call returns, even if the underlying delete failed. Identical behavior on Windows, macOS, and Linux.",
+      "display_name": "Delete Storage Key",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "agent.storage.delete",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve a value from the agent's persistent KV storage by key. Returns the sentinel \"not_found\" if the key has no stored value. Identical behavior on Windows, macOS, and Linux.",
+      "display_name": "Get Storage Key",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "agent.storage.get",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "List all keys in the agent's persistent KV storage, optionally filtered by prefix. Identical behavior on Windows, macOS, and Linux.",
+      "display_name": "List Storage Keys",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "agent.storage.list",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Store a key-value pair in the agent's persistent KV storage. Keys are namespaced per plugin. Identical behavior on Windows, macOS, and Linux (in-process KV store, no OS-specific code path).",
+      "display_name": "Set Storage Key",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "agent.storage.set",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Persistent key-value storage — set, get, delete, list, clear",
+  "how_it_works": "All five actions are thin wrappers over the agent's own in-process KV store (`agents/core/src/agent.cpp:577-627`), reached through the C ABI functions `yuzu_ctx_storage_{set,get,delete,list}` — no OS-specific code and no subprocess anywhere in the plugin (`agents/plugins/storage/src/storage_plugin.cpp:27-29`). `set`/`get`/`delete` operate on a single key; `list` enumerates keys under an optional prefix; `clear` is built from `list` + `delete` — it reads every key in the plugin's namespace, deletes each one in a loop, and reports the size of that initial list as `cleared`, not a per-key confirmed-delete count (`storage_plugin.cpp:189-198`). The store is namespaced by the calling plugin's own declared name (`impl->plugin_name`, `agent.cpp:246,970`), so one plugin cannot read another's keys; there is no TTL, versioning, or value type-checking — every value is opaque text.\n\n**Root cause worth stating plainly:** the C ABI depends on `StoragePlugin::init()` having already run and cached the host's `YuzuPluginContext*` into the static `g_ctx` (`storage_plugin.cpp:25,108`). A harness that loads the plugin and calls `execute()` without first calling `init()` — which is exactly how the docs capture driver and the `PluginHandle::load` + `LocalDispatcher::run` pattern work — leaves `g_ctx` null, so every `yuzu_ctx_storage_*` call takes its `!ctx` early-return path (`agent.cpp:578,587,604,613,622`). `set` surfaces this loudly as `error|storage write failed` (`storage_plugin.cpp:145`). `get`, `delete`, and `list` mask it instead: their SDK wrappers treat a null/negative ABI return as an empty result rather than an error (`sdk/include/yuzu/plugin.hpp:122-129,132-134,142-145`), and `do_delete` never inspects the bool `storage_delete()` returns (`storage_plugin.cpp:172-174`) — so a run through this path reads as \"no such key\" or \"cleared 0 keys\" when the real cause is that storage was never wired up at all. In the real agent boot path, `init()` is called with a correctly-wired context before any dispatch (`agent.cpp:966-983`), so this only bites harnesses that skip it — which is exactly what produced the `[rc] 1` on every OS's `set` sample below.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.storage.delete",
+      "description": "Storage key to delete, e.g. \"yuzu_capture_tmp\".",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.storage.get",
+      "description": "Storage key to retrieve, e.g. \"yuzu_capture_tmp\".",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.storage.list",
+      "description": "Only return keys starting with this prefix, e.g. \"yuzu_\". Default is all keys.\n",
+      "name": "prefix",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.storage.set",
+      "description": "Storage key name, arbitrary text, e.g. \"yuzu_capture_tmp\".",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.storage.set",
+      "description": "Value to store, arbitrary text, stored and returned byte-for-byte.",
+      "name": "value",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "cc5994a9097a",
+  "manifest_version": 1,
+  "name": "storage",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Write outcome. Always the literal \"ok\", written after the clear loop completes.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Count of keys deleted in this run — the size of the key list read at the start of the pass, not a per-key confirmed-delete count. Values: integer >= 0.",
+          "example": "-",
+          "name": "cleared",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.storage.clear"
+    },
+    {
+      "columns": [
+        {
+          "description": "Write outcome. Always the literal \"ok\" when present — written unconditionally once the delete call returns, without checking whether the delete actually succeeded.\n",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The key name that was targeted for deletion, echoed back unchanged. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.storage.delete"
+    },
+    {
+      "columns": [
+        {
+          "description": "The requested key name, echoed back unchanged. (The literal \"key\" row-discriminator emitted before this field is not itself a separate column.). Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The stored value, or the literal sentinel \"not_found\" when the key has no stored value. Values: free text, or the sentinel not_found.",
+          "example": "not_found",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.storage.get"
+    },
+    {
+      "columns": [
+        {
+          "description": "Number of keys returned, written once as the first row of every response. Values: integer >= 0.",
+          "example": "0",
+          "name": "count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "One row per matching key name; no key rows at all when count is 0. Values: free text.",
+          "example": "-",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.storage.list"
+    },
+    {
+      "columns": [
+        {
+          "description": "Write outcome. Present and equal to \"ok\" only when the write succeeded; on failure this row is absent and an \"error|<message>\" line is written instead (not represented as a column).\n",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The key name that was stored, echoed back unchanged. Values: free text.",
+          "example": "yuzu_capture_tmp",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.storage.set"
+    }
+  ],
+  "outputs_note": "Each action writes one or more independently-shaped, pipe-delimited lines via `write_output()` (`storage_plugin.cpp:132-198`) rather than a uniform repeating row. `set`, `delete`, and `clear` announce success as a literal `status|ok` line — or, on failure, no `status` line at all and instead a separate `error|<message>` line (not represented in the YAML columns below, since it only appears when the row-producing path is never reached). `get` always writes exactly one `key|<key>|<value-or-not_found>` line, where the sentinel `not_found` means both \"no such key\" and — per the root-cause note above — \"storage was never wired up.\" `list` writes one `count|<n>` line followed by `n` `key|<k>` lines, with zero `key` rows when `n` is 0.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — pure in-process SQLite KV read/write inside the agent's own data directory; no privileged API is touched",
+      "if_refused": "No permission gate exists in this plugin. A missing/uninitialized store takes the ABI's `!ctx` early-return path (`agent.cpp:577-627`), not a typed permission error",
+      "measured": "2026-09-07, bare-metal, `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "same as above",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — **unprivileged**, i.e. this capture was taken at a weaker identity than the shipped root daemon",
+      "os": "macOS",
+      "runs_as": "agent daemon; ships root today per `docs/agent-privilege-model.md` (narrowing tracked in #1455)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "same as above",
+      "measured": "2026-09-06, container, euid 0 — this capture was taken as root, not the production `yuzu` identity",
+      "os": "Linux",
+      "runs_as": "agent service account `yuzu`, unprivileged, per `docs/agent-privilege-model.md`"
+    }
+  ],
+  "readme": "agents/plugins/storage/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|storage write failed"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "key|yuzu_capture_tmp|not_found"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|ok",
+            "key|yuzu_capture_tmp"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "cc5994a9097a",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|storage write failed"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "key|yuzu_capture_tmp|not_found"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|ok",
+            "key|yuzu_capture_tmp"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "cc5994a9097a",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "set",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp value=1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|storage write failed"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "key|yuzu_capture_tmp|not_found"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "key=yuzu_capture_tmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|ok",
+            "key|yuzu_capture_tmp"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "clear",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "cc5994a9097a",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "set",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "get",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "delete",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "clear",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/storage.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/storage/src/storage_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — a grep of `server/core/src` for `\"storage\"` and for the five `agent.storage.*` ids finds no server-side consumer beyond the generic dispatch/response path.",
+    "**Sensitivity.** The plugin never interprets its `key`/`value` content — every row is opaque caller-supplied text, so whether a given row identifies a device, a person, or installed software depends entirely on what the calling plugin chose to store there, not on anything this plugin's own columns declare. The `status`/`count`/`cleared` fields carry nothing beyond the device id.",
+    "**Siblings:** none. `content/definitions/storage.yaml` is the only definitions file with `execution.plugin: storage`; the plugin's five actions are the only definitions that execute against it.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"agent.storage.get\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

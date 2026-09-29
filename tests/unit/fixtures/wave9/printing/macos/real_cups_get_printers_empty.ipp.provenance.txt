@@ -1,0 +1,25 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 501 (alex, non-root — no sudo used or required)
+
+request: CUPS-Get-Printers (0x4002), request-id 1, built by
+`build_request.py cups-get-printers`.
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/macos
+  python3 build_request.py cups-get-printers > /tmp/req_printers.ipp
+  curl --unix-socket /private/var/run/cupsd -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      --data-binary @/tmp/req_printers.ipp \
+      http://localhost/ -o real_cups_get_printers_empty.ipp
+
+decoded result: 113 bytes; status-code 0x0406 (client-error-not-found);
+status-message = "No destinations added." — this host has no configured
+print queues, so CUPS-Get-Printers legitimately returns no destinations.
+
+This is a REAL, unprivileged capture against the live `/private/var/run/
+cupsd` socket — no sudo, no queue creation. Captured by `capture.sh`
+Phase A, which any developer or CI leg can re-run to reproduce this file
+byte-for-byte on a host in the same state (no configured queues).

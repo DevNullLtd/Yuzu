@@ -73,6 +73,20 @@ public:
 
     void report_progress(int percent) { yuzu_ctx_report_progress(raw_, percent); }
 
+    /**
+     * Report the CC-07 typed result status for the command currently
+     * executing (ABI v4+). Optional — a plugin that never calls this leaves
+     * the status YUZU_RESULT_STATUS_UNDECLARED and the agent derives a
+     * coarse one from execute()'s int return code instead. See
+     * yuzu_ctx_set_result_status() in plugin.h for the full contract.
+     */
+    void set_result_status(YuzuResultStatus status, YuzuResultCompleteness completeness,
+                           std::string_view provenance = {}) {
+        const std::string owned{provenance};
+        yuzu_ctx_set_result_status(raw_, status, completeness,
+                                   owned.empty() ? nullptr : owned.c_str());
+    }
+
 private:
     YuzuCommandContext* raw_;
 };
@@ -197,13 +211,49 @@ public:
     [[nodiscard]] virtual const char* const* actions() const noexcept = 0;
 
     /**
+     * Per-action, per-OS capability declarations (ABI v4+, #2204). Override
+     * this AND action_descriptor_count() together — see the override idiom
+     * documented on YUZU_PLUGIN_EXPORT below — to declare capability legs for
+     * this plugin's actions. Non-pure: a plugin that overrides neither gets
+     * the honest "undeclared" default (nullptr / 0), identical to how an
+     * ABI<4 plugin reads, never a fabricated claim. The returned pointer must
+     * be valid for the lifetime of the plugin (e.g. a function-local static
+     * array). See YuzuActionDescriptor (plugin.h) for the leg shape and
+     * docs/adr/3002-acquisition-ladder.md for what a leg's `rung` means.
+     */
+    [[nodiscard]] virtual const YuzuActionDescriptor* action_descriptors() const noexcept {
+        return nullptr;
+    }
+
+    /**
+     * Number of entries in action_descriptors(). Must agree with it: 0 iff
+     * action_descriptors() returns nullptr, non-zero iff it returns a real
+     * array of that length. Non-pure; defaults to 0 (undeclared).
+     */
+    [[nodiscard]] virtual size_t action_descriptor_count() const noexcept { return 0; }
+
+    /**
      * Called once after the shared library is loaded.
      * @return Result<void> — return an error to abort loading.
      */
     virtual Result<void> init(PluginContext& ctx) = 0;
 
     /**
-     * Called once before the shared library is unloaded.
+     * Called once before the shared library is unloaded. Runs synchronously
+     * on the host's own teardown path (Agent::Run()'s final-teardown loop)
+     * -- an implementation that blocks indefinitely here hangs the whole
+     * agent's shutdown, not just this plugin's unload. A short, explicitly
+     * BOUNDED wait (e.g. a few seconds, with a documented fallback for the
+     * timeout case) is an accepted pattern for a plugin that owns
+     * background work it must not race against dlclose/FreeLibrary --
+     * see agents/plugins/discovery/src/bounded_wait.hpp's
+     * OutstandingCallGuard for a worked example. A background thread that
+     * may still be running PAST the bounded wait's timeout must never touch
+     * this plugin's own code or statics after that point (dlclose/
+     * FreeLibrary can unmap them while it runs) -- if the underlying work
+     * can't be made safe against that, don't defer it to a thread at all;
+     * accept a bounded resource residue instead. Never an unbounded
+     * wait/join.
      */
     virtual void shutdown(PluginContext& ctx) noexcept = 0;
 
@@ -353,6 +403,32 @@ private:
  * Example:
  *   class InventoryPlugin final : public yuzu::Plugin { ... };
  *   YUZU_PLUGIN_EXPORT(InventoryPlugin)
+ *
+ * Declaring per-action, per-OS capabilities (ABI v4+, #2204): override BOTH
+ * action_descriptors() and action_descriptor_count() on your Plugin subclass
+ * — this macro wires whatever they return straight into the generated
+ * descriptor, unmodified. A file-scope array both methods share is the usual
+ * shape (a function-local static inside ONLY action_descriptors() would be
+ * out of scope for action_descriptor_count() to size against):
+ *
+ *   namespace {
+ *   const YuzuActionDescriptor kLegs[] = { ... };
+ *   } // namespace
+ *
+ *   class InventoryPlugin final : public yuzu::Plugin {
+ *       ...
+ *       const YuzuActionDescriptor* action_descriptors() const noexcept override {
+ *           return kLegs;
+ *       }
+ *       size_t action_descriptor_count() const noexcept override {
+ *           return sizeof(kLegs) / sizeof(kLegs[0]);
+ *       }
+ *   };
+ *
+ * Leaving both unoverridden is the default and honest: the descriptor then
+ * carries action_descriptors=nullptr / action_descriptor_count=0, exactly
+ * what capmatrix-gen (#2204) renders as "undeclared" for an ABI<4 plugin —
+ * never a fabricated support claim.
  */
 #define YUZU_PLUGIN_EXPORT(ClassName)                                                              \
     static ClassName _yuzu_plugin_instance_{};                                                     \
@@ -400,6 +476,8 @@ private:
         .shutdown = _yuzu_shutdown_,                                                               \
         .execute = _yuzu_execute_,                                                                 \
         .sdk_version = YUZU_PLUGIN_SDK_VERSION,                                                    \
+        .action_descriptors = _yuzu_plugin_instance_.action_descriptors(),                         \
+        .action_descriptor_count = _yuzu_plugin_instance_.action_descriptor_count(),               \
     };                                                                                             \
                                                                                                    \
     extern "C" YUZU_PLUGIN_API const YuzuPluginDescriptor* yuzu_plugin_descriptor(void) {          \

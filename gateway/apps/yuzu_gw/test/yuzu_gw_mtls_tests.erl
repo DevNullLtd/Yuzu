@@ -9,12 +9,15 @@
 %%%      per-agent mTLS auto-provisioning breaks for gateway-connected
 %%%      agents (the bug this PR fixes).
 %%%
-%%%   2. The grpcbox v0.17.1 listener TLS contract: a transport_opts map
+%%%   2. The vendored grpcbox listener TLS contract: a transport_opts map
 %%%      enables TLS ONLY when it carries `ssl => true` AND all three of
-%%%      keyfile/certfile/cacertfile (grpcbox_pool.erl:18-31). A map that
+%%%      keyfile/certfile/cacertfile (grpcbox_pool.erl). A map that
 %%%      omits `ssl => true` silently degrades to plaintext — the latent
-%%%      bug in the old config/sys.config.prod. grpcbox then HARDCODES
-%%%      fail_if_no_peer_cert + verify_peer, so any TLS listener is mTLS.
+%%%      bug in the old config/sys.config.prod. The _checkouts patch made
+%%%      verify / fail_if_no_peer_cert CONFIGURABLE (stock v0.17.1
+%%%      hardcoded them), defaulting to the strict verify_peer +
+%%%      fail_if_no_peer_cert=true when omitted — so an unconfigured TLS
+%%%      listener is mTLS, and :50051 relaxes both explicitly.
 %%%
 %%%   3. A real TLS 1.2 mutual handshake using EC certs (P-384 CA, P-256
 %%%      leaf with serverAuth+clientAuth — the shape the server mints as
@@ -475,3 +478,166 @@ run_all([Cmd | Rest]) ->
         nomatch -> run_all(Rest);
         _ -> {error, {openssl_missing, Out}}
     end.
+
+%%%-------------------------------------------------------------------
+%%% Mgmt-listener boot-guard policy (#1422) — evaluate_mgmt_posture/3
+%%%-------------------------------------------------------------------
+
+-define(PIN_FUN, fun yuzu_gw_authz:check_mgmt_peer/1).
+
+secure_mgmt() ->
+    #{grpc_opts => #{service_protos => [management_pb],
+                     services => #{},
+                     auth_fun => ?PIN_FUN},
+      listen_opts => #{port => 50063, ip => {0, 0, 0, 0}},
+      transport_opts => #{ssl => true, certfile => "c.pem", keyfile => "k.pem",
+                          cacertfile => "ca.pem"}}.
+
+pins() -> [{cert_file, "srv.pem"}].
+
+with_transport(Fun) ->
+    S = secure_mgmt(),
+    S#{transport_opts := Fun(maps:get(transport_opts, S))}.
+
+mgmt_posture_secure_ok_test() ->
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([secure_mgmt()], pins(), false)).
+
+mgmt_posture_loopback_exempt_test() ->
+    %% Loopback (v4 and v6) plaintext mgmt is the dev posture — no network
+    %% attack surface, boots without the hatch.
+    Plain = fun(Ip) ->
+        #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+          listen_opts => #{port => 50063, ip => Ip}}
+    end,
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([Plain({127, 0, 0, 1})], [], false)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       [Plain({0, 0, 0, 0, 0, 0, 0, 1})], [], false)).
+
+mgmt_posture_wildcard_plaintext_refused_test() ->
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063, ip => {0, 0, 0, 0}}},
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([Plain], [], false),
+    ?assert(lists:member(plaintext, Defects)).
+
+mgmt_posture_missing_ip_is_exposed_test() ->
+    %% grpcbox defaults a missing ip to {0,0,0,0} — the guard must too.
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063}},
+    ?assertMatch({error, {insecure_mgmt_listener, _}},
+                 yuzu_gw_app:evaluate_mgmt_posture([Plain], [], false)).
+
+mgmt_posture_escape_hatch_boots_with_warning_result_test() ->
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063, ip => {0, 0, 0, 0}}},
+    ?assertMatch({ok_insecure, [{50063, _}]},
+                 yuzu_gw_app:evaluate_mgmt_posture([Plain], [], true)).
+
+mgmt_posture_tcp_fallback_refused_test() ->
+    %% ssl => true WITHOUT full cert material: grpcbox_pool silently serves
+    %% plaintext TCP — must be refused, not treated as TLS.
+    S = with_transport(fun(T) -> maps:remove(cacertfile, T) end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(missing_cert_material, Defects)).
+
+mgmt_posture_verify_none_refused_test() ->
+    %% TLS + verify_none would hand the auth_fun a SELF-SIGNED cert — the
+    %% CA gate must stay in front of the pin.
+    S = with_transport(fun(T) -> T#{verify => verify_none} end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(verify_not_peer, Defects)).
+
+mgmt_posture_optional_peer_cert_refused_test() ->
+    %% fail_if_no_peer_cert=false: a certless peer skips the auth_fun
+    %% entirely (grpcbox only authenticates a PRESENTED cert).
+    S = with_transport(fun(T) -> T#{fail_if_no_peer_cert => false} end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(peer_cert_not_required, Defects)).
+
+mgmt_posture_wrong_auth_fun_refused_test() ->
+    S0 = secure_mgmt(),
+    Grpc = maps:get(grpc_opts, S0),
+    Wrong = S0#{grpc_opts := Grpc#{auth_fun := fun erlang:is_binary/1}},
+    Missing = S0#{grpc_opts := maps:remove(auth_fun, Grpc)},
+    lists:foreach(fun(S) ->
+        {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+            yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+        ?assert(lists:member(missing_or_wrong_auth_fun, Defects))
+    end, [Wrong, Missing]).
+
+mgmt_posture_empty_pins_refused_test() ->
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([secure_mgmt()], [], false),
+    ?assert(lists:member(no_mgmt_peer_pins, Defects)).
+
+mgmt_posture_non_mgmt_listener_ignored_test() ->
+    %% The wildcard one-way-TLS agent listener (verify_none, no auth_fun) is
+    %% NOT a mgmt listener — the guard must not refuse it.
+    Agent = #{grpc_opts => #{service_protos => [agent_pb], services => #{}},
+              listen_opts => #{port => 50051, ip => {0, 0, 0, 0}},
+              transport_opts => #{ssl => true, certfile => "c", keyfile => "k",
+                                  cacertfile => "ca", verify => verify_none,
+                                  fail_if_no_peer_cert => false}},
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([Agent], [], false)).
+
+mgmt_posture_malformed_entries_tolerated_test() ->
+    %% Non-map junk in the servers list can't be proven to expose the mgmt
+    %% proto — the guard skips it (the tls-trap logger covers misconfig).
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([not_a_map, []], [], false)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(undefined, [], false)).
+
+mgmt_posture_proplist_transport_refused_test() ->
+    %% A PROPLIST transport_opts with {ssl,true} + full material is the
+    %% is_tls_trap shape: grpcbox only enables TLS on the MAP form, so this
+    %% listener serves plaintext TCP — the guard must refuse it, not read
+    %% the proplist as TLS.
+    S = (secure_mgmt())#{transport_opts := [{ssl, true}, {certfile, "c.pem"},
+                                            {keyfile, "k.pem"},
+                                            {cacertfile, "ca.pem"}]},
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(plaintext, Defects)).
+
+mgmt_posture_fd_socket_forfeits_loopback_exemption_test_() ->
+    %% PR #3905 review blocking finding: grpcbox DELETES the map ip whenever
+    %% socket_options carries an inherited {fd, _} (systemd socket
+    %% activation) and binds wherever the descriptor points — so a nominal
+    %% loopback ip is a dead letter and must NOT exempt the listener. An
+    %% {ip, _} inside socket_options likewise overrides (later inet option
+    %% wins). An unrecognised socket_options shape is unprovable — exposed.
+    Plain = fun(SockOpts) ->
+        #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+          listen_opts => maps:merge(#{port => 50063, ip => {127, 0, 0, 1}},
+                                    SockOpts)}
+    end,
+    [{"loopback ip + {fd,_} socket option refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{fd, 42}]})], [], false))},
+     {"loopback ip + overriding {ip,_} socket option refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{ip, {0, 0, 0, 0}}]})], [], false))},
+     {"loopback ip + unrecognised socket_options shape refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => junk})], [], false))},
+     {"loopback ip + benign socket_options list stays exempt",
+      ?_assertEqual(ok,
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{reuseaddr, true}]})], [], false))},
+     {"secure posture with {fd,_} still passes (exemption lost, posture holds)",
+      ?_assertEqual(ok,
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [#{grpc_opts => #{service_protos => [management_pb],
+                                          services => #{},
+                                          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1},
+                           listen_opts => #{port => 50063, ip => {127, 0, 0, 1},
+                                            socket_options => [{fd, 42}]},
+                           transport_opts => #{ssl => true, certfile => "c.pem",
+                                               keyfile => "k.pem",
+                                               cacertfile => "ca.pem"}}],
+                        [{cert_file, "srv.pem"}], false))}].

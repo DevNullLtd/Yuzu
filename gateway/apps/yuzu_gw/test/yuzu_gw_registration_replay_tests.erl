@@ -42,7 +42,12 @@ replay_test_() ->
       {"replayed payload is byte-identical to stored request",
        fun replay_payload_is_verbatim/0},
       {"half_open to closed transition triggers replay",
-       fun half_open_recovery_triggers_replay/0}
+       fun half_open_recovery_triggers_replay/0},
+      {"HA WS-4 4.4: an ADOPTED replay re-announces CONNECTED",
+       fun adopted_replay_reannounces_connected/0},
+      {"HA WS-4 4.4: a SUPERSEDED replay counts as breaker success and "
+       "forces reconnect",
+       fun superseded_replay_forces_reconnect/0}
      ]}.
 
 setup() ->
@@ -52,6 +57,7 @@ setup() ->
     %% Clean up stale mocks from prior modules.
     catch meck:unload(grpcbox_client),
     catch meck:unload(telemetry),
+    catch meck:unload(yuzu_gw_agent),
 
     %% Fail loud at the boundary if a prior test leaked the real
     %% yuzu_gw_upstream gen_server — a meck stub coexisting with the
@@ -69,6 +75,16 @@ setup() ->
     end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
+    %% HA WS-4 4.4 (`#4246` #6): mocked at the FIXTURE level (unloaded in
+    %% cleanup/1 unconditionally, unlike the old per-test meck:new/unload
+    %% this replaced) so a failed assertion mid-test can never leave
+    %% yuzu_gw_agent mocked for every module that runs after this one —
+    %% `passthrough` means only reannounce/2 and disconnect/1 are
+    %% intercepted; every other yuzu_gw_agent function used elsewhere in
+    %% this suite (none, today) would fall through to the real code.
+    meck:new(yuzu_gw_agent, [passthrough, no_link]),
+    meck:expect(yuzu_gw_agent, reannounce, fun(_Pid, _SessionId) -> ok end),
+    meck:expect(yuzu_gw_agent, disconnect, fun(_Pid) -> ok end),
 
     %% Low threshold + fast timers + tight replay spacing so the tests
     %% run quickly. Threshold 5 means 1-2 failures stay closed — that is
@@ -91,7 +107,7 @@ cleanup(UpPid) ->
     lists:foreach(fun(Id) -> yuzu_gw_registry:deregister_agent(Id) end,
                   yuzu_gw_registry:all_agents()),
     wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([grpcbox_client, telemetry, yuzu_gw_agent]),
     ok.
 
 %%%===================================================================
@@ -223,6 +239,93 @@ half_open_recovery_triggers_replay() ->
     lists:foreach(fun({_Id, Req}) ->
         ?assert(lists:member(Req, Replayed))
     end, Agents).
+
+adopted_replay_reannounces_connected() ->
+    %% HA WS-4 4.4 (`#4246` #6): a successful ADOPT-S replay must tell the
+    %% still-live agent process to re-send its own CONNECTED, so the
+    %% server's freshly-installed (and placement-wiped, per
+    %% gateway_service_impl.cpp's ProxyRegister) AgentSession converges.
+    %% Verified via the fixture-level meck on yuzu_gw_agent (setup/0)
+    %% rather than a real gen_statem — the WIRING is this file's concern;
+    %% yuzu_gw_agent_tests.erl covers the state-function's own reaction
+    %% to the cast.
+    Id  = unique_id(<<"adopt">>),
+    Req = agent_req(Id),
+    Pid = spawn_dummy(),
+    SessionId = <<"sess-", Id/binary>>,
+    ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
+
+    cause_one_failure(),
+    meck:reset(grpcbox_client),
+    %% Distinguish the trigger RPC (always succeeds, kicking off the
+    %% replay) from THIS agent's own replayed request (verbatim-equal to
+    %% Req, per replay_payload_is_verbatim's own precedent) by CONTENT —
+    %% Path is identical ("ProxyRegister") for both.
+    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _ ->
+                case IncomingReq of
+                    Req -> {ok, #{session_id => SessionId}, #{}};
+                    _   -> {ok, #{session_id => <<"ok">>}, #{}}
+                end
+        end
+    end),
+    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+
+    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay
+    ok = wait_until(fun() -> length(meck:history(yuzu_gw_agent)) > 0 end, 2000),
+    ReannounceCalls = [{P, S} || {_, {yuzu_gw_agent, reannounce, [P, S]}, _}
+                                     <- meck:history(yuzu_gw_agent)],
+    ?assert(lists:member({Pid, SessionId}, ReannounceCalls)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    kill_dummy(Pid).
+
+superseded_replay_forces_reconnect() ->
+    %% HA WS-4 4.4 (`#4246` #6): a genuine stale/zombie replay (the
+    %% server's presented-session row belongs to a DIFFERENT, live
+    %% session) must (a) NOT trip the circuit breaker — the server
+    %% answered authoritatively, this is not an outage — and (b) force
+    %% this process to reconnect via yuzu_gw_agent:disconnect/1, per
+    %% gateway_route_store.hpp's FORWARD NOTE (agent-driven reconnect is
+    %% the only sanctioned recovery for a superseded session). Mocked at
+    %% the fixture level (setup/0).
+    Id  = unique_id(<<"zombie">>),
+    Req = agent_req(Id),
+    Pid = spawn_dummy(),
+    SessionId = <<"sess-", Id/binary>>,
+    ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
+
+    cause_one_failure(),
+    meck:reset(grpcbox_client),
+    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _ ->
+                case IncomingReq of
+                    %% ?GRPC_STATUS_FAILED_PRECONDITION (grpcbox.hrl) is the
+                    %% BINARY digit string <<"9">> — the raw grpc-status
+                    %% trailer value (grpcbox_client_stream.erl reads it
+                    %% straight off the HTTP/2 header, never converting to
+                    %% an integer). Using the integer 9 here (as the
+                    %% pre-existing proxy_register_error test's OWN mock
+                    %% does for a different status) would silently miss
+                    %% do_replay_one's `Status =:= ?GRPC_STATUS_FAILED_PRECONDITION`
+                    %% guard and fall through to the generic error branch.
+                    Req -> {error, {<<"9">>, <<"session superseded; reconnect">>}, #{}};
+                    _   -> {ok, #{session_id => <<"ok">>}, #{}}
+                end
+        end
+    end),
+    {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
+
+    ok = wait_for_proxy_register_count(2, 3000), %% trigger + 1 replay attempt
+    ok = wait_until(fun() -> length(meck:history(yuzu_gw_agent)) > 0 end, 2000),
+    DisconnectCalls = [P || {_, {yuzu_gw_agent, disconnect, [P]}, _}
+                                <- meck:history(yuzu_gw_agent)],
+    ?assert(lists:member(Pid, DisconnectCalls)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    kill_dummy(Pid).
 
 %%%===================================================================
 %%% Helpers — registry population

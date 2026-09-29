@@ -1,0 +1,568 @@
+{
+  "actions": [
+    {
+      "action": "errors",
+      "definition_ids": [
+        "device.event_logs.errors"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable",
+          "mechanism": "sd_journal (bounded local read, PRIORITY<=err)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon",
+          "mechanism": "log_show",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wevtapi (EvtQuery/EvtRender, Level=2, bounded EvtNext)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "query",
+      "definition_ids": [
+        "device.event_logs.query"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "falls back to a bounded journalctl argv invocation (rung 2) when libsystemd is compiled out (-Dsystemd_guard) or the journal is unreachable",
+          "mechanism": "sd_journal (bounded local read, keyword match)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "requires root or a real login session to open the local unified-log data store -- a non-root headless process gets EX_NOPERM/77 regardless of Full Disk Access (docs/darwin-compat.md); no gap in production, which runs as a root LaunchDaemon",
+          "mechanism": "log_show",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wevtapi (EvtQuery/EvtRender, bounded EvtNext)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**macOS never sets a typed result status.** `decide_log_show_output` (`event_logs_macos.hpp:187-233`) decides rows and an rc but calls `set_result_status` nowhere; every macOS run — success, permission denial, timeout, or a truncated capture — reports `UNDECLARED`/`UNKNOWN` at the ABI4 status layer. An operator must parse the row's second field (`permission_denied`/`timeout`/`unavailable`/`none`) or check rc, not the typed status, to detect a degraded macOS read.",
+    "**The row shape is not the same across OSes for the same action.** The YAML `result.columns` for `errors` (`timestamp, event_id, source, message`) and `query` (adds `level`) describe the Windows row exactly; Linux and macOS instead emit `<prefix>|timestamp|unit|message` with no `event_id`/`level`/`source` fields at all. This is why `event_logs` is listed in the server's `kKeyValuePlugins` (`result_parsing.hpp:67`) rather than given a fixed dashboard column schema.",
+    "**The Linux capture sample shows the fallback failing, not the native leg.** In the 2026-09-06 container capture, both actions fell straight through to `UNAVAILABLE` with reason \"journalctl did not run\" — meaning the native `sd_journal` leg also declined (compiled out or the journal was unreadable/unopenable for this account) and the rung-2 binary itself was absent from the minimal container image. Neither Linux mechanism was exercised end-to-end by this capture.",
+    "**`sd_journal_open` succeeding proves nothing about read access.** A caller outside the `systemd-journal` group can open the journal and see zero entries; the native leg treats \"no visible entries\" as a denied read (`event_logs_journal.hpp:117-135`) and falls through to the argv fallback rather than reporting a confident empty log.",
+    "**`journalctl --grep` is deliberately not used.** It exits 1 on a genuine no-match result (verified against systemd 257), which the plugin's own honesty rule would otherwise misclassify as an acquisition failure; filtering instead happens in-process with the same case-insensitive substring predicate the native leg uses (`event_logs_plugin.cpp:333-346`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve recent error-level events from a system event log. On Windows, queries the specified log (default \"System\") for Level 2 (Error) events within the time window via the in-process Event Log API (wevtapi). On Linux, reads the journal in-process at priority err or worse, falling back to a bounded journalctl invocation where libsystemd is unavailable. On macOS, uses log show with an error predicate. Returns up to 100 events with timestamp and truncated message (max 200 chars); event ID and provider/source are populated on Windows only, and Linux/macOS instead resolve a unit or process name that does not appear in this schema. A read that fails, is denied, or is cut short by its bound reports a typed status rather than an empty result, except on macOS, which signals degradation only through the row content and return code.",
+      "display_name": "Recent Error Events",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.event_logs.errors",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Search event log entries by keyword filter within a specified log. On Windows, reads events via the in-process Event Log API (wevtapi) and matches the keyword against the event's data and provider name. On Linux, matches a case-insensitive substring against the journal message. On macOS, uses log show with an eventMessage contains predicate (last 24h). Returns matching events with timestamp and message; level, event ID, and provider/source are populated on Windows only, and Linux/macOS instead resolve a unit or process name that does not appear in this schema. Input is matched in-process; no operator-supplied value is passed to an external command.",
+      "display_name": "Search Event Log",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.event_logs.query",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Queries system event logs for errors and filtered events",
+  "how_it_works": "`errors` reads Level=2/PRIORITY<=err events from the last `hours` hours (default 24, clamped 1–720) of a named log (Windows only; Linux/macOS always read the system journal/unified log). `query` requires `log` and `filter`, and keyword-matches messages case-insensitively; on Windows the match runs over the newest `count` events examined, while Linux and macOS return up to `count` matches. Both actions are pure reads — nothing is deleted, rotated, or acknowledged.\n\nEach OS has its own acquisition path: Windows calls wevtapi in-process (`EvtQuery`/`EvtRender`, bounded `EvtNext`); Linux prefers an in-process bounded `sd_journal` walk and falls back to a bounded, pre-split `journalctl` argv invocation (no shell) when libsystemd is compiled out or the journal can't be opened; macOS always shells out to `/usr/bin/log show` through the bounded subprocess runner. A read that is denied, times out, or hits its scan bound reports a typed status rather than a confident empty result — except on macOS, which signals degradation only through the row content and a nonzero return code (see Caveats).\n\nEvery OS-facing raw field (message text, provider/unit name) is escaped via `safe_output_field` before joining a pipe-delimited row, so a hostile `|` or embedded newline in log content cannot forge extra columns or rows.",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 128
+      },
+      "default": "System",
+      "definition_id": "device.event_logs.errors",
+      "description": "The event log to query, e.g. \"System\" or \"Application\". Windows only — the value is accepted but has no effect on Linux/macOS, which always read the system journal / unified log. Default: \"System\".\n",
+      "name": "log",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 720,
+        "minimum": 1
+      },
+      "default": 24,
+      "definition_id": "device.event_logs.errors",
+      "description": "Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24.\n",
+      "name": "hours",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 128,
+        "minLength": 1
+      },
+      "default": null,
+      "definition_id": "device.event_logs.query",
+      "description": "The event log to search, e.g. \"System\" or \"Application\". On Windows this selects the channel; on Linux/macOS the value is accepted but does not select a log (both always read the journal / unified log).\n",
+      "name": "log",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256,
+        "minLength": 1
+      },
+      "default": null,
+      "definition_id": "device.event_logs.query",
+      "description": "Keyword to search for in event messages, e.g. \"error\" or \"disk-warning\". Case-insensitive substring match. Only alphanumeric characters, spaces, dots, hyphens, underscores, and slashes are allowed.\n",
+      "name": "filter",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 500,
+        "minimum": 1
+      },
+      "default": 50,
+      "definition_id": "device.event_logs.query",
+      "description": "Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50.\n",
+      "name": "count",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "81838b2b5566",
+  "manifest_version": 1,
+  "name": "event_logs",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.",
+          "example": "2026-09-06T14:55:55.0521384Z",
+          "name": "timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.",
+          "example": "6008",
+          "name": "event_id",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.",
+          "example": "EventLog",
+          "name": "source",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Event message text, truncated to 200 bytes at a UTF-8 character boundary. Values: free text.",
+          "example": "16:11:31 ‎05/‎09/‎2026 105614",
+          "name": "message",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.event_logs.errors"
+    },
+    {
+      "columns": [
+        {
+          "description": "Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.",
+          "example": "2026-09-06 10:55:53.560",
+          "name": "timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows event level display name derived from the numeric `<Level>`. Not populated on Linux or macOS. Values: Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level.",
+          "example": "not observed in any capture (the Windows query run matched no rows)",
+          "name": "level",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.",
+          "example": "6008 (from the errors sample; the query run matched no rows)",
+          "name": "event_id",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.",
+          "example": "Kernel-General",
+          "name": "source",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Matched event message text, truncated to 200 bytes at a UTF-8 character boundary. The `filter` keyword is matched against this field (and the provider name, on Windows). Values: free text.",
+          "example": "2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh).",
+          "name": "message",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.event_logs.query"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per event; field 0 is a literal discriminator (`error` or `event`). **The row shape differs by OS**, not only by action: the Windows rows carry the full 5/6-field shape below, while Linux and macOS collapse the `event_id`/`source` fields into a single `unit` (Linux) or `process` (macOS) field and never emit `event_id`. A missing/inapplicable value renders `-`, never an empty field. The message field is capped at 200 bytes, backed off to a UTF-8 character boundary (`event_logs_parsers.hpp:66`), so a non-ASCII message can be shorter than 200 characters.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "`Event Log Readers` group; the `Security` log additionally needs `SeSecurityPrivilege`",
+      "if_refused": "`PERMISSION_DENIED`, message \"Cannot access the event log channel (requires elevated privileges)\"",
+      "measured": "2026-09-07 on bare-metal Windows 10.0.26200 as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "none for root; a non-root, non-login-session process cannot open the store at all",
+      "if_refused": "`log show` exits `EX_NOPERM` (77); row tagged `permission_denied`, rc 1 — **no typed result status is set** (see Caveats)",
+      "measured": "2026-09-07 on bare-metal macOS 26.6.2, euid 501 (a real login session, not the production root daemon)",
+      "os": "macOS",
+      "runs_as": "agent daemon; production runs as a root LaunchDaemon"
+    },
+    {
+      "grant": "`systemd-journal` group",
+      "if_refused": "native leg: journal open/visibility check fails, falls through to the fallback; fallback: `UNAVAILABLE`, message names the reason (e.g. \"journalctl did not run\")",
+      "measured": "2026-09-06 in a container, euid 0 (root)",
+      "os": "Linux",
+      "runs_as": "agent daemon (dedicated `_yuzu`/`yuzu` account)"
+    }
+  ],
+  "readme": "agents/plugins/event_logs/README.md",
+  "result_status": [
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_win:access_denied`",
+      "status": "`PERMISSION_DENIED`",
+      "when": "Windows: `EvtQuery` fails `ERROR_ACCESS_DENIED` (`event_logs_plugin.cpp:136-139`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_win:channel_not_found`",
+      "status": "`UNAVAILABLE`",
+      "when": "Windows: channel doesn't exist (`event_logs_plugin.cpp:140-142`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_win:evt_next_timeout`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: `EvtNext` times out mid-query (`event_logs_plugin.cpp:143-146`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_win:evt_query_failed`",
+      "status": "`UNAVAILABLE`",
+      "when": "Windows: any other query failure (`event_logs_plugin.cpp:147-151`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_win:count_window_full`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows `query`: the `count`-event examine window filled (`event_logs_plugin.cpp:548-550`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_journal:errors_truncated` / `event_logs_journal:query_truncated`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux native leg hits its wall-clock budget or scan cap before finishing (`event_logs_plugin.cpp:264-266`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`event_logs_journalctl:errors_unavailable` / `_query_unavailable`",
+      "status": "`UNAVAILABLE`",
+      "when": "Linux fallback: `journalctl` didn't run, was signaled, or exited nonzero (`event_logs_plugin.cpp:366-369`)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "same provenance as above",
+      "status": "`CONSTRAINED`",
+      "when": "Linux fallback: `journalctl`'s own output was truncated, or (query only) the scan window filled before a confident answer (`event_logs_plugin.cpp:374-377`, `398-401`)"
+    },
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "*(none set)*",
+      "when": "Windows/Linux clean success; **macOS never calls `set_result_status` on any path** — the agent records `UNDECLARED`/`UNKNOWN`, and degradation is signalled only via row content + return code (`event_logs_macos.hpp:187-233`; no `set_result_status` call in that file or its callers)"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "errors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "event_logs_journalctl:errors_unavailable",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|none|-|journalctl did not run"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "log=system filter=error",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "event_logs_journalctl:query_unavailable",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "event|none|-|journalctl did not run"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "81838b2b5566",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "errors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 100,
+          "rows": [
+            "error|Timestamp||           Ty Process[PID:TID]",
+            "error|2026-09-06 10:55:53.370 E|-|chronod[704:da8004] [com.apple.chrono:location] [ext:com.apple.weather::com.apple.weather.widget] failed to acquire new underlying visibility assertion",
+            "error|2026-09-06 10:55:53.370 E|-|chronod[704:da8004] [com.apple.chrono:location] [ext:com.apple.weather::com.apple.weather.widget] failed to acquire new underlying activity assertion",
+            "error|2026-09-06 10:55:53.668 E|-|chronod[704:da8004] [com.apple.chrono:location] [ext:com.apple.weather::com.apple.weather.widget] failed to acquire new underlying visibility assertion",
+            "error|2026-09-06 10:56:10.400 E|-|contactsd[85796:da8129] [com.apple.accounts:core] \"Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 \"The connection to service named com.apple.accountsd.accountmana"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "log=system filter=error",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 50,
+          "rows": [
+            "event|Timestamp||           Ty Process[PID:TID]",
+            "event|2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] Location state is not fresh; returning error refresh policy; state=stale|-|2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] Location state is not fresh; returning error refresh policy; state=stale",
+            "event|2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh).|-|2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh).",
+            "event|2026-09-06 10:56:10.400 E|-|contactsd[85796:da8129] [com.apple.accounts:core] \"Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 \"The connection to service named com.apple.accountsd.accountmana",
+            "event|2026-09-06 10:56:10.400 E|-|contactsd[85796:da8129] [com.apple.accounts:core] \"Remote account store returned fatal error: Error Domain=NSCocoaErrorDomain Code=4099 \"The connection to service named com.apple.accountsd.accountmana"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "81838b2b5566",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "errors",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|2026-09-06T14:55:55.0521384Z|6008|EventLog|16:11:31 ‎05/‎09/‎2026 105614"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "log=System filter=error",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "event_logs_win:count_window_full",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 1,
+          "rows": [
+            "event|none|-|-|-|No match within the newest events examined (count window full; older events not searched)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "81838b2b5566",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "errors",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "AuditLog"
+    },
+    {
+      "action": "query",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "AuditLog"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/event_logs.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/event_logs/src/event_logs_journal.hpp",
+      "agents/plugins/event_logs/src/event_logs_journalctl.hpp",
+      "agents/plugins/event_logs/src/event_logs_macos.hpp",
+      "agents/plugins/event_logs/src/event_logs_parsers.hpp",
+      "agents/plugins/event_logs/src/event_logs_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_event_logs_journalctl.cpp",
+      "tests/unit/test_event_logs_macos.cpp",
+      "tests/unit/test_event_logs_parsers.cpp",
+      "tests/unit/test_event_logs_posix_actions.cpp",
+      "tests/unit/test_event_logs_win_actions.cpp"
+    ]
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention per `docs/yaml-dsl-spec.md:194`; the definitions carry no `response.retentionDays` override), queryable at `/api/responses/{id}` and aggregatable (`errors` groups by `source`; `query` groups by `level`,`source` — `content/definitions/event_logs.yaml:73-75,172-174`).",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, or metrics. `event_logs` is one of `result_parsing.hpp`'s `kKeyValuePlugins` (`server/core/src/result_parsing.hpp:67`), so the server's legacy dashboard row renderer treats its output as generic `Agent|Key|Value` pairs rather than a fixed column set — a consequence of the same per-OS row-shape divergence documented above.",
+    "**Sensitivity.** `message` is raw log/journal text and can carry usernames, hostnames, or other operator-identifying content depending on what the OS logged; Windows' `source` (provider name) and Linux's `unit` field can themselves be an installed-software or service identifier — this plugin's rows are the least predictable in the catalogue for what they may disclose, by design.",
+    "**Siblings:** none — `event_logs` is the only plugin in the shipped catalogue reading OS event/journal/unified logs (`server/core/src/agent_registry.cpp:848-849`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.event_logs.errors\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

@@ -1,0 +1,15 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a44c8631e3c1
+== action=flush_dns
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=ping host=127.0.0.1
+output|PING 127.0.0.1 (127.0.0.1): 56 data bytes
+output|64 bytes from 127.0.0.1: icmp_seq=0 ttl=64 time=0.063 ms
+output|64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.146 ms
+output|64 bytes from 127.0.0.1: icmp_seq=2 ttl=64 time=0.126 ms
+output|64 bytes from 127.0.0.1: icmp_seq=3 ttl=64 time=0.137 ms
+output|--- 127.0.0.1 ping statistics ---
+output|4 packets transmitted, 4 packets received, 0.0% packet loss
+output|round-trip min/avg/max/stddev = 0.063/0.118/0.146/0.033 ms
+[result_status] UNDECLARED / UNKNOWN / 
+

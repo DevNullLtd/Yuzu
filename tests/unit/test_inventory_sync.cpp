@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "local_dispatcher.hpp"
+#include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
 #include "sync_source_installed_software.hpp"
 
@@ -311,7 +312,7 @@ TEST_CASE("collect skips an empty inventory rather than wiping stored rows (UP-I
     // inventory and the server would record the wipe as a successful store. The
     // collector returns nullopt on an empty parse; here we assert the parse itself is
     // empty for the sentinel so the guard upstream fires.
-    auto e = parse_installed_apps_output("app|No applications found|-|-|-\n");
+    auto e = parse_installed_apps_output("app|No applications found|-|-|-|-|-\n");
     CHECK(e.empty());
 }
 
@@ -341,7 +342,8 @@ TEST_CASE("empty inventory parses to no entries and a stable empty hash",
           "[sync][parse]") {
     // A host with zero machine-scope apps must still hash-skip cleanly, not look
     // broken: empty list → empty canonical blob → the well-known SHA-256 of "".
-    auto e = parse_installed_apps_output("user_app|x|y|1|p|d\napp|No applications found|-|-|-\n");
+    auto e = parse_installed_apps_output(
+        "user_app|x|y|1|p|d\napp|No applications found|-|-|-|-|-\n");
     CHECK(e.empty());
     CHECK(installed_software_canonical_blob({}) == "");
     CHECK(sha256_hex("") ==
@@ -588,4 +590,146 @@ TEST_CASE("SyncScheduler: consecutive need_full nacks back off, reset on clean s
     sched.tick(after_reset);
     CHECK(std::strtoll(kv["sync.installed_software.nf_streak"].c_str(), nullptr, 10) == 1);
     CHECK((next_fire() - after_reset) == delays[0]); // same delay as the very first nack
+}
+
+// Round-3 item 4 (sync-speed fix): a forced source (request_now) is sent in its
+// OWN immediate RPC, decoupled from any other cadence-due source's collect() in
+// the same tick — so an operator forcing the slow installed_software source no
+// longer makes a fast, ALSO-forced-or-due source wait behind it, and vice versa.
+namespace {
+// A three-source fixture (fast_a, fast_b, slow) with a shared call log — each
+// sender_ invocation records exactly which source names it carried, so a test
+// can assert both the CALL COUNT (one per forced source, not one shared batch)
+// and per-call CONTENTS (never more than one source unless it's the genuine
+// cadence-due batch pass).
+struct SchedulerFixture {
+    std::map<std::string, std::string> kv;
+    std::vector<std::vector<std::string>> calls; // one entry per sender_() invocation
+    std::vector<int> collect_counts{0, 0, 0};    // fast_a, fast_b, slow
+    bool fail_next = false;
+
+    // Returns a heap-allocated scheduler — SyncScheduler holds a std::mutex
+    // (pending_mu_) and is therefore neither copyable nor movable, so it can't
+    // be returned by value from a factory function.
+    std::unique_ptr<SyncScheduler> make() {
+        auto kv_get = [this](const std::string& k) {
+            auto it = kv.find(k);
+            return it == kv.end() ? std::string{} : it->second;
+        };
+        auto kv_set = [this](const std::string& k, const std::string& v) { kv[k] = v; };
+        auto sender = [this](const std::vector<std::pair<std::string, std::string>>& hashes,
+                             const std::vector<std::pair<std::string, std::string>>&)
+            -> std::optional<std::vector<std::string>> {
+            std::vector<std::string> names;
+            for (const auto& [n, h] : hashes)
+                names.push_back(n);
+            calls.push_back(names);
+            if (fail_next) {
+                fail_next = false;
+                return std::nullopt;
+            }
+            return std::vector<std::string>{}; // no need_full
+        };
+        auto sched = std::make_unique<SyncScheduler>("agent-forced", kv_get, kv_set, sender);
+        SyncSource fast_a;
+        fast_a.name = "fast_a";
+        fast_a.interval = std::chrono::seconds{86400};
+        fast_a.collect = [this]() -> std::optional<std::pair<std::string, std::string>> {
+            ++collect_counts[0];
+            return std::make_pair(std::string{"ba"}, std::string{"ha"});
+        };
+        SyncSource fast_b;
+        fast_b.name = "fast_b";
+        fast_b.interval = std::chrono::seconds{86400};
+        fast_b.collect = [this]() -> std::optional<std::pair<std::string, std::string>> {
+            ++collect_counts[1];
+            return std::make_pair(std::string{"bb"}, std::string{"hb"});
+        };
+        SyncSource slow;
+        slow.name = "slow";
+        slow.interval = std::chrono::seconds{86400};
+        slow.collect = [this]() -> std::optional<std::pair<std::string, std::string>> {
+            ++collect_counts[2];
+            return std::make_pair(std::string{"bs"}, std::string{"hs"});
+        };
+        sched->add_source(fast_a);
+        sched->add_source(fast_b);
+        sched->add_source(slow);
+        return sched;
+    }
+};
+} // namespace
+
+TEST_CASE("SyncScheduler: request_now(source) fires that source alone, "
+          "not folded into a shared batch",
+          "[sync][scheduler]") {
+    SchedulerFixture fx;
+    auto sched = fx.make();  // unique_ptr<SyncScheduler>
+    sched->tick(1000); // schedule the startup-jittered first fire for all three — not due yet
+    CHECK(fx.calls.empty());
+
+    // Force only "slow" — nothing else is due yet at this timestamp.
+    auto armed = sched->request_now("slow");
+    REQUIRE(armed == std::vector<std::string>{"slow"});
+    sched->tick(1000);
+
+    REQUIRE(fx.calls.size() == 1);
+    CHECK(fx.calls[0] == std::vector<std::string>{"slow"});
+    // Only the forced source's collect() ran this tick — the other two are not
+    // yet due and were never touched.
+    CHECK(fx.collect_counts == std::vector<int>{0, 0, 1});
+}
+
+TEST_CASE("SyncScheduler: request_now(kAllSources) fires ONE RPC per source, "
+          "fast sources before the slow one (registration order)",
+          "[sync][scheduler]") {
+    SchedulerFixture fx;
+    auto sched = fx.make();  // unique_ptr<SyncScheduler>
+    sched->tick(1000);
+    CHECK(fx.calls.empty());
+
+    auto armed = sched->request_now(SyncScheduler::kAllSources);
+    REQUIRE(armed.size() == 3);
+    sched->tick(1000);
+
+    // THREE separate sender_ calls — never one shared batch of three — each
+    // carrying exactly its own source, in REGISTRATION order (fast_a, fast_b,
+    // slow) so a slow source registered last never blocks an earlier one's own
+    // immediate RPC in the same tick.
+    REQUIRE(fx.calls.size() == 3);
+    CHECK(fx.calls[0] == std::vector<std::string>{"fast_a"});
+    CHECK(fx.calls[1] == std::vector<std::string>{"fast_b"});
+    CHECK(fx.calls[2] == std::vector<std::string>{"slow"});
+    CHECK(fx.collect_counts == std::vector<int>{1, 1, 1}); // one collect() per source, no re-attempt
+}
+
+TEST_CASE("SyncScheduler: a forced source's own RPC failure retries next tick, "
+          "without a second collect() attempt via the batch pass this tick",
+          "[sync][scheduler]") {
+    SchedulerFixture fx;
+    auto sched = fx.make();  // unique_ptr<SyncScheduler>
+    sched->tick(1000);
+    (void)sched->request_now("slow");
+    fx.fail_next = true; // the forced source's OWN RPC fails
+    sched->tick(1000);
+
+    REQUIRE(fx.calls.size() == 1);
+    CHECK(fx.calls[0] == std::vector<std::string>{"slow"});
+    // Exactly one collect() this tick — the failed forced send is NOT retried a
+    // second time via the batch pass in the SAME tick.
+    CHECK(fx.collect_counts == std::vector<int>{0, 0, 1});
+    // force_full/next_fire were persisted by drain_pending BEFORE the send (so a
+    // failed RPC still retries as forced on the next tick, matching the
+    // pre-existing "persist before send" contract for the batch path).
+    CHECK(fx.kv["sync.slow.force_full"] == "1");
+    CHECK(std::strtoll(fx.kv["sync.slow.next_fire"].c_str(), nullptr, 10) == 1000);
+
+    // Next tick at the same due time: the forced source is due again (next_fire
+    // == now still) and is NOT re-armed via request_now — this exercises the
+    // ordinary cadence-due batch path picking up a source whose next_fire is
+    // already <= now, proving the earlier failure didn't wedge it.
+    sched->tick(1000);
+    REQUIRE(fx.calls.size() == 2);
+    CHECK(fx.calls[1] == std::vector<std::string>{"slow"});
+    CHECK(fx.collect_counts == std::vector<int>{0, 0, 2});
 }

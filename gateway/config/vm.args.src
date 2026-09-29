@@ -1,5 +1,14 @@
-## Node name (change for each node in the cluster)
--name yuzu_gw1@127.0.0.1
+## Node name — the short name (`yuzu_gw`) is FIXED and shared by every
+## gateway replica; nodes are interchangeable and distinguished only by
+## address (HA WS-4 #4555, ADR-2002 §7b). The host part is an IP LITERAL,
+## resolved and exported as YUZU_GW_ADVERTISE_ADDR by
+## deploy/docker/gateway-entrypoint.sh BEFORE this boot script runs — never
+## a hostname (the distribution handshake requires an exact match against a
+## resolved A record, which a hostname does not reliably round-trip
+## through). Set YUZU_GW_ADVERTISE_ADDR directly to override auto-detection
+## on a bare-VM/multi-NIC/NAT deployment. The 127.0.0.1 fallback below is
+## what boots today's single-node behavior unchanged when nothing sets it.
+-name yuzu_gw@${YUZU_GW_ADVERTISE_ADDR:-127.0.0.1}
 
 ## Cookie for Erlang distribution (must match across cluster).
 ## Supplied at boot from the YUZU_GW_COOKIE environment variable (this is a

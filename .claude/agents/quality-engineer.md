@@ -28,6 +28,7 @@ You ensure that every new store, manager, engine, and plugin ships with comprehe
 
 ## Key Files
 
+- `tests/unit/test_helpers.hpp` — the shared fixture helpers every unit test uses; read its doc comments before writing a new fixture
 - `tests/unit/` — All Catch2 unit tests
 - `tests/meson.build` — Test build configuration
 - `scripts/run-tests.sh` — Test orchestrator script
@@ -39,8 +40,8 @@ You ensure that every new store, manager, engine, and plugin ships with comprehe
 ## Test Standards
 
 1. **Naming** — Test files: `test_<module>.cpp`. Test cases: descriptive names using Catch2 `TEST_CASE` and `SECTION`.
-2. **Isolation** — Each test creates its own SQLite database (`:memory:` or temp file). No shared state between test cases.
-3. **Determinism** — No sleeps, no wall-clock dependencies, no network calls. Use mock time where needed.
+2. **Isolation** — Each test gets its own store, via the shared helpers in `tests/unit/test_helpers.hpp` (`unique_temp_path` / `TempDbFile` / `TempDir`, or the `YUZU_REQUIRE_PG_DB*` macros for PostgreSQL) — never a hand-rolled temp path. No shared state between test cases. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` (#473/#482), and pass a `yuzu_test_` underscore prefix. Full contract: `docs/testing/unit-test-conventions.md`.
+3. **Determinism** — No sleeps, no wall-clock dependencies, no network calls. Use mock time where needed. A fixed registry key, port, named object or path is a cross-JOB shared resource on the self-hosted pools (4 runner agents, one OS identity, one box) — salt every such identifier per-test (#1871).
 4. **Coverage targets** — Stores: all CRUD operations + error paths. Engines: valid input + malformed input + edge cases. Parsers: valid syntax + every error branch + adversarial input.
 5. **Fuzz target pattern** — Use Catch2 generators or standalone fuzz harnesses. Input: random bytes → parse → must not crash/leak/UB.
 

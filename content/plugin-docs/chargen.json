@@ -1,0 +1,352 @@
+{
+  "actions": [
+    {
+      "action": "chargen_start",
+      "definition_ids": [
+        "testing.chargen.start"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "chargen_stop",
+      "definition_ids": [
+        "testing.chargen.stop"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`chargen_start` cannot be captured by a bounded, single-shot driver.** `execute()` blocks the calling dispatch thread in a `while (session->running)` loop and only returns once a *separate* `chargen_stop` call flips that flag; a capture driver that runs one action to completion and exits has nothing to stop the session with, so it always hits its own timeout (15s on macOS/Windows, 60s on Linux) with zero rows. This is expected behavior of a long-running action, not a defect — a real capture needs a driver that issues `chargen_start` then `chargen_stop` concurrently.",
+    "**No typed result status, ever.** Neither branch of `execute()` calls `set_result_status`, so every run — success or not — reports `UNDECLARED / UNKNOWN` to the agent and the sample. The int return code (0 on both paths, 1 for an unrecognized action) is the only status signal.",
+    "**At most one session per agent.** `start_chargen` keys every session under the fixed map key `\"active\"` and calls `stop_all()` first, so a second `chargen_start` silently stops and replaces the first rather than running alongside it — there is no per-caller or per-`rate_ms` isolation.",
+    "**No deadline on the generation loop itself.** The `while` loop has no maximum duration or line count; it runs until an explicit `chargen_stop`, `shutdown()`, or the process exits.",
+    "**Reachable through two dispatch surfaces.** The definition-based path (`execute_instruction` / MCP) and the legacy `/api/chargen/start|stop` REST routes both resolve to the same plugin/action pair and the same RBAC gate, so `chargen_start` is `AdminOrApproval` and `chargen_stop` is `None` regardless of which surface issues the call."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Starts an RFC 864 character generator session. Produces continuous 72-character lines of rotating printable ASCII (characters 32-126). Each successive line starts one character position later. Output is streamed back as CommandResponse messages, one line per message. Useful for benchmarking network throughput and command pipeline capacity. Only one session runs at a time — starting a new session stops any existing one.",
+      "display_name": "Start Character Generator",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 0
+      },
+      "id": "testing.chargen.start",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Stops all running chargen sessions on the target device. Returns a confirmation message once all sessions have been terminated.",
+      "display_name": "Stop Character Generator",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 0
+      },
+      "id": "testing.chargen.stop",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "RFC 864 character generator — streams rotating ASCII lines",
+  "how_it_works": "`chargen_start` first stops any session already running (`stop_all()`), parses `rate_ms` (default 100, floored at 1), then loops: emit one RFC 864 line via `write_output`, advance the offset by one character position, and wait on a condition variable for `rate_ms` or until told to stop. Because sessions are keyed under one fixed map key (`\"active\"`), the agent runs at most one chargen session at a time — a second `chargen_start` implicitly stops the first. `execute()` does not return while the loop runs; it only returns once `chargen_stop` (or plugin `shutdown()`) flips the session's `running` flag and wakes the condition variable, at which point the loop writes a final `\"chargen session ended\"` line and returns 0. `chargen_stop` signals and clears every session and writes back one confirmation line.\n\nThe plugin is deliberately not an OS collector: every leg is declared `in-process` at rung 1 with no OS-specific call at all — it exists to exercise the command/response pipeline (throughput, backpressure, long-running-command handling), not to read host state. An unrecognized action writes an error line and returns 1 rather than being silently ignored.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": 100,
+      "definition_id": "testing.chargen.start",
+      "description": "Milliseconds between output lines. Default 100 (10 lines/sec). Minimum 1.\n",
+      "name": "rate_ms",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "5789eff1c673",
+  "manifest_version": 1,
+  "name": "chargen",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "One streamed line: an RFC 864 line (72 rotating printable ASCII characters, offset one position from the previous line), or the literal \"chargen session ended\" on the final line once the session stops. Values: free text — RFC 864 line, or the literal chargen session ended.",
+          "example": " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefg",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "testing.chargen.start"
+    },
+    {
+      "columns": [
+        {
+          "description": "Confirmation message sent once every running chargen session has been signalled to stop. Values: free text — the literal chargen stopped.",
+          "example": "chargen stopped",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "testing.chargen.stop"
+    }
+  ],
+  "outputs_note": "Output is not a pipe-delimited row set like most plugins — each action streams one `output` message per `write_output()` call. `chargen_start` sends one message per RFC 864 line for as long as the session runs, plus a final `\"chargen session ended\"` message when it stops; `chargen_stop` sends exactly one message, the literal `\"chargen stopped\"`. Neither action has an empty-result placeholder: zero output means `execute()` has not yet returned control to the caller (see Caveats).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None. The loop touches no OS resource — no file, registry, or network handle is opened.",
+      "if_refused": "n/a — the plugin performs no privileged operation; the `AdminOrApproval` gate on `chargen_start` is an authorization check enforced server-side before dispatch, not a host permission",
+      "measured": "2026-09-07, bare-metal",
+      "os": "Windows",
+      "runs_as": "not documented — no row in `docs/agent-privilege-model.md`; the capture ran as `SYSTEM`"
+    },
+    {
+      "grant": "None",
+      "if_refused": "n/a",
+      "measured": "2026-09-07, bare-metal, euid 501",
+      "os": "macOS",
+      "runs_as": "not documented; the capture ran unprivileged at euid 501 (jsmith)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "n/a",
+      "measured": "2026-09-06, container, euid 0",
+      "os": "Linux",
+      "runs_as": "not documented; the capture ran as euid 0 in a container"
+    }
+  ],
+  "readme": "agents/plugins/chargen/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "chargen_start",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "chargen_stop",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "chargen stopped"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "5789eff1c673",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "chargen_start",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "chargen_stop",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "chargen stopped"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "5789eff1c673",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "chargen_start",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "chargen_stop",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "chargen stopped"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "5789eff1c673",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "chargen_start",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Execute",
+      "risk_tier": "Medium",
+      "securable": "Execution"
+    },
+    {
+      "action": "chargen_stop",
+      "dispatch_class": "Mutating",
+      "execute_gate": "None",
+      "mutability": "Reversible",
+      "operation": "Execute",
+      "risk_tier": "Medium",
+      "securable": "Execution"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/chargen.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/chargen/src/chargen_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Both actions dispatch through `execute_instruction` (definitions `testing.chargen.start` / `testing.chargen.stop`); output lines travel as CommandResponse messages and land in the ResponseStore, queryable at `/api/responses/{id}`.",
+    "**Also reachable via a legacy REST sink.** `POST /api/chargen/start` and `POST /api/chargen/stop` forward straight to the same `chargen`/`chargen_start`/`chargen_stop` plugin-action pair through `forward_legacy_command`, bypassing the definition id; both routes are confined through the same dispatch chokepoint and RBAC gate as the definition-based path. `GET /chargen` (the old dashboard page) just redirects to `/`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule (`gather.ttlSeconds: 0` on both definitions); the plugin only runs when explicitly dispatched.",
+    "**Sensitivity.** `output` rows are a fixed, rotating ASCII pattern (RFC 864) with no reference to the host — nothing that could identify a device, a person, or installed software.",
+    "**Siblings:** none — `chargen` is a standalone testing/benchmark plugin, not part of an inventory family.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"testing.chargen.start\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

@@ -4,12 +4,31 @@
  * Tests the helper functions (glob_match, has_nested_quantifiers,
  * atomic_write_file) and core file operation logic (search, replace,
  * append, delete_lines) by replicating the algorithms from the plugin.
+ * Also covers the macOS get_signature/get_version_info plugin-level seams
+ * (select_info_plist's PLAN-08 base_dir re-validation, the BR-006 immediate
+ * pre-exec TOCTOU re-check, and the PLAN-02 timed_out short-circuit) -- the
+ * classify_codesign_result/classify_plutil_extract mappers themselves are
+ * covered separately by test_filesystem_macos_sig.cpp.
  *
  * Same pattern as test_filesystem_read.cpp: helpers are copied into the
  * test file's anonymous namespace since we cannot link the plugin directly.
  */
 
+#include "test_helpers.hpp"
+
+// classify_codesign_result / classify_plutil_extract mappers used by the
+// PLAN-02 short-circuit seam below -- header-only, no __APPLE__ guard, so
+// this runs on every CI host regardless of platform (already an include
+// directory here via tests/meson.build, filesystem_macos_sig.hpp #2273/1.14).
+#include "filesystem_macos_sig.hpp"
+
 #include <catch2/catch_test_macros.hpp>
+
+// yuzu::util::safe_output_field -- do_get_version_info now calls the SDK
+// helper directly (no plugin-local copy), so the output-framing tests below
+// exercise that exact function rather than a replica (already linked into
+// this test binary via yuzu_sdk_dep; see test_string_utils.cpp for precedent).
+#include <yuzu/string_utils.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -26,12 +45,36 @@ namespace {
 
 // ── TempFile / TempDir helpers ──────────────────────────────────────────
 
+// Every fixture below lives under ONE process-salted base dir. The fixed
+// literal names the ~27 call sites pass stay readable, but two concurrent CI
+// jobs on the same shared-identity box (one shared %TEMP%) can no longer see
+// each other's files — under the old fixed paths, one job's fixture dtor
+// deleted the other job's live file mid-test (#1883). The base is created
+// once. NOTE (#3507): it is NOT removed at process exit any more. TempDir's
+// only cleanup is its destructor, and the Catch2 main hard_exit()s after
+// Session::run() on Windows and macOS, which skips static destruction - so
+// this base leaks one directory per run under $TMPDIR/%TEMP% on those two
+// platforms. Bounded (macOS purges unaccessed temp entries after ~3 days) and
+// tracked; the durable fix is a testRunEnded listener, not a destructor.
+const fs::path& fsaction_base() {
+    static yuzu::test::TempDir base{"yuzu_test_fsaction-"};
+    static const bool created = [] {
+        std::error_code ec;
+        fs::create_directories(base.path, ec);
+        return fs::exists(base.path);
+    }();
+    // A silently-failed creation would fail every fixture below with
+    // confusing downstream errors — fail loudly at the source (gov safe-2).
+    REQUIRE(created);
+    return base.path;
+}
+
 struct TempFile {
     fs::path path;
 
     explicit TempFile(const std::string& content = "",
                       const std::string& name = "yuzu_test_fsaction.txt") {
-        path = fs::temp_directory_path() / name;
+        path = fsaction_base() / name;
         std::ofstream f(path, std::ios::binary);
         f << content;
     }
@@ -46,7 +89,7 @@ struct TempDir {
     fs::path path;
 
     explicit TempDir(const std::string& name = "yuzu_test_fsaction_dir") {
-        path = fs::temp_directory_path() / name;
+        path = fsaction_base() / name;
         std::error_code ec;
         fs::create_directories(path, ec);
     }
@@ -58,7 +101,12 @@ struct TempDir {
 };
 
 // ── Replicated: glob_match ──────────────────────────────────────────────
-// Exact copy from filesystem_plugin.cpp
+// Exact copy from filesystem_plugin.cpp's anonymous-namespace glob_match
+// (agents/plugins/filesystem/src/filesystem_plugin.cpp). This test links a
+// COPY, not the plugin symbol, so the two can silently diverge (qe-L1): keep
+// this replica byte-identical to the plugin, and re-sync it on any change to
+// the plugin-side helper. If a third consumer ever needs it, promote it to a
+// pure header (the *_macos.hpp pattern) so there is a single source of truth.
 
 bool glob_match(std::string_view pattern, std::string_view text) {
     size_t px = 0, tx = 0;
@@ -162,6 +210,94 @@ std::vector<std::string> read_lines(const fs::path& p) {
         lines.push_back(std::move(line));
     }
     return lines;
+}
+
+// ── Replicated: validate_path (macOS get_signature/get_version_info seam) ──
+// Same logic as filesystem_plugin.cpp -- select_info_plist below re-validates
+// the derived Info.plist through this exact function (PLAN-08).
+
+std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+    if (raw_path.empty())
+        return {};
+
+    std::error_code ec;
+    std::string path_str{raw_path};
+
+    if (!fs::exists(path_str, ec))
+        return {};
+
+    auto canonical = fs::canonical(path_str, ec);
+    if (ec)
+        return {};
+
+    if (!base_dir.empty()) {
+        auto canonical_base = fs::canonical(std::string{base_dir}, ec);
+        if (ec)
+            return {};
+
+        auto canon_str = canonical.string();
+        auto base_str = canonical_base.string();
+
+        if (canon_str.size() < base_str.size() ||
+            canon_str.compare(0, base_str.size(), base_str) != 0) {
+            return {};
+        }
+        if (canon_str.size() > base_str.size() && canon_str[base_str.size()] != '/' &&
+            canon_str[base_str.size()] != '\\') {
+            return {};
+        }
+    }
+
+    return canonical.string();
+}
+
+// ── Replicated: select_info_plist (do_get_version_info macOS, PLAN-08) ─────
+// `validated` is already base_dir-validated by the caller and may be a .app
+// bundle directory or a direct Info.plist file. The DERIVED
+// Contents/Info.plist is re-canonicalized and re-validated against base_dir
+// here -- a bundle whose Info.plist is a symlink resolving outside base_dir
+// is rejected, not read.
+
+std::string select_info_plist(const std::string& validated, std::string_view base_dir) {
+    fs::path vpath(validated);
+    std::error_code ec;
+    std::string candidate;
+    if (fs::is_directory(vpath, ec) && vpath.extension() == ".app") {
+        candidate = (vpath / "Contents" / "Info.plist").string();
+    } else if (vpath.filename() == "Info.plist") {
+        candidate = validated;
+    } else {
+        return {};
+    }
+
+    return validate_path(candidate, base_dir);
+}
+
+// ── Replicated: do_get_signature / do_get_version_info PLAN-02/BR-008
+// short-circuit. A timed-out OR output_truncated subprocess run is reported
+// honestly (unknown / absent) BEFORE the run's exit_code/output is ever
+// handed to the classifier -- a codesign killed at the deadline can still
+// have tool_ran=true and partial stderr diagnostics, and a 1MB-truncated
+// capture is only a PREFIX of what the tool actually said; either way
+// classify_codesign_result/classify_plutil_extract would otherwise read the
+// partial data as a genuine verdict.
+
+yuzu::filesystem_macos::SignatureStatus signature_status_for(bool timed_out,
+                                                              bool output_truncated,
+                                                              bool tool_ran, int exit_code,
+                                                              std::string_view output) {
+    if (timed_out || output_truncated)
+        return yuzu::filesystem_macos::SignatureStatus::unknown;
+    return yuzu::filesystem_macos::classify_codesign_result(tool_ran, exit_code, output);
+}
+
+yuzu::filesystem_macos::PlutilExtractResult version_field_for(bool timed_out,
+                                                               bool output_truncated,
+                                                               bool tool_ran, int exit_code,
+                                                               std::string_view output) {
+    if (timed_out || output_truncated)
+        return {};
+    return yuzu::filesystem_macos::classify_plutil_extract(tool_ran, exit_code, output);
 }
 
 } // namespace
@@ -889,4 +1025,322 @@ TEST_CASE("DeleteLines: end_line clamped to total lines", "[filesystem][deleteli
     auto final_lines = read_lines(tf.path);
     REQUIRE(final_lines.size() == 1);
     CHECK(final_lines[0] == "line1");
+}
+
+// ── select_info_plist (do_get_version_info macOS, PLAN-08) ─────────────────
+//
+// Fixture-only: real temp directories/files (a .app bundle shape, a
+// symlinked Info.plist) drive the replicated pure helper above -- no
+// codesign/plutil fork, no macOS box required.
+
+TEST_CASE("SelectInfoPlist: a .app bundle resolves to its Contents/Info.plist",
+          "[filesystem][macos_sig][plist]") {
+    auto base = fsaction_base() / "yuzu_test_plist_ok_base";
+    std::error_code ec;
+    fs::create_directories(base / "MyApp.app" / "Contents", ec);
+    REQUIRE(!ec);
+    {
+        std::ofstream f(base / "MyApp.app" / "Contents" / "Info.plist");
+        f << "<plist/>";
+    }
+
+    auto result = select_info_plist((base / "MyApp.app").string(), base.string());
+    CHECK(!result.empty());
+    CHECK(fs::path(result).filename() == "Info.plist");
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("SelectInfoPlist: a direct Info.plist path resolves to itself",
+          "[filesystem][macos_sig][plist]") {
+    auto base = fsaction_base() / "yuzu_test_plist_direct_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto plist = base / "Info.plist";
+    {
+        std::ofstream f(plist);
+        f << "<plist/>";
+    }
+
+    auto result = select_info_plist(plist.string(), base.string());
+    CHECK(!result.empty());
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("SelectInfoPlist: neither a .app bundle nor an Info.plist is honest-empty",
+          "[filesystem][macos_sig][plist]") {
+    auto base = fsaction_base() / "yuzu_test_plist_neither_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto plain = base / "SomeBinary";
+    {
+        std::ofstream f(plain);
+        f << "not a bundle";
+    }
+
+    auto result = select_info_plist(plain.string(), base.string());
+    CHECK(result.empty());
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("SelectInfoPlist: a .app with no Contents/Info.plist at all is honest-empty",
+          "[filesystem][macos_sig][plist]") {
+    auto base = fsaction_base() / "yuzu_test_plist_missing_base";
+    std::error_code ec;
+    fs::create_directories(base / "Empty.app" / "Contents", ec);
+    REQUIRE(!ec);
+
+    auto result = select_info_plist((base / "Empty.app").string(), base.string());
+    CHECK(result.empty());
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("SelectInfoPlist: PLAN-08 -- a symlinked Info.plist resolving outside base_dir "
+          "is rejected, not read",
+          "[filesystem][macos_sig][plist]") {
+    auto base = fsaction_base() / "yuzu_test_plist_escape_base";
+    std::error_code ec;
+    fs::create_directories(base / "Evil.app" / "Contents", ec);
+    REQUIRE(!ec);
+
+    // The escape target lives OUTSIDE base -- a sibling of it, not nested
+    // inside (mirrors test_filesystem_read.cpp's sibling convention for an
+    // unambiguous "outside base_dir" fixture).
+    auto outside_target = fsaction_base() / "yuzu_test_plist_escape_target.plist";
+    {
+        std::ofstream f(outside_target);
+        f << "<plist>secret</plist>";
+    }
+
+    auto link = base / "Evil.app" / "Contents" / "Info.plist";
+    fs::create_symlink(outside_target, link, ec);
+    if (ec) {
+        SUCCEED("symlinks unsupported on this platform — skip");
+    } else {
+        auto result = select_info_plist((base / "Evil.app").string(), base.string());
+        CHECK(result.empty());
+    }
+
+    fs::remove(outside_target, ec);
+    fs::remove_all(base, ec);
+}
+
+// ── BR-006: TOCTOU re-check (get_signature / get_version_info) ─────────────
+//
+// do_get_signature/do_get_version_info re-run validate_path on the exact
+// path about to be handed to codesign/plutil immediately before building
+// that tool's argv, comparing the result against the already-validated
+// value. These fixtures drive the replicated validate_path/select_info_plist
+// helpers through the same two-call sequence the plugin uses, simulating an
+// unprivileged writer inside base_dir swapping the target for a symlink to
+// an out-of-scope path in the window between the first validate_path() call
+// and the re-check -- no codesign/plutil fork involved (pure path helpers
+// only).
+
+TEST_CASE("BR-006: re-check of an untouched validated path still matches (get_signature seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_stable_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto target = base / "Target.app";
+    fs::create_directories(target, ec);
+    REQUIRE(!ec);
+
+    auto validated = validate_path(target.string(), base.string());
+    REQUIRE(!validated.empty());
+
+    // Re-run exactly as do_get_signature does immediately before building
+    // codesign's argv -- nothing changed on disk, so it must match.
+    auto recheck = validate_path(validated, base.string());
+    CHECK(recheck == validated);
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("BR-006: re-check catches a path swapped for a symlink outside base_dir "
+          "after the initial validate (get_signature seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_swap_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto target = base / "Target.app";
+    fs::create_directories(target, ec);
+    REQUIRE(!ec);
+
+    // Step 1 (mirrors do_get_signature's earlier validate_path call): the
+    // path is legitimate and inside base_dir at this point.
+    auto validated = validate_path(target.string(), base.string());
+    REQUIRE(!validated.empty());
+
+    // Step 2: an attacker swaps the validated path for a symlink resolving
+    // OUTSIDE base_dir, in the window before codesign is ever invoked.
+    auto outside_target = fsaction_base() / "yuzu_test_br006_outside_target";
+    fs::create_directories(outside_target, ec);
+    REQUIRE(!ec);
+    fs::remove_all(target, ec);
+    fs::create_directory_symlink(outside_target, target, ec);
+    if (ec) {
+        SUCCEED("symlinks unsupported on this platform — skip");
+    } else {
+        // Step 3 (the BR-006 re-check, immediately before building the
+        // codesign argv): must no longer match the originally validated
+        // value, so do_get_signature aborts rather than invoking the tool.
+        auto recheck = validate_path(validated, base.string());
+        CHECK(recheck != validated);
+    }
+
+    fs::remove_all(outside_target, ec);
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("BR-006: re-check catches an Info.plist swapped for a symlink outside base_dir "
+          "after select_info_plist (get_version_info seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_plist_swap_base";
+    std::error_code ec;
+    fs::create_directories(base / "MyApp.app" / "Contents", ec);
+    REQUIRE(!ec);
+    auto plist = base / "MyApp.app" / "Contents" / "Info.plist";
+    {
+        std::ofstream f(plist);
+        f << "<plist/>";
+    }
+
+    // Step 1 (do_get_version_info's select_info_plist call, PLAN-08): the
+    // derived Info.plist path is legitimate and inside base_dir.
+    auto info_plist = select_info_plist((base / "MyApp.app").string(), base.string());
+    REQUIRE(!info_plist.empty());
+
+    // Step 2: an attacker swaps the Info.plist for a symlink resolving
+    // OUTSIDE base_dir, in the window before plutil is ever invoked.
+    auto outside_target = fsaction_base() / "yuzu_test_br006_plist_outside.plist";
+    {
+        std::ofstream f(outside_target);
+        f << "<plist>secret</plist>";
+    }
+    fs::remove(plist, ec);
+    fs::create_symlink(outside_target, plist, ec);
+    if (ec) {
+        SUCCEED("symlinks unsupported on this platform — skip");
+    } else {
+        // Step 3 (the BR-006 re-check, immediately before building the
+        // plutil argv): must no longer match the value select_info_plist
+        // returned, so do_get_version_info aborts to not_available rather
+        // than invoking the tool.
+        auto recheck = validate_path(info_plist, base.string());
+        CHECK(recheck != info_plist);
+    }
+
+    fs::remove(outside_target, ec);
+    fs::remove_all(base, ec);
+}
+
+// ── PLAN-02: timed_out short-circuit (get_signature / get_version_info) ────
+//
+// do_get_signature/do_get_version_info must never hand a killed subprocess
+// run's exit_code/output to the classifier -- these fixtures drive the
+// replicated ternaries above directly, no fork involved.
+
+TEST_CASE("PLAN-02: a timed-out codesign run is unknown despite a nonzero exit and "
+          "captured diagnostics",
+          "[filesystem][macos_sig][plan02]") {
+    // Mirrors a real codesign killed mid-diagnostic: tool_ran=true, a
+    // nonzero exit_code, and partial stderr text that would otherwise
+    // classify as `invalid`.
+    auto status = signature_status_for(/*timed_out=*/true, /*output_truncated=*/false,
+                                        /*tool_ran=*/true, /*exit_code=*/1,
+                                        "a sealed resource is missing or invalid");
+    CHECK(status == yuzu::filesystem_macos::SignatureStatus::unknown);
+}
+
+TEST_CASE("PLAN-02: a codesign run that finishes before the deadline still classifies normally",
+          "[filesystem][macos_sig][plan02]") {
+    auto status = signature_status_for(/*timed_out=*/false, /*output_truncated=*/false,
+                                        /*tool_ran=*/true, /*exit_code=*/0, "");
+    CHECK(status == yuzu::filesystem_macos::SignatureStatus::valid);
+}
+
+TEST_CASE("PLAN-02: a timed-out plutil run is honest-absent despite captured stdout",
+          "[filesystem][macos_sig][plan02]") {
+    auto result = version_field_for(/*timed_out=*/true, /*output_truncated=*/false,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    CHECK(result.available == false);
+}
+
+TEST_CASE("PLAN-02: a plutil run that finishes before the deadline still classifies normally",
+          "[filesystem][macos_sig][plan02]") {
+    auto result = version_field_for(/*timed_out=*/false, /*output_truncated=*/false,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    CHECK(result.available == true);
+    CHECK(result.value == "1.2.3");
+}
+
+// ── BR-008: output_truncated short-circuit (get_signature / get_version_info)
+//
+// A 1MB-truncated capture is only a PREFIX of what codesign/plutil actually
+// said -- classifying that prefix (e.g. a truncated "satisfies its
+// Designated Requirement" string that happens to look like a clean pass)
+// would report a complete verdict from incomplete data. Verified separately
+// from timed_out since a truncated capture can complete (tool_ran=true,
+// exit_code==0) despite the cap having discarded real output.
+
+TEST_CASE("BR-008: a truncated codesign capture is unknown despite a clean exit",
+          "[filesystem][macos_sig][br008]") {
+    auto status = signature_status_for(/*timed_out=*/false, /*output_truncated=*/true,
+                                        /*tool_ran=*/true, /*exit_code=*/0,
+                                        "valid on disk\nsatisfies its Designated Requirement");
+    CHECK(status == yuzu::filesystem_macos::SignatureStatus::unknown);
+}
+
+TEST_CASE("BR-008: a truncated plutil capture is honest-absent despite a clean exit",
+          "[filesystem][macos_sig][br008]") {
+    auto result = version_field_for(/*timed_out=*/false, /*output_truncated=*/true,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    CHECK(result.available == false);
+}
+
+// ── yuzu::util::safe_output_field (do_get_version_info macOS output framing)
+// A raw CFBundleShortVersionString/CFBundleVersion value is interpolated
+// into a pipe-delimited output line -- an untrusted Info.plist must not be
+// able to inject extra columns (via `|`), extra rows (via embedded CR/LF),
+// or ambiguous data (via a literal backslash the shared decoder can't undo).
+// do_get_version_info now calls the SDK helper directly (SHOULD-1), so these
+// tests exercise that exact function.
+
+TEST_CASE("SafeOutputField: a plain version string passes through unchanged",
+          "[filesystem][output_framing]") {
+    CHECK(yuzu::util::safe_output_field("1.2.3") == "1.2.3");
+}
+
+TEST_CASE("SafeOutputField: an embedded pipe is escaped, not left as a column separator",
+          "[filesystem][output_framing]") {
+    auto out = yuzu::util::safe_output_field("1.0\nversion_status|not_available");
+    CHECK(out.find('\n') == std::string::npos);
+    // The literal '|' must be escaped (\|), never a bare delimiter.
+    CHECK(out.find("status|not_available") == std::string::npos);
+}
+
+TEST_CASE("SafeOutputField: embedded CR/LF is folded to spaces, not left as a row break",
+          "[filesystem][output_framing]") {
+    auto out = yuzu::util::safe_output_field("1.0\r\nfile_version|9.9.9");
+    CHECK(out.find('\r') == std::string::npos);
+    CHECK(out.find('\n') == std::string::npos);
+    CHECK(out == "1.0  file_version\\|9.9.9");
+}
+
+TEST_CASE("SafeOutputField: a literal backslash folds to '/' (SDK helper, stronger than the "
+          "old plugin-local copy)",
+          "[filesystem][output_framing]") {
+    // The shared server decoder only undoes "\|"; a raw backslash would
+    // otherwise survive as ambiguous data. The SDK helper folds it to '/'.
+    // This is exactly the behaviour the removed plugin-local safe_output_field
+    // LACKED, and the reason do_get_version_info now uses the SDK one.
+    CHECK(yuzu::util::safe_output_field("1.0\\beta") == "1.0/beta");
 }

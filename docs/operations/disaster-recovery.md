@@ -12,9 +12,11 @@
 
 > Shipped InstructionDefinitions live inside the `yuzu-server` binary
 > (embedded at build time by `server/core/scripts/embed_content.py`)
-> and are re-seeded into `instructions.db` on first boot. Operator
-> edits to definitions persist in `instructions.db`, which is already
-> covered above.
+> and are reseeded on every boot into the PostgreSQL `instruction_store`
+> schema (ADR-0058) — not `instructions.db`, which this store no longer
+> reads or writes. Operator edits to definitions persist in Postgres;
+> back them up via the `pg_dump`/`pg_restore` procedure covered
+> elsewhere in this document for the server's Postgres substrate.
 
 ## Backup Strategy
 
@@ -65,6 +67,14 @@ systemctl start yuzu-server
 # 5. Verify
 curl http://localhost:8080/livez
 ```
+
+> **Restoring a backup taken before the OIDC-secret redaction fix?** Rotate the OIDC client
+> secret. Earlier versions recorded it in the clear in the server log, `GET /api/config` and the
+> `config.update` audit detail. The current server no longer discloses it - including for audit
+> rows written before the fix, which are redacted when read - but **a restored backup still
+> contains the plaintext bytes on disk**, and anything that read it while it was exposed still
+> holds a working credential. See
+> [Security hardening -> OIDC](../user-manual/security-hardening.md#oidc-hardening).
 
 ## Recovery Time
 

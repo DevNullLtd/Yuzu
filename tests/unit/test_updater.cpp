@@ -7,6 +7,8 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -18,19 +20,25 @@ namespace fs = std::filesystem;
 
 namespace {
 
-/// Helper: create a temporary directory for test files.
-fs::path make_temp_dir(const std::string& suffix) {
-    auto dir = fs::temp_directory_path() / ("yuzu_test_updater_" + suffix);
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    return dir;
-}
-
-/// Helper: clean up a temporary directory.
-void cleanup_dir(const fs::path& dir) {
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-}
+/// RAII per-test scratch dir, process-salted via yuzu::test::TempDir. The
+/// previous fixed `yuzu_test_updater_<suffix>` dirs were cross-JOB shared
+/// resources on the shared-identity CI pools: one job's cleanup remove_all
+/// deleted another's just-written fixtures, and a leftover marker file could
+/// flip rollback_if_needed()'s result (#1883). RAII also removes the dir when
+/// a REQUIRE fails (the old trailing cleanup_dir call was skipped). The
+/// suffix keeps the yuzu_test_updater_* naming inside the Defender exclusion
+/// wildcard.
+struct TempUpdaterDir {
+    yuzu::test::TempDir guard;
+    explicit TempUpdaterDir(const std::string& suffix)
+        : guard("yuzu_test_updater_" + suffix + "-") {
+        std::error_code ec;
+        fs::create_directories(guard.path, ec);
+        // A silently-failed creation (full temp volume, ACL) would hollow out
+        // the negative-assertion rollback tests into no-op passes (gov safe-2).
+        REQUIRE(fs::exists(guard.path));
+    }
+};
 
 /// Helper: write a small file to simulate a binary.
 void write_fake_binary(const fs::path& path) {
@@ -55,7 +63,8 @@ TEST_CASE("current_executable_path points to existing file", "[updater][exe_path
 // ── cleanup_old_binary ──────────────────────────────────────────────────────
 
 TEST_CASE("cleanup_old_binary deletes .old file if present", "[updater][cleanup]") {
-    auto dir = make_temp_dir("cleanup_present");
+    TempUpdaterDir tmp("cleanup_present");
+    const auto& dir = tmp.guard.path;
 
 #ifdef _WIN32
     auto exe_path = dir / "yuzu-agent.exe";
@@ -76,12 +85,11 @@ TEST_CASE("cleanup_old_binary deletes .old file if present", "[updater][cleanup]
 
     REQUIRE_FALSE(fs::exists(old_path));
     REQUIRE(fs::exists(exe_path)); // Current exe must still exist
-
-    cleanup_dir(dir);
 }
 
 TEST_CASE("cleanup_old_binary does nothing if no .old exists", "[updater][cleanup]") {
-    auto dir = make_temp_dir("cleanup_absent");
+    TempUpdaterDir tmp("cleanup_absent");
+    const auto& dir = tmp.guard.path;
 
 #ifdef _WIN32
     auto exe_path = dir / "yuzu-agent.exe";
@@ -98,14 +106,13 @@ TEST_CASE("cleanup_old_binary does nothing if no .old exists", "[updater][cleanu
     updater.cleanup_old_binary();
 
     REQUIRE(fs::exists(exe_path));
-
-    cleanup_dir(dir);
 }
 
 // ── rollback_if_needed ──────────────────────────────────────────────────────
 
 TEST_CASE("rollback_if_needed returns false when no .old exists", "[updater][rollback]") {
-    auto dir = make_temp_dir("rollback_no_old");
+    TempUpdaterDir tmp("rollback_no_old");
+    const auto& dir = tmp.guard.path;
 
 #ifdef _WIN32
     auto exe_path = dir / "yuzu-agent.exe";
@@ -119,13 +126,12 @@ TEST_CASE("rollback_if_needed returns false when no .old exists", "[updater][rol
     Updater updater(config, "test-agent", "0.1.0", "windows", "x86_64", exe_path);
 
     REQUIRE_FALSE(updater.rollback_if_needed());
-
-    cleanup_dir(dir);
 }
 
 TEST_CASE("rollback_if_needed returns false when .old exists AND verified marker exists",
           "[updater][rollback]") {
-    auto dir = make_temp_dir("rollback_verified");
+    TempUpdaterDir tmp("rollback_verified");
+    const auto& dir = tmp.guard.path;
 
 #ifdef _WIN32
     auto exe_path = dir / "yuzu-agent.exe";
@@ -148,13 +154,12 @@ TEST_CASE("rollback_if_needed returns false when .old exists AND verified marker
     REQUIRE_FALSE(updater.rollback_if_needed());
     REQUIRE_FALSE(fs::exists(old_path));
     REQUIRE_FALSE(fs::exists(marker_path));
-
-    cleanup_dir(dir);
 }
 
 TEST_CASE("rollback_if_needed returns true when .old exists but NO verified marker",
           "[updater][rollback]") {
-    auto dir = make_temp_dir("rollback_needed");
+    TempUpdaterDir tmp("rollback_needed");
+    const auto& dir = tmp.guard.path;
 
 #ifdef _WIN32
     auto exe_path = dir / "yuzu-agent.exe";
@@ -177,8 +182,6 @@ TEST_CASE("rollback_if_needed returns true when .old exists but NO verified mark
     // After rollback, the old binary should have been moved back to exe_path
     REQUIRE(fs::exists(exe_path));
     REQUIRE_FALSE(fs::exists(old_path));
-
-    cleanup_dir(dir);
 }
 
 // ── Construction ────────────────────────────────────────────────────────────

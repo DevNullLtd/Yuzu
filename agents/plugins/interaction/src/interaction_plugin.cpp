@@ -16,18 +16,27 @@
  *   Linux   — notify-send, zenity
  *   macOS   — osascript (display notification, display dialog)
  *
- * Input validation: title/message/prompt fields are sanitized to prevent
- * command injection in popen calls. Only alphanumeric, spaces, and safe
- * punctuation are allowed.
+ * Input validation: title/message/prompt fields are sanitized before being
+ * embedded in an osascript/PowerShell script fragment or passed as a zenity/
+ * notify-send argument. Every spawn goes through the bounded argv runner
+ * (yuzu::agent::run_bounded_subprocess) with clean argv end to end on every
+ * OS — no shell is ever invoked. On macOS, osascript's own multi-statement
+ * `-e` form carries each AppleScript fragment as its own argv element
+ * (ADR-3002 Decision 5: osascript is the deepest interpreter intentionally
+ * invoked and sets the rung, but the outer spawn is argv-clean, same
+ * principle as PowerShell's `-Command`). On Linux, zenity/notify-send are
+ * plain binaries with no interpreter role at all — ordinary rung-2 argv
+ * candidates, each flag/value its own argv element. Only alphanumeric,
+ * spaces, and safe punctuation are allowed through sanitize().
  */
 
 #include <yuzu/plugin.hpp>
 
+#include "interaction_parsers.hpp"
+
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <sstream>
@@ -45,6 +54,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002)
+#else
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (arch-L1)
 #endif
 
 namespace {
@@ -52,15 +66,19 @@ namespace {
 // ── Input sanitization ────────────────────────────────────────────────────────
 
 /**
- * Returns true if the character is safe for inclusion in shell commands.
- * Blocks backticks, $, |, ;, &, <, >, (, ), {, }, [, ], \, newlines,
- * single quotes, double quotes, and other shell metacharacters.
+ * Returns true if the character is safe for inclusion in a dialog title/
+ * message/prompt. Blocks backticks, $, |, ;, &, <, >, (, ), {, }, [, ], \,
+ * newlines, single quotes, double quotes, and other metacharacters.
  *
  * M13: Single and double quotes are blocked on macOS/Linux because
- * osascript and zenity commands embed user text inside shell quotes.
- * Allowing quotes would enable shell injection via quote-breaking.
- * On Windows, native APIs (MessageBoxW, ShellNotifyIconW) are used
- * so quotes are safe — but we block them uniformly for defense-in-depth.
+ * osascript's AppleScript fragments and PowerShell's `-Command` script embed
+ * this text inside their own string literal syntax (`"..."`) — an
+ * unescaped quote would break out of that literal into the surrounding
+ * script, an AppleScript/PowerShell-syntax injection even though the outer
+ * process spawn itself is clean argv with no shell involved. Allowing
+ * quotes would enable exactly that break-out. On Windows notify/message_box,
+ * native APIs (MessageBoxW, ShellNotifyIconW) are used so quotes are safe —
+ * but we block them uniformly for defense-in-depth.
  */
 bool is_safe_char(char c) {
     if (c >= 'a' && c <= 'z') return true;
@@ -69,7 +87,8 @@ bool is_safe_char(char c) {
     // Safe punctuation: space, period, comma, hyphen, underscore, colon,
     // question mark, exclamation, slash, at, hash, percent, plus, equals.
     // Note: single quote and double quote are intentionally excluded (M13)
-    // to prevent shell injection on macOS/Linux popen calls.
+    // to prevent AppleScript/PowerShell string-literal injection into the
+    // script fragments these values are embedded in.
     switch (c) {
     case ' ':  case '.':  case ',':  case '-':  case '_':
     case ':':  case '?':  case '!':  case '/':  case '@':
@@ -109,51 +128,125 @@ bool require_param(yuzu::CommandContext& ctx, std::string_view value,
     return true;
 }
 
-#if !defined(_WIN32)
-/**
- * Run a command via popen and capture the first line of output.
- * Returns the output string (may be empty).
- */
-std::string run_command(const std::string& cmd) {
-    std::string output;
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return output;
+#if defined(_WIN32)
+// Same generous per-call wall-clock bound as kInteractionCmdDeadline below,
+// for the single-field PowerShell InputBox site (input). Interactive and can
+// legitimately block on a user, so this is deliberately long — it only fires
+// on a genuinely wedged invocation.
+constexpr std::chrono::seconds kInteractionCmdDeadlineWin{120};
 
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
-    }
-    pclose(pipe);
+// platform_survey builds ONE PowerShell script covering every question and
+// issues a single bounded call for the whole form (unlike the POSIX legs,
+// which loop and issue one osascript/zenity call PER question, so each
+// question implicitly gets its own fresh deadline). A multi-question form
+// can legitimately take a human several minutes combined to fill in, so this
+// gets its own, longer bound rather than reusing kInteractionCmdDeadlineWin
+// -- the pre-migration _popen call had no timeout at all here, so a bound
+// this tight would be a newly-introduced usability regression for a
+// legitimately slow-but-real multi-question response (Gate 4 finding F1).
+constexpr std::chrono::seconds kInteractionSurveyCmdDeadlineWin{600};
 
-    // Trim trailing newline
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
-        output.pop_back();
-    }
-    return output;
-}
-
-/**
- * Run a command via popen and return the exit code.
- */
-int run_command_status(const std::string& cmd) {
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return -1;
-
-    // Drain output
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        // discard
-    }
-    int status = pclose(pipe);
-#if defined(__linux__) || defined(__APPLE__)
-    // pclose returns the wait status; extract exit code
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
-#else
-    return status;
+// The stable, well-known location of Windows PowerShell 5.1 -- the only
+// candidate probed (ADR-3002 "tool path probing"): probe_tool_path()
+// verifies it exists and is executable at call time rather than assuming a
+// hardcoded path is safe to exec unchecked.
+constexpr const char* kPowerShellPath =
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 #endif
+
+#if !defined(_WIN32)
+// A generous per-call wall-clock bound for the interaction dialog spawns.
+// osascript/zenity/notify-send calls are interactive and can legitimately
+// block on a user, so this is deliberately long — it only fires on a
+// genuinely wedged invocation.
+constexpr std::chrono::seconds kInteractionCmdDeadline{120};
+
+#if defined(__APPLE__)
+// The stable, well-known location of osascript -- the only candidate probed
+// (ADR-3002 "tool path probing"): probe_tool_path() verifies it exists and
+// is executable at call time rather than assuming a hardcoded path is safe
+// to exec unchecked.
+constexpr const char* kOsascriptPath = "/usr/bin/osascript";
+#elif defined(__linux__)
+// zenity/notify-send ship at one of these paths across the mainstream
+// Linux distros this agent targets.
+const std::vector<std::string> kZenityPaths = {"/usr/bin/zenity", "/usr/local/bin/zenity"};
+const std::vector<std::string> kNotifySendPaths = {"/usr/bin/notify-send",
+                                                   "/usr/local/bin/notify-send"};
+
+/**
+ * Whether this process has a plausible GUI session to talk to. zenity fails
+ * to connect ("Failed to open display", exit 1) when neither an X11 DISPLAY
+ * nor a Wayland WAYLAND_DISPLAY is set -- the normal state for a headless
+ * daemon, which is the ordinary deployment posture for a Linux Yuzu agent
+ * (docs/agent-privilege-model.md). zenity's own exit-code contract cannot
+ * distinguish that delivery failure from a real user decline -- `--info`
+ * has no decline at all, so ANY nonzero exit there is a delivery failure
+ * with no legitimate alternate reading, and `--question`/`--entry` collapse
+ * a real Cancel/No onto the exact same exit code a display failure produces
+ * (verified live: `DISPLAY= zenity --question/--info/--entry ...` -> exit 1,
+ * "Failed to open display", indistinguishable from rc=1 on a real display).
+ * Checking this UPFRONT, before ever spawning zenity, closes that honest-
+ * status gap at its root instead of trying to infer it from an ambiguous
+ * exit code after the fact.
+ */
+bool has_linux_display_session() {
+    const char* display = std::getenv("DISPLAY");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    return (display && *display) || (wayland && *wayland);
+}
+#endif
+
+/**
+ * Result of run_tool(): the captured output plus the process exit code,
+ * from a single run_bounded_subprocess round trip.
+ */
+struct CommandResult {
+    std::string output;
+    int exit_code = -1;
+    // Full runner result, kept alongside output/exit_code so a caller can
+    // forward a genuine runner-level failure (spawn error/deadline/cancel/
+    // signal death) through the ABI4 result seam (runner_status.hpp) before
+    // ever trusting exit_code/output as a real dialog outcome -- see
+    // classify_posix_capture in interaction_parsers.hpp.
+    yuzu::agent::SubprocessResult res;
+};
+
+/**
+ * Run a tool via clean argv through the bounded, fork-lock-covered,
+ * CLOEXEC-pipe runner (arch-L1) -- no shell involved, so there is nothing to
+ * quote or escape. `merge_stderr` folds the tool's stderr into `output`
+ * (the old shell string's `2>&1`); the default (false) discards it, the
+ * runner's native equivalent of the old `2>/dev/null`.
+ *
+ * Captures output and exit status in ONE invocation (unlike calling two
+ * separate runner calls, which would run an interactive dialog -- e.g. an
+ * osascript dialog -- twice), so a caller can tell "the tool ran and
+ * produced this text" apart from "the tool failed" (non-zero exit, e.g. no
+ * reachable GUI session for the daemon to display a dialog on) without a
+ * second round trip.
+ *
+ * An empty argv[0] (a probe_tool_path miss) is rejected before ever
+ * attempting an OS call, reporting the same shape run_bounded_subprocess
+ * uses for its own runtime-reject (tool_ran=false) -- the same idiom
+ * users_plugin.cpp's run_tool() uses.
+ */
+CommandResult run_tool(std::vector<std::string> argv, bool merge_stderr = false) {
+    if (argv.empty() || argv.front().empty()) {
+        return CommandResult{};
+    }
+    auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline,
+                                             .merge_stderr = merge_stderr});
+    CommandResult result;
+    result.output = res.output;
+    result.exit_code = res.exit_code;
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    result.res = std::move(res);
+    return result;
 }
 #endif // !_WIN32
 
@@ -216,17 +309,34 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     std::string safe_title = sanitize(title);
     std::string safe_msg = sanitize(message);
 
-    std::string cmd = std::format(
-        "osascript -e 'display notification \"{}\" with title \"{}\"' 2>&1",
-        safe_msg, safe_title);
+    // sink: interaction/posix_osascript_notify#1 -- osascript given a
+    // script fragment via -e; no shell is involved (ADR-3002 Decision 5:
+    // rung-3 governed-interpreter site -- osascript is the deepest
+    // interpreter intentionally invoked and sets the rung; the outer spawn
+    // is argv-clean, not a Decision-7 shell exception -- see
+    // docs/agent-spawn-sink-manifest.md).
+    auto osascript_path = yuzu::agent::probe_tool_path({kOsascriptPath});
+    auto result = run_tool(
+        {osascript_path, "-e",
+         std::format("display notification \"{}\" with title \"{}\"", safe_msg, safe_title)});
 
-    int rc = run_command_status(cmd);
-    if (rc == 0) {
+    if (result.exit_code == 0) {
         ctx.write_output("status|ok");
-    } else {
-        ctx.write_output("status|error|osascript failed");
+        return 0;
     }
-    return 0;
+    // Non-zero exit from osascript on a daemon most often means there is
+    // no reachable GUI session to post the notification to. Report that
+    // honestly rather than a bare "failed" (which reads like a bug in
+    // this plugin rather than an environment limitation) — but still
+    // return non-zero so the agent core records this command as a
+    // terminal FAILURE rather than SUCCESS, since nothing was ever shown
+    // to the user. forward_runner_failure is a no-op for a genuine
+    // nonzero osascript exit (TerminationReason::exited) and only sets the
+    // ABI4 typed status for an actual runner-level failure (spawn error,
+    // deadline, signal death, or an empty probe_tool_path miss).
+    yuzu::agent::forward_runner_failure(ctx, result.res);
+    ctx.write_output("status|unavailable|no reachable GUI session");
+    return 1;
 }
 
 #elif defined(__linux__)
@@ -242,17 +352,26 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     else if (type == "warning") urgency = "normal";
     else urgency = "low";
 
-    std::string cmd = std::format(
-        "notify-send -u {} '{}' '{}' 2>&1",
-        urgency, safe_title, safe_msg);
+    // sink: interaction/posix_notify_send#1 -- notify-send is a plain
+    // binary with no interpreter role; clean argv, no shell (ADR-3002
+    // Decision 1: rung-2 candidate).
+    auto notify_send_path = yuzu::agent::probe_tool_path(kNotifySendPaths);
+    // ADR-3002 Decision 6 argv hygiene: title/message are positional (no
+    // preceding --summary/--body flag), so sanitize()'s allowed leading '-'
+    // could otherwise be parsed as a notify-send option instead of data
+    // (e.g. a title of "-i" reads as --icon) -- "--" ends option parsing.
+    auto result = run_tool({notify_send_path, "-u", urgency, "--", safe_title, safe_msg});
 
-    int rc = run_command_status(cmd);
-    if (rc == 0) {
+    if (result.exit_code == 0) {
         ctx.write_output("status|ok");
-    } else {
-        ctx.write_output("status|error|notify-send not available or failed");
+        return 0;
     }
-    return 0;
+    // A consumer keying off the command's execution-level return code
+    // (rather than parsing the status|error text) must not read a failed
+    // notification as a successful command -- matches the macOS leg above.
+    yuzu::agent::forward_runner_failure(ctx, result.res);
+    ctx.write_output("status|error|notify-send not available or failed");
+    return 1;
 }
 
 #else
@@ -318,21 +437,58 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         btn_spec = "buttons {\"OK\"} default button \"OK\"";
     }
 
-    std::string cmd = std::format(
-        "osascript -e 'display dialog \"{}\" with title \"{}\" {}' 2>&1",
-        safe_msg, safe_title, btn_spec);
+    // Wrap the dialog in try/on-error and return a sentinel so an unreachable
+    // display server (this agent is a root LaunchDaemon with no Aqua/GUI
+    // session — see docs/agent-privilege-model.md) is reported honestly as
+    // not_reachable instead of a false button. The bare substring match this
+    // replaced fell through to "response|ok" for ANY unrecognised output,
+    // claiming the user clicked OK on a dialog that was never shown. The
+    // try/on-error idiom mirrors platform_input; capturing the error NUMBER
+    // keeps a genuine user-cancel (-128) distinct from an undeliverable
+    // session.
+    //
+    // sink: interaction/posix_osascript_message_box#1 -- osascript given a
+    // multi-statement script via -e flags, clean argv, no shell (ADR-3002
+    // Decision 5: rung-3 governed-interpreter site -- osascript is the
+    // deepest interpreter intentionally invoked and sets the rung; the
+    // outer spawn is argv-clean). safe_msg/safe_title are already
+    // sanitize()d (unsafe chars replaced with '_'); btn_spec and every
+    // sentinel/-e fragment are fixed compile-time literals — no
+    // operator-supplied text controls the argv's shape.
+    auto osascript_path = yuzu::agent::probe_tool_path({kOsascriptPath});
+    std::vector<std::string> argv = {osascript_path};
+    auto dialog_argv = yuzu::interaction::build_dialog_argv(safe_title, safe_msg, btn_spec);
+    argv.insert(argv.end(), dialog_argv.begin(), dialog_argv.end());
+    auto result = run_tool(argv, /*merge_stderr=*/true);
 
-    std::string output = run_command(cmd);
-
-    // osascript returns "button returned:OK" or "button returned:Yes" etc.
-    if (output.find("Cancel") != std::string::npos) {
-        ctx.write_output("response|cancel");
-    } else if (output.find("No") != std::string::npos) {
-        ctx.write_output("response|no");
-    } else if (output.find("Yes") != std::string::npos) {
-        ctx.write_output("response|yes");
-    } else {
+    switch (yuzu::interaction::parse_dialog_result(result.output)) {
+    case yuzu::interaction::DialogOutcome::ok:
         ctx.write_output("response|ok");
+        break;
+    case yuzu::interaction::DialogOutcome::cancel:
+        ctx.write_output("response|cancel");
+        break;
+    case yuzu::interaction::DialogOutcome::yes:
+        ctx.write_output("response|yes");
+        break;
+    case yuzu::interaction::DialogOutcome::no:
+        ctx.write_output("response|no");
+        break;
+    case yuzu::interaction::DialogOutcome::not_reachable:
+        // No GUI session / TCC denial / osascript failure — honest status,
+        // never a fabricated button. forward_runner_failure is a no-op for
+        // a genuine AppleScript-level error (TerminationReason::exited,
+        // e.g. a real non-(-128) osascript error number) and only sets the
+        // ABI4 typed status for an actual runner-level failure. Rides the
+        // new `status` result column AND returns terminal FAILURE so a
+        // generic success/failure consumer (the executions drawer, retry/
+        // automation logic) does not read a dialog that was never shown as
+        // SUCCESS. This matches the sibling actions notify/input/survey,
+        // which already return 1 for the identical undeliverable-session
+        // condition.
+        yuzu::agent::forward_runner_failure(ctx, result.res);
+        ctx.write_output("status|not_reachable");
+        return 1;
     }
     return 0;
 }
@@ -341,27 +497,62 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
                          const std::string& message, const std::string& buttons) {
+    if (!has_linux_display_session()) {
+        // Closes the round-2 review blocker at its root: zenity's own exit
+        // code cannot distinguish "no display" from a real button press
+        // (--info has no legitimate nonzero reading at all), so check
+        // upfront rather than spawn and guess.
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
     std::string safe_title = sanitize(title);
     std::string safe_msg = sanitize(message);
+    auto zenity_path = yuzu::agent::probe_tool_path(kZenityPaths);
 
+    // sink: interaction/posix_zenity_message_box#1 -- zenity is a plain
+    // binary with no interpreter role; clean argv, no shell (ADR-3002
+    // Decision 1: rung-2 candidate).
     if (buttons == "yesno") {
-        std::string cmd = std::format(
-            "zenity --question --title='{}' --text='{}' 2>/dev/null",
-            safe_title, safe_msg);
-        int rc = run_command_status(cmd);
-        ctx.write_output(rc == 0 ? "response|yes" : "response|no");
+        auto result = run_tool({zenity_path, "--question", "--title", safe_title, "--text",
+                                safe_msg});
+        // zenity's own contract: 0=Yes, 1=No, 5=timeout/ESC. -1 is the
+        // runner's documented sentinel for a genuine spawn error/deadline/
+        // signal death -- never to be misread as the user clicking No, the
+        // same honest-status gap already closed on the input/survey legs.
+        if (result.exit_code == -1) {
+            yuzu::agent::forward_runner_failure(ctx, result.res);
+            ctx.write_output("status|unavailable|zenity dialog failed to complete");
+            return 1;
+        }
+        ctx.write_output(result.exit_code == 0 ? "response|yes" : "response|no");
     } else if (buttons == "okcancel") {
-        std::string cmd = std::format(
-            "zenity --question --title='{}' --text='{}' "
-            "--ok-label='OK' --cancel-label='Cancel' 2>/dev/null",
-            safe_title, safe_msg);
-        int rc = run_command_status(cmd);
-        ctx.write_output(rc == 0 ? "response|ok" : "response|cancel");
+        auto result = run_tool({zenity_path, "--question", "--title", safe_title, "--text",
+                                safe_msg, "--ok-label", "OK", "--cancel-label", "Cancel"});
+        if (result.exit_code == -1) {
+            yuzu::agent::forward_runner_failure(ctx, result.res);
+            ctx.write_output("status|unavailable|zenity dialog failed to complete");
+            return 1;
+        }
+        ctx.write_output(result.exit_code == 0 ? "response|ok" : "response|cancel");
     } else {
-        std::string cmd = std::format(
-            "zenity --info --title='{}' --text='{}' 2>/dev/null",
-            safe_title, safe_msg);
-        run_command_status(cmd);
+        auto result = run_tool({zenity_path, "--info", "--title", safe_title, "--text",
+                                safe_msg});
+        if (result.exit_code == -1) {
+            yuzu::agent::forward_runner_failure(ctx, result.res);
+            ctx.write_output("status|unavailable|zenity dialog failed to complete");
+            return 1;
+        }
+        // `--info` has no button to decline -- there is no legitimate
+        // reading of a nonzero exit here other than a delivery failure
+        // (e.g. a DISPLAY that is set but stale/unreachable, since the
+        // has_linux_display_session() check above only catches the unset
+        // case). Never fabricate response|ok on a dialog that may never
+        // have been shown.
+        if (result.exit_code != 0) {
+            ctx.write_output("status|unavailable|zenity dialog did not complete");
+            return 1;
+        }
         ctx.write_output("response|ok");
     }
     return 0;
@@ -396,21 +587,42 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
         "else {{ Write-Output $result }}",
         safe_prompt, safe_title, safe_default);
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -Command \"" + ps_script + "\"";
-
-    std::string output;
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
+    // interaction/input_windows#1 -- clean argv via the bounded runner instead
+    // of a raw _popen shell string; the script text itself remains a single
+    // argv element PowerShell interprets (ADR-3002 Decision 5: the outer
+    // invocation is now argv-clean, but the deepest interpreter intentionally
+    // invoked -- PowerShell -- still sets the rung, rung 3, same as before).
+    auto ps_path = yuzu::agent::probe_tool_path({kPowerShellPath});
+    if (ps_path.empty()) {
         ctx.write_output("status|error|failed to launch PowerShell");
         return 1;
     }
 
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
-    }
-    _pclose(pipe);
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps_script},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
 
+    // Consolidated runner-failure/exit-code decision (classify_windows_dialog_
+    // capture, unit-tested): a killed-at-deadline dialog can still have
+    // tool_ran=true with empty or partial output (subprocess_runner.hpp's
+    // documented contract) -- without the timed_out check, empty output falls
+    // through to the "cancelled" branch below and silently misreports a
+    // timeout as a user cancel. The exit_code check closes the remaining gap:
+    // a ShowDialog()/InputBox() exception under a non-interactive session
+    // exits nonzero with empty output (its error text never reaches `output`
+    // -- merge_stderr defaults false), which previously fell through to
+    // "cancelled|true" as a fabricated user outcome. None of these three
+    // cases may be reinterpreted as a real dialog response, matching
+    // classify_input_capture's macOS/Linux contract.
+    auto decision = yuzu::interaction::classify_windows_dialog_capture(
+        res.tool_ran, res.timed_out, res.exit_code);
+    if (decision.is_failure) {
+        yuzu::agent::forward_runner_failure(ctx, res);
+        ctx.write_output(decision.output_line);
+        return decision.rc;
+    }
+
+    std::string output = std::move(res.output);
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {
@@ -433,59 +645,83 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
 
-    std::string cmd = std::format(
-        "osascript -e 'try' -e 'set result to text returned of "
-        "(display dialog \"{}\" with title \"{}\" default answer \"{}\")' "
-        "-e 'return result' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
-        safe_prompt, safe_title, safe_default);
+    // "on error number err_num" + re-raising every code other than -128
+    // (the AppleScript "User canceled" error) ensures only a genuine Cancel
+    // click is converted to the "##CANCELLED##" sentinel at exit 0; any
+    // other failure (e.g. no reachable GUI session) propagates as a
+    // non-zero osascript exit so it is never misreported as cancellation.
+    //
+    // sink: interaction/posix_osascript_input#1 -- osascript given a
+    // multi-statement script via -e flags, clean argv, no shell (ADR-3002
+    // Decision 5: rung-3 governed-interpreter site -- osascript is the
+    // deepest interpreter intentionally invoked and sets the rung; the
+    // outer spawn is argv-clean).
+    auto osascript_path = yuzu::agent::probe_tool_path({kOsascriptPath});
+    std::vector<std::string> argv = {
+        osascript_path, "-e", "try",
+        "-e",
+        std::format("set result to text returned of (display dialog \"{}\" with title \"{}\" "
+                    "default answer \"{}\")",
+                    safe_prompt, safe_title, safe_default),
+        "-e", "return result",
+        "-e", "on error number err_num",
+        "-e", "if err_num is -128 then return \"##CANCELLED##\"",
+        "-e", "error number err_num",
+        "-e", "end try",
+    };
+    auto result = run_tool(argv, /*merge_stderr=*/true);
 
-    std::string output = run_command(cmd);
-
-    if (output == "##CANCELLED##") {
-        ctx.write_output("cancelled|true");
-    } else {
-        ctx.write_output(std::format("response|{}", output));
+    // The exit-code/output decision is the pure classify_input_capture (qe-L2,
+    // unit-tested): a non-zero exit is a delivery failure reported as an honest
+    // status|unavailable (never the error text wrapped as a response), the
+    // ##CANCELLED## sentinel is a user cancel, everything else is real input.
+    auto decision = yuzu::interaction::classify_input_capture(result.exit_code, result.output);
+    if (decision.rc != 0) {
+        // No-op for a genuine AppleScript-level error (TerminationReason::
+        // exited); sets the ABI4 typed status only for an actual
+        // runner-level failure, so a wedged/missing osascript is
+        // distinguishable on the wire from an honest no-GUI-session exit.
+        yuzu::agent::forward_runner_failure(ctx, result.res);
     }
-    return 0;
+    ctx.write_output(decision.output_line);
+    return decision.rc;
 }
 
 #elif defined(__linux__)
 
 int platform_input(yuzu::CommandContext& ctx, const std::string& title,
                    const std::string& prompt, const std::string& default_value) {
+    if (!has_linux_display_session()) {
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
     std::string safe_title = sanitize(title);
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
 
-    // Capture output and exit code in a single invocation using a
-    // shell wrapper that appends the exit status on a separate line.
-    std::string cmd = std::format(
-        "sh -c 'OUT=$(zenity --entry --title='\"'\"'{}'\"'\"' "
-        "--text='\"'\"'{}'\"'\"' --entry-text='\"'\"'{}'\"'\"' 2>/dev/null); "
-        "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
-        safe_title, safe_prompt, safe_default);
+    // sink: interaction/posix_zenity_input#1 -- zenity is a plain binary
+    // with no interpreter role; clean argv, no shell (ADR-3002 Decision 1:
+    // rung-2 candidate).
+    auto zenity_path = yuzu::agent::probe_tool_path(kZenityPaths);
+    auto result = run_tool({zenity_path, "--entry", "--title", safe_title, "--text", safe_prompt,
+                            "--entry-text", safe_default});
 
-    std::string output = run_command(cmd);
-
-    // Parse the exit code from the last line
-    int rc = 1;
-    std::string user_text;
-    auto rc_pos = output.rfind("__RC=");
-    if (rc_pos != std::string::npos) {
-        auto rc_str = output.substr(rc_pos + 5);
-        std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-        user_text = output.substr(0, rc_pos);
-        // Trim trailing newline from user text
-        while (!user_text.empty() &&
-               (user_text.back() == '\n' || user_text.back() == '\r')) {
-            user_text.pop_back();
-        }
-    }
-
-    if (rc != 0) {
+    switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+    case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+        // exit_code == -1: the runner itself never produced a real zenity
+        // exit status (spawn error, deadline, or signal death) -- report it
+        // honestly instead of misreading it as the user clicking Cancel.
+        yuzu::agent::forward_runner_failure(ctx, result.res);
+        ctx.write_output("status|unavailable|zenity dialog failed to complete");
+        return 1;
+    case yuzu::interaction::PosixCaptureOutcome::cancelled:
+        // zenity's own contract: a real nonzero exit here is Cancel/dismiss.
         ctx.write_output("cancelled|true");
-    } else {
-        ctx.write_output(std::format("response|{}", user_text));
+        break;
+    case yuzu::interaction::PosixCaptureOutcome::real_output:
+        ctx.write_output(std::format("response|{}", result.output));
+        break;
     }
     return 0;
 }
@@ -660,21 +896,42 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
     ps += "  } else { Write-Output $c.Text } ";
     ps += "} ";
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -Command \"" + ps + "\"";
-
-    std::string output;
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
+    // interaction/survey_windows#1 -- clean argv via the bounded runner
+    // instead of a raw _popen shell string; the script text itself remains a
+    // single argv element PowerShell interprets (ADR-3002 Decision 5: the
+    // outer invocation is now argv-clean, but the deepest interpreter
+    // intentionally invoked -- PowerShell -- still sets the rung, rung 3,
+    // same as before).
+    auto ps_path = yuzu::agent::probe_tool_path({kPowerShellPath});
+    if (ps_path.empty()) {
         ctx.write_output("status|error|failed to launch PowerShell");
         return 1;
     }
 
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
-    }
-    _pclose(pipe);
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionSurveyCmdDeadlineWin});
 
+    // Consolidated runner-failure/exit-code decision (classify_windows_dialog_
+    // capture, unit-tested): a killed-at-deadline dialog can still have
+    // tool_ran=true with empty or partial output (subprocess_runner.hpp's
+    // documented contract). Without the timed_out check, empty output falls
+    // through to the answer-parse loop below and reports "cancelled|false" +
+    // "question_count|N" with zero answer_ lines -- reading to a caller as
+    // "survey completed, nothing answered" rather than the honest truth that
+    // the dialog never delivered a result. The exit_code check closes the
+    // remaining gap: a WinForms exception under a non-interactive session
+    // (tool_ran=true, not timed out, nonzero exit, empty output) previously
+    // hit that same fabricated-completion branch.
+    auto decision = yuzu::interaction::classify_windows_dialog_capture(
+        res.tool_ran, res.timed_out, res.exit_code);
+    if (decision.is_failure) {
+        yuzu::agent::forward_runner_failure(ctx, res);
+        ctx.write_output(decision.output_line);
+        return decision.rc;
+    }
+
+    std::string output = std::move(res.output);
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {
@@ -705,8 +962,11 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                     const std::vector<SurveyQuestion>& questions) {
-    // macOS: sequential osascript dialogs for each question
-    ctx.write_output("cancelled|false");
+    // macOS: sequential osascript dialogs for each question. "cancelled|false"
+    // is emitted only after every question below has succeeded (see the tail
+    // of this function) — emitting it up front here would contradict a later
+    // "status|unavailable" or "cancelled|true" for the very same survey.
+    auto osascript_path = yuzu::agent::probe_tool_path({kOsascriptPath});
 
     for (size_t i = 0; i < questions.size(); ++i) {
         const auto& q = questions[i];
@@ -714,55 +974,145 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
         std::string safe_title = sanitize(title);
 
         if (q.type == "yesno") {
-            std::string cmd = std::format(
-                "osascript -e 'try' -e 'set r to button returned of "
-                "(display dialog \"{}\" with title \"{}\" buttons {{\"No\", \"Yes\"}} "
-                "default button \"Yes\")' -e 'return r' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
-                safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            // sink: interaction/posix_osascript_survey_yesno#1 -- osascript
+            // given a multi-statement script via -e flags, clean argv, no
+            // shell (ADR-3002 Decision 5: rung-3 governed-interpreter
+            // site -- osascript is the deepest interpreter intentionally
+            // invoked and sets the rung; the outer spawn is argv-clean).
+            std::vector<std::string> argv = {
+                osascript_path, "-e", "try",
+                "-e",
+                std::format("set r to button returned of (display dialog \"{}\" with title "
+                            "\"{}\" buttons {{\"No\", \"Yes\"}} default button \"Yes\")",
+                            safe_prompt, safe_title),
+                "-e", "return r",
+                "-e", "on error number err_num",
+                "-e", "if err_num is -128 then return \"##CANCELLED##\"",
+                "-e", "error number err_num",
+                "-e", "end try",
+            };
+            auto result = run_tool(argv, /*merge_stderr=*/true);
+            if (result.exit_code != 0) {
+                // osascript failed outright (not the AppleScript-level "on
+                // error", which exits 0) — no reachable GUI session. Stop
+                // the survey rather than fabricate an answer. Non-zero
+                // return so the agent core records this command as a
+                // terminal FAILURE rather than SUCCESS.
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i,
-                out.find("Yes") != std::string::npos ? "yes" : "no"));
+            // The AppleScript's button set is exactly {"No", "Yes"}, so a
+            // successful invocation should return exactly one of those two
+            // labels. Match exactly rather than by substring — anything
+            // else is unrecognized output, not a "no" answer, so it is
+            // reported honestly (non-zero) instead of fabricated.
+            if (result.output == "Yes") {
+                ctx.write_output(std::format("answer_{}|yes", i));
+            } else if (result.output == "No") {
+                ctx.write_output(std::format("answer_{}|no", i));
+            } else {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
+            }
 
         } else if (q.type == "choice" && !q.choices.empty()) {
             // Build AppleScript choose from list
             std::string items;
+            std::vector<std::string> safe_choices;
+            safe_choices.reserve(q.choices.size());
             for (size_t ci = 0; ci < q.choices.size(); ++ci) {
                 if (ci > 0) items += ", ";
-                items += "\"" + sanitize(q.choices[ci]) + "\"";
+                safe_choices.push_back(sanitize(q.choices[ci]));
+                items += "\"" + safe_choices.back() + "\"";
             }
-            std::string cmd =
-                "osascript -e 'try' -e 'set r to choose from list {" + items +
-                "} with title \"" + safe_title + "\" with prompt \"" + safe_prompt +
-                "\"' -e 'if r is false then' -e 'return \"##CANCELLED##\"' "
-                "-e 'else' -e 'return item 1 of r' -e 'end if' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1";
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            // sink: interaction/posix_osascript_survey_choice#1 -- osascript
+            // given a multi-statement script via -e flags, clean argv, no
+            // shell (ADR-3002 Decision 5: rung-3 governed-interpreter
+            // site -- osascript is the deepest interpreter intentionally
+            // invoked and sets the rung; the outer spawn is argv-clean).
+            std::vector<std::string> argv = {
+                osascript_path, "-e", "try",
+                "-e",
+                "set r to choose from list {" + items + "} with title \"" + safe_title +
+                    "\" with prompt \"" + safe_prompt + "\"",
+                "-e", "if r is false then",
+                "-e", "return \"##CANCELLED##\"",
+                "-e", "else",
+                "-e", "return item 1 of r",
+                "-e", "end if",
+                "-e", "on error number err_num",
+                "-e", "if err_num is -128 then return \"##CANCELLED##\"",
+                "-e", "error number err_num",
+                "-e", "end try",
+            };
+            auto result = run_tool(argv, /*merge_stderr=*/true);
+            if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            // "choose from list" can only return an item from the list we
+            // supplied. Confirm the output matches one of the sanitized
+            // choices we offered rather than trusting it blindly — output
+            // that matches none of them is unrecognized, not a genuine
+            // selection, so it is reported honestly (non-zero) instead of
+            // fabricated.
+            bool recognized = std::find(safe_choices.begin(), safe_choices.end(),
+                                        result.output) != safe_choices.end();
+            if (!recognized) {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
+            }
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
         } else {
             // text input
-            std::string cmd = std::format(
-                "osascript -e 'try' -e 'set r to text returned of "
-                "(display dialog \"{}\" with title \"{}\" default answer \"\")' "
-                "-e 'return r' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
-                safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            // sink: interaction/posix_osascript_survey_text#1 -- osascript
+            // given a multi-statement script via -e flags, clean argv, no
+            // shell (ADR-3002 Decision 5: rung-3 governed-interpreter
+            // site -- osascript is the deepest interpreter intentionally
+            // invoked and sets the rung; the outer spawn is argv-clean).
+            std::vector<std::string> argv = {
+                osascript_path, "-e", "try",
+                "-e",
+                std::format("set r to text returned of (display dialog \"{}\" with title \"{}\" "
+                            "default answer \"\")",
+                            safe_prompt, safe_title),
+                "-e", "return r",
+                "-e", "on error number err_num",
+                "-e", "if err_num is -128 then return \"##CANCELLED##\"",
+                "-e", "error number err_num",
+                "-e", "end try",
+            };
+            auto result = run_tool(argv, /*merge_stderr=*/true);
+            if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
         }
     }
+    // All questions completed without failure or cancellation — only now is
+    // it accurate to report the survey as not cancelled.
+    ctx.write_output("cancelled|false");
     ctx.write_output(std::format("question_count|{}", questions.size()));
     return 0;
 }
@@ -771,8 +1121,17 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                     const std::vector<SurveyQuestion>& questions) {
-    // Linux: sequential zenity dialogs for each question
-    ctx.write_output("cancelled|false");
+    // Linux: sequential zenity dialogs for each question. "cancelled|false"
+    // is emitted only after every question below has succeeded (see the tail
+    // of this function) — matching macOS/Windows; emitting it up front here
+    // would contradict a later "status|unavailable" or "cancelled|true" for
+    // the very same survey.
+    if (!has_linux_display_session()) {
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
+    auto zenity_path = yuzu::agent::probe_tool_path(kZenityPaths);
 
     for (size_t i = 0; i < questions.size(); ++i) {
         const auto& q = questions[i];
@@ -780,71 +1139,91 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
         std::string safe_title = sanitize(title);
 
         if (q.type == "yesno") {
-            std::string cmd = std::format(
-                "zenity --question --title='{}' --text='{}' 2>/dev/null",
-                safe_title, safe_prompt);
-            int rc = run_command_status(cmd);
-            if (rc == 5) { // zenity returns 5 for timeout/ESC, 1 for No
+            // sink: interaction/posix_zenity_survey_yesno#1 -- zenity is a
+            // plain binary with no interpreter role; clean argv, no shell
+            // (ADR-3002 Decision 1: rung-2 candidate).
+            //
+            // Not classify_posix_capture: zenity's yesno leg has a genuine
+            // three-way exit-code contract (0=Yes, 1=No, 5=timeout/ESC) that
+            // classifier's two-way real_output/cancelled split would collapse
+            // (a real "No" click, rc=1, would misclassify as "cancelled").
+            // The runner-failure sentinel is still checked explicitly first
+            // -- without it, a genuine spawn/deadline failure (exit_code=-1)
+            // fell into the rc!=0 branch and reported a fabricated "no" (the
+            // same honest-status gap this PR closes on the sibling
+            // choice/text legs below).
+            auto result = run_tool({zenity_path, "--question", "--title", safe_title, "--text",
+                                    safe_prompt});
+            if (result.exit_code == -1) {
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            }
+            if (result.exit_code == 5) { // zenity returns 5 for timeout/ESC
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, rc == 0 ? "yes" : "no"));
+            ctx.write_output(std::format("answer_{}|{}", i, result.exit_code == 0 ? "yes" : "no"));
 
         } else if (q.type == "choice" && !q.choices.empty()) {
-            std::string items;
+            // sink: interaction/posix_zenity_survey_choice#1 -- zenity is a
+            // plain binary with no interpreter role; clean argv, no shell
+            // (ADR-3002 Decision 1: rung-2 candidate). Each choice is its own
+            // trailing positional argv element (zenity --list's own contract)
+            // rather than a space-joined, individually-quoted shell string.
+            std::vector<std::string> argv = {zenity_path,  "--list", "--title",
+                                             safe_title,   "--text", safe_prompt,
+                                             "--column=Option"};
+            // ADR-3002 Decision 6 argv hygiene: the choices are trailing
+            // positional argv elements with no preceding flag, so a choice
+            // starting with '-' (sanitize() allows a leading hyphen) could
+            // otherwise be parsed as a zenity option instead of a list item
+            // (e.g. "-timeout" -> "This option is not available") -- "--"
+            // ends option parsing before the first positional element.
+            argv.push_back("--");
             for (const auto& ch : q.choices) {
-                items += " '" + sanitize(ch) + "'";
+                argv.push_back(sanitize(ch));
             }
-            std::string cmd = std::format(
-                "sh -c 'OUT=$(zenity --list --title='\"'\"'{}'\"'\"' "
-                "--text='\"'\"'{}'\"'\"' --column=Option{} 2>/dev/null); "
-                "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
-                safe_title, safe_prompt, items);
-            std::string output = run_command(cmd);
+            auto result = run_tool(argv);
 
-            int rc = 1;
-            std::string chosen;
-            auto rc_pos = output.rfind("__RC=");
-            if (rc_pos != std::string::npos) {
-                auto rc_str = output.substr(rc_pos + 5);
-                std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-                chosen = output.substr(0, rc_pos);
-                while (!chosen.empty() && (chosen.back() == '\n' || chosen.back() == '\r'))
-                    chosen.pop_back();
-            }
-            if (rc != 0) {
+            switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+            case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            case yuzu::interaction::PosixCaptureOutcome::cancelled:
                 ctx.write_output("cancelled|true");
                 return 0;
+            case yuzu::interaction::PosixCaptureOutcome::real_output:
+                ctx.write_output(std::format("answer_{}|{}", i, result.output));
+                break;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, chosen));
 
         } else {
             // text entry
-            std::string cmd = std::format(
-                "sh -c 'OUT=$(zenity --entry --title='\"'\"'{}'\"'\"' "
-                "--text='\"'\"'{}'\"'\"' 2>/dev/null); "
-                "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
-                safe_title, safe_prompt);
-            std::string output = run_command(cmd);
+            // sink: interaction/posix_zenity_survey_text#1 -- zenity is a
+            // plain binary with no interpreter role; clean argv, no shell
+            // (ADR-3002 Decision 1: rung-2 candidate).
+            auto result = run_tool({zenity_path, "--entry", "--title", safe_title, "--text",
+                                    safe_prompt});
 
-            int rc = 1;
-            std::string user_text;
-            auto rc_pos = output.rfind("__RC=");
-            if (rc_pos != std::string::npos) {
-                auto rc_str = output.substr(rc_pos + 5);
-                std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-                user_text = output.substr(0, rc_pos);
-                while (!user_text.empty() &&
-                       (user_text.back() == '\n' || user_text.back() == '\r'))
-                    user_text.pop_back();
-            }
-            if (rc != 0) {
+            switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+            case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            case yuzu::interaction::PosixCaptureOutcome::cancelled:
                 ctx.write_output("cancelled|true");
                 return 0;
+            case yuzu::interaction::PosixCaptureOutcome::real_output:
+                ctx.write_output(std::format("answer_{}|{}", i, result.output));
+                break;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, user_text));
         }
     }
+    // All questions completed without failure or cancellation — only now is
+    // it accurate to report the survey as not cancelled.
+    ctx.write_output("cancelled|false");
     ctx.write_output(std::format("question_count|{}", questions.size()));
     return 0;
 }
@@ -859,12 +1238,67 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Per-OS rung split (docs/agent-spawn-sink-manifest.md is the authoritative
+// evidence ledger; this table must stay consistent with it):
+// linux: notify/message_box/input/survey spawn notify-send/zenity via clean
+// argv through run_bounded_subprocess -- rung 2 (plain binaries, no
+// interpreter role; ADR-3002 Decision 1). has_linux_display_session() checks
+// DISPLAY/WAYLAND_DISPLAY upfront before ever spawning, but that is a
+// runtime honest-degrade path, not a change to the platform's rung.
+// macos: the same four actions spawn osascript via its own multi-`-e` argv
+// form -- rung 3 (ADR-3002 Decision 5: osascript is the deepest interpreter
+// intentionally invoked and sets the rung, even though the outer spawn is
+// argv-clean). macOS additionally has no reachable Aqua/GUI session when
+// running as a root LaunchDaemon (docs/agent-privilege-model.md); the code
+// explicitly detects and reports that ("no reachable GUI session" /
+// "not_reachable"), so those 4 legs are CONSTRAINED rather than SUPPORTED.
+// windows: notify/message_box are native Win32 (Shell_NotifyIconW /
+// MessageBoxW, rung 1); input/survey spawn powershell.exe via
+// run_bounded_subprocess with clean argv (rung 3 -- an interpreter payload,
+// same principle as osascript; ADR-3002 Decision 5 -- the outer invocation
+// is argv-clean, but PowerShell interpreting its own -Command script is
+// still the deepest interpreter intentionally invoked, so the rung is
+// unchanged from the prior popen-based mechanism).
+// set_dnd is a pure in-process KV-store write on every OS (rung 1).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"notify",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "notify_send", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "shell_notifyicon", nullptr}},
+    {"message_box",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "messageboxw", nullptr}},
+    {"input",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_inputbox", nullptr}},
+    {"survey",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_winforms", nullptr}},
+    {"set_dnd",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr}},
+};
+
 } // namespace
 
 class InteractionPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "interaction"; }
-    std::string_view version() const noexcept override { return "0.2.0"; }
+    std::string_view version() const noexcept override { return "0.3.0"; }
     std::string_view description() const noexcept override {
         return "Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND";
     }
@@ -873,6 +1307,13 @@ public:
         static const char* acts[] = {
             "notify", "message_box", "input", "survey", "set_dnd", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
@@ -907,7 +1348,7 @@ public:
         if (action == "set_dnd")
             return do_set_dnd(ctx, params);
 
-        ctx.write_output(std::format("unknown action: {}", action));
+        ctx.write_output(std::format("status|error|unknown action: {}", action));
         return 1;
     }
 

@@ -11,10 +11,14 @@ metadata:
   displayName: List Installed Updates
   version: 1.0.0
   description: >
-    Lists recently installed OS updates and packages on the endpoint.
-    On Windows uses Get-HotFix (returns KB ID, description, install date,
-    limited to 50 most recent). On Linux tries rpm --last then apt.
-    On macOS uses system_profiler SPInstallHistoryDataType.
+    Lists installed OS updates and packages on the endpoint. On Windows uses
+    a bounded WMI Win32_QuickFixEngineering query (KB ID, description,
+    install date; capped at 512 rows with no sort order -- not the 50
+    most-recent-first list the retired PowerShell Get-HotFix path returned).
+    On Linux tries rpm --last (capped 50 lines) then falls back to
+    apt list --installed (capped 50 lines) if rpm reports nothing.
+    On macOS uses system_profiler SPInstallHistoryDataType (capped to the
+    first 100 matched lines).
   tags: [updates, patching, compliance, inventory]
 
 spec:
@@ -34,10 +38,22 @@ spec:
     columns:
       - name: identifier
         type: string
+        description: >-
+          The updated item's identifier: a Windows KB number, an installed Linux package name, or a macOS update/app name. Values: free text.
+        example: "KB5122385"
+        platforms: [windows, linux, darwin]
       - name: description
         type: string
+        description: >-
+          A short human-readable label for the item. Populated only on Windows (the WMI Description field); Linux and macOS rows carry only two data fields (identifier + install_date), so this column is always empty there. Values: free text or empty.
+        example: "Update"
+        platforms: [windows]
       - name: install_date
         type: string
+        description: >-
+          The date or version string the source reports, verbatim: Windows WMI InstalledOn, macOS's "Install Date:" text, or Linux's rpm --last date -- but a package VERSION string (not a date) when the apt list --installed fallback ran instead of rpm, since apt has no install-date field. Values: free text (a date string, or a package version on Linux/apt).
+        example: "9/1/2026"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List installed OS updates and packages"
 
@@ -67,9 +83,15 @@ metadata:
   version: 1.0.0
   description: >
     Lists available OS updates and packages that are not yet installed.
-    On Windows uses the Windows Update Agent COM API to search for
-    updates where IsInstalled=0, returning title and MSRC severity.
-    On Linux tries apt then yum. On macOS uses softwareupdate -l.
+    On Windows uses the Windows Update Agent COM API's asynchronous
+    BeginSearch/ISearchJob call to search for updates where IsInstalled=0
+    (title and MSRC severity), polled under a 120s deadline so a wedged
+    search is aborted rather than hung on. On Linux tries
+    apt list --upgradable then falls back to yum check-update if apt finds
+    nothing to upgrade. On macOS uses softwareupdate -l under a 60s deadline
+    (it contacts Apple's servers); if that call's raw output is entirely
+    banner/status text, this action returns zero rows rather than an
+    explicit "up to date" row.
   tags: [updates, patching, compliance, security, vulnerability]
 
 spec:
@@ -89,8 +111,18 @@ spec:
     columns:
       - name: title
         type: string
+        description: >-
+          The available update's title or name. Windows: the WUA update Title. Linux: the package name (apt path) or the raw yum check-update line (yum fallback). macOS: the raw softwareupdate -l line. Values: free text.
+        example: >-
+          Security Intelligence Update for Microsoft Defender Antivirus -
+          KB2267602 (Version 1.459.91.0) - Current Channel (Broad)
+        platforms: [windows, linux, darwin]
       - name: severity
         type: string
+        description: >-
+          The MSRC severity rating. Populated only on Windows (IUpdate::MsrcSeverity, itself often empty for a non-security update); Linux and macOS have no equivalent field, so this column is always empty there. Values: free text or empty.
+        example: "(empty)"
+        platforms: [windows]
 
   readablePayload: "List available (missing) OS updates"
 
@@ -120,12 +152,17 @@ metadata:
   version: 1.0.0
   description: >
     Detects whether the endpoint requires a reboot, typically after OS updates.
-    On Windows checks three registry keys: WindowsUpdate Auto Update
-    RebootRequired, Component Based Servicing RebootPending, and Session
-    Manager PendingFileRenameOperations. On Linux checks /var/run/reboot-required
-    (Debian/Ubuntu) and compares running vs installed kernel versions; falls
-    back to needs-restarting on RHEL/Fedora. On macOS checks softwareupdate -l
-    output for restart indicators.
+    On Windows checks three registry keys for existence only (no value is
+    decoded): WindowsUpdate Auto Update RebootRequired, Component Based
+    Servicing RebootPending, and Session Manager
+    PendingFileRenameOperations. On Linux checks /var/run/reboot-required
+    (Debian/Ubuntu) and compares the running kernel (uname -r) against the
+    newest installed kernel (ls -t /boot/vmlinuz-*); falls back to
+    needs-restarting -r on RHEL/Fedora when no /boot/vmlinuz-* is found. On
+    macOS checks softwareupdate -l output (60s deadline; contacts Apple's
+    servers) for a case-insensitive "restart" match. Every OS emits one row
+    per check plus a trailing summary row; this action never sets a typed
+    result status.
   tags: [updates, patching, compliance, reboot, health]
 
 spec:
@@ -145,10 +182,22 @@ spec:
     columns:
       - name: source
         type: string
+        description: >-
+          Which check produced this row: a per-check probe name for every row but the last, or the literal "reboot_required" for the trailing summary row. Values: windows_update_reboot, cbs_reboot, pending_file_rename, reboot_required_file, kernel_mismatch, needs_restarting, softwareupdate_restart, reboot_required.
+        example: "pending_file_rename"
+        platforms: [windows, linux, darwin]
       - name: pending
         type: bool
+        description: >-
+          Whether this specific check (or, on the summary row, any check) found a pending reboot. Values: true, false.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: >-
+          Free text explaining a true `pending` on a per-check row (which registry key existed, which kernel versions mismatched); a comma-separated list of the triggering check names on the summary row; empty when `pending` is false. Values: free text or empty.
+        example: "Non-empty value"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Check if endpoint requires a reboot after updates"
 

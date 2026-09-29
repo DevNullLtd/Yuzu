@@ -32,32 +32,46 @@ spec:
       role:
         type: string
         displayName: Role
-        description: The device's operational role (free-form).
+        description: The device's operational role, free-form text (e.g. "db-primary").
       environment:
         type: string
         displayName: Environment
-        description: Deployment stage for this device.
+        description: Deployment stage for this device — one of "Dev", "UAT", "Production".
         validation:
           enum: ["Dev", "UAT", "Production"]
       location:
         type: string
         displayName: Location
-        description: Physical or logical location of the device (free-form).
+        description: Physical or logical location of the device, free-form text (e.g. "us-east-dc2").
       service:
         type: string
         displayName: Service
-        description: IT service this device belongs to (free-form).
+        description: IT service this device belongs to, free-form text (e.g. "billing-api").
 
   result:
     columns:
       - name: event
         type: string
+        description: What changed in this sync call, relative to the previously cached value.
+        values: ["no_changes", "tag_added", "tag_removed", "tag_changed"]
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: key
         type: string
+        description: The tag category this change applies to. Absent from the wire line when event is no_changes.
+        values: ["role", "environment", "location", "service"]
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: old_value
         type: string
+        description: "The category's value before this sync call. Omitted from the wire line (not merely empty) when event is tag_added or no_changes. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: new_value
         type: string
+        description: "The category's value after this sync call. Omitted from the wire line when event is tag_removed or no_changes. Values: free text."
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: >
     Sync asset tags: role=${role}, env=${environment},
@@ -109,16 +123,35 @@ spec:
     columns:
       - name: key
         type: string
+        description: The tag category named on a "tag|key|value" line.
+        values: ["role", "environment", "location", "service"]
+        example: "role"
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: 'The cached value for that category; empty string if the category has never been synced. Values: free text or empty.'
+        example: ""
+        platforms: [windows, linux, darwin]
       - name: last_sync
         type: int64
+        description: 'Epoch seconds of the last successful sync; 0 before any sync has landed. Values: integer (unix epoch seconds).'
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: stale
         type: bool
+        description: True when no sync has landed within check_interval seconds of the last one, or none has ever landed.
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: check_interval
         type: int32
+        description: 'The configured staleness-check interval in seconds, read from asset_tags.check_interval and floored at 30; default 300. Values: integer seconds, >= 30.'
+        example: "300"
+        platforms: [windows, linux, darwin]
       - name: change_count
         type: int32
+        description: 'Number of entries currently in the change log (in memory and persisted, capped at the last 50). Values: integer 0-50.'
+        example: "0"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Query asset tag status"
 
@@ -167,7 +200,7 @@ spec:
       key:
         type: string
         displayName: Category Key
-        description: One of the 4 structured tag categories.
+        description: One of the 4 structured tag categories (e.g. "role").
         validation:
           enum: ["role", "environment", "location", "service"]
 
@@ -175,8 +208,15 @@ spec:
     columns:
       - name: key
         type: string
+        description: The category key that was requested, echoed back.
+        values: ["role", "environment", "location", "service"]
+        example: "role"
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: 'The cached value for that category; empty string if never set. Values: free text or empty.'
+        example: "" # captured on a cold store (init() not called by the capture harness) — see README Caveats
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get asset tag '${key}'"
 
@@ -228,12 +268,25 @@ spec:
     columns:
       - name: key
         type: string
+        description: The tag category the change record is for.
+        values: ["role", "environment", "location", "service"]
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: old_value
         type: string
+        description: 'The value before the change. Values: free text.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: new_value
         type: string
+        description: 'The value after the change. Values: free text.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: timestamp
         type: int64
+        description: 'Epoch seconds when the change was recorded. Values: integer (unix epoch seconds).'
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Query asset tag change log"
 

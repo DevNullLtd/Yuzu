@@ -11,6 +11,8 @@
  * SQLite table names (process_live, tcp_hourly) via a whitelist translation.
  */
 
+#include <yuzu/plugin.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -53,7 +55,39 @@ struct GranularityDef {
 // `kUnsupported`         -- platform cannot supply the data at all (e.g.,
 //                           `services` on a kernel that has no service
 //                           manager)
-enum class OsSupportStatus { kSupported, kSupportedConstrained, kPlanned, kUnsupported };
+//
+// Unified with the ABI4 plugin descriptor's per-OS support enum (#2204):
+// TAR is the first adopter, so these four values are pinned 1:1 to
+// YuzuSupportLevel's four declared values (YUZU_SUPPORT_UNDECLARED is
+// deliberately never used here — every registry row always declares one of
+// the other four). This is the single source of truth both the `compatibility`
+// action (tar_plugin.cpp's do_compatibility()) and any future capability-matrix
+// consumer derive their output from, rather than each maintaining its own copy.
+enum class OsSupportStatus {
+    kSupported           = YUZU_SUPPORT_SUPPORTED,
+    kSupportedConstrained = YUZU_SUPPORT_CONSTRAINED,
+    kPlanned             = YUZU_SUPPORT_PLANNED,
+    kUnsupported         = YUZU_SUPPORT_UNSUPPORTED,
+};
+
+/**
+ * Convert an OsSupportStatus to the shared ABI4 descriptor enum. Since the
+ * two are pinned 1:1 by value, this is a plain reinterpretation — but going
+ * through a named function keeps the "single source of truth" claim
+ * mechanically checkable rather than relying on every call site getting the
+ * cast right.
+ */
+[[nodiscard]] constexpr YuzuSupportLevel to_yuzu_support_level(OsSupportStatus status) noexcept {
+    return static_cast<YuzuSupportLevel>(status);
+}
+
+/**
+ * Human-readable name for a support level, as surfaced by the `compatibility`
+ * action. The one place that maps YuzuSupportLevel to the operator-facing
+ * string — do_compatibility() derives its output from this rather than
+ * keeping its own switch.
+ */
+[[nodiscard]] std::string_view support_level_name(OsSupportStatus status);
 
 struct OsSupport {
     std::string_view os;             // "windows", "linux", "macos"
@@ -76,6 +110,14 @@ struct CaptureSourceDef {
     // (Declared before os_support so the designated initialisers in
     // build_sources() stay in member-declaration order.)
     bool default_enabled = true;
+    // Non-empty for a source whose LIVE tier enforces replay idempotence via a
+    // UNIQUE index (tar_cursor.hpp rule 3 — the cursor-model seam). When set,
+    // generate_warehouse_ddl() emits
+    // `CREATE UNIQUE INDEX IF NOT EXISTS <table>_record_key_uq ON <table>(<this column>)`
+    // for the live tier only. Empty ("") for every source that has no such
+    // column (the default — a plain diff-driven source has no idempotence
+    // requirement beyond its own diff logic).
+    std::string_view unique_key_column;
     std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
@@ -105,6 +147,17 @@ struct CaptureSourceDef {
 // running host. `kPlanned` rows for that OS are still included (pre-staging).
 [[nodiscard]] std::vector<std::string>
 accepted_capture_methods_for_os(std::string_view source_name, std::string_view os);
+
+// Support status of `source_name` on `os`, or nullopt for an unknown source or
+// an OS with no row. When a source lists several rows for one OS the best
+// (kSupported > kSupportedConstrained > kPlanned > kUnsupported) wins.
+[[nodiscard]] std::optional<OsSupportStatus> os_support_status(std::string_view source_name,
+                                                               std::string_view os);
+
+// The registry's capture_method for the source's kSupported/kSupportedConstrained
+// row on `os` (first such row); "none" when there is no supported row.
+[[nodiscard]] std::string_view supported_capture_method(std::string_view source_name,
+                                                        std::string_view os);
 
 // ── Effective (actually-wired) network capture mechanism (issue #1528) ─────
 //
@@ -138,6 +191,18 @@ accepted_capture_methods_for_os(std::string_view source_name, std::string_view o
 const std::vector<CaptureSourceDef>& capture_sources();
 
 /**
+ * The timestamp column for a granularity suffix: `ts` (live), `hour_ts`,
+ * `day_ts`, `month_ts`. Unknown suffixes fall back to `ts`.
+ *
+ * This is the one mapping the warehouse DDL indexes, `retention_sql`'s
+ * time-based branch filters on, and the #2361 retention clock guard counts
+ * against. Read it from here rather than re-deriving it -- a second copy would
+ * diverge silently, and the guard would then count a different column from the
+ * one the delete acts on.
+ */
+[[nodiscard]] std::string_view ts_column_for_suffix(std::string_view suffix);
+
+/**
  * Generate DDL for all typed warehouse tables.
  * Returns a single SQL string containing CREATE TABLE IF NOT EXISTS + indexes.
  */
@@ -153,7 +218,8 @@ std::optional<std::string> translate_dollar_name(std::string_view dollar_name);
 /**
  * Return true if `real_table_name` is a table that untrusted operator SQL
  * (the tar.sql action) is permitted to read: the typed warehouse tables from
- * the registry plus the base tar_state / tar_config / tar_events tables. Used
+ * the registry plus the base tar_state / tar_config tables (tar_events is NOT
+ * included — schema v3 retired it and v5 drops it from the installed base). Used
  * by the read-only SQL sandbox's SQLite authorizer (#760). The set is computed
  * once from the registry, so it stays in sync as new capture sources land.
  */

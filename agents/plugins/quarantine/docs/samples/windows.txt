@@ -1,0 +1,16 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash f4d514eecc28
+== action=quarantine
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=unquarantine
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=status
+state|inactive
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=whitelist
+error|missing required parameter: action (add/remove)
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

@@ -4,8 +4,9 @@
 ##
 ## Sources by platform:
 ##   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList + WlanQueryInterface
-##   Linux:   nmcli device wifi list / nmcli device show (fallback: iw/iwlist)
-##   macOS:   airport -s / airport -I
+##   Linux:   NetworkManager D-Bus (sd-bus) primary; fallback nmcli device wifi list
+##            (ACTIVE row for `connected`), then iw/iwlist/iwconfig via the argv runner
+##   macOS:   list_networks: airport -s (legacy) / system_profiler · connected: CoreWLAN
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,13 +14,17 @@ kind: InstructionDefinition
 metadata:
   id: device.wifi.list_networks
   displayName: List WiFi Networks
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Scans for visible WiFi networks and reports each network's SSID,
-    signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
-    network type or channel, and BSSID or connection status.
-    On Windows uses WlanGetAvailableNetworkList, on Linux uses
-    nmcli device wifi list, on macOS uses the airport utility.
+    signal (0-100 quality/percent on Windows and Linux; RSSI in dBm on
+    macOS), security type (WPA2-PSK, Open, etc.), and either a channel
+    number or, on Windows only, the BSS type in that column's place.
+    On Windows uses WlanGetAvailableNetworkList, on Linux reads
+    NetworkManager over D-Bus and falls back to nmcli then iw/iwlist,
+    on macOS uses `airport -s` (legacy, removed in macOS 14) or
+    system_profiler, which needs a Location Services grant a
+    background daemon may lack.
   tags: [wifi, network, wireless, inventory, security]
 
 spec:
@@ -39,14 +44,34 @@ spec:
     columns:
       - name: ssid
         type: string
+        description: >-
+          The network's SSID, or a sentinel discriminator (info/error/ scan_output) when the row is a status line rather than an access point. Values: SSID text, <hidden> (empty SSID), <hex:...> (Linux D-Bus non-UTF-8 SSID), or info/error/scan_output.
+        example: "info"
+        platforms: [windows, linux, darwin]
       - name: signal
         type: string
+        description: >-
+          Signal strength: 0-100 quality/percent on Windows and Linux, RSSI in dBm on macOS; on a sentinel row this field carries the free-text message instead. Values: integer 0-100 (Windows/Linux), a dBm integer (macOS), or free text on a sentinel row.
+        example: "wi-fi scan unavailable; airport removed in macOS 14+ and system_profiler requires Location Services"
+        platforms: [windows, linux, darwin]
       - name: security
         type: string
+        description: >-
+          The access point's security type in the emitting leg's own vocabulary (e.g. Open, WPA2-Personal, WPA3, 802.1X); "0" on a sentinel row. Values: free text, or 0 on a sentinel row.
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: channel_or_type
         type: string
+        description: >-
+          802.11 channel number on Linux/macOS; BSS type (Infrastructure/Ad-hoc/Unknown) on Windows -- the two OS families populate genuinely different data in this column. Values: channel number as a string, 0 when unknown, or Infrastructure/Ad-hoc/Unknown.
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: bssid_or_connected
         type: string
+        description: >-
+          Access point MAC address on Linux/macOS; the literal true/false for whether this network is the one currently connected on Windows -- again a different meaning per OS. Values: MAC address, - when unknown, or true/false.
+        example: "none"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Scan visible WiFi networks"
 
@@ -73,12 +98,17 @@ kind: InstructionDefinition
 metadata:
   id: device.wifi.connected
   displayName: Current WiFi Connection
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Reports information about the currently connected WiFi network,
-    including SSID, signal strength, security type, BSSID, and the
-    wireless interface or channel. On Windows uses WlanQueryInterface,
-    on Linux uses nmcli or iwconfig, on macOS uses airport -I.
+    including SSID, signal (same per-OS units as list_networks:
+    0-100 quality/percent on Windows and Linux, RSSI in dBm on
+    macOS), security type, BSSID, and the wireless interface name
+    (Linux/Windows) or channel number (macOS). On Windows uses
+    WlanQueryInterface, on Linux reads NetworkManager over D-Bus and
+    falls back to nmcli then iwconfig, on macOS uses CoreWLAN (macOS
+    14+ withholds SSID/BSSID behind Location Services, reported as
+    "<ssid-withheld>" on an otherwise-live connection).
     Returns "Not connected" if no WiFi connection is active.
   tags: [wifi, network, wireless, connectivity, inventory]
 
@@ -99,14 +129,34 @@ spec:
     columns:
       - name: ssid
         type: string
+        description: >-
+          The connected network's SSID; sentinel none/unknown when disconnected or undetermined; <ssid-withheld> on macOS when Location Services blocks the read on an otherwise-live association; <hex:...> on the Linux D-Bus leg for a non-UTF-8 SSID. Values: SSID text, none, unknown, <ssid-withheld>, or <hex:...>.
+        example: "none"
+        platforms: [windows, linux, darwin]
       - name: signal
         type: string
+        description: >-
+          Signal strength using the same per-OS units as list_networks' signal field; on a disconnected/undetermined sentinel row this carries the free-text message instead (e.g. "Not connected"). Values: integer, or a free-text sentinel message.
+        example: "Not connected"
+        platforms: [windows, linux, darwin]
       - name: security
         type: string
+        description: >-
+          Security type of the connected access point; "unknown" on the Linux iwconfig blob fallback; "0" on the disconnected/undetermined sentinel. Values: free text, unknown, or 0.
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: bssid
         type: string
+        description: >-
+          Connected access point's MAC address; - or none when not associated or unknown. Values: MAC address, -, or none.
+        example: "none"
+        platforms: [windows, linux, darwin]
       - name: interface_or_channel
         type: string
+        description: >-
+          Wireless interface name on Linux/Windows (e.g. wlan0, an adapter description); 802.11 channel number on macOS; none when undetermined. Values: interface name string, channel number, or none.
+        example: "none"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get current WiFi connection info"
 

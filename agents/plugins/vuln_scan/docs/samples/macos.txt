@@ -1,0 +1,425 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20c66f1c0618
+== action=scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+INFO|config|Gatekeeper|Enabled - only verified apps can run
+INFO|config|FileVault Disk Encryption|Enabled
+INFO|config|System Integrity Protection (SIP)|Enabled
+MEDIUM|config|Application Firewall|Disabled
+MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
+INFO|config|Automatic Software Updates|Enabled
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=cve_scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=config_scan
+INFO|config|Gatekeeper|Enabled - only verified apps can run
+INFO|config|FileVault Disk Encryption|Enabled
+INFO|config|System Integrity Protection (SIP)|Enabled
+MEDIUM|config|Application Firewall|Disabled
+MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
+INFO|config|Automatic Software Updates|Enabled
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=summary
+summary|TOTAL|8 findings (4 issues)
+summary|CRITICAL|0
+summary|HIGH|1
+summary|MEDIUM|3
+summary|LOW|0
+summary|INFO|4
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=inventory
+App Store|3.0
+Apps|1.0
+Automator|2.10
+Books|8.5
+Calculator|12.0
+Calendar|16.0
+Chess|3.18
+Clock|1.1
+Contacts|14.0
+Dictionary|2.3.0
+FaceTime|36
+Find My|4.0
+Font Book|11.0
+Freeform|4.5
+Games|1.0
+Home|10.0
+Image Capture|8.0
+Image Playground|1.0
+Journal|2.0
+Mail|16.0
+Maps|3.0
+Messages|26.0
+Mission Control|1.2
+Music|1.6.6
+ShortcutsActions|
+Siri|3525.5.2
+Software Update|6
+SpacesTouchBarAgent|1.0
+Spotlight|1.0
+StageManagerOnboarding|1.0
+System Events|1.3.6
+SystemIntents|1.0
+SystemUIServer|1.7
+TextInputMenuAgent|1.0
+TextInputSwitcher|1.1
+ThermalTrap|1.0
+TMHelperAgent|13
+Tips|1.0
+UIKitSystem|1.0
+UniversalAccessControl|7.0
+Universal Control|1.0
+UnmountAssistantAgent|5.0
+UserNotificationCenter|82
+VoiceOver|10
+Wallpaper|1.0
+Watch Face Help|1.0
+WiFiAgent|1.0
+WidgetKit Simulator|1.0
+WindowManager|341.6.1
+WindowManagerShowDesktopEducation|1.0
+WorkoutAlert-Mac|1.0
+iCloud+|1.0
+iCloud|1.0
+liquiddetectiond|
+loginwindow|9.0
+rcd|362
+screencaptureui|1.0
+AddressBookSync|14.0
+ABAssistantService|14.0
+AddressBookManager|14.0
+AddressBookSourceSync|14.0
+FontRegistryUIAgent|81.0
+System Speech|9.2.22
+CinematicFramingOnboardingUI|1.0
+ContinuityCaptureOnboardingUI|1.0
+SmartCard Pairing|1.0
+LinkedNotesUIService|1.0
+qlmanage|1.0
+quicklookd|5.0
+Quick Look Simulator|1.0
+QuickLookUIHelper|5.0
+SyncServer|8.1
+Wish|8.5.9
+Build Web Page|10.1
+MakePDF|10.1
+AirScanScanner|18
+50onPaletteServer|1.1.0
+AinuIM|1.0
+Assistive Control|2.0
+CharacterPalette|2.0.1
+Dictation|6.2.47
+EmojiFunctionRowIM|1.0
+JapaneseIM-KanaTyping|6.3
+JapaneseIM-RomajiTyping|6.3
+KoreanIM|1.0
+PluginIM|26.200
+PressAndHold|1.0
+SCIM|104
+TCIM|104
+TYIM|104
+TamilIM|1.6
+TrackpadIM|1.0
+TransliterationIM|1.0
+VietnameseIM|1.0
+iCloudUserNotificationsd|1.0
+AOSAlertManager|1.07
+AOSHeartbeat|1.07
+AOSPushRelay|1.07
+Live Captions|1.0
+LiveSpeech|1.0
+AccessibilityVisualsAgent|1.0
+Calibration Assistant|1.0
+AppSSOAgent|1.0
+KerberosMenuExtra|1.0
+AMSEngagementViewService|1.0
+AskPermissionUI|129.6.2
+AutoFillPanelService|1.0
+AutomationModeUI|1.0
+BackgroundTaskManagementAgent|1.0
+storeuid|1.0
+CIMFindInputCodeTool|104
+FollowUpUI|1.0
+DiskImages UI Agent|683.160.3
+eaptlstrust|13.0
+ParentalControls|4.1
+FeedbackRemoteView|1.0
+FindMyMacMessenger|4.1
+identityservicesd|10.0
+IDSRemoteURLConnectionAgent|10.0
+imagent|10.0
+IMAutomaticHistoryDeletionAgent|10.0
+IMTransferAgent|10.0
+nbagent|1.0
+privatecloudcomputed|1.0
+ScreenReaderUIServer|10
+VoiceOver Quickstart|10
+AquaAppearanceHelper|1.0
+sociallayerd|1.0
+SoftwareUpdateNotificationManager|1.0
+Speech Downloader|10
+SpeechRecognitionServer|10
+STMUIHelper|1.0
+Conflict Resolver|8.1
+syncuid|8.1
+AXVisualSupportAgent|1.0
+Accessibility Tutorial|1.0
+DFRHUD|1.0
+universalAccessAuthWarn|1.0
+UASharedPasteboardProgressUI|54.1
+iCloud Drive|1.0
+AppleSpell|2.4
+ChineseTextConverterService|2.1
+OpenSpell|1.0
+SpeechService|9.2.22
+Spotlight|3.0
+Summary Service|2.0
+Time Machine|1.3
+Tips|26.6
+Activity Monitor|10.14
+AirPort Utility|6.3.9
+Audio MIDI Setup|3.8
+Bluetooth File Exchange|9.0
+Boot Camp Assistant|6.1.0
+ColorSync Utility|12.2.0
+Console|1.1
+Digital Colour Meter|6.11
+Disk Utility|22.7
+Grapher|2.8
+Magnifier|1.0
+Migration Assistant|26.6
+Print Centre|1.0
+Screen Sharing|6.1
+Screenshot|1.0
+Script Editor|2.11
+System Information|11.0
+Terminal|2.15
+VoiceOver Utility|10
+Voice Memos|3.2
+Weather|6.0
+iPhone Mirroring|1.6
+About This Mac|1.0
+Archive Utility|10.15
+DVD Player|6.0
+Desk View|2.0
+Directory Utility|7.0
+Expansion Slot Utility|2.0
+Feedback Assistant|5.1
+Folder Actions Setup|1.2
+Keychain Access|11.0
+Ticket Viewer|4.1
+Wireless Diagnostics|11.0
+iOS App Installer|1.0
+Finder|26.4
+AirDrop|26.4
+Computer|26.4
+Network|26.4
+Recents|26.4
+iCloud Drive|26.4
+ClassroomStudentMenuExtra|1.0
+Display Calibrator|4.19
+AOSUIPrefPaneLauncher|1.0
+AVB Configuration|1440.7
+Accessibility Reader|1.0
+AccessibilityUIServer|1.0
+AddPrinter|607
+AddressBookUrlForwarder|14.0
+AirPlayUIAgent|2.0
+AirPort Base Station Agent|2.2.1
+Apple Diagnostics|1.0
+AppleScript Utility|1.1.2
+Automator Application Stub|1.3
+Automator Installer|2.10
+Batteries|1.0
+Bluetooth Setup Assistant|9.0
+BluetoothUIServer|9.0
+BluetoothUIService|1.0
+CalendarFileHandler|8.0
+Captive Network Assistant|5.0
+Certificate Assistant|5.0
+Control Centre|1.0
+ControlStrip|1.0
+CoreLocationAgent|3077.0.4
+CoreServicesUIAgent|369
+Coverage Details|1.0
+Database Events|1.0.6
+Diagnostics Reporter|1.0
+DiscHelper|1.0
+DiskImageMounter|1.0
+Dock|1.8
+Dwell Control|1.0
+Enhanced Logging|1.0
+Erase Assistant|1.0
+EscrowSecurityAlert|1.0
+Family|1.0
+FamilyExtensionHost|1.0
+FileProvider-Feedback|1.0
+FolderActionsDispatcher|1.0
+Game Center|1.0
+GameOverlayUI|1.0
+Games|820.6.10.1.1
+IOUIAgent|1.0
+Image Events|1.1.6
+Install Command Line Developer Tools|2416
+Install in Progress|3.0
+Installer Progress|1.0
+Installer|6.2.0
+JavaLauncher|326
+KeyboardAccessAgent|10
+KeyboardSetupAssistant|1.0
+Keychain Circle Notification|1.0
+Language Chooser|1.0
+MDMMigrationTrampoline|1.0
+MTLReplayer|314.14
+ManagedClient|18.0
+Medical Imaging Calibrator|1.0
+Memory Slot Utility|1.5.3
+Music Recognition|1.0
+NetAuthAgent|6.2
+Notification Centre|1.0
+NowPlayingTouchUI|1.0
+OBEXAgent|9.0
+OSDUIHelper|1.0
+PIPAgent|2.0
+Paired Devices|7.1
+Pass Viewer|1.0
+PassViewer|
+PeopleMessageService|1.0
+Contacts|1.0
+PowerChime|1.0
+PreviewShell|16.0
+PreviewShellMac|16.0
+Pro Display Calibrator|212.35
+Problem Reporter|10.13
+Profile Installer|1.0
+RapportUIAgent|7.1
+RegisterPluginIMApp|26.200
+ARDAgent|3.9.8
+Remote Desktop Message|3.9.8
+SSMenuAgent|3.9.8
+Rosetta 2 Updater|1.0
+Screen Time|3.0
+ScreenSaverEngine|5.0
+Script Menu|1
+ScriptMonitor|1.0.1
+Setup Assistant|10.10
+ShortcutDroplet|1.0
+Shortcuts Events|1.0
+News|11.5
+Notes|4.13
+Passwords|2.6.2
+Phone|1.0
+Photo Booth|13.1
+Photos|11.0
+Podcasts|1.1.0
+Preview|11.0
+QuickTime Player|10.5
+Reminders|7.0
+Shortcuts|7.0
+Siri|1.0
+Stickies|10.3
+Stocks|8.5
+System Settings|15.0
+TV|1.6.6
+TextEdit|1.20
+Keynote|15.1.1
+Pages|15.1.1
+Numbers|15.1
+iMovie|10.4.4
+GarageBand|10.4.13
+Tailscale|1.102.2
+Hush|1.0.19
+Visual Studio Code|1.136.1
+group.is.workflow|
+MRT|1.93
+XProtect|157
+Signal|8.26.0
+Python|3.9.6
+Install Spotify|1.2.96.518
+com.apple.ctcategories|
+Spotify|1.2.98.301
+AppleMobileDeviceHelper|5.0
+MobileDeviceUpdater|1.0
+AppleMobileSync|5.0
+AirScanLegacyDiscovery|607
+Docker|4.89.0
+uBlock Origin Lite|2026.901.1442
+NordVPN|10.9.0
+WhatsApp|26.34.24
+Recursive File Processing Droplet|1.0
+Droplet with Settable Properties|1.0
+Recursive Image File Processing Droplet|1.0
+Cocoa-AppleScript Applet|1.0
+actionlint|1.7.12
+ada-url|4.0.0
+autoconf|2.73
+automake|1.18.1_1
+bash|5.3.15
+blake3|1.8.7
+brotli|1.2.0
+c-ares|1.34.8
+ca-certificates|2026-08-13
+ccache|4.13.6_1
+cmake|4.4.2
+erlang@28|28.5.0.5
+fmt|12.2.0
+gettext|1.0
+gh|2.97.0
+giflib|6.1.3
+git|2.55.0
+gmp|6.3.0
+hdrhistogram_c|0.11.10
+hiredis|1.4.1
+icu4c@78|78.3
+isl|0.28
+jpeg-turbo|3.2.0
+json-c|0.19
+krb5|1.22.2
+libffi|3.8.0
+libmpc|1.4.1
+libnghttp2|1.70.0
+libnghttp3|1.18.0
+libngtcp2|1.25.0
+libpng|1.6.58
+libtiff|4.7.2
+libtool|2.6.2
+libunistring|1.4.2
+libuv|1.52.1
+llhttp|9.4.3
+lz4|1.10.0
+m4|1.4.21
+merve|1.2.2_2
+meson|1.12.0
+mingw-w64|14.0.0_3
+mpdecimal|4.0.1
+mpfr|4.2.2
+nbytes|0.1.4
+ncurses|6.6
+ninja|1.13.2
+node|26.7.0
+openssl@3|3.6.3
+pcre2|10.47_1
+pkgconf|3.0.5
+postgresql@18|18.6
+python@3.14|3.14.7
+readline|8.3.3
+rebar3|3.27.0
+shellcheck|0.11.0
+simdjson|4.6.7
+simdutf|9.1.0
+sqlite|3.53.4
+unixodbc|2.3.14
+uvwasi|0.0.23
+webp|1.6.0
+wxwidgets@3.2|3.2.11
+xxhash|0.8.3
+xz|5.8.3
+zstd|1.5.7_1
+[result_status] UNDECLARED / UNKNOWN / 
+

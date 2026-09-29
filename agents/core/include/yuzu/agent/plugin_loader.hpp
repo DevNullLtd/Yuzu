@@ -26,10 +26,32 @@ struct LoadError {
 /// that declare one of these names are rejected so a compromised or
 /// misconfigured plugin author cannot shadow the reserved dispatch paths.
 /// See docs/yuzu-guardian-design-v1.1.md §7.2 for `__guard__`.
-inline constexpr std::array<std::string_view, 3> kReservedPluginNames{
-    "__guard__",   // Guardian engine (design v1.1 §7.2)
-    "__system__",  // reserved for future system-scope commands
-    "__update__",  // reserved for OTA update commands
+///
+/// The `__guardian*__` / `__sync__` entries are agent-internal kv_store
+/// namespaces. They MUST stay reserved because yuzu_ctx_storage_* keys KvStore
+/// by the plugin's OWN declared name, on the SAME connection these subsystems
+/// use, so a plugin allowed to claim one of those names could read, delete, or
+/// forge the state the subsystem loads as authoritative:
+///   - `__guardian__`         GuardianEngine rule-state (loaded as live policy
+///                            at boot) -> a claimant could forge Guardian rules.
+///   - `__guardian_journal__` Guardian lifecycle journal (arm/disarm audit
+///                            records replayed over the authenticated stream).
+///   - `__sync__`             daily-sync scheduler state (last-hash / need_full)
+///                            -> a claimant could force or suppress a sync.
+/// Native plugins are trusted (the ABI has no sandbox), so this is a hygiene /
+/// audit-integrity control, not isolation. Each namespace constant lives in its
+/// owning src/ header, which this include/ header cannot include without
+/// inverting the layering, so the literals are duplicated here and pinned to
+/// their source constant by a static_assert in the owning translation unit
+/// (guardian_lifecycle_journal.cpp, guardian_engine.cpp, agent.cpp) so they
+/// cannot drift. See docs/cpp-conventions.md and docs/yuzu-guardian-design-v1.1.md §7.2.
+inline constexpr std::array<std::string_view, 6> kReservedPluginNames{
+    "__guard__",            // Guardian engine command dispatch (design v1.1 §7.2)
+    "__system__",           // reserved for future system-scope commands
+    "__update__",           // reserved for OTA update commands
+    "__guardian_journal__", // Guardian lifecycle journal kv namespace (#2303 C2)
+    "__guardian__",         // GuardianEngine rule-state kv namespace (#2303 sec-M)
+    "__sync__",             // daily-sync scheduler-state kv namespace (#2303 sec-L)
 };
 
 /// Stable reason prefix recorded in LoadError::reason when a plugin is

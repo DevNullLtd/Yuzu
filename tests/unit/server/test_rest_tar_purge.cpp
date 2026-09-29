@@ -12,10 +12,11 @@
  *   - the success dispatch shape (tar/purge_source targeting the one device, {source}).
  *
  * The DashboardRoutes HTML fragment (/fragments/tar/retention-paused/purge) shares
- * these properties but is registered on a raw httplib::Server (not HttpRouteSink),
- * so it is not reachable by this in-process sink — its route-handler coverage is a
- * tracked follow-up (migrate those fragments to HttpRouteSink — Tr3kkR/Yuzu#1786).
- * The fragment's render-time button gating is covered in test_dashboard_tar_retention.cpp.
+ * these properties and has its own route-handler coverage since #1786 moved
+ * DashboardRoutes onto HttpRouteSink — see test_dashboard_tar_fragments.cpp (the
+ * fragment additionally gates a CSRF same-site check that this REST twin, being the
+ * programmatic surface, does not). The fragment's render-time button gating is
+ * covered in test_dashboard_tar_retention.cpp.
  */
 
 #include "rest_api_v1.hpp"
@@ -26,7 +27,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <optional>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,8 +57,23 @@ struct PurgeHarness {
     bool scope_allow{true}; // scoped_perm_fn verdict
     bool audit_ok{true};    // AuditFn return (false → fail-closed 503, no dispatch)
     int dispatch_sent{1};   // agents reached per dispatch
+    /// #1788: what the route derived and handed to dispatch. The per-device
+    /// scoped_perm_fn above remains this route's PRIMARY authorization — the
+    /// VisibleSet is a second, independent confinement check at the seam.
+    yuzu::server::authz::VisibleSet last_exec_visible;
+    /// PR1.9c: the WHOLE caller the route handed to dispatch. `principal` is
+    /// the half that matters — `build_classified_command` refuses an empty one
+    /// as `AnonymousOperator` before the legacy-open bypass, so a route that
+    /// derives a visible set but no identity dispatches to nobody.
+    yuzu::server::DispatchCaller last_caller;
+    /// The VisibleSet the wired derivation returns; nullopt = unfiltered.
+    yuzu::server::authz::VisibleSet exec_visible_override{};
+    /// false → register with an EMPTY `exec_visible_fn`, modelling a deployment
+    /// that never wired the derivation. Not a synonym for `exec_visible_override`
+    /// being nullopt: that is a callback ANSWERING "unfiltered".
+    bool wire_exec_visible{true};
 
-    PurgeHarness() {
+    explicit PurgeHarness(bool with_exec_visible = true) : wire_exec_visible(with_exec_visible) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -85,10 +103,24 @@ struct PurgeHarness {
         RestApiV1::CommandDispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string&,
-                   const std::unordered_map<std::string, std::string>& params,
-                   const std::string&) -> std::pair<std::string, int> {
+                   const std::unordered_map<std::string, std::string>& params, const std::string&,
+                   const yuzu::server::DispatchCaller& caller)
+            -> yuzu::server::ConfinedDispatchOutcome {
+            last_exec_visible = caller.exec_visible;
+            last_caller = caller;
             calls.push_back({plugin, action, ids, params});
-            return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+            // Model what the production seam does to the Ids arm, rather than
+            // ignoring the set the route just handed us: a target the caller
+            // cannot see is not reached. Without this the fake would report a
+            // successful dispatch no matter what confinement said, which is
+            // exactly how the handoff went unasserted in the first place.
+            // exec_visible == nullopt (unfiltered) admits everything, so every
+            // pre-existing case in this file is unaffected.
+            const bool admitted =
+                std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
+                    return yuzu::server::authz::in_scope(caller.exec_visible, id);
+                });
+            return {.sent = admitted ? dispatch_sent : 0, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         api.register_routes(
@@ -101,8 +133,21 @@ struct PurgeHarness {
             /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr, /*license_store=*/nullptr,
             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr, dispatch,
-            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-            /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped);
+            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
+            /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped,
+            /*software_inventory_store=*/nullptr,
+            /*response_scope_fn=*/{},
+            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+            /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
+            // #1788: by default wire a derivation that ANSWERS (nullopt =
+            // unfiltered), so every pre-existing dispatch assertion in this
+            // file keeps its meaning; `wire_exec_visible=false` models the
+            // genuinely-unwired deployment.
+            wire_exec_visible ? RestApiV1::ExecVisibleFn{[this](const auth::Session&)
+                                                             -> yuzu::server::authz::VisibleSet {
+                                    return exec_visible_override;
+                                }}
+                              : RestApiV1::ExecVisibleFn{});
     }
 
     nlohmann::json post(const std::string& body, int& status) {
@@ -163,6 +208,57 @@ TEST_CASE("REST purge: audit fail-closed → 503, no dispatch",
     CHECK(h.calls.empty()); // must NOT dispatch when the evidence row is known lost
 }
 
+// ── #1788 per-device dispatch confinement ────────────────────────────────
+// This route's PRIMARY authorization is the per-device `scoped_perm_fn` gate
+// above; the derived VisibleSet is a SECOND, independent check at the dispatch
+// seam. These cases exist because the handoff was added without any assertion
+// reading it — a code review confirmed empirically that forcing the route to
+// pass `nullopt` left this entire suite green, so the layer was unverifiable.
+
+TEST_CASE("REST purge: the caller's confined VisibleSet reaches dispatch",
+          "[server][tar][purge][rest][scope][1788]") {
+    PurgeHarness h;
+    h.exec_visible_override = std::unordered_set<std::string>{"dev-A", "dev-B"};
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"tcp"})", st);
+    CHECK(st == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.last_exec_visible.has_value()); // CONFINED, not unfiltered
+    CHECK(h.last_exec_visible->count("dev-A") == 1);
+    CHECK(h.last_exec_visible->count("dev-Z") == 0);
+}
+
+TEST_CASE("REST purge: a target the caller cannot see is not reached, even though the per-device "
+          "gate admitted it",
+          "[server][tar][purge][rest][scope][1788]") {
+    // scope_allow stays TRUE — the primary gate admits dev-A — so the only
+    // thing that can refuse this dispatch is the confinement layer under test.
+    PurgeHarness h;
+    h.scope_allow = true;
+    h.exec_visible_override = std::unordered_set<std::string>{"dev-OTHER"};
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"tcp"})", st);
+    CHECK(st == 404); // reported as unreachable, deliberately indistinguishable from offline
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.last_exec_visible.has_value());
+    CHECK(h.last_exec_visible->count("dev-A") == 0);
+}
+
+TEST_CASE("REST purge: an UNWIRED ExecVisibleFn fails CLOSED (present-empty), never unfiltered",
+          "[server][tar][purge][rest][scope][fail-closed][1788]") {
+    // ADR-0033 §1 / routed-concern clause 2: a missing derivation must never be
+    // read as "no filter". On this route class the substitute is present-empty
+    // — the primary gate is what reports a misconfiguration, so this layer
+    // denies quietly rather than 500ing.
+    PurgeHarness h(/*with_exec_visible=*/false);
+    h.scope_allow = true;
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"tcp"})", st);
+    CHECK(st == 404);
+    REQUIRE(h.last_exec_visible.has_value()); // PRESENT (deny-all), not nullopt
+    CHECK(h.last_exec_visible->empty());
+}
+
 TEST_CASE("REST purge: success dispatches tar/purge_source with {source} and returns 202",
           "[server][tar][purge][rest]") {
     PurgeHarness h;
@@ -191,4 +287,41 @@ TEST_CASE("REST purge: offline agent (0 reached) → 404 after dispatch attempt"
     h.post(R"({"device_id":"dev-A","source":"process"})", st);
     CHECK(st == 404);
     REQUIRE(h.calls.size() == 1); // dispatch was attempted, reached 0 agents
+}
+
+// ── PR1.9c regression: the PRODUCTION wiring must supply a principal ─────────
+//
+// This is the test the branch review's CRITICAL slipped past. `RestApiV1`'s
+// dispatch callback used to end in a bare `VisibleSet`, so the route derived a
+// confinement set and NO identity; `ServerImpl::build_classified_command`
+// refuses an empty `DispatchCaller::principal` as `AnonymousOperator` BEFORE
+// the legacy-open/RBAC-off bypass, so every REST v1 dispatch reached zero
+// agents and surfaced as `503 "device offline"` against a healthy fleet.
+//
+// Nothing caught it because the existing coverage tests the two halves apart:
+// `test_dispatch_chokepoint.cpp` proves the pure function REFUSES an empty
+// principal, and every REST/MCP suite injects a fake dispatch lambda, so no
+// test ever asked whether the real route SUPPLIES one. This case closes that
+// seam — it drives the genuine `resolve_secondary_caller` path in
+// rest_api_v1.cpp through a real `auth_fn` and asserts the identity actually
+// arrives at the dispatch boundary.
+TEST_CASE("REST purge: the route hands dispatch a NON-EMPTY principal (anonymous-operator "
+          "regression)",
+          "[server][tar][purge][rest]") {
+    PurgeHarness h;
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"tcp"})", st);
+    REQUIRE(st == 202); // purge is accepted-and-dispatched, like its siblings above
+    REQUIRE(h.calls.size() == 1);
+
+    // The harness authenticates as "purge-op"; the route must carry that
+    // through, not a default-constructed caller. An empty principal here means
+    // production dispatch is dead on arrival regardless of what this test's
+    // fake returns for `sent`.
+    CHECK_FALSE(h.last_caller.principal.empty());
+    CHECK(h.last_caller.principal == "purge-op");
+    // `system` must stay false: this is an operator dispatch, and a true here
+    // would route it under system authority — bypassing the system_reserved
+    // guard the chokepoint applies only to non-system callers.
+    CHECK_FALSE(h.last_caller.system);
 }

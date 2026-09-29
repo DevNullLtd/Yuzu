@@ -154,7 +154,7 @@ info "creating enrollment token"
 ENROLL_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
     -d "label=fixture-${RANDOM}&max_uses=1&ttl=3600" 2>/dev/null || echo "")
-ENROLL_TOKEN=$(echo "$ENROLL_BODY" | grep -oP '[a-f0-9]{64}' | head -1)
+ENROLL_TOKEN=$(echo "$ENROLL_BODY" | grep -oE '[a-f0-9]{64}' | head -1)
 if [[ -n "$ENROLL_TOKEN" ]]; then
     ok "enrollment token created (sha256 prefix ${ENROLL_TOKEN:0:8}...)"
     WROTE=$((WROTE + 1))
@@ -172,12 +172,12 @@ info "creating API token"
 API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/api-tokens" \
     -d "name=fixture-api-${RANDOM}&ttl_hours=1" 2>/dev/null || echo "__HTTP__000")
-API_TOKEN_HTTP=$(echo "$API_TOKEN_BODY" | grep -oP '__HTTP__\K[0-9]+' | tail -1)
+API_TOKEN_HTTP=$(echo "$API_TOKEN_BODY" | sed -n 's/.*__HTTP__\([0-9][0-9]*\).*/\1/p' | tail -1)
 API_TOKEN_RAW=$(echo "$API_TOKEN_BODY" | sed '/__HTTP__/d')
 # The success fragment embeds the raw token once. It's long (>=32 url-safe
 # chars). An error fragment contains "feedback-error" and no token.
 if [[ "$API_TOKEN_HTTP" =~ ^[23] && "$API_TOKEN_RAW" != *"feedback-error"* ]]; then
-    API_TOKEN_PREFIX=$(echo "$API_TOKEN_RAW" | grep -oP '[a-zA-Z0-9_-]{32,}' | head -1 || echo "")
+    API_TOKEN_PREFIX=$(echo "$API_TOKEN_RAW" | grep -oE '[a-zA-Z0-9_-]{32,}' | head -1 || echo "")
     if [[ -n "$API_TOKEN_PREFIX" ]]; then
         ok "API token created"
         WROTE=$((WROTE + 1))

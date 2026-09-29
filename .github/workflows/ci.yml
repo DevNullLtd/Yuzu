@@ -4,7 +4,8 @@ on:
   # push fires only on mainline branches (merges into dev/main) so feature/
   # fix branches with an open PR run CI exactly once via pull_request rather
   # than the previous duplicate (push + pull_request). For pre-PR feature
-  # work, open the PR earlier or use workflow_dispatch.
+  # work, open the PR earlier; fork revisions use the explicit trusted-fork
+  # workflow documented in docs/ci-architecture.md.
   #
   # tags-ignore is belt-and-suspenders: with `branches:` set, GitHub
   # already filters tag pushes — but explicitly excluding `v*` documents
@@ -19,13 +20,24 @@ on:
   push:
     branches: [main, dev]
     tags-ignore: ['v*']
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.github/runner-inventory.json'
-      - '.github/workflows/runner-inventory-sentinel.yml'
+    # BR-010: expressed as a `paths` ALLOW-list (not `paths-ignore`) precisely
+    # so docs/os-capability-matrix.md can be re-included after the docs
+    # exclusion. GitHub honours a trailing `!`-negation only in `paths`
+    # (last-match-wins); the same trick in `paths-ignore` is a silent no-op,
+    # which is why the earlier carve-out did nothing. `**` matches everything,
+    # the negations then re-exclude the ignore set, and the final positive
+    # pattern re-includes ONLY the generated matrix (whose drift gate must run
+    # on a push that touches just that file). Its generator/plugins/scripts are
+    # not in the ignore set, so they already trigger.
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!*.md'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.github/runner-inventory.json'
+      - '!.github/workflows/runner-inventory-sentinel.yml'
+      - 'docs/os-capability-matrix.md'
   pull_request:
     branches: [main, dev]
     # No paths-ignore here (issue #1978). Filtering this whole workflow out
@@ -37,7 +49,23 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above keeps its
     # paths-ignore — post-merge docs pushes need no build and gate nothing.
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Open fork PR number approved for trusted execution"
+        required: true
+        type: string
+      head_sha:
+        description: "Exact 40-character PR head SHA approved for execution"
+        required: true
+        type: string
+    secrets:
+      TRUSTED_FORK_CI_GATE:
+        description: "Repository-only sentinel proving the trusted wrapper invoked this workflow"
+        required: true
+      RUNNER_INVENTORY_TOKEN:
+        description: "Administration:read token used only by hosted runner-control preflight"
+        required: true
 
 # Scorecard Token-Permissions hardening: ci.yml builds and tests only —
 # no registry pushes, no release creation. contents:read is all that's
@@ -53,6 +81,15 @@ concurrency:
   # killing 10+ min of compile work on rapid landings, and the
   # squash-merge-mid-CI race plausibly explained the irreproducible
   # post-squash Windows test failure (#501). PR-4 of the CI overhaul plan.
+  #
+  # Canary-specific consequence (#3889): if the canary's vcpkg-canary cache
+  # entry is ever evicted under pool pressure, the resulting cold rebuild
+  # (~65-70 min) needs to run to completion to save a fresh entry. On an
+  # actively-iterated PR, cancel-in-progress means each push cancels the
+  # prior run before it can finish and save — so that PR repeats the full
+  # cold rebuild on every push, never catching up, until either a push
+  # lands with no immediate follow-up or dev/main (which queues instead of
+  # cancelling) completes one and re-warms the shared scope.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -64,15 +101,170 @@ env:
   # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
   # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
   # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
-  # thrashing the cache between configs. The hosted macOS leg uploads
-  # via actions/cache and gets capped at GitHub's 10 GB per-repo cache
-  # limit, so this is effectively a "self-hosted gets the full cache"
-  # bump — no risk of bloating the GitHub Actions cache budget.
+  # thrashing the cache between configs. This is a self-hosted-only budget:
+  # the macOS leg moved to the BigMags pool (#3217) and no longer uploads
+  # ccache via actions/cache, so the only job still writing to GitHub's
+  # 10 GB per-repo cache is the GHA-hosted canary — which therefore
+  # carries its OWN job-level CCACHE_MAXSIZE override sized for one build
+  # (see the canary job's env). This comment previously claimed that
+  # override existed while none did: the canary inherited 30G, its cache
+  # never trimmed, and the saved entry grew monotonically (measured
+  # 2.28 GB → 2.50 GB, Aug-28 → Sep-1) while each source-delta run saved
+  # a fresh copy — dozens of ~2.3 GB entries against the repo's 10 GB
+  # cache quota, evicting every other cache and putting the canary
+  # itself into 8-20 min degraded rebuilds whenever its freshest entry
+  # got evicted (bimodal wallclock, measured 2026-09-01).
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
+  # The reusable-workflow entry point is intentionally protected by a
+  # repository-only secret. Ordinary pull_request runs still perform the
+  # fail-closed fork check in preflight; only trusted-fork-ci.yml can invoke
+  # this workflow against a fork SHA with secrets available.
+  trusted_inputs:
+    name: "Validate trusted CI inputs"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      checkout_repository: ${{ steps.validate.outputs.checkout_repository }}
+      checkout_ref: ${{ steps.validate.outputs.checkout_ref }}
+      checkout_sha: ${{ steps.validate.outputs.checkout_sha }}
+      base_sha: ${{ steps.validate.outputs.base_sha }}
+      trusted_execution: ${{ steps.validate.outputs.trusted_execution }}
+    steps:
+      - id: validate
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          APPROVED_SHA: ${{ inputs.head_sha }}
+          TRUSTED_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # A reusable workflow inherits the caller's github.event_name, so
+          # inputs.head_sha — which only the trusted wrapper supplies — is the
+          # call-boundary discriminator. Do not use github.event_name here.
+          if [[ -z "$APPROVED_SHA" ]]; then
+            echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
+            # PIN the checkout to the event's own commit, exactly as the trusted
+            # path below does with $head_sha. NOT ${GITHUB_REF}: on a
+            # pull_request that is the SYMBOLIC refs/pull/N/merge, which GitHub
+            # re-mints whenever mergeability is invalidated — a new SHA for
+            # identical content, because a merge commit carries a timestamp. The
+            # event payload meanwhile carries the merge SHA CACHED FROM BEFORE
+            # the triggering action, so `Verify resolved checkout` compared a
+            # stale expected against a freshly minted actual and failed on a PR
+            # that had changed nothing. Measured on #2826: the mismatch recurred
+            # across five runs, expected always equal to the PREVIOUS run's
+            # actual, with the mint timestamps 1-3 s before each run.
+            #
+            # Pinning also makes that verify mean something. Every downstream
+            # job takes its `ref` from this same output, so with a symbolic ref
+            # each one re-resolved it independently and could legally build a
+            # DIFFERENT merge commit than preflight verified — the check passed
+            # while pinning nothing. With a SHA, preflight and every consumer
+            # build the identical commit.
+            #
+            # This is stock `actions/checkout` behaviour on `pull_request` (its
+            # refspec is `+<github.sha>:<ref>`, never the floating ref tip), so
+            # the by-SHA fetch is the globally exercised path rather than a
+            # novel one. Measured before shipping: superseded merge commits from
+            # PRs closed a week earlier still fetch by bare SHA.
+            #
+            # The one behaviour this gives up is a re-run after GitHub evicts
+            # that object, which now fails "commit not found". That failure is
+            # loud and honest, and the pre-change pipeline failed those re-runs
+            # anyway — at the verify below, against a stale expected.
+            # SCOPED TO `pull_request`, and that scoping is load-bearing (review
+            # of this PR, blocker). This branch runs for EVERY non-workflow_call
+            # trigger, `push` included. On `push`, GITHUB_REF is a stable
+            # `refs/heads/<branch>` with no re-minting problem — and checking a
+            # self-hosted workspace out by BARE SHA leaves it in detached HEAD.
+            # The pre-checkout branch-switch sentinel (this file, the
+            # "Wipe build-<os>/ on branch switch" steps) reads
+            # `git rev-parse --abbrev-ref HEAD`, which prints the literal string
+            # "HEAD" when detached. Its guard is `current != "HEAD"`, so one
+            # push-triggered job by SHA makes that permanently false and the
+            # build-dir wipe NEVER FIRES AGAIN on that runner — for push or PR —
+            # until someone runs scripts/ci/runner-reset.sh by hand. Silent, no
+            # adversary needed, and it would reuse one branch's meson/ninja state
+            # for another branch's build. Reproduced against a temp repo before
+            # this fix landed. Contract: docs/ci-architecture.md "Persistence and
+            # recovery".
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            else
+              echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            fi
+            echo "checkout_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "trusted_execution=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "base_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ -n "$TRUSTED_GATE" ]] || {
+            echo "::error::TRUSTED_FORK_CI_GATE is required; direct reusable-workflow calls are forbidden."
+            exit 1
+          }
+
+          # CWE-349 (#4471): the caller's ref is this run's GitHub Actions
+          # cache scope, and every job below executes the approved fork
+          # revision. Dispatched on main/dev, that code could write cache
+          # entries every later trusted run restores (main is readable from
+          # every ref; dev is every PR's base). The #3543 save gates in the
+          # canary only cover this workflow's OWN save steps. So: confine
+          # the run to a throwaway per-PR trusted-fork/pr-<N>[-<sha>] branch
+          # whose scope nothing trusted ever reads (a run restores only from
+          # its own ref, the default branch, and a PR's base), and let the
+          # wrapper purge that scope afterwards. docs/ci-troubleshooting.md
+          # 1.2 is the runbook. Checked BEFORE the API calls so the hermetic
+          # test (tests/shell/test_trusted_inputs_validate.sh) reaches it.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::trusted-fork-ci must be dispatched on refs/heads/trusted-fork/pr-${PR_NUMBER}[-<sha>] (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+
+          pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          state=$(jq -r '.state' <<<"$pr_json")
+          head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")
+          base_sha=$(jq -r '.base.sha' <<<"$pr_json")
+          [[ "$state" == "open" ]] || {
+            echo "::error::PR #$PR_NUMBER is not open."
+            exit 1
+          }
+          [[ "$head_sha" == "$APPROVED_SHA" ]] || {
+            echo "::error::PR #$PR_NUMBER head moved; approved=$APPROVED_SHA current=$head_sha"
+            exit 1
+          }
+          [[ -n "$head_repo" && "$head_repo" != "$REPOSITORY" ]] || {
+            echo "::error::trusted-fork-ci is only for fork-originated PRs."
+            exit 1
+          }
+
+          # Checkout from the base repository at the immutable PR head SHA.
+          # This keeps the comparison base and workflow definitions anchored to
+          # the repository while still executing the approved fork revision.
+          echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "checkout_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "trusted_execution=true" >> "$GITHUB_OUTPUT"
+          echo "Trusted execution approved for $head_repo PR #$PR_NUMBER @ $head_sha"
+
   # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
   # Runs on a GHA-hosted runner (always available) and queries
   # /actions/runners. Each downstream job that targets a self-hosted
@@ -89,12 +281,12 @@ jobs:
   #     gate on the pool, not a single named runner, so a free pool member keeps
   #     them running and a fully-offline pool still skips them fast.
   #
-  # If RUNNER_INVENTORY_TOKEN is missing, the script writes
-  # all runners as `false` and exits 0 (fail-closed): downstream jobs
-  # skip with an obvious "preflight detected unhealthy runner" reason
-  # rather than disappearing into a queue.
+  # If the runner-control query is unavailable or a required pool is wholly
+  # offline, preflight fails red. Required checks must never disappear behind
+  # a successful skip merely because their control-plane evidence is missing.
   preflight:
     name: "Preflight (runner health)"
+    needs: [trusted_inputs]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # Job-level permissions REPLACE the workflow default (contents: read), so
@@ -111,10 +303,12 @@ jobs:
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
       # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
-      # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
-      # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
-      # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
-      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
+      # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
+      # Shulgi is an operator testbed, not a production scheduling fallback.
+      weetam_pool_healthy: ${{ steps.health.outputs.weetam_pool_healthy }}
+      # Exact BigMags pool gate matching the macOS job's runs-on labels.
+      # No GitHub-hosted or Shulgi fallback can satisfy the Apple-Silicon job.
+      bigmags_pool_healthy: ${{ steps.health.outputs.bigmags_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -124,23 +318,19 @@ jobs:
       # PR skips them instead of blocking forever on absent required checks.
       # Always true for non-PR events (push / workflow_dispatch build always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
+      checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+      checkout_ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+      checkout_sha: ${{ needs.trusted_inputs.outputs.checkout_sha }}
+      trusted_execution: ${{ needs.trusted_inputs.outputs.trusted_execution }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Control-plane code must come from the base workflow revision. In a
+      # trusted fork run, the runner-inventory PAT is exposed only to this
+      # hosted step, before any fork-controlled file is checked out.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Probe runner health
-        id: health
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
-
-      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
-      # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash.
-      - name: Shell gate tests
-        run: |
-          bash tests/shell/test_check_compose_versions.sh
-          bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
 
       # ── Docs-only vs code gate (issue #1978) ───────────────────────────
       # Decide whether the heavy build matrix runs for this PR. The
@@ -187,12 +377,146 @@ jobs:
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
 
+      - name: Probe runner health for code-bearing changes
+        id: health
+        # Docs-only same-repository PRs do not depend on the build fleet.
+        # An automatic fork still runs this base-revision check and fails red
+        # before querying, so it can never claim a healthy self-hosted pool.
+        if: steps.codegate.outputs.code_changed == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam --require-pool weetam --require-pool bigmags
+
+      # The checkout below is deliberately after the only step that receives
+      # RUNNER_INVENTORY_TOKEN. A trusted fork may execute tests from this
+      # revision, but it must never receive that administration-scoped secret.
+      - name: Checkout requested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+          persist-credentials: false
+      # Assert that checkout produced the immutable revision propagated to every
+      # downstream job. Both inputs are the same pinned SHA on every path now, so
+      # this is a postcondition rather than the race adjudication it used to be —
+      # but it is not redundant: `checkout_ref` and `checkout_sha` are two
+      # separate outputs, and this is the only tripwire if a later edit desyncs
+      # them.
+      - name: Verify resolved checkout
+        env:
+          EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA" || {
+            echo "::error::checkout mismatch: expected=$EXPECTED_SHA actual=$actual_sha"
+            exit 1
+          }
+
+      # Portable-path gate (ws91 P91-7, Architect ruling 2026-09-08). Pure
+      # `git ls-files` scan -- no build deps -- so it belongs here beside the
+      # other preflight gates. Fails on any tracked path Windows/NTFS cannot
+      # represent (a ':' -- the recurring offender for sysfs/PCI/MAC-
+      # address-shaped fixture data -- or `* ? " < > |` or a trailing '.'/' '
+      # on any path component): P91-5's Linux sysfs fixture tree shipped 35
+      # such paths and broke `git checkout` on every Windows host, the-rig
+      # and the "Windows MSVC ${{ matrix.build_type }}" self-hosted CI
+      # checkout job (this file's build matrix, below) included. Selftest
+      # first (fixture-level proof the predicate still discriminates
+      # clean/seeded paths), then the real scan over the tree.
+      - name: Portable path gate (ws91 P91-7)
+        run: |
+          bash scripts/ci/check-portable-paths.sh --selftest
+          bash scripts/ci/check-portable-paths.sh
+
+      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
+      # otherwise only runs at release time, so a regex regression would surface
+      # too late (after the full build matrix). No build deps — just bash.
+      - name: Shell gate tests
+        run: |
+          bash tests/shell/test_check_compose_versions.sh
+          bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          python3 scripts/ci/test_runner_health_check.py
+          bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
+          bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
+          bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
+          bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
+
+      # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
+      # so it belongs on the PR fast path beside the shell gate above rather
+      # than in a build job. Selftest first (fixture-level proof the gate
+      # still discriminates clean/seeded/comment-prose text), then the real
+      # scan over the tree.
+      - name: Metrics HELP ASCII gate (#2128)
+        run: |
+          bash scripts/ci/check-metrics-help-ascii.sh --selftest
+          bash scripts/ci/check-metrics-help-ascii.sh
+
+      # API parity ledger gate (#3991, F1 of the #2146 programme; ADR-0031
+      # INV-31-4). Pure lexical source-tree analysis — no build deps — so it
+      # belongs here beside the other preflight gates rather than in a build
+      # job. Fails on an unledgered fragment/legacy route, a stale twin
+      # claim, an undocumented+unallowlisted /api/v1 route, the untwinned-row
+      # ratchet regressing, or docs/api-parity-ledger.md's generated block
+      # going stale. See that script's module docstring for the full
+      # contract and the "lexical tripwire, not a proof" caveat. Selftest
+      # first (fixture-level proof the extractor still catches its own two
+      # known false-negative shapes — arrow-notation receivers, adjacent
+      # string-literal splits — per the same convention as the sibling gates
+      # above), then the real scan over the tree.
+      - name: API parity ledger gate (#3991)
+        run: |
+          python3 scripts/ci/check-api-parity.py --selftest
+          python3 scripts/ci/check-api-parity.py
+
+      # MCP retry_after_ms hard rule (A5, ADR-1005 exec-plan Decision 16 /
+      # routed-concerns.md's A5 row): every NEW MCP tool's store/query-fault
+      # error branch must carry a retry_after_ms hint or an inline
+      # `// retry-hint-exempt:` comment. Diff-aware (new kTools[] entries
+      # only) — see that script's module docstring for why this is NOT a
+      # repo-wide retrofit gate. pull_request only: on push (merge to
+      # dev/main) new tools were already gated at PR time, same reasoning as
+      # the Plugin README touch rule job. Reuses trusted_inputs' own base_sha
+      # (#2826) rather than re-deriving from the raw PR event field — this
+      # job already has that output one hop away; a second independent
+      # derivation of "the right base" is exactly the class of drift #2826
+      # was about.
+      - name: MCP retry_after_ms hard rule (A5)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Regression guard first: fail fast, with a clear message, if the
+          # gate's own extraction logic is broken -- rather than silently
+          # degrading to zero findings (exactly how the balanced-brace defect
+          # found on PR #4261 hid for an entire fix round).
+          python3 scripts/ci/check-mcp-retry-hints.py --selftest
+          # Fail CLOSED, matching the script's own HEAD-unreadable path (its
+          # module docstring: "an unreadable target must never look like a
+          # clean gate"). An empty/all-zero BASE_SHA means the diff this gate
+          # depends on cannot be computed -- that is a CI-input defect to
+          # investigate, not a condition that should silently look green
+          # (colleague review on PR #4261: the prior exit-0-and-skip here
+          # directly contradicted the script's stated fail-closed philosophy).
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::Base commit unavailable (BASE_SHA='$BASE_SHA') -- cannot diff, failing closed."
+            exit 1
+          fi
+          git fetch --depth=1 origin "$BASE_SHA"
+          python3 scripts/ci/check-mcp-retry-hints.py "$BASE_SHA" "$HEAD_SHA" --summary
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -216,10 +540,14 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           # Need history so buf can compare against the merge base
           fetch-depth: 0
+          # A trusted fork never reuses a prior self-hosted workspace.
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -228,6 +556,12 @@ jobs:
         run: buf lint proto
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          git reset --hard
+          git clean -ffdx
 
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
@@ -249,6 +583,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     env:
+      # Each Big Tam runner is confined to one 8C/16T L3 domain. Keep Ninja's
+      # process fan-out inside that boundary; affinity alone still leaves
+      # Ninja seeing the host-wide 64 logical CPUs.
+      YUZU_BUILD_JOBS: "16"
       # Big Tam runs 4 runners on one host. A gateway eunit test that boots the
       # app can transiently bring up Erlang distribution and trip the #659
       # insecure-default-cookie boot guard (observed flaking 1/4 legs). This is
@@ -259,6 +597,30 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     strategy:
       fail-fast: false
+      # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
+      # agents on one box. A `dev`/`main` push runs the full 2x2 matrix below
+      # and would otherwise claim all 4 simultaneously, starving a
+      # concurrently-queued PR's single Linux leg at the RUNNER-ACQUISITION
+      # level — below with-test-slot.sh, which only gates contention *inside*
+      # a job that already has a runner (docs/ci-architecture.md "Cross-job";
+      # a PR job was directly observed waiting 35 minutes for a free runner
+      # during exactly this window). Capping at 3 leaves at least one Big Tam
+      # runner unclaimed BY THIS MATRIX. No-op on `pull_request` events: the
+      # exclude below already trims that matrix to a single gcc-15/debug leg,
+      # so max-parallel never binds there. Trade-off: a `dev` push's 4th leg
+      # waits for a slot to free (two waves instead of one) — acceptable,
+      # since push-triggered runs aren't PR-fast-path latency sensitive.
+      # NOT a guarantee the freed runner reaches the intended PR job: this
+      # matrix isn't the only claimant on the pool. `proto-compat` below
+      # targets the bare `[self-hosted, Linux, X64]` label, which every
+      # Big Tam Linux runner also carries, and runs on the same push trigger
+      # this cap targets — it can claim the freed runner itself (its own
+      # `timeout-minutes: 5` means it self-frees quickly, but it is a real
+      # same-push competitor, not just the already-named nightly-overlap
+      # case). A stacked nightly run, another concurrent PR/push, or a
+      # manual `workflow_dispatch` can do the same. Mitigation, not a
+      # guarantee. Tracked: #3443.
+      max-parallel: 3
       matrix:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
@@ -266,9 +628,41 @@ jobs:
           # PRs: only gcc-15 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
+        # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
+        # third axis (2x matrix, breaks max-parallel:3's 4-runner arithmetic) and
+        # never in `name:` (job names are the ruleset's required-check contexts,
+        # docs-required-checks below must stay in lockstep). A key-only include
+        # entry attaches to every combination surviving exclude:; a later include
+        # that ALSO matches a given combination can overwrite a value an earlier
+        # include added (never an original axis value) — this is GitHub's
+        # documented include: behavior — confirmed by observation (the PR run
+        # below) AND now actively guarded: the "Resolve pg_mode" step asserts
+        # gcc-15/debug resolves to full and fails the job loudly if it doesn't
+        # (adversarial-review hardening; this comment no longer describes an
+        # unchecked assumption). So: default smoke first,
+        # then the gcc-15/debug override to full. On a PR the exclude above has
+        # already trimmed the matrix to the single gcc-15/debug leg, so both
+        # include entries match that one leg and the net result is pg_mode=full
+        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
+        # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
+        # stay smoke. Item 4 of the original plan (a periodic full clang-release
+        # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
+        # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
+        # narrowing this would need to join) is shelved and nightly.yml only
+        # fires against `main`, which trails `dev` by thousands of commits right
+        # now; landing an ungated periodic leg would reintroduce exactly the
+        # uncoordinated-contention problem Phase 6A exists to close. Tracked on
+        # #3443, not silently dropped.
+        include:
+          - pg_mode: smoke
+          - compiler: gcc-15
+            build_type: debug
+            pg_mode: full
 
     steps:
-      # PR-5 of the CI overhaul plan: clean:false preserves build-linux/
+      # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
+      # build-linux/ across jobs. A maintainer-approved fork is the explicit
+      # exception: it starts clean and uses only run-private caches below.
       # across jobs so meson + ninja can be incremental across pushes.
       # The branch-switch sentinel below is the safety net — if the
       # previous job on this runner was on a different branch, the
@@ -293,16 +687,41 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
           # vcpkg_installed/ between runs. Branch switches are handled
           # by the pre-checkout wipe step above; cache freshness is
           # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
           # runner-reset.sh.
-          clean: false
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
+
+      # One DB per runner agent, below runner.tool_cache and therefore outside
+      # the checkout. ci-telemetry exports YUZU_TEST_DB for later steps and
+      # records this exact matrix leg; reruns remain distinct by run_attempt.
+      - name: Start persistent CI telemetry
+        continue-on-error: true
+        env:
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
+        run: >-
+          python3 scripts/ci/ci-telemetry.py start
+          --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+          --triplet x64-linux
 
       - name: Install system packages
         run: |
@@ -316,8 +735,9 @@ jobs:
           # on a shared host lock (the standard fix — this is what apt-systemd-daily
           # itself does). Keep DPkg::Lock::Timeout inside as belt-and-suspenders
           # for the frontend lock vs. any background unattended-upgrades. Serializing
-          # apt also staggers the legs, so they don't hit ensure-postgres (one
-          # shared yuzu-ci-postgres container) or pip --user ($HOME) all at once.
+          # apt also staggers the legs, so they don't hit ensure-postgres
+          # (per-agent yuzu-ci-postgres-<n> containers since #2094) or
+          # pip --user ($HOME) all at once.
           # FD-9 flock pattern: the subshell opens the lock file on fd 9, flock
           # blocks up to 600s for it, and releases on subshell exit. /tmp is
           # 1777 so the runner can create the lock; all 4 runners are the same
@@ -327,7 +747,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool \
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool \
               ${{ matrix.compiler == 'gcc-15' && 'gcc-15 g++-15' || 'clang-21' }}
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
@@ -415,7 +835,7 @@ jobs:
           # one cache means the first matrix variant pays the from-source
           # cost (~25 min) and the other three restore in seconds, vs.
           # 4× from-source under per-matrix scoping. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-linux', runner.tool_cache) }}
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -452,7 +872,56 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into this step rather than a standalone one: tools/plugin-capture
+        # must reject a --os that does not match the platform it was compiled
+        # for, or a wrong-platform capture becomes gate-certified, embedded,
+        # and served as truth. Deliberately part of Build, not its own step --
+        # CodeQL (CWE-349, actions/cache-poisoning/poisonable-step) flagged a
+        # standalone new step here as a fresh node its reachability analysis
+        # has to reason about on the workflow_dispatch/trusted-fork-ci path,
+        # even gated on trusted_execution; Build itself (already executing
+        # this same untrusted checkout's meson.build content, unconditionally)
+        # is not flagged, so this check rides the already-accepted boundary
+        # instead of adding a new one.
+        run: |
+          meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
+          bash scripts/ci/check-plugin-capture-os-guard.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
+
+      # #2204 capability-matrix drift gate (PR1.1). Runs right after Build so
+      # capmatrix-gen and every agents/plugins/*/ shared object already
+      # exist — the script discovers the full plugin set from the source
+      # tree itself (not a hand-maintained subset), so a missing artifact
+      # for ANY plugin is a hard failure (never a skip), and a stale
+      # docs/os-capability-matrix.md generated block fails the same way.
+      # RATCHET mode only (do not flip to hard-fail on any undeclared plugin
+      # — that is a later PR): the undeclared-plugin count must not grow.
+      #
+      # A-2/compliance: this gate's pass/fail signal lives only in the
+      # workflow run log, which sits under Actions' default 90-day retention
+      # — short of a 12-month SOC 2 evidence window. Accepted for now: the
+      # gate is an enforcement mechanism (the PR merge record is the durable
+      # evidence that it ran and passed), not an evidence-retention system;
+      # revisit with an artifact upload (retention-days) if a SOC 2 control
+      # is later scoped to require the raw gate output itself.
+      - name: Capability matrix drift gate (#2204)
+        run: |
+          bash scripts/ci/check-capability-matrix.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
+
+      # PR1.1 finding F10: the gate step above can only ever observe the
+      # all-undeclared state (every shipped plugin is undeclared and the
+      # baseline equals the count), so on its own it proves neither that
+      # capmatrix-gen renders a DECLARED descriptor nor that either ratchet
+      # rejection branch rejects. This exercises both against the real binary
+      # and the real gate script, using the tests/fixtures/abi4/ declaring
+      # fixture plugin inside throwaway git repos. Runs here rather than on
+      # the preflight shell-gate step because it needs the built artifacts.
+      - name: Capability matrix gate tests (#2204 F10)
+        run: |
+          bash tests/shell/test_capability_matrix_gate.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
 
       # Link-provenance assertion (#1331 review HIGH-2): prove the canary linked
       # vcpkg's static libpq archive, not a system/dynamic libpq. Per ADR-0008
@@ -470,15 +939,415 @@ jobs:
 
       # Postgres for server tests (ADR-0006 decision 8, #1318). On this
       # self-hosted runner the script idempotently (re)uses a persistent
-      # `yuzu-ci-postgres` docker container on 127.0.0.1:15432 and exports
-      # YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per runner,
-      # no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1): a missing
-      # Postgres fails the job here, before the test step.
+      # docker container — PER AGENT on the 4-runner pool
+      # (`yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>, #2094; the shared
+      # `yuzu-ci-postgres` on :15432 remains for single-agent boxes) — and
+      # exports YUZU_TEST_POSTGRES_DSN via GITHUB_ENV — one-time cost per
+      # runner, no per-run install. Required since #1320 PR 1 (SOFT_EXIT=1):
+      # a missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
-      - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs
+      # #3443 Phase 2: fail fast on a broken DSN or an unrecognized pg_mode
+      # BEFORE any test invocation runs — not just the PG ones — so a
+      # provisioning or matrix-include problem surfaces immediately instead
+      # of after several minutes of unrelated non-PG suite time. `Ensure
+      # Postgres` above already runs unconditionally in BOTH modes
+      # (Correction 1's fix: pg_mode selects which TEST INVOCATION runs,
+      # never whether Postgres is provisioned — gating provisioning itself
+      # would mean the [pg]-tagged cases silently SKIP instead of failing,
+      # since they skip cleanly whenever YUZU_TEST_POSTGRES_DSN is unset; a
+      # smoke leg would go green having run zero PG tests). This step is the
+      # loud-fail backstop for that class of defect, for every leg.
+      #
+      # The gcc-15/debug assertion below hardens a gap adversarial review
+      # raised (both reviewers, one deemed it non-blocking): the matrix
+      # include: block's own comment already flags "confirmed-by-observation,
+      # not asserted certainty" that this leg resolves to pg_mode=full — this
+      # turns that into an actual static guarantee instead of an assumption
+      # nothing checks. A future edit that inverts/breaks the two include:
+      # entries would otherwise silently drop full PG-shard coverage from
+      # every PR and push while every other check (DSN assert, partition
+      # invariant) kept passing.
+      - name: Resolve pg_mode + assert Postgres DSN
+        env:
+          PG_MODE: ${{ matrix.pg_mode }}
+          MATRIX_COMPILER: ${{ matrix.compiler }}
+          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+        run: |
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *)
+              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
+              exit 1
+              ;;
+          esac
+          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
+            exit 1
+          fi
+          if [[ "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
+            echo "::error::gcc-15/debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
+            exit 1
+          fi
+          # Symmetric guard (governance Gate 6 sre nit): the check above only
+          # catches the primary leg losing full coverage. It says nothing if a
+          # future include: edit instead sends every leg back to 'full' -
+          # every existing check (this one included) stays green while the
+          # 4-leg PG-shard contention this change exists to fix silently
+          # returns. GITHUB_EVENT_NAME is one of GitHub Actions' own default
+          # step env vars, set on every run - no extra wiring needed.
+          if [[ "$GITHUB_EVENT_NAME" == "push" && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
+            exit 1
+          fi
+          echo "pg_mode=$PG_MODE"
+
+      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
+      # --suite list below omits server-pg-smoke, and the by-name line
+      # matches none of its six names against it — meson's positional
+      # test-name matching is an EXACT match (fnmatch with no glob characters
+      # in a literal name, mtest.py's tests_from_args), not a substring one.
+      # See 'Test (pg shards, full)' below for the full #3443 concurrency-
+      # tuning history (with-test-slot.sh slot counts, --num-processes,
+      # shard timeouts) — kept there since it's about the PG-shard
+      # invocation specifically, not this non-PG one.
+      - name: Test (non-pg suites)
+        # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
+        # the remaining lines on the first non-zero exit): 21 tests across 5
+        # cheap suites (agent/docs/proto/tar/gateway) run first, then the 6
+        # non-pg server entries by name (4 shards — #3443 Windows
+        # restructuring added shard C, a later measured-by-time follow-up
+        # added shard D, carved from B's [body_cap] tests — + the mcp bridge
+        # teardown budget test + the pg shard partition invariant, #3443
+        # Phase 1 — needs no Postgres DSN,
+        # --list-tests only enumerates TEST_CASE macros). Both now pass
+        # --num-processes 2 (2026-09-18, extends #3443). The old reasoning
+        # here ("UNCAPPED since neither touches Postgres") conflated
+        # Postgres contention with the WITHIN-job meson fan-out #3443 already
+        # proved on the pg shards below: uncapped `meson test` spawns every
+        # registered test() entry through its own cpu_count()-based worker
+        # pool, blind to this box's cgroup-confined CPU count, regardless of
+        # whether any of those entries touch Postgres. Evidence this actually
+        # fires here: on two independently-diagnosed CI runs (PR #4532 run
+        # 35307458479, PR #4566 run 35361987460, no diff in common), THIS
+        # invocation's own testlog.txt shows exactly ONE Catch2 case failing
+        # each time, both async/timing assertions in the spark/guardian
+        # suite (a 10s spin_until that never resolved; an ArmOutcomeKind/
+        # ReceiptStatus mismatch in an async wedge test) - consistent with
+        # CPU steal flipping a real-time assertion, not a Postgres-specific
+        # mechanism. --num-processes 2 matches the value already established
+        # for this box's pg-shard step below rather than inventing a new
+        # one.
+        #
+        # CORRECTION (build-ci review, 2026-09-18): the much larger ~20-case
+        # "blocked" list CI actually reports for those same two runs
+        # (content_dist/script_exec/event_logs/wifi/windows_updates/
+        # software_actions/license_scan) is NOT produced by this meson
+        # invocation and this flag does not touch it - it comes from
+        # flake-retry.py's catch2_failed_cases() classifier, which re-runs
+        # the WHOLE failed binary a second time, SOLO, as a bare subprocess
+        # outside meson's own test orchestrator, to enumerate failing case
+        # names for the retry pass. Why that solo re-run fails ~20 different
+        # cases than the original invocation above is NOT diagnosed (see
+        # #4580) - candidates include cross-job box contention during the
+        # solo re-run, shared-fixture/test-order pollution, or resource
+        # pressure from running the 3300+-case suite twice back to back;
+        # none confirmed. This cap is shipped on the single-case evidence
+        # above; do not read it as a fix for the classifier cascade.
+        #
+        # Cross-job with-test-slot.sh gating is deliberately NOT added here
+        # yet: this step's aggregate duration is
+        # still short, so the within-job cap is the single-axis fix shipped
+        # first, per this file's own "ship and measure one axis at a time"
+        # practice - watch ci-suite-stats for this leg before adding the
+        # cross-job gate too. The pg-tagged invocations (full shards or
+        # smoke, #3443 Phase 2) still separately go through with-test-slot.sh
+        # below; this step does not.
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
+        # enabled on the nightly windows-asan leg, so a hang in this leg's agent
+        # suite - the exact class #2345/#4018 recurred as - had no per-test
+        # attribution beyond the coarser suite-level testlog. Harmless for the
+        # other suites here: the listener is compiled into yuzu_agent_tests only,
+        # so an env var it doesn't check is simply ignored by the rest. Absolute
+        # path for the same reason as windows-asan's own comment on this - meson's
+        # default test workdir is the build directory itself. flake-retry.py's
+        # subprocess calls inherit the full parent environment (verified against
+        # its source), so this reaches every invocation including isolated retries.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant" "dex link no presentation symbols"
+
+      - name: Test (pg shards, full)
+        if: matrix.pg_mode == 'full'
+        # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
+        # resolved to 'full' (today: gcc-15/debug, every PR and its matching
+        # push leg) — the other 3 push legs run 'Test (pg smoke)' below
+        # instead. Everything from here down is the pre-Phase-2 concurrency-
+        # tuning history for THIS invocation (with-test-slot.sh, --num-
+        # processes, shard timeouts) — unchanged by Phase 2, kept in full.
+        #
+        # --num-processes 2: without a cap, meson fans every test() entry out at
+        # once — its default worker count is an uncapped, non-affinity-aware
+        # cpu_count() (this runner's job is genuinely confined to execute on 16
+        # logical CPUs via cgroup, "Self-hosted runner topology" in
+        # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
+        # the ~10 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # those 16 CPUs AND the one ensure-postgres.sh container this job got.
+        # Proved via back-computed shard start times (printed-timestamp minus
+        # elapsed) landing within ~0.01s of each other across every pg shard in a
+        # failing run. Each pg shard's `timeout:` (tests/meson.build) is a
+        # hard per-test kwarg, not the job budget: shard E hit its then-600s
+        # ceiling dead-on (600.11-600.60s) repeatedly under this same uncapped
+        # fan-out before the 2026-08-19 E->E+G split (#3322), and the post-split
+        # E/G pair was still measured at 86-96% of that ceiling across several
+        # runs that week — so the box was never actually "scaling flat" (see the
+        # now-corrected claim in docs/ci-architecture.md's "Linux concurrency
+        # caps (within-job + cross-job)" section + this step's Windows
+        # counterpart below). Solo/uncontended per-shard cost is much lower —
+        # but NOT as low as tests/meson.build's own then-recorded ~50-180s
+        # numbers suggested: a direct solo (--num-processes 1, no other job on
+        # the box) diagnostic run on this exact runner (PR #3582, 2026-08-25)
+        # measured A=227.86s H=214.19s B=90.35s D=227.48s E=353.32s G=317.04s
+        # F=262.81s C=359.42s — E and G both already well past HALF the then-
+        # 600s ceiling on their own, with no contention at all. --num-processes
+        # 2 stays at 2 here, not a higher number: this mirrored Windows' own
+        # starting `--num-processes 2` on its "Test (pg shards, full)" step
+        # (#3443) rather than deriving a Linux-specific value — the two
+        # platforms have since DIVERGED: PR #3677's staged Windows
+        # measurement protocol (docs/ci-architecture.md, current value
+        # there, not restated here to avoid this comment going stale every
+        # widening round) has moved Windows past 2 on real per-shard
+        # contention data; Linux stays at 2, unmeasured-and-unwidened,
+        # since nothing here has re-derived a Linux-specific value either.
+        #
+        # with-test-slot.sh (#3443 AC4): --num-processes 2 alone fixed
+        # WITHIN-job fan-out but left cross-job contention unmeasured. Now
+        # confirmed real, not just a theoretical risk: a single push to dev
+        # launches its own 4-way Linux matrix (gcc-15/clang-21 x debug/release)
+        # simultaneously, saturating all 4 Big Tam runners by itself, and a
+        # concurrently-queued PR's Linux job was observed waiting 35 minutes for
+        # a free runner while shard E timed out at exactly 600.01s under that
+        # same load. Mirrors Windows' own already-proven pattern (#3443, its
+        # "Test (non-pg suites)" / "Test (pg shards, full)" steps): caps
+        # concurrent heavy test PHASES to 2 per box (crash-safe
+        # flock; the build phase stays 4-wide, unaffected). YUZU_TEST_SLOT_DIR
+        # is set explicitly because Big Tam's RUNNER_TOOL_CACHE is PER-AGENT
+        # (docs/ci-architecture.md), unlike Wee Tam's box-wide one — the
+        # script's own default would silently no-op here (each runner gating
+        # against its own private lock dir, never contending with the others)
+        # without this override. YUZU_TEST_SLOT_TIMEOUT_MIN=30 is deliberately
+        # short relative to the 90-minute job budget, to REDUCE (not
+        # guarantee-away) the chance a starved job hits the ambiguous
+        # job-level timeout kill instead of with-test-slot.sh's own
+        # attributable error — the 90-minute budget also covers checkout and
+        # build time before Test even starts, so a slow build can still leave
+        # less than 30 minutes of headroom when the wait begins.
+        #
+        # HISTORICAL (pre-#3443-Phase-2) — describes what was then a single
+        # step's internal 3-invocation split: 21 tests across 5 cheap suites
+        # (agent/docs/proto/tar/gateway) run first, then the 4 non-pg server
+        # entries by name (corrected count — this paragraph originally said
+        # "3", found stale by adversarial review), both UNCAPPED (no
+        # --num-processes at all) since neither touches Postgres. Only the pg
+        # shards — isolated by exact name — go through with-test-slot.sh + a
+        # cap, so they get the full pool dedicated to them. 21+4+10 = 35, the
+        # whole registered test set as of the 2026-08-25 E->E+I / G->G+J split
+        # below — re-verified as an exact partition (meson test --list,
+        # diffed against the unfiltered full list) at that split, not assumed
+        # carried over from the prior 32. Phase 2 moved the first two
+        # invocations into their own "Test (non-pg suites)" step above; only
+        # the third (this one, now with-test-slot.sh-gated) remains here.
+        #
+        # Root cause, corrected after Gate 3 governance re-derived it from the
+        # actual failing run's timestamps rather than the first-draft guess this
+        # comment originally shipped with: a live run (PR #3582, 2026-08-24) hit
+        # shard E/G TIMEOUT at 600.51s/600.54s (SIGKILL'd) despite acquiring the
+        # cross-job slot in 0s — zero cross-job contention. The first-draft
+        # theory (a cheap test stealing one of the 2 within-job slots) doesn't
+        # match the evidence: back-computed start times show E's actual
+        # co-runners were shard D (~370s of overlap) then shard G (~230s) — pg
+        # shards, in tests/meson.build declaration order, matching plain 2-wide
+        # FIFO. Cheap tests hadn't even started by the time G timed out. The
+        # real mechanism is exactly what this file's own "Linux within-job
+        # concurrency cap" history above already says: shard cost is a function
+        # of how many pg shards run concurrently, and 8 shards at 2-wide
+        # inherently pairs adjacent-declared ones (some of which are the heavy
+        # ones) for extended stretches. Isolating cheap tests from the pg pool
+        # is still a real, if smaller, improvement — it removes an incidental
+        # ~51s gap this reconstruction also found between shards A and H
+        # starting — but it does not by itself explain or fix E/G's own margin.
+        # --num-processes stays at 2 here, not 3: an earlier version of this
+        # commit raised it, reasoning the pool was now pg-only so 2 had "no
+        # competition to spend margin on" — but 3-wide FIFO over shards A,H,B,D,
+        # E,G,F,C predicts D, E, and G (three of the heaviest) running
+        # concurrently for a long stretch, worse than today's 2-wide pairing,
+        # not better. Reverted without a real run confirming it helps; this
+        # repo's own house rule (tests/meson.build's shard-history comment):
+        # "raising the number is the last resort, not the first." The cross-job
+        # slot count in with-test-slot.sh below was ALSO held at 2 at the time
+        # this paragraph was written, for the same reason (box-wide job
+        # saturation, #3443 AC4) — SUPERSEDED 2026-08-25, see the "Cross-job
+        # slot count: 2 -> 3" paragraph below. --num-processes here is
+        # UNCHANGED (still 2) — only the box-wide slot count moved.
+        #
+        # 2026-08-25: the solo diagnostic above (E=353.32s, G=317.04s) is what
+        # finally disproved the "isolate the pool and it'll fit" premise this
+        # whole comment was built on — even alone, uncontended, E and G were
+        # each already past HALF of 600s, so 2-wide pairing was never going to
+        # have real headroom regardless of which OTHER shard it paired with.
+        # tests/meson.build split E->E+I and G->G+J the same day (see that
+        # file's own comment for the measurements and verification) and those
+        # four shards' timeout moved 600->700s (A/B/C/D/F/H unchanged) as a
+        # deliberate, TEMPORARY exception to the "split, don't raise" house
+        # rule. Justification corrected after Gate 2 governance review
+        # (2026-08-25) caught an earlier draft overclaiming a settled
+        # near-term shrink: docs/postgres-migration-ladder.md disclaims any
+        # timeline, and completing it is architecturally more likely to GROW
+        # the [pg] population than shrink it (each migrated store adds its
+        # own [pg]-tagged CRUD cases; only the thin migrate_from_sqlite
+        # backfill suites become prunable). The bump is a plain safety
+        # cushion on what the split alone already earns, not a bet on the
+        # population shrinking. Both mitigations are combined on purpose: the
+        # split cuts each shard's real cost roughly in half, the timeout bump
+        # absorbs whatever 2-wide pairing overlap remains on top of that.
+        #
+        # Same day: EXTENDED to the remaining six shards (A/B/D/F/H/C, all
+        # now 700s too) after merging #3582 required a dev sync, and dev's
+        # own CI (run 32833097478) TIMEOUT'd shard E at the OLD 600.51s and
+        # landed G at 585-590/600s (97-98%) on all four Linux legs — live
+        # confirmation the 600s ceiling was tight fleet-wide, not just on the
+        # two shards #3582 split. See tests/meson.build's shard-E/I/G/J
+        # comment block and docs/ci-architecture.md's worst-case job-budget
+        # arithmetic (re-derived for all-ten-at-700s: makespan is now a
+        # deterministic 3500s at --num-processes 2, no pairing variance,
+        # margin against the 90-min job ceiling under 2 minutes worst-case).
+        #
+        # Telemetry note: each invocation overwrites meson's single
+        # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
+        # rows survive the "Finish persistent CI telemetry" step's unmodified
+        # default import — the pg-gated call runs last on purpose, since that's
+        # the shard timing this investigation has cared about. A second,
+        # separate loss: flake-retry.py writes meson-logs/flake-retry.json
+        # unconditionally on every clean invocation, including an empty report
+        # on success — so if the cheap-suite calls recover a real known flake,
+        # a clean pg-shard pass silently overwrites that evidence too, not just
+        # the per-suite duration rows. Neither loss affects the job's own
+        # pass/fail (that comes from each invocation's own exit code under
+        # bash -e), only downstream telemetry granularity for the two cheap
+        # calls. Also note: groups 1 and 2 run entirely outside
+        # with-test-slot.sh now — before this split, one gated invocation
+        # covered all 32 tests; up to 4 concurrent Linux jobs' cheap-suite
+        # phases can now overlap unrestrained. Judged low-risk (cheap suites
+        # measured ~1-2 min combined, no Postgres/heavy-CPU contention), but a
+        # real narrowing of what #3443 AC4's gate covers, not just an
+        # implementation detail.
+        #
+        # Cross-job slot count: 2 -> 3 (2026-08-25, same day as max-parallel:3
+        # landed). max-parallel:3 (this job's `strategy:` block, above) and
+        # this slot gate are DIFFERENT axes, not substitutes for each other:
+        # max-parallel governs RUNNER ACQUISITION for one push's own matrix;
+        # this gate governs box-wide HEAVY TEST-PHASE concurrency across ALL
+        # jobs (any push, any PR, nightly, manual dispatch) once a job already
+        # has a runner and has finished building. Raising max-parallel:3
+        # doesn't make the OLD "stays at 2" reasoning wrong on its own terms —
+        # it just no longer needs the slot gate to ALSO be the sole box-wide
+        # throttle, which is what "reopen that problem" assumed.
+        #
+        # Trigger: two real runs the same day hit the 2-slot ceiling hard —
+        # PR #3600's own Linux job waited the full 30-min
+        # YUZU_TEST_SLOT_TIMEOUT_MIN and gave up (`no 'yuzu-bigtam-heavy' slot
+        # free after 30 min (2 slots busy)`; recovered via a manual rerun once
+        # the contending jobs finished); PR #3530's Linux job waited 17m16s
+        # (`acquired 'yuzu-bigtam-heavy' slot 1/2 after 1036s`) before running
+        # clean. Both times the 2 slots were held by OTHER concurrent jobs'
+        # own long pg-shard test phases, not by anything abnormal.
+        #
+        # Why 3 is safe to try, not just convenient: each of the 4 Big Tam
+        # runner agents idempotently (re)uses its OWN persistent
+        # `yuzu-ci-postgres-<n>` container — 3 concurrent heavy phases don't
+        # contend for one shared Postgres instance, unlike the WITHIN-job
+        # `--num-processes` cap above (which exists because ONE job's own pg
+        # shards fan out onto that SAME job's ONE container). A same-day
+        # diagnostic (tests/meson.build's shard-history comment) measured a
+        # shard's wall time within ~3% whether the box was quiet or under 3
+        # OTHER PRs' full CI runs — Big Tam's per-op cost doesn't degrade
+        # sharply under moderate added load. CAVEAT (Gate 4 unhappy-path,
+        # governance): that ~3% figure was measured while the slot gate held
+        # at 2 — it describes a lighter load shape (never more than 2
+        # SIMULTANEOUS heavy pg phases) than the 3-slot regime this change
+        # ships. It supports TRYING 3, it is not proof the same low
+        # sensitivity holds at 3-wide; treat post-ship telemetry as the real
+        # confirmation, not this number alone. Per-runner Postgres isolation
+        # also removes DB lock/connection contention but NOT shared physical
+        # resources (page cache, DRAM bandwidth, kernel/container overhead) —
+        # necessary evidence, not sufficient proof by itself. The cap stays
+        # below 4 (not raised to match runner count) specifically to keep
+        # SOME protection against a full-box heavy-phase pileup.
+        #
+        # NOT starvation-proof: this script has no FIFO or PR-aware admission
+        # — a freed slot goes to whichever waiter's 5s poll tick (see
+        # scripts/ci/with-test-slot.sh) happens to fire next, not to
+        # whichever waiter arrived first. If 3 dev-push legs hold all 3
+        # slots, a 4th job (a PR's or otherwise) still waits the full 30
+        # minutes, same as before. Raising the count reduces how OFTEN that
+        # happens, it doesn't eliminate it. Also unenforced: nightly.yml's
+        # and sanitizer-tests.yml's Linux legs share this same box but invoke
+        # meson test directly, bypassing this gate entirely (pre-existing gap,
+        # #3443) — an ungated heavy job on the box's 4th runner can erode the
+        # margin above further, on top of whatever the 3-slot regime itself
+        # costs.
+        #
+        # --num-processes stays at 2, deliberately NOT bundled with this
+        # change: 2 slots x 2 shards/job = 4 concurrent pg shards today; 3
+        # slots x 2 = 6; 3 slots x 3 would jump to 9 with no diagnostic
+        # support at that load and no way to attribute a regression to either
+        # knob. Ship and measure one axis at a time.
+        #
+        # Acceptance/rollback signal: the #2093 duration watchdog's 560s
+        # (80% of the 700s per-shard ceiling) warning is an EXPECTED, accepted
+        # verification signal on early 3-slot runs, not a reason to revert on
+        # its own (worst shard measured 522.73s at 2-wide — PR #3530's Linux
+        # gcc-15 debug leg, run 32861777346/job 97847463421, 2026-08-25 —
+        # vs. the 700s ceiling needs roughly a 34% slowdown to actually fail,
+        # comfortably avoided). Two rollback triggers, not one: REPEATED
+        # warnings on the SAME shard under confirmed 3-slot occupancy, OR
+        # warnings scattered across MULTIPLE DIFFERENT shards in the same or
+        # overlapping runs (the box-wide-contention signature a single-shard
+        # trigger would miss) — either is the signal this operating point
+        # consumed too much margin. "Confirmed 3-slot occupancy" today means
+        # manual correlation of each job's own "acquired slot N/3" log line
+        # against overlapping runs' timestamps — there is no automated
+        # cross-job correlation yet; building that is a real #3443 follow-up,
+        # not assumed done here. Response to either trigger is
+        # rebalancing/splitting the affected shard(s) or reverting to
+        # slots=2, never another timeout increase. Tracked: #3443.
+        env:
+          YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
+          YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+        run: |
+          bash scripts/ci/with-test-slot.sh 3 -- \
+            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
+
+      # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
+      # this small tagged subset INSTEAD of the 12-shard server-pg suite
+      # above — see tests/meson.build's 'server pg smoke' entry for the full
+      # rationale (tag membership, why --allow-running-no-tests is REQUIRED
+      # here unlike Correction 1's original "no flag" wording, why it's a
+      # separate suite from server-pg, why by-name invocation). Deliberately
+      # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
+      # (280 assertions, all passed) is far cheaper than the up-to-30-minute
+      # slot wait the gate exists to bound — gating it would make the wait
+      # dominate the work. The DSN/pg_mode correctness this depends on was
+      # already asserted above, before any PG invocation ran.
+      - name: Test (pg smoke)
+        if: matrix.pg_mode == 'smoke'
+        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -487,6 +1356,29 @@ jobs:
         env:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
+
+      # Fresh-install Administrator bootstrap: the fatal refusal when the config
+      # lists local users but none has role=admin, and the durable
+      # rbac.bootstrap.first_admin audit row on a successful bootstrap — neither
+      # is exercisable by the Catch2 suite (which never drives main()).
+      - name: First-admin bootstrap CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_first_admin_bootstrap_refusal.sh
+
+      # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
+      # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
+      # completely — and three shutdown defects shipped and were each caught only by a human
+      # sending a signal by hand: O_NONBLOCK on both pipe ends (SIGTERM silently stopped being
+      # graceful), a nested lock_guard that self-deadlocked Agent::stop() (the agent hung on every
+      # SIGTERM while the suites and TSan stayed green), and handlers installed without a live
+      # watcher (signal swallowed, agent unkillable). Needs no server: the agent's reconnect loop
+      # against a closed port is a fully-booted steady state.
+      - name: Agent graceful-shutdown smoke test
+        env:
+          YUZU_AGENT_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/core/yuzu-agent
+          YUZU_PLUGIN_DIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/agents/plugins
+        run: bash scripts/test/agent-shutdown-smoke.sh
 
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
@@ -537,15 +1429,35 @@ jobs:
           fi
           exit 0
 
-  # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
+      - name: Finish persistent CI telemetry
+        if: always()
+        continue-on-error: true
+        env:
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
+          YUZU_CI_CONCLUSION: ${{ job.status }}
+        run: >-
+          python3 scripts/ci/ci-telemetry.py finish
+          --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+          --triplet x64-linux
+          --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          --conclusion "$YUZU_CI_CONCLUSION"
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
+
+  # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     needs: [preflight]
-    # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
-    # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
-    # Shulgi fallback) — mirrors the Linux pool gate.
+    # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
+    # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
     # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
-    if: needs.preflight.outputs.windows_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight.outputs.weetam_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -553,6 +1465,10 @@ jobs:
     # optimization target. See issue #374 for the full migration rationale.
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 120
+    env:
+      # Belt-and-suspenders with Start-PinnedRunner.ps1: every Wee Tam job
+      # explicitly carries the 16-thread width of its assigned CCD.
+      YUZU_BUILD_JOBS: "16"
     defaults:
       run:
         # The default `bash` keyword on a self-hosted Windows runner
@@ -569,9 +1485,22 @@ jobs:
         build_type: [debug, release]
         exclude:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+        # pg_mode mirrors the Linux job's own matrix shape (#3443): an
+        # include:-derived key, never a real axis (would double this
+        # matrix and break the runner-pool arithmetic) and never in
+        # `name:` above (job names are required-check contexts,
+        # docs-required-checks). debug keeps full pg-shard coverage on
+        # every PR and push (PRs are debug-only via the exclude: above, so
+        # PR coverage is unchanged by this); release runs the pg smoke
+        # subset on a push instead (the only event that builds release on
+        # Windows).
+        include:
+          - pg_mode: smoke
+          - build_type: debug
+            pg_mode: full
 
     steps:
-      # PR-5 of the CI overhaul plan: clean:false on the persistent
+      # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
       # yuzu-local-windows runner. Branch-switch sentinel runs in the
       # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
       # env vars and bash test syntax both work).
@@ -607,16 +1536,42 @@ jobs:
             rm -rf "$GITHUB_WORKSPACE/build-windows"
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
-          clean: false
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
+
+      - name: Start persistent CI telemetry
+        continue-on-error: true
+        env:
+          # Keep the workflow path identical to Start-PinnedRunner.ps1 even
+          # before the next safe runner restart propagates its process env.
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
+        run: >-
+          python scripts/ci/ci-telemetry.py start
+          --job-name "Windows MSVC ${{ matrix.build_type }}"
+          --triplet x64-windows
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       - name: Assert toolchain available
         run: |
@@ -641,19 +1596,12 @@ jobs:
           python -c "import yaml" >/dev/null 2>&1 || \
             python -m pip install --user --require-hashes -r requirements-ci.txt
 
-      - name: Assert toolchain manifest (self-hosted, optional)
+      - name: Assert toolchain manifest (self-hosted)
         shell: pwsh
-        run: |
-          # Manifest-based self-test for boxes provisioned via
-          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
-          # runners that predate the manifest — the PATH check above still covers
-          # them. Catches path/version/env drift the bare PATH check misses.
-          $m = 'C:\actions-runner\toolchain-manifest.json'
-          if (Test-Path $m) {
-            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
-          } else {
-            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
-          }
+        # Every active Windows runner must have a manifest before this change
+        # is deployed. Missing or unknown-schema manifests fail closed --
+        # there is no compatibility bridge.
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -682,6 +1630,10 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Assert effective vcpkg checkout
+        shell: pwsh
+        run: ./deploy/windows/Assert-VcpkgCheckout.ps1 -VcpkgRoot (Join-Path $env:GITHUB_WORKSPACE 'vcpkg')
+
       - name: vcpkg sentinel (x64-windows)
         # Universal cache-key contract — wipe vcpkg_installed/x64-windows
         # only when (vcpkg.json | vcpkg-configuration.json | triplet | baseline)
@@ -708,7 +1660,7 @@ jobs:
           # triplet builds both variants in one port build (the
           # VCPKG_BUILD_TYPE override was removed in the LNK2038 fix), so
           # the zip filename is the same regardless of consumer build_type.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-windows', runner.tool_cache) }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -739,12 +1691,16 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS,
-        # exported only by the Wee Tam pin-wrapper (Shulgi is unpinned and omits
-        # it, keeping ninja's default). Without the cap, ninja sizes -j from the
-        # 64-CPU system count and oversubscribes the 16-thread CCD, thrashing the
-        # very L3 the pinning exists to keep hot.
-        run: meson compile -C build-windows-${{ matrix.build_type }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        # Affinity controls placement, not Ninja's processor-count discovery;
+        # pass the runner's 16-thread CCD width unconditionally.
+        #
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into Build rather than a standalone step: see the linux
+        # job's identical Build step for the full rationale, including why
+        # a standalone step tripped CodeQL (CWE-349) here.
+        run: |
+          meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
+          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the
@@ -764,12 +1720,16 @@ jobs:
           echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Precondition on yuzu-local-windows: a native PostgreSQL 16+ service
-      # with role yuzu / password yuzu / db yuzu_test (one-time bootstrap,
-      # see docs/ci-architecture.md "Postgres for server tests"), or a
-      # runner-level YUZU_TEST_POSTGRES_DSN override. The script probes
-      # 127.0.0.1:5432 and exports the DSN; required since #1320 PR 1
-      # (SOFT_EXIT=1) — nothing listening fails the job at this step.
+      # Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4: each runner
+      # provides a native PostgreSQL 18 service — agent 0's
+      # `postgresql-x64-18-yuzu-ci` on :5433, agents 1-3 their own
+      # `postgresql-x64-18-yuzu-ci-<n>` on :5433+<n> (#2094) — and a
+      # machine-level YUZU_TEST_POSTGRES_DSN (the agent-0 DSN) that the
+      # script's path 1 derives the per-agent port from before exporting it;
+      # required since #1320 PR 1 (SOFT_EXIT=1) — nothing answering fails the
+      # job at this step. See docs/ci-architecture.md "Postgres for server
+      # tests" for the full path-1 mechanism and deploy/windows/ for
+      # provisioning.
       #
       # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
       # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
@@ -779,7 +1739,70 @@ jobs:
       - name: Ensure Postgres (server tests)
         run: source scripts/ci/ensure-postgres.sh
 
-      - name: Test
+      # Mirrors the Linux job's own step of the same name (#3443) — see that
+      # step's comment for the full rationale (loud-fail backstop for a
+      # provisioning/matrix-include defect, checked BEFORE any test
+      # invocation runs, not just the PG ones). MATRIX_BUILD_TYPE only:
+      # Windows has no `compiler` axis, so the "primary leg" the Linux
+      # version pins to gcc-15/debug collapses to "debug" alone here.
+      - name: Resolve pg_mode + assert Postgres DSN
+        env:
+          PG_MODE: ${{ matrix.pg_mode }}
+          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+        run: |
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *)
+              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
+              exit 1
+              ;;
+          esac
+          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
+            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
+            exit 1
+          fi
+          if [[ "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
+            echo "::error::Windows debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
+            exit 1
+          fi
+          # Symmetric guard (mirrors the Linux step's own): a push leg that
+          # is NOT debug (i.e. release, the only other Windows leg) must
+          # resolve to smoke, or a future include: edit could silently send
+          # every leg back to full and reintroduce full-PG-shard contention
+          # on every push.
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::Windows $MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
+            exit 1
+          fi
+          echo "pg_mode=$PG_MODE"
+
+      # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
+      # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
+      # "PG coverage by platform" for the full rationale and the measured
+      # numbers as the staged protocol produces them. Three differences from
+      # Linux, each with its own reason:
+      #   1. ONE gated non-pg invocation, not two uncapped ones — Wee Tam's
+      #      measured contention (docs/ci-architecture.md "Windows test-phase
+      #      concurrency gate") is DRAM/disk/Defender-minifilter, not
+      #      Postgres, so Big Tam's "cheap suites are never the contention
+      #      source, leave them uncapped" reasoning does not transfer; every
+      #      non-pg suite here shares the same box-wide gate.
+      #   2. --suite selection has no by-name fallback (Windows registers no
+      #      per-shard by-name list the way Linux's second invocation does),
+      #      and a bad --suite silently matches zero entries — so
+      #      assert-suite-cover.py runs FIRST, failing loud on a dropped or
+      #      misspelled suite before the real invocation could silently skip
+      #      a whole category.
+      #   3. YUZU_TEST_SLOT_TIMEOUT_MIN: "30" on both gated steps below —
+      #      Wee Tam's with-test-slot.sh default is 115 min; two acquisitions
+      #      per job (non-pg, then pg-shards-full) at that default could
+      #      together exceed this job's own 120-min budget, turning a slot
+      #      wait into an ambiguous job-level kill instead of an attributable
+      #      with-test-slot.sh failure (same reasoning as Big Tam's explicit
+      #      30-min override on its own pg-shards step).
+      - name: Test (non-pg suites)
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
           if [[ "${{ matrix.build_type }}" == "debug" ]]; then
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
@@ -787,7 +1810,94 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs
+          # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): same rationale
+          # as the Linux non-pg step above and the nightly windows-asan leg this was
+          # previously scoped to alone - this step is the one that includes --suite
+          # agent. Absolute path, same reason as windows-asan's own comment on this.
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-${{ matrix.build_type }}/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          # Single-sourced: the guard and the real invocation must select the
+          # SAME suites, or the guard certifies a list the real run doesn't
+          # actually use (sre Gate 6 finding, governance 2026-08-28) — a
+          # future edit to one without the other would let the guard pass
+          # while flake-retry silently ran fewer suites than verified.
+          suites=(--suite agent --suite docs --suite proto --suite tar --suite gateway --suite server-nonpg --suite server-checks)
+          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
+            "${suites[@]}" \
+            --exclude-suite server-pg --exclude-suite server-pg-smoke
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
+              "${suites[@]}"
+
+      # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
+      # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
+      # the STARTING pool width (measured 602s, one sample); push 2 widened
+      # to k=4 and took 2 same-SHA samples per the protocol's own median
+      # rule (358s / 359s — remarkably stable run-to-run despite the
+      # non-pg step swinging 3x on the SAME commit, confirming the pg step
+      # itself isn't the noisy part): a real 40.5% improvement, no shard's
+      # own duration inflated past 1.16x its k=2 value (well under the
+      # 1.5x stop-rule), nowhere near the 700s per-shard timeout. Push 3
+      # widens to k=6 on that same basis — each width change lands in its
+      # own, individually-measured push (docs/ci-architecture.md), never
+      # bundled with a topology change, so a wall-time delta stays
+      # attributable to one axis at a time.
+      - name: Test (pg shards, full)
+        if: matrix.pg_mode == 'full'
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+        run: |
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
+          # Same zero-match hazard the non-pg step's guard above exists for
+          # (review finding, PR #3677): --suite server-pg is inline below
+          # with no by-name fallback, so a typo'd/renamed suite label would
+          # silently match zero tests and this step would "pass" having run
+          # nothing. Excludes everything else so the guard also catches a
+          # future suite this step should select but doesn't.
+          # Single-sourced (build-ci Gate 8 finding, governance
+          # 2026-08-28): the guard and the real invocation must select the
+          # SAME suite, mirroring the non-pg step's pattern above — a
+          # future edit to one without the other would let the guard pass
+          # while flake-retry silently selected a different suite.
+          suites=(--suite server-pg)
+          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
+            "${suites[@]}" \
+            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite tar \
+            --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
+            --exclude-suite server-pg-smoke
+          # Runs LAST (after the non-pg step above): flake-retry.py /
+          # ci-import-junit only import the LAST invocation's testlog.junit.xml
+          # into CI telemetry per job — ordering it last means the pg-shard
+          # numbers (the ones the staged measurement protocol reads) are what
+          # survives, not the non-pg step's. The non-pg step's own
+          # job-summary "Suite durations vs meson budgets" table (written on
+          # every invocation, not just the last) is where its numbers live.
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 \
+              "${suites[@]}"
+
+      # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
+      # are debug-only, so this step never runs on a PR; verified post-merge
+      # by the first dev push, not pre-merge). Deliberately UNGATED, mirroring
+      # the Linux smoke step: the smoke set costs seconds, far cheaper than
+      # the slot-wait it would otherwise pay.
+      - name: Test (pg smoke)
+        if: matrix.pg_mode == 'smoke'
+        run: |
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
+          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
@@ -842,15 +1952,40 @@ jobs:
           fi
           exit 0
 
+      - name: Finish persistent CI telemetry
+        if: always()
+        continue-on-error: true
+        env:
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
+          YUZU_CI_CONCLUSION: ${{ job.status }}
+        run: >-
+          python scripts/ci/ci-telemetry.py finish
+          --job-name "Windows MSVC ${{ matrix.build_type }}"
+          --triplet x64-windows
+          --builddir build-windows-${{ matrix.build_type }}
+          --conclusion "$YUZU_CI_CONCLUSION"
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
+
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
     needs: [preflight]
-    # code_changed (issue #1978): docs-only PRs skip this required job
-    # (skipped == satisfied). No self-hosted pool gate — GitHub-hosted — so
-    # it otherwise runs on every code PR.
-    if: needs.preflight.outputs.code_changed == 'true'
-    runs-on: macos-15  # Apple Silicon, Xcode 16 / Apple Clang 16
+    # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
+    # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
+    # it, so gate on bigmags_pool_healthy (>=1 yuzu-bigmags-macos runner online).
+    # Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline pool skips this job
+    # fast instead of queueing against an empty pool.
+    # `&& code_changed` (issue #1978): docs-only PRs skip this required job
+    # (skipped == satisfied).
+    if: needs.preflight.outputs.bigmags_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -860,17 +1995,83 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
+          # Deliberately NOT the linux/windows conditional clean:false — this
+          # job keeps actions/checkout's default clean:true. A fresh workspace
+          # every run is a *stronger* fork-isolation boundary; the conditional
+          # clean:false form is not adopted here because it requires the
+          # branch-switch wipe step + vcpkg sentinel companions that are not
+          # ported to macOS (cross-run incrementality is deferred). See the
+          # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
-          brew install cmake ninja ccache pipx autoconf automake libtool
+          #
+          # cmake deliberately excluded from this brew line, pinned via pipx
+          # below instead (a single pin mechanism — the two 8-way-merged PRs
+          # that each hit the 4.4.0 regression pinned it differently; the pipx
+          # path is kept because it mirrors the repo's pip3 --user pattern and
+          # carries the brew-unlink belt-and-suspenders below). 2026-07-16:
+          # brew's floating `cmake` drifted to 4.4.0 underneath us with no code
+          # change on our side, and that release crashes resolving httplib's
+          # CMake package: FindThreads' try_compile() trips CMake's own internal
+          # "This should not have happened" guard in
+          # Internal/CheckSourceCompiles.cmake, which poisons every subsequent
+          # cmake-method dependency lookup in the same configure. Broke macOS CI
+          # fleet-wide across unrelated PRs simultaneously (e.g. #2224). Pin like
+          # meson below so a future brew bump can't repeat this.
+          # pkg-config: the self-hosted BigMags box does not ship the hosted
+          # image's baked-in pkg-config, which the Configure step's
+          # PKG_CONFIG_PATH (vcpkg_installed/arm64-osx/lib/pkgconfig) assumes
+          # exists. The GitHub-hosted macos-15 image bundled it implicitly.
+          brew install ninja ccache pipx autoconf automake libtool pkg-config
+          # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
+          # (that's what the log line "cmake 4.4.0 is already installed and
+          # up-to-date" was reporting) independent of this workflow's brew
+          # line, so dropping cmake above doesn't remove it. Unlink it so it
+          # can never win a PATH race against the pinned pipx cmake below.
+          # `|| true`: fine if a future image doesn't pre-bake cmake at all;
+          # stderr is left visible (not redirected) so a genuine unlink
+          # failure still shows up in the step log for a future debugger.
+          brew unlink cmake || true
+          # 4.3.4 is the latest 4.x release before the 4.4.0 regression
+          # above. Bump deliberately once a fixed release is confirmed clean
+          # here. Query pipx's own shim dir and prepend it to GITHUB_PATH
+          # (mirrors the pip3 --user pattern the Linux legs use, above) so
+          # it's guaranteed to win on PATH rather than assumed to. Captured
+          # into a variable first (not inlined into the `echo` argument):
+          # under `set -e`, a failing/empty command substitution inlined
+          # into `echo "$(...)"` would NOT abort the step (echo's own exit
+          # status is what -e checks), silently writing a blank PATH entry.
+          pipx install cmake==4.3.4
+          pipx_bin_dir="$(pipx environment --value PIPX_BIN_DIR)"
+          test -n "$pipx_bin_dir"
+          echo "$pipx_bin_dir" >> "$GITHUB_PATH"
+          # GITHUB_PATH only takes effect from the next step onward, not
+          # within this script, so verify via the resolved dir directly
+          # rather than a bare `cmake` (which may still hit an empty PATH
+          # slot right here). Self-documents the fix in every future log:
+          # today's incident was exactly this kind of silent version drift.
+          "$pipx_bin_dir/cmake" --version
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
@@ -878,57 +2079,28 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
-      # Split restore + always-save: `save-always: true` is deprecated and
-      # documented as "does not work as intended" by the actions/cache
-      # maintainers (https://github.com/actions/cache/tree/main/save#always-save-cache).
-      # Pattern: restore on the way in, then a paired `actions/cache/save`
-      # at the job tail gated on `if: always() && cache-hit != 'true'`. The
-      # `always()` lets the save run even if the build step failed (which
-      # is the only behaviour `save-always` was meant to deliver); the
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already exists, matching the default `actions/cache` semantics.
-      - name: Restore ccache
-        id: cache-ccache-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-macos-${{ matrix.build_type }}-
-            ccache-macos-
-
+      # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
+      # BigMags runner, which persists in the runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying the
+      # GHA upload cost would just reupload data that's already on disk.
+      # Mirrors the Linux/Windows self-hosted pattern. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export was previously done
+      # here for the in-process GHA cache backend that lukka/run-vcpkg used to
+      # support. We don't consume those vars anywhere on this self-hosted
+      # runner (binary cache lives in runner.tool_cache, ccache writes to the
+      # runner's HOME), so the export was dead wiring. Issue #569.
 
-      - name: Restore vcpkg installed packages
-        # Cache-key contract: vcpkg.json (ports/features) + vcpkg-configuration.json
-        # (registry/baseline) + the pinned VCPKG_COMMIT baseline (in the key
-        # prefix) catch the D3 staleness cases — a port edit or baseline bump.
-        # This leg installs the BUILTIN `arm64-osx` triplet (no
-        # `triplets/arm64-osx.cmake` overlay exists), so the repo's custom
-        # triplet descriptors (x64-linux-asan/tsan/static, x64-windows) cannot
-        # change its vcpkg output — hashing `triplets/*.cmake` only cold-starts
-        # this cache on unrelated sanitizer-triplet edits. We hash the specific
-        # `triplets/arm64-osx.cmake` instead: empty today (stable key), and
-        # auto-tracked the moment an arm64-osx overlay is ever added.
-        # Save side is the paired `actions/cache/save` step at the job tail
-        # — see comment on `Restore ccache` above for the save-always
-        # deprecation rationale.
-        id: cache-vcpkg-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/arm64-osx.cmake') }}
-          restore-keys: |
-            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
-            vcpkg-arm64-osx-
+      # No actions/cache round-trip for vcpkg. This job keeps actions/checkout's
+      # default clean:true (unlike the Linux/Windows legs' PR-5 clean:false,
+      # which is safe only with their companion branch-switch wipe step + vcpkg
+      # sentinel — not yet ported here), so vcpkg_installed/ is wiped each run.
+      # That's cheap: `vcpkg install` below restores it fast from the warm
+      # binary cache in runner.tool_cache, which lives OUTSIDE the workspace and
+      # so survives the clean. ccache likewise persists in the runner's HOME.
+      # Full clean:false incrementality on macOS is a deferred follow-up.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -937,7 +2109,18 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace on the self-hosted
+          # BigMags runner. Without this, lukka/run-vcpkg defaults to a per-run
+          # temp dir → 0% hit rate every run → every port rebuilt from source.
+          # runner.tool_cache survives actions/checkout's default clean.
+          # A trusted fork uses a per-run temp dir instead of the shared cache
+          # so an untrusted-fork build cannot poison the pool's binary cache;
+          # trusted (non-fork) runs resolve to the shared tool_cache dir.
+          # Mirrors the Linux/Windows self-hosted pattern verbatim. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
             --x-manifest-root=${{ github.workspace }}
@@ -956,7 +2139,19 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-macos
+        # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the
+        # Linux/Windows self-hosted legs. On BigMags this is load-bearing: 2 agents
+        # share 12 cores / 24 GiB, so an unbounded ninja (all cores per agent) can
+        # oversubscribe memory when both build at once. Guarded default keeps it
+        # bounded even if the var is unset (unlike the bare Linux/Windows form,
+        # because macOS is the only pool where uncontrolled -j risks OOM here).
+        # Cross-OS capture certification guard (PR #4112 review, blocker),
+        # folded into Build rather than a standalone step: see the linux
+        # job's identical Build step for the full rationale, including why
+        # a standalone step tripped CodeQL (CWE-349) here.
+        run: |
+          meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
+          bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
       # carry a system PostgreSQL, so prove the canary linked vcpkg's static
@@ -972,17 +2167,48 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres for server tests (ADR-0006 decision 8, #1318). GHA
-      # macOS runners have no docker; the script brew-installs
-      # postgresql@18 (bottle, ~1 min), boots a throwaway trust-auth
-      # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports
-      # YUZU_TEST_POSTGRES_DSN. Required since #1320 PR 1 (SOFT_EXIT=1) — a
-      # missing Postgres fails the job here, before the test step.
-      - name: Ensure Postgres (server tests)
-        run: bash scripts/ci/ensure-postgres.sh
+      # The server Postgres suite is DELIBERATELY NOT run on macOS (ADR-0035:
+      # the Yuzu server is a Linux-only component; macOS/Windows are agent-only
+      # platforms). macos-15 GHA runners have a SINGLE brew Postgres cluster,
+      # and the auth->Postgres migration (ADR-0006) ~doubled the [pg] test
+      # population to ~660 clone-bound cases (each does CREATE DATABASE ...
+      # TEMPLATE + DROP ... FORCE). One slow cluster cannot service that within
+      # the per-suite meson budget, and sharding does NOT help — parallel shards
+      # contend on the one cluster (both shards hit their 600s timeout, #2394).
+      # So we intentionally do NOT provision Postgres / export
+      # YUZU_TEST_POSTGRES_DSN here: every [pg] server test then SKIPS
+      # (env-unset -> skip, the same contract the Catch2 PG fixtures and
+      # tests/shell/test_mfa_reset.sh use), while the non-PG server suite
+      # (~[pg]), the agent suite, and the Apple-Clang compile all still run.
+      # Linux + Windows keep FULL [pg] coverage (multi-cluster, faster I/O).
+      # Do NOT re-add ensure-postgres here without first solving the
+      # single-cluster capacity problem — see the shard comment in
+      # tests/meson.build and docs/ci-architecture.md.
+      - name: Server Postgres suite skipped on macOS (ADR-0035; no DSN exported)
+        run: |
+          echo "macOS: server [pg] tests SKIP (YUZU_TEST_POSTGRES_DSN intentionally unset)."
+          echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
-        run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
+        # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
+        # the release+LTO build is co-resident after #3348), so give each test 2x
+        # meson's kill-timeout to absorb CPU/memory contention. Per tests/meson.build's
+        # own guidance, multiply for a slower environment rather than raising
+        # individual test `timeout:` kwargs. This ONLY covers a slow test being
+        # KILLED before it finishes — it does NOT help in-test wall-clock
+        # assertions (CHECK(elapsed < N), CHECK_FALSE(poll_until(...))), which flake
+        # on a loaded box and are fixed per-test (#3357, #2372, and the
+        # elapsed-ceiling issue).
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): same rationale as
+        # the Linux/Windows Test steps above. $GITHUB_WORKSPACE is set by the runner
+        # agent itself on self-hosted BigMags too, so this absolute path resolves the
+        # same way as on the GHA-hosted legs.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-macos/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2
 
       # Same rationale as the linux + windows upload steps: keep test
       # failures diagnosable when meson's `--print-errorlogs` truncation
@@ -1002,10 +2228,10 @@ jobs:
           # Informational only — never fail the job from here (set +e).
           set +e
           ccache -s
-          # Mirror the Linux/Windows job-summary (P3 observability). macOS is a
-          # GHA-hosted ephemeral runner with an actions/cache-backed ccache, so
-          # a cold restore is expected on a cache-key miss — no cold-cache
-          # ::warning:: here (that signal is self-hosted-only).
+          # Mirror the Linux/Windows job-summary (P3 observability). macOS now
+          # runs on the self-hosted BigMags pool with a persistent on-disk
+          # ccache in the runner user's HOME (~/Library/Caches/ccache), so a
+          # warm cache is the steady-state expectation across runs.
           s="$(ccache --print-stats 2>/dev/null)"
           get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
           hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
@@ -1024,24 +2250,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      # Paired saves for the two restore-only steps above. `if: always()`
-      # is the documented replacement for `save-always: true` and lets
-      # the cache populate even when Build/Test failed. The
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already matched on restore (no new content to save).
-      - name: Save ccache
-        if: always() && steps.cache-ccache-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ${{ steps.cache-ccache-macos.outputs.cache-primary-key }}
-
-      - name: Save vcpkg installed packages
-        if: always() && steps.cache-vcpkg-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
 
   # ── Docs-only required-check stubs (issue #1978) ──────────────────────
   # The linux/windows/macos required contexts are MATRIX-expanded names
@@ -1095,38 +2310,91 @@ jobs:
   # regressions are caught against a vanilla environment BEFORE the
   # change lands on main and becomes the next CI run for everyone.
   #
-  # Cache-warming rationale for the push-to-main trigger: GHA cache scope
-  # is branch-isolated. PR runs save to `refs/pull/<N>/merge`, which
-  # sibling PRs cannot read, so without a push-to-main run the canary's
-  # vcpkg + ccache caches never land on `refs/heads/main` and every PR
-  # cold-starts (~25 min from-source vcpkg). Running on push to main
-  # populates the default-branch cache scope, which every subsequent PR
-  # inherits as its restore fallback (~10 s warm restore). Limited to
-  # main only — dev pushes are pre-merge churn, the warm canonical state
-  # we want operators to inherit is what landed on main.
+  # Cache-warming rationale: GHA cache scope is branch-isolated. A PR job
+  # can read caches from (a) its own ref, (b) the repo's default branch,
+  # and (c) the PR's BASE branch — never a sibling PR's. PR runs save to
+  # `refs/pull/<N>/merge`, so without a push-triggered run the canary's
+  # vcpkg + ccache caches land in no scope any other PR can read, and
+  # every PR cold-starts (~65-70 min from-source vcpkg).
+  #
+  # Warmed on BOTH main and dev, and dev is the one that does the work:
+  # every PR bases on dev, so a dev-scoped entry is restorable by all of
+  # them. main-only warming was the original design and it silently
+  # stopped working — main has had no ci.yml run since 2026-07-11, so the
+  # warm scope was simply empty and each PR saved its own private ~843 MB
+  # copy of a byte-identical tree (six such duplicates were live at once,
+  # against a 10 GB repo cache cap).
+  #
+  # Known gap: the canary cache key hashes vcpkg.json /
+  # vcpkg-configuration.json / triplets/x64-linux.cmake, but the
+  # `ci-infrastructure` path class does not match those files. A manifest
+  # or baseline bump merged to dev therefore does not re-warm the new key
+  # until some unrelated CI-infra push lands.
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [trusted_inputs]
+    if: github.event_name == 'pull_request' || inputs.head_sha != '' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
       workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           fetch-depth: 0
           persist-credentials: false
       - id: detect
+        env:
+          TRUSTED_BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
+          TRUSTED_HEAD_SHA: ${{ inputs.head_sha }}
+          # Read via the environment rather than interpolated into the shell
+          # body: `github.event.*` expansion inside `run:` is what zizmor's
+          # template-injection audit flags.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          # PRs diff against the base ref; pushes diff against the SHA
-          # before the push (`github.event.before`). For push-to-main
-          # that's the previous main tip, which is exactly the boundary
-          # we want — anything in this push that touched CI infra needs
-          # to (re)warm the canary cache scope.
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
+          # Two different questions, so two different diffs.
+          #
+          # PUSH: "what did this push move" — two-dot against
+          # `github.event.before`, the previous tip. That boundary is exactly
+          # right, and a merge-base there would be wrong.
+          #
+          # PULL REQUEST: "what does this PR change" — three-dot from the fork
+          # point. `base.sha` is a LIVE branch tip, so two-dot additionally
+          # reports everything that landed on the base branch since the fork,
+          # and a PR that has merely fallen behind a dev which touched CI infra
+          # is misclassified (PR #3158 burned 1h30m of canary this way).
+          #
+          # The head object matters as much as the mode. This job checks out
+          # `refs/pull/<N>/merge` — the synthetic MERGE COMMIT — and `base.sha`
+          # is always an ancestor of it, so `merge-base(base.sha, HEAD)` is
+          # `base.sha` and three-dot collapses straight back to two-dot. Pass
+          # the PR HEAD explicitly or this whole branch is an inert no-op that
+          # still passes every test.
+          diff_mode=--git-diff-merge-base
+          diff_head="$PR_HEAD_SHA"
+          if [[ -n "$TRUSTED_HEAD_SHA" ]]; then
+            # Trusted-fork review: the checkout IS the real head, and the base
+            # comes from the live PR API rather than the event payload.
+            base_sha="$TRUSTED_BASE_SHA"
+            diff_head="$TRUSTED_HEAD_SHA"
+          elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$PR_BASE_SHA"
           else
-            base_sha="${{ github.event.before }}"
+            base_sha="$PUSH_BEFORE_SHA"
+            diff_mode=--git-diff
+            diff_head=HEAD
+          fi
+          # An empty head must NOT reach the classifier: its `${3:-HEAD}`
+          # default would substitute HEAD — the merge commit — reinstating the
+          # exact no-op this branch exists to avoid, silently. Fail closed.
+          if [[ -z "$diff_head" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No head SHA resolved for '$GITHUB_EVENT_NAME' — canary will run (fail-closed)."
+            exit 0
           fi
           # Defensive: a brand-new branch push has before = 40 zeros.
           # main is protected and never created from scratch in normal
@@ -1136,18 +2404,34 @@ jobs:
           if [[ "$base_sha" =~ ^0{40}$ ]]; then
             base_sha="HEAD~1"
           fi
-          if git diff --name-only "$base_sha"..HEAD \
-              | grep -qE '^\.github/(workflows|actions)/|^scripts/ci/'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "CI infrastructure changes detected — canary will run."
+          # The shared classifier owns both diff establishment and the named
+          # CI-infrastructure path class. It reports true on a bad/missing base
+          # so uncertainty runs the clean-host canary instead of skipping it.
+          # Also to the step summary: detect-ci-changes is NOT a required check,
+          # so a wrongly-skipped canary renders identically to a correctly-skipped
+          # one in the Checks tab and is otherwise only diagnosable by log-diving
+          # before retention expires.
+          echo "Classifying with $diff_mode base=$base_sha head=$diff_head"
+          echo "canary classification: mode=\`$diff_mode\` base=\`$base_sha\` head=\`$diff_head\`" >> "$GITHUB_STEP_SUMMARY"
+          if ! changed=$(bash scripts/ci/detect-code-change.sh \
+                --class ci-infrastructure "$diff_mode" "$base_sha" "$diff_head"); then
+            changed=true
+            echo "Classifier errored — canary will run (fail-closed)."
+          fi
+          if [[ "$changed" != "true" && "$changed" != "false" ]]; then
+            echo "Unexpected classifier result '$changed' — canary will run (fail-closed)."
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [[ "$changed" == "true" ]]; then
+            echo "CI infrastructure changes detected or diff uncertain — canary will run."
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No CI infrastructure changes — canary skipped."
           fi
 
   canary:
     name: "Workflow canary (GHA-hosted ubuntu-24.04)"
-    needs: [detect-ci-changes]
+    needs: [detect-ci-changes, trusted_inputs]
     if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
     runs-on: ubuntu-24.04
     # A genuinely cold cache builds the whole vcpkg closure from source on a
@@ -1158,9 +2442,32 @@ jobs:
     # cache saves rescued the next run. 120 min covers a cold build with
     # margin; warm runs still finish in ~6 min.
     timeout-minutes: 120
+    env:
+      # Override the workflow-level 30G (a self-hosted budget). This job is
+      # the ONLY writer to GitHub's 10 GB per-repo cache quota, and ccache
+      # only trims at MAXSIZE: without this cap the saved entry grows
+      # monotonically (measured 2.3-2.5 GB and climbing) and its copies
+      # crowd the quota until GitHub's LRU eviction takes them AND every
+      # other cache in the repo. One full canary build (~700 debug TUs,
+      # gcc-13, compressed) was ESTIMATED at 0.9-1.35 GB when the 2G cap
+      # was picked; that estimate was low. MEASURED 2026-09-02/03 across
+      # several warm, exact-key-hit runs: restored/working-set size sits
+      # at 2.2-2.6 GB, and the 'ccache stats (canary)' step after Build
+      # consistently showed the cap's own documented trigger for raising
+      # it — "Cache size" pegged at the ceiling (100%) with cleanups > 0
+      # (as high as 172 in one run) on an ordinary warm run, meaning the
+      # cap was trimming live, still-needed objects mid-build rather than
+      # just aging out stale ones. 3G sits above the measured working set
+      # with real margin while still bounding the entry at well under a
+      # third of the quota; ccache evicts its own oldest objects past the
+      # cap either way, so a too-low value costs wallclock (mid-build
+      # eviction churn), never correctness.
+      CCACHE_MAXSIZE: "3G"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           submodules: recursive
           persist-credentials: false
 
@@ -1170,10 +2477,27 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache \
-            bison flex libsystemd-dev autoconf automake libtool
+            bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # DELIBERATE NON-ADOPTION — do not "fix" this by pointing
+      # VCPKG_DEFAULT_BINARY_CACHE at a persisted path and caching that
+      # instead. It was measured and is worse here (#3229):
+      #   * this tree caches at 843 MB (5.2 GB on disk, compresses well);
+      #   * vcpkg's binary cache is ~1.8 GB across ~43 ALREADY-ZIPPED port
+      #     archives, so actions/cache compression buys ~nothing.
+      # That is ~2x the footprint for the same end state plus an extra
+      # 1-2 min of unpack, against a 10 GB per-repo cap we have already hit.
+      # The granularity it would buy (a manifest change rebuilding only the
+      # changed ports) is largely delivered already by the restore-keys prefix
+      # fallback below. vcpkg's native `x-gha` backend was considered too:
+      # same aggregate footprint, plus cache-service-v2 fragility against the
+      # pinned tool. Every other VCPKG_DEFAULT_BINARY_CACHE in this file is on
+      # a SELF-HOSTED runner where the dir persists for free — that pattern
+      # does not transplant to this fresh-disk GHA-hosted job, and its
+      # `needs.preflight.outputs.trusted_execution` ternary would silently
+      # evaluate empty here (this job's `needs:` has no `preflight`).
       - name: Restore vcpkg installed packages (canary)
         # Key tracks only what changes the canary's vcpkg output: the
         # manifest (vcpkg.json), the registry/baseline config
@@ -1192,6 +2516,20 @@ jobs:
         # — see comment on the macOS `Restore ccache` step (line ~564) for
         # the save-always deprecation rationale and the documented split
         # restore + always-save pattern.
+        #
+        # The bare `vcpkg-canary-x64-linux-` fallback below is the same
+        # open-prefix shape the ccache step a few lines down used to have
+        # (see that step's comment for why that's a risk). Not fixed here:
+        # `VCPKG_COMMIT` has never changed in this repo's history, so the
+        # path that would resurrect a dead-format entry has never fired —
+        # tracked as #3888.
+        #
+        # A miss here isn't announced anywhere a human would notice short of
+        # reading this step's raw log for "Cache not found" — a silent
+        # ~65-70 min cold rebuild reads as an unexplained slow job, not a
+        # flagged event. No aggregate signal for the shared cache pool's
+        # total usage exists either (would need an `actions: read`
+        # permission grant this job doesn't have). Both tracked as #3889.
         id: cache-vcpkg-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -1201,20 +2539,108 @@ jobs:
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-
 
+      - name: Compute ccache time bucket (canary)
+        # The ccache key deliberately does NOT hash sources any more. The
+        # source-hash key (previous design, #3270) never exact-hit on a repo
+        # doing ~75 commits/day, so EVERY canary run fell to the prefix
+        # restore-key and then saved a fresh multi-GB entry — measured
+        # 2026-09-01: 10+ live ~2.3 GB entries, the dominant share of a
+        # cache pool 7x over GitHub's 10 GB quota, whose LRU eviction then
+        # served the canary week-old entries (8-20 min degraded rebuilds,
+        # bimodal wallclock) and starved every other cache in the repo.
+        # ccache needs no source identity in the KEY — it hashes the real
+        # preprocessed input per object, so a stale entry can never yield a
+        # wrong object, only a smaller hit rate. (That guarantee is
+        # load-bearing on CCACHE_SLOPPINESS staying unset and compiler_check
+        # at its default for this job — a future sloppiness edit voids it,
+        # and the key design with it.) A rolling 3-DAY bucket (epoch days
+        # div 3 — no calendar alignment needed, the boundary is arbitrary):
+        # the bucket's first completed run saves, later runs exact-hit
+        # (skip the save) and absorb source drift via ccache's internal
+        # hashing. 3 days caps hit-rate decay at ~3 days of dev drift
+        # (operator call over a weekly bucket, whose Thu/Fri decay on a
+        # heavy week was the residual risk) while keeping live entries to
+        # ~2-3 per scope. At the 3G cap (raised from 2G — see the env
+        # block above) and ccache's own measured ~1.1-1.3x overshoot past
+        # its cap before a cleanup pass catches up, that's 2x3.3 to 3x3.9
+        # = ~6.6-11.7 GB of ccache alone in the worst case (both dimensions
+        # at their max simultaneously — an outer bound, not the expected
+        # case; every run observed this session sat at 1-2 live entries,
+        # not 3), before the ~2.24 GB vcpkg-canary entry or misc caches —
+        # the true worst case is OVER the 10 GB repo quota, not merely
+        # tight against it. vcpkg-canary is the more exposed entry if the
+        # pool is ever forced to evict (it restores earlier in the job, so
+        # it's the older of the two once a dead bucket ages out), and
+        # losing it costs a 65-70 min cold rebuild — far worse than the
+        # ccache churn this cap raise fixes. Daily buckets would re-crowd
+        # the quota further still. Verify on the first live 3G run:
+        # `Save ccache (canary)`'s archived-size log line comfortably
+        # under ~3.7 GB (deliberately below the ~3.9 GB single-entry
+        # ceiling above, to alarm on drift before a run actually reaches
+        # it) means the margin holds; near or over means either
+        # the overshoot ratio or the live-entry-count assumption above
+        # needs re-measuring, not the cap re-raised blind.
+        #
+        # PREV_BUCKET exists only to bound the restore-keys fallback below
+        # to the immediately preceding 3-day bucket — see that step for why
+        # an open-ended prefix fallback defeats the whole design. Both
+        # values are derived from ONE `date` call — two independent calls
+        # could straddle the bucket boundary (rare, and self-healing on
+        # the next run either way), but a single `now` removes the
+        # question entirely.
+        run: |
+          now="$(date -u +%s)"
+          echo "CCACHE_BUCKET=$(( now / 259200 ))" >> "$GITHUB_ENV"
+          echo "CCACHE_PREV_BUCKET=$(( now / 259200 - 1 ))" >> "$GITHUB_ENV"
+
       - name: Restore ccache (canary)
         # ccache is `apt-get install`-ed and used as the compiler wrapper
         # below, but the GHA-hosted runner is fresh-disk per job — without
         # this cache step every TU compiles cold every run. Mirrors the
-        # macOS pattern. Source-hash key triggers a fresh save on any
-        # source change but cascading restore-keys keep most of the cache
-        # warm. Closes the canary's biggest unforced-loss perf hole (#743).
+        # macOS pattern; 3-day-bucket key per the step above. Closes the
+        # canary's biggest unforced-loss perf hole (#743).
+        #
+        # #3269 (thin-entry occupancy) trade, decided deliberately: a run
+        # whose Build fails EARLY in a fresh bucket saves a thin entry that
+        # occupies the bucket's key until it rolls. Accepted because (a) the
+        # save gate below already excludes cancellations, the routine thin
+        # producer, (b) an early hard Build failure on the canary is rare
+        # (it builds merge refs that compile on the required legs), and
+        # (c) the blast radius is bounded to 3 days — the source-hash
+        # design this replaces had the unbounded-growth failure instead.
+        #
+        # restore-keys names the specific previous bucket, never a bare
+        # `ccache-canary-x64-linux-` prefix. (GitHub's restore-keys match by
+        # PREFIX, not exact string — but a bucket is a plain small integer,
+        # so the one named value can't accidentally prefix-match anything
+        # else live in the pool.) An open-ended prefix matches every entry
+        # this cache-type name has ever produced, including a dead one left
+        # behind by a since-changed key format (measured 2026-09-02: the
+        # pre-bucket source-hash entry from before this design shipped was
+        # still alive a day later, because every fallback hit refreshes
+        # GitHub's last-accessed clock and that clock is the only thing
+        # that ever ages a cache out — the entry was immortal by
+        # construction, ~2.4 GB of dead weight pinning the pool back near
+        # the 10 GB quota it took #3797 to clear). Pinning the fallback to
+        # one real, named bucket means anything else — an old format, an
+        # orphaned bucket several rolls back — is never touched again and
+        # ages out on GitHub's own 7-day-unused clock instead of living
+        # forever.
+        #
+        # This buys cold-start protection at a bucket rollover ONLY when
+        # the prior bucket actually saved something — every run in it
+        # cancelled, or dispatched trusted-fork-only (excluded from Save
+        # below), leaves nothing for PREV_BUCKET to find and this run
+        # builds fully cold. That's a silent, self-healing miss, not a
+        # regression: watch for it via `ccache -s`'s hit-rate output in the
+        # "ccache stats (canary)" step below, not this comment.
         id: cache-ccache-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          key: ccache-canary-x64-linux-${{ env.CCACHE_BUCKET }}
           restore-keys: |
-            ccache-canary-x64-linux-
+            ccache-canary-x64-linux-${{ env.CCACHE_PREV_BUCKET }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -1231,6 +2657,7 @@ jobs:
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
 
       - name: Install vcpkg packages
+        id: vcpkg-install-canary
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
@@ -1249,6 +2676,7 @@ jobs:
             -Dbuild_tests=true
 
       - name: Build
+        id: build-canary
         run: meson compile -C build-linux
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
@@ -1271,20 +2699,92 @@ jobs:
       # (linux_matrix, nightly asan/tsan/coverage). Skipping it here saves
       # ~10 min per canary run without reducing coverage. #743.
 
+      - name: ccache stats (canary)
+        # The only ccache leg previously WITHOUT a stats step. Load-bearing
+        # for the CCACHE_MAXSIZE sizing: the original 2G cap was estimated
+        # (one full canary build ~0.9-1.35 GB compressed), not measured —
+        # if "Cache size" here sits at the ceiling with cleanups > 0 on a
+        # warm run, the cap is trimming a live working set and should be
+        # raised. That's exactly what happened: measured 2026-09-02/03 at
+        # 2.0/2.0GB pegged with 172 cleanups on an ordinary warm run, cap
+        # raised to 3G — watch this same signal on 3G too (see the "Compute
+        # ccache time bucket" step's comment on the quota math this cap
+        # now sits against). Informational only; never fails the job.
+        if: always()
+        run: |
+          set +e
+          ccache -s
+          exit 0
+
       # Paired saves for the two restore-only steps above. `if: always()`
       # is the documented replacement for `save-always: true` and lets
       # the cache populate even when Build failed. The
       # `cache-hit != 'true'` gate skips the upload when the primary key
       # already matched on restore (no new content to save).
+      # `vcpkg_installed` is a COHERENT-ARTIFACT cache: a half-populated tree
+      # restores as though it were complete and poisons the key, and GHA cache
+      # keys are immutable so nothing can overwrite it afterwards. A canary
+      # cancelled mid-install did exactly that (run 32052590410 — cancelled at
+      # 259s, save still fired, wrote a 25 MB tree); every later run then got an
+      # exact hit, rebuilt all 12 heavy ports anyway, and skipped its own save.
+      # So gate on the INSTALL step's outcome, not the job's.
+      #
+      # The leading `always()` is load-bearing, not stylistic: an `if:` with no
+      # status function has an implicit `success()` ANDed on (CLAUDE.md standing
+      # invariant), which would also skip the save when only the *Build* step
+      # failed — even though the dependency tree is complete and worth keeping.
+      # Contrast the ccache save below, which stays on bare `always()` because a
+      # partial ccache is simply a smaller ccache.
       - name: Save vcpkg installed packages (canary)
-        if: always() && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+        # CWE-349 (GHSA cache-poisoning query, #3543/#4471): a trusted-fork-ci
+        # dispatch runs approved fork content through this same job. Its
+        # workflow_call runs in the CALLER's cache scope, which trusted_inputs
+        # confines to a throwaway trusted-fork/pr-<N> branch (#4471) that no
+        # dev/main/PR run can restore from — unlike a plain pull_request run,
+        # which the docs' "Cache access for low-trust workflow triggers"
+        # section confines to its own PR-scoped cache namespace. This gate is
+        # therefore defence in depth: a mis-scoped dispatch is refused before
+        # this job runs, and even inside the quarantine a fork's build output
+        # is never worth keeping. RESTORE above stays unconditional — reading
+        # a pre-existing entry cannot inject anything — only SAVE is gated.
+        # Mirrors the existing run-id-scoped `trusted_execution` ternary the
+        # self-hosted legs use for VCPKG_DEFAULT_BINARY_CACHE (this job has no
+        # such local-disk cache to isolate instead, since it's GHA-hosted).
+        if: >-
+          always()
+          && steps.vcpkg-install-canary.outcome == 'success'
+          && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+          && needs.trusted_inputs.outputs.trusted_execution != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
 
+      # ccache is ADDITIVE — every object in it is independently valid — so unlike
+      # the vcpkg tree above, a partial save is not a correctness problem. But key
+      # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
+      # once written, is exact-hit by every later run on the same key, which then
+      # skips its own save. The key is immutable and now a 3-DAY BUCKET (see the
+      # restore step), so a thin entry occupies its bucket until it rolls —
+      # longer-lived than under the old source-hash key, which #3269 tracked.
+      # Under `cancel-in-progress` on PRs, cancelled runs are the routine
+      # producer of thin entries.
+      #
+      # So: save when Build RAN, pass or fail — a failed build still produced
+      # objects worth keeping, which is why this is not `== 'success'`. Skip when
+      # Build was cancelled or never started. The cost is that a run cancelled
+      # after a long compile loses its cache; a superseding same-bucket push then
+      # exact-hits nothing (no entry was saved) and writes the bucket's entry
+      # itself, so the loss is one run's warmth, not the bucket's.
       - name: Save ccache (canary)
-        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        # Same CWE-349 gate as "Save vcpkg installed packages (canary)" above
+        # — a trusted-fork-ci dispatch must never write fork-built objects
+        # into the default branch's shared GitHub Actions cache scope.
+        if: >-
+          always()
+          && (steps.build-canary.outcome == 'success' || steps.build-canary.outcome == 'failure')
+          && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+          && needs.trusted_inputs.outputs.trusted_execution != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache

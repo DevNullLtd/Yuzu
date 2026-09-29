@@ -1,5 +1,15 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
+#include "ota_audit_key.hpp"
+
+#include "on_behalf_guard.hpp"
+#include "ota_transfer_rules.hpp"
+
+#include <algorithm>
+#include <string_view>
+
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
@@ -20,9 +30,14 @@
 #include "device_ci_ingestion.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
+#include "offline_endpoint_store.hpp" // HA WS-5: remove_if_session on disconnect
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
+#include "software_licensing_ingestion.hpp"
+#include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -52,7 +67,12 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
                                    UpdateRegistry* update_registry)
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), require_client_identity_(require_client_identity),
-      gateway_mode_(gateway_mode), update_registry_(update_registry) {}
+      gateway_mode_(gateway_mode), update_registry_(update_registry) {
+    // Build the OTA quota from the DEFAULT bounds so the DownloadUpdate path is
+    // bounded even when no operator config is applied and in every test that
+    // constructs this service directly. set_ota_bound_config() replaces it.
+    set_ota_bound_config(ota_cfg_);
+}
 
 // -- Register -----------------------------------------------------------------
 
@@ -190,7 +210,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     .counter("yuzu_enrollment_token_rejected_total",
                              {{"variant", "invalid_input_length"}})
                     .increment();
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -200,7 +220,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kWarn;
                     ae.attributes = {{"reason", "invalid_input_length"},
                                      {"token_length", enrollment_token.size()}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
                 response->set_accepted(false);
                 response->set_reject_reason(
@@ -286,7 +306,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 if (!audit_ok)
                     signal_grpc_audit_failed(context);
 
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
                     ae.agent_id = info.agent_id();
@@ -309,7 +329,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         attrs["already_consumed_by"] = already_consumed_by;
                     }
                     ae.attributes = std::move(attrs);
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
 
                 response->set_accepted(false);
@@ -355,7 +375,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
             if (!enroll_audit_ok) {
                 signal_grpc_audit_failed(context);
-                if (analytics_store_) {
+                if (auto analytics_store = analytics_store_.lock()) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_audit_dropped";
                     ae.agent_id = info.agent_id();
@@ -365,7 +385,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.severity = Severity::kError;
                     ae.attributes = {
                         {"result", "success"}, {"audit_emitted", false}, {"source", "direct"}};
-                    analytics_store_->emit(std::move(ae));
+                    analytics_store->emit(std::move(ae));
                 }
             }
 
@@ -421,14 +441,14 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_enrollment_status("pending");
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_pending";
                         ae.agent_id = info.agent_id();
                         ae.hostname = info.hostname();
                         ae.os = info.platform().os();
                         ae.arch = info.platform().arch();
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
                 }
@@ -444,7 +464,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
-                    if (analytics_store_) {
+                    if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_denied";
                         ae.agent_id = info.agent_id();
@@ -453,7 +473,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         ae.arch = info.platform().arch();
                         ae.severity = Severity::kWarn;
                         ae.attributes = {{"reason", "admin_denied"}};
-                        analytics_store_->emit(std::move(ae));
+                        analytics_store->emit(std::move(ae));
                     }
                     return grpc::Status::OK;
 
@@ -469,7 +489,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 enrolled:
     // -- Agent is enrolled -- proceed with registration --------------------------
 
-    registry_.register_agent(info);
+    // #3401 Gap 2: register_agent fails closed if the W1.5/#823 device-token revoke sweep
+    // itself errors — refuse the registration rather than install a session the sweep could
+    // not clear stale tokens for. UNAVAILABLE (not accepted=false / reject_reason, which the
+    // agent treats as a PERMANENT rejection, agent.cpp:1649-1657) so the agent retries with its
+    // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
+    if (auto reg_result = registry_.register_agent(info); !reg_result) {
+        spdlog::error("Register: register_agent failed for '{}': {}", info.agent_id(),
+                      reg_result.error());
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            "registration temporarily unavailable");
+    }
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
@@ -481,7 +511,7 @@ enrolled:
     if (fleet_topology_store_)
         fleet_topology_store_->invalidate();
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.registered";
         ae.agent_id = info.agent_id();
@@ -497,17 +527,27 @@ enrolled:
             plugins_list.push_back(p.name());
         }
         ae.payload = {{"plugins", plugins_list}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
-    // Create notification for agent enrollment
-    if (notification_store_ && notification_store_->is_open()) {
+    // Create notification for FIRST enrollment only (#3261 governance
+    // hardening, Gate 4 happy-path + unhappy-path UP-3). Unconditional on
+    // is_reauth would fire "Agent Enrolled" on every gRPC reconnect - a
+    // server restart with N connected agents floods the (unreaper'd,
+    // docs/enterprise-readiness-soc2-first-customer.md:316) notification
+    // feed with N rows for zero new enrollments. This is deliberately
+    // narrower than the webhook/offload suppression below: `agent.registered`
+    // firing on reauth IS the documented contract
+    // (docs/user-manual/rest-api.md's webhook/offload sections say "enrolls
+    // or re-enrolls"), so only the dashboard-toast side is gated here.
+    if (!is_reauth && notification_store_ && notification_store_->is_open()) {
         notification_store_->create("success", "Agent Enrolled",
                                     "Agent " + info.agent_id() + " (" + info.hostname() +
                                         ") enrolled successfully");
     }
 
-    // Fire webhook + offload for agent enrollment.
+    // Fire webhook + offload for agent enrollment (documented to fire on
+    // both first enrollment AND re-enrollment - see the comment above).
     //
     // Both sinks receive the same serialised body; we build the JSON +
     // dump it ONCE (perf-S1) outside either guard so that one sink being
@@ -528,13 +568,25 @@ enrolled:
         }
     }
 
-    // Sync agent-reported tags to persistent TagStore
+    // Sync agent-reported tags to persistent TagStore. A failed sync cannot
+    // fail the Register RPC (enrollment must not hinge on a tag write), but
+    // it is surfaced rather than swallowed — the sync rolled back
+    // atomically, so the agent keeps its PRIOR complete tag set and
+    // re-syncs on its next Register. Observability is this warn line ONLY:
+    // write-path failures have no counter (yuzu_server_tag_store_read_
+    // degrade_total is reads-only — governance sec-L1/sre-2; a wave-level
+    // write-degrade-metric decision is tracked as follow-up, deliberately
+    // not a one-store one-off here).
     if (tag_store_ && !info.scopable_tags().empty()) {
         std::unordered_map<std::string, std::string> tags;
         for (const auto& [k, v] : info.scopable_tags()) {
             tags[k] = v;
         }
-        tag_store_->sync_agent_tags(info.agent_id(), tags);
+        if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
+            spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
+                         "re-syncs on next Register",
+                         info.agent_id(), sync.error());
+        }
     }
 
     auto session_id =
@@ -696,6 +748,11 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
 
     response->set_received(true);
 
+    // Reject abusive source-map cardinality before any typed store sees the
+    // report. The empty ack deliberately avoids a resend-amplification loop.
+    if (!validate_inventory_report_source_count(agent_id, *request, &metrics_))
+        return grpc::Status::OK;
+
     // Each typed source ingests through its own shared seam (ADR-0016 §5) — the SAME
     // seam the gateway ProxyInventory path uses — independently guarded + isolated, so
     // one store being down or one payload being bad can't fail the RPC into a retry
@@ -704,8 +761,9 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
     //
     // INTENTIONAL ASYMMETRY (gov architect A-1 / consistency S1): neither direct path
     // upserts *generic* (non-typed) plugin_data keys into the generic InventoryStore.
-    // The three live sources (installed_software, app_perf, device_ci) are TYPED and
-    // routed through their typed seams on both paths, so the two paths stay symmetric;
+    // The live sources (installed_software, app_perf, device_ci, software_licensing)
+    // are TYPED and routed through their typed seams on both paths, so the two paths
+    // stay symmetric;
     // a future GENERIC source must fold its upsert into ingest_inventory_report (pass the
     // InventoryStore&), not add a parallel loop here.
     if (software_inventory_store_ && software_inventory_store_->is_open()) {
@@ -746,6 +804,40 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
                          agent_id);
         }
     }
+    if (software_licensing_store_ && software_licensing_store_->is_open()) {
+        try {
+            ingest_software_licensing_report(*software_licensing_store_, agent_id, *request,
+                                             *response, &metrics_);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReportInventory: software_licensing ingest threw for agent {} — "
+                         "acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("ReportInventory: software_licensing ingest threw unknown exception for "
+                         "agent {} — acked",
+                         agent_id);
+        }
+    }
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            // P11: unlike the sibling blocks above, a swallowed throw here with no
+            // nack lets the agent's SyncScheduler advance last_hash and go
+            // hash-only for a day with nothing persisted — the nack forces a full
+            // resend next cycle. Follow-up issue filed at delivery to retrofit the
+            // four sibling blocks (installed_software/app_perf/device_ci/
+            // software_licensing) with the same nack; do not do it here.
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw for agent {} — nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw unknown exception for agent {} "
+                         "— nacked",
+                         agent_id);
+        }
+    }
     spdlog::debug("ReportInventory from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
 }
@@ -774,7 +866,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     // PR3: revoked-cert gate. The presented client leaf IS the agent's mTLS
     // identity (issued bound to agent_id at enrollment). If its serial is on the
     // CRL the whole data plane is closed to it — reject before any registry work.
-    // Independent of pending_mu_: reads only the gRPC auth context + ca.db, so it
+    // Independent of pending_mu_: reads only the gRPC auth context + ca_store, so it
     // runs BEFORE the plane lock is taken (no cross-store query under the lock,
     // gov #1117). No-op when no cert is presented or no checker is wired.
     if (revocation_checker_) {
@@ -1114,13 +1206,13 @@ grpc::Status AgentServiceImpl::Subscribe(
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         AnalyticsEvent ae;
         ae.event_type = "agent.connected";
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.attributes = {{"via", "direct"}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     // Read loop -- process responses from the agent
@@ -1148,7 +1240,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // response-store / executions path.
             if (guaranteed_state_store_)
                 ingest_guardian_response(*guaranteed_state_store_, agent_id, resp,
-                                         blast_radius_detector_, dex_alert_router_);
+                                         blast_radius_detector_, dex_alert_router_, &metrics_);
             continue;
         }
         // Solicited __guard__ replies (push_rules / reconcile carry a command_id)
@@ -1169,6 +1261,19 @@ grpc::Status AgentServiceImpl::Subscribe(
                 auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
                 bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
                                            html_escape(ms) + " ms</strong>");
+                continue;
+            }
+            // CHAOS-TTL-1 (PR #3784 fix round, ADR-1007): the agent's
+            // concurrency-claim keepalive thread (agents/core/src/agent.cpp)
+            // sends a bare RUNNING with this exact output sentinel, on a
+            // fixed interval, independent of any real plugin progress. It
+            // exists SOLELY to feed ExecutionTracker::renew_concurrency_claim
+            // via notify_exec_tracker below — it is not a response row (no
+            // output for the executions drawer/SSE to show) and must not be
+            // stored, published as output, or counted as an analytics event,
+            // same reasoning as the __timing__ intercept above.
+            if (resp.output() == "__keepalive__") {
+                notify_exec_tracker(resp.command_id(), agent_id, resp);
                 continue;
             }
 
@@ -1200,17 +1305,14 @@ grpc::Status AgentServiceImpl::Subscribe(
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
+                sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                 sr.output = resp.output();
                 sr.plugin = plugin;
-                // PR 2: stamp execution_id from the dispatch-time mapping so
-                // the executions detail drawer can correlate exactly.
-                {
-                    std::lock_guard lock(cmd_times_mu_);
-                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                        eit != cmd_execution_ids_.end()) {
-                        sr.execution_id = eit->second;
-                    }
-                }
+                // PR 2 / HA WS-1(1b): stamp execution_id from the PG-backed
+                // command_execution table so the executions detail drawer
+                // can correlate exactly, on any replica.
+                if (auto eid = resolve_execution_id(resp.command_id()))
+                    sr.execution_id = *eid;
                 response_store_->store(sr);
             }
 
@@ -1219,14 +1321,14 @@ grpc::Status AgentServiceImpl::Subscribe(
             // `agent-transition` event fires for live updates.
             notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.response";
                 ae.agent_id = agent_id;
                 ae.plugin = plugin;
                 ae.correlation_id = resp.command_id();
                 ae.payload = {{"output_bytes", resp.output().size()}};
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
         } else {
@@ -1240,20 +1342,16 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.has_error()) {
                     err_detail = resp.error().message();
                 }
-                // PR 2: resolve execution_id from the dispatch-time mapping.
-                // Do NOT erase on terminal status — a single command_id
-                // can produce N terminal responses (one per agent in
-                // fan-out); erasing on the first agent's terminal would
-                // cause agents 2..N to stamp empty execution_id (HF-1).
-                // Map entries persist until a future sweeper (PR 2.x).
+                // PR 2 / HA WS-1(1b): resolve execution_id from the
+                // PG-backed command_execution table. Do NOT delete on
+                // terminal status — a single command_id can produce N
+                // terminal responses (one per agent in fan-out); deleting on
+                // the first agent's terminal would leave agents 2..N with no
+                // execution_id to stamp (HF-1). The row ages out via
+                // ExecutionTracker::reap_command_execution_mappings instead.
                 std::string current_exec;
-                {
-                    std::lock_guard lock(cmd_times_mu_);
-                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                        eit != cmd_execution_ids_.end()) {
-                        current_exec = eit->second;
-                    }
-                }
+                if (auto eid = resolve_execution_id(resp.command_id()))
+                    current_exec = *eid;
                 // Terminal frame with no output: update the existing
                 // RUNNING rows in place — the data is already there.
                 // Persisting an empty-output row whose status enum reads
@@ -1269,7 +1367,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.output().empty()) {
                     finalize_result = response_store_->finalize_terminal_status(
                         resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
-                        current_exec);
+                        current_exec, static_cast<int>(resp.plugin_result_status()));
                 }
                 if (finalize_result == FR::NoRow) {
                     // No prior RUNNING row (terminal-only command) or the
@@ -1278,6 +1376,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.instruction_id = resp.command_id();
                     sr.agent_id = agent_id;
                     sr.status = static_cast<int>(resp.status());
+                    sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                     sr.output = resp.output();
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
@@ -1305,7 +1404,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                                    "</span>");
             }
 
-            if (analytics_store_) {
+            if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.completed";
                 ae.agent_id = agent_id;
@@ -1317,7 +1416,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.has_error()) {
                     ae.payload["error_message"] = resp.error().message();
                 }
-                analytics_store_->emit(std::move(ae));
+                analytics_store->emit(std::move(ae));
             }
 
             // Create notification on execution failure
@@ -1363,7 +1462,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                         .observe(static_cast<double>(total_ms) / 1000.0);
                     bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                                std::to_string(total_ms) + " ms</strong>");
-                    cmd_send_times_.erase(it);
+                    erase_send_time_locked(it);
                 }
                 cmd_first_seen_.erase(resp.command_id());
             }
@@ -1373,7 +1472,24 @@ grpc::Status AgentServiceImpl::Subscribe(
     // Agent disconnected — use session-aware cleanup so a stale Subscribe
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
-    registry_.remove_agent_if_session(agent_id, session_id);
+    const bool removed_current_session = registry_.remove_agent_if_session(agent_id, session_id);
+    // HA WS-5 (ADR-2002 §7a): mirror the departure into the durable presence
+    // row too, session-guarded — so a graceful disconnect on a single
+    // replica leaves scope-evaluation's outcome unchanged from pre-WS-5
+    // behavior (the row would otherwise linger, matched, until the presence
+    // TTL expires; see evaluate_scope's presence merge in agent_registry.cpp).
+    //
+    // Gated on removed_current_session (external review finding, 2026-09-22):
+    // the durable row's session_id is heartbeat-driven, not registration-
+    // driven (heartbeat_ingestion.cpp), so on an ordinary same-replica
+    // reconnect (this session S1 superseded locally by a new S2 that hasn't
+    // heartbeated yet) the row can still read S1's session_id — an
+    // unconditional delete here would remove a LIVE agent's presence row.
+    // A false (session mismatch — S1 already superseded) means this
+    // disconnect notice is stale and must NOT touch the durable row at all.
+    if (removed_current_session && heartbeat_ingestion_)
+        if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
+            offline->remove_if_session(agent_id, session_id);
     // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
     // Without this, deregistered agents render as ghost cubes
     // indefinitely from the cached last-known-good snapshot.
@@ -1381,7 +1497,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         fleet_topology_store_->evict_pushed(agent_id);
     spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
-    if (analytics_store_) {
+    if (auto analytics_store = analytics_store_.lock()) {
         auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - subscribe_start)
                                     .count();
@@ -1390,7 +1506,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         ae.agent_id = agent_id;
         ae.session_id = session_id;
         ae.payload = {{"session_duration_ms", session_duration}};
-        analytics_store_->emit(std::move(ae));
+        analytics_store->emit(std::move(ae));
     }
 
     return grpc::Status::OK;
@@ -1402,18 +1518,74 @@ void AgentServiceImpl::record_send_time(const std::string& command_id) {
     std::lock_guard lock(cmd_times_mu_);
     cmd_send_times_[command_id] = std::chrono::steady_clock::now();
     output_row_count_.store(0, std::memory_order_relaxed);
+    publish_send_times_gauge_locked();
 }
 
-// -- record_execution_id (PR 2) -----------------------------------------------
+// -- discard_send_time (#2557) -------------------------------------------------
+
+void AgentServiceImpl::erase_send_time_locked(
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it) {
+    cmd_send_times_.erase(it);
+    publish_send_times_gauge_locked();
+}
+
+void AgentServiceImpl::publish_send_times_gauge_locked() {
+    metrics_.gauge("yuzu_cmd_send_times_pending")
+        .set(static_cast<double>(cmd_send_times_.size()));
+}
+
+bool AgentServiceImpl::discard_send_time(const std::string& command_id) {
+    std::lock_guard lock(cmd_times_mu_);
+    auto it = cmd_send_times_.find(command_id);
+    if (it == cmd_send_times_.end())
+        return false;
+    erase_send_time_locked(it);
+    return true;
+}
+
+// -- resolve_execution_id (HA WS-1(1b), ADR-2002 section 5) ------------------
+
+std::optional<std::string>
+AgentServiceImpl::resolve_execution_id(const std::string& command_id) const {
+    // Atomic snapshot — see notify_exec_tracker's identical load for the
+    // detached gateway-forward-thread rationale (governance UAT 2026-05-06
+    // Gate 7 re-review HIGH).
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    if (!tracker)
+        return std::nullopt;
+    // Distinguish a STORE DEGRADE from an ordinary miss (adversarial
+    // review Should-fix, PR #3780): this is the hot path, hit on every
+    // CommandResponse, and a nullopt here was previously indistinguishable
+    // from the common "out-of-band dispatch" case. A sustained degrade now
+    // counts, mirroring the write path's yuzu_exec_correlation_write_degrade_total.
+    std::string degrade_reason;
+    auto result = tracker->lookup_execution_id(command_id, &degrade_reason);
+    if (!degrade_reason.empty())
+        metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", degrade_reason}})
+            .increment();
+    return result;
+}
+
+// -- record_execution_id (PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --
 
 void AgentServiceImpl::record_execution_id(const std::string& command_id,
                                            const std::string& execution_id) {
-    std::lock_guard lock(cmd_times_mu_);
-    if (execution_id.empty()) {
-        cmd_execution_ids_.erase(command_id);
-    } else {
-        cmd_execution_ids_[command_id] = execution_id;
-    }
+    // Atomic snapshot — see notify_exec_tracker's identical load for the
+    // detached gateway-forward-thread rationale (governance UAT 2026-05-06
+    // Gate 7 re-review HIGH). A null tracker (not wired, or mid-shutdown)
+    // means the correlation is simply not recorded — same no-op posture the
+    // former in-process map had before this dispatch's first write.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    if (!tracker)
+        return;
+    // Best-effort: a false return degrades observability for this one
+    // command (see record_command_execution's doc comment) and is
+    // deliberately not propagated to the dispatch caller — it is counted
+    // here so a sustained write-side degrade is visible in Prometheus
+    // (governance Gate 4/6 finding: previously log-only, asymmetric with
+    // the reap path's yuzu_exec_correlation_store_degrade_total).
+    if (!tracker->record_command_execution(command_id, execution_id))
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
 }
 
 // -- process_gateway_response -------------------------------------------------
@@ -1428,6 +1600,13 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
             bus_.publish("timing", "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
                                        html_escape(ms) + " ms</strong>");
+            return;
+        }
+        // CHAOS-TTL-1 — see the direct-Subscribe twin of this intercept above
+        // (this function's own doc comment names it "the gateway-streamed
+        // RUNNING" path); same sentinel, same reasoning.
+        if (resp.output() == "__keepalive__") {
+            notify_exec_tracker(resp.command_id(), agent_id, resp);
             return;
         }
 
@@ -1455,30 +1634,27 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.instruction_id = resp.command_id();
             sr.agent_id = agent_id;
             sr.status = static_cast<int>(resp.status());
+            sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
             sr.output = resp.output();
             sr.plugin = plugin;
-            // PR 2: streaming response — keep the mapping until completion.
-            {
-                std::lock_guard lock(cmd_times_mu_);
-                if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                    eit != cmd_execution_ids_.end()) {
-                    sr.execution_id = eit->second;
-                }
-            }
+            // PR 2 / HA WS-1(1b): streaming response — keep the mapping
+            // until completion (PG-backed, shared across replicas).
+            if (auto eid = resolve_execution_id(resp.command_id()))
+                sr.execution_id = *eid;
             response_store_->store(sr);
         }
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.response";
             ae.agent_id = agent_id;
             ae.plugin = plugin;
             ae.correlation_id = resp.command_id();
             ae.payload = {{"output_bytes", resp.output().size()}};
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
     } else {
         spdlog::info("[gateway] Command {} completed: status={}, exit_code={}", resp.command_id(),
@@ -1490,18 +1666,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 err_detail = resp.error().message();
             }
-            // PR 2: stamp execution_id from the dispatch-time mapping.
-            // Do NOT erase on terminal status (HF-1) — multi-agent
-            // fan-out produces N terminal responses; entries persist
-            // until a future sweeper (PR 2.x) lands.
+            // PR 2 / HA WS-1(1b): resolve execution_id from the
+            // PG-backed command_execution table. Do NOT delete on
+            // terminal status (HF-1) — multi-agent fan-out produces N
+            // terminal responses; the row ages out via
+            // ExecutionTracker::reap_command_execution_mappings instead.
             std::string current_exec;
-            {
-                std::lock_guard lock(cmd_times_mu_);
-                if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                    eit != cmd_execution_ids_.end()) {
-                    current_exec = eit->second;
-                }
-            }
+            if (auto eid = resolve_execution_id(resp.command_id()))
+                current_exec = *eid;
             // Terminal frame with no output: update existing RUNNING row(s)
             // instead of inserting a separate empty-output sentinel that
             // operators misread as a failure (UAT 2026-05-06). Tri-state
@@ -1511,13 +1683,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.output().empty()) {
                 finalize_result = response_store_->finalize_terminal_status(
                     resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
-                    current_exec);
+                    current_exec, static_cast<int>(resp.plugin_result_status()));
             }
             if (finalize_result == FR::NoRow) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
+                sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                 sr.output = resp.output();
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
@@ -1540,7 +1713,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                                "</span>");
         }
 
-        if (analytics_store_) {
+        if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
             ae.event_type = "command.completed";
             ae.agent_id = agent_id;
@@ -1552,7 +1725,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 ae.payload["error_message"] = resp.error().message();
             }
-            analytics_store_->emit(std::move(ae));
+            analytics_store->emit(std::move(ae));
         }
 
         if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
@@ -1594,7 +1767,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                     .observe(static_cast<double>(total_ms) / 1000.0);
                 bus_.publish("timing", "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
                                            std::to_string(total_ms) + " ms</strong>");
-                cmd_send_times_.erase(it);
+                erase_send_time_locked(it);
             }
             cmd_first_seen_.erase(resp.command_id());
         }
@@ -1672,15 +1845,76 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (!tracker)
         return;
-    std::string execution_id;
-    {
-        std::lock_guard lock(cmd_times_mu_);
-        if (auto eit = cmd_execution_ids_.find(command_id); eit != cmd_execution_ids_.end()) {
-            execution_id = eit->second;
+    // HA WS-1(1b): resolved from the PG-backed command_execution table
+    // (shared across replicas), not an in-process map — a response landing
+    // on a different server instance than the one that dispatched it now
+    // still resolves.
+    auto execution_id_opt = resolve_execution_id(command_id);
+    if (!execution_id_opt || execution_id_opt->empty()) {
+        // ADR-1007 by-command concurrency-claim fallback (originally UP-1,
+        // unhappy-path Gate 4 finding, PR #3784 fix round — reconciled onto
+        // HA WS-1(1b) above; the fallback's ORIGINAL trigger, a server
+        // restart losing an in-process `cmd_execution_ids_` map, is now the
+        // PG-backed `command_execution` table's own job and no longer needs
+        // this fallback's help). What still reaches here, genuinely: (1)
+        // every workflow-step dispatch (`workflow_routes.cpp`), which
+        // always passes an empty `execution_id` (CONSIST-2/sec-M2), so
+        // `record_execution_id` never records a mapping for it and
+        // `resolve_execution_id` correctly returns nullopt — this is the
+        // ONLY release path a workflow-step per-device claim ever reaches;
+        // (2) a genuine degrade on `command_execution`'s own write or
+        // read side (pool exhaustion, a query failure), which this fallback
+        // also transparently covers since it doesn't depend on that table
+        // having succeeded; and (3) `command_execution`'s own bounded
+        // retention (`reap_command_execution_mappings`, a fixed 24h window)
+        // aging a mapping out from under a command that is STILL
+        // legitimately running past that window (ADR-1007 supports
+        // unbounded "run until finished" dispatch) — the mapping's reap has
+        // nothing to do with whether the command finished. The
+        // concurrency-claim safety property does not have to share any of
+        // these fates: `command_id` rides on every response
+        // independent of this table, and `(command_id, agent_id)` is a
+        // DB-enforced-unique match key (see
+        // release_concurrency_claim_by_command's doc comment) — so route
+        // release/renewal through it directly. A no-op if no open claim
+        // matches (ordinary out-of-band dispatch that never took one).
+        // Releases immediately on a genuine terminal response rather than
+        // waiting for the reconciler.
+        //
+        // `__guard__-` skip (Fable adversarial-review finding, PR #3784 fix
+        // round): every `__guard__.*` dispatch (push_rules / reconcile,
+        // server.cpp) is minted under this reserved double-underscore
+        // prefix and NEVER goes through the per-device concurrency gate —
+        // confirmed no `__guard__`-plugin definition can carry
+        // `concurrency_mode: per-device` (guard pushes are system-caller,
+        // definition-less dispatch). Skipping it here avoids a wasted
+        // write-pool lease + UPDATE on every guard push/reconcile response
+        // (routine, high-frequency) for a claim that can structurally never
+        // exist. Deliberately NOT extended to `tar-` (Fable's other
+        // candidate): `tar` is also a REAL agent plugin name
+        // (agents/plugins/tar) that a per-device-gated definition could in
+        // principle target — a string-prefix skip there would risk
+        // silently skipping a legitimate release if that ever happens, and
+        // nothing in the code (only today's content library) guarantees it
+        // won't. See ADR-1007 for the fuller note.
+        if (command_id.starts_with("__guard__-"))
+            return;
+        switch (resp.status()) {
+        case pb::CommandResponse::RUNNING:
+            tracker->renew_concurrency_claim_by_command(command_id, agent_id);
+            break;
+        case pb::CommandResponse::SUCCESS:
+        case pb::CommandResponse::FAILURE:
+        case pb::CommandResponse::TIMEOUT:
+        case pb::CommandResponse::REJECTED:
+            tracker->release_concurrency_claim_by_command(command_id, agent_id);
+            break;
+        default:
+            break;
         }
-    }
-    if (execution_id.empty())
         return; // out-of-band dispatch, nothing to publish
+    }
+    const std::string& execution_id = *execution_id_opt;
 
     // Compliance-check correlation ids ("polchk-…", minted by PolicyEvaluator)
     // are NOT operator executions: the evaluator tags responses with this id only
@@ -1729,6 +1963,11 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     s.agent_id = agent_id;
     s.dispatched_at = 0; // upsert keeps prior value if non-zero
     s.exit_code = resp.exit_code();
+    // CC-07: mirror the wire enum straight through — both are small,
+    // stable, append-only integer enums (agent.proto's PluginResultStatus /
+    // sdk/include/yuzu/plugin.h's YuzuResultStatus), so no separate mapping
+    // table is needed to avoid drift; 0 in both is PLUGIN_RESULT_UNDECLARED.
+    s.plugin_result_status = static_cast<int>(resp.plugin_result_status());
     if (resp.has_error()) {
         s.error_detail = resp.error().message();
     }
@@ -1873,6 +2112,13 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     if (auto s = reject_revoked_peer(context, "check_for_update"); !s.ok())
         return s;
 
+    // #416: positive identity + agent_id/certificate binding. Inert unless the
+    // agent listener requires a client certificate. agent_id matters here even
+    // though this RPC streams nothing: it selects rollout eligibility below.
+    if (auto s = require_positive_ota_identity(context, "check_for_update", request->agent_id());
+        !s.ok())
+        return s;
+
     if (!update_registry_) {
         response->set_update_available(false);
         return grpc::Status::OK;
@@ -1901,6 +2147,42 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     response->set_eligible(eligible);
     response->set_file_size(latest->file_size);
 
+    // The detached signature, when the operator uploaded one (#416/#3807).
+    //
+    // Read fresh from the sidecar rather than cached: it is a few KB against an
+    // RPC an agent makes every six hours, and a cache would be one more place
+    // for the signature to go stale relative to the binary it covers. A missing
+    // sidecar is the ordinary unsigned case, not an error — the AGENT decides
+    // whether that is acceptable, since this server is not the authority on its
+    // own packages' authenticity.
+    {
+        const auto sig_path = update_registry_->signature_path(*latest);
+        std::string sig;
+        switch (read_signature_sidecar(sig_path, sig)) {
+        case SidecarOutcome::kServed:
+            response->set_update_signature(std::move(sig));
+            break;
+        case SidecarOutcome::kAbsent:
+            break; // the ordinary unsigned case
+        case SidecarOutcome::kOverCap:
+            // NOT "missing" — an absent sidecar is the separate, deliberately
+            // silent kAbsent branch above. Naming it here sends an operator
+            // investigating an oversized or irregular file looking for one that
+            // is not there.
+            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (over the {} "
+                          "byte cap, or not a regular file); serving as unsigned",
+                          latest->filename, kMaxSignatureBytes);
+            break;
+        case SidecarOutcome::kUnreadable:
+            // Present but unreadable is worth a log: the operator believes this
+            // package is signed and every agent will be told it is not.
+            spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
+                         "serving the package as unsigned",
+                         latest->filename);
+            break;
+        }
+    }
+
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
                  request->agent_id(), request->current_version(), latest->version, eligible,
                  latest->mandatory);
@@ -1918,26 +2200,160 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     // PR3: a revoked agent must not be able to pull the agent binary over the OTA
-    // path. (Requiring a *positive* identity here — not just non-revocation — is a
-    // tracked follow-up that pairs with the centralised identity interceptor.)
+    // path.
     if (auto s = reject_revoked_peer(context, "download_update"); !s.ok())
         return s;
 
+    // #416: positive identity + agent_id/certificate binding. Inert unless the
+    // agent listener requires a client certificate.
+    if (auto s = require_positive_ota_identity(context, "download_update", request->agent_id());
+        !s.ok())
+        return s;
+
+    // ── Per-peer admission (#913) ───────────────────────────────────────────
+    const auto admission_key = ota_admission_key(*context);
+    const std::string& ota_key = admission_key.key;
+    metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", admission_key.mode}})
+        .increment();
+
+    // SERVER-WIDE cap first — it is the only bound that does not scale with the
+    // caller's address space. The per-peer gate below bounds one identity, but
+    // where the identity gate is inert the key falls back to source IP, so a
+    // caller with a /24 buys 256 independent per-peer budgets. This one is flat.
+    // Taken before the per-peer bucket so a refused transfer spends no token.
+    const bool cert_keyed = std::string_view(admission_key.mode) == "cert";
+    auto total = ota_total_admission_.try_acquire(ota_cfg_.max_concurrent_total,
+                                                  ota_cfg_.cert_reserve_pct, cert_keyed);
+    if (!total.admitted) {
+        metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "rejected_total"}})
+            .increment();
+        if (should_log_ota_rejection())
+            spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
+                         "(in_flight={} cap={} cert_keyed={} key={}) [sampled]",
+                         total.observed_in_flight, total.effective_cap, cert_keyed,
+                         onbehalf::sanitize_for_log(ota_key));
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "server OTA transfer capacity exceeded");
+    }
+
+    auto slot = ota_quota_.try_acquire(ota_key, QuotaSide::kEngine);
+
+    // Published on EVERY call, admitted or not. Updating it only on the admit
+    // path left it stale exactly when the map is under pressure — which is the
+    // one condition YuzuOtaPeerMapNearCapacity exists to observe, since a peer
+    // storm large enough to fill the map is also the case most likely to be
+    // rejected rather than admitted.
+    metrics_.gauge("yuzu_ota_download_peers_tracked")
+        .set(static_cast<double>(ota_quota_.principal_count()));
+
+    if (!slot.admitted()) {
+        const bool by_concurrency = slot.decision().limit == QuotaLimit::kConcurrency;
+        metrics_
+            .counter("yuzu_ota_download_admission_total",
+                     {{"decision", by_concurrency ? "rejected_concurrency" : "rejected_rate"}})
+            .increment();
+        // Name the peer. Admission rejections are deliberately metric-only (no
+        // audit row — see docs/user-manual/audit-log.md), and the metric labels are
+        // bounded, so without this line a YuzuOtaConcurrencyRejections page has NO
+        // path from alert to peer.
+        //
+        // SAMPLED, because the obvious justification for logging every one is
+        // wrong: the cap bounds concurrent ADMISSIONS, not rejections — a refused
+        // request returns immediately, so rejections are bounded only by inbound
+        // request rate, and the file sink is a non-rotating basic_logger_mt. One
+        // peer looping refused pulls would grow the log without limit. The metric
+        // is the complete count; this line exists for ATTRIBUTION, and the first
+        // occurrence plus a periodic sample gives an operator the identity they
+        // need without making the log the failure.
+        if (should_log_ota_rejection())
+            spdlog::warn("DownloadUpdate: rejected by per-peer {} bound "
+                         "(key={} mode={} retry_after_ms={}) [sampled]",
+                         by_concurrency ? "concurrency" : "rate",
+                         onbehalf::sanitize_for_log(ota_key), admission_key.mode,
+                         slot.decision().retry_after_ms);
+        // One wire status for both dimensions, and a REJECT rather than a queue:
+        // queueing at capacity would hold the very thread the cap exists to free.
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "per-peer OTA download limit exceeded");
+    }
+    metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "admitted"}}).increment();
+
+    // The concurrency slot is held by `slot` for the rest of this function and
+    // released by its destructor on EVERY exit path, including the early returns
+    // below — that is the whole reason it is an RAII reservation.
+    //
+    // The rate token is charged at admission and given back on SERVER-attributable
+    // failure only. Metering our own failures would let an honest but unlucky
+    // agent spend itself into a lockout, which is exactly the pathology recorded
+    // on #934 (7.5h) and #941 (75min). Idempotent: several exit paths refund, and
+    // a double refund would mint quota.
+    bool refunded = false;
+    auto refund_token = [&](const char* reason) {
+        if (refunded)
+            return;
+        refunded = true;
+        ota_quota_.refund(ota_key);
+        // Its OWN family, deliberately not a `decision="refunded"` label on the
+        // admission counter: a refunded request already incremented
+        // `decision="admitted"`, so folding refunds in there stops `decision`
+        // being a partition and makes sum(admission_total) double-count. The
+        // `reason` label is also what makes the refund invariant checkable —
+        // #939 wants deadline charges compared against deadline refunds, which
+        // a single undifferentiated "refunded" bucket cannot express.
+        metrics_.counter("yuzu_ota_download_refund_total", {{"reason", reason}}).increment();
+    };
+
     if (!update_registry_) {
+        refund_token("registry_unavailable"); // nothing streamed, and not the peer's doing
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
     }
 
     auto pkg = update_registry_->latest_for(request->platform().os(), request->platform().arch());
     if (!pkg || pkg->version != request->version()) {
+        // Refunded even though the peer chose the version: nothing was streamed,
+        // so no capacity was consumed, and the bucket meters WORK DONE rather
+        // than requests attempted. A staged rollout routinely has agents asking
+        // for versions this server does not hold; charging for that would drain
+        // their buckets against zero cost. Parallel probing is already bounded by
+        // the concurrency cap, which is the dimension that matters here.
+        refund_token("version_not_found");
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
     }
 
+    // KNOWN LIMITATION, and its consequence is worse than the read itself.
+    //
+    // This read is blocking and cannot be interrupted: TryCancel does not unblock
+    // read(2), and O_NONBLOCK is a no-op for a regular file. That is UP-112, which
+    // ships mitigated rather than closed. What is NOT obvious, and is recorded here
+    // because it bit a review: a wedged read holds this peer's QuotaSlot for the
+    // process lifetime, because the slot is released by scope exit and the scope
+    // never exits. So that peer is refused RESOURCE_EXHAUSTED on every subsequent
+    // pull until restart, and at --ota-max-concurrent-per-peer=1 a single hang is
+    // permanent for that peer.
+    //
+    // What bounds the damage: the server-wide cap above (one wedged handler is one
+    // of --ota-max-concurrent-total, not an unbounded drain), and the per-peer cap
+    // (the blast radius is that peer, not the fleet). What does NOT bound it: the
+    // transfer watchdog, which fires, marks the registration cancelled, and cannot
+    // do anything about a thread parked in the kernel.
+    //
+    // Operators: keep OTA artifacts on local storage. The runbook says so.
     auto file_path = update_registry_->binary_path(*pkg);
     std::ifstream file(file_path, std::ios::binary);
     if (!file) {
         spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
+        refund_token("package_missing"); // server-side artifact problem
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
     }
+
+    // ── Transfer deadline (#911 UP-101) ─────────────────────────────────────
+    // Scoped to exactly this function body: the watchdog can only ever TryCancel a
+    // context whose handler frame is still live, because this registration erases
+    // itself before the frame returns. See ota_transfer_watchdog.hpp's LIFETIME
+    // note — the agent hit the equivalent use-after-free in cancel_ctx().
+    auto transfer_guard = ota_watchdog_.register_transfer(
+        [context] { context->TryCancel(); },
+        std::chrono::steady_clock::now() + ota_cfg_.transfer_deadline);
 
     constexpr std::size_t kChunkSize = 64 * 1024; // 64KB
     std::vector<char> buffer(kChunkSize);
@@ -1950,9 +2366,49 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         chunk.set_offset(offset);
         chunk.set_total_size(pkg->file_size);
 
-        if (!writer->Write(chunk)) {
-            spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
-            return grpc::Status::CANCELLED;
+        // Time the Write. A peer whose receive window is open but tiny completes
+        // every Write slowly; the whole-transfer deadline would eventually catch
+        // that, but this bails at the first clearly-stalled chunk instead of
+        // holding the thread for the entire budget.
+        const auto write_started = std::chrono::steady_clock::now();
+        const bool wrote = writer->Write(chunk);
+        const auto write_elapsed = std::chrono::steady_clock::now() - write_started;
+
+        // The decision itself lives in ota_transfer_rules.hpp so every branch is
+        // reachable by a test without a package on disk (which would drag in
+        // UpdateRegistry and a PgPool). This is the thin caller: classify, then
+        // act. A Write unblocked by our own TryCancel and one that failed because
+        // the peer hung up are INDISTINGUISHABLE at the return value, which is
+        // why the watchdog's verdict is an input.
+        const auto outcome = ota::classify_write(wrote, transfer_guard.cancelled(), write_elapsed,
+                                                 ota_cfg_.chunk_stall_deadline);
+
+        if (ota::is_terminal(outcome)) {
+            if (const char* phase = ota::deadline_phase(outcome)) {
+                metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", phase}})
+                    .increment();
+            }
+            if (const char* reason = ota::refund_reason(outcome))
+                refund_token(reason);
+
+            switch (outcome) {
+            case ota::TransferOutcome::kTransferDeadline:
+                spdlog::warn("DownloadUpdate: transfer deadline exceeded at offset {}", offset);
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "OTA transfer deadline exceeded");
+            case ota::TransferOutcome::kChunkStalled:
+                spdlog::warn(
+                    "DownloadUpdate: chunk write stalled {}s at offset {}, aborting",
+                    std::chrono::duration_cast<std::chrono::seconds>(write_elapsed).count(),
+                    offset);
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "OTA chunk write deadline exceeded");
+            case ota::TransferOutcome::kPeerDisconnected:
+                spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
+                return grpc::Status::CANCELLED;
+            case ota::TransferOutcome::kContinue:
+                break; // unreachable: is_terminal() excluded it
+            }
         }
 
         offset += file.gcount();
@@ -1964,6 +2420,220 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
 }
 
 // -- Private helpers ----------------------------------------------------------
+
+void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
+    ota_cfg_ = cfg;
+    // Drive the eviction counter at the moment the ceiling bites. Sampling
+    // evicted_count() instead would lose every eviction between samples, and a
+    // sampled cumulative value cannot honestly be exported as a counter.
+    // Capturing `this` is safe: the quota is a member, so it cannot outlive us.
+    ota_quota_.set_on_evict(
+        [this] { metrics_.counter("yuzu_ota_download_peers_evicted_total").increment(); });
+    ota_quota_.set_config(PrincipalQuotaConfig{
+        .max_concurrency = cfg.max_concurrent_per_peer,
+        // PrincipalQuota refills per SECOND; the OTA knob is per MINUTE because
+        // that is the scale an operator reasons about for a fleet-update pull.
+        .rate_per_second = cfg.rate_refill_per_min / 60.0,
+        .burst = cfg.rate_capacity,
+        .idle_evict_seconds = 3600,
+        // Clamp UP: see OtaBoundConfig::max_peers_tracked. A too-small ceiling
+        // silently disables the rate dimension rather than merely shrinking a cache.
+        .max_tracked = std::max(cfg.max_peers_tracked, kMinPeersTracked),
+    });
+}
+
+bool AgentServiceImpl::should_log_ota_rejection() {
+    // Log the first rejection, then one in every kOtaRejectionLogSample. Cheap
+    // (one relaxed atomic increment), lock-free, and it keeps the log bounded to
+    // O(rejections / sample) without hiding the condition — the metric carries the
+    // exact count, and YuzuOtaConcurrencyRejections alerts off the metric, not off
+    // the log. The first-occurrence case matters because an operator paged at 03:00
+    // needs an identity immediately, not after the sample interval.
+    const auto n = ota_rejection_log_seq_.fetch_add(1, std::memory_order_relaxed);
+    return n == 0 || (n % kOtaRejectionLogSample) == 0;
+}
+
+AgentServiceImpl::AdmissionKey
+AgentServiceImpl::ota_admission_key(const grpc::ServerContext& ctx) const {
+    const auto idents = extract_peer_identities(ctx);
+    if (!idents.empty())
+        return AdmissionKey{idents.front(), "cert"};
+
+    // No client certificate. Fall back to peer IP rather than an empty shared
+    // key — see the header comment on this function (#935).
+    std::string ip = extract_peer_ip(ctx.peer());
+    if (!ip.empty())
+        return AdmissionKey{std::move(ip), "peer_ip"};
+
+    // Neither a certificate nor a parseable peer. This is REACHABLE, not merely
+    // defensive: extract_peer_ip returns empty for any scheme that is not ipv4/ipv6
+    // (see peer_ip.hpp), so a unix-socket listen address collapses every caller
+    // onto this one bucket — 2 concurrent transfers for the whole fleet. Yuzu
+    // configures a TCP listener, so it does not arise in a supported deployment,
+    // and the mode label makes it visible if it ever does.
+    return AdmissionKey{std::string("unknown"), "unknown"};
+}
+
+grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext* context,
+                                                             std::string_view rpc,
+                                                             const std::string& claimed_agent_id) {
+    if (!require_positive_ota_identity_ || !context)
+        return grpc::Status::OK;
+
+    // `code` is a parameter because the rejections are not all the same KIND.
+    // A missing/mismatched identity is UNAUTHENTICATED; an absent required field
+    // is INVALID_ARGUMENT, matching what Register already returns for the same
+    // empty-agent_id condition. Collapsing both onto one code would tell an agent
+    // its certificate was rejected when in fact its request was malformed.
+    auto deny = [&](grpc::StatusCode code, const char* reason, const char* message) {
+        // event=security: unlike an admission rejection (expected steady state,
+        // operational), a failed identity bind on an already-enrolled agent's OTA
+        // pull is an authentication signal. Mirrors yuzu_grpc_revoked_cert_total.
+        metrics_
+            .counter("yuzu_grpc_ota_identity_rejected_total",
+                     {{"event", "security"}, {"rpc", std::string(rpc)}, {"reason", reason}})
+            .increment();
+        // SANITIZED, not merely truncated. This value is attacker-chosen and it
+        // lands in the file the OTA runbook names as the only attribution path for
+        // these rejections, so a raw write lets a caller embed newlines and forge
+        // log lines that are indistinguishable from real ones. sanitize_for_log
+        // replaces control characters and bounds the length.
+        spdlog::warn("{} rejected: {} (agent_id={})", rpc, reason,
+                     onbehalf::sanitize_for_log(claimed_agent_id));
+
+        // WHICH REJECTIONS GET AN AUDIT ROW, and why this is not all of them.
+        //
+        // The audit write is SYNCHRONOUS and PostgreSQL-backed, and this gate runs
+        // BEFORE the per-peer admission bound — so an unbounded stream of denials
+        // here would pin gRPC threads on the audit path, which is the exact vector
+        // this change exists to close. Two distinct floods reach it: an attacker
+        // looping a certless or mismatched pull (sec-2), and a fleet-wide identity
+        // drift after a mass re-image, which needs no attacker at all and scales
+        // with fleet size (UP-4).
+        //
+        // `no_client_identity` — no cert at all — has no principal to attribute,
+        // is the cheapest case to forge in volume, and is left metric-only. That
+        // is the same split reject_revoked_peer already makes for `heartbeat` ("a
+        // flood must not hammer the WAL") and the no-resolvable-principal
+        // carve-out in docs/observability-conventions.md.
+        //
+        // RATE-BOUNDED, and the earlier justification for not bounding it was
+        // wrong. It claimed the audited reasons were "bounded by the size of the
+        // issued-certificate population"; they are bounded by the number of
+        // REQUESTS. One enrolled agent holding a valid certificate can loop
+        // CheckForUpdate — which has no admission bound at all — with a mismatched
+        // agent_id and drive one synchronous Postgres write per call, ahead of
+        // every other bound. That is the vector this change exists to close, so
+        // the write is gated on a small per-PEER bucket. The METRIC still counts
+        // every rejection, so suppression is visible as a gap between the counter
+        // and the row count, never as a missing signal.
+        //
+        // The bucket key is the PEER, never the claimed agent_id: see the member's
+        // own comment. Keying on the claim let a caller varying it per request mint
+        // a fresh, always-admitting bucket every time.
+        //
+        // ORDER MATTERS on both counts. The store check comes FIRST so a token is
+        // never spent on a denial that could not have been written anyway, and the
+        // key comes from the shared composer so the peer/reason namespacing cannot
+        // drift — see ota_audit_key.hpp for what went wrong twice here.
+        //
+        // The limiter is consulted on REASON alone, before any check on whether a
+        // store is wired. Consulting it store-first would be marginally cheaper —
+        // no token is spent on a denial that could not have been written — but it
+        // would also make the bound unobservable without Postgres, and this bound
+        // has now shipped broken twice. A suppression counter that only moves on
+        // deployments with an audit store is not a counter anyone tests. The cost
+        // of the trade is one map entry per (rpc, reason, peer) on a server with
+        // no audit store, which the same handshake price already bounds.
+        bool audit_worthy = false;
+        if (std::string_view(reason) != "no_client_identity") {
+            const auto peer = ota_admission_key(*context);
+            audit_worthy = ota_identity_audit_limiter_.allow(
+                ota_identity_audit_key(rpc, reason, peer.mode, peer.key));
+            if (!audit_worthy) {
+                // The operator-facing half of the trade documented in audit-log.md
+                // and metrics.md: rows are sampled under a flood, and THIS is how
+                // an operator sees that it is happening rather than inferring it
+                // from a gap between two other numbers.
+                metrics_
+                    .counter("yuzu_ota_identity_audit_suppressed_total",
+                             {{"rpc", std::string(rpc)}, {"reason", reason}})
+                    .increment();
+            }
+        }
+        if (audit_worthy && audit_store_ && audit_store_->is_open()) {
+            const auto ids = extract_peer_identities(*context);
+            const std::string cert_id = ids.empty() ? std::string{} : ids.front();
+            AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            // Clamp: Register's kMaxAgentIdLength gate is Register-only, so an
+            // unclamped body value would let a peer inflate every audit row it
+            // provokes (the W1.4/UP-H1 defect, on a new surface).
+            ev.principal =
+                "agent:" + (cert_id.empty() ? claimed_agent_id.substr(0, auth::kMaxAgentIdLength)
+                                            : cert_id);
+            ev.principal_role = "agent";
+            // session.* keeps this inside the CC7.2 auth-sample export, which
+            // filters on that prefix (see AuditQuery::action_prefixes).
+            //
+            // Deliberately NOT session.identity_mismatch: that verb is already
+            // taken by the Subscribe mTLS binding check and carries a different
+            // detail shape (presented=[...] bound=[...]). Reusing it would put
+            // two different detail formats under one action, which breaks any
+            // consumer parsing that field.
+            ev.action = "session.ota_identity_rejected";
+            ev.target_type = "AgentCertificate";
+            ev.target_id = cert_id;
+            ev.detail = std::string("reason=").append(reason).append(" rpc=").append(rpc);
+            ev.source_ip = extract_peer_ip(context->peer());
+            ev.result = "denied";
+            if (!audit_store_->log(ev))
+                signal_grpc_audit_failed(context);
+        }
+        return grpc::Status(code, message);
+    };
+
+    const auto idents = extract_peer_identities(*context);
+    if (idents.empty()) {
+        // The listener requires a client certificate, so a peer without an
+        // identity here is anomalous rather than a bootstrap case. Register keeps
+        // its bootstrap exemption; an OTA pull has none, because an agent pulling
+        // an update is by definition already enrolled.
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "no_client_identity",
+                    "client certificate required");
+    }
+
+    // Hermes CRITICAL-1, same reasoning as Register: in a multi-CA trust bundle a
+    // foreign certificate carrying a spoofed CN=<agent_id> must not be accepted
+    // as a Yuzu agent identity. When no recognizer is wired (operator-supplied
+    // single trust root) every authenticated cert is an agent — legacy behaviour.
+    const std::string peer_pem = extract_peer_cert_pem(*context);
+    if (peer_cert_recognizer_ && !peer_cert_recognizer_(peer_pem))
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "foreign_ca",
+                    "client certificate was not issued by this server's CA");
+
+    // An ABSENT claim is refused rather than waved through. Skipping the bind on
+    // an empty agent_id would make the whole check evadable by omission: the
+    // protobuf default is the empty string, and CheckForUpdate feeds that value
+    // straight to UpdateRegistry::is_eligible(), so a caller that simply omits
+    // the field would pick its own rollout bucket while presenting a valid
+    // certificate. Register already refuses an empty agent_id for the same
+    // reason (see the kMaxAgentIdLength gate at the top of this file); this is
+    // the OTA sibling of that rule.
+    if (claimed_agent_id.empty())
+        return deny(grpc::StatusCode::INVALID_ARGUMENT, "agent_id_missing", "agent_id is required");
+
+    // Bind the request-body agent_id to the certificate. Until this, agent_id was
+    // client-supplied and unverified, yet it drives rollout eligibility
+    // (UpdateRegistry::is_eligible) and is logged as the acting identity.
+    if (!peer_identity_matches_agent_id(*context, claimed_agent_id))
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "agent_id_mismatch",
+                    "agent_id must match client certificate identity (CN/SAN)");
+
+    return grpc::Status::OK;
+}
 
 std::vector<std::string>
 AgentServiceImpl::extract_peer_identities(const grpc::ServerContext& context) {

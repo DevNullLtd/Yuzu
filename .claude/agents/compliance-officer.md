@@ -55,9 +55,10 @@ Produce a **Compliance Review** with:
 ## Key Files
 - `docs/enterprise-readiness-soc2-first-customer.md` — Control framework and workstreams
 - `server/core/src/audit_store.cpp` — Audit event generation
-- `server/core/src/rbac.cpp` — Access control implementation
+- `server/core/src/rbac_store.cpp` — Access control implementation
 - `server/core/src/rest_api_v1.cpp` — API auth enforcement
-- `server/core/src/session_manager.cpp` — Session lifecycle
+- `server/core/src/auth.cpp` + `server/core/src/session_store.cpp` + `server/core/src/auth_routes.cpp` — Session lifecycle (login, logout, step-up entry points in `auth_routes.cpp`)
+- `server/core/src/mfa_step_up.cpp` + `server/core/src/api_token_store.cpp` — Authentication strength and API token lifecycle
 - `.github/workflows/` — CI/CD pipeline controls
 - `deploy/` — Deployment configurations and hardening
 

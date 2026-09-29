@@ -13,6 +13,8 @@
 
 #include "tar_proc_es.hpp"
 
+#include <yuzu/agent/es_client.hpp> // yuzu::agent::{es_seq_gap,es_stream_is_stalled,kEsIdleFallbackSeconds} (A0 relocation)
+
 #include <string>
 
 namespace yuzu::tar {
@@ -64,27 +66,15 @@ std::string resolve_uid_cached(std::unordered_map<std::uint32_t, std::string>& c
     return name;
 }
 
-std::uint64_t es_seq_gap(std::uint64_t last_seq, std::uint64_t seq) noexcept {
-    // Only a strict forward jump is a kernel drop; equal/decreasing seq (a client
-    // re-create resets the per-type counter) yields 0 rather than underflowing.
-    return seq > last_seq + 1 ? seq - last_seq - 1 : 0;
-}
-
-bool es_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts,
-                          std::int64_t now, std::int64_t threshold_seconds) noexcept {
-    const std::int64_t since = (last_event_ts != 0) ? last_event_ts : started_ts;
-    if (since <= 0)
-        return false; // never started / clock uninitialised — don't fall back blindly
-    return (now - since) > threshold_seconds;
-}
-
 } // namespace yuzu::tar
 
-// The real ES client compiles only where the EndpointSecurity framework is
-// available (full Xcode SDK; detected by meson → -DYUZU_HAVE_ENDPOINT_SECURITY).
-// On macOS without it (Command Line Tools SDK) and on every non-Apple platform,
-// the no-op path below is used and start() returns false so the caller falls back
-// to the sysctl process poll.
+// The real ES client compiles only where the ES SDK is detected by meson
+// (-DYUZU_HAVE_ENDPOINT_SECURITY) -- the ES lib+header pair ships in BOTH the
+// Command Line Tools and full Xcode SDKs ("needs full Xcode" is a myth; see
+// docs/darwin-compat.md's EndpointSecurity row). On macOS with no ES SDK
+// detected, and on every non-Apple platform, the no-op path below is used
+// and start() returns false so the caller falls back to the sysctl process
+// poll.
 #if defined(__APPLE__) && defined(YUZU_HAVE_ENDPOINT_SECURITY)
 
 #include <EndpointSecurity/EndpointSecurity.h>
@@ -124,13 +114,6 @@ const char* es_new_client_err(es_new_client_result_t r) {
     default:                                      return "unknown";
     }
 }
-
-// Endpoint Security idle-fallback threshold (see ProcEsCollector::stalled). A
-// NOTIFY-only ES client exposes no liveness API, so prolonged TOTAL silence is the
-// only "presumed dead" signal available. Sized well beyond any plausible quiet
-// period so a healthy stream on a legitimately idle host is not falsely dropped to
-// the inferior poll. Revisit once a real liveness signal exists (#1455).
-constexpr std::int64_t kEsIdleFallbackSeconds = 3600; // 1 hour with zero events
 
 // uid → username via getpwuid_r, with an ERANGE-driven growing buffer (a
 // directory-joined Mac can return a passwd record larger than the initial guess).
@@ -202,7 +185,8 @@ struct ProcEsCollector::Impl {
     void note_seq(es_event_type_t type, std::uint64_t seq) {
         auto it = last_seq.find(type);
         if (it != last_seq.end())
-            kernel_dropped->fetch_add(es_seq_gap(it->second, seq), std::memory_order_relaxed);
+            kernel_dropped->fetch_add(yuzu::agent::es_seq_gap(it->second, seq),
+                                      std::memory_order_relaxed);
         last_seq[type] = seq;
     }
 
@@ -381,14 +365,14 @@ bool ProcEsCollector::stalled() const noexcept {
     // avoid demoting a HEALTHY stream to the inferior poll until the agent restarts.
     // The health atomics are collector-owned, so reading them here is impl_-free.
     const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
-    return es_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
-                                started_ts_.load(std::memory_order_relaxed),
-                                now, kEsIdleFallbackSeconds);
+    return yuzu::agent::es_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
+                                             started_ts_.load(std::memory_order_relaxed), now,
+                                             yuzu::agent::kEsIdleFallbackSeconds);
 }
 
 } // namespace yuzu::tar
 
-#else // no Endpoint Security (non-Apple, or macOS without the Xcode SDK framework)
+#else // no Endpoint Security (non-Apple, or the build-time ES probe found no ES SDK)
 
 namespace yuzu::tar {
 

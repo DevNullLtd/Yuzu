@@ -302,7 +302,7 @@ std::string render_verify_drill(const PairedComparison& c, bool truncated) {
     for (const auto& p : c.pairs) { // engine already sorts largest CPU mover first
         const std::string dc = cpu_dir(p.cpu_delta);
         const std::string dw = ws_dir(p.ws_delta);
-        h += "<tr><td><a href=\"/device?id=" + esc(p.agent_id) +
+        h += "<tr><td><a href=\"/hardware/ci?id=" + esc(p.agent_id) +
              "\" style=\"color:#cfdbe8;border-bottom:1px dotted #36507e;text-decoration:none\">" +
              esc(p.agent_id) + "</a></td>";
         h += "<td class=\"n\">" + fmt_pct(p.cpu_before) + "</td>";

@@ -7,7 +7,8 @@
  * Platform support:
  *   Windows -- GetExtendedTcpTable + GetExtendedUdpTable (IP Helper API)
  *   Linux   -- /proc/net/{tcp,tcp6,udp,udp6} + /proc/[pid]/fd inode mapping
- *   macOS   -- proc_listallpids + proc_pidfdinfo (libproc)
+ *   macOS   -- libproc, via the shared agents/shared/macos_socket_walk.hpp
+ *              walk (#3403 dedupe)
  */
 
 #include "tar_collectors.hpp"
@@ -50,9 +51,12 @@
 #define NETLINK_SOCK_DIAG 4
 #endif
 #elif defined(__APPLE__)
-#include <arpa/inet.h>
-#include <libproc.h>
-#include <sys/proc_info.h>
+#include <macos_socket_walk.hpp> // shared libproc socket walk (#3403 dedupe)
+// netqual (per-connection quality) + tcp lifecycle event stream (roadmap
+// 2.2) — the plugin-owned NstatClient, reached via a registered pointer (see
+// netqual_nstat_register_client in tar_collectors.hpp).
+#include "tar_netqual_nstat.hpp"
+#include <atomic>
 #elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -537,151 +541,94 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
 
 std::string_view netqual_effective_capture_method() { return "inetdiag"; }
 
+// nstat (tar_netqual_nstat.hpp) is macOS-only; the plugin still calls
+// netqual_nstat_register_client() unconditionally at init/shutdown (matching
+// NstatClient's own "inert off-macOS" contract), so this TU needs a body on
+// every platform it compiles for.
+void netqual_nstat_register_client(NstatClient*) {}
+
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
 
 namespace {
 
-constexpr std::string_view tcp_state_str_mac(int st) noexcept {
-    switch (st) {
-    case 0:  return "CLOSED";
-    case 1:  return "LISTEN";
-    case 2:  return "SYN_SENT";
-    case 3:  return "SYN_RECV";
-    case 4:  return "ESTABLISHED";
-    case 5:  return "CLOSE_WAIT";
-    case 6:  return "FIN_WAIT1";
-    case 7:  return "CLOSING";
-    case 8:  return "LAST_ACK";
-    case 9:  return "FIN_WAIT2";
-    case 10: return "TIME_WAIT";
-    default: return "UNKNOWN";
-    }
-}
-
-std::string format_addr4(const struct in_addr& addr) {
-    char buf[INET_ADDRSTRLEN]{};
-    inet_ntop(AF_INET, &addr, buf, sizeof(buf));
-    return buf;
-}
-
-std::string format_addr6(const struct in6_addr& addr) {
-    char buf[INET6_ADDRSTRLEN]{};
-    inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
-    return buf;
-}
+// The plugin-owned NstatClient (roadmap 2.2), reached via
+// netqual_nstat_register_client() — see tar_collectors.hpp for the ownership
+// contract. Non-owning: set/cleared only by tar_plugin.cpp's init()/shutdown().
+std::atomic<NstatClient*> g_nstat_client{nullptr};
 
 } // namespace
 
+void netqual_nstat_register_client(NstatClient* client) {
+    g_nstat_client.store(client, std::memory_order_release);
+}
+
+// The libproc walk now rides the shared agents/shared/macos_socket_walk.hpp
+// helper (#3403 dedupe, PR3.1-b) instead of an inline copy -- byte-parity
+// with the pre-migration output (walk_sockets(dedup=true) matches the
+// removed inline walk's fork-dedup behaviour: same key shape, first PID
+// wins). Roadmap 2.2 makes nstat the PRIMARY tcp connection-lifecycle source
+// when the plugin's NstatClient is running() and system_wide() -- that drain
+// lives in tar_plugin.cpp's collect_fast tcp leg (mirrors the
+// ES-stream-with-poll-fallback shape used for process_live), not here. This
+// poll keeps its job unconditionally: it is the tcp lifecycle fallback/seed
+// whenever nstat is not primary, the ONLY source for udp/udp6 (nstat's TCP
+// provider has no UDP counterpart), and the full live snapshot
+// fleet_snapshot reads directly.
 std::vector<NetConnection> enumerate_connections() {
     std::vector<NetConnection> result;
-    std::unordered_map<std::string, bool> seen;
-
-    int pid_count = proc_listallpids(nullptr, 0);
-    if (pid_count <= 0)
-        return result;
-
-    std::vector<pid_t> pids(static_cast<size_t>(pid_count) * 2);
-    pid_count = proc_listallpids(pids.data(), static_cast<int>(pids.size() * sizeof(pid_t)));
-    if (pid_count <= 0)
-        return result;
-    pids.resize(static_cast<size_t>(pid_count));
-
-    // NOTE: TOCTOU race is inherent to the proc_listallpids + proc_pidinfo
-    // approach on macOS. A process can exit between the listing and the FD
-    // enumeration. The `continue` on error is the correct mitigation -- we
-    // simply skip PIDs that have disappeared and log at debug level.
-    for (pid_t pid : pids) {
-        int buf_size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nullptr, 0);
-        if (buf_size <= 0) {
-            spdlog::debug("TAR: PID {} disappeared before FD enumeration (TOCTOU)", pid);
-            continue;
-        }
-
-        auto fd_count = static_cast<size_t>(buf_size) / sizeof(struct proc_fdinfo);
-        std::vector<struct proc_fdinfo> fds(fd_count);
-        int actual = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.data(),
-                                  static_cast<int>(fds.size() * sizeof(struct proc_fdinfo)));
-        if (actual <= 0) {
-            spdlog::debug("TAR: PID {} disappeared during FD read (TOCTOU)", pid);
-            continue;
-        }
-        fd_count = static_cast<size_t>(actual) / sizeof(struct proc_fdinfo);
-
-        for (size_t i = 0; i < fd_count; ++i) {
-            if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET)
-                continue;
-
-            struct socket_fdinfo si{};
-            int si_size = proc_pidfdinfo(pid, fds[i].proc_fd,
-                                         PROC_PIDFDSOCKETINFO, &si, sizeof(si));
-            if (si_size < static_cast<int>(sizeof(si)))
-                continue;
-
-            int family = si.psi.soi_family;
-            if (family != AF_INET && family != AF_INET6)
-                continue;
-
-            int kind = si.psi.soi_kind;
-            bool is_tcp = (kind == SOCKINFO_TCP);
-            bool is_udp = (kind == SOCKINFO_IN);
-            if (!is_tcp && !is_udp)
-                continue;
-
-            NetConnection nc;
-            nc.pid = static_cast<uint32_t>(pid);
-
-            if (is_tcp) {
-                auto& tcp = si.psi.soi_proto.pri_tcp;
-                nc.state = tcp_state_str_mac(tcp.tcpsi_state);
-
-                if (family == AF_INET) {
-                    nc.proto = "tcp";
-                    nc.local_addr = format_addr4(tcp.tcpsi_ini.insi_laddr.ina_46.i46a_addr4);
-                    nc.remote_addr = format_addr4(tcp.tcpsi_ini.insi_faddr.ina_46.i46a_addr4);
-                } else {
-                    nc.proto = "tcp6";
-                    nc.local_addr = format_addr6(tcp.tcpsi_ini.insi_laddr.ina_6);
-                    nc.remote_addr = format_addr6(tcp.tcpsi_ini.insi_faddr.ina_6);
-                }
-                nc.local_port = ntohs(static_cast<uint16_t>(tcp.tcpsi_ini.insi_lport));
-                nc.remote_port = ntohs(static_cast<uint16_t>(tcp.tcpsi_ini.insi_fport));
-            } else {
-                auto& inp = si.psi.soi_proto.pri_in;
-
-                if (family == AF_INET) {
-                    nc.proto = "udp";
-                    nc.local_addr = format_addr4(inp.insi_laddr.ina_46.i46a_addr4);
-                    nc.remote_addr = "*";
-                } else {
-                    nc.proto = "udp6";
-                    nc.local_addr = format_addr6(inp.insi_laddr.ina_6);
-                    nc.remote_addr = "*";
-                }
-                nc.local_port = ntohs(static_cast<uint16_t>(inp.insi_lport));
-                nc.remote_port = 0;
-            }
-
-            // Deduplicate -- same socket may appear in multiple PIDs (fork)
-            auto key = std::format("{}:{}:{}:{}:{}", nc.proto, nc.local_addr,
-                                   nc.local_port, nc.remote_addr, nc.remote_port);
-            if (seen.contains(key))
-                continue;
-            seen.emplace(std::move(key), true);
-
-            result.push_back(std::move(nc));
-        }
+    for (auto& s : yuzu::shared::walk_sockets(/*dedup=*/true)) {
+        NetConnection nc;
+        nc.proto = std::move(s.proto);
+        nc.local_addr = std::move(s.local_addr);
+        nc.local_port = s.local_port;
+        nc.remote_addr = std::move(s.remote_addr);
+        nc.remote_port = s.remote_port;
+        nc.state = std::move(s.state);
+        nc.pid = static_cast<uint32_t>(s.pid);
+        result.push_back(std::move(nc));
     }
 
     resolve_hostnames(result);
     return result;
 }
 
-// netqual per-connection quality is Linux + Windows for now (macOS: nstat /
-// PRIVATE_TCP_INFO is kPlanned — see the netqual schema source).
-std::vector<TcpQualitySample> collect_tcp_quality() { return {}; }
+// netqual per-connection quality (roadmap 2.2): the plugin-owned NstatClient's
+// live flow-table snapshot when it is running() AND system_wide() — an
+// own-process-only session is real capture via nstat, just not COMPLETE
+// capture, so it is deliberately withheld here rather than reported as a
+// partial netqual sample (memo §3, "no silent partial capture"; mirrors the
+// Windows ESTATS admin-only "records nothing" honesty at tar_netqual.hpp).
+// {} when no client is registered (off, not yet started, or this build never
+// wired one), the client isn't running (layout_mismatch or stop()ed), or it
+// is scoped to own-process flows only.
+std::vector<TcpQualitySample> collect_tcp_quality() {
+    NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
+    // Also gate on !stalled() (UP-1): a reader that has gone silent past the
+    // idle-fallback threshold is demoted to the poll for TCP lifecycle
+    // (tar_plugin.cpp's nstat_primary includes !stalled()), so the quality
+    // source must demote in lockstep rather than keep serving a stale snapshot.
+    if (!client || !client->running() || !client->system_wide() || client->stalled())
+        return {};
+    return client->snapshot_quality();
+}
 
-std::string_view netqual_effective_capture_method() { return "none"; }
+// "nstat" only while the registered client is running(), system_wide(), has not
+// self-failed to a layout_mismatch(), AND is not stalled() — running() already
+// reflects a layout-mismatch shutdown (the reader thread stops itself), but the
+// extra checks keep this honest even if that internal coupling changes. The
+// !stalled() gate (UP-1) matches the lifecycle demotion: once the stream goes
+// quiet past the idle threshold, the advertised method must fall to "none" in
+// lockstep with the source, never advertise nstat while data comes from the
+// poll. "none" in every other case: no client, not running, own-process scope,
+// layout mismatch, or stalled — never a partial/misleading "nstat".
+std::string_view netqual_effective_capture_method() {
+    NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
+    if (client && client->running() && client->system_wide() && !client->layout_mismatch() &&
+        !client->stalled())
+        return "nstat";
+    return "none";
+}
 
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
@@ -1214,6 +1161,10 @@ std::string_view netqual_effective_capture_method() {
     }
 }
 
+// nstat (tar_netqual_nstat.hpp) is macOS-only — see the Linux definition's
+// comment for why this TU still needs the symbol on every platform.
+void netqual_nstat_register_client(NstatClient*) {}
+
 #else
 // Unsupported platform
 std::vector<NetConnection> enumerate_connections() {
@@ -1223,6 +1174,7 @@ std::vector<TcpQualitySample> collect_tcp_quality() {
     return {};
 }
 std::string_view netqual_effective_capture_method() { return "none"; }
+void netqual_nstat_register_client(NstatClient*) {}
 #endif
 
 } // namespace yuzu::tar

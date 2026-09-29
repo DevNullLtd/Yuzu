@@ -1,0 +1,14 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash fdf67a9b8831
+== action=device_name
+device_name|workstation1.local
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=domain
+domain|local
+joined|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ou
+ou|N/A
+[result_status] UNDECLARED / UNKNOWN / 
+

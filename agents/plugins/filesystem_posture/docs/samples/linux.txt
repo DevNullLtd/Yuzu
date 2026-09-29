@@ -1,0 +1,26 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 6094b93f5b9d
+== action=mounts
+mount|/|overlay|overlay|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
+mount|/proc|proc|proc|rw,nosuid,nodev,noexec,relatime|0|0|0|rw,nosuid,nodev,noexec,relatime
+mount|/dev|tmpfs|tmpfs|rw,nosuid|67108864|67108864|67108864|rw,nosuid
+mount|/dev/pts|devpts|devpts|rw,nosuid,noexec,relatime|0|0|0|rw,nosuid,noexec,relatime
+mount|/sys|sysfs|sysfs|rw,nosuid,nodev,noexec,relatime|0|0|0|rw,nosuid,nodev,noexec,relatime
+mount|/sys/fs/cgroup|cgroup|cgroup2|rw,nosuid,nodev,noexec,relatime|0|0|0|rw,nosuid,nodev,noexec,relatime
+mount|/dev/mqueue|mqueue|mqueue|rw,nosuid,nodev,noexec,relatime|0|0|0|rw,nosuid,nodev,noexec,relatime
+mount|/dev/shm|shm|tmpfs|rw,nosuid,nodev,noexec,relatime|67108864|67108864|67108864|rw,nosuid,nodev,noexec,relatime
+mount|/etc/resolv.conf|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
+mount|/etc/hostname|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
+mount|/etc/hosts|/dev/vda1|ext4|rw,relatime|485473984512|432465076224|407729119232|rw,relatime
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=quotas
+quota|/etc/resolv.conf|volume|not_enabled|-|-|ESRCH
+quota|/etc/hostname|volume|not_enabled|-|-|ESRCH
+quota|/etc/hosts|volume|not_enabled|-|-|ESRCH
+quota|-|volume|no_block_device|-|-|8 non-block-device mounts (overlay/tmpfs/virtual/network) not quota-capable
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=snapshots
+snapshot|-|-|none|no btrfs or device-mapper mount found
+[result_status] UNDECLARED / UNKNOWN / 
+

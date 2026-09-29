@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu HA-Postgres node — the yuzu-postgres substrate + Patroni (WS-7, ADR-2002 §11).
+#
+# This is a THIN layer over ghcr.io/<owner>/yuzu-postgres:<version>: same
+# PostgreSQL 18.4, same pinned pgvector build, same two-password first-boot
+# init (deploy/docker/postgres-init/, inherited from the base at
+# /docker-entrypoint-initdb.d/). Patroni is added on top to manage
+# replication, leader election (via etcd), and automatic failover.
+#
+# Why layer over yuzu-postgres and NOT a stock Spilo/Patroni image: a stock
+# image carries neither pgvector nor the Yuzu app-role/db init, and
+# re-implementing them in a Spilo template would drift the HA nodes away from
+# the single-node substrate. Patroni runs its OWN initdb (it bypasses the
+# upstream docker-entrypoint-initdb.d mechanism), so the shipped init is
+# re-invoked through Patroni's `post_init` hook (see patroni-entrypoint.sh) —
+# the SAME script, byte-for-byte, so a single-node and an HA node create the
+# app role/db/extension identically.
+#
+# Local build (needs yuzu-postgres:local built first):
+#   docker build -t yuzu-postgres:local -f deploy/docker/Dockerfile.postgres .
+#   docker build -t yuzu-postgres-ha:local \
+#     -f deploy/docker/ha-postgres/Dockerfile.postgres-ha .
+#
+# Release: published as ghcr.io/<owner>/yuzu-postgres-ha:<version> alongside
+# the other images (cosign + SLSA + SBOM) — see docs/ha-postgres-ws7-plan.md §9.
+# The Patroni/psycopg2 pins below are EXACT; a release build MUST additionally
+# install with --require-hashes (mirroring the pgvector commit-pin discipline).
+
+ARG HA_BASE=yuzu-postgres:local
+FROM ${HA_BASE}
+
+# Patroni + its etcd-v3 driver, isolated in a venv so it never perturbs the
+# base image's system Python or the postgres runtime. psycopg2-binary needs no
+# build toolchain (prebuilt wheel), so the layer stays lean.
+#   - patroni[etcd3]: the v3 etcd API (v2 is deprecated/disabled by default in
+#     etcd 3.4+).
+#   - EXACT pins (the versions this profile was built and failover-validated
+#     against). A release build should additionally install with --require-hashes
+#     from a hash-locked requirements file (tracked, plan §9).
+#   - curl is a RUNTIME dependency, not build-only: the failover harness probes
+#     each node's Patroni REST API via `docker exec <node> curl :8008/primary`.
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3 python3-venv curl; \
+    python3 -m venv /opt/patroni; \
+    /opt/patroni/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/patroni/bin/pip install --no-cache-dir 'patroni[etcd3]==4.0.11' 'psycopg2-binary==2.9.12'; \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH=/opt/patroni/bin:$PATH
+
+COPY deploy/docker/ha-postgres/patroni-entrypoint.sh /usr/local/bin/patroni-entrypoint.sh
+RUN chmod +x /usr/local/bin/patroni-entrypoint.sh
+
+# Patroni REST API (leader/replica health for HAProxy) on 8008; PostgreSQL on
+# 5432. Patroni manages PGDATA at the base image's version-pinned path
+# (/var/lib/postgresql/18/docker) — mount the PARENT /var/lib/postgresql as a
+# named volume, exactly as the single-node substrate requires.
+EXPOSE 5432 8008
+
+# Runs as root to fix volume/socket ownership, then drops to `postgres` (gosu)
+# to exec Patroni — Patroni must run as the OS user that owns PGDATA.
+ENTRYPOINT ["/usr/local/bin/patroni-entrypoint.sh"]

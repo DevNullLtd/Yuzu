@@ -271,4 +271,14 @@ std::vector<AutoApproveRule> AutoApproveEngine::list_rules() const {
     return rules_;
 }
 
+bool AutoApproveEngine::require_all() const {
+    std::lock_guard lock(mu_);
+    return require_all_;
+}
+
+void AutoApproveEngine::set_require_all(bool val) {
+    std::lock_guard lock(mu_);
+    require_all_ = val;
+}
+
 } // namespace yuzu::server::auth

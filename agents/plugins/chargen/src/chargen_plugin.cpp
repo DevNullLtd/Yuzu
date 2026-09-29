@@ -41,6 +41,25 @@ std::string generate_line(int offset) {
     return line;
 }
 
+// ABI4 capability declarations (#2204). Reference/test plugin: both actions
+// are in-process (a synchronous condition_variable-gated loop run on the
+// calling dispatch thread, no separate worker thread and no OS-specific
+// call at all), so every leg is rung 1 uniformly on every OS.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "chargen_start",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+    },
+    {
+        /* .action      = */ "chargen_stop",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+    },
+};
+
 } // namespace
 
 class ChargenPlugin final : public yuzu::Plugin {
@@ -54,6 +73,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"chargen_start", "chargen_stop", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

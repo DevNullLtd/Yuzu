@@ -1,0 +1,69 @@
+{
+  "_comment": [
+    "WS-0 machine-readable interlock ledger — the data half of the split merge-gate.",
+    "Read by tests/test_split_interlock_tripwire.py (wired into .github/workflows/docs-lint.yml).",
+    "Its LOAD-BEARING CONSTANTS (gate_set, search_paths, exclude_paths, the engine-path + substrate",
+    "marker dicts incl. regexes, and 'every gate cell has a substrate marker') are PINNED against frozen values in",
+    "tests/test_split_interlock_tripwire_selftest.py — so a PR that edits this file to neuter the gate",
+    "(drop a gate cell, widen an exclude, delete a marker) must ALSO edit those frozen test constants,",
+    "which fails CI loudly and is a reviewable change (the ledger cannot silently disarm its own gate).",
+    "Human narrative + per-cell grep provenance: docs/security-reviews/split-ws0-interlock-certification-2026-09-08.md.",
+    "Authority: docs/adr/0032-use-case-admission-protocol.md (the Sequencing interlock section).",
+    "GREP LIMIT (acknowledged): markers prove STRING-PRESENCE, not semantic existence. A cell can be",
+    "flipped green off an incidental string match or a comment, and a renamed/synonym engine symbol or a",
+    "gitignored generated file evades RULE 1. The routed-concern row's human review is the compensating",
+    "control for substrate QUALITY and for the un-mechanizable nvd_*/vuln_finding disclosure path.",
+    "Update-on-close: a PR that lands a substrate item flips its cell to green HERE in the same PR;",
+    "the false-certification guard fails CI if a cell is green while its substrate marker is absent.",
+    "Verified against origin/dev @ d2e89ffaade703ed0da31ee4cee0962438d7cc0a on 2026-09-08."
+  ],
+  "gate_set": ["a", "b", "c", "d", "h"],
+  "search_paths": ["."],
+  "exclude_paths": [
+    "docs/",
+    ".claude/",
+    "changelog.d/",
+    "governance.d/",
+    "tests/split_interlock_ledger.json",
+    "tests/test_split_interlock_tripwire.py",
+    "tests/test_split_interlock_tripwire_selftest.py"
+  ],
+  "cells": {
+    "a": {"status": "green", "title": "Phase-4 engine principals", "note": "RBAC-only enforcement shipped (auth_routes.cpp require_permission/require_scoped_permission engine branch). ADR-0032 (a) cell is STALE (says not shipped).", "issues": []},
+    "b": {"status": "red", "title": "admit-then-filter gate + deny-precedence + evaluate-as-operator seam", "note": "authorize_list_read/require_list_read chokepoint SHIPPED + pinned ([1715]); #1715 landed ADDITIVE. TWO open halves: #2665 deny-precedence (a SEMANTIC change to the existing combining algorithm — NO grep symbol, so RULE 2 cannot verify it; flipping (b) green requires a HUMAN ATTESTATION that deny-precedence landed, not just the seam) and #2675 the evaluate_as_operator seam (a new symbol, the marker below).", "issues": [2665, 2675]},
+    "c": {"status": "red", "title": "D12 audit schema with indexed use_case_run_id", "note": "use_case_run_id = 0-in-code. AuditEvent has a single principal field.", "issues": []},
+    "d": {"status": "red", "title": "P7 release-log schema", "note": "release-log store = 0-in-code (one comment forward-reference at authz_model.hpp:206). Born-on-PG store, ADR-0012.", "issues": []},
+    "e": {"status": "red", "title": "G1 cross-process event transport", "note": "Gates Decision 9 only, not the merge-gate. Buses process-local. Rides HA WS-2a event_outbox.", "issues": []},
+    "f": {"status": "red", "title": "per-action mutability in the plugin ABI", "note": "Gates fact-acquisition dispatch only. plugin.h is ALREADY YUZU_PLUGIN_ABI_VERSION 4 (YuzuActionDescriptor); RED because no per-action MUTABILITY field exists yet — the real change is an append-only v4->v5 bump, not v3->v4.", "issues": []},
+    "g": {"status": "red", "title": "derived-state confinement", "note": "Gates any module persisting cross-run derived state. Nothing exists.", "issues": []},
+    "h": {"status": "red", "title": "runtime capability-declaration registry + credential columns", "note": "Securables are a compile-time std::array<27> at rbac_store.cpp:559 with NO runtime create-path. Registry + admitting/requesting-credential columns UNBUILT. The substrate marker below pins the registry CREATE-PATH symbol only; the credential columns (ADR-0032:956) live on use_case_runs + the Execution Plan, which are ENGINE-PATH markers RULE 1 blocks pre-gate, so they cannot be mechanized here without deadlocking the interlock. Therefore, like (b)'s #2665 half, flipping (h) green REQUIRES a HUMAN ATTESTATION that the admitting/requesting-credential columns also landed — the registry symbol alone is NOT sufficient.", "issues": []},
+    "i": {"status": "red", "title": "execution semantics: outcome correlation + coverage envelope", "note": "Gates every distributed fact read and effect. Coverage fields 0-in-code; workflow_engine.cpp marks steps successful on dispatch.", "issues": []},
+    "j": {"status": "red", "title": "capability projection (generated OpenAPI + tools/list)", "note": "tools/list iterates a compile-time array; OpenAPI is a hand-typed literal. RED refers to the GENERATED projection (#2678); the INV-31-4 drift test against the hand-written OpenAPI EXISTS and is green (#842/#3991/#3992) — a LEXICAL tripwire over literal registrations only: a non-literal direct verb call warns, a helper- or header-defined registration escapes SILENTLY (type-aware successor #2572).", "issues": []},
+    "k": {"status": "red", "title": "operational readiness (new stores in readyz + reaper liveness)", "note": "Gates admitting a run in production. Six new stores, none in /readyz; reaper has no liveness signal.", "issues": []},
+    "l": {"status": "red", "title": "intra-module cross-run isolation", "note": "Gates any module serving multiple operators' runs concurrently from one deployment. Nothing exists.", "issues": []},
+    "m": {"status": "red", "title": "per-principal quota caps", "note": "PARTIAL, so NOT green: the #1973 base per-principal concurrency/rate cap SHIPPED (PrincipalQuota, max_concurrency=16, rate=20/s, wired into agent_service_impl/mcp_server/mcp_stream), but ADR-0032 (m) ALSO requires the 2b §5 invocation-grant outstanding-count + issuance-rate caps + dual-side debit under delegation, which are engine-path and 0-in-code. So ADR-0032's (m) 'none enforced' overstates the gap (the base cap ships) but is NOT wholesale stale.", "issues": [1973]},
+    "n": {"status": "red", "title": "credential predecessor/successor relation + terminal-reason classification", "note": "Gates approval-preserving rebind across credential rotation. Unbuilt; 2b must be amended.", "issues": []}
+  },
+  "substrate_markers": {
+    "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
+    "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
+    "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
+    "release_log_store": {"cell": "d", "regex": "release_log|ReleaseLog"},
+    "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
+    "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"}
+  },
+  "engine_path_markers": {
+    "run_row_store": {"regex": "use_case_runs"},
+    "invocation_grant": {"regex": "invocation_grant|InvocationGrant"},
+    "result_scoped_grant": {"regex": "release_authorization"},
+    "finalisation_receipt": {"regex": "finalisation_receipt|finalization_receipt|FinalisationReceipt|FinalizationReceipt"},
+    "served_from_run_id": {"regex": "served_from_run_id"},
+    "released_input_digest": {"regex": "released_input_digest"},
+    "reaper_metrics": {"regex": "yuzu_use_case_runs|yuzu_use_case_reaper"}
+  },
+  "excluded": {
+    "plan_hash": "Pre-existing dispatch-tag grammar (compute_plan_hash; the v1|<class>|<mutability>|<plan_hash_hex> command-capability tag), dozens of pre-existing hits led by command_capability_parsers.hpp. NOT the ADR-0032 Execution-Plan hash. Never treat as an engine-path marker.",
+    "use_case_run_id_as_engine_path": "use_case_run_id is a SUBSTRATE marker (cell c, the D12 audit column WS-A6 must land), never an engine-path blocker — blocking its first occurrence would deadlock the interlock against itself.",
+    "nvd_and_vuln_finding": "nvd_* and vuln_finding_store already exist as server-side NVD sync (not 0-in-code), so they are a REVIEW-ROUTING path trigger in the routed-concern row, NOT a CI symbol marker. A PR putting them behind an engine principal is caught by human review, not this grep."
+  }
+}

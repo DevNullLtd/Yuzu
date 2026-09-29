@@ -29,6 +29,9 @@ import re
 import sys
 from pathlib import Path
 
+# Raw-string delimiter for every embedded literal: R"BCT(...)BCT".
+DELIM = "BCT"
+
 # PyYAML is a hard build dependency. Bundled content is the *only* path
 # by which shipped InstructionDefinitions reach the server's runtime
 # (no filesystem fallback — see CLAUDE.md "Instruction Engine"), so a
@@ -47,6 +50,17 @@ except ImportError:
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+# The three modes InstructionStore::import_definition_json_impl and the
+# governed-execute path (workflow_routes.cpp) actually understand. Any other
+# value falls through the governed path's fail-closed "unknown mode" arm —
+# approval-required for every caller including admins — which is safe but
+# means the definition is effectively unexecutable via the governed REST
+# path. Rejecting it here at build time (#1398) surfaces that as a build
+# failure instead of a silent, permanently-pending definition discovered
+# only at runtime.
+VALID_APPROVAL_MODES = {"auto", "role-gated", "always"}
 
 
 def to_string_list(v):
@@ -144,6 +158,53 @@ def main() -> int:
 
     defs_json: list[str] = []
     sets_json: list[str] = []
+
+    # Plugin documentation manifests — see the kBundledPluginDocs emit below.
+    # Re-serialised compactly (sorted keys) so the embedded bytes are stable
+    # regardless of how the generator pretty-printed the file.
+    plugin_docs_json: list[str] = []
+    bad_manifests: list[tuple[str, str]] = []
+    for mf in sorted((root / "plugin-docs").glob("*.json")):
+        try:
+            manifest = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            bad_manifests.append((str(mf), str(e)))
+            continue
+        if not isinstance(manifest, dict) or manifest.get("name") != mf.stem:
+            bad_manifests.append((str(mf), "top-level object with name == file stem required"))
+            continue
+        # The keys the server's index reads (discover_routes.cpp) must have the
+        # shape it expects; a wrong-typed key must fail HERE, at build time.
+        shape_errors = [
+            f"{key} must be a string" for key in ("description", "readme")
+            if not isinstance(manifest.get(key), str)
+        ]
+        for key in ("platforms", "kind"):
+            if not isinstance(manifest.get(key), dict):
+                shape_errors.append(f"{key} must be an object")
+        if shape_errors:
+            bad_manifests.append((str(mf), "; ".join(shape_errors)))
+            continue
+        try:
+            compact = json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except ValueError as e:  # NaN/Infinity: not JSON, and the server's parser would drop the manifest
+            bad_manifests.append((str(mf), str(e)))
+            continue
+        if f"){DELIM}\"" in compact:
+            bad_manifests.append((str(mf), "contains the raw-string delimiter sequence"))
+            continue
+        plugin_docs_json.append(compact)
+    if bad_manifests:
+        print(
+            f"ERROR: embed_content.py: {len(bad_manifests)} plugin-docs manifest(s) "
+            "failed validation (content/plugin-docs/<name>.json must be a JSON object "
+            "whose name matches the file stem, with string description/readme and object "
+            "platforms/kind — regenerate with tools/plugin-doc-gen):",
+            file=sys.stderr,
+        )
+        for path, reason in bad_manifests:
+            print(f"  {path}: {reason}", file=sys.stderr)
+        return 1
     bad_defs: list[tuple[str, str]] = []  # (path, reason) — fail loudly at build
 
     if not root.is_dir():
@@ -202,6 +263,15 @@ def main() -> int:
                         f"action={(exec_.get('action') or spec.get('action'))!r}",
                     ))
                     continue
+                if env["approval_mode"] not in VALID_APPROVAL_MODES:
+                    bad_defs.append((
+                        str(yf),
+                        f"invalid approval.mode {env['approval_mode']!r} for "
+                        f"id={env['id']!r} plugin={env['plugin']!r} "
+                        f"action={env['action']!r} — must be one of "
+                        f"{sorted(VALID_APPROVAL_MODES)}",
+                    ))
+                    continue
                 if env["id"] not in seen_def_ids:
                     seen_def_ids.add(env["id"])
                     defs_json.append(json.dumps(env))
@@ -216,7 +286,8 @@ def main() -> int:
     if bad_defs:
         print(
             f"ERROR: embed_content.py: {len(bad_defs)} "
-            f"InstructionDefinition doc(s) missing required fields:",
+            f"InstructionDefinition doc(s) failed validation "
+            f"(missing required fields or invalid approval.mode):",
             file=sys.stderr,
         )
         for path, reason in bad_defs:
@@ -232,30 +303,40 @@ def main() -> int:
         return 1
 
     # Emit C++. Each JSON string becomes a raw string literal in a
-    # std::vector<std::string>. Picking ")BCT(" as the raw-string
-    # delimiter — chosen for impossibility in any sane content YAML.
-    DELIM = "BCT"
+    # std::vector<std::string> (DELIM, module scope, is the raw-string
+    # delimiter — chosen for impossibility in any sane content YAML).
 
-    # MSVC caps a single string-literal token at 16380 bytes (error C2026), so a
-    # large envelope (a verbose definition's yaml_source + parameter_schema) is
-    # split into several ADJACENT raw-string literals — the compiler concatenates
-    # them into one std::string element, transparently. Safe because the whole
-    # envelope is verified free of the `)BCT"` delimiter below, so no chunk can
-    # contain it and no chunk boundary can synthesise it (chunks are separate
-    # literals; only their VALUES are concatenated). Chunk well under the cap.
-    CHUNK = 12000
+    # MSVC has TWO string-literal limits. A single literal token is capped at
+    # 16380 bytes (error C2026), so a large envelope (a verbose definition's
+    # yaml_source + parameter_schema, a plugin-docs manifest) is split into
+    # several ADJACENT raw-string literals the compiler concatenates. The
+    # CONCATENATED literal is then capped at 65535 bytes (error C1091), so
+    # adjacent chunks are grouped well under that and, when an element needs
+    # more than one group, the groups are joined with std::string's operator+
+    # instead — a std::string expression is a valid vector<std::string>
+    # initialiser element and carries no literal-length limit. Both limits are
+    # enforced by construction here, on every host, so an oversize element can
+    # never surface only on the Windows CI leg. Safe because the whole
+    # envelope is verified free of the `)BCT"` delimiter below, so no chunk
+    # can contain it and no chunk boundary can synthesise it (chunks are
+    # separate literals; only their VALUES are concatenated).
+    CHUNK = 12000           # bytes per literal token, well under 16380
+    CHUNKS_PER_GROUP = 4    # 48000 bytes per concatenated literal, well under 65535
 
     def emit_literal(j: str) -> bytes:
         # Sanity check: rule out delimiter collision in the JSON envelope.
         if f"){DELIM}\"" in j:
             raise ValueError("JSON envelope contains raw-string delimiter")
-        parts = [j[i:i + CHUNK] for i in range(0, len(j), CHUNK)] or [""]
-        line = b"    "
-        for k, part in enumerate(parts):
-            if k:
-                line += b" "
-            line += b'R"' + DELIM.encode() + b"(" + part.encode("utf-8") + b")" + DELIM.encode() + b'"'
-        return line + b",\n"
+        raw = j.encode("utf-8")
+        parts = [raw[i:i + CHUNK] for i in range(0, len(raw), CHUNK)] or [b""]
+        groups = [parts[i:i + CHUNKS_PER_GROUP] for i in range(0, len(parts), CHUNKS_PER_GROUP)]
+        rendered = [
+            b" ".join(b'R"' + DELIM.encode() + b"(" + part + b")" + DELIM.encode() + b'"' for part in group)
+            for group in groups
+        ]
+        if len(rendered) == 1:
+            return b"    " + rendered[0] + b",\n"
+        return b"    std::string(" + rendered[0] + b")\n      + " + b"\n      + ".join(rendered[1:]) + b",\n"
 
     out = bytearray()
     out += f"// AUTO-GENERATED from {root.name}/ by embed_content.py — do not edit.\n".encode("utf-8")
@@ -273,6 +354,19 @@ def main() -> int:
         for j in sets_json:
             out += emit_literal(j)
         out += b"};\n\n"
+
+        # Plugin documentation manifests (docs/plugin-readme-standard.md rule
+        # 10): content/plugin-docs/<name>.json, generated by tools/plugin-doc-gen
+        # from each plugin's README. Served as GET /api/v1/discover/plugin-docs
+        # and the MCP resource yuzu://plugin-docs. Zero files is legitimate —
+        # the retrospective sweep lands them plugin by plugin — so, unlike
+        # definitions, an empty table is emitted rather than refused. Each
+        # file is validated as JSON here so a malformed manifest fails the
+        # build, never the server's boot or a discovery request.
+        out += b"extern const std::vector<std::string> kBundledPluginDocs = {\n"
+        for j in plugin_docs_json:
+            out += emit_literal(j)
+        out += b"};\n\n"
     except ValueError as e:
         print(f"ERROR: {e} {DELIM}", file=sys.stderr)
         return 1
@@ -281,7 +375,8 @@ def main() -> int:
 
     out_path.write_bytes(bytes(out))
     print(f"embed_content.py: wrote {out_path} "
-          f"({len(defs_json)} definitions, {len(sets_json)} sets)")
+          f"({len(defs_json)} definitions, {len(sets_json)} sets, "
+          f"{len(plugin_docs_json)} plugin-docs manifests)")
     return 0
 
 

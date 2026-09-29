@@ -22,6 +22,7 @@ metadata:
       # Antivirus detection
       - security.antivirus.products
       - security.antivirus.defender_status
+      - security.antivirus.xprotect_status
       # Firewall state and rules
       - security.firewall.state
       - security.firewall.rules

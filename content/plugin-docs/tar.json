@@ -1,0 +1,2913 @@
+{
+  "actions": [
+    {
+      "action": "collect_fast",
+      "definition_ids": [
+        "crossplatform.tar.collect_fast"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is native (procfs, /proc/net/arp); core process/network/netqual collection is native",
+          "mechanism": "procfs",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained (route_sysctl, entry_type always 'unknown')",
+          "mechanism": "endpoint_security+nstat+route_sysctl",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "etw+iphlpapi",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "collect_perf",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "procfs",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "host_statistics",
+          "rung": "1",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "ntcounters",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "collect_slow",
+      "definition_ids": [
+        "crossplatform.tar.collect_slow"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED (no-op) on Linux",
+          "mechanism": "systemctl+utmp",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "service enumeration runs bounded argv (rung 2) via the shared subprocess runner; no startup_type; mapdrive opt-in source is wired but outbound-live-only (getfsstat, no username, no inbound, no history); netconn opt-in source is PLANNED (no-op) on macOS",
+          "mechanism": "launchctl+utmpx+getfsstat",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "scm+wts+wnet+wevtapi",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "collect_software",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg_rpm",
+          "rung": "2",
+          "support": "planned"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "pkgutil",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "compatibility",
+      "definition_ids": [
+        "crossplatform.tar.compatibility"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "configure",
+      "definition_ids": [
+        "crossplatform.tar.configure"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "export",
+      "definition_ids": [
+        "crossplatform.tar.export"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "fleet_snapshot",
+      "definition_ids": [
+        "crossplatform.tar.fleet_snapshot"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "procfs",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "inherent TOCTOU between pid enumeration and per-fd query; short-lived sockets may be missed",
+          "mechanism": "libproc(proc_pidfdinfo)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "iphlpapi+win32_process_enum",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "purge_source",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "query",
+      "definition_ids": [
+        "crossplatform.tar.query"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "rollup",
+      "definition_ids": [
+        "crossplatform.tar.rollup"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "snapshot",
+      "definition_ids": [
+        "crossplatform.tar.snapshot"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration runs bounded argv (rung 2) via the shared subprocess runner",
+          "mechanism": "procfs+systemctl+dpkg_rpm(planned)",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only (getfsstat, no username, no inbound, no history); service enumeration runs bounded argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege",
+          "mechanism": "endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned)",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "etw+iphlpapi+scm+wts+wnet+wevtapi+registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "sql",
+      "definition_ids": [
+        "crossplatform.tar.connections_to_ip",
+        "crossplatform.tar.daily_connection_summary",
+        "crossplatform.tar.daily_process_summary",
+        "crossplatform.tar.hourly_process_summary",
+        "crossplatform.tar.listening_ports",
+        "crossplatform.tar.process_tree",
+        "crossplatform.tar.recent_arp",
+        "crossplatform.tar.recent_dns",
+        "crossplatform.tar.recent_mapdrive",
+        "crossplatform.tar.recent_processes",
+        "crossplatform.tar.recent_processes_iso",
+        "crossplatform.tar.service_state_changes",
+        "crossplatform.tar.sql",
+        "crossplatform.tar.tcp_by_process",
+        "crossplatform.tar.user_sessions"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "status",
+      "definition_ids": [
+        "crossplatform.tar.status"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "sqlite",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**One `db_` chokepoint gates all 14 actions, and the capture driver never opens it.** `execute()` returns `error|TAR database not initialized` / rc 1 before the 14-way action dispatch whenever the member `db_` is null (`tar_plugin.cpp:1037-1041`); `db_` is populated only inside `init()`, which opens `tar.db` via `TarDatabase::open` (`tar_plugin.cpp:580-586`). The `plugin-capture` driver loads the plugin through `PluginHandle::load` + `LocalDispatcher::run` without calling `init()`, so every action in the samples above — including `compatibility`, which needs no database at all — fails identically at the same guard rather than exercising its own OS leg.",
+    "**`rollup` is Destructive/Irreversible, and its wire format does not match its declared columns.** `do_rollup` always runs `run_aggregation()` before unconditionally calling `run_retention()`, which permanently deletes aged rows (`tar_plugin.cpp:3619-3627`) — the basis for its `Destructive`/`Irreversible` capability declaration. Its actual response line is `tar|rollup|<n>|rows_aggregated`, a single positional line; the declared `status` column is never populated. `snapshot`'s declared `events_recorded` column has the same gap — its line is `tar|snapshot|complete`/`partial|<sources>` with no numeric count (`tar_capture_status.hpp:210-220`).",
+    "**`purge_source` refuses to run while its source is enabled.** It requires the named source to already be disabled, holding `collect_mu_` (and `software_collect_mu_` for `software`) across both the enabled-check and the delete to close the scan-then-purge race a concurrent re-enable would otherwise open (`tar_plugin.cpp:3013-3031`).",
+    "**Several legs are declared but not implemented.** `collect_perf` on macOS (`host_statistics`) and `collect_software` on Linux/macOS (`dpkg_rpm`/`pkgutil`) are `planned`, not `constrained` — no macOS code path exists in `tar_perf.cpp` or `tar_proc_perf.cpp` at all (confirmed absent by direct read, not merely unused), and the non-Windows branch of `tar_software_collector.cpp` is a stub returning empty. `netconn` and `dns` are likewise `planned` (no-op) on Linux and macOS. A `planned` leg's table is queryable and empty, which means \"not yet collecting,\" never \"nothing happened.\"",
+    "**Cursor-model sources never silently replay or wipe.** `power` and `removable` are the first two live `CursorSource` instances (`tar_cursor_sources.cpp:30-35`); a lost/invalid cursor or a wrapped log emits a `capture_gap` event and re-baselines forward at the log's current end rather than replaying from zero (`tar_cursor.hpp:25-75`); a transient read failure throws `IncompleteCaptureError` and retains the cursor instead. The same discipline applies to bulk deletes: `run_retention`'s clock guard *declines* a pass that looks like a wall-clock jump (counted in `retention_guard_declines_total`) rather than deleting on an implausible reading, and separately counts read/delete failures (`retention_guard_failures_total`) so a silently unretained table is still visible on `status` (`tar_aggregator.hpp:147-252`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Internal trigger-driven action that collects process and network connection snapshots, computes diffs against previous state, and records change events. Runs automatically every 60 seconds by default. Not typically invoked manually.",
+      "display_name": "TAR Fast Collection",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "crossplatform.tar.collect_fast",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Internal trigger-driven action that collects service and user session snapshots, computes diffs against previous state, and records change events. Also checks if purge is due and removes expired records. Runs automatically every 300 seconds by default. Not typically invoked manually.",
+      "display_name": "TAR Slow Collection",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "crossplatform.tar.collect_slow",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the live OS-support matrix for every TAR capture source. Output is one header line followed by N row lines, pipe-delimited: header|source|os|status|capture_method|notes row|process|windows|supported|toolhelp32|... row|process|linux|supported|procfs|... Status values: supported | constrained | planned | unsupported. Use this to verify on a target host which capture sources are wired and which are kPlanned (so operators can pre-stage network_capture_method before the implementation lands). Read-only, static metadata — does not touch the database or the filesystem, safe to call at any frequency.",
+      "display_name": "TAR OS Compatibility Matrix",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.tar.compatibility",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Updates TAR plugin configuration. Changes take effect on the next collection cycle. Configurable settings include data retention period, collection intervals, and command-line redaction patterns for sensitive data protection.",
+      "display_name": "Configure TAR",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "crossplatform.tar.configure",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show all TCP connections to a specific remote IP address. Replace the target_ip parameter with the IP to investigate.",
+      "display_name": "TAR: Network Connections to IP",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.connections_to_ip",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show daily aggregated TCP connection counts by remote address and process.",
+      "display_name": "TAR: Daily Connection Summary",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.daily_connection_summary",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Per-day process activity for the last 30 days, aggregated from $Process_Daily. Each row is (date, process_name, user, start_count, stop_count). Useful for trend questions (\"did $process_name run more often last week than the week before?\") that would be O(N) over $Process_Live.",
+      "display_name": "TAR: Daily process summary",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "crossplatform.tar.daily_process_summary",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Exports TAR events as a JSON array for integration with external analytics tools (Splunk, ClickHouse, ELK). Each event object includes id, timestamp, event_type, event_action, snapshot_id, and a nested detail object with type-specific fields.",
+      "display_name": "Export TAR Events as JSON",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.export",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Produces a single JSON document enumerating every running process and open network connection on this host at the moment of invocation, in the fleet_snapshot.v1 schema. Used by the server-side FleetTopologyStore to assemble the 3D fleet network-topology view (/viz/fleet, ladder PR 5+). Each list is capped at 4096 entries; truncation is signalled by truncated_processes and truncated_connections flags. Cmdlines are redacted per the active redaction_patterns config (defaults always apply). Process and tcp source pause states are honoured -- when paused, the corresponding list is empty and source_paused.* markers appear in the payload. Not typically invoked manually; the server pulls on demand at the topology cache TTL.",
+      "display_name": "TAR Fleet Snapshot",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "crossplatform.tar.fleet_snapshot",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show hourly aggregated process start counts for the last 7 days.",
+      "display_name": "TAR: Hourly Process Summary",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.hourly_process_summary",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show all listening TCP ports with the process that owns them.",
+      "display_name": "TAR: Listening Ports",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.listening_ports",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show recently started processes with parent-child relationships for the last hour.",
+      "display_name": "TAR: Process Tree",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.process_tree",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Queries the TAR event database for system activity records within a time range. Events include process starts/stops, network connections opened/closed, service state changes, and user logins/logouts. Results are pipe-delimited: timestamp|event_type|event_action|snapshot_id|detail_json. The detail_json field contains a JSON object with type-specific fields: Process events: {\"pid\":N, \"ppid\":N, \"name\":\"...\", \"cmdline\":\"...\", \"user\":\"...\"} Network events: {\"proto\":\"tcp\", \"local_addr\":\"...\", \"local_port\":N, \"remote_addr\":\"...\", \"remote_host\":\"...\", \"remote_port\":N, \"state\":\"...\", \"pid\":N} Service events: {\"name\":\"...\", \"display_name\":\"...\", \"status\":\"...\", \"startup_type\":\"...\"} User events: {\"user\":\"...\", \"domain\":\"...\", \"logon_type\":\"...\", \"session_id\":\"...\"}",
+      "display_name": "Query TAR Events",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.query",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per interface with their appeared/removed action. Requires the opt-in `arp` capture source to be enabled on the device.",
+      "display_name": "TAR: ARP table (recent)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.recent_arp",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with their appeared/removed action. Device-level (no per-process attribution). Requires the opt-in `dns` capture source to be enabled on the device; DNS cache is usage-class telemetry under the works-council posture.",
+      "display_name": "TAR: DNS cache (recent)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.recent_dns",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Mapped network-share activity (capability-map §3.8) in both directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares). Live rows carry appeared/removed; historical rows (origin='historical', from registry / fstab / event-log backfill) carry action='historical'. Requires the opt-in `mapdrive` capture source to be enabled on the device; rows expose usernames + share paths (identity/usage- class telemetry under the works-council posture).",
+      "display_name": "TAR: Mapped drives (recent + historical)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.recent_mapdrive",
+      "platforms": [
+        "windows",
+        "linux"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show all processes that started or stopped in the last 24 hours.",
+      "display_name": "TAR: Recent Processes",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.recent_processes",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Same as `tar.recent_processes` but emits human-readable ISO-8601 timestamps via `datetime(ts, 'unixepoch')` instead of epoch seconds. Use this when piping query output to a human reader; use `tar.recent_processes` when piping to another tool that expects epoch seconds.",
+      "display_name": "TAR: Recent processes (ISO timestamps)",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.recent_processes_iso",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Force an immediate rollup aggregation cycle (normally runs every 15 minutes). Aggregates live data into hourly, daily, and monthly summary tables and then permanently deletes rows older than each tier's retention limit. Classified Destructive/Irreversible with no approval gate: an operator who can dispatch it deletes history immediately and cannot undo it.",
+      "display_name": "TAR: Run Aggregation",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.tar.rollup",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show recent service start/stop/state_changed events.",
+      "display_name": "TAR: Service State Changes",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.service_state_changes",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Forces an immediate full snapshot of all four TAR collectors (processes, network connections, services, user sessions). Computes diffs against the previous state and records any detected changes. Useful before maintenance windows or incident investigations.",
+      "display_name": "TAR Force Snapshot",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.tar.snapshot",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Execute an arbitrary SELECT query against the TAR warehouse tables on each targeted agent. Use $-prefixed table names ($Process_Live, $TCP_Hourly, etc.) which are translated to real table names on the agent. Only SELECT queries are permitted.",
+      "display_name": "TAR: SQL Query",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.sql",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the current status of the TAR database including record count, oldest and newest event timestamps, database size on disk, and the configured retention period. Use this to verify TAR is collecting data and to monitor disk usage. Also reports both the configured network_capture_method and the network_capture_method_effective (the mechanism actually collecting — always polling today), so status never misrepresents the active capture mechanism. On the healthy path the FIRST line is storage_state|ok. Offline means a wedged rollback closed the TAR database, so collection and retention are both stopped until the agent restarts and every other field is withheld -- the reply is then just an error| line followed by storage_state|offline, and the action exits non-zero. The order is REVERSED on that path: error| comes FIRST, because server and dashboard consumers key off the output starting with error|, so do not assume storage_state is always the first line. Historical data NORMALLY stays queryable via tar sql, but only when the read-only query connection is itself available; the error| line states which case applies, so do not infer tar sql access from storage_state|offline alone. Reports the retention clock guard counters (#2361): retention_guard_declines_total and retention_guard_failures_total are always present, with per-table retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for any table with a non-zero count. Read the two totals TOGETHER - a zero declines total only means the endpoint's clock is behaving if the failures total is also zero. Scrape this across the fleet to find hosts whose clocks need attention; the agent has no /metrics endpoint.",
+      "display_name": "TAR Status",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "crossplatform.tar.status",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Aggregate TCP connections grouped by process name and remote endpoint.",
+      "display_name": "TAR: TCP Connections by Process",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.tcp_by_process",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Show recent user login and logout events.",
+      "display_name": "TAR: User Sessions",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "crossplatform.tar.user_sessions",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Timeline Activity Record -- continuous system state change tracking",
+  "how_it_works": "TAR is the agent's local telemetry warehouse. Four scheduled collectors diff each cycle's OS\nsnapshot against the previous baseline and append change events to a local SQLite database\n(`tar.db`): `collect_fast` (process + network, default 60s), `collect_slow` (service + user\nsession, default 300s), `collect_perf` (device CPU/memory/disk/network counters, default 30s) and\n`collect_software` (installed-software inventory, default hourly) — all four triggers are\nregistered in `init()` (`tar_plugin.cpp:601-644`). `collect_slow` also drives a generic cursor-model\nloop (`tar_plugin.cpp:2122-2130`) over the sources `make_cursor_sources()` constructs\n(`tar_cursor_sources.cpp:30-35`): `power` (sleep/wake/AC-power transitions — Windows\n`PowerRegisterSuspendResumeNotification`/`WM_POWERBROADCAST`, Linux `systemd-logind`\nPrepareForSleep + power-supply sysfs/udev, macOS `pmset -g log` replay) and `removable`\n(removable-media attach/detach plus exec-from-removable correlation — Windows `EvtQuery` over the\nPartition/Diagnostic and Kernel-PnP channels, Linux a udev netlink monitor, macOS DiskArbitration\n`DADiskAppeared`/`Disappeared`; `tar_removable_diskarb.mm`). Both are the first\nworks-council-class sources shipped **on by default** (`tar_schema_registry.cpp:976-992`,\n\"ALEX RULING 2026-09-04\") — every other opt-in source added since 1.5 (procperf, netqual, module,\nsoftware, arp, dns, netconn, mapdrive) still defaults off; the plugin now has 15 registered\ncapture sources, 7 on by default (the five always-on machine-scope sources plus `power` and\n`removable`) and 8 opt-in. `rollup` runs every 15 minutes: it always\naggregates live rows into hourly/daily/monthly tiers first, then unconditionally enforces\nretention on every tier, deleting aged rows (`tar_plugin.cpp:3619-3627`) — the ordering is\nload-bearing and the reason the capability declaration marks this action Destructive/Irreversible.\nReads go through `status` (health + the retention clock-guard counters), `query`/`export` (the\ncore process/network/service/user/software union, or one type behind an explicit filter — arp,\ndns and mapdrive are opt-in PII sources reachable only that way, never the default feed) and `sql`\n(an arbitrary `SELECT` against `$`-prefixed warehouse tables, validated SELECT-only and translated\nto real table names — `tar_sql_executor.cpp:205-244`). `snapshot` forces an out-of-cycle full\ncollection across all four collectors and reports `complete` or `partial|<sources>` if any source\nretained a stale baseline instead. `fleet_snapshot` is a separate on-demand full re-enumeration\nthat bypasses the warehouse entirely, feeding the 3D fleet-topology view. `configure` rewrites\naround 25 collection knobs (retention, intervals, per-source enable flags, redaction patterns).\n`purge_source` deletes every warehouse row for one named source, but only once that source is\nalready disabled — closing the scan-then-purge race a still-collecting source would otherwise hit\n(`tar_plugin.cpp:2987-3031`).\n\nDeliberately not: TAR does not stream events to the server in real time — everything lands in the\nlocal warehouse first and is pulled on `query`/`export`/`sql`/`status`. It does not replay history\nfrom zero when a cursor-model source's log position is lost or wraps — it re-baselines forward and\nrecords a `capture_gap` (`tar_cursor.hpp:25-75`). It never fabricates OS support: a leg without a\nbound mechanism reports `planned`, not a guessed read.",
+  "inputs": [
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Number of days to retain TAR events before automatic purging. Valid range: 1-365. Default: 7.\n",
+      "name": "retention_days",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Interval in seconds for process and network collection. Valid range: 10-3600. Default: 60.\n",
+      "name": "fast_interval",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Interval in seconds for service and user session collection. Valid range: 30-7200. Default: 300.\n",
+      "name": "slow_interval",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "JSON array of case-insensitive SUBSTRING patterns (not glob) for command-line redaction. Leading/trailing `*` are stripped; `?` and `[abc]` are literals. Any process command line containing a pattern has its cmdline replaced with \"[REDACTED by TAR]\". At most 256 elements of at most 256 characters each; over-cap elements are dropped at load. Default patterns: [\"*password*\", \"*secret*\", \"*token*\", \"*api_key*\", \"*credential*\"]. These defaults are ALWAYS MERGED IN — your patterns are ADDED to them, never replace them, so an empty or all-invalid array cannot disable the baseline redaction.\n",
+      "name": "redaction_patterns",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the process collector on this agent. \"true\" (default) keeps the collector active; \"false\" short-circuits the process branch of every collect_fast cycle. Existing rows remain queryable until they age out by retention. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "process_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the TCP/network collector on this agent. See process_enabled for semantics. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "tcp_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the service collector on this agent. See process_enabled for semantics. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "service_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the user-session collector on this agent. See process_enabled for semantics. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "user_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the device performance sampler (CPU / memory / disk / network rates → $Perf_*) on this agent. \"true\" (default) keeps it active. Device-level perf carries no per-application identity. See process_enabled for the disable semantics. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "perf_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the per-application top-N CPU/working-set sampler (procperf source → $ProcPerf_*). **Off by default** — per-application resource usage reveals which applications run on a device, which is usage-class telemetry under the works-council posture; independent of perf_enabled. Image names only — never command lines. **Enabling this also sends per-app names + versions OFF-DEVICE**: the top-N is synced daily to the central app_perf store (the B1 per-device and B2 fleet views), so it is not local-triage-only. To keep the device fully local, leave this off, or suppress the upload with --inventory-disable / YUZU_AGENT_INVENTORY_DISABLE. Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "procperf_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the per-connection TCP-quality sampler (netqual source → $NetQual_Live, plus the per-boot retrospective baseline $NetQual_Boot). **Off by default** — per-connection quality is usage-class telemetry under the works-council posture; only a coarse destination class (loopback/private/public) is stored, raw remote addresses are dropped at the edge. Linux (netlink INET_DIAG) and Windows (TCP ESTATS — ADR-0020); **Windows requires an elevated agent** (non-elevated records nothing and tar.status reports netqual_capture_method=none). macOS is planned. Independent of tcp_enabled. Queried via tar.sql only ($NetQual_Live / $NetQual_Boot); the legacy tar.query / tar.export actions do not surface netqual. Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "netqual_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the connectivity-transition source (netconn → $NetConn_Live, ADR-0020). **Off by default** — opt-in usage-class telemetry. Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills connectivity history from BEFORE the source was enabled (bounded by netconn_lookback_seconds; set that to 0 for forward-only). Only closed enum tokens + numeric reason codes are stored — NO SSID, BSSID, profile name, interface GUID, or MAC. Windows-only collector today (Linux journald / macOS oslog planned; the table is queryable-empty there). Queried via tar.sql only ($NetConn_Live); the legacy tar.query / tar.export actions do not surface netconn. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "netconn_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "How far BEFORE enablement the netconn backfill reads OS-retained connectivity history (ADR-0020 privacy note). Because the timing of network / Wi-Fi connect/disconnect events is a presence / working-hours proxy — behavioral data even with SSIDs stripped — enabling netconn retroactively ingests a window that predates any monitoring disclosure. Set to \"0\" to DISABLE the pre-enablement read entirely (the source then records only forward connectivity from the moment it is enabled) for jurisdictions or works-council agreements where retrospective collection is not permitted. Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Requires agent v0.12.0+.\n",
+      "name": "netconn_lookback_seconds",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the image-load / module-stream capture source (module source → $Module_*). **Off by default** — module-load capture is high-volume usage-class telemetry (every library and driver load per process, with a code-signing verdict) under the works-council posture; no command line is ever captured. No data is recorded until a collector for the host's OS ships ($Module_* tables are queryable-empty until then). Set to \"true\" to opt in. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "module_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the software install/uninstall source (software → $Software_*) on this agent. **Off by default** — turn it on per host to record machine-wide installed-software inventory (HKLM Uninstall), which is device asset-management and vulnerability-relevance data and carries NO user identity (machine scope only — no per-user / profile-name data). Names, versions, and publisher only. See process_enabled for the disable semantics (atomic, existing rows remain queryable, clean re-baseline on re-enable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "software_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Interval in seconds for the software install/uninstall sampler (tar.software trigger). \"0\" disables the trigger entirely; any other value must be 300-86400 (5 minutes - 1 day). Default: 3600 (hourly). Installs are rare, so this runs on its own slower trigger. Requires agent v0.12.0+.\n",
+      "name": "software_interval",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the ARP / neighbour-table capture source (ADR-0015). Opt-in: \"false\" by default. See process_enabled for semantics. Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp on Linux, and a route_sysctl dump on macOS (constrained there -- entry_type always reports \"unknown\"). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "arp_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the DNS resolver-cache capture source (ADR-0015). Opt-in: \"false\" by default — the DNS cache reveals visited domains (usage-class telemetry under the works-council posture; enabling is audited). Windows-only collector today (Linux/macOS planned). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "dns_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the mapped-drive capture source (capability-map §3.8, mapdrive → $MapDrive_*). Records network-share mappings in BOTH directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal). Opt-in: \"false\" by default — rows expose usernames and remote share paths (identity/usage-class telemetry under the works-council posture; enabling is audited). Windows + Linux (macOS planned); inbound needs local-admin / Server-Operator on Windows and Samba on Linux and degrades to empty otherwise. NOTE: the one-time HISTORICAL backfill (all PREVIOUSLY mapped drives, from the registry / fstab / event logs) is seeded at agent init, so it materializes on the first agent restart AFTER you enable this. See software_enabled for disable semantics (same opt-in posture; disabling leaves existing rows queryable). Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "mapdrive_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the sleep/wake/AC-power transition source (power → $Power_Live, cursor-model seam). **ON by default (\"true\")** — the first works-council-class source to ship enabled. Note this is NOT the product's first default-on source: process, tcp, service, user and perf have always been on as machine-scope operational telemetry. Of the eight sources added since 1.5 under the works-council opt-in posture (procperf, netqual, module, software, arp, dns, netconn, mapdrive) every one defaults OFF, and power is the first of THAT class to diverge. The divergence is deliberate, but it does NOT mean the data is low-sensitivity: the SOC 2 data inventory classifies $Power_Live as usage-class / behavioral-adjacent, because the TIMING of sleep/wake and AC events is a presence and working-hours proxy. Treat it as co-determination-relevant and use power_lookback_seconds=0 where a retrospective read is not lawful. The source WILL use a durable log-position cursor (not a snapshot diff), so a restart will resume from where it left off rather than re-scanning; a lost/invalid cursor or a wrapped OS event log will re-baseline forward and record a capture_gap rather than replaying from the beginning. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "power_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "How far BEFORE enablement the power source's first read may reach into OS-retained sleep/wake/AC-power history (same shape as netconn_lookback_seconds, ADR-0020). Set to \"0\" to disable the pre-enablement read entirely (forward-only from the moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Effective on macOS only — Windows and Linux have no power-history API, so their first read is always forward-only regardless of this value. Requires agent v0.12.0+.\n",
+      "name": "power_lookback_seconds",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the removable-media attach/detach source (removable → $Removable_Live, cursor-model seam), including exec_from_removable correlation (a process observed running from a removable volume). **ON by default (\"true\")** — the first works-council-class source to ship enabled, alongside power. This is NOT the product's first default-on source: process, tcp, service, user and perf have always been on as machine-scope operational telemetry. Of the eight sources added since 1.5 under the works-council opt-in posture every one defaults OFF, and removable is one of the first two of THAT class to diverge. The divergence is deliberate and it does NOT mean the data is low-sensitivity — this is the MORE sensitive of the two. The SOC 2 data inventory classifies $Removable_Live as usage/identity-class: it records device vendor, product and SERIAL, plus the executed binary path and pid of any process running from a removable volume. Treat it as co-determination-relevant and set removable_lookback_seconds=0 where a retrospective read of OS-retained removable history is not lawful. The source WILL use the same durable log-position cursor model as power (see power_enabled) — a lost/invalid cursor will re-baseline forward and record a capture_gap rather than replaying history. Queried via tar.sql only ($Removable_Live); the legacy tar.query / tar.export actions do not surface removable. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "removable_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "How far BEFORE enablement the removable source's first read may reach into OS-retained device-attach history (same shape as netconn_lookback_seconds / power_lookback_seconds above). Set to \"0\" to disable the pre-enablement read entirely (forward-only from the moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7 days). Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. Requires agent v0.12.0+.\n",
+      "name": "removable_lookback_seconds",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^(true|false)$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "Enable or disable the `usage` derived fold (usage → $Usage_Live / $Usage_Daily), a checked_transaction-based pairing of the process source's started/stopped events into per-executable run/duration aggregates plus a per-day distinct-user count. **ON by default (\"true\")** — joining power/removable as a works-council-class source shipping enabled; process, tcp, service, user and perf are already default-on as machine-scope operational telemetry. The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as usage-class / behavioral-adjacent: $Usage_Live persists the owning pid and user for each open run, and the per-day username membership (queryable via tar.sql) reveals which applications run on a device, when, and by whom. Treat as co-determination-relevant, same basis as power/removable. Forward-only, no retrospective backfill: disabling and later re-enabling always re-baselines from the moment of re-enable, never a retrospective fold over whatever process history accrued during the disabled window — this is a lifecycle-state-machine property, not a best-effort marker check. Set to \"false\" to opt out. Requires agent v0.12.0+; older agents silently ignore. Valid: \"true\" | \"false\".\n",
+      "name": "usage_enabled",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "TCP capture mechanism. \"polling\" (always accepted) drives the collector via the platform polling API at fast_interval cadence and is the only mechanism wired today. Validation is OS-AWARE and scoped to the NETWORK (tcp) source: besides \"polling\", only the tcp-source method valid on the RUNNING host's OS is accepted — iphlpapi on Windows, procfs on Linux, proc_pidfdinfo on macOS (run the `compatibility` action for the live list). Process-source methods such as \"etw\" / \"endpoint_security\" are NOT network_capture_method values and are rejected even on their own OS. A method belonging to a DIFFERENT OS is also rejected, so a Linux agent can no longer store \"iphlpapi\". A host-valid future method is accepted for pre-staging; the agent emits a warn line and continues polling until that collector lands. The mechanism actually in force is observable via network_capture_method_effective in the status action (always polling today). Requires agent v0.12.0+.\n",
+      "name": "network_capture_method",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.configure",
+      "description": "JSON array of case-insensitive substring patterns matched against the process name. Any process whose name contains a pattern is dropped before the diff so noisy short-lived helpers do not dwarf real activity. Trade-off: forensic completeness — anything matching is invisible to TAR. Leading and trailing `*` are stripped (so `*-helper*` is the same as `-helper`). NOT real glob — `?` and `[abc]` are treated as literals. At most 256 elements of at most 256 characters each, and the EFFECTIVE substring (after stripping `*`) must be at least 3 characters — a shorter core like \"a\" or \"*a*\" would match almost every process and is rejected at configure AND dropped at load. Requires agent v0.12.0+. Example: '[\"chrome-helper\",\"ms-edge-helper\"]'.\n",
+      "name": "process_stabilization_exclusions",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '10.0.0.1' ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.connections_to_ip",
+      "description": "Query with target IP. Edit the IP address in the WHERE clause.",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.daily_connection_summary",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT datetime(day_ts, 'unixepoch') AS day, name, user, start_count, stop_count FROM $Process_Daily WHERE day_ts > strftime('%s', 'now', '-30 days') ORDER BY day_ts DESC, start_count DESC LIMIT 1000",
+      "definition_id": "crossplatform.tar.daily_process_summary",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.export",
+      "description": "Start of export range as Unix epoch seconds.",
+      "name": "from",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.export",
+      "description": "End of export range as Unix epoch seconds.",
+      "name": "to",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.export",
+      "description": "Filter by event type (process, network, service, user, software, arp, dns, mapdrive).",
+      "name": "type",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.export",
+      "description": "Maximum events to export. Default 1000, max 10000.",
+      "name": "limit",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT hour_ts, name, start_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 168",
+      "definition_id": "crossplatform.tar.hourly_process_summary",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port",
+      "definition_id": "crossplatform.tar.listening_ports",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts",
+      "definition_id": "crossplatform.tar.process_tree",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.query",
+      "description": "Start of the query time range as Unix epoch seconds. Defaults to 0 (beginning of time).\n",
+      "name": "from",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.query",
+      "description": "End of the query time range as Unix epoch seconds. Defaults to the current time.\n",
+      "name": "to",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "process",
+          "network",
+          "service",
+          "user",
+          "software",
+          "arp",
+          "dns",
+          "mapdrive",
+          ""
+        ]
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.query",
+      "description": "Filter results by event type. Valid values: process, network, service, user, software, arp, dns, mapdrive. software joins the default feed once enabled (its collection is off by default — see software_enabled); arp/dns/mapdrive are opt-in device-state / PII sources reached only by an explicit filter — they are excluded from the default (empty-filter) feed. mapdrive (§3.8) returns network-share mappings in both directions, including historical (action='historical') rows. Leave empty to return the core process/network/service/user/software types.\n",
+      "name": "type",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": null,
+      "definition_id": "crossplatform.tar.query",
+      "description": "Maximum number of events to return. Default 1000, max 10000.\n",
+      "name": "limit",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.recent_arp",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.recent_dns",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.recent_mapdrive",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.recent_processes",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500",
+      "definition_id": "crossplatform.tar.recent_processes_iso",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200",
+      "definition_id": "crossplatform.tar.service_state_changes",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.tar.sql",
+      "description": "A SELECT query using $-prefixed table names. Available tables include $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly, $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly, $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and the opt-in $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; require arp_enabled=true / dns_enabled=true, Windows-only today — empty elsewhere).\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200",
+      "definition_id": "crossplatform.tar.tcp_by_process",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200",
+      "definition_id": "crossplatform.tar.user_sessions",
+      "description": "The preset SQL text this canned query runs. Hidden from the operator UI (not editable via the dashboard); see metadata.description for what it returns. Edit this file to change the query.\n",
+      "name": "sql",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "3094b2651318",
+  "manifest_version": 1,
+  "name": "tar",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable. Values: non-negative integer.",
+          "example": "-",
+          "name": "events_recorded",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.collect_fast"
+    },
+    {
+      "columns": [
+        {
+          "description": "Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_slow|<events_recorded>|<token>` (same token vocabulary as collect_fast). Values: non-negative integer.",
+          "example": "-",
+          "name": "events_recorded",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.collect_slow"
+    },
+    {
+      "columns": [
+        {
+          "description": "One `header|source|os|status|capture_method|notes` line, then one `row|<source>|<os>|<status>|<capture_method>|<notes>` line per registered capture source x OS combination (every OS, not only the host's own). Values: header|... or row|... lines; status is supported, constrained, planned, or unsupported.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.compatibility"
+    },
+    {
+      "columns": [
+        {
+          "description": "Name of one configuration setting that was changed by this call (e.g. retention_days, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs.",
+          "example": "-",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The new value that was persisted for that key, as a string (post-clamp / post-validation where the parameter defines one). Values: free text, mirrors the parameter's own type/values.",
+          "example": "-",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.configure"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.connections_to_ip"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.daily_connection_summary"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.daily_process_summary"
+    },
+    {
+      "columns": [
+        {
+          "description": "A JSON array of event objects; each carries id, timestamp, event_type, event_action, snapshot_id and a nested detail object with type-specific fields.\n",
+          "example": "-",
+          "name": "json_output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.export"
+    },
+    {
+      "columns": [
+        {
+          "description": "A single fleet_snapshot.v1 JSON document: hostname, timestamp, local IPs, up to 4096 processes and 4096 TCP connections (each list truncated with a truncated_processes / truncated_connections flag), and source_paused.* markers when process or tcp capture is paused. Values: JSON object (fleet_snapshot.v1).",
+          "example": "-",
+          "name": "json_output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.fleet_snapshot"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.hourly_process_summary"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.listening_ports"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.process_tree"
+    },
+    {
+      "columns": [
+        {
+          "description": "Unix epoch seconds the event was recorded.",
+          "example": "-",
+          "name": "timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Which capture source the row came from. Values: process, network, service, user, software, arp, dns, mapdrive.",
+          "example": "-",
+          "name": "event_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific. Values: free text, source-dependent verb.",
+          "example": "-",
+          "name": "event_action",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Internal id of the collection cycle that produced this row, used to correlate rows from the same tick. Values: integer.",
+          "example": "-",
+          "name": "snapshot_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "JSON object with type-specific fields (see metadata.description for the per-type shape); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.",
+          "example": "-",
+          "name": "detail_json",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.query"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.recent_arp"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.recent_dns"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.recent_mapdrive"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.recent_processes"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.recent_processes_iso"
+    },
+    {
+      "columns": [
+        {
+          "description": "Declared as a literal status token; the plugin's actual response line is `tar|rollup|<n>|rows_aggregated` (a single positional line, not a status/rows_aggregated pair), so this column is not populated by the current wire format — see Caveats and known gaps. Values: not emitted by the current wire format.",
+          "example": "-",
+          "name": "status",
+          "platforms": [],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `tar|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.",
+          "example": "-",
+          "name": "rows_aggregated",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.rollup"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.service_state_changes"
+    },
+    {
+      "columns": [
+        {
+          "description": "Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial.",
+          "example": "-",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Declared as a count of events the forced snapshot recorded; the current wire format (tar|snapshot|complete or |partial|<sources>) does not carry a numeric count, so this column is not populated — see Caveats and known gaps. Values: not emitted by the current wire format.",
+          "example": "-",
+          "name": "events_recorded",
+          "platforms": [],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.snapshot"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.sql"
+    },
+    {
+      "columns": [
+        {
+          "description": "Total number of TAR event rows currently stored across all warehouse tables. Values: non-negative integer.",
+          "example": "-",
+          "name": "record_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty. Values: epoch seconds, or 0.",
+          "example": "-",
+          "name": "oldest_timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix epoch seconds of the newest event row, or 0 when the warehouse is empty. Values: epoch seconds, or 0.",
+          "example": "-",
+          "name": "newest_timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Size in bytes of tar.db on disk. Values: non-negative integer.",
+          "example": "-",
+          "name": "db_size_bytes",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Currently configured retention window in days (see configure.retention_days). Values: 1-365.",
+          "example": "-",
+          "name": "retention_days",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.status"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.tcp_by_process"
+    },
+    {
+      "columns": [
+        {
+          "description": "One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__|<col>|<col>...` line and a trailing `__total__|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines.",
+          "example": "-",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "clob",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.tar.user_sessions"
+    }
+  ],
+  "outputs_note": "Every action writes its response as a sequence of independent lines (one `ctx.write_output` call\nper line); most, but not all, actions follow the plugin-wide `discriminator\\|field\\|field...`\npipe-delimited convention (`tar_status_format.hpp:3-20`, `tar_collectors.hpp:39-57`). The four\ncollection actions share one line shape, `tar\\|collect_<leg>\\|<events_recorded>\\|<token>`, where\n`<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,\n`apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable` (`tar_collectors.hpp:51-80`).\n`status`'s wire format is line-oriented `key\\|value` pairs (`storage_state\\|ok`,\n`record_count\\|<n>`, `config\\|<key>\\|<value>`, ...), not one positional row — the five YAML columns\nbelow correspond to five of those lines; the rest (`config\\|*`, `retention_guard\\|*`,\n`retention_guard_failed\\|*`) are operational fields the YAML schema does not model. `query`'s rows\nmatch its five columns exactly, followed by an un-modelled `total\\|<n>` summary line. `sql` (and\nevery canned query in `tar_warehouse.yaml`) emits a leading `__schema__\\|<col>\\|<col>...` line,\nthen one pipe-joined data line per row, then a trailing `__total__\\|<n>` line — all three land in\nthe single declared `output` column. `snapshot`'s and `rollup`'s actual lines do not decompose into\ntheir declared columns at all; see Caveats.\n\n\n\n**Actions without a definition.** `collect_perf` writes `tar\\|collect_perf\\|<n>\\|<token>`, the same\nshape as `collect_fast`/`collect_slow` (see `do_collect_perf` in `tar_plugin.cpp`). `collect_software` follows the\nsame convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `purge_source` writes a single JSON line,\n`{\"source\":\"<name>\",\"rows_deleted\":<n>,\"status\":\"purged\"}` (see `do_purge_source` in `tar_plugin.cpp`), or an\n`error|` line if the named source is unknown or still enabled.\n\n**Empty-result / not-yet-collected convention.** `module` (image-load capture) ships its schema and\nconfig key with no collector registered yet — the `$Module_*` tables stay queryable and empty,\nwhich means \"not yet collecting,\" never \"nothing happened\" (`tar.yaml` `module_enabled`\ndescription). `power` and `removable` were in this state until PRs #4017/#4023 landed real\ncollectors for all three OSes on both (`tar_schema_registry.cpp:969-1094`); see How it works.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None beyond install-time grants.** `SeBackupPrivilege` and the ETW-enabling group membership are already provisioned; the `software` source needs no extra privilege beyond the account's existing registry-read access.",
+      "if_refused": "Not observed in this capture. The Windows legs never fall back to a poll (they are all `supported`, not `constrained`) — a refused read would surface as an `error|` line from the underlying Win32 call, not a degrade.",
+      "measured": "2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats)",
+      "os": "Windows",
+      "runs_as": "Agent service account, granted `SeBackupPrivilege` (read regardless of DACL) and `Performance Log Users` group membership (`docs/agent-privilege-model.md:94`)"
+    },
+    {
+      "grant": "Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`tar_proc_es.cpp:302-307`).",
+      "if_refused": "A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`tar_proc_es.cpp:302-307`).",
+      "measured": "2026-09-07, bare-metal, captured at **euid 501 (jsmith)** — unprivileged; the root LaunchDaemon path was not exercised by this capture.",
+      "os": "macOS",
+      "runs_as": "**root** (LaunchDaemon, no `UserName` — `docs/agent-privilege-model.md:94`)"
+    },
+    {
+      "grant": "None beyond the binary capability. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated.",
+      "if_refused": "Not observed in this capture.",
+      "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed `cap_dac_read_search` account.",
+      "os": "Linux",
+      "runs_as": "Agent account with `cap_dac_read_search` set on the binary (`docs/agent-privilege-model.md:94`); not root"
+    }
+  ],
+  "readme": "agents/plugins/tar/README.md",
+  "result_status": [
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`tar:snapshot_skipped_sources`",
+      "status": "`CONSTRAINED`",
+      "when": "`snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass."
+    },
+    {
+      "completeness": "`UNKNOWN`",
+      "provenance": "*(empty)*",
+      "status": "`UNDECLARED` (default)",
+      "when": "Every other action and every early-return path, including the `db_`-not-open guard."
+    },
+    {
+      "completeness": "*(n/a)*",
+      "provenance": "`linux:netlink:remove:`",
+      "status": "*(not a `set_result_status` call)*",
+      "when": "Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`tar_removable_collector.cpp:898`)."
+    },
+    {
+      "completeness": "*(n/a)*",
+      "provenance": "`macos:diskarbitration:`",
+      "status": "*(not a `set_result_status` call)*",
+      "when": "Same, on macOS: the literal prefix of `evidence` the DiskArbitration `removable` cursor-source writes on a normal `attached`/`detached` device event, followed by the BSD device name (`tar_removable_collector.cpp:477`)."
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "export",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "configure",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "collect_fast",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_slow",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_perf",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_software",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "rollup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "sql",
+          "not_captured": null,
+          "params": "sql=\"SELECT 1\"",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "compatibility",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "fleet_snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "purge_source",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "3094b2651318",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "export",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "configure",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "collect_fast",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_slow",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_perf",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_software",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "rollup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "sql",
+          "not_captured": null,
+          "params": "sql=\"SELECT 1\"",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "compatibility",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "fleet_snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "purge_source",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "3094b2651318",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "query",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "export",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "configure",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "collect_fast",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_slow",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_perf",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "collect_software",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "rollup",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "sql",
+          "not_captured": null,
+          "params": "sql=\"SELECT 1\"",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "compatibility",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "fleet_snapshot",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|TAR database not initialized"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "purge_source",
+          "not_captured": "Destructive/Irreversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "3094b2651318",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "fleet_snapshot",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Response"
+    },
+    {
+      "action": "status",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "query",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "snapshot",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "export",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "configure",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "collect_fast",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "collect_slow",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "collect_perf",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "collect_software",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "rollup",
+      "dispatch_class": "Destructive",
+      "execute_gate": "None",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "sql",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "compatibility",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "purge_source",
+      "dispatch_class": "Destructive",
+      "execute_gate": "None",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
+      "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/tar.yaml",
+      "content/definitions/tar_warehouse.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/tar/src/tar_aggregator.cpp",
+      "agents/plugins/tar/src/tar_aggregator.hpp",
+      "agents/plugins/tar/src/tar_arp_collector.cpp",
+      "agents/plugins/tar/src/tar_arp_parsers.hpp",
+      "agents/plugins/tar/src/tar_capture_status.hpp",
+      "agents/plugins/tar/src/tar_collectors.hpp",
+      "agents/plugins/tar/src/tar_cursor.hpp",
+      "agents/plugins/tar/src/tar_cursor_sources.cpp",
+      "agents/plugins/tar/src/tar_db.cpp",
+      "agents/plugins/tar/src/tar_db.hpp",
+      "agents/plugins/tar/src/tar_diff.cpp",
+      "agents/plugins/tar/src/tar_dns_collector.cpp",
+      "agents/plugins/tar/src/tar_fleet_snapshot.cpp",
+      "agents/plugins/tar/src/tar_fleet_snapshot.hpp",
+      "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
+      "agents/plugins/tar/src/tar_mapdrive_macos_parsers.hpp",
+      "agents/plugins/tar/src/tar_module_etw.cpp",
+      "agents/plugins/tar/src/tar_module_etw.hpp",
+      "agents/plugins/tar/src/tar_module_stream.cpp",
+      "agents/plugins/tar/src/tar_module_stream.hpp",
+      "agents/plugins/tar/src/tar_netconn.hpp",
+      "agents/plugins/tar/src/tar_netconn_win.cpp",
+      "agents/plugins/tar/src/tar_netqual.hpp",
+      "agents/plugins/tar/src/tar_netqual_boot.cpp",
+      "agents/plugins/tar/src/tar_netqual_boot.hpp",
+      "agents/plugins/tar/src/tar_netqual_nstat.cpp",
+      "agents/plugins/tar/src/tar_netqual_nstat.hpp",
+      "agents/plugins/tar/src/tar_network_collector.cpp",
+      "agents/plugins/tar/src/tar_perf.cpp",
+      "agents/plugins/tar/src/tar_perf.hpp",
+      "agents/plugins/tar/src/tar_plugin.cpp",
+      "agents/plugins/tar/src/tar_power_collector.cpp",
+      "agents/plugins/tar/src/tar_power_parsers.hpp",
+      "agents/plugins/tar/src/tar_proc_es.cpp",
+      "agents/plugins/tar/src/tar_proc_es.hpp",
+      "agents/plugins/tar/src/tar_proc_etw.cpp",
+      "agents/plugins/tar/src/tar_proc_etw.hpp",
+      "agents/plugins/tar/src/tar_proc_perf.cpp",
+      "agents/plugins/tar/src/tar_proc_perf.hpp",
+      "agents/plugins/tar/src/tar_proc_stream.cpp",
+      "agents/plugins/tar/src/tar_proc_stream.hpp",
+      "agents/plugins/tar/src/tar_removable_collector.cpp",
+      "agents/plugins/tar/src/tar_removable_diskarb.mm",
+      "agents/plugins/tar/src/tar_removable_parsers.hpp",
+      "agents/plugins/tar/src/tar_schema_registry.cpp",
+      "agents/plugins/tar/src/tar_schema_registry.hpp",
+      "agents/plugins/tar/src/tar_service_collector.cpp",
+      "agents/plugins/tar/src/tar_service_parsers.hpp",
+      "agents/plugins/tar/src/tar_software_collector.cpp",
+      "agents/plugins/tar/src/tar_software_core.cpp",
+      "agents/plugins/tar/src/tar_software_core.hpp",
+      "agents/plugins/tar/src/tar_source_health.hpp",
+      "agents/plugins/tar/src/tar_sql_executor.cpp",
+      "agents/plugins/tar/src/tar_sql_executor.hpp",
+      "agents/plugins/tar/src/tar_status_format.hpp",
+      "agents/plugins/tar/src/tar_usage.cpp",
+      "agents/plugins/tar/src/tar_usage.hpp",
+      "agents/plugins/tar/src/tar_user_collector.cpp",
+      "agents/plugins/tar/src/tar_version.hpp",
+      "agents/plugins/tar/src/tar_win_raii_guards.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/server/test_tar_process_tree.cpp",
+      "tests/unit/server/test_tar_tree_routes.cpp",
+      "tests/unit/test_tar_aggregator.cpp",
+      "tests/unit/test_tar_arp.cpp",
+      "tests/unit/test_tar_capability_table.cpp",
+      "tests/unit/test_tar_capture_status.cpp",
+      "tests/unit/test_tar_cursor.cpp",
+      "tests/unit/test_tar_diff.cpp",
+      "tests/unit/test_tar_local_dispatcher.cpp",
+      "tests/unit/test_tar_mapdrive.cpp",
+      "tests/unit/test_tar_module_etw.cpp",
+      "tests/unit/test_tar_module_stream.cpp",
+      "tests/unit/test_tar_netconn.cpp",
+      "tests/unit/test_tar_netqual_nstat.cpp",
+      "tests/unit/test_tar_perf.cpp",
+      "tests/unit/test_tar_power.cpp",
+      "tests/unit/test_tar_proc_es.cpp",
+      "tests/unit/test_tar_proc_etw.cpp",
+      "tests/unit/test_tar_proc_perf.cpp",
+      "tests/unit/test_tar_removable.cpp",
+      "tests/unit/test_tar_schema_registry.cpp",
+      "tests/unit/test_tar_service.cpp",
+      "tests/unit/test_tar_software.cpp",
+      "tests/unit/test_tar_source_health.cpp",
+      "tests/unit/test_tar_store.cpp",
+      "tests/unit/test_tar_usage.cpp",
+      "tests/unit/test_tar_warehouse.cpp",
+      "tests/unit/test_tar_win_raii_guards.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result, primarily.** `status`/`query`/`export`/`sql`/`compatibility` rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}` and rendered by the `/tar` dashboard (`docs/tar-dashboard.md`, `docs/tar-implementer.md`).",
+    "**`fleet_snapshot`** feeds the server-side `FleetTopologyStore` on a cache miss, assembling the 3D `/viz/fleet` topology view (`tar.yaml:900-901`); it is not itself a warehouse read.",
+    "**`rollup`/`purge_source`** mutate `tar.db` directly (aggregation, retention, source purge) — their effect is visible through later `status`/`query`/`sql` reads, not a separate sink.",
+    "**Not consumed by** daily-sync inventory, DEX, or metrics — TAR has no `/metrics` endpoint; `status`'s retention-guard counters are the plugin's only fleet-readable health signal (`tar_plugin.cpp:2424-2431`).",
+    "**Sensitivity.** `user` events name the logged-in account; `process` events carry the invoking user and full command line (redacted only against the configured `*password*`-style substring patterns); `network`/opt-in `arp` events carry remote IP/MAC addresses (device identifiers) and the owning `process_name`; the opt-in `software` source is an installed-software inventory (name/publisher/version) reachable via `query type=software`/`sql`; opt-in `dns`/`mapdrive` add resolved hostnames and mapped-drive usernames/remote hosts; `removable` events name an attached device's vendor/product/serial and its BSD/udev device name.",
+    "**Siblings:** `crossplatform.tar.*` (this plugin) is standalone; the `installed_software` daily-sync source (ADR-0016) is a separate, machine-scope inventory feed, distinct from TAR's opt-in `software` capture source.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.tar.status\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, and `/viz/fleet` for `fleet_snapshot`."
+  ]
+}

@@ -1,0 +1,12 @@
+host: the-rig (Microsoft Windows 11 Pro 10.0.26200 build 26200, x64)
+identity: nt authority\system (scheduled task, RunLevel Highest)
+date: 2026-09-21T15:29:55.4194287+01:00
+command: PowerShell registry dump of HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy in the fixture grammar name<TAB>u32|text|other<TAB>data (probe.ps1, one line per value; DWORD emitted as unsigned)
+status: REAL CAPTURE (rig session A)
+cross-check, raw 'reg query HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy' from the same task:
+
+  HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Policy
+      EmodePolicyRequired    REG_DWORD    0x0
+      SkuPolicyRequired    REG_DWORD    0x0
+      VerifiedAndReputablePolicyState    REG_DWORD    0x0
+      SAC_PreviousState    REG_DWORD    0xffffffff

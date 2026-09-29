@@ -1,0 +1,28 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash d55c173b7ddd
+== action=set key=yuzu_capture_tmp value=1
+tag_set|yuzu_capture_tmp|1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get key=yuzu_capture_tmp
+tag|yuzu_capture_tmp|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_all
+count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=delete key=yuzu_capture_tmp
+tag_deleted|yuzu_capture_tmp|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=check key=yuzu_capture_tmp
+tag_exists|yuzu_capture_tmp|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=clear
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=count
+count|0
+[result_status] UNDECLARED / UNKNOWN / 
+

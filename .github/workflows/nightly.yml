@@ -16,7 +16,15 @@ name: Nightly
 on:
   schedule:
     - cron: '0 6 * * *'  # 06:00 UTC daily
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Which jobs to run (#4018: lets recurrence be measured on dev without paying for the full Big Tam matrix each time - scheduled nightlies only ever run main, never dev)"
+        type: choice
+        options:
+          - all
+          - windows-asan
+        default: all
 
 permissions:
   contents: read
@@ -31,6 +39,8 @@ env:
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
+  # Big Tam and Wee Tam both allocate one 8C/16T L3 domain per runner.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Preflight: Big Tam runner-health gate ─────────────────────────────
@@ -40,35 +50,53 @@ jobs:
   # than queueing 60 min into a stalled runner). Secrets are available on
   # schedule + workflow_dispatch, so the PAT resolves.
   #
-  # Skip semantics: if Big Tam is wholly offline, all three skip; `alert`
-  # (if: failure()) does NOT fire on a skip and `close-on-green`
-  # (if: success()) does — i.e. nightly does not block on an offline pool.
-  # That edge is covered by runner-inventory-sentinel.yml, which opens an
-  # issue on an OFFLINE/MISSING runner independently.
+  # Big Tam and Windows are required nightly pools. Missing control evidence
+  # or a wholly unavailable required pool fails this job red; it is not
+  # converted into a successful matrix skip.
   preflight:
-    name: "Preflight (runner health)"
+    name: "Nightly preflight (runner health)"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
-      # Pool gate for windows-asan (the [self-hosted, Windows, X64] job pool)
-      # — same output the script already emits for ci.yml's windows job.
-      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
+      # Exact Wee Tam pool gate used by windows-asan.
+      weetam_pool_healthy: ${{ steps.health.outputs.weetam_pool_healthy }}
+      failure_kind: ${{ steps.health.outputs.failure_kind }}
+      failure_report: ${{ steps.health.outputs.failure_report }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+          DISPATCH_JOBS: ${{ inputs.jobs }}
+        run: |
+          # #4018 hardening: a `jobs=windows-asan` dispatch only needs Wee Tam
+          # healthy. Requiring Big Tam unconditionally (as before) meant an
+          # unrelated Big Tam outage failed THIS job, which - via windows-asan's
+          # bare `if:` (no status function, so an implicit success() is ANDed on
+          # per CLAUDE.md's own standing invariant) - silently skipped
+          # windows-asan too, defeating the selector's whole point in exactly the
+          # case a cheap, isolated Wee Tam check is most valuable.
+          pools=(--require-pool weetam)
+          if [[ "$DISPATCH_JOBS" != "windows-asan" ]]; then
+            pools+=(--require-pool bigtam)
+          fi
+          python3 scripts/ci/runner-health-check.py --mode preflight "${pools[@]}"
 
   # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    # inputs.jobs is null on a schedule trigger (no workflow_dispatch inputs), and
+    # `null != 'windows-asan'` is true - so this guard, and its four siblings on
+    # sanitize-tsan/coverage/alert/close-on-green, are no-ops on the daily cron and
+    # a plain `jobs=all` dispatch. Only `jobs=windows-asan` skips them. A future edit
+    # comparing against `'all'` instead of `!= 'windows-asan'` would silently skip
+    # every one of these jobs on the cron - don't make that change here.
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool (native Ubuntu 26.04, GCC 15). The ASan
     # triplet (x64-linux-asan) is a forced cold-cache rebuild every run
     # because per-instrumentation vcpkg packages can't be safely shared
@@ -77,12 +105,26 @@ jobs:
     # fast; the bigtam-linux label guarantees the gcc-15 toolchain (Shulgi
     # 24.04 can't build it).
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 60
+    # 60->75 (#4018 hardening round): the #2373 tsan-heavy split adds a second,
+    # separately-budgeted test() entry (up to 600s x this leg's own
+    # --timeout-multiplier 2 = 1200s worst case) that this job's own timeout-minutes
+    # never accounted for. sanitizer-tests.yml's equivalent ASan/TSan legs already
+    # run the identical surface + multiplier at 75 minutes - match that, don't leave
+    # nightly as the tighter of the two jobs doing the same work.
+    timeout-minutes: 75
     env:
-      # detect_odr_violation=0 mirrors ci.yml's matrix linux: gRPC's
-      # libgpr.so embeds a static copy of abseil's kToUpper while the
-      # application links abseil dynamically. Re-enable when gpr's
-      # vcpkg port stops vendoring abseil.
+      # detect_odr_violation=0: kept as belt-and-braces post-#4019, not
+      # because the original trigger still applies. It was added because
+      # gRPC's libgpr.so embedded a static copy of abseil's kToUpper while
+      # the rest of the dep tree linked abseil dynamically -- #4019's
+      # triplets/x64-linux-asan.cmake switch to static linkage eliminated
+      # that specific split (confirmed: no separate libgpr.so in the built
+      # binaries). A narrower, still-live instance of the same ODR class
+      # survives at the libyuzu_agent_core.so/test-binary boundary (each
+      # independently embeds its own abseil kSeed) -- confirmed empirically
+      # NOT to trip this detector across a full agent-suite run, but not
+      # proven absent under every code path. Re-enabling is tracked
+      # separately; don't assume this line is dead weight.
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
       # Shared 4-runner Big Tam host: harmless gateway-eunit default-cookie
@@ -101,7 +143,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -118,7 +160,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build gcc-15 g++-15 \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -176,31 +218,50 @@ jobs:
             -Db_sanitize=address,undefined
 
       - name: Build
-        run: meson compile -C build-linux-asan
+        run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Idempotent persistent `yuzu-ci-postgres` docker container on
-      # 127.0.0.1:15432 — same step as ci.yml's linux job, shared on this
-      # runner. Required since #1320 PR 1 (SOFT_EXIT=1): a missing Postgres
-      # fails the job here, before the test step.
+      # Idempotent persistent docker container — per agent on the 4-runner
+      # pool (`yuzu-ci-postgres-<n>` on 127.0.0.1:15440+<n>, #2094) — same
+      # step as ci.yml's linux job. Required since #1320 PR 1 (SOFT_EXIT=1):
+      # a missing Postgres fails the job here, before the test step.
       - name: Ensure Postgres (server tests)
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-asan --print-errorlogs
+        # --timeout-multiplier 2: the #2092 server shards carry 600s budgets
+        # sized for uninstrumented runs; sanitizer instrumentation runs
+        # slower (the pre-split 900s budget was justified by exactly that),
+        # and 2x1200s parallel shards still fit this job's timeout.
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
+        # enabled on the nightly windows-asan leg, so a hang here had no per-test
+        # attribution beyond the coarser suite-level testlog. Absolute path, same
+        # reason as windows-asan's own comment on this: meson's default test workdir
+        # is the build directory itself, so a bare path would double-prefix.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-asan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-asan --timeout-multiplier 2 --print-errorlogs
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
-        if: failure()
+      - name: Upload meson testlog (on failure or cancel)
+        # `|| cancelled()` added alongside progress.log (#4153 round 4): the historical
+        # stalls this listener exists to attribute (#2345, #4018) rode to the JOB's own
+        # timeout, which GitHub Actions reports as CANCELLED, not FAILED - a bare
+        # `failure()` would silently drop exactly the artifact this fix adds.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-asan
           path: |
             build-linux-asan/meson-logs/testlog.txt
             build-linux-asan/meson-logs/testlog.junit.xml
+            build-linux-asan/meson-logs/progress.log
           retention-days: 14
           if-no-files-found: warn
 
@@ -208,15 +269,20 @@ jobs:
   sanitize-tsan:
     name: "Sanitizers (TSan)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool. Same compute argument as the ASan job:
     # the TSan triplet (x64-linux-tsan, issue #917) is a forced cold-cache
     # rebuild every run because per-instrumentation vcpkg packages can't be
     # safely shared with the standard or ASan triplets. The bigtam-linux
     # label guarantees the gcc-15 toolchain (Shulgi 24.04 can't build it).
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 60
+    # 60->75: see the sanitize-asan job's identical comment above (#4018 hardening).
+    timeout-minutes: 75
     env:
+      # TSan suppressions are COMPILED INTO the test binaries
+      # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+      # there is deliberately no `suppressions=` file here. Read that comment
+      # before adding one.
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
       # Shared 4-runner Big Tam host: harmless gateway-eunit default-cookie
       # defence (matches ci.yml's linux leg).
@@ -234,7 +300,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -245,13 +311,19 @@ jobs:
           # flock serializes apt across the 4 runners sharing the Big Tam
           # host — DPkg::Lock::Timeout does NOT cover apt-get update's lists
           # lock — reusing ci.yml's lock path so all Big Tam jobs coordinate.
+          #
+          # gdb is in this list (not apt-installed inside the diagnostic step
+          # where it used to live) so the failure path costs no apt-get update
+          # round-trip, and so a broken apt mirror surfaces here — up front, on
+          # every run — rather than only on the run where we need a stack and
+          # cannot get one (#1038, build-ci N1).
           (
             flock -w 600 9 || { echo "::error::timed out waiting for apt lock"; exit 1; }
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
-              cmake ninja-build gcc-15 g++-15 \
+              cmake ninja-build gcc-15 g++-15 gdb \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -313,65 +385,19 @@ jobs:
             -Db_sanitize=thread
 
       - name: Build
-        run: meson compile -C build-linux-tsan
+        run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS"
 
       - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
-        # cpp-httplib enables CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO by
-        # default (HTTPLIB_IS_USING_NON_BLOCKING_GETADDRINFO=ON in
-        # httplibConfig.cmake), routing Client::create_socket through
-        # getaddrinfo_a(). glibc implements that by spawning an async DNS
-        # helper thread via clone3 directly — bypassing TSan's
-        # pthread_create interceptor — so the helper's per-thread
-        # allocator state never initialises and its first malloc() segfaults
-        # inside __tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8).
-        # That bare SIGSEGV (#438) is what the #1031 race fix was unmasking;
-        # the diagnostic step below captured the stack in run 25901174628.
-        #
-        # The shim interposes getaddrinfo_a/gai_suspend/gai_error/gai_cancel
-        # with synchronous getaddrinfo on the calling thread — no async
-        # helper, no crash. Scoped to the TSan job only via LD_PRELOAD on
-        # the Test and gdb steps; production keeps the non-blocking-DNS
-        # behaviour (DNS timeouts still interruptible there).
-        run: |
-          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
-          #define _GNU_SOURCE
-          #include <netdb.h>
-          #include <stddef.h>
-          #include <signal.h>
-          #include <time.h>
-
-          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
-                             struct sigevent *sig) {
-              (void)mode; (void)sig;
-              for (int i = 0; i < nitems; ++i) {
-                  if (!list[i]) continue;
-                  list[i]->ar_result = NULL;
-                  list[i]->__return = getaddrinfo(list[i]->ar_name,
-                                                    list[i]->ar_service,
-                                                    list[i]->ar_request,
-                                                    &list[i]->ar_result);
-              }
-              return 0;
-          }
-
-          int gai_suspend(const struct gaicb *const list[], int nitems,
-                           const struct timespec *timeout) {
-              (void)list; (void)nitems; (void)timeout;
-              return 0; /* already completed synchronously */
-          }
-
-          int gai_error(struct gaicb *req) {
-              return req ? req->__return : 0;
-          }
-
-          int gai_cancel(struct gaicb *req) {
-              (void)req;
-              return EAI_NOTCANCELED;
-          }
-          SHIM_EOF
-          gcc -shared -fPIC -O2 -Wall -Wextra \
-            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
-          file /tmp/libgai_sync_shim.so
+        # cpp-httplib's non-blocking DNS routes through glibc's getaddrinfo_a(),
+        # whose clone3-spawned helper thread bypasses TSan's pthread_create
+        # interceptor and segfaults on its first malloc() (#438). The shim
+        # interposes it with a synchronous getaddrinfo() on the calling thread.
+        # Full rationale, the glibc-private-ABI guard, and the gcc-15/-Werror
+        # reasoning live in the script — ONE copy, shared with sanitizer-tests.yml,
+        # so the two can't drift (#1038 CS-03). Built into $RUNNER_TEMP, not /tmp,
+        # because the 4-agent Big Tam pool shares one filesystem and a fixed path
+        # is a cross-job collision class (#1038 R-15 / CS-04).
+        run: bash scripts/ci/build-gai-sync-shim.sh "$RUNNER_TEMP/libgai_sync_shim.so"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
@@ -381,78 +407,87 @@ jobs:
       - name: Test
         id: test
         env:
-          LD_PRELOAD: /tmp/libgai_sync_shim.so
-        run: meson test -C build-linux-tsan --print-errorlogs
+          LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
+        # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets).
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): see the asan Test
+        # step's comment - same rationale, same absolute-path requirement.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-tsan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-tsan --timeout-multiplier 2 --print-errorlogs
 
       - name: Capture stack trace under gdb (#438 diagnostic)
         # With the gai_sync_shim active, the originally-documented #438
-        # getaddrinfo_a crash is suppressed and the TSan suite should pass.
-        # This step only runs when the Test step itself failed — so any
-        # stack captured here is a NEW failure mode worth investigating.
-        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so
-        # we replay the seed the meson run used when extractable.
+        # getaddrinfo_a crash is suppressed and the TSan suite should pass, so
+        # any stack captured here is a NEW failure mode worth investigating.
         #
-        # `if: steps.test.outcome == 'failure'` (rather than `failure()`)
-        # ensures we don't gdb against a non-test failure (e.g. ccache
-        # binary corrupt, artifact upload error) where there's no
-        # meaningful binary to inspect.
-        if: steps.test.outcome == 'failure'
+        # The `if:` needs care, and got it wrong before (#1038). The previous
+        # guard was a bare `steps.test.outcome == 'failure'`, which contains no
+        # status-check function — so GitHub ANDs an implicit `success()` onto it,
+        # and `success()` is false the moment Test fails. The condition was
+        # therefore unsatisfiable and the step skipped on every red nightly since
+        # #1034 (verified against runs 29312580979 / 29231499246 / 29183473414:
+        # "Test: failure" -> "Capture stack trace under gdb: skipped"). The whole
+        # diagnostic has been dead code.
+        #
+        # `failure() || cancelled()` restores reachability AND extends it to job
+        # cancellation — a TSan test stuck until the 60-min timeout is exactly the
+        # case a stack helps most, and `failure()` alone does not fire there
+        # (#1038, NICE-3). The outcome check is kept as the inner clause so we
+        # still don't gdb an unrelated failure (a corrupt ccache, a bad artifact
+        # upload) where there is no meaningful binary to inspect — which was the
+        # original, correct intent of the guard this replaces.
+        if: (failure() || cancelled()) && (steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled')
         env:
-          LD_PRELOAD: /tmp/libgai_sync_shim.so
+          LD_PRELOAD: ${{ runner.temp }}/libgai_sync_shim.so
+          # TSan suppressions are COMPILED INTO the test binaries
+          # (tests/unit/test_runner_main.cpp, __tsan_default_suppressions, #1611);
+          # there is deliberately no `suppressions=` file here. Read that comment
+          # before adding one.
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          # Not interpolated into the shell directly: keeps the expression out of
+          # the script body (zizmor template-injection hygiene, and it is the
+          # pattern the rest of this file uses).
+          TEST_OUTCOME: ${{ steps.test.outcome }}
         run: |
-          # flock-wrapped (shared Big Tam host); best-effort, so a lock
-          # timeout must not fail this diagnostic step.
-          ( flock -w 120 9 || true
-            sudo apt-get -o DPkg::Lock::Timeout=120 install -y gdb >/dev/null 2>&1 || true
-          ) 9>/tmp/yuzu-ci-apt.lock
-          if ! command -v gdb >/dev/null; then
-            echo "gdb unavailable on this runner — skipping stack capture"
-            exit 0
-          fi
-          cd build-linux-tsan
-          seed=$(grep -oE 'Randomness seeded to: [0-9]+' meson-logs/testlog.txt 2>/dev/null | head -1 | awk '{print $NF}') || true
-          if [ -n "$seed" ]; then
-            echo "replaying Catch2 seed: $seed"
-            seed_args="--rng-seed $seed --order rand"
+          # Which binaries to gdb, with which Catch2 seed, is derived from the run
+          # itself — see scripts/ci/tsan-gdb-capture.py. It replaces a hardcoded
+          # `./tests/yuzu_server_tests`, which captured nothing at all when the
+          # crash was in agent/tar/transport (#1038, R-06). Best-effort by
+          # contract: the script always exits 0, so a diagnostic that cannot run
+          # never masks — or adds to — the real failure.
+          # Explicit if/else, not `[[ ]] && mode=…`: the default runner shell is
+          # `bash -eo pipefail`, and a bare `cond && assign` whose cond is false
+          # returns non-zero — harmless here (it's exempt from set -e as a non-final
+          # &&-list member) but a needless snag for the next reader.
+          if [[ "$TEST_OUTCOME" == "cancelled" ]]; then
+            mode=cancelled
           else
-            seed_args="--order rand"
+            mode=failure
           fi
-          export TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
-          # gdb's default SIGSEGV disposition (stop + don't pass to inferior)
-          # leaves us at the crashing frame; subsequent commands then dump
-          # every thread's stack plus the crashing thread's registers.
-          # `timeout 300` caps a non-reproducing run so it can't consume
-          # the rest of the 60-min job budget (unhappy-path R-07).
-          timeout 300 gdb -batch \
-            -ex 'set pagination off' \
-            -ex 'set print thread-events off' \
-            -ex 'set backtrace limit 80' \
-            -ex "run $seed_args" \
-            -ex 'printf "\n=== thread backtraces (full) ===\n"' \
-            -ex 'thread apply all bt full' \
-            -ex 'printf "\n=== info registers ===\n"' \
-            -ex 'info registers' \
-            -ex 'quit' \
-            ./tests/yuzu_server_tests 2>&1 | tee stack-capture.log || true
-          # Match TSan-aborted runs (SIGABRT after a printed race report) and
-          # bus errors as well as SIGSEGV. Otherwise non-allocator TSan races
-          # produce a false-negative "did not crash" annotation (R-13).
-          if ! grep -qE 'received signal|SIGSEGV|SIGABRT|SIGBUS|ThreadSanitizer:' stack-capture.log; then
-            echo "(test binary did not crash this run — Catch2 shuffle non-determinism; re-dispatch nightly for another attempt)" >> stack-capture.log
-          fi
+          python3 scripts/ci/tsan-gdb-capture.py \
+            --builddir build-linux-tsan \
+            --mode "$mode"
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog and stack capture (on failure)
-        if: failure()
+      - name: Upload meson testlog and stack capture (on failure or cancel)
+        # `|| cancelled()` for the same reason the gdb step has it: on a 60-min
+        # timeout the job is CANCELLED, not failed, so a plain `failure()` upload
+        # would throw away the very stack capture the step above just took for
+        # the stuck-test case. An `always()` here would also upload on green runs.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-tsan
           path: |
             build-linux-tsan/meson-logs/testlog.txt
             build-linux-tsan/meson-logs/testlog.junit.xml
+            build-linux-tsan/meson-logs/progress.log
             build-linux-tsan/stack-capture.log
           retention-days: 14
           if-no-files-found: warn
@@ -503,7 +538,7 @@ jobs:
   windows-asan:
     name: "Sanitizer (Windows ASan)"
     needs: [preflight]
-    if: needs.preflight.outputs.windows_pool_healthy == 'true'
+    if: needs.preflight.outputs.weetam_pool_healthy == 'true'
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 90
     defaults:
@@ -535,7 +570,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -543,6 +578,8 @@ jobs:
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       - name: Assert toolchain available
         run: |
@@ -555,19 +592,9 @@ jobs:
           done
           meson --version
 
-      - name: Assert toolchain manifest (self-hosted, optional)
+      - name: Assert toolchain manifest (self-hosted)
         shell: pwsh
-        run: |
-          # Manifest-based self-test for boxes provisioned via
-          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
-          # runners that predate the manifest — the PATH check above still covers
-          # them. Same step as ci.yml's windows job.
-          $m = 'C:\actions-runner\toolchain-manifest.json'
-          if (Test-Path $m) {
-            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
-          } else {
-            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
-          }
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -626,25 +653,71 @@ jobs:
             -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"
 
       - name: Build
-        run: meson compile -C build-windows-asan tests/yuzu_agent_tests ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        run: meson compile -C build-windows-asan tests/yuzu_agent_tests -j "$YUZU_BUILD_JOBS"
 
       - name: Test
+        # #4018/#2373: sibling-aligned with every other sanitizer leg (Linux
+        # asan/tsan/coverage, sanitizer-tests.yml, the macOS ci.yml leg all carry
+        # --timeout-multiplier 2 already) and joins ci.yml's Windows with-test-slot.sh
+        # gate (this leg previously ran ungated on the shared 4-runner Wee Tam box).
+        # YUZU_TEST_PROGRESS_FILE is an ABSOLUTE path deliberately: meson's default
+        # test workdir is the build directory itself (verified against meson's own
+        # source), so a bare "build-windows-asan/meson-logs/..." value would resolve
+        # relative to a cwd that's already build-windows-asan and double-prefix.
+        id: test
+        env:
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
           export PATH="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin:$PATH"
-          meson test -C build-windows-asan --suite agent --print-errorlogs
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-asan/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          bash scripts/ci/with-test-slot.sh 2 -- \
+            meson test -C build-windows-asan --suite agent --timeout-multiplier 2 --print-errorlogs
+
+      - name: Process snapshot (on Test stall/cancel)
+        # #4018 Gate-4 ask: a process inventory captured as soon as possible after a
+        # stall or cancel, so a future recurrence's contention theory can be checked
+        # against evidence instead of staying a guess. Runs after meson's own kill (or
+        # the job-level cancel) has already happened, not "before teardown" - it
+        # inspects co-tenant processes on the box, not the killed process itself.
+        #
+        # BOTH clauses are required, exactly per the TSan job's gdb-capture step
+        # above (#1038): a bare `steps.test.outcome == ...` has no status-check
+        # function, so GitHub ANDs an implicit success() onto it - unsatisfiable
+        # the moment Test fails, making the step permanently unreachable dead
+        # code (this exact mistake shipped here once already in this PR's own
+        # governance round and was caught by build-ci's Gate 8 re-verify).
+        # `failure() || cancelled()` restores reachability; the outcome check
+        # stays as the inner clause so an unrelated Configure/Build/vcpkg
+        # failure earlier in this job doesn't trigger an irrelevant process dump.
+        if: (failure() || cancelled()) && (steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled')
+        # `tasklist /v` shows PID/session/user/CPU/window-title, not command lines -
+        # it will list every process on this SYSTEM-identity, 4-runner-shared box
+        # (CLAUDE.md's standing single-identity invariant), which lands in this
+        # repo's public run log. No new confidentiality issue - equivalent to the
+        # box's existing routine CI-log visibility - but worth this acknowledgment
+        # given that shared-identity posture is treated as significant elsewhere.
+        run: tasklist //v
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
-        if: failure()
+      - name: Upload meson testlog (on failure/cancel; always on a windows-asan-only dispatch)
+        # cancelled() matters for #4018: a 90-minute job-level timeout is a CANCEL,
+        # not a failure, and that's exactly when the progress log matters most.
+        # The always() half separately lets a `jobs=windows-asan` recurrence
+        # dispatch record a clean run's timings, not only a failing/cancelled one.
+        if: failure() || cancelled() || (always() && inputs.jobs == 'windows-asan')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-windows-asan
           path: |
             build-windows-asan/meson-logs/testlog.txt
             build-windows-asan/meson-logs/testlog.junit.xml
+            build-windows-asan/meson-logs/progress.log
           retention-days: 14
           if-no-files-found: warn
 
@@ -652,7 +725,7 @@ jobs:
   coverage:
     name: "Coverage (GCC 15)"
     needs: [preflight]
-    if: needs.preflight.outputs.bigtam_pool_healthy == 'true'
+    if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool. Was the generic [self-hosted, Linux, X64]
     # pool, but that spans both Shulgi (24.04/gcc-13) and Big Tam
     # (26.04/gcc-15); a gcc-15 coverage build can only run on Big Tam, so
@@ -676,7 +749,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -693,7 +766,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build gcc-15 g++-15 \
               pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool
           ) 9>/tmp/yuzu-ci-apt.lock
           # requirements-ci.txt is hash-pinned (includes gcovr for the
           # coverage report).
@@ -759,7 +832,7 @@ jobs:
             -Db_coverage=true
 
       - name: Build
-        run: meson compile -C build-linux-coverage
+        run: meson compile -C build-linux-coverage -j "$YUZU_BUILD_JOBS"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.
@@ -767,7 +840,18 @@ jobs:
         run: bash scripts/ci/ensure-postgres.sh
 
       - name: Test
-        run: meson test -C build-linux-coverage --print-errorlogs
+        # --timeout-multiplier 2: see the asan Test step (#2092 shard budgets;
+        # coverage instrumentation is similarly slower than plain debug).
+        # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): this leg runs the
+        # full unfiltered suite including agent, but had no per-test attribution on a
+        # hang - only the asan/tsan/windows-asan legs did. Same absolute-path reasoning
+        # as those: meson's default test workdir is the build directory itself.
+        run: |
+          export YUZU_TEST_PROGRESS=1
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-coverage/meson-logs/progress.log"
+          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
+          rm -f "$YUZU_TEST_PROGRESS_FILE"
+          meson test -C build-linux-coverage --timeout-multiplier 2 --print-errorlogs
 
       - name: Generate coverage reports
         run: |
@@ -789,7 +873,7 @@ jobs:
             --html --html-details -o build-linux-coverage/coverage-html/index.html
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: build-linux-coverage/coverage.xml
           fail_ci_if_error: false
@@ -800,20 +884,27 @@ jobs:
           name: coverage-report
           path: build-linux-coverage/coverage-html/
 
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
-      - name: Upload meson testlog (on failure)
-        if: failure()
+      - name: Upload meson testlog (on failure or cancel)
+        # Supersedes the leg's prior bare `if: failure()` testlog upload (adversarial-
+        # review finding, #4153): that step had no progress.log and, on a duplicate
+        # `meson-testlog-coverage` name, would have collided with this one and failed
+        # on every red run - deleted rather than kept alongside this one. `|| cancelled()`:
+        # see the same line's comment on the asan leg - a stall here rides the JOB's own
+        # timeout, reported as CANCELLED not FAILED, which the deleted step never covered.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-testlog-coverage
           path: |
             build-linux-coverage/meson-logs/testlog.txt
             build-linux-coverage/meson-logs/testlog.junit.xml
+            build-linux-coverage/meson-logs/progress.log
           retention-days: 14
           if-no-files-found: warn
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
   # ── Alert on nightly failure ───────────────────────────────────────────
   # Opens or comments on the `nightly-broken` issue if any of the four
@@ -822,8 +913,10 @@ jobs:
   # issue-creation pattern.
   alert:
     name: "Open nightly-broken on failure"
-    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
-    if: failure()
+    needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
+    # `always()` alone also runs after cancellation, which must not create a
+    # repository-wide merge block. Retain failure handling for preflight.
+    if: ${{ !cancelled() && inputs.jobs != 'windows-asan' && (failure() || needs.preflight.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -834,6 +927,8 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           NEEDS_JSON: ${{ toJSON(needs) }}
+          PREFLIGHT_FAILURE_KIND: ${{ needs.preflight.outputs.failure_kind }}
+          PREFLIGHT_FAILURE_REPORT: ${{ needs.preflight.outputs.failure_report }}
         with:
           script: |
             const label = 'nightly-broken';
@@ -845,6 +940,13 @@ jobs:
             const summary = failedJobs.length
               ? failedJobs.join(', ')
               : 'unknown (alert fired without specific job failures)';
+            const preflightDetail = process.env.PREFLIGHT_FAILURE_REPORT
+              ? [
+                  `**Preflight failure:** \`${process.env.PREFLIGHT_FAILURE_KIND || 'unknown'}\``,
+                  process.env.PREFLIGHT_FAILURE_REPORT,
+                  ``,
+                ]
+              : [];
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             const sha = '${{ github.sha }}';
             const refName = process.env.REF_NAME;
@@ -853,6 +955,7 @@ jobs:
               ``,
               `**Failed jobs:** ${summary}`,
               ``,
+              ...preflightDetail,
               `**Run:** ${runUrl}`,
               ``,
               `**Discipline:** no merge to main while this issue is open.`,
@@ -897,8 +1000,8 @@ jobs:
   # duplicate from any prior bug doesn't linger.
   close-on-green:
     name: "Close nightly-broken on green"
-    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
-    if: success()
+    needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
+    if: success() && inputs.jobs != 'windows-asan'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

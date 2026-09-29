@@ -61,7 +61,7 @@ const GROUPS = [
     ['network_diag listening', 1],
     ['network_diag connections', 1],
     ['netstat netstat_list', 1],
-    ['sockwho sockwho_list', 1],
+    ['netstat attribution', 1],
   ]],
   ['Users & Sessions', [
     ['users logged_on', 1],
@@ -173,7 +173,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function sendCommand(page, instruction) {
   // Clear and type
-  await page.click('#instr-input', { clickCount: 3 });
+  await page.click('#instr-input', { count: 3 });
   await page.keyboard.press('Backspace');
   await page.type('#instr-input', instruction);
   await page.click('#btn-send');
@@ -236,7 +236,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: false,
-    args: ['--window-size=1400,900'],
+    args: ['--window-size=1400,900', '--no-sandbox'],
     defaultViewport: { width: 1400, height: 900 },
   });
 

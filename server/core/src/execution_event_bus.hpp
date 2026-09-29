@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -64,6 +65,16 @@ public:
     /// without `std::this_thread::sleep_for(60s)`. Set to nullptr to
     /// restore real time. governance round qe-S3.
     using ClockFn = std::function<std::int64_t()>;
+
+    /// C5 (#2409): the terminal verdict `unsubscribe_and_visit_terminal` hands to
+    /// its callback. `kTerminalKnownLost` means the channel is flagged terminal but
+    /// the payload aged out of the buffer - benign; the caller maps it to a
+    /// success-shaped fallback, never a synthesized error.
+    enum class TerminalVisit { kNeverTerminal, kTerminalBuffered, kTerminalKnownLost };
+    /// Operational status of the visit (distinct from the terminal verdict). The
+    /// caller MUST fail closed on kAbsentChannel/kInternalError - never infer
+    /// kNeverTerminal from them, which would re-open #2409.
+    enum class VisitStatus { kVisited, kStaleSub, kAbsentChannel, kInternalError };
 
     static constexpr std::size_t kBufferCap = 1000;
     static constexpr std::int64_t kRetentionAfterTerminalSec = 60;
@@ -116,9 +127,108 @@ public:
     /// comparable. Listener is invoked synchronously from `publish`.
     std::size_t subscribe(const std::string& execution_id, Listener listener);
 
+    /// Atomically install `listener` AND replay buffered events with `id > since_id` to
+    /// it, under a single hold of the channel mutex. Returns the subscription token, as
+    /// `subscribe` does.
+    ///
+    /// Used by both execution SSE routes and the MCP progress bridge to close the
+    /// replay-then-subscribe race: a publisher needs the same channel mutex, so nothing
+    /// can land in the gap. Each event reaches the listener EXACTLY once - buffered events
+    /// came from publishes that completed before this lock was held (the listener missed
+    /// their live fan-out) and are delivered by the replay; events published after this
+    /// returns get the live fan-out and are past the replay cursor.
+    ///
+    /// The listener is installed BEFORE the replay on purpose: `listeners.emplace` is the
+    /// only allocating step, so doing it first means an insertion failure throws with ZERO
+    /// projection side effects (nothing was replayed). The listener MUST be non-throwing
+    /// (the bus's standing "short, queue-and-notify" contract): a throw from a replay call
+    /// would propagate out with the listener already installed. The 2f progress bridge's
+    /// listener is a hard noexcept boundary, satisfying this.
+    std::size_t subscribe_and_replay(const std::string& execution_id, std::uint64_t since_id,
+                                     Listener listener);
+
     /// Unsubscribe a token previously returned by `subscribe`. Idempotent;
     /// silently no-ops if the channel or sub_id no longer exists.
     void unsubscribe(const std::string& execution_id, std::size_t sub_id);
+
+    /// C5 (#2409): atomically, under a SINGLE hold of the per-execution channel
+    /// mutex - (1) compute a terminal verdict, (2) invoke `f(verdict, ev)` (which
+    /// does the record-side claim/latch under ITS OWN lock), (3) erase the listener
+    /// IFF `f` returns true (it committed a teardown claim). This is the
+    /// linearization point that closes #2409: because `publish` fans out under the
+    /// same channel mutex, no terminal can slip between the verdict and the claim.
+    ///
+    /// Erase-only-on-claim is load-bearing: every DEFER (`f` returns false) KEEPS
+    /// the listener, so an unclaimed terminal-bearing channel can never go
+    /// listener-less and be GC'd out from under the record.
+    ///
+    /// `f` contract (caller-enforced, NOT checkable here): takes only ITS record
+    /// mutex; MUST NOT call any ExecutionEventBus method (it runs UNDER Channel::mu;
+    /// a bus call taking `map_mu_` would invert the `map_mu_ -> Channel::mu` order
+    /// publish/GC rely on). It returns `true` iff it claimed. `f` need NOT be
+    /// `noexcept` - the call is inside this method's try/catch, so a throw becomes
+    /// `kInternalError` (fail-closed); a `noexcept` `f` would instead terminate on a
+    /// record-lock failure before that catch is reached. `f` MUST make its only
+    /// uncontained throw-site its initial record-lock acquisition (before any
+    /// mutation) and contain any payload copy internally, so `kInternalError` still
+    /// means "record untouched" == "`f` did not run", never "ran then threw".
+    ///
+    /// The verdict scan keys ONLY on `first_terminal_id` (the FIRST terminal-flagged
+    /// event - which in the `refresh_counts` split is a terminal-flagged
+    /// `execution-progress`, NOT `execution-completed`; a type scan would
+    /// misclassify). A marker miss (aged out past `kBufferCap`) is
+    /// `kTerminalKnownLost` -> the caller's safe success-shaped fallback; we do NOT
+    /// recover a later buffered `execution-completed`, which could be a spurious
+    /// terminal (#2409 UP-1). `ev` points into the channel buffer, valid only for
+    /// the `f` call.
+    ///
+    /// Returns `kAbsentChannel` (no channel -> no barrier) WITHOUT running `f`, or
+    /// `kInternalError` (a lock/alloc threw - in the wrapped body OR propagated out
+    /// of `f` per the contract above); `kStaleSub` (channel present, sub_id already
+    /// gone) still runs `f` - a stale sub means a prior visit ran and `f`'s
+    /// record-state-first checks make the re-run idempotent.
+    template <class F>
+    VisitStatus unsubscribe_and_visit_terminal(const std::string& execution_id,
+                                               std::size_t sub_id, F&& f) noexcept {
+        try {
+            auto ch = find(execution_id);
+            if (!ch) return VisitStatus::kAbsentChannel;
+            std::lock_guard<std::mutex> g(ch->mu);
+            TerminalVisit verdict = TerminalVisit::kNeverTerminal;
+            const ExecutionEvent* ev = nullptr;
+            if (ch->terminal) {
+                // The ONLY scan: the FIRST terminal-flagged event, by id. NOT an
+                // event-type scan (the marker's target is a terminal-flagged
+                // execution-progress in the refresh_counts split; a completed-type
+                // scan misclassifies). If the marker aged out we deliberately do NOT
+                // recover a later buffered execution-completed: one present after the
+                // marker evicted is more likely a spurious LATER terminal (a
+                // mark_cancelled on the same id) than the real one (#2409 UP-1) and
+                // would build a WRONG final. kTerminalKnownLost -> the caller's
+                // success-shaped fallback ("fetch by execution_id") is always safe:
+                // the durable execution result is authoritative.
+                for (const auto& e : ch->buffer) {
+                    if (e.id == ch->first_terminal_id) {
+                        ev = &e;
+                        break;
+                    }
+                }
+                verdict = ev != nullptr ? TerminalVisit::kTerminalBuffered
+                                        : TerminalVisit::kTerminalKnownLost;
+            }
+            const bool sub_present = ch->listeners.find(sub_id) != ch->listeners.end();
+            // f runs after every throwing step (find/lock/scan); its return is the
+            // sole erase trigger. f may throw ONLY at its initial record-lock (before
+            // any mutation); the catch below maps that to kInternalError.
+            const bool claimed = f(verdict, ev);
+            if (claimed) {
+                ch->listeners.erase(sub_id);  // noexcept (erase by key)
+            }
+            return sub_present ? VisitStatus::kVisited : VisitStatus::kStaleSub;
+        } catch (...) {
+            return VisitStatus::kInternalError;
+        }
+    }
 
     /// Publish an event onto a per-execution channel. Assigns a monotonic
     /// id, appends to the ring buffer (evicting the oldest if at cap),
@@ -127,6 +237,13 @@ public:
     /// `is_terminal` marks the execution as having reached completion;
     /// the channel keeps the buffer for `kRetentionAfterTerminalSec` so
     /// late reconnects can replay, then is GC'd on next sweep.
+    ///
+    /// The event id is the per-channel counter, assigned in PUBLISH order under
+    /// the channel mutex — buffer order == id order, so a `Last-Event-ID`
+    /// reconnect never skips an undelivered event (HA WS-2a-2 Option A: the
+    /// durable event_outbox.event_id is deliberately NOT the live bus id — see
+    /// the publish body). The HA cross-replica poll re-publishes foreign events
+    /// through this same path, so they too get a monotonic local counter id.
     void publish(const std::string& execution_id, const std::string& event_type,
                  const std::string& data, bool is_terminal = false);
 
@@ -163,6 +280,13 @@ private:
         std::size_t next_sub_id{0};
         bool terminal{false};
         std::int64_t terminal_at_ms{0};
+        /// C5 (#2409): id of the FIRST terminal-flagged event, set atomically with
+        /// the `terminal` flag flip under `mu`. Names the exact terminal event so a
+        /// consumer need not event-type-search - which would misclassify, because
+        /// `refresh_counts` flags an `execution-progress` terminal before publishing
+        /// `execution-completed` (two publishes, `mu` released between). 0 until the
+        /// first terminal. Consumed by `unsubscribe_and_visit_terminal`.
+        std::uint64_t first_terminal_id{0};
     };
 
     /// Returns the channel pointer, allocating it if missing. The shared

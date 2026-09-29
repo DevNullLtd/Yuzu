@@ -1,0 +1,286 @@
+# Unit tests for the yuzu-guardian-journal alert group (#2340 CH-2 +
+# CH-5-PROM) - a group that is entirely commented out in
+# docs/prometheus/yuzu-alerts.yml (REASON 1 + REASON 2 in that file's own
+# "DISABLED" preamble) and stays that way in production.
+#
+# `rule_files:` below points at a GENERATED file that does not exist until
+# `run_promtool_tests.py` writes it. That script marker-extracts the
+# commented block between yuzu-alerts.yml's PROMTOOL-EXTRACT-BEGIN/END
+# comments, strips one leading "  # " from each line, and materializes the
+# result fresh on every run - the production file is never touched. Running
+# `promtool test rules` on THIS file by hand, without the harness, prints
+# "WARNING: no file match pattern ... SUCCESS" (promtool exits 0 on a glob
+# match nothing) - go through the harness instead:
+#
+#   YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1 python3 tests/prometheus/run_promtool_tests.py
+#
+# WHY THIS FILE IS SEPARATE FROM yuzu-alerts.test.yml. The extracted group's
+# rules are not shipped, so a case here proves something about a candidate
+# form, not the live fleet - keeping the two files apart keeps that
+# distinction visible in every diff and review, per the kickoff's "keep the
+# commented-group tests visually distinct" note.
+#
+# CH-2 VERDICT (ruled 2026-09-02, see #2340): the issue's literal wording
+# ("assert zero alerts") is inverted from YuzuGuardianJournalIntegrityGap's
+# own design intent - its doc comment states the 90s staleness window means
+# a reported-then-died agent is visible for LESS THAN ONE for: PERIOD, which
+# is why it carries no `for:` clause. The correct verdict is
+# fires-THEN-resolves: the rule must fire while the loss is visible (CH-2a)
+# and must ALSO resolve once the agent leaves the window, despite the loss
+# never healing (CH-2b) - that resolve-while-unhealed gap is the actual
+# characterized defect, not a simple "never fires" bug.
+#
+# CH-2c (added after adversarial review, #2340 PR-4): CH-2a/CH-2b alone never
+# exercise IntegrityGap's OTHER exclusion - `unless (metric offset 15m > 0)` -
+# because their loss window is short-lived, so the offset lookback is always
+# absent at every eval_time either case asserts. Deleting that clause
+# entirely left both cases green (confirmed by mutation, twice, independently,
+# by both adversarial reviewers). CH-2c closes it: a loss that STAYS nonzero
+# (never dies, never heals) fires only within its first 15m, then the offset
+# exclusion suppresses it for good - proving the rule is a rising-edge
+# detector, not a naive `> 0` alert that would page continuously on a single
+# known, ongoing loss (exactly what REASON 2's false-positive analysis rules
+# out for the naive forms).
+#
+# MUTATION COVERAGE (#2340 PR-4 scope, stated explicitly per the kickoff's
+# Sol flag): the harness's own canary (build_canary_tree, run_promtool_tests.py)
+# gives WHOLE-SUITE proof this fixture is read and can redden - it mutates
+# YuzuGuardianJournalTelemetryDark's `and on() yuzu_fleet_agents_healthy > 0`
+# guard and requires at least one case here to go red. Per-case mutation
+# proof for every other clause (does CH-2a specifically redden against a
+# `for:` clause added to IntegrityGap; does CH-5-PROM case 3 specifically
+# redden against the `and on()` guard removed; does CH-2c specifically
+# redden against the `unless (... offset 15m > 0)` clause removed) was
+# verified MANUALLY at authorship time - flip the rule, rerun, confirm the
+# intended case goes red, revert - and is NOT automated in CI. That is a
+# scope decision, not an oversight: automating per-case discrimination means
+# a mutated rules file PER CASE, which is real additional engineering the
+# kickoff left to a future PR if it turns out to be worth the ongoing cost.
+rule_files:
+  - generated/yuzu-guardian-journal-extracted.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── CH-2 -- YuzuGuardianJournalIntegrityGap ───────────────────────────────
+  #
+  # Both cases share one series: a fleet-sum counter that is 0 from t=0,
+  # jumps nonzero at t=65s (an agent reports a lost batch), stays nonzero
+  # through and past the 90s staleness window (to t=160s - a 95s span, so it
+  # genuinely persists THROUGH 90s, not just up to the edge), then returns
+  # to 0 for good (the agent's contribution ages out of the fleet sum once
+  # it leaves the 90s window - it does not merely go absent, matching the
+  # doc comment's "the SUM shrinks when that SPECIFIC agent restarts or
+  # leaves the 90s staleness window", not a Prometheus-lookback artifact).
+  #
+  # THE PHASE IS DELIBERATELY MISALIGNED, not a convenient round number:
+  # under `evaluation_interval: 1m` (ticks at 0/60/120/180s...), a 95s
+  # window starting at t=65s is visible at EXACTLY ONE tick (t=120s) - t=60s
+  # is still baseline, t=180s is already back to 0. This is the WORST
+  # evaluation phase for the rule's own no-`for:` design claim: it is also
+  # the only phase that reddens against a `for: 1m` mutation, since a
+  # single-tick-visible condition can never satisfy a for: clause requiring
+  # two consecutive true evaluations. A window aligned to span two ticks
+  # would pass a `for: 1m` mutation by accident and prove nothing about it.
+
+  # CH-2a -- fires while the loss is visible. Asserted at the single tick
+  # that sees it (t=120s) and, for contrast, at the tick immediately before
+  # the loss appears (t=60s, still quiet).
+  - interval: 5s
+    name: CH-2a - a reported loss then the agent dies - fires at the one eval tick that sees it
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_evicted_no_send_evidence'
+        values: "0x12 3x19 0x207"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 60s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 120s
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CH-2b -- the characterized defect: ALERTS clears on the VERY NEXT tick
+  # after the agent leaves the window (t=180s), even though the loss was
+  # real and never healed - an operator reading current alert state at that
+  # point sees nothing wrong. Stays clear well beyond too (t=20m): this is
+  # a genuine resolve, not a delayed re-fire.
+  - interval: 5s
+    name: CH-2b - the same loss resolves once the agent leaves the 90s window, though it never healed
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_evicted_no_send_evidence'
+        values: "0x12 3x19 0x207"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 180s
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CH-2c -- the rule's OTHER exclusion: a loss that never dies and never
+  # heals fires only within its first 15m, then `unless (metric offset 15m
+  # > 0)` suppresses it for good, because the offset lookback starts finding
+  # the SAME earlier nonzero sample. Proves the rising-edge design directly
+  # (not just fire-then-resolve-on-death): a naive `> 0` alert would page
+  # continuously for the whole 40m below; this one pages once, then goes
+  # quiet despite the loss being real, known, and ongoing the entire time.
+  - interval: 1m
+    name: CH-2c - a loss that never heals fires only within its first 15m, then the offset exclusion suppresses it for good
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_evicted_no_send_evidence'
+        values: "3x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # ── CH-5-PROM -- YuzuGuardianJournalTelemetryDark ─────────────────────────
+  #
+  # The pipeline-health counter RULES' own preamble calls out as able to be
+  # sound today - server-owned, published every sweep including 0, unlike
+  # the 30-ish fleet-sum loss/fault counters. Guard: presumes Guardian is
+  # actually deployed fleet-wide (yuzu_fleet_agents_healthy > 0), or a
+  # legitimately-quiet journal on an undeployed fleet reads identically to
+  # a dark telemetry pipeline.
+
+  # CASE 1 -- pending before the 15m `for:`, firing at the boundary.
+  - interval: 1m
+    name: CH-5-PROM case 1 - reporting dark with a healthy fleet is pending before 15m, firing at 15m
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_reporting'
+        values: "0x20"
+      - series: 'yuzu_fleet_agents_healthy'
+        values: "10000x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="pending"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="pending", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE 2 -- the "all families absent for 7d" shape from the original
+  # issue text: sustained darkness stays firing, not a one-shot pulse.
+  # Sampled every 4m (comfortably inside Prometheus's 5m default lookback,
+  # so the condition reads as continuously true between real samples)
+  # rather than every 1m, to keep the series a few thousand points instead
+  # of ten - the rule's own evaluation still ticks every 1m via
+  # `evaluation_interval:` above.
+  - interval: 4m
+    name: CH-5-PROM case 2 - reporting dark sustained for 7 days stays firing
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_reporting'
+        values: "0x2520"
+      - series: 'yuzu_fleet_agents_healthy'
+        values: "10000x2520"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing"}'
+        eval_time: 168h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE 3 -- no healthy agents at all: the rule presumes Guardian is
+  # deployed fleet-wide (its own doc comment), and a fleet of zero healthy
+  # agents is not that case. Stays quiet despite reporting==0.
+  - interval: 1m
+    name: CH-5-PROM case 3 - reporting dark with zero healthy agents stays quiet
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_reporting'
+        values: "0x30"
+      - series: 'yuzu_fleet_agents_healthy'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 4 -- a healthy, reporting fleet stays quiet.
+  - interval: 1m
+    name: CH-5-PROM case 4 - reporting nonzero on a healthy fleet stays quiet
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_reporting'
+        values: "5x30"
+      - series: 'yuzu_fleet_agents_healthy'
+        values: "10000x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 5 -- recovery: firing since before t=15m, reporting resumes at
+  # t=21m. The alert clears on the very next expected evaluation (t=21m) -
+  # clearing has no grace, unlike the rise.
+  - interval: 1m
+    name: CH-5-PROM case 5 - reporting recovers from zero and clears on the next evaluation
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_reporting'
+        values: "0x20 5x10"
+      - series: 'yuzu_fleet_agents_healthy'
+        values: "10000x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTelemetryDark"}'
+        eval_time: 21m
+        exp_samples: []
+
+  # CASE 6 -- extraction hygiene: with every series in the group absent (a
+  # clean environment, nothing journalled or scraped yet), every OTHER
+  # rule in the extracted group stays quiet too. Proves the marker
+  # extraction did not accidentally make something else in the group fire
+  # on missing data. Enumerated by name deliberately, not
+  # `alertname!="YuzuGuardianJournalTelemetryDark"` - a rename inside the
+  # group would silently pass a negation; an explicit list does not.
+  # TelemetryDark itself is covered by cases 1-5 above, not repeated here.
+  - interval: 1m
+    name: CH-5-PROM case 6 - every other rule in the group stays quiet with no input series
+    input_series: []
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalTagRejected"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalPageStale"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalPruneStale"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalRecordsDropped"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalWriteFailures"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalCapacityRefusal"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalForensicLoss"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalAccountingBug"}'
+        eval_time: 30m
+        exp_samples: []

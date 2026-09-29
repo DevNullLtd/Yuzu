@@ -1,0 +1,172 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/compliance",
+    "capability_id": "get.api-compliance",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/compliance"
+    },
+    "mcp_twin": "get_fleet_compliance",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/compliance/{param}",
+    "capability_id": "get.api-compliance-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/compliance/{param}"
+    },
+    "mcp_twin": "get_policy_agent_statuses",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/policies",
+    "capability_id": "get.api-policies",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policies"
+    },
+    "mcp_twin": "list_policies",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies",
+    "capability_id": "post.api-policies",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/invalidate-all",
+    "capability_id": "post.api-policies-invalidate-all",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/policies/{param}",
+    "capability_id": "delete.api-policies-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/policies/{param}",
+    "capability_id": "get.api-policies-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policies/{param}"
+    },
+    "mcp_twin": "get_policy",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/{param}/disable",
+    "capability_id": "post.api-policies-param-disable",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/{param}/enable",
+    "capability_id": "post.api-policies-param-enable",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/{param}/evaluate",
+    "capability_id": "post.api-policies-param-evaluate",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/{param}/invalidate",
+    "capability_id": "post.api-policies-param-invalidate",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policies/{param}/remediate",
+    "capability_id": "post.api-policies-param-remediate",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/policy-fragments",
+    "capability_id": "get.api-policy-fragments",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policy-fragments"
+    },
+    "mcp_twin": "list_policy_fragments",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/policy-fragments",
+    "capability_id": "post.api-policy-fragments",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/policy-fragments/{param}",
+    "capability_id": "delete.api-policy-fragments-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/compliance/summary",
+    "capability_id": "get.fragments-compliance-summary",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-compliance"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/compliance/{param}",
+    "capability_id": "get.fragments-compliance-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.api-compliance-param"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/nvd",
+    "capability_id": "get.fragments-settings-nvd",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:<ADR-1005 grandfathered surface #2 — NVD sync/CVE matching, re-homed by the vuln-module strangler, not twinned>"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/tag-compliance",
+    "capability_id": "get.fragments-settings-tag-compliance",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/tag-compliance"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  }
+]

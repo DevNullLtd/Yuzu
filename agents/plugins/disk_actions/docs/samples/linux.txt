@@ -1,0 +1,9 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f062fb9a3dfd
+== action=smart
+smart|-|-|unknown|unknown|unsupported|-|-|drive health is not implemented on Linux in this release; no mechanism was bound against real hardware
+[result_status] UNAVAILABLE / PARTIAL / linux:smart
+
+== action=volumes
+volume|-|-|-|-|-|physical-to-logical volume mapping is not implemented on Linux in this release; it ships with the smart leg it exists to support
+[result_status] UNAVAILABLE / PARTIAL / linux:volumes
+

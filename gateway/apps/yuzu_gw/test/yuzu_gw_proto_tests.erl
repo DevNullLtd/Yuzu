@@ -133,6 +133,17 @@ encode_command_request_preserves_payload_test() ->
     Encoded = yuzu_gw_proto:encode_command_request(Input),
     ?assertEqual(Payload, maps:get(payload, Encoded)).
 
+%% PR1.9b / CC-03: the normaliser must preserve `dispatch_tag` (field 9) the
+%% same way it preserves `payload` (field 8) above — same rationale, same
+%% not-on-the-forward-path caveat, same "must never become a silent strip
+%% point" requirement.
+encode_command_request_preserves_dispatch_tag_test() ->
+    Tag = <<"v1|dest|irrev|deadbeefcafef00d">>,
+    Input = #{plugin => <<"services">>, action => <<"remove">>,
+              command_id => <<"c1">>, dispatch_tag => Tag},
+    Encoded = yuzu_gw_proto:encode_command_request(Input),
+    ?assertEqual(Tag, maps:get(dispatch_tag, Encoded)).
+
 encode_command_response_fills_defaults_test() ->
     Input = #{command_id => <<"c1">>, status => 'SUCCESS'},
     Encoded = yuzu_gw_proto:encode_command_response(Input),
@@ -140,6 +151,42 @@ encode_command_response_fills_defaults_test() ->
     ?assertEqual('SUCCESS', maps:get(status, Encoded)),
     ?assertEqual(<<>>, maps:get(output, Encoded)),
     ?assertEqual(0, maps:get(exit_code, Encoded)).
+
+%% C4-gw: the normaliser must carry plugin(7)/action(8)/payload(9) — the
+%% Guardian side-channel shape — through untouched, the same as its
+%% encode_command_request/1 sibling.
+encode_command_response_preserves_guardian_fields_test() ->
+    Payload = <<"guardian-event", 0, 7>>,
+    Input = #{command_id => <<"c1">>, status => 'SUCCESS',
+              plugin => <<"__guard__">>, action => <<"status">>,
+              payload => Payload},
+    Encoded = yuzu_gw_proto:encode_command_response(Input),
+    ?assertEqual(<<"__guard__">>, maps:get(plugin, Encoded)),
+    ?assertEqual(<<"status">>,    maps:get(action, Encoded)),
+    ?assertEqual(Payload,         maps:get(payload, Encoded)).
+
+%% C4-gw: field 10 (CC-07 plugin_result_status, ABI4) must not be dropped by
+%% the whitelist rebuild either.
+encode_command_response_preserves_plugin_result_status_test() ->
+    Input = #{command_id => <<"c1">>, status => 'SUCCESS',
+              plugin_result_status => 'PLUGIN_RESULT_CONSTRAINED'},
+    Encoded = yuzu_gw_proto:encode_command_response(Input),
+    ?assertEqual('PLUGIN_RESULT_CONSTRAINED',
+                 maps:get(plugin_result_status, Encoded)).
+
+%% C5-gw: pin the field-10 encode->decode round-trip through the actual gpb
+%% wire codec, not just the map-normaliser above — this is the assertion the
+%% register calls out as missing entirely.
+plugin_result_status_wire_roundtrip_test() ->
+    Input = #{command_id => <<"c1">>, status => 'SUCCESS',
+              output => <<>>, exit_code => 0,
+              plugin => <<>>, action => <<>>, payload => <<>>,
+              plugin_result_status => 'PLUGIN_RESULT_PERMISSION_DENIED'},
+    Normalized = yuzu_gw_proto:encode_command_response(Input),
+    Wire = agent_pb:encode_msg(Normalized, 'yuzu.agent.v1.CommandResponse'),
+    Decoded = agent_pb:decode_msg(Wire, 'yuzu.agent.v1.CommandResponse'),
+    ?assertEqual('PLUGIN_RESULT_PERMISSION_DENIED',
+                 maps:get(plugin_result_status, Decoded)).
 
 encode_agent_event_connected_test() ->
     E = yuzu_gw_proto:encode_agent_event(<<"a1">>, connected, #{session_id => <<"s1">>}),

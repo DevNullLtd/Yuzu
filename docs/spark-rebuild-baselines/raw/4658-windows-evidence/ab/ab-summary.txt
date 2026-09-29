@@ -1,0 +1,47 @@
+sanity: 0 (0 = saved head binary runs)
+sanity base: 0
+iso 1 head=0 base=0
+iso 2 head=42 base=0
+iso 3 head=0 base=0
+iso 4 head=0 base=0
+iso 5 head=0 base=0
+iso 6 head=0 base=0
+iso 7 head=0 base=0
+iso 8 head=0 base=0
+iso 9 head=0 base=0
+iso 10 head=0 base=42
+iso 11 head=0 base=0
+iso 12 head=0 base=0
+iso 13 head=0 base=0
+iso 14 head=0 base=0
+iso 15 head=0 base=0
+iso 16 head=0 base=0
+iso 17 head=0 base=0
+iso 18 head=0 base=0
+iso 19 head=0 base=0
+iso 20 head=0 base=0
+iso 21 head=0 base=0
+iso 22 head=0 base=0
+iso 23 head=0 base=42
+iso 24 head=0 base=0
+iso 25 head=0 base=0
+iso 26 head=0 base=0
+iso 27 head=0 base=0
+iso 28 head=0 base=0
+iso 29 head=0 base=0
+iso 30 head=0 base=42
+ISO SUMMARY head pass=29 fail=1 | base pass=27 fail=3
+full 1 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=0 (test cases:   3469 |   3465 passed | 4 skipped)
+  head failing:
+  base failing:
+full 2 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=0 (test cases:   3469 |   3465 passed | 4 skipped)
+  head failing:
+  base failing:
+full 3 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=42 (test cases:   3469 |   3464 passed | 1 failed | 4 skipped)
+  head failing:
+  base failing: test_spark_mechanism.cpp(7053)
+full 4 head=0 (test cases:   3485 |   3481 passed | 4 skipped) base=42 (test cases:   3469 |   3464 passed | 1 failed | 4 skipped)
+  head failing:
+  base failing: test_spark_mechanism.cpp(7053)
+FULL SUMMARY head pass=4 fail=0 | base pass=2 fail=2
+AB_DONE

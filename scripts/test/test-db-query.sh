@@ -18,6 +18,8 @@
 # CI-runs queries (PR-9 of CI overhaul plan):
 #   bash scripts/test/test-db-query.sh ci-stats                  # 7d aggregate
 #   bash scripts/test/test-db-query.sh ci-stats --since 14d
+#   bash scripts/test/test-db-query.sh ci-suite-stats --since 14d
+#   bash scripts/test/test-db-query.sh ci-flakes --since 30d
 #   bash scripts/test/test-db-query.sh ci-ingest                 # backfill from gh
 #   bash scripts/test/test-db-query.sh ci-ingest --branch dev --limit 100
 
@@ -28,7 +30,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # First positional arg routes to a ci-* subcommand if it matches; otherwise
 # falls through to the legacy `query` surface.
 case "${1:-}" in
-  ci-stats|ci-ingest|ci-record)
+  ci-stats|ci-suite-stats|ci-flakes|ci-ingest|ci-record|ci-import-junit)
     exec python3 "$HERE/test_db.py" "$@"
     ;;
 esac

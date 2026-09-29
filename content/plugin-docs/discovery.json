@@ -1,0 +1,394 @@
+{
+  "actions": [
+    {
+      "action": "scan_subnet",
+      "definition_ids": [
+        "device.discovery.scan_subnet"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink RTM_GETNEIGH is a recorded future promotion over /proc/net/arp",
+          "mechanism": "/proc/net/arp + unprivileged SOCK_DGRAM ICMP",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetIpNetTable2 + IcmpSendEcho",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**A clean scan reports `UNDECLARED`, not `OK`.** All three legs completed a real `127.0.0.0/30` loopback sweep with no ARP/ICMP/timeout degrade, so `set_result_status` — which fires only inside `if (worst_degrade.has_report)` — is never called. The agent records `UNDECLARED`/`UNKNOWN` for what is otherwise a fully successful scan; this is not an error, but it means a machine consumer cannot distinguish \"clean scan\" from \"no status was ever set\" by result status alone. Also visible in the same captures: `127.0.0.1` resolved a hostname (`localhost` on macOS/Linux, `kubernetes.docker.internal` on Windows) while `127.0.0.2` did not (`unknown`) and, on macOS, was not found alive at all (`scan_complete|1|2` vs `2|2` on Linux/Windows) — loopback interface behaviour differs per OS, and `mac_address` is `unknown` on every leg because a loopback address has no ARP/neighbour-table entry.",
+    "**`scan_subnet`'s results are not wired into `DiscoveryStore`.** `POST /api/discovery/scan` is the only path that populates the managed/unmanaged device table, and nothing in this plugin or the agent daemon calls it — the instruction result is the only place a scan's rows land today.",
+    "**Linux ICMP is permission-gated.** An unprivileged `SOCK_DGRAM` ICMP socket needs `net.ipv4.ping_group_range` to admit the agent's gid; without it the scan falls back to ARP-only hosts with `CONSTRAINED`/`PARTIAL` `icmp:ping_group_range` rather than reporting a clean, smaller network.",
+    "**The definition's `result.columns` names one row shape but the plugin emits four.** Only `host` (5 pipe-fields) and `scan_complete` (3 pipe-fields, of which `found`/`total` are not separate columns) rows are structured; `status|` and `progress|` lines are free text and not represented in the schema.",
+    "**Was rung 3 (subprocess), now rung 1 (native).** The plugin previously shelled out via `popen()`/`ping` per host (declared rung 3 alongside `firewall`/`quarantine`/`network_actions`); Wave 2 replaced every leg with a native, in-process API and a single shared ICMP session per scan. Do not reintroduce a per-host process spawn."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Scans a subnet to discover devices on the network by reading the OS ARP/neighbour table and running an unprivileged ICMP ping sweep, with no subprocess spawn on any platform (GetIpNetTable2 on Windows, /proc/net/arp on Linux, the kernel routing-table sysctl on macOS). For each discovered host, returns the IP address, MAC address (from ARP, or \"unknown\" when absent), hostname (via reverse DNS, or \"unknown\"), and a literal \"unknown\" managed flag the server correlates against enrolled agents separately. Accepts /24 through /30 CIDR blocks (254 down to 2 usable hosts) — a wider prefix is refused rather than scanned. On Linux the ICMP half additionally needs net.ipv4.ping_group_range to admit the agent's gid, or the scan degrades to ARP-only results with a CONSTRAINED/PARTIAL status.",
+      "display_name": "Subnet Discovery Scan",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "device.discovery.scan_subnet",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Network device discovery — ARP scan and ping sweep",
+  "how_it_works": "`scan_subnet` combines two reads: the OS ARP/neighbour table (hosts the kernel already knows about) and an ICMP ping sweep of every host address in the requested subnet (hosts that answer but aren't yet cached). The ARP table is read twice — once before the sweep, once after — so hosts that only just replied to a probe still get a MAC address in the output. Input is validated as a CIDR block first (digits/dots/slash only), then parsed into octets and a prefix length; only /24 through /30 is accepted, a wider prefix is refused rather than scanned to bound the sweep to 254 hosts.\n\nEvery degrade condition the scan can hit — an ARP read that failed or was truncated, an ICMP socket denied or unavailable, probes that could not transmit, the scan's own 300-second deadline, or throttled reverse-DNS lookups — is accumulated by severity across the whole run and applied to the typed result status exactly once at the end, so an earlier and more specific reason is never silently overwritten by a later, less specific one. The plugin deliberately never reports an empty network as a clean success when a read simply didn't happen: a degraded read yields real ARP-table hosts with a `CONSTRAINED`/`UNAVAILABLE` status, not a fabricated empty result.\n\nIt is deliberately not a subprocess wrapper: Wave 2 removed the last `popen()`/`ping` spawn, so every leg is a native, in-process API call.",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 18,
+        "minLength": 9,
+        "pattern": "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$"
+      },
+      "default": null,
+      "definition_id": "device.discovery.scan_subnet",
+      "description": "Target subnet in CIDR notation (e.g., 192.168.1.0/24). The plugin accepts only /24 through /30 (254 down to 2 usable hosts) — a request outside that range is refused with an error (\"too many hosts to scan\" or \"contains no usable host addresses\") rather than scanned. Only IPv4 is supported.\n",
+      "name": "subnet",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 10000,
+        "minimum": 100
+      },
+      "default": 1000,
+      "definition_id": "device.discovery.scan_subnet",
+      "description": "Per-host ICMP probe timeout in milliseconds, validated to 100-10000. The effective per-host budget is separately clamped to 100-300ms regardless of the requested value, so a value above 300 has no further effect. This is not the overall scan deadline, which is a fixed 300 seconds.\n",
+      "name": "timeout_ms",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "77514adb726f",
+  "manifest_version": 1,
+  "name": "discovery",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Literal row-type discriminator marking this line as a discovered-host row, as opposed to a status/progress/ scan_complete line, which this schema does not separately enumerate.\n",
+          "example": "host",
+          "name": "host",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "host"
+          ]
+        },
+        {
+          "description": "IPv4 address of a host found in the target subnet, either already present in the OS ARP/neighbour table or reached by an ICMP probe. Values: free text (dotted-quad IPv4).",
+          "example": "127.0.0.1",
+          "name": "ip_address",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Colon-separated lowercase MAC48 read from the ARP/neighbour table, or the literal \"unknown\" when the host has no ARP entry. Values: colon-hex MAC48, or \"unknown\".",
+          "example": "unknown",
+          "name": "mac_address",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Reverse-DNS (PTR) result for the IP, or the literal \"unknown\" when the lookup found nothing, timed out, or was throttled. Values: free text (PTR hostname), or \"unknown\".",
+          "example": "localhost",
+          "name": "hostname",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Always the literal \"unknown\" from the agent — the server correlates the IP/MAC against enrolled agents separately.\n",
+          "example": "unknown",
+          "name": "managed",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "unknown"
+          ]
+        },
+        {
+          "description": "Literal row-type discriminator for the scan's one summary line, emitted once per run; the same line also carries \"found\" and \"total\" host counts as two further pipe-fields not enumerated as separate columns here.\n",
+          "example": "scan_complete",
+          "name": "scan_complete",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "scan_complete"
+          ]
+        }
+      ],
+      "definition_id": "device.discovery.scan_subnet"
+    }
+  ],
+  "outputs_note": "The plugin writes four distinct pipe-delimited line shapes, only two of which are structured data: a `host` row per discovered host, and one `scan_complete` summary row per run. `status|` (error/warning) and `progress|` lines are free text used for operator-facing progress and degrade warnings; they are not represented in the definition's `result.columns` schema at all. A run that fails input validation emits only a `status|error|...` line and no `host`/`scan_complete` rows (not the case in any of the current captures, which all completed a real sweep).",
+  "platforms": {
+    "linux": "constrained",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None.** `GetIpNetTable2` and `IcmpSendEcho` (linked via `iphlpapi`/`ws2_32`) need no elevated handle open.",
+      "if_refused": "ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error`",
+      "measured": "2026-09-07, bare-metal, Windows 10.0.26200.0, `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (captured as `SYSTEM`; no dedicated row in `docs/agent-privilege-model.md` for this plugin)"
+    },
+    {
+      "grant": "**None.** The routing-socket sysctl read and an unprivileged `SOCK_DGRAM` ICMP socket need no elevated privilege.",
+      "if_refused": "ARP failure → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`; ICMP session unavailable → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error`",
+      "measured": "2026-09-07, bare-metal, macOS 26.6.2, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "agent daemon (captured unprivileged, euid 501)"
+    },
+    {
+      "grant": "`net.ipv4.ping_group_range` must admit the agent's gid for the unprivileged ICMP socket, or the sweep falls back to ARP-only.",
+      "if_refused": "ICMP denied → `CONSTRAINED`/`PARTIAL` `icmp:ping_group_range`; ICMP unavailable for any other reason → `UNAVAILABLE`/`PARTIAL` `icmp:socket_error`; `/proc/net/arp` unreadable → `UNAVAILABLE`/`PARTIAL` `arp:read_failed`",
+      "measured": "2026-09-07, Debian GNU/Linux 13 (trixie) aarch64, container, euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon (captured as euid 0 in a container; production identity not pinned by a row in `docs/agent-privilege-model.md`)"
+    }
+  ],
+  "readme": "agents/plugins/discovery/README.md",
+  "result_status": [
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "`OK` (derived from `UNDECLARED`)",
+      "when": "a clean scan hit none of the conditions below"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`icmp:ping_group_range`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux ICMP socket denied for a permissions reason — ARP-table hosts only"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`icmp:socket_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "ICMP socket construction failed for a non-permissions reason — ARP-table hosts only"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`icmp:transmit_blocked`",
+      "status": "`CONSTRAINED`",
+      "when": "every ICMP probe was constructed but could not transmit"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`arp:read_failed`",
+      "status": "`UNAVAILABLE`",
+      "when": "the ARP/neighbour table read failed outright"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`arp:table_truncated`",
+      "status": "`CONSTRAINED`",
+      "when": "the ARP/neighbour table was only partially decodable"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`scan:timeout`",
+      "status": "`CONSTRAINED`",
+      "when": "the scan hit its 300-second deadline; wins ties against `arp:table_truncated`/`dns:hostname_lookup_degraded`"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`dns:hostname_lookup_degraded`",
+      "status": "`CONSTRAINED`",
+      "when": "one or more reverse-DNS lookups timed out or were throttled"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "scan_subnet",
+          "not_captured": null,
+          "params": "subnet=127.0.0.0/30",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "host|127.0.0.1|unknown|localhost|unknown",
+            "host|127.0.0.2|unknown|unknown|unknown",
+            "scan_complete|2|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "container",
+        "leg_hash": "77514adb726f",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "scan_subnet",
+          "not_captured": null,
+          "params": "subnet=127.0.0.0/30",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "host|127.0.0.1|unknown|localhost|unknown",
+            "scan_complete|1|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "77514adb726f",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "scan_subnet",
+          "not_captured": null,
+          "params": "subnet=127.0.0.0/30",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "host|127.0.0.1|unknown|kubernetes.docker.internal|unknown",
+            "host|127.0.0.2|unknown|unknown|unknown",
+            "scan_complete|2|2"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "77514adb726f",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "scan_subnet",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/discovery.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/discovery/src/discovery_parsers.hpp",
+      "agents/plugins/discovery/src/discovery_plugin.cpp",
+      "agents/plugins/discovery/src/discovery_scan_plan.hpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/server/test_discovery_routes.cpp",
+      "tests/unit/server/test_discovery_scan_route.cpp",
+      "tests/unit/server/test_discovery_store.cpp",
+      "tests/unit/test_discovery_parsers.cpp",
+      "tests/unit/test_discovery_scan_plan.cpp"
+    ]
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (server-configured retention via `response_retention_days`, 90-day default), queryable at `/api/responses/{id}`.",
+    "**Not automatically forwarded to `DiscoveryStore`.** `POST /api/discovery/scan` is a separate REST ingestion surface that upserts device rows (by `ip_address`) into the Postgres-backed `discovery_store` behind `GET /api/discovery/results` and the managed/unmanaged correlation it drives — but nothing in this plugin or the agent daemon calls that endpoint. Today the two are unwired: an operator or external automation must parse this action's rows and POST them to `/api/discovery/scan` separately for a scan to update the managed-device table.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, or DEX. Nothing runs on a schedule beyond the definition's 600-second gather TTL, which caches a repeat dispatch rather than re-triggering a background collection.",
+    "**Sensitivity.** Each `host` row carries another device's `ip_address`, `mac_address`, and reverse-DNS `hostname` — a network inventory of every device that answered the sweep, not just the scanning device; nothing in the rows names a person or installed software.",
+    "**Siblings:** none — `scan_subnet` is this plugin's only action and only definition.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.discovery.scan_subnet\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

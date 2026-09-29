@@ -1,0 +1,285 @@
+{
+  "actions": [
+    {
+      "action": "procfetch_fetch",
+      "definition_ids": [
+        "crossplatform.process.fetch"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc enumeration + OpenSSL EVP SHA-1",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "CreateToolhelp32Snapshot + BCrypt SHA-1",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows hashing opens a UTF-8 path via the ANSI `CreateFileA`.** `get_process_image_path` converts the wide image path to UTF-8 via `from_wide` (`procfetch_plugin.cpp:263`), then `sha1_of_file` passes that UTF-8 string straight to `CreateFileA` (`procfetch_plugin.cpp:267`), which interprets it as the ANSI code page, not UTF-8. A process whose executable path contains non-ASCII characters will fail to open, silently leaving `sha1` empty with no error surfaced.",
+    "**This plugin never sets a typed result status.** Both captured samples read `UNDECLARED / UNKNOWN /` regardless of whether any row's path/hash resolution failed — a caller cannot distinguish \"clean run\" from \"every row's hash silently failed\" without inspecting the rows themselves.",
+    "**Protected Windows processes report name only.** `OpenProcess` is refused even running as SYSTEM for a handful of processes (`[System Process]`, `System`, `Secure System`, `Registry` in the sample); those rows carry empty `path` and `sha1` with no row-level error indicator.",
+    "**SHA-1, not SHA-256.** The metadata description positions this action for \"security auditing\" and \"IOC matching\" (`content/definitions/procfetch.yaml:16-17`), but the hash is SHA-1 on every leg (`EVP_sha1()` / `BCRYPT_SHA1_ALGORITHM`), which is broken for collision resistance; it remains adequate for matching against a known-hash IOC list (a preimage property SHA-1 still holds) but not for detecting a deliberately-collided binary.",
+    "**Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe` (`procfetch_plugin.cpp:134-140`); the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Deep process enumeration that returns PID, process name, full executable path, and SHA-1 hash of each executable binary. Hashes are cached per path to avoid re-hashing duplicate executables (e.g. svchost.exe). Useful for security auditing, IOC matching, and software inventory validation. Supported on Windows (CreateToolhelp32Snapshot + BCrypt), Linux (/proc + OpenSSL EVP), and macOS (libproc + OpenSSL EVP).",
+      "display_name": "Fetch Processes with Hashes",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.process.fetch",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Enumerates running processes with SHA-1 hashes of executables",
+  "how_it_works": "`procfetch_fetch` is the plugin's only action. Each leg enumerates every process the OS exposes, resolves the executable image path, and SHA-1-hashes the file at that path, streaming one pipe-delimited row per process via `write_output()` as it goes rather than collecting the whole list first. Hashes are cached by path within a single run so a binary loaded by many processes (`svchost.exe`, `cfprefsd`, `MTLCompilerService`) is only read and hashed once. The three legs are native, in-process enumeration — `/proc` on Linux, `libproc` on macOS, `CreateToolhelp32Snapshot` on Windows — with OpenSSL EVP (POSIX) or BCrypt (Windows) doing the hashing; no subprocess is spawned anywhere in the plugin. It is deliberately not a general process inventory: `processes` (`crossplatform.process.list`/`.query`) already lists PID and name only, cheaply and without touching disk; `procfetch` exists specifically to add the executable path and a file hash, which costs one file read and one hash per unique binary.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "514b81c2df7e",
+  "manifest_version": 1,
+  "name": "procfetch",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The process ID assigned by the OS. Values: integer.",
+          "example": "1052",
+          "name": "pid",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "The process's short or executable name, as reported by the OS. Values: free text.",
+          "example": "svchost.exe",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Absolute path to the process's executable image on disk; empty when the OS refuses or fails to resolve it (a protected process, a permission-denied read, or a pseudo-process with no backing binary). Values: absolute path or empty.",
+          "example": "/usr/bin/dash",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file could not be opened or its path could not be resolved. Values: 40-char lowercase hex or empty.",
+          "example": "e5355187cbd952a5bc9dfca430d10383f0f8750c",
+          "name": "sha1",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.process.fetch"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sha1`. `name` and `path` are pipe-escaped (a literal `|` becomes `\\|`) before being written, so the delimiter itself is never ambiguous. `path` and `sha1` are empty strings, not `-`, when the OS would not hand back an image path or the file could not be opened/hashed — there is no placeholder row for \"no processes\": the row is only ever missing fields, never absent.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None observed at SYSTEM. Even as SYSTEM, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...)` is refused for a handful of protected/system processes — the sample's `[System Process]`, `System`, `Secure System`, `Registry` rows carry no path or hash.",
+      "if_refused": "that row's `path` and `sha1` fields are empty; no error is surfaced and enumeration continues (`procfetch_plugin.cpp:251-264`)",
+      "measured": "2026-09-07, bare-metal, `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "SYSTEM (measured; no row in `docs/agent-privilege-model.md` for this plugin)"
+    },
+    {
+      "grant": "None observed unprivileged — `proc_listpids`/`proc_pidpath` resolved paths and hashes for processes owned by root and other users in the sample (e.g. `postgres`, `XprotectService`) without elevation.",
+      "if_refused": "`proc_pidpath` failing falls back to `proc_name()` for a short name only, leaving `path` and `sha1` empty (`procfetch_plugin.cpp:216-223`) — not observed in this capture",
+      "measured": "2026-09-07, macOS 26.6.2, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "unprivileged (agent daemon)"
+    },
+    {
+      "grant": "`resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail",
+      "if_refused": "`std::filesystem::read_symlink` throws `filesystem_error`, caught and turned into an empty path, so `path` and `sha1` are empty and the row still emits (`procfetch_plugin.cpp:134-140`)",
+      "measured": "2026-09-06, Debian 13 (trixie) aarch64 container, euid 0",
+      "os": "Linux",
+      "runs_as": "root (captured in a container; not measured unprivileged)"
+    }
+  ],
+  "readme": "agents/plugins/procfetch/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "procfetch_fetch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "1|sh|/usr/bin/dash|e5355187cbd952a5bc9dfca430d10383f0f8750c",
+            "9|plugin-capture|/src/builddir/tools/plugin-capture/plugin-capture|c93a85ef1e07f11e88bcea0d85f828adc1069521"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "514b81c2df7e",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "procfetch_fetch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 818,
+          "rows": [
+            "10151|plugin_capture|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|87ea43e2b7d3dd2eb6e7db6a20041b1f77d20272",
+            "10143|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7",
+            "10125|Code Helper (Plugin)|/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)|0478d377b6ffa6659d823d3c72d25dc9b8816bd6",
+            "10121|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7",
+            "10120|mdworker_shared|/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared|19ca6c856d80cfc6b83800c821b3129f40b135c7"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "514b81c2df7e",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "procfetch_fetch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 184,
+          "rows": [
+            "0|[System Process]||",
+            "4|System||",
+            "332|Secure System||",
+            "376|Registry||",
+            "1052|smss.exe|C:\\Windows\\System32\\smss.exe|2c84c834b6326b8fc02cc3262d9035e16fc27847"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "514b81c2df7e",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "procfetch_fetch",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/procfetch.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/procfetch/src/procfetch_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The classic dashboard also reaches this action through the legacy `POST /api/procfetch/fetch` route (`server.cpp:14943`), which forwards into the same dispatch chokepoint as the DSL path (`changelog.d/1.9-dispatch-chokepoint.security.md`) rather than a separate mechanism.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — grepping the server for `procfetch` finds only the dashboard route, the legacy REST forwarder, the capability declaration, and the static result-table column list (`result_parsing.hpp:49`).",
+    "**Sensitivity.** `name` rows name installed applications on the host (process/executable names — an installed-software inventory by another route, e.g. `XprotectService`, `Code Helper (Plugin)`); `path` frequently embeds the owning account's home directory on macOS/Linux (e.g. `/Users/jsmith/...` in the macOS sample), identifying a specific person, while `sha1` alone identifies neither a device nor a person.",
+    "**Siblings:** `crossplatform.process.list` / `crossplatform.process.query` (the `processes` plugin) — PID and name only, no path or hash, cheaper to run.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"crossplatform.process.fetch\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

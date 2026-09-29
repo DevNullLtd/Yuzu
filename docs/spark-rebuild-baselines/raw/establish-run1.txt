@@ -1,0 +1,34 @@
+ESTABLISH S2 service list open+notify OpenServiceW n=200 min=13 p50=17 p90=19 p99=34 max=35 us
+ESTABLISH S2 service list open+notify NotifyServiceStatusChangeW n=200 min=14 p50=18 p90=21 p99=36 max=174 us
+ESTABLISH R5 drain idle WaitForThreadpoolWaitCallbacks n=200 min=0 p50=0 p90= 0 p99=0 max=0 us
+ESTABLISH R5 drain in-flight (50ms callback) WaitForThreadpoolWaitCallbacks n=200 min=32585 p50=48274 p90=48610 p99=48826 max=48853 us
+ESTABLISH R3 registry target-present UNDER HIVE LOAD CreateEventW n=200 min=0 p50=1 p90=1 p99=5 max=8 us
+ESTABLISH R3 registry target-present UNDER HIVE LOAD CreateThreadpoolWait n= 200 min=0 p50=2 p90=2 p99=4 max=5 us
+ESTABLISH R3 registry target-present UNDER HIVE LOAD RegOpenKeyExW n=200 min= 3 p50=11 p90=14 p99=43 max=63 us
+ESTABLISH R3 registry target-present UNDER HIVE LOAD RegNotifyChangeKeyValue n=200 min=1 p50=4 p90=5 p99=17 max=17 us
+ESTABLISH R3 registry target-present UNDER HIVE LOAD SetThreadpoolWait n=200 min=0 p50=1 p90=1 p99=3 max=11 us
+ESTABLISH S3 OpenServiceW UNDER SCM LOAD OpenServiceW n=200 min=16 p50=38 p90=61 p99=82 max=108 us
+ESTABLISH S3 NotifyServiceStatusChangeW UNDER SCM LOAD NotifyServiceStatusChangeW n=200 min=16 p50=45 p90=71 p99=99 max=103 us
+ESTABLISH F1 file dir sanity is_directory n=200 min=12 p50=34 p90=44 p99=67 max=79 us
+ESTABLISH F1 file dir sanity CreateFileW(BACKUP|OVERLAPPED) n=200 min=8 p50= 21 p90=30 p99=47 max=54 us
+ESTABLISH R4 registry target-absent depth6 UNDER HIVE LOAD CreateEventW n=200 min=0 p50=0 p90=1 p99=1 max=3 us
+ESTABLISH R4 registry target-absent depth6 UNDER HIVE LOAD CreateThreadpoolWait n=200 min=0 p50=1 p90=1 p99=3 max=7 us
+ESTABLISH R4 registry target-absent depth6 UNDER HIVE LOAD RegOpenKeyExW (per level) n=1400 min=2 p50=3 p90=4 p99=9 max=20 us
+ESTABLISH R4 registry target-absent depth6 UNDER HIVE LOAD RegNotifyChangeKeyValue n=200 min=1 p50=1 p90=2 p99=6 max=12 us
+ESTABLISH R4 registry target-absent depth6 UNDER HIVE LOAD SetThreadpoolWait n=200 min=0 p50=0 p90=0 p99=1 max=1 us
+ESTABLISH R2 registry target-absent depth6 CreateEventW n=200 min=0 p50=0 p90=1 p99=4 max=16 us
+ESTABLISH R2 registry target-absent depth6 CreateThreadpoolWait n=200 min=0 p50=1 p90=2 p99=6 max=45 us
+ESTABLISH R2 registry target-absent depth6 RegOpenKeyExW (per level) n=1400 min=2 p50=3 p90=8 p99=13 max=25 us
+ESTABLISH R2 registry target-absent depth6 RegNotifyChangeKeyValue n=200 min= 1 p50=2 p90=5 p99=8 max=14 us
+ESTABLISH R2 registry target-absent depth6 SetThreadpoolWait n=200 min=0 p50= 0 p90=1 p99=2 max=2 us
+ESTABLISH R2 registry target-absent depth6 TOTAL (event+waitcreate+walk+ notify+set, INCL. TEARDOWN/DRAIN) n=200 min=324 p50=465 p90=1112 p99=1200 max=1221 us
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (Registry) n=200 min=127 p50=250 p90=517 p99=618 max=623 us
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (File) n=200 min=120 p50=152 p90=251 p99=440 max=502 us
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (Service) n=199 min=24 p50=37 p90=69 p99=155 max=204 us
+ESTABLISH R1 registry target-present CreateEventW n=200 min=0 p50=0 p90=1 p99=2 max=3 us
+ESTABLISH R1 registry target-present CreateThreadpoolWait n=200 min=0 p50=1 p90=2 p99=5 max=8 us
+ESTABLISH R1 registry target-present RegOpenKeyExW n=200 min=3 p50=5 p90=12 p99=53 max=54 us
+ESTABLISH R1 registry target-present RegNotifyChangeKeyValue n=200 min=1 p50= 1 p90=4 p99=18 max=22 us
+ESTABLISH R1 registry target-present SetThreadpoolWait n=200 min=0 p50=0 p90= 1 p99=2 max=2 us
+ESTABLISH S1 OpenSCManagerW connect OpenSCManagerW n=200 min=15 p50=21 p90=24 p99=45 max=136 us
+ESTABLISH S1 OpenSCManagerW connect CloseServiceHandle n=200 min=9 p50=13 p90=14 p99=30 max=43 us

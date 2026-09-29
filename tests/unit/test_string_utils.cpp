@@ -1,8 +1,8 @@
 /**
  * test_string_utils.cpp — Unit tests for shared string utility functions
  *
- * Covers: icontains, sanitize_utf8, escape_pipes, sanitize_input,
- *         format_uptime, split_args, chargen_line
+ * Covers: icontains, sanitize_utf8, escape_pipes, safe_output_field,
+ *         sanitize_input, format_uptime, split_args, chargen_line
  */
 
 #include <yuzu/string_utils.hpp>
@@ -131,6 +131,98 @@ TEST_CASE("escape_pipes: empty string", "[string_utils][pipes]") {
 
 TEST_CASE("escape_pipes: only pipes", "[string_utils][pipes]") {
     REQUIRE(escape_pipes("|||") == "\\|\\|\\|");
+}
+
+// ── safe_output_field ───────────────────────────────────────────────────────
+
+namespace {
+// Mirrors server/core/src/result_parsing.hpp's find_unescaped_pipe /
+// unescape_pipes exactly (kept local to this test -- the server file lives
+// in a different build target/suite) so the tests below assert against the
+// real consumer-side parsing semantics: a '|' is a real separator iff
+// preceded by a single backslash (base decoder, not parity-aware).
+size_t test_find_unescaped_pipe(const std::string& s, size_t pos) {
+    while (pos < s.size()) {
+        auto p = s.find('|', pos);
+        if (p == std::string::npos)
+            return std::string::npos;
+        if (p > 0 && s[p - 1] == '\\') {
+            pos = p + 1;
+            continue;
+        }
+        return p;
+    }
+    return std::string::npos;
+}
+
+std::string test_unescape_pipes(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|')
+            continue;
+        out += s[i];
+    }
+    return out;
+}
+
+std::vector<std::string> test_split_fields(const std::string& line) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        auto p = test_find_unescaped_pipe(line, pos);
+        if (p == std::string::npos) {
+            parts.push_back(test_unescape_pipes(line.substr(pos)));
+            break;
+        }
+        parts.push_back(test_unescape_pipes(line.substr(pos, p - pos)));
+        pos = p + 1;
+    }
+    return parts;
+}
+} // namespace
+
+TEST_CASE("safe_output_field: literal backslash folds to '/'", "[string_utils][safe_output_field]") {
+    REQUIRE(safe_output_field("value ending in\\") == "value ending in/");
+    REQUIRE(safe_output_field("a\\b\\c") == "a/b/c");
+}
+
+TEST_CASE("safe_output_field: CR/LF fold to spaces", "[string_utils][safe_output_field]") {
+    REQUIRE(safe_output_field("line1\nline2") == "line1 line2");
+    REQUIRE(safe_output_field("line1\r\nline2") == "line1  line2");
+}
+
+TEST_CASE("safe_output_field: pipe is escaped", "[string_utils][safe_output_field]") {
+    REQUIRE(safe_output_field("a|b") == "a\\|b");
+}
+
+TEST_CASE("safe_output_field: plain value with no special bytes is unchanged",
+          "[string_utils][safe_output_field]") {
+    REQUIRE(safe_output_field("plain value") == "plain value");
+}
+
+TEST_CASE("safe_output_field: a value with a trailing backslash stays inside a "
+          "single field under the base decoder",
+          "[string_utils][safe_output_field]") {
+    std::string field1 = safe_output_field("value ending in\\");
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == "value ending in/");
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: a value with an embedded pipe stays inside a "
+          "single field under the base decoder",
+          "[string_utils][safe_output_field]") {
+    std::string field1 = safe_output_field("contains | inside");
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == "contains | inside");
+    CHECK(parts[1] == "next");
 }
 
 // ── sanitize_input ──────────────────────────────────────────────────────────

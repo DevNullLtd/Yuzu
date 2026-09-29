@@ -1,0 +1,1038 @@
+{
+  "actions": [
+    {
+      "action": "input",
+      "definition_ids": [
+        "device.interaction.input"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "zenity",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no reachable GUI session under a headless/root LaunchDaemon",
+          "mechanism": "osascript",
+          "rung": "3",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "powershell_inputbox",
+          "rung": "3",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "message_box",
+      "definition_ids": [
+        "device.interaction.message_box"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "zenity",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no reachable GUI session under a headless/root LaunchDaemon",
+          "mechanism": "osascript",
+          "rung": "3",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "messageboxw",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "notify",
+      "definition_ids": [
+        "device.interaction.notify"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "notify_send",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no reachable GUI session under a headless/root LaunchDaemon",
+          "mechanism": "osascript",
+          "rung": "3",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "shell_notifyicon",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "set_dnd",
+      "definition_ids": [
+        "device.interaction.set_dnd"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_kv_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_kv_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_kv_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "survey",
+      "definition_ids": [
+        "device.interaction.survey"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "zenity",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "no reachable GUI session under a headless/root LaunchDaemon",
+          "mechanism": "osascript",
+          "rung": "3",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "powershell_winforms",
+          "rung": "3",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**No sample shows a real dialog.** All three captures ran with zero parameters, so every dialog action failed validation before reaching a platform leg. `response`, `cancelled`, `answer_0`–`answer_4`, `question_count`, `dnd_duration_minutes`, and `dnd_expires_at` have no observed real value anywhere in this repo — see the code paths in Data contract → Outputs for what would populate them.",
+    "**The macOS capture ran as an interactive user, not the production posture.** It was taken at euid 501 (a logged-in human), not as the root LaunchDaemon the plugin actually ships under, so it cannot demonstrate the constrained \"no reachable GUI session\" path even though the descriptor declares macOS `CONSTRAINED` for all four dialog actions.",
+    "**Honest-status is a hard invariant, not a bug to \"fix.\"** Every dialog leg treats a non-zero exit, a runner failure, or an unreachable session as `status|unavailable`/`status|not_reachable`, never a fabricated button. A pre-0.3.0 version wrongly reported `response|ok` for an undelivered macOS dialog; do not reintroduce a catch-all \"unrecognized output → ok\" branch on any platform.",
+    "**`message_box`'s `status` fires on every OS, not only macOS.** It is set on a validation failure (missing title/message or a bad `buttons` value — all three OSes, confirmed by every sample), the macOS `not_reachable` sentinel, or a Linux zenity delivery failure — never only the macOS undeliverable path.",
+    "**`executeRoles` differs per action.** `notify`/`set_dnd` allow `endpoint-operator`; `message_box`/`input`/`survey` are `endpoint-admin`-only. Do not assume one roles line covers every action of this plugin."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Shows a text input dialog on the endpoint desktop. On Windows uses PowerShell with Microsoft.VisualBasic.Interaction.InputBox, on Linux uses zenity --entry, and on macOS uses osascript 'display dialog' with default answer. Returns the text entered by the user, or indicates cancellation.",
+      "display_name": "Text Input Dialog",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.interaction.input",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Shows a modal message box dialog on the endpoint desktop. On Windows uses MessageBoxW, on Linux uses zenity, and on macOS uses osascript 'display dialog'. On success returns which button the user clicked in the `response` column (ok, cancel, yes, or no); the dialog blocks until the user responds. On macOS, when the agent cannot reach a desktop session (it runs as a GUI-less root LaunchDaemon, or the user is not logged in), it reports `status|not_reachable` instead of a fabricated button — earlier agents (interaction plugin < 0.3.0) wrongly reported `response|ok` for an undelivered dialog.",
+      "display_name": "Message Box Dialog",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.interaction.message_box",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Shows a desktop notification/toast on the endpoint. On Windows uses ShellNotifyIcon balloon notifications, on Linux uses notify-send, and on macOS uses osascript 'display notification'. Supports info, warning, and error severity levels.",
+      "display_name": "Desktop Notification",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "device.interaction.notify",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enables or disables Do Not Disturb (DND) mode on the endpoint. When DND is active, notifications and surveys are suppressed (the action returns status=suppressed instead of showing a dialog). An optional duration_minutes parameter sets a time-limited DND window; after expiry, DND is automatically cleared. DND state is persisted in the agent's KV store so it survives agent restarts.",
+      "display_name": "Set Do Not Disturb",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "device.interaction.set_dnd",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Shows a multi-question survey form on the endpoint desktop. On Windows uses a PowerShell-generated Windows.Forms dialog with text inputs, checkboxes, and combo boxes. On Linux uses sequential zenity dialogs. On macOS uses sequential osascript dialogs (display dialog, choose from list). Supports three question types: text (free-form input), yesno (boolean checkbox/question), and choice (pick from a list). Returns numbered answer fields and a question_count. If the user cancels at any point, cancelled=true is returned. Respects Do Not Disturb mode — if DND is active, the survey is suppressed.",
+      "display_name": "User Survey",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "device.interaction.survey",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND",
+  "how_it_works": "Four of the five actions dispatch a platform-native dialog or notification mechanism and report what happened; the fifth, `set_dnd`, is a pure local KV-store flag with no OS call. `notify` and `survey` first check whether Do Not Disturb is active and, if so, short-circuit to `status|suppressed` without ever spawning anything. Every dialog action validates its required parameters in the OS-agnostic dispatch layer before reaching a platform leg — a missing `title` never spawns a subprocess, on any OS. Text fields are then sanitized (metacharacters and quotes stripped) before being interpolated into an osascript/PowerShell script fragment; every spawn itself goes through the bounded argv runner with no shell involved end to end. The plugin never fabricates a dialog outcome: a non-zero exit, a runner-level failure, or an unreachable GUI session is always reported as an honest `status|unavailable`/`status|not_reachable`/`status|error` line rather than a guessed button or cancellation. It is deliberately not a general scripting surface — the only mechanisms it invokes are ShellNotifyIcon/MessageBoxW/PowerShell (Windows), notify-send/zenity (Linux), and osascript (macOS).",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.input",
+      "description": "Dialog title text",
+      "name": "title",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.input",
+      "description": "Prompt text shown above the input field",
+      "name": "prompt",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "",
+      "definition_id": "device.interaction.input",
+      "description": "Pre-filled default text in the input field",
+      "name": "default_value",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.message_box",
+      "description": "Dialog title text",
+      "name": "title",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.message_box",
+      "description": "Dialog body text",
+      "name": "message",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "ok",
+      "definition_id": "device.interaction.message_box",
+      "description": "Button configuration: ok, okcancel, or yesno",
+      "name": "buttons",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.notify",
+      "description": "Notification title text",
+      "name": "title",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.notify",
+      "description": "Notification body text",
+      "name": "message",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "info",
+      "definition_id": "device.interaction.notify",
+      "description": "Notification severity: info, warning, or error",
+      "name": "type",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.set_dnd",
+      "description": "Set to 'true' to enable DND, 'false' to disable",
+      "name": "enabled",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": 0,
+      "definition_id": "device.interaction.set_dnd",
+      "description": "Optional duration in minutes. If set and enabled=true, DND will automatically expire after this many minutes. If 0 or omitted, DND remains active indefinitely until explicitly disabled.\n",
+      "name": "duration_minutes",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.survey",
+      "description": "Survey window title",
+      "name": "title",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.interaction.survey",
+      "description": "JSON array of question objects. Each object has: prompt (string), type (text|yesno|choice), and choices (array of strings, required when type=choice). Example: [{\"prompt\":\"Your name?\",\"type\":\"text\"},\n {\"prompt\":\"Agree?\",\"type\":\"yesno\"},\n {\"prompt\":\"Department\",\"type\":\"choice\",\"choices\":[\"IT\",\"HR\",\"Eng\"]}]\n",
+      "name": "questions",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "dc6c8e5f72d5",
+  "manifest_version": 1,
+  "name": "interaction",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The text the operator/user entered and confirmed. Absent when the dialog was cancelled or could not be shown. Values: free text.",
+          "example": "-",
+          "name": "response",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "true when the user dismissed the dialog without entering text (Escape, Cancel, or AppleScript error -128); omitted otherwise.\n",
+          "example": "true",
+          "name": "cancelled",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "Set instead of response/cancelled when the dialog never ran: a validation failure (every platform), or an unavailable/failed dialog on Windows, macOS, or Linux. Values: error|<reason>, unavailable|<reason>.",
+          "example": "error|missing required parameter: title",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.interaction.input"
+    },
+    {
+      "columns": [
+        {
+          "description": "The button the operator/user clicked on the dialog. Absent when the dialog could not be shown — see status. Values: ok, cancel, yes, no.",
+          "example": "ok",
+          "name": "response",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Set when no button could be returned: a validation failure (missing title/message or a bad buttons value — every platform), the macOS not_reachable sentinel (no GUI session), or a Linux zenity delivery failure. Empty on a normal button-press response. Values: not_reachable, error|<reason>, unavailable|<reason>.",
+          "example": "error|missing required parameter: title",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.interaction.message_box"
+    },
+    {
+      "columns": [
+        {
+          "description": "Outcome of the notification attempt: ok (shown, or handed to the OS successfully), suppressed|<reason> (Do Not Disturb was active), error|<reason> (missing/invalid parameter, or an unsupported platform), or unavailable|<reason> (macOS/Linux: no reachable GUI session). Values: ok, suppressed|<reason>, error|<reason>, unavailable|<reason> (reason is free text).",
+          "example": "error|missing required parameter: title",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.interaction.notify"
+    },
+    {
+      "columns": [
+        {
+          "description": "The DND state after this call — true when DND is now active, false when cleared. Values: true, false.",
+          "example": "true",
+          "name": "dnd_enabled",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The duration parameter echoed back, in minutes. Only emitted when DND was enabled with a positive duration_minutes. Values: integer.",
+          "example": "-",
+          "name": "dnd_duration_minutes",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Unix epoch seconds when DND auto-clears. Only emitted alongside dnd_duration_minutes (enabled with a positive duration); 0 or omitted means indefinite. Values: epoch seconds, or omitted.",
+          "example": "-",
+          "name": "dnd_expires_at",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Always ok — set_dnd is a local KV-store write with no external dependency and no failure path once dispatched.\n",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.interaction.set_dnd"
+    },
+    {
+      "columns": [
+        {
+          "description": "true when the user dismissed the survey (Cancel, Escape, or AppleScript error -128) before answering every question.\n",
+          "example": "true",
+          "name": "cancelled",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The number of questions in the submitted survey. Only emitted when the survey completed without cancellation or failure. Values: integer.",
+          "example": "-",
+          "name": "question_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "The answer to question 0 (0-indexed): free text for a text question, yes/no for a yesno question, or the chosen item's text for a choice question. Omitted if the survey was cancelled or could not be shown. Values: free text, or yes/no for a yesno question.",
+          "example": "-",
+          "name": "answer_0",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The answer to question 1 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.",
+          "example": "-",
+          "name": "answer_1",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The answer to question 2 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.",
+          "example": "-",
+          "name": "answer_2",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The answer to question 3 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.",
+          "example": "-",
+          "name": "answer_3",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The answer to question 4 (0-indexed), same convention as answer_0. Omitted past question_count-1. Values: free text, or yes/no for a yesno question.",
+          "example": "-",
+          "name": "answer_4",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Set instead of cancelled/answers when the survey never completed: a validation failure (every platform, e.g. missing title or unparseable questions), a suppressed Do Not Disturb, or an undeliverable/unrecognized-response dialog. Values: suppressed|<reason>, error|<reason>, unavailable|<reason>.",
+          "example": "error|missing required parameter: title",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.interaction.survey"
+    }
+  ],
+  "outputs_note": "Each action writes one or more `key|value` lines via `write_output()`. The dashboard/REST layer treats `interaction` as a key/value plugin and splits each line into exactly a key and the remainder of the line as its value — so a value can itself contain literal `|` characters, e.g. `status|error|missing required parameter: title` has key `status` and value `error|missing required parameter: title`. Not every declared column is written on every invocation: `response`/`cancelled` are mutually exclusive per action, and `status` appears only on a validation failure, a suppressed DND, or an undeliverable/failed dialog — a clean button press or clean survey completion never emits a `status` line at all.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — `Shell_NotifyIconW`/`MessageBoxW` are unprivileged, and PowerShell needs no elevation to run `InputBox`/`WinForms`",
+      "if_refused": "PowerShell dialogs (`input`/`survey`) report `status|unavailable|PowerShell dialog exited with an error` or `...timed out`; native `notify`/`message_box` have no refusal path — `MessageBoxW` always returns a button",
+      "measured": "2026-09-07, bare-metal, as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account; registers and runs as LocalSystem today (#1442, not yet the intended virtual service account)"
+    },
+    {
+      "grant": "None — but no LaunchDaemon has a reachable Aqua/GUI session by design",
+      "if_refused": "`status|unavailable|no reachable GUI session` (`notify`) or `status|not_reachable` (`message_box`/`input`/`survey`)",
+      "measured": "2026-09-07, bare-metal, as euid 501 (jsmith) — an interactive logged-in user, **not** the production root-daemon posture",
+      "os": "macOS",
+      "runs_as": "root (shipped LaunchDaemon has no `UserName` key)"
+    },
+    {
+      "grant": "None — the plugin checks `DISPLAY`/`WAYLAND_DISPLAY` before ever spawning",
+      "if_refused": "`status|unavailable|no reachable GUI session`, checked upfront before spawning zenity/notify-send",
+      "measured": "2026-09-06, container, as euid 0",
+      "os": "Linux",
+      "runs_as": "agent unprivileged account (`yuzu`)"
+    }
+  ],
+  "readme": "agents/plugins/interaction/README.md",
+  "result_status": [
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "`UNDECLARED` (agent-recorded default)",
+      "when": "Every clean dialog outcome — a button press, survey answers, a DND-suppressed run, or a validation failure — matches every sample's `[result_status] UNDECLARED / UNKNOWN /` line. `forward_runner_failure` is a no-op unless the runner itself failed."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "The dialog child process (osascript/zenity/notify-send/PowerShell) could not be spawned at all."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`subprocess_runner:deadline`",
+      "status": "`CONSTRAINED`",
+      "when": "The runner's deadline elapsed and the still-running dialog process was killed."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`subprocess_runner:cancelled`",
+      "status": "`CONSTRAINED`",
+      "when": "The run was cancelled before it finished."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`subprocess_runner:signaled`",
+      "status": "`CONSTRAINED`",
+      "when": "The child was killed by a signal, not a clean exit."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`subprocess_runner:line_limit`",
+      "status": "`OK`",
+      "when": "A deliberate bounded stop: the runner capped output at its line limit and killed a still-producing child — not a failure, but incomplete."
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "notify",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "message_box",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "input",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "survey",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_dnd",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "dnd_enabled|true",
+            "status|ok"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "dc6c8e5f72d5",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "notify",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "message_box",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "input",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "survey",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_dnd",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "dnd_enabled|true",
+            "status|ok"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "dc6c8e5f72d5",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "notify",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "message_box",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "input",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "survey",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|error|missing required parameter: title"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_dnd",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "dnd_enabled|true",
+            "status|ok"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "dc6c8e5f72d5",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "notify",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "message_box",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "input",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "survey",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "set_dnd",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/interaction.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/interaction/src/interaction_parsers.hpp",
+      "agents/plugins/interaction/src/interaction_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_interaction_parsers.cpp"
+    ]
+  },
+  "version": "0.3.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, TAR, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its five definitions. The dashboard's generic key/value renderer is the only non-ResponseStore consumer of these rows.",
+    "**Sensitivity.** Nothing beyond the device id. Every column is either an enum/bool the plugin itself computes (`status`, `response` button choice, `cancelled`, `dnd_enabled`, `question_count`) or free text the interactively-logged-in user typed into a dialog (`response`, `answer_0`–`answer_4`) — the schema targets no username, device identifier, or software name, though a user could in principle type anything into a free-text field.",
+    "**Siblings:** none — no other plugin performs desktop notification/dialog interaction.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.interaction.notify\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

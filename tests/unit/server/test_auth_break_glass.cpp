@@ -17,7 +17,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -33,27 +33,15 @@ using yuzu::server::auth::Role;
 namespace {
 
 struct BreakGlassFixture {
-    std::filesystem::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    // AuthDbPg defaults to cleanup_interval_secs=0 — no background reaper
+    // jthread (matches the lockout fixture).
+    yuzu::test::AuthDbPg db;
 
     BreakGlassFixture() {
-        // cleanup_interval_secs=0 — no background reaper jthread (matches the
-        // lockout fixture; avoids the macOS-arm64 SIGSEGV of PR #1199).
-        data_dir = yuzu::test::unique_temp_path("yuzu-breakglass-");
-        std::filesystem::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         auto salt = AuthManager::random_bytes(16);
         auto salt_hex = AuthManager::bytes_to_hex(salt);
         auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
         REQUIRE(db->upsert_user("alice", hash, salt_hex, Role::admin).has_value());
-    }
-
-    ~BreakGlassFixture() {
-        db.reset();
-        std::error_code ec;
-        std::filesystem::remove_all(data_dir, ec);
     }
 
     // Complete a real MFA enrollment for `name` so break_glass_account_problem
@@ -71,14 +59,14 @@ struct BreakGlassFixture {
 
 } // namespace
 
-TEST_CASE_METHOD(BreakGlassFixture, "fresh user is dormant (not armed)", "[auth][breakglass]") {
+TEST_CASE_METHOD(BreakGlassFixture, "fresh user is dormant (not armed)", "[pg][auth][breakglass]") {
     auto st = db->break_glass_status("alice");
     REQUIRE(st.has_value());
     CHECK_FALSE(st->armed);
     CHECK(st->armed_until.empty());
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "arm_break_glass arms the account", "[auth][breakglass]") {
+TEST_CASE_METHOD(BreakGlassFixture, "arm_break_glass arms the account", "[pg][auth][breakglass]") {
     auto armed = db->arm_break_glass("alice", 3600);
     REQUIRE(armed.has_value());
     CHECK(armed->armed);
@@ -92,7 +80,7 @@ TEST_CASE_METHOD(BreakGlassFixture, "arm_break_glass arms the account", "[auth][
     CHECK(st->armed_until == armed->armed_until);
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "disarm_break_glass rolls back an arm", "[auth][breakglass]") {
+TEST_CASE_METHOD(BreakGlassFixture, "disarm_break_glass rolls back an arm", "[pg][auth][breakglass]") {
     // The compensating un-arm used when the mandatory audit row fails to persist
     // (review #1735 HIGH-2) — so the exemption is never left standing without a
     // record.
@@ -113,7 +101,7 @@ TEST_CASE_METHOD(BreakGlassFixture, "disarm_break_glass rolls back an arm", "[au
     CHECK_FALSE(db->disarm_break_glass("alice:admin").has_value());
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "re-arming refreshes the window", "[auth][breakglass]") {
+TEST_CASE_METHOD(BreakGlassFixture, "re-arming refreshes the window", "[pg][auth][breakglass]") {
     auto first = db->arm_break_glass("alice", 3600);
     REQUIRE(first.has_value());
     REQUIRE(first->armed);
@@ -126,7 +114,7 @@ TEST_CASE_METHOD(BreakGlassFixture, "re-arming refreshes the window", "[auth][br
     CHECK(second->armed_until >= first->armed_until);
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[auth][breakglass][slow]") {
+TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[pg][auth][breakglass][slow]") {
     // Arm with a 1-second window. SQLite datetime('now','+1 seconds') has
     // calendar-second granularity, so the real wait is up to ~2 s; the
     // `yuzu-local-windows` runner adds Defender I/O serialisation on top (flake
@@ -145,7 +133,7 @@ TEST_CASE_METHOD(BreakGlassFixture, "expired window auto-disarms", "[auth][break
 }
 
 TEST_CASE_METHOD(BreakGlassFixture, "arming a non-existent account is UserNotFound",
-                 "[auth][breakglass]") {
+                 "[pg][auth][breakglass]") {
     // No silent no-op: the host operator running --break-glass-arm against a
     // typo'd username must get a hard error, not a false "armed" report.
     auto r = db->arm_break_glass("nobody", 3600);
@@ -153,7 +141,7 @@ TEST_CASE_METHOD(BreakGlassFixture, "arming a non-existent account is UserNotFou
     CHECK(r.error() == AuthDBError::UserNotFound);
 }
 
-TEST_CASE_METHOD(BreakGlassFixture, "malformed username is rejected", "[auth][breakglass]") {
+TEST_CASE_METHOD(BreakGlassFixture, "malformed username is rejected", "[pg][auth][breakglass]") {
     // A ':' is config-injection-reserved and rejected by is_valid_username, so
     // both methods surface InvalidUsername rather than touching a divergent row.
     const std::string bad = "alice:admin";
@@ -164,13 +152,13 @@ TEST_CASE_METHOD(BreakGlassFixture, "malformed username is rejected", "[auth][br
 // ── break_glass_account_problem (boot guard + --break-glass-arm validator) ────
 
 TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: enrolled user is usable",
-                 "[auth][breakglass]") {
+                 "[pg][auth][breakglass]") {
     enroll_mfa("alice");
     CHECK_FALSE(break_glass_account_problem(*db, "alice").has_value()); // nullopt = usable
 }
 
 TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: no-MFA user is rejected",
-                 "[auth][breakglass]") {
+                 "[pg][auth][breakglass]") {
     // alice exists but has no MFA — a break-glass account MUST carry a second
     // factor, so this is fail-closed (SOC 2 CC6.6).
     auto problem = break_glass_account_problem(*db, "alice");
@@ -179,14 +167,14 @@ TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: no-MFA user is
 }
 
 TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: missing user is rejected",
-                 "[auth][breakglass]") {
+                 "[pg][auth][breakglass]") {
     auto problem = break_glass_account_problem(*db, "ghost");
     REQUIRE(problem.has_value());
     CHECK(problem->find("does not exist") != std::string::npos);
 }
 
 TEST_CASE_METHOD(BreakGlassFixture, "break_glass_account_problem: malformed username is rejected",
-                 "[auth][breakglass]") {
+                 "[pg][auth][breakglass]") {
     auto problem = break_glass_account_problem(*db, "alice:admin");
     REQUIRE(problem.has_value());
     CHECK(problem->find("valid username") != std::string::npos);

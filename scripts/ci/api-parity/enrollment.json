@@ -1,0 +1,154 @@
+[
+  {
+    "method": "PUT",
+    "path": "/api/directory/group-mappings",
+    "capability_id": "put.api-directory-group-mappings",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/directory/status",
+    "capability_id": "get.api-directory-status",
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/directory/status"},
+    "mcp_twin": "get_directory_status",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/directory/sync",
+    "capability_id": "post.api-directory-sync",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/directory/users",
+    "capability_id": "get.api-directory-users",
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/directory/users"},
+    "mcp_twin": "list_directory_users",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/auto-approve",
+    "capability_id": "post.api-settings-auto-approve",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/auto-approve/mode",
+    "capability_id": "post.api-settings-auto-approve-mode",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/auto-approve/{param}",
+    "capability_id": "delete.api-settings-auto-approve-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/auto-approve/{param}/toggle",
+    "capability_id": "post.api-settings-auto-approve-param-toggle",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/enrollment-tokens",
+    "capability_id": "post.api-settings-enrollment-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/enrollment-tokens/batch",
+    "capability_id": "post.api-settings-enrollment-tokens-batch",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/enrollment-tokens/{param}",
+    "capability_id": "delete.api-settings-enrollment-tokens-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/pending-agents/bulk-approve",
+    "capability_id": "post.api-settings-pending-agents-bulk-approve",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/pending-agents/bulk-deny",
+    "capability_id": "post.api-settings-pending-agents-bulk-deny",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/pending-agents/{param}",
+    "capability_id": "delete.api-settings-pending-agents-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/pending-agents/{param}/approve",
+    "capability_id": "post.api-settings-pending-agents-param-approve",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/pending-agents/{param}/deny",
+    "capability_id": "post.api-settings-pending-agents-param-deny",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/auto-approve",
+    "capability_id": "get.fragments-settings-auto-approve",
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/enrollment/auto-approve-rules"},
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/directory",
+    "capability_id": "get.fragments-settings-directory",
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/settings/oidc"},
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/pending",
+    "capability_id": "get.fragments-settings-pending",
+    "rest_v1_twin": {"method": "GET", "path": "/api/v1/enrollment/pending-agents"},
+    "mcp_twin": null,
+    "status": "twinned"
+  }
+]

@@ -1,0 +1,14 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2688724a5dd5
+== action=set_log_level level=info
+status|ok
+level|info
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=info
+agent.id|(not set)
+agent.version|(not set)
+agent.server_address|(not set)
+agent.heartbeat_interval|(not set)
+agent.plugins.count|(not set)
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -26,8 +26,8 @@ name: Runner inventory sentinel
 # without that secret the workflow falls back to GITHUB_TOKEN and fails
 # loud with an actionable "create a PAT" message on the gh api call.
 # To create the PAT: gh-web → Settings → Developer settings → Personal
-# access tokens → Fine-grained tokens → Generate, scope = "Self-hosted
-# runners: read-only" on Tr3kkR/Yuzu, then `gh secret set
+# access tokens → Fine-grained tokens → Generate, repository permission =
+# "Administration: read-only" on DevNullLtd/Yuzu, then `gh secret set
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:
@@ -62,7 +62,7 @@ jobs:
       issues: write   # opens/comments runner-inventory-drift tracking issue
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -78,19 +78,29 @@ jobs:
         # sentinel preserves this workflow's loud-failure-on-drift contract.
         run: python3 scripts/ci/runner-health-check.py --mode sentinel
 
-      - name: Open or update drift issue
-        if: failure() && steps.check.outputs.drift_count != ''
+      - name: Open or update runner-control issue
+        # `always()` is required: without a status function GitHub implicitly
+        # ANDs success(), making an outcome=='failure' predicate unsatisfiable.
+        if: ${{ always() && steps.check.outcome == 'failure' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DRIFT_REPORT: ${{ steps.check.outputs.drift_report }}
+          FAILURE_KIND: ${{ steps.check.outputs.failure_kind }}
+          FAILURE_REPORT: ${{ steps.check.outputs.failure_report }}
         run: |
           set -euo pipefail
+          failure_kind="${FAILURE_KIND:-runner_control_crash}"
+          failure_report="${FAILURE_REPORT:-Runner inventory check failed before it could emit typed evidence. Inspect the failed step log.}"
           existing=$(gh issue list --label runner-inventory-drift --state open --json number --jq '.[0].number // empty')
+          case "$failure_kind" in
+            inventory_drift) title="Runner inventory drift ($(date -u +%Y-%m-%d))" ;;
+            runner_control_error) title="Runner inventory sentinel cannot observe GitHub ($(date -u +%Y-%m-%d))" ;;
+            *) title="Runner inventory sentinel failure ($(date -u +%Y-%m-%d))" ;;
+          esac
           body=$(cat <<EOF
-          Runner inventory drift detected by \`runner-inventory-sentinel\` workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          Runner inventory sentinel reported **\`$failure_kind\`** in workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
-          **Drift report:**
-          $DRIFT_REPORT
+          **Failure report:**
+          $failure_report
 
           **How to resolve:**
           - If a runner is legitimately missing/offline: bring it back online (see \`docs/ci-troubleshooting.md\` for the runner restart runbook).
@@ -109,7 +119,7 @@ jobs:
           else
             echo "Creating new drift issue"
             gh issue create \
-              --title "Runner inventory drift ($(date -u +%Y-%m-%d))" \
+              --title "$title" \
               --label runner-inventory-drift \
               --label operational \
               --body "$body"

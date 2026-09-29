@@ -1,0 +1,26 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash dc6c8e5f72d5
+== action=notify
+status|error|missing required parameter: title
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=message_box
+status|error|missing required parameter: title
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=input
+status|error|missing required parameter: title
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=survey
+status|error|missing required parameter: title
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=set_dnd
+dnd_enabled|true
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,15 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a4abf06e398d
+== action=products
+av_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=status
+av|ClamAV|not_running
+av|CrowdStrike Falcon|not_detected
+av|Sophos|not_detected
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=av_exclusions
+unsupported|av_exclusions is Windows-only
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -16,10 +16,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "test_helpers.hpp" // process_random_salt (#486 UP-R12)
 
 using namespace yuzu::agent;
 
@@ -35,9 +36,9 @@ using namespace yuzu::agent;
 
 namespace {
 
-// Process-salted unique-id generator — mirrors yuzu::test::unique_temp_path()
-// (tests/unit/test_helpers.hpp) exactly, extended from the filesystem to the
-// registry. The Windows CI pool runs 4 runner agents on ONE physical box, all
+// Process-salted unique-id generator — the same salt+counter scheme as
+// yuzu::test::unique_temp_path(), sharing its process_random_salt()
+// (tests/unit/test_helpers.hpp), extended from the filesystem to the registry. The Windows CI pool runs 4 runner agents on ONE physical box, all
 // as LOCAL SYSTEM (deploy/windows/README.md) — SYSTEM's HKCU is one shared
 // hive keyed by SID S-1-5-18, so a fixed registry path is a cross-JOB shared
 // mutable resource (two unrelated CI jobs on the same box can genuinely
@@ -49,12 +50,8 @@ struct UniqueTag {
     std::uint64_t n;
 };
 UniqueTag next_unique_tag() {
-    static const std::uint64_t salt = [] {
-        std::mt19937_64 rng{std::random_device{}()};
-        return rng();
-    }();
     static std::atomic<std::uint64_t> counter{0};
-    return {salt, counter.fetch_add(1, std::memory_order_relaxed)};
+    return {yuzu::test::process_random_salt(), counter.fetch_add(1, std::memory_order_relaxed)};
 }
 
 // RAII per-test HKCU scratch key for the "enforce"/"audit" single-value tests.

@@ -1,0 +1,6 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 514b81c2df7e
+== action=procfetch_fetch
+1|sh|/usr/bin/dash|e5355187cbd952a5bc9dfca430d10383f0f8750c
+9|plugin-capture|/src/builddir/tools/plugin-capture/plugin-capture|c93a85ef1e07f11e88bcea0d85f828adc1069521
+[result_status] UNDECLARED / UNKNOWN / 
+

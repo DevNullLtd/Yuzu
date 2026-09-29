@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: enumerated HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options (83 subkeys), searched for a Debugger value on each, none found; reg export of sample subkey "appverif.exe" (first enumerated, no Debugger value) captured instead
+date: 2026-09-06
+status: REAL CAPTURE
+note: no IFEO subkey with a Debugger value exists on the-rig (checked all 83 subkeys) -- per spec instructed to create none; this exports one representative empty-of-Debugger subkey instead. See ifeo_sample_status.txt for the full enumeration result.

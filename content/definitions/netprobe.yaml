@@ -38,40 +38,80 @@ spec:
       targets:
         type: string
         displayName: Targets
-        description: Comma-separated hostnames or IPv4 literals (max 4).
+        description: >
+          Comma-separated hostnames or IPv4 literals (max 4), e.g.
+          "10.0.0.1,gateway.corp.example.com".
       count:
         type: int32
         displayName: Samples
-        description: Echo samples per target (1-10, default 5).
+        description: Echo samples per target (1-10, default 5), e.g. 5.
         default: 5
       timeout_ms:
         type: int32
         displayName: Timeout (ms)
-        description: Per-sample timeout in milliseconds (100-3000, default 1000).
+        description: >
+          Per-sample timeout in milliseconds (100-3000, default 1000), e.g.
+          1000.
         default: 1000
 
   result:
     columns:
       - name: target
         type: string
+        description: >-
+          The probe target as supplied in targets, or the sanitized value when it failed validation. Values: free text (hostname or IPv4 literal).
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: proto
         type: string
+        description: Literal protocol tag for this row; always "icmp".
+        example: "icmp"
+        platforms: [windows, linux, darwin]
       - name: sent
         type: int32
+        description: >-
+          Number of echo samples attempted (the clamped count parameter), or 0 when the target was invalid or no ICMP session could be opened. Values: integer 0-10.
+        example: "5"
+        platforms: [windows, linux, darwin]
       - name: ok
         type: int32
+        description: 'Number of echo samples that received a reply within timeout_ms. Values: integer 0-sent.'
+        example: "5"
+        platforms: [windows, linux, darwin]
       - name: min_ms
         type: string
+        description: >-
+          Fastest successful sample's round-trip time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.
+        example: "0.1"
+        platforms: [windows, linux, darwin]
       - name: avg_ms
         type: string
+        description: 'Mean round-trip time of the successful samples, one decimal place. Values: 1-decimal milliseconds.'
+        example: "0.1"
+        platforms: [windows, linux, darwin]
       - name: max_ms
         type: string
+        description: >-
+          Slowest successful sample's round-trip time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.
+        example: "0.2"
+        platforms: [windows, linux, darwin]
       - name: jitter_ms
         type: string
+        description: >-
+          Population standard deviation of the successful samples' RTT in milliseconds; 0.0 with fewer than two successful samples. Values: 1-decimal milliseconds.
+        example: "0.0"
+        platforms: [windows, linux, darwin]
       - name: loss_pct
         type: string
+        description: >-
+          Percentage of samples that did not receive a reply within timeout, one decimal place; 100.0 when the session could not be opened or the target failed validation. Values: 1-decimal percentage, 0.0-100.0.
+        example: "0.0"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: "Outcome of this target's probe. Values: ok, invalid-target, resolve-failed, error, not-permitted (Linux only, ping socket refused)."
+        example: "ok"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Probe ICMP round-trip time to {{targets}}"
 
@@ -123,45 +163,87 @@ spec:
       targets:
         type: string
         displayName: Targets
-        description: Comma-separated hostnames or IP literals (max 4).
+        description: >
+          Comma-separated hostnames or IP literals (max 4), e.g.
+          "10.0.0.1,vpn-gw.corp.example.com". The port is a separate
+          parameter — do not embed it in a target.
       port:
         type: int32
         displayName: Port
-        description: TCP port to connect to (default 443).
+        description: TCP port to connect to (default 443; clamped 1-65535).
         default: 443
       count:
         type: int32
         displayName: Samples
-        description: Connect samples per target (1-10, default 5).
+        description: Connect samples per target (1-10, default 5), e.g. 5.
         default: 5
       timeout_ms:
         type: int32
         displayName: Timeout (ms)
-        description: Per-sample timeout in milliseconds (100-3000, default 1000).
+        description: >
+          Per-sample timeout in milliseconds (100-3000, default 1000), e.g.
+          1000.
         default: 1000
 
   result:
     columns:
       - name: target
         type: string
+        description: >-
+          The probe target as supplied in targets, or the sanitized value when it failed validation. Values: free text (hostname or IP literal).
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: proto
         type: string
+        description: 'Literal protocol tag including the connect port. Values: tcp:<port>.'
+        example: "tcp:22"
+        platforms: [windows, linux, darwin]
       - name: sent
         type: int32
+        description: >-
+          Number of connect samples attempted (the clamped count parameter), or 0 when the target was invalid or resolution failed. Values: integer 0-10.
+        example: "5"
+        platforms: [windows, linux, darwin]
       - name: ok
         type: int32
+        description: 'Number of connect samples that succeeded within timeout_ms. Values: integer 0-sent.'
+        example: "5"
+        platforms: [windows, linux, darwin]
       - name: min_ms
         type: string
+        description: >-
+          Fastest successful connect time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.
+        example: "0.3"
+        platforms: [windows, linux, darwin]
       - name: avg_ms
         type: string
+        description: 'Mean connect time of the successful samples, one decimal place. Values: 1-decimal milliseconds.'
+        example: "0.3"
+        platforms: [windows, linux, darwin]
       - name: max_ms
         type: string
+        description: >-
+          Slowest successful connect time, one decimal place; 0.0 when no sample succeeded. Values: 1-decimal milliseconds.
+        example: "0.4"
+        platforms: [windows, linux, darwin]
       - name: jitter_ms
         type: string
+        description: >-
+          Population standard deviation of the successful samples' connect time in milliseconds; 0.0 with fewer than two successful samples. Values: 1-decimal milliseconds.
+        example: "0.0"
+        platforms: [windows, linux, darwin]
       - name: loss_pct
         type: string
+        description: >-
+          Percentage of samples that did not connect within timeout, one decimal place; 100.0 when resolution failed or the target failed validation. Values: 1-decimal percentage, 0.0-100.0.
+        example: "0.0"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: >-
+          Outcome of this target's probe. "ok" means the probe ran to completion, not that every sample connected — check loss_pct too. Values: ok, invalid-target, resolve-failed.
+        example: "ok"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Probe TCP connect time to {{targets}}"
 
@@ -212,18 +294,34 @@ spec:
       targets:
         type: string
         displayName: Names
-        description: Comma-separated DNS names to resolve (max 4).
+        description: >
+          Comma-separated DNS names to resolve (max 4), e.g.
+          "example.com,internal.corp.local".
 
   result:
     columns:
       - name: name
         type: string
+        description: >-
+          The DNS name as supplied in targets, or the sanitized value when it failed validation. Values: free text DNS name.
+        example: "localhost"
+        platforms: [windows, linux, darwin]
       - name: resolve_ms
         type: string
+        description: 'Wall-clock time for the getaddrinfo call, one decimal place. Values: 1-decimal milliseconds.'
+        example: "2.9"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: 'Outcome of the resolution. Values: ok, invalid-target, error:<getaddrinfo return code>.'
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: addresses
         type: int32
+        description: >-
+          Number of addresses getaddrinfo returned; 0 on failure or invalid target. Values: integer, 0 or more.
+        example: "2"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Time DNS resolution of {{targets}}"
 

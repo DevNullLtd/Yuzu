@@ -2,5 +2,6 @@
 # (Dockerfile.runner-linux), which tracks the interactive-dev meson line
 # (1.11.x — see CLAUDE.md Prerequisites) rather than the container-builder
 # 1.9.x line in requirements-meson.txt. Same --require-hashes contract.
-meson==1.11.1 \
-    --hash=sha256:9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80
+meson==1.12.0 \
+    --hash=sha256:71f133147fa0fcfe8f4df49fa1045771064947834538409e5d97b3613aac8b4e \
+    --hash=sha256:88afe0c20e52030218924ac37d0c81c59b4b5f3ae3752c8c6d7470c7d365886c

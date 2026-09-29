@@ -162,7 +162,10 @@ No changes to the `tar.sql` agent action; the change is purely server-side scope
 > shipped reconstructs the tree from **the agent's existing local TAR warehouse
 > only** (`$Process_Live` + `$TCP_Live`, queried via the read-only `tar.sql`
 > action) — there is **no agent-side seed action, no `action='seed'` rows, no
-> `__checkpoint__` rows, and no `/api/v1/tar/process-tree` REST surface**. This was
+> `__checkpoint__` rows, and (until #4027) no `/api/v1/tar/process-tree` REST
+> surface at all**. #4027 added `GET /api/v1/tar/process-tree` as the frame's
+> device-PICKER list twin only (§5.6) — the per-device reconstructed-tree JSON
+> surface this paragraph is about remains deferred. This was
 > a deliberate scope choice (local-TAR-data-only); the consequence is an honest
 > completeness limit (see "Honesty" below). Modules: server engine
 > `server/core/src/tar_process_tree.{hpp,cpp}` (pure, unit-tested), routes
@@ -274,9 +277,29 @@ in-panel error and caches nothing rather than minting a weak token.
 
 ### 5.6 Deferred
 
-- **Agentic-first REST/MCP parity** (`GET /api/v1/tar/process-tree/{id}` + an MCP
-  tool) — deferred to a tracked follow-up, mirroring the precedent set for the
-  device live-info seam (also dashboard-only at first).
+- **Agentic-first REST/MCP parity for the reconstruction itself** — a JSON
+  surface returning the PER-DEVICE reconstructed tree (`{device_id}` in the
+  path, the `/result`+`/detail` fragments' data) — remains deferred. #4027
+  (API-parity programme) shipped REST+MCP twins for the OTHER three TAR
+  fragment reads — the process-tree and capture-sources device PICKER lists
+  (`GET /api/v1/tar/process-tree` / `GET /api/v1/tar/capture-sources`, no
+  `{device_id}` segment — distinct routes from the still-deferred one above,
+  no path collision) and the retention-paused source list (`GET
+  /api/v1/tar/retention-paused`) — plus MCP tools `list_tar_process_tree_devices`
+  / `list_tar_capture_sources_devices` / `list_tar_retention_paused`. #4027
+  deliberately did NOT twin `/fragments/tar/process-tree/result` or `.../detail`
+  — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG
+  value minted and principal-bound only inside the `/result` handler itself, so
+  a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd`
+  pair is an ordinary `tar sql` dispatch result (`Infrastructure:Read`, no
+  execute gate) reachable in principle through the already-twinned generic
+  dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing
+  the two canned `$Process_Live`/`$TCP_Live` queries verbatim — not a dedicated
+  API path, and a real twin would still need a new async polling contract (no
+  htmx auto-reissue on REST/MCP). Both are otherwise minted only by the
+  dashboard-only `/run` route, itself excluded as dispatch-shaped (batched with
+  #3994). Revisit once a `/run` (and `/result`) twin lands — see
+  `scripts/ci/api-parity/tar.json`'s `exception:` rows on those two paths.
 - **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
   would need a new collector (ETW `Image`/`Load`) or a live modules probe.
 - **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
@@ -322,7 +345,16 @@ Per `docs/observability-conventions.md`:
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
 | `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
+| `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
+| `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |
 | `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` | **planned — not yet emitted** (SRE follow-up) |
+
+> **Do not sum `yuzu_tar_source_purge_total` across surfaces yet.** The dashboard
+> fragment and the REST twin write the same series with different `result` tokens:
+> the fragment distinguishes `scope_violation` from `denied`, while REST folds
+> per-device scope denial, missing wiring, and audit failure all into `denied` and
+> otherwise only ever writes `requested`. `success` and `agent_not_connected` are
+> comparable; nothing else is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 

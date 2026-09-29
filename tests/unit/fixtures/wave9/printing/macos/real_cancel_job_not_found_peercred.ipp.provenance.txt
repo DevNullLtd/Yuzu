@@ -1,0 +1,41 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 501 (alex, non-root — no sudo used or required)
+
+request: IDENTICAL body to real_cancel_job_not_found.ipp — Cancel-Job
+(0x0008), printer `no_such_queue`, job-id 424242, requesting-user-name=
+alex, request-id 1 — plus header `Authorization: PeerCred alex`.
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/macos
+  python3 build_request.py cancel-job no_such_queue 424242 alex \
+      > /tmp/req_cancel.ipp
+  curl --unix-socket /private/var/run/cupsd -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      -H 'Authorization: PeerCred alex' \
+      --data-binary @/tmp/req_cancel.ipp \
+      http://localhost/ -o real_cancel_job_not_found_peercred.ipp
+
+decoded result: 118 bytes; status-code 0x0406 (client-error-not-found);
+status-message = "Job #424242 does not exist." — BYTE-IDENTICAL to
+real_cancel_job_not_found.ipp (verified: `diff` reports no difference).
+
+WHAT THIS PROVES: `Authorization: PeerCred alex` is accepted by cupsd and
+does not disturb request framing or the IPP response — the transport-level
+risk this header carried (a malformed or rejected header breaking the
+Cancel-Job round trip) is retired.
+
+WHAT THIS DOES NOT PROVE: whether the header changes an authorisation
+*outcome*. Both this request and its without-header sibling target a job
+id (424242) that does not exist under any printer on this host, so both
+short-circuit at not-found (0x0406) before cupsd's `<Limit Cancel-Job
+CUPS-Authenticate-Job>` policy (cupsd.conf:88-90) is ever evaluated. The
+authorisation question — does PeerCred let one principal cancel another
+principal's job — is OPEN and is not answered by this fixture pair. It is
+measured by Phase B (a privileged local capture against a real job owned
+by a different user) or by I93-7's Debian/Ubuntu cupsd container capture,
+neither of which has run yet. No sentence anywhere in this plugin's code,
+comments, descriptors, or fixtures may resolve that question in either
+direction until one of those captures exists.

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::AppPerfDailyStore;
@@ -23,6 +24,14 @@ using yuzu::server::pg::PgPool;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_app_perf_daily_store.cpp (identical setup — first build wins).
+yuzu::test::PgTestTemplate apperf_daily_tpl{"apperf_daily", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AppPerfDailyStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("apperf_daily template: store failed to migrate");
+}};
 std::int64_t yesterday_utc() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -70,7 +79,7 @@ TEST_CASE("parse_app_perf_blob parses, caps names, drops bad rows", "[app_perf][
 }
 
 TEST_CASE("ingest_app_perf_report end-to-end", "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_daily_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore store{pool};

@@ -1,5 +1,7 @@
 #include "nvd_sync.hpp"
 
+#include "background_jobs.hpp" // WS-10 YUZU_ASSERT_BACKGROUND_JOB gate
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -245,6 +247,7 @@ void NvdSyncManager::sync_loop() {
     }
 
     // Immediate first sync (runs the backfill until the floor, or freshness).
+    YUZU_ASSERT_BACKGROUND_JOB("nvd_sync.do_sync"); // WS-10 DisabledUntilFixed (engine-tier pending)
     do_sync();
 
     while (true) {

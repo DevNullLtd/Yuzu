@@ -1,0 +1,214 @@
+## Browser Inventory Definitions
+## Chromium-family browser and profile inventory. Read-only on
+## every platform; never emits a browsing-account identifier, browsing
+## history, cookies or bookmarks -- the Linux profiles row does carry the
+## LOCAL OS username (a deliberate exception) -- see
+## agents/plugins/browser_inventory/src/browser_inventory_parsers.hpp's
+## PRIVACY CONTRACT and the plugin README.
+## Plugin: browser_inventory | Actions: browsers, profiles
+##
+## Sources by platform:
+##   Linux:   system-wide binary presence (browsers) and each browser's
+##            Local State JSON under ~/.config/{google-chrome,chromium,
+##            microsoft-edge} (profiles), walked across every discoverable
+##            user. No file inside a profile directory is read.
+##   macOS:   PLANNED -- follows as its own PR (see the descriptor's
+##            PLANNED mechanism string).
+##   Windows: PLANNED -- follows as its own PR (see the descriptor's
+##            PLANNED mechanism string).
+## The per-profile `extensions` action follows as its own PR; Firefox and
+## Safari are out of scope for this plugin's initial legs and follow separately.
+##
+## Gated behind the Forensics securable, Administrator-only. Same enforced
+## boundary as execution_artifacts and app_usage (Forensics:Read +
+## AdminOrApproval, Forensics seeded to Administrator only); see this
+## plugin's README (agents/plugins/browser_inventory/README.md); the
+## docs/user-manual page is a separate follow-up. Every read is
+## SINGLE-TARGET (exactly one agent id) -- fleet/scope dispatch is refused
+## with the forensic 400 body at the server layer, not enforced here. See
+## server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp.
+##
+## DEFAULT-OFF: gated behind the server-side plugin-config kill switch
+## (`PluginConfigStore::seed_kill_switch_default_off`) -- an operator must
+## explicitly `PUT /api/v1/plugin-config/browser_inventory/kill-switch
+## {"enabled":true}` before either of these two actions will dispatch.
+##
+## Every action's wire stream leads with a `status|<action>|<supported|
+## constrained>|<reason>` row before any data row (CC-07 typed status
+## pairing), so `row_kind` is always field 0 -- see autoruns.yaml's
+## precedent comment for why an omitted row_kind column shifts every
+## dashboard column one to the left.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.browser_inventory.browsers
+  displayName: Browser Inventory - Installed Browsers
+  version: 1.0.0
+  description: >
+    Which Chromium-family browsers (Google Chrome, Microsoft Edge) are
+    installed on this host. Linux this wave: presence-only detection of
+    the system-wide binary; version is always "-" (no version/channel
+    probe in this package). macOS and Windows legs are PLANNED and follow
+    as their own PR.
+  tags: [forensics, browser, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: browser_inventory
+    action: browsers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Two row shapes on one stream, discriminated by field 0:
+    #   status|<action>|<supported|constrained>|<reason>
+    #   browser|<browser>|<present:1|0>|<version>
+    columns:
+      - name: row_kind
+        type: string
+        description: Discriminates the row shape - "status" or "browser".
+        example: "browser"
+      - name: field_1
+        type: string
+        description: >
+          status row: the action name ("browsers"). browser row: the
+          browser identifier.
+        example: "chrome"
+      - name: field_2
+        type: string
+        description: >
+          status row: "supported" or "constrained". browser row: "1" if
+          the binary is present, "0" otherwise.
+        example: "1"
+      - name: field_3
+        type: string
+        description: >
+          status row: the constraint reason, "-" when supported. browser
+          row: version, always "-" this wave (no version/channel probe).
+        example: "-"
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List installed Chromium-family browsers"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [browser_inventory]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.browser_inventory.profiles
+  displayName: Browser Inventory - Profiles
+  version: 1.0.0
+  description: >
+    Per-browser profile directories, read from each browser's "Local
+    State" file, across every user this leg discovers. Each row names the
+    local OS user it belongs to; never emits a browsing-account identifier
+    -- see the plugin README's PRIVACY CONTRACT. Linux this wave; macOS
+    and Windows legs are PLANNED and follow as their own PR.
+  tags: [forensics, browser, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: browser_inventory
+    action: profiles
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Two row shapes on one stream, discriminated by field 0:
+    #   status|<action>|<supported|constrained>|<reason>
+    #   profile|<user>|<browser>|<profile_dir>|<display_name>
+    columns:
+      - name: row_kind
+        type: string
+        description: Discriminates the row shape - "status" or "profile".
+        example: "profile"
+      - name: field_1
+        type: string
+        description: >
+          status row: the action name ("profiles"). profile row: the
+          owning OS user, redacted per the sample-capture convention in
+          non-sample contexts this is the real local username.
+        example: "jdoe"
+      - name: field_2
+        type: string
+        description: >
+          status row: "supported" or "constrained". profile row: the
+          browser identifier.
+        example: "chrome"
+      - name: field_3
+        type: string
+        description: >
+          status row: the constraint reason, "-" when supported. profile
+          row: the profile directory name (the Local State info_cache
+          key), e.g. "Default", "Profile 1" — redacted whole to
+          "[redacted-email]" when the raw value contains an e-mail-shaped
+          substring — bare, decorated or several addresses (some
+          Chromium builds key a signed-in profile by its account
+          e-mail).
+        example: "Default"
+      - name: field_4
+        type: string
+        description: >
+          status row: empty. profile row: the profile's user-editable
+          display name — redacted whole to "[redacted-email]" under the
+          same rule as field_3, otherwise emitted as-is (may legitimately
+          be a personal name).
+        example: "Work"
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List browser profiles"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [browser_inventory]
+
+status:
+  phase: active

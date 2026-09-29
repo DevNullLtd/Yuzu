@@ -1,8 +1,9 @@
 /**
- * yuzu/version.hpp.in — CMake configure_file template
+ * yuzu/version.hpp.in — Meson configure_file template
  *
- * This file is processed by CMake to produce version.hpp with build-time
- * values substituted. Do NOT edit the generated version.hpp directly.
+ * This file is processed by Meson's configure_file (sdk/include/yuzu/meson.build)
+ * to produce version.hpp with build-time values substituted. Do NOT edit the
+ * generated version.hpp directly.
  */
 
 #pragma once

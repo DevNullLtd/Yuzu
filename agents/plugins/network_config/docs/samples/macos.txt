@@ -1,0 +1,78 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 3b5c27bfec23
+== action=adapters
+adapter|lo0|-|0|up
+adapter|gif0|-|0|down
+adapter|stf0|-|0|down
+adapter|anpi0|00:00:5e:00:53:01|0|up
+adapter|anpi1|00:00:5e:00:53:02|0|up
+adapter|anpi3|00:00:5e:00:53:03|0|up
+adapter|en0|00:00:5e:00:53:04|1000|up
+adapter|en5|00:00:5e:00:53:05|0|up
+adapter|en6|00:00:5e:00:53:06|0|up
+adapter|en7|00:00:5e:00:53:07|0|up
+adapter|en2|00:00:5e:00:53:08|0|up
+adapter|en3|00:00:5e:00:53:09|0|up
+adapter|en4|00:00:5e:00:53:0a|0|up
+adapter|bridge0|00:00:5e:00:53:08|0|up
+adapter|ap1|00:00:5e:00:53:0b|0|up
+adapter|en1|00:00:5e:00:53:0c|0|up
+adapter|awdl0|00:00:5e:00:53:0d|0|down
+adapter|llw0|00:00:5e:00:53:0d|0|up
+adapter|utun0|-|0|up
+adapter|utun1|-|0|up
+adapter|utun2|-|0|up
+adapter|utun3|-|0|up
+adapter|utun4|-|0|up
+adapter|utun5|-|0|up
+adapter|utun6|-|0|up
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ip_addresses
+ip|en0|fe80::9e:c46b:750c:b2eb|64|203.0.113.1
+ip|en0|203.0.113.66|24|203.0.113.1
+ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|203.0.113.1
+ip|utun0|fe80::93eb:5451:9abf:3695|64|203.0.113.1
+ip|utun1|fe80::313e:505c:4e40:16c8|64|203.0.113.1
+ip|utun2|fe80::fa0e:b15e:9046:683d|64|203.0.113.1
+ip|utun3|fe80::ce81:b1c:bd2c:69e|64|203.0.113.1
+ip|utun4|fe80::d211:e5ff:fec0:a099|64|203.0.113.1
+ip|utun4|198.51.100.77|32|203.0.113.1
+ip|utun4|fd7a:115c:a1e0::1234:5678|48|203.0.113.1
+ip|utun5|fe80::b145:6483:7c96:77fa|64|203.0.113.1
+ip|utun6|fe80::68ce:f640:7c7a:bb05|64|203.0.113.1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_servers
+dns|system|100.100.100.100|IPv4
+dns|system|fd7a:115c:a1e0::53|IPv6
+dns|system|192.0.2.100|IPv4
+dns|system|192.0.2.101|IPv4
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=proxy
+bypass|*.local,169.254/16
+proxy_type|none
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_cache
+dns_cache|unsupported|macOS does not expose DNS resolver cache contents
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=arp
+arp|-|203.0.113.1|00:00:5e:00:53:0e|-
+arp|-|203.0.113.61|00:00:5e:00:53:0f|-
+arp|-|203.0.113.71|00:00:5e:00:53:10|-
+arp|-|203.0.113.131|00:00:5e:00:53:11|-
+arp|-|203.0.113.138|00:00:5e:00:53:12|-
+arp|-|203.0.113.140|00:00:5e:00:53:13|-
+arp|-|203.0.113.179|00:00:5e:00:53:14|-
+arp|-|203.0.113.197|00:00:5e:00:53:15|-
+arp|-|203.0.113.210|00:00:5e:00:53:16|-
+arp|-|203.0.113.222|00:00:5e:00:53:17|-
+arp|-|203.0.113.238|00:00:5e:00:53:18|-
+arp|-|203.0.113.246|00:00:5e:00:53:19|-
+arp|-|203.0.113.255|ff:ff:ff:ff:ff:ff|-
+arp|-|224.0.0.251|01:00:5e:00:00:fb|-
+arp|-|239.255.255.250|01:00:5e:7f:ff:fa|-
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,10 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e17062cd8474
+== action=set_state
+rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=status
+rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing
+[result_status] UNDECLARED / UNKNOWN / 
+

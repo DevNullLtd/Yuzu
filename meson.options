@@ -1,15 +1,17 @@
 option('build_agent',    type: 'boolean', value: true,  description: 'Build the agent daemon')
 option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
-option('build_examples', type: 'boolean', value: true,  description: 'Build example plugins')
+option('build_examples', type: 'boolean', value: true,  description: 'Build the demo example plugins (example, chargen, procfetch, netprobe) -- every other plugin builds regardless of this flag')
 option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
 option('build_fuzzers',  type: 'boolean', value: false,
        description: 'Build the libFuzzer harnesses in tests/fuzz/ (requires clang; '
                   + 'links -fsanitize=fuzzer,address,undefined). Mirrored by '
                   + '.clusterfuzzlite/build.sh for CI fuzzing.')
 option('systemd_guard',  type: 'feature', value: 'enabled',
-       description: 'Linux systemd service guard AND Service spark mechanism (libsystemd / sd-bus). '
-                  + 'enabled (default): require libsystemd so the shipped agent always offers both. '
-                  + 'auto: use libsystemd if present, else build no-op stubs. disabled: always stub. '
+       description: 'Linux libsystemd integration: systemd service guard, Service spark mechanism '
+                  + '(sd-bus), and the event_logs sd_journal native leg (sd-journal). '
+                  + 'enabled (default): require libsystemd so the shipped agent always offers all. '
+                  + 'auto: use libsystemd if present, else build no-op stubs / argv fallbacks. '
+                  + 'disabled: always stub. '
                   + 'Use auto/disabled for musl/Alpine/minimal images without libsystemd.')
 option('enable_enterprise', type: 'boolean', value: false,
        description: 'Build commercial enterprise modules from enterprise/. '

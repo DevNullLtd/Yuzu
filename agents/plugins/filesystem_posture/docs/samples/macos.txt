@@ -1,0 +1,31 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6094b93f5b9d
+== action=mounts
+mount|/|/dev/disk3s1s1|apfs|-|494384795648|313557540864|313557540864|ro
+mount|/dev|devfs|devfs|-|201728|0|0|rw
+mount|/System/Volumes/VM|/dev/disk3s6|apfs|-|494384795648|313795141632|313795141632|rw,noexec,noatime
+mount|/System/Volumes/Preboot|/dev/disk3s2|apfs|-|494384795648|313549758464|313549758464|rw
+mount|/System/Volumes/Update|/dev/disk3s4|apfs|-|494384795648|313795141632|313795141632|rw
+mount|/System/Volumes/xarts|/dev/disk1s2|apfs|-|524288000|506204160|506204160|rw,noexec,noatime
+mount|/System/Volumes/iSCPreboot|/dev/disk1s1|apfs|-|524288000|506204160|506204160|rw
+mount|/System/Volumes/Hardware|/dev/disk1s3|apfs|-|524288000|506204160|506204160|rw
+mount|/System/Volumes/Data|/dev/disk3s5|apfs|-|494384795648|313557196800|313557196800|rw
+mount|/System/Volumes/Data/home|map auto_home|autofs|-|0|0|0|rw
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=quotas
+quota|/|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/dev|volume|unsupported_fs|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/VM|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/Preboot|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/Update|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/xarts|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/iSCPreboot|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/Hardware|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/Data|volume|none|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+quota|/System/Volumes/Data/home|volume|unsupported_fs|-|-|volume-level only; per-user/group quotas are unsupported on APFS (quotactl returns ENOTSUP on every APFS mount, though it succeeds on HFS+)
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=snapshots
+snapshot|/|com.apple.os.update-60587424F5399FC05D957DF05B4D2F65543462495C77AEF520F790FBB57CB212|apfs|-
+[result_status] UNDECLARED / UNKNOWN / 
+

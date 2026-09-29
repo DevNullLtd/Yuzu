@@ -1,0 +1,289 @@
+name: Docker healthcheck invariants
+
+# Verifies that the five Yuzu APPLICATION images still provide the tool their
+# compose healthcheck invokes (#751): bash + /dev/tcp + grep for the server
+# image, busybox wget --spider for the gateway image, and /bin/busybox for the
+# three FROM-scratch chisel images. (yuzu-postgres is published and healthchecked
+# too, but is FROM postgres:* and out of scope — see the script's header.)
+#
+# Why this exists: those dependencies are invisible to the application. A base-
+# image swap, a dropped apt package, or a chisel slice change that stops
+# shipping the busybox symlink breaks NOTHING at build time and nothing at boot
+# -- it breaks only the healthcheck. Compose then parks every container in
+# `unhealthy` forever and anything with `depends_on: condition: service_healthy`
+# never starts, with no application failure to point at. Until now no automated
+# gate exercised them.
+#
+# ── Placement (issue #751 asked for this choice to be justified) ─────────────
+# The gate runs in TWO places, sharing one script:
+#
+#   1. HERE, on PRs and on pushes to dev/main -- so a base-image swap is caught
+#      in the PR that introduces it, not weeks later during a release.
+#   2. In release.yml's docker-publish + docker-publish-chisel jobs, between the
+#      image build and the registry push -- so a broken image is never
+#      published, which is the bar the issue actually set.
+#
+# ── Why no `paths:` filter (this is a trap, see #1978) ───────────────────────
+# The obvious design -- `on.pull_request.paths: [deploy/docker/**]` -- is wrong
+# for this repo. ci.yml carries a long comment explaining why: a path-filtered
+# workflow that is also a REQUIRED check never reports on PRs it filters out, so
+# the check sits at "Expected -- waiting for status" forever and a non-admin can
+# never merge. A *skipped* required check is satisfied; an *absent* one is not.
+# So the workflow always runs, and the `changes` job below skips the expensive
+# matrix instead.
+#
+# That is necessary but NOT sufficient for a matrix job: per actions/runner#952 a
+# matrix job skipped at the job level is skipped BEFORE the matrix expands, so it
+# emits none of its inner check-run names -- "skipped" never appears, and the
+# required context hangs. The `required-check-stubs` job at the bottom closes that
+# hole, exactly as ci.yml's `docs-required-checks` does. Only with the stub is the
+# gate safe to add to branch protection.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Docker build workers do not inherit the Big Tam runner service's cpuset.
+  YUZU_BUILD_JOBS: "16"
+
+concurrency:
+  group: hc-invariants-${{ github.ref }}
+  # Supersede in-flight PR runs, but let a mainline push run to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Cheap GitHub-hosted gate: did this change touch the image surface or the
+  # healthcheck definitions? Fail-closed -- anything we cannot classify builds.
+  changes:
+    name: "Detect image-surface changes"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      images_touched: ${{ steps.classify.outputs.images_touched }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "images_touched=$1" >> "$GITHUB_OUTPUT"
+            echo "images_touched=$1"
+            exit 0
+          }
+
+          # Fail-closed: a manual dispatch, or any event we do not model,
+          # verifies rather than silently skipping.
+          case "$EVENT_NAME" in
+            pull_request) BASE="$BASE_SHA" ;;
+            push)         BASE="$BEFORE_SHA" ;;
+            *)            echo "Unmodelled event '$EVENT_NAME' -- verifying (fail-closed)."; emit true ;;
+          esac
+
+          # A force-push or an initial commit leaves an all-zero / unknown base.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "Base commit unavailable -- verifying (fail-closed)."
+            emit true
+          fi
+
+          if ! FILES="$(git diff --name-only "$BASE" "$HEAD_SHA" 2>/dev/null)"; then
+            echo "git diff failed -- verifying (fail-closed)."
+            emit true
+          fi
+
+          echo "Changed files:"; echo "$FILES" | sed 's/^/  /'
+
+          # The image surface: the five gated Dockerfiles, EVERY file that defines
+          # a healthcheck for one of those images, the script itself, and this
+          # workflow.
+          #
+          # The healthcheck definitions matter because the script's probes are a
+          # hard-coded COPY of them. A compose edit cannot break the image, but it
+          # CAN silently invalidate the probe -- so it must at least force this
+          # gate to run and a human to look.
+          #
+          # KEEP IN SYNC with the healthcheck list in
+          # scripts/ci/verify-healthcheck-invariants.sh. The last two patterns are
+          # easy to forget: scripts/test/ and the compose heredocs inlined in
+          # pre-release.yml both healthcheck yuzu-server with bash + /dev/tcp.
+          if echo "$FILES" | grep -qE \
+            -e '^deploy/docker/Dockerfile\.(server|gateway)(\.chisel)?$' \
+            -e '^deploy/docker/Dockerfile\.agent\.chisel$' \
+            -e '^deploy/docker/docker-compose.*\.ya?ml$' \
+            -e '^docker-compose\.uat\.yml$' \
+            -e '^scripts/test/docker-compose\.upgrade-test\.yml$' \
+            -e '^\.github/workflows/pre-release\.yml$' \
+            -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
+            -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
+            echo "Image surface touched -- verifying."
+            emit true
+          fi
+
+          echo "No image-surface changes -- skipping the build matrix."
+          emit false
+
+  verify:
+    name: "Verify ${{ matrix.role }} healthcheck invariant"
+    needs: changes
+    if: needs.changes.outputs.images_touched == 'true'
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
+    # Cold-cache worst case is a full vcpkg-from-source compile for the server /
+    # agent chisel images (release.yml allows 360 min for those, but that budget
+    # covered a QEMU-emulated arm64 leg this gate does not build). In the normal
+    # case the release job's local buildcache is warm and only the runtime stage
+    # -- the part that actually carries the invariant -- rebuilds.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: server
+            dockerfile: deploy/docker/Dockerfile.server
+            cache: server
+            build_args: TRIPLET=x64-linux
+          - role: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway
+            cache: gateway
+            build_args: TRIPLET=x64-linux
+          # NO TRIPLET for the chisel images: they derive the vcpkg triplet from
+          # buildx's TARGETARCH when TRIPLET is empty, and pinning it here would
+          # diverge from how release.yml builds them.
+          - role: server-chisel
+            dockerfile: deploy/docker/Dockerfile.server.chisel
+            cache: server-chisel
+            build_args: ""
+          - role: gateway-chisel
+            dockerfile: deploy/docker/Dockerfile.gateway.chisel
+            cache: gateway-chisel
+            build_args: ""
+          - role: agent-chisel
+            dockerfile: deploy/docker/Dockerfile.agent.chisel
+            cache: agent-chisel
+            build_args: ""
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image (load, do not push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+          build-args: |
+            ${{ matrix.build_args }}
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+          # READ-ONLY reuse of release.yml's local buildcache: the expensive
+          # builder stages are already there, so a runtime-stage change (the
+          # kind that breaks these invariants) rebuilds in seconds.
+          #
+          # Deliberately NO cache-to. This gate must not write to the release
+          # job's cache -- a PR build would otherwise evict release layers, and
+          # a new cache directory here would be invisible to cache-prune.yml and
+          # grow unbounded on the runner.
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.cache }}
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.role }}
+          IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the loaded image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
+
+  # ── Required-check stubs (#1978 / actions/runner#952) ────────────────────────
+  # `verify` is a MATRIX job, and a matrix job skipped at the job level is skipped
+  # BEFORE the matrix expands — so it emits none of its inner check-run names
+  # (actions/runner#952, documented at length in ci.yml). A *non-matrix* skipped
+  # job reports "skipped" and satisfies a required check; a skipped matrix job
+  # emits nothing at all, and the required context sits at "Expected — waiting for
+  # status" forever. So without this stub, the moment anyone adds the five
+  # "Verify <role> healthcheck invariant" contexts to branch protection, every PR
+  # that does not touch the image surface becomes unmergeable — the very #1978
+  # trap this workflow's header claims to sidestep.
+  #
+  # This mirrors ci.yml's `docs-required-checks`: emit those exact names as
+  # success when, and only when, the real matrix is skipped. It is itself a matrix
+  # job, so the same runner#952 behaviour makes it collision-free — on an
+  # image-surface PR it is skipped before expansion and emits nothing, leaving
+  # `verify` as the sole producer of each name. Exactly one producer per name.
+  required-check-stubs:
+    # MUST stay byte-identical to `verify`'s name template, or the emitted check
+    # names will not match the required contexts.
+    name: "Verify ${{ matrix.role }} healthcheck invariant"
+    needs: changes
+    # NOT `== 'false'`. A bare `if:` is implicitly ANDed with success(), so if
+    # `changes` itself fails, BOTH this job and `verify` would be skipped,
+    # `images_touched` would be '' (neither 'true' nor 'false'), and — per
+    # runner#952 — neither matrix would emit any check-run name. The required
+    # contexts would hang at "Expected — waiting for status" exactly as they do
+    # under a path filter. `!cancelled()` re-arms this job on that path, and the
+    # step below turns it into an honest red X instead of a silent hang.
+    if: ${{ !cancelled() && needs.changes.outputs.images_touched != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # MUST stay in lockstep with `verify`'s matrix roles.
+        role: [server, gateway, server-chisel, gateway-chisel, agent-chisel]
+    steps:
+      - name: Satisfy required check (image surface untouched)
+        env:
+          ROLE: ${{ matrix.role }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          # The classifier died. We do not know whether the image surface changed,
+          # so we must NOT emit a green check -- but we must still emit the check
+          # NAME, or the required context hangs forever instead of failing. Emit
+          # it red.
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "The 'Detect image-surface changes' job did not succeed (result: ${CHANGES_RESULT})."
+            echo "Whether the ${ROLE} image surface changed is therefore UNKNOWN, and its"
+            echo "healthcheck invariant has NOT been verified. Failing closed: re-run the job."
+            exit 1
+          fi
+
+          echo "No image-surface change in this PR, so the ${ROLE} image is not built."
+          echo "Its healthcheck invariant cannot have regressed: neither the Dockerfile"
+          echo "nor any compose healthcheck changed."
+          echo "This stub emits the required check name as success so the PR is not"
+          echo "blocked on a check that will never report (#1978 / actions/runner#952)."

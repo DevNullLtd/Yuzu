@@ -3,19 +3,19 @@
 # Covers both Linux x64 and ARM64 cross-compile jobs.
 # Pre-bakes vcpkg packages for both triplets so CI skips compilation.
 #
-# Push to ghcr.io/tr3kkr/yuzu-ci-linux:latest
+# Push to ghcr.io/devnullltd/yuzu-ci-linux:latest
 #
 # Usage in workflows:
 #   jobs:
 #     build-linux:
 #       runs-on: ubuntu-24.04
-#       container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
+#       container: ghcr.io/devnullltd/yuzu-ci-linux:latest
 
 # Ubuntu 26.04 (Resolute) — matches the native OS of the Big Tam self-hosted
 # Linux runner pool (yuzu-bigtam-linux). GCC 15 / Clang 21 are 26.04 defaults;
 # gcc-13 (24.04 / Shulgi) is retired from this image as part of the runner
 # cutover. Digest is the multi-arch OCI index for ubuntu:26.04.
-FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 
@@ -28,6 +28,9 @@ RUN apt-get update && apt-get install -y \
     autoconf automake libtool bison flex \
     # sd-bus headers for the Linux Guardian systemd service guard (agent build)
     libsystemd-dev \
+    # libblkid headers for the bitlocker plugin's in-process LUKS enumeration
+    # (wave-3 native/argv migration off lsblk/cryptsetup)
+    libblkid-dev \
     # OpenSSL build deps
     perl linux-libc-dev \
     # Utilities
@@ -82,6 +85,6 @@ RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
 RUN git config --global --add safe.directory '*'
 
 # ── Labels ────────────────────────────────────────────────────────────
-LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
+LABEL org.opencontainers.image.source="https://github.com/DevNullLtd/Yuzu"
 LABEL org.opencontainers.image.description="Yuzu CI build environment (Linux x64 + ARM64 cross) with pre-built vcpkg dependencies"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"

@@ -5,8 +5,20 @@
 ///
 /// Wires the storage layer (`ScimStore`, slice 1) and JSON codec (`yuzu::
 /// server::scim`, slice 2) into an HTTP surface an enterprise IdP (Okta/
-/// Entra) drives to auto-provision and auto-deprovision Yuzu operators.
-/// Users-only in this slice — no Groups resource.
+/// Entra) drives to auto-provision and auto-deprovision Yuzu operators, and
+/// (#2021, slice 2) auto-manage Group membership feeding SCIM-group->Yuzu-
+/// role resolution.
+///
+/// SECURITY-CRITICAL — role application core: `recompute_scim_user_role`
+/// (scim_routes.cpp) re-derives a SCIM-provisioned user's role from their
+/// CURRENT SCIM group memberships (via `auth::resolve_role_from_groups` and
+/// the configured `--scim-admin-group`) every time membership could have
+/// changed (Group POST/PUT/PATCH/DELETE, User POST/revive). It is gated on
+/// the SAME provenance guard as every other mutation on this surface
+/// (`AuthDB::get_provisioning_source(username) == "scim"`) — a Group
+/// `members[].value` that resolves to a local/break-glass/non-SCIM account
+/// NEVER changes that account's role, even if an IdP is compromised or
+/// misconfigured into referencing it.
 ///
 /// AUTH MODEL: every route (including discovery) is gated on a static Bearer
 /// token validated against `ScimStore` (sha256 + constant-time compare) —
@@ -39,6 +51,9 @@
 namespace yuzu::server {
 
 class AuditStore;
+class EnginePrincipalStore;
+class ApiTokenStore;
+class AnalyticsEventStore;
 struct Config;
 
 /// Testable core of the `--scim-enable` fail-closed boot guard (SOC 2 CC6.2,
@@ -59,13 +74,46 @@ public:
     /// only constructs/registers this class when `--scim-enable` is set, so in
     /// practice all three are always non-null on this path — the null checks in
     /// scim_routes.cpp are defense-in-depth for the test harness and any future
-    /// caller that constructs it before its deps are ready.
+    /// caller that constructs it before its deps are ready. `scim_admin_group`
+    /// is `Config::scim_admin_group` (`--scim-admin-group`/
+    /// `YUZU_SCIM_ADMIN_GROUP`) — empty means no SCIM group ever promotes to
+    /// admin (see `recompute_scim_user_role`).
+    ///
+    /// `token_store` (ADR-2001 Sec.3, nullable -- same non-null-in-practice
+    /// posture as scim_store/auth_mgr/audit_store above: server.cpp
+    /// constructs ApiTokenStore unconditionally alongside ScimStore, both
+    /// born-on-PG) is where the deprovision seams (deactivate(), the DELETE
+    /// handler, and create-with-active:false) revoke API tokens
+    /// credentials-FIRST, across the resolved slug + linked-OIDC principal
+    /// set, before the account is marked inactive. A null/closed
+    /// token_store fails the deprovision closed (503) rather than silently
+    /// skipping the revoke.
+    ///
+    /// `analytics_store` (ADR-2001 D1, nullable, same deferred-wiring
+    /// posture) — the D1 "make it LOUD" signal needs a real SEVERITY
+    /// channel, and `AuditEvent`/`AuditStore` (what every other call on
+    /// this surface writes to) has no severity field at all: its `result`
+    /// column is success/denied/failure/partial, never a severity level.
+    /// The one severity-carrying mechanism in this codebase is
+    /// `AnalyticsEvent::severity` via `AnalyticsEventStore` — the same
+    /// channel `AuthRoutes::emit_event` uses for `Severity::kCritical`
+    /// break-glass-login events. D1 reuses that mechanism rather than
+    /// inventing a parallel one; a null store degrades to "no critical
+    /// analytics event" (the AuditStore row + the
+    /// `yuzu_scim_deprovision_role_refused_with_active_link_total` metric
+    /// still fire either way).
     void register_routes(httplib::Server& svr, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store);
+                         AuditStore* audit_store, std::string scim_admin_group = {},
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         ApiTokenStore* token_store = nullptr,
+                         AnalyticsEventStore* analytics_store = nullptr);
 
     /// Testable overload — register against an in-process sink (no socket).
     void register_routes(HttpRouteSink& sink, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store);
+                         AuditStore* audit_store, std::string scim_admin_group = {},
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         ApiTokenStore* token_store = nullptr,
+                         AnalyticsEventStore* analytics_store = nullptr);
 };
 
 } // namespace yuzu::server

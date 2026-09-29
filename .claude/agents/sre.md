@@ -71,8 +71,10 @@ Produce an **Operational Readiness Review** with:
 - **Verdict**: PASS, or findings with severity
 
 ## Key Files
-- `server/core/src/metrics.cpp` — Server metrics
-- `agents/core/src/metrics.cpp` — Agent metrics
+- `sdk/include/yuzu/metrics.hpp` — `MetricsRegistry` (header-only; shared by server and agent)
+- `server/core/src/server.cpp` (the `metrics_.describe(...)` calls, spread through the file; a few more live in individual route/store files) + `agents/core/src/agent.cpp` — Where metric names, HELP text and types are registered
+- `docs/user-manual/metrics.md` — Operator-facing metric catalogue
+- `docs/prometheus/yuzu-alerts.yml` — Shipped alert rules (tests in `tests/prometheus/yuzu-alerts.test.yml`)
 - `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl` — Gateway metrics
 - `deploy/systemd/` — Service definitions
 - `deploy/docker/` — Container configs

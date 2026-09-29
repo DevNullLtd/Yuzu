@@ -1,0 +1,31 @@
+status: REAL CAPTURE
+
+host: this Mac (macOS, arm64)
+date: 2026-09-08 (UTC, see `date -u` at capture time)
+identity: id -u = 501 (alex, non-root — no sudo used or required)
+
+request: Cancel-Job (0x0008), printer `no_such_queue`, job-id 424242,
+requesting-user-name=alex, request-id 1, built by `build_request.py
+cancel-job no_such_queue 424242 alex`. NO `Authorization` header.
+
+exact command:
+  cd tests/unit/fixtures/wave9/printing/macos
+  python3 build_request.py cancel-job no_such_queue 424242 alex \
+      > /tmp/req_cancel.ipp
+  curl --unix-socket /private/var/run/cupsd -s -X POST \
+      -H 'Content-Type: application/ipp' \
+      --data-binary @/tmp/req_cancel.ipp \
+      http://localhost/ -o real_cancel_job_not_found.ipp
+
+decoded result: 118 bytes; status-code 0x0406 (client-error-not-found);
+status-message = "Job #424242 does not exist." — job-id 424242 does not
+exist on this host under any printer, so cupsd short-circuits before any
+authorisation policy is evaluated (there is nothing to authorise a
+cancellation of).
+
+This is a REAL, unprivileged capture against the live `/private/var/run/
+cupsd` socket — no sudo, no privileged queue/job creation. Captured by
+`capture.sh` Phase A. It is one half of the header-framing control — see
+`real_cancel_job_not_found_peercred.ipp.provenance.txt` for the full
+framing-vs-authorisation distinction; this file's role is the WITHOUT-
+header half of that pair.

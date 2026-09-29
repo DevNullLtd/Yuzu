@@ -1,0 +1,6 @@
+- `CLAUDE.md` + `.claude/routed-concerns.md` (the auth/RBAC row, and the new authorization-topology-floor row)
+- `docs/auth-architecture.md` — "The authorization topology floor" section, and the engine-principal lifecycle section
+- `docs/authz-model.md` + `docs/adr/0033-access-control-spine.md` (the access-control spine)
+- `docs/adr/0017-management-group-confinement-list-reads.md` (admit-then-filter; note #2225 records that the access-review global gate is DELIBERATE)
+- `docs/security-reviews/authz-topology-floor-2026-08-05.md` (this change's own recorded decisions — attack these)
+- `docs/agentic-first-principle.md` (A1–A5, REST/MCP parity)

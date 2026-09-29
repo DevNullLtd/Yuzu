@@ -23,6 +23,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 
@@ -63,6 +65,13 @@ public:
     /// released store. Optional — null = no persistence (legacy behavior).
     void set_offline_endpoint_store(OfflineEndpointStore* s) { offline_store_ = s; }
 
+    /// HA WS-5 (ADR-2002 §7a): lets a disconnect handler reach the same
+    /// durable presence store this class writes, for a session-guarded
+    /// delete (`OfflineEndpointStore::remove_if_session`) — reusing the
+    /// existing wiring rather than threading a second pointer through
+    /// `AgentServiceImpl`/`GatewayUpstreamServiceImpl`. May be null.
+    [[nodiscard]] OfflineEndpointStore* offline_endpoint_store() const { return offline_store_; }
+
     /// Ingest one heartbeat. `agent_id` is the session-resolved agent id
     /// (already validated by the caller). `via` is "direct" or "gateway"
     /// — the only label that varies between the two ingestion paths.
@@ -80,6 +89,43 @@ public:
         guardian_reconcile_fn_ = std::move(fn);
     }
 
+    /// Quarantine reconnect reconciler (#3425). Invoked UNCONDITIONALLY once
+    /// per ingested heartbeat (unlike the guardian hook above, this one
+    /// carries no tag to gate on — reconnect itself is the signal). The
+    /// callee (`QuarantineContainmentReconciler::notify_agent_heartbeat`)
+    /// owns its own fast-path cache lookup, so an unset or a hit-nothing fn
+    /// costs at most one branch here. Optional; unset = no reconcile.
+    ///
+    /// Synchronized (governance Gate 3, cpp-safety, 2026-08-24) — unlike
+    /// `guardian_reconcile_fn_`/`offline_store_` above, which are bare/raw
+    /// and rely on the (pre-existing, out of scope for this fix) benign-
+    /// aligned-pointer-store argument. That argument does not extend to a
+    /// `std::function`: a live `ingest()` call on a heartbeat-handler thread
+    /// can still be INSIDE `quarantine_reconcile_fn_(...)` — doing blocking
+    /// Postgres + gRPC-dispatch I/O — when `server.cpp`'s stop() sequence
+    /// nulls the fn and then `.reset()`s the `QuarantineContainmentReconciler`
+    /// the fn's closure captures. `agent_server_->Shutdown(deadline)` is a
+    /// BOUNDED drain, not a quiescence guarantee (same "a handler thread can
+    /// legitimately outlive the deadline" precedent as the `execution_tracker_`/
+    /// `nvd_sync_`/`web_thread_` teardown comments in server.cpp) — so a
+    /// reassignment-during-call (a `std::function`'s destructive multi-word
+    /// reassign racing its own `operator()`) and a post-null dangling capture
+    /// are both real, not theoretical. `quarantine_reconcile_mu_` makes
+    /// `set_quarantine_reconcile_fn(nullptr)` an actual drain barrier: it
+    /// takes the EXCLUSIVE lock, so it cannot return while `ingest()` still
+    /// holds the SHARED lock across an in-flight call — the caller in
+    /// server.cpp's stop() is therefore guaranteed no invocation is in
+    /// flight once `set_quarantine_reconcile_fn(nullptr)` returns, and only
+    /// then is it safe to `.reset()` the reconciler the closure captures.
+    /// Concurrent `ingest()` calls from different heartbeats are unaffected
+    /// (shared/shared never blocks each other) — only the teardown set(nullptr)
+    /// pays the cost of a real wait, and only once, at shutdown.
+    using QuarantineReconcileFn = std::function<void(std::string_view agent_id)>;
+    void set_quarantine_reconcile_fn(QuarantineReconcileFn fn) {
+        std::unique_lock lock(quarantine_reconcile_mu_);
+        quarantine_reconcile_fn_ = std::move(fn);
+    }
+
 private:
     detail::AgentRegistry& registry_;
     detail::AgentHealthStore* health_store_;
@@ -87,6 +133,8 @@ private:
     MetricsRegistry* metrics_;
     OfflineEndpointStore* offline_store_{nullptr};
     GuardianReconcileFn guardian_reconcile_fn_;
+    QuarantineReconcileFn quarantine_reconcile_fn_;
+    std::shared_mutex quarantine_reconcile_mu_;
 };
 
 } // namespace yuzu::server

@@ -12,6 +12,8 @@
 %%%   - proxy_register returns upstream response
 %%%   - proxy_inventory returns upstream response
 %%%   - notify_stream_status is fire-and-forget (no crash on error)
+%%%   - connect notification advertises the command_dispatch_tag_v1 wire
+%%%     capability (CC-03)
 %%%   - Buffer is retained on flush failure (not silently discarded)
 %%%   - Buffer retention is capped to prevent unbounded growth
 %%% @end
@@ -33,8 +35,11 @@ upstream_test_() ->
       {"empty flush sends no rpc", fun empty_flush_no_rpc/0},
       {"proxy_register returns response", fun proxy_register_ok/0},
       {"proxy_register returns error", fun proxy_register_error/0},
+      {"HA WS-4 4.4 (c-1/CH-2): a real http_error shape does not crash",
+       fun proxy_register_http_error/0},
       {"proxy_inventory returns response", fun proxy_inventory_ok/0},
       {"notify_stream_status does not crash on error", fun notify_no_crash/0},
+      {"connect notification advertises command_dispatch_tag_v1", fun notify_advertises_dispatch_tag_capability/0},
       {"buffer retained on flush failure", fun buffer_retained_on_failure/0},
       {"buffer cap prevents unbounded growth", fun buffer_cap_on_failure/0}
      ]}.
@@ -139,14 +144,41 @@ proxy_register_ok() ->
     ?assertMatch({ok, #{session_id := <<"new-sess">>}}, Result).
 
 proxy_register_error() ->
+    %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error return for a
+    %% genuine (non-transport) grpc status is a 3-ELEMENT tuple — `error`,
+    %% the `{Status, Message}` pair, and the trailers map
+    %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) — not the
+    %% OLD mocked shape here (`{error, {Status, Message, Trailers}}`, a
+    %% 2-element tuple whose 2nd element was itself a 3-tuple), which this
+    %% test previously used and do_rpc's matching clause mirrored. That
+    %% shape does not match ANYTHING grpcbox actually returns, so do_rpc's
+    %% corresponding clause could never fire against the real dependency —
+    %% both were wrong together. Fixed to the real shape.
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _       -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _       -> {error, {14, <<"UNAVAILABLE">>}, #{}}
         end
     end),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertMatch({error, {14, _}}, Result).
+
+proxy_register_http_error() ->
+    %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
+    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
+    %% `{http_error, {Status, Message}, Trailers}` (a non-grpc-layer HTTP
+    %% error), previously matched no clause in do_rpc and would have crashed
+    %% this gen_server with a case_clause exception.
+    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+        case binary:match(Path, <<"ProxyRegister">>) of
+            nomatch -> {ok, #{}, #{}};
+            _       -> {http_error, {502, <<>>}, #{}}
+        end
+    end),
+    Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertMatch({error, {internal, _}}, Result),
+    %% Above all: the gen_server survived and answers normally.
+    ?assert(is_pid(whereis(yuzu_gw_upstream))).
 
 proxy_inventory_ok() ->
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
@@ -166,10 +198,33 @@ notify_no_crash() ->
             _       -> {error, connection_refused}
         end
     end),
-    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
     timer:sleep(100),
     %% The upstream process should still be alive.
     ?assert(is_process_alive(whereis(yuzu_gw_upstream))).
+
+%% CC-03: the StreamStatusNotification the gateway sends on the agent's
+%% CONNECTED event — the first message a gateway-connected agent's session
+%% causes the gateway to emit upstream — must advertise the literal
+%% "command_dispatch_tag_v1" in wire_capabilities, proving to the server's
+%% dispatch chokepoint that this gateway build carries
+%% CommandRequest.dispatch_tag = 9 through untouched.
+notify_advertises_dispatch_tag_capability() ->
+    meck:reset(grpcbox_client),
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {ok, #{acknowledged => true}, #{}}
+    end),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
+    timer:sleep(100),
+    Calls = meck:history(grpcbox_client),
+    NotifyReqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+                         binary:match(Path, <<"NotifyStreamStatus">>) =/= nomatch],
+    ?assert(length(NotifyReqs) > 0),
+    [LastReq | _] = lists:reverse(NotifyReqs),
+    ?assert(lists:member(<<"command_dispatch_tag_v1">>,
+                         maps:get(wire_capabilities, LastReq, []))).
 
 buffer_retained_on_failure() ->
     %% First drain any existing buffer.

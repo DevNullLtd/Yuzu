@@ -1,6 +1,10 @@
 #include "inventory_eval.hpp"
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <charconv>
@@ -160,14 +164,57 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     return false;
 }
 
+/// #4541 review (Important finding 1): both the depth-guard and parse-error
+/// exclusion paths below log once per excluded record, unconditionally - a
+/// caller-controlled batch of up to the two producer routes' own
+/// `limit = 5000` inventory read could pay thousands of synchronous,
+/// mutex-guarded writes to the process's rotating_file_sink_mt default
+/// logger on a shared httplib worker thread, for a result the two
+/// durable-result-set producers discard anyway (they hard-refuse on ANY
+/// non-zero exclusion count regardless of how many records excluded it).
+/// Cap detailed per-record logging at this many entries PER CAUSE, per call,
+/// then fold the rest into one summary line - same "+K more" shape as
+/// `deprovision_revoke.cpp`'s `enumerate_principals_for_audit`
+/// (kMaxEnumeratedPrincipals). Implementation detail, not a contract, so it
+/// lives here rather than the header alongside kMaxInventoryConditions.
+constexpr std::size_t kMaxLoggedExclusionsPerCause = 10;
+
 } // namespace
 
 std::vector<InventoryEvalResult> evaluate_inventory(
     const InventoryEvalRequest& req,
-    const std::vector<std::pair<std::string, std::string>>& records) {
+    const std::vector<std::pair<std::string, std::string>>& records,
+    std::size_t* excluded_by_depth,
+    std::size_t* excluded_by_parse_error) {
+
+    // #4496: zero the out-param up front (including on the early returns
+    // below) so a caller can never read a garbage/stale count.
+    if (excluded_by_depth) {
+        *excluded_by_depth = 0;
+    }
+    // #4496 follow-up: same zero-up-front discipline for the parse-error
+    // twin.
+    if (excluded_by_parse_error) {
+        *excluded_by_parse_error = 0;
+    }
 
     std::vector<InventoryEvalResult> results;
+    // Defense-in-depth backstop (Gate 6 sre BLOCKING fix): every caller MUST
+    // reject an oversized conditions[] array before reaching here (see
+    // kMaxInventoryConditions' doc comment) - this bounds the cost even if a
+    // future caller forgets to.
+    if (req.conditions.size() > kMaxInventoryConditions) {
+        return results;
+    }
     bool combine_all = (req.combine != "any");
+
+    // #4541 review: running totals kept locally (not just via the possibly-
+    // null out-param pointers) so the per-cause log cap below can gate on the
+    // real count regardless of whether a given caller wants the out-param at
+    // all; written through to *excluded_by_depth/*excluded_by_parse_error
+    // once, after the loop.
+    std::size_t depth_excluded_total = 0;
+    std::size_t parse_error_excluded_total = 0;
 
     for (const auto& [key, data_json] : records) {
         // Parse the composite key: "agent_id|plugin"
@@ -183,10 +230,56 @@ std::vector<InventoryEvalResult> evaluate_inventory(
             continue;
         }
 
+        // #2437-class guard: data_json is the same generic ADR-0016 blob read by
+        // data_inventory_routes.cpp (see its own guard for the write-side
+        // context) - reached here via all three evaluate_inventory() callers,
+        // the REST /api/v1/inventory/evaluate route, the REST
+        // from-inventory-query result-set producer, and the MCP
+        // create_result_set_from_inventory_query tool. json::parse handles very
+        // deep input fine (the catch below guards a genuine parse error, not
+        // this), but json_value_to_string's dump() fallback on the parsed tree
+        // is unboundedly recursive - a too-deep record would SIGSEGV the whole
+        // process for every caller at once. Check the raw text before parse and
+        // skip this record exactly like a genuine parse error, below. Log
+        // identifiers only, never the payload. #4496: count the exclusion so
+        // callers can signal an incomplete result rather than silently
+        // returning fewer matches than actually exist. #4541 review: capped
+        // at kMaxLoggedExclusionsPerCause detailed lines (see its doc
+        // comment) - this guard predates the cap (shipped in #4478/#4496),
+        // retrofitted here once the review caught the identical unbounded
+        // shape on the parse-error sibling below.
+        if (mcp::json_exceeds_depth(data_json, mcp::kMcpMaxJsonDepth)) {
+            ++depth_excluded_total;
+            if (depth_excluded_total <= kMaxLoggedExclusionsPerCause) {
+                spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json nests "
+                            "too deeply (#2437-class)",
+                            onbehalf::sanitize_for_log(record_agent_id, 128),
+                            onbehalf::sanitize_for_log(record_plugin, 128));
+            }
+            continue;
+        }
+
         nlohmann::json data;
         try {
             data = nlohmann::json::parse(data_json);
         } catch (const nlohmann::json::parse_error&) {
+            // #4496 follow-up: a genuinely malformed data_json (syntax
+            // defect, not over-nesting - the depth guard above already
+            // excluded the latter) is the SAME "excluded from evaluation"
+            // hazard #4496 fixed, triggered by a different cause. Count it
+            // separately from excluded_by_depth so a caller can tell WHICH
+            // guard excluded a record. Log identifiers only, never the
+            // payload. #4541 review: same per-cause cap as the depth guard
+            // above, for the identical reason (an unbounded per-record
+            // spdlog::warn here was Important finding 1 on the PR review that
+            // added this branch).
+            ++parse_error_excluded_total;
+            if (parse_error_excluded_total <= kMaxLoggedExclusionsPerCause) {
+                spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json failed "
+                            "to parse (malformed JSON)",
+                            onbehalf::sanitize_for_log(record_agent_id, 128),
+                            onbehalf::sanitize_for_log(record_plugin, 128));
+            }
             continue;
         }
 
@@ -237,6 +330,27 @@ std::vector<InventoryEvalResult> evaluate_inventory(
                 .collected_at = collected_at,
             });
         }
+    }
+
+    // #4541 review: fold whatever the per-cause cap above suppressed into one
+    // summary line each, so the total exclusion volume for this call stays
+    // visible in the log even though the per-record detail was capped.
+    if (depth_excluded_total > kMaxLoggedExclusionsPerCause) {
+        spdlog::warn("evaluate_inventory: suppressed {} further depth-guard exclusion log "
+                    "lines ({} excluded total this call)",
+                    depth_excluded_total - kMaxLoggedExclusionsPerCause, depth_excluded_total);
+    }
+    if (parse_error_excluded_total > kMaxLoggedExclusionsPerCause) {
+        spdlog::warn("evaluate_inventory: suppressed {} further parse-error exclusion log "
+                    "lines ({} excluded total this call)",
+                    parse_error_excluded_total - kMaxLoggedExclusionsPerCause,
+                    parse_error_excluded_total);
+    }
+    if (excluded_by_depth) {
+        *excluded_by_depth = depth_excluded_total;
+    }
+    if (excluded_by_parse_error) {
+        *excluded_by_parse_error = parse_error_excluded_total;
     }
 
     return results;

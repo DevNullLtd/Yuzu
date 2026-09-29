@@ -15,50 +15,56 @@
 #include "execution_tracker.hpp"
 #include "inventory_eval.hpp"
 #include "license_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "software_deployment_store.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
 #include <cstdint>
-#include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server;
-namespace fs = std::filesystem;
 
-// ── RAII wrapper for sqlite3* (in-memory) ─────────────────────────────────
+// LicenseStore (ADR-0048), SoftwareDeploymentStore (ADR-0051),
+// DeviceTokenStore (ADR-0052), and ExecutionTracker (ADR-0065) are all
+// Postgres-backed. Mirrors test_deployment_store.cpp's PgTestTemplate
+// declaration.
+namespace {
+yuzu::test::PgTestTemplate license_store_tpl{
+    "licensestore_t2", [](const std::string& dsn) {
+        pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        LicenseStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("license_store template: store failed to migrate");
+    }};
 
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
+// Pre-migrated template — shares the "swdeploystore" key with
+// test_software_deployment_store.cpp's own template (identical setup,
+// replay-verified per docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate t2_sw_deploy_tpl{
+    "swdeploystore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        SoftwareDeploymentStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("software_deployment_store template: failed to migrate");
+    }};
 
-// ── Helpers: unique temp paths for file-backed stores ─────────────────────
-// Delegates to the shared salt + atomic counter helper (#482). The prior
-// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to.
-
-static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
-
-// RAII guard to remove temp files on scope exit
-struct TempFileGuard {
-    fs::path path;
-    explicit TempFileGuard(fs::path p) : path(std::move(p)) {}
-    ~TempFileGuard() {
-        std::error_code ec;
-        fs::remove(path, ec);
-    }
-};
+// Shares the "devicetokenstore" key with test_device_token_store.cpp's and
+// test_rest_api_tokens.cpp's own templates (identical setup, replay-verified
+// per docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate t2_device_token_tpl{
+    "devicetokenstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        DeviceTokenStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("device_token_store template: store failed to migrate");
+    }};
+} // namespace
 
 static Execution make_execution(const std::string& definition_id = "def-001",
                                 const std::string& scope = "ostype = 'windows'",
@@ -78,10 +84,9 @@ static Execution make_execution(const std::string& definition_id = "def-001",
 // ============================================================================
 
 TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create executions with various statuses
     auto e1 = make_execution("def-001");
@@ -128,10 +133,9 @@ TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
 }
 
 TEST_CASE("T2 REST: get_fleet_summary with zero executions returns zeroed fields",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto summary = tracker.get_fleet_summary();
     CHECK(summary.total_executions == 0);
@@ -142,10 +146,9 @@ TEST_CASE("T2 REST: get_fleet_summary with zero executions returns zeroed fields
 }
 
 TEST_CASE("T2 REST: get_agent_statistics with pagination (limit=5)",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create a single execution targeting 8 agents
     auto exec = make_execution();
@@ -171,10 +174,9 @@ TEST_CASE("T2 REST: get_agent_statistics with pagination (limit=5)",
 }
 
 TEST_CASE("T2 REST: get_agent_statistics filters by agent_id",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     auto id = tracker.create_execution(exec);
@@ -204,10 +206,9 @@ TEST_CASE("T2 REST: get_agent_statistics filters by agent_id",
 }
 
 TEST_CASE("T2 REST: get_definition_statistics returns per-definition aggregates",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Two different definitions
     auto e1 = make_execution("def-alpha");
@@ -341,10 +342,11 @@ TEST_CASE("T2 REST: inventory eval with contains operator", "[rest_api_t2][inven
 // Device Token flow (POST/GET/DELETE /api/v1/device-tokens)
 // ============================================================================
 
-TEST_CASE("T2 REST: device token create and validate round-trip", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-test");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token create and validate round-trip",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     auto token_result = store.create_token("test-token", "admin", "device-001", "def-001", 0);
@@ -362,27 +364,31 @@ TEST_CASE("T2 REST: device token create and validate round-trip", "[rest_api_t2]
     CHECK(validated->revoked == false);
 }
 
-TEST_CASE("T2 REST: device token list shows created tokens", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-list");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token list shows created tokens",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
-    store.create_token("token-a", "admin", "", "", 0);
-    store.create_token("token-b", "admin", "", "", 0);
-    store.create_token("token-c", "user1", "", "", 0);
+    REQUIRE(store.create_token("token-a", "admin", "", "", 0).has_value());
+    REQUIRE(store.create_token("token-b", "admin", "", "", 0).has_value());
+    REQUIRE(store.create_token("token-c", "user1", "", "", 0).has_value());
 
     auto all = store.list_tokens();
-    CHECK(all.size() == 3);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 3);
 
     auto admin_only = store.list_tokens("admin");
-    CHECK(admin_only.size() == 2);
+    REQUIRE(admin_only.has_value());
+    CHECK(admin_only->size() == 2);
 }
 
-TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-revoke");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token revoke invalidates validation",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     // Bind to an explicit device — empty device_id tokens are rejected as
@@ -397,9 +403,10 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
 
     // Get the token_id from the list so we can revoke by id
     auto tokens = store.list_tokens();
-    REQUIRE(!tokens.empty());
-    auto revoked = store.revoke_token(tokens[0].token_id);
-    CHECK(revoked == true);
+    REQUIRE(tokens.has_value());
+    REQUIRE(!tokens->empty());
+    auto revoked = store.revoke_token((*tokens)[0].token_id);
+    CHECK(revoked.has_value());
 
     // Validate after revoke should fail
     auto post_revoke = store.validate_token(raw_token, "device-RV");
@@ -408,10 +415,11 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
     CHECK(post_revoke.error().error == DeviceTokenValidateError::revoked);
 }
 
-TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2][device_token]") {
-    auto path = unique_temp_path("device-token-expire");
-    TempFileGuard guard(path);
-    DeviceTokenStore store(path);
+TEST_CASE("T2 REST: device token expired token fails validation",
+          "[rest_api_t2][device_token][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_device_token_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeviceTokenStore store(pool);
     REQUIRE(store.is_open());
 
     // Expires at epoch 1 (long past). Bind to a device so the failure is
@@ -429,10 +437,11 @@ TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2]
 // Software Deployment flow (software deployment endpoints)
 // ============================================================================
 
-TEST_CASE("T2 REST: create package and list packages", "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-pkg");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+TEST_CASE("T2 REST: create package and list packages",
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -450,17 +459,18 @@ TEST_CASE("T2 REST: create package and list packages", "[rest_api_t2][software_d
     CHECK(!id->empty());
 
     auto packages = store.list_packages();
-    REQUIRE(packages.size() == 1);
-    CHECK(packages[0].name == "Firefox");
-    CHECK(packages[0].version == "125.0");
-    CHECK(packages[0].platform == "windows");
+    REQUIRE(packages.has_value());
+    REQUIRE(packages->size() == 1);
+    CHECK((*packages)[0].name == "Firefox");
+    CHECK((*packages)[0].version == "125.0");
+    CHECK((*packages)[0].platform == "windows");
 }
 
 TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-lifecycle");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     // Create package first
@@ -488,11 +498,12 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
 
     // Start deployment
     auto started = store.start_deployment(*dep_id);
-    CHECK(started == true);
+    CHECK(started.has_value());
 
     auto fetched = store.get_deployment(*dep_id);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "deploying");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->status == "deploying");
 
     // Add agent statuses
     AgentDeploymentStatus s1;
@@ -500,14 +511,14 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
     s1.agent_id = "agent-1";
     s1.status = "success";
     s1.completed_at = 2000;
-    store.update_agent_status(*dep_id, s1);
+    REQUIRE(store.update_agent_status(*dep_id, s1).has_value());
 
     AgentDeploymentStatus s2;
     s2.deployment_id = *dep_id;
     s2.agent_id = "agent-2";
     s2.status = "success";
     s2.completed_at = 2001;
-    store.update_agent_status(*dep_id, s2);
+    REQUIRE(store.update_agent_status(*dep_id, s2).has_value());
 
     AgentDeploymentStatus s3;
     s3.deployment_id = *dep_id;
@@ -515,22 +526,23 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
     s3.status = "failed";
     s3.completed_at = 2002;
     s3.error = "checksum mismatch";
-    store.update_agent_status(*dep_id, s3);
+    REQUIRE(store.update_agent_status(*dep_id, s3).has_value());
 
     // Refresh counts
-    store.refresh_counts(*dep_id);
+    REQUIRE(store.refresh_counts(*dep_id).has_value());
 
     auto summary = store.get_deployment(*dep_id);
     REQUIRE(summary.has_value());
-    CHECK(summary->agents_success == 2);
-    CHECK(summary->agents_failure == 1);
+    REQUIRE(summary->has_value());
+    CHECK((*summary)->agents_success == 2);
+    CHECK((*summary)->agents_failure == 1);
 }
 
 TEST_CASE("T2 REST: deployment cancel stops active deployment",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-cancel");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -551,20 +563,21 @@ TEST_CASE("T2 REST: deployment cancel stops active deployment",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
     auto cancelled = store.cancel_deployment(*dep_id);
-    CHECK(cancelled == true);
+    CHECK(cancelled.has_value());
 
     auto fetched = store.get_deployment(*dep_id);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "cancelled");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->status == "cancelled");
 }
 
 TEST_CASE("T2 REST: deployment agent statuses are retrievable",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-statuses");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -585,26 +598,27 @@ TEST_CASE("T2 REST: deployment agent statuses are retrievable",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
 
     AgentDeploymentStatus s1;
     s1.deployment_id = *dep_id;
     s1.agent_id = "mac-1";
     s1.status = "downloading";
     s1.started_at = 3000;
-    store.update_agent_status(*dep_id, s1);
+    REQUIRE(store.update_agent_status(*dep_id, s1).has_value());
 
     auto statuses = store.get_agent_statuses(*dep_id);
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].agent_id == "mac-1");
-    CHECK(statuses[0].status == "downloading");
+    REQUIRE(statuses.has_value());
+    REQUIRE(statuses->size() == 1);
+    CHECK((*statuses)[0].agent_id == "mac-1");
+    CHECK((*statuses)[0].status == "downloading");
 }
 
 TEST_CASE("T2 REST: active_count reflects running deployments",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-active");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -618,7 +632,9 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
     auto pkg_id = store.create_package(pkg);
     REQUIRE(pkg_id.has_value());
 
-    CHECK(store.active_count() == 0);
+    auto ac0 = store.active_count();
+    REQUIRE(ac0.has_value());
+    CHECK(*ac0 == 0);
 
     SoftwareDeployment dep;
     dep.package_id = *pkg_id;
@@ -627,18 +643,20 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
-    CHECK(store.active_count() >= 1);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
+    auto ac1 = store.active_count();
+    REQUIRE(ac1.has_value());
+    CHECK(*ac1 >= 1);
 }
 
 // ============================================================================
 // License flow (POST/GET /api/v1/license)
 // ============================================================================
 
-TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-test");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -653,16 +671,17 @@ TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license]") 
 
     auto active = store.get_active_license();
     REQUIRE(active.has_value());
-    CHECK(active->organization == "Acme Corp");
-    CHECK(active->seat_count == 100);
-    CHECK(active->edition == "enterprise");
+    REQUIRE(active->has_value());
+    CHECK((*active)->organization == "Acme Corp");
+    CHECK((*active)->seat_count == 100);
+    CHECK((*active)->edition == "enterprise");
 }
 
 TEST_CASE("T2 REST: license validate with agent count generates alerts on exceeded",
-          "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-validate");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+          "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -676,12 +695,14 @@ TEST_CASE("T2 REST: license validate with agent count generates alerts on exceed
     REQUIRE(result.has_value());
 
     // Validate with more agents than seats
-    store.validate(10);
+    auto validated = store.validate(10);
+    REQUIRE(validated.has_value());
 
     auto alerts = store.list_alerts();
+    REQUIRE(alerts.has_value());
     // Should have generated at least one alert about exceeded seats
     bool found_exceeded = false;
-    for (auto& a : alerts) {
+    for (auto& a : *alerts) {
         if (a.alert_type == "exceeded" || a.alert_type == "seat_limit_warning") {
             found_exceeded = true;
         }
@@ -689,10 +710,10 @@ TEST_CASE("T2 REST: license validate with agent count generates alerts on exceed
     CHECK(found_exceeded);
 }
 
-TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-features");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -702,17 +723,23 @@ TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license]") {
     lic.features_json = R"(["sso","advanced_policies","webhook_delivery"])";
     lic.status = "active";
 
-    store.activate_license(lic, "LICENSE-FEAT-001");
+    REQUIRE(store.activate_license(lic, "LICENSE-FEAT-001").has_value());
 
-    CHECK(store.has_feature("sso") == true);
-    CHECK(store.has_feature("advanced_policies") == true);
-    CHECK(store.has_feature("nonexistent_feature") == false);
+    auto sso = store.has_feature("sso");
+    REQUIRE(sso.has_value());
+    CHECK(*sso == true);
+    auto adv = store.has_feature("advanced_policies");
+    REQUIRE(adv.has_value());
+    CHECK(*adv == true);
+    auto none = store.has_feature("nonexistent_feature");
+    REQUIRE(none.has_value());
+    CHECK(*none == false);
 }
 
-TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-ack");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -722,28 +749,30 @@ TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license]") {
     lic.features_json = "[]";
     lic.status = "active";
 
-    store.activate_license(lic, "LICENSE-ALERT-001");
-    store.validate(100); // trigger alerts
+    REQUIRE(store.activate_license(lic, "LICENSE-ALERT-001").has_value());
+    REQUIRE(store.validate(100).has_value()); // trigger alerts
 
     auto alerts = store.list_alerts();
-    if (!alerts.empty()) {
-        auto ack_result = store.acknowledge_alert(alerts[0].id);
-        CHECK(ack_result == true);
+    REQUIRE(alerts.has_value());
+    if (!alerts->empty()) {
+        auto ack_result = store.acknowledge_alert((*alerts)[0].id);
+        CHECK(ack_result.has_value());
 
         auto unacked = store.list_alerts(true);
+        REQUIRE(unacked.has_value());
         bool found_acked = false;
-        for (auto& a : unacked) {
-            if (a.id == alerts[0].id)
+        for (auto& a : *unacked) {
+            if (a.id == (*alerts)[0].id)
                 found_acked = true;
         }
         CHECK(found_acked == false);
     }
 }
 
-TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-remove");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license remove", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -757,10 +786,11 @@ TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
     REQUIRE(result.has_value());
 
     auto removed = store.remove_license(*result);
-    CHECK(removed == true);
+    CHECK(removed.has_value());
 
     auto active = store.get_active_license();
-    CHECK(!active.has_value());
+    REQUIRE(active.has_value());
+    CHECK(!active->has_value());
 }
 
 // ============================================================================
@@ -768,10 +798,9 @@ TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
 // ============================================================================
 
 TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
-          "[rest_api_t2][cross_store]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][cross_store]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create two executions concurrently
     auto e1 = make_execution("def-cross-1");
@@ -822,15 +851,15 @@ TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
 }
 
 TEST_CASE("T2 REST: device tokens and software deployment independent stores",
-          "[rest_api_t2][cross_store]") {
-    auto token_path = unique_temp_path("cross-token");
-    auto deploy_path = unique_temp_path("cross-deploy");
-    TempFileGuard tg1(token_path);
-    TempFileGuard tg2(deploy_path);
-
-    DeviceTokenStore token_store(token_path);
-    SoftwareDeploymentStore deploy_store(deploy_path);
+          "[rest_api_t2][cross_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(token_db, t2_device_token_tpl);
+    yuzu::server::pg::PgPool token_pool{{.conninfo = token_db.dsn(), .size = 4}};
+    DeviceTokenStore token_store(token_pool);
     REQUIRE(token_store.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore deploy_store(pool);
     REQUIRE(deploy_store.is_open());
 
     // Create a device token
@@ -861,19 +890,19 @@ TEST_CASE("T2 REST: device tokens and software deployment independent stores",
     auto validated = token_store.validate_token(*token, "device-001");
     CHECK(validated.has_value());
     auto deployment = deploy_store.get_deployment(*dep_id);
-    CHECK(deployment.has_value());
+    REQUIRE(deployment.has_value());
+    CHECK(deployment->has_value());
 }
 
 TEST_CASE("T2 REST: license store and execution tracker independent operation",
-          "[rest_api_t2][cross_store]") {
-    auto license_path = unique_temp_path("cross-license");
-    TempFileGuard lg(license_path);
-    LicenseStore license_store(license_path);
+          "[rest_api_t2][cross_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore license_store{pool};
     REQUIRE(license_store.is_open());
 
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Activate a license
     License lic;
@@ -891,8 +920,12 @@ TEST_CASE("T2 REST: license store and execution tracker independent operation",
     REQUIRE(exec_id.has_value());
 
     // Both stores maintain their data independently
-    CHECK(license_store.has_feature("unlimited_executions") == true);
-    CHECK(license_store.seat_count() == 50);
+    auto feat = license_store.has_feature("unlimited_executions");
+    REQUIRE(feat.has_value());
+    CHECK(*feat == true);
+    auto seats = license_store.seat_count();
+    REQUIRE(seats.has_value());
+    CHECK(*seats == 50);
 
     auto fetched = tracker.get_execution(*exec_id);
     CHECK(fetched.has_value());

@@ -1,0 +1,18 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 082db96f6e05
+== action=battery
+battery|0|unknown|-1|-1|-1|-1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=thermal
+thermal|unavailable|sys_class_thermal_not_readable
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=power_plan
+power_plan|-|-|0|planned_not_implemented
+[result_status] UNAVAILABLE / PARTIAL / power_plan is PLANNED (platform_profile) — not implemented in this package
+
+== action=set_power_plan
+set_power_plan|error|planned_not_implemented|-|-
+[result_status] UNAVAILABLE / PARTIAL / power_plan mutation is PLANNED on Linux, not implemented; no mutation attempted
+[rc] 1
+

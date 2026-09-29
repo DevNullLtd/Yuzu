@@ -1,0 +1,63 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a8a6121c1219
+== action=query wql="SELECT Caption FROM Win32_OperatingSystem"
+row0|Caption|Microsoft Windows 11 Pro
+rows|1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_instance class=Win32_OperatingSystem
+property|BootDevice|\Device\HarddiskVolume1
+property|BuildNumber|26200
+property|BuildType|Multiprocessor Free
+property|CSCreationClassName|Win32_ComputerSystem
+property|CSName|DESKTOP-04DNSIG
+property|Caption|Microsoft Windows 11 Pro
+property|CodeSet|1252
+property|CountryCode|44
+property|CreationClassName|Win32_OperatingSystem
+property|CurrentTimeZone|60
+property|DataExecutionPrevention_32BitApplications|true
+property|DataExecutionPrevention_Available|true
+property|DataExecutionPrevention_Drivers|true
+property|DataExecutionPrevention_SupportPolicy|2
+property|Debug|false
+property|Distributed|false
+property|EncryptionLevel|256
+property|ForegroundApplicationBoost|2
+property|FreePhysicalMemory|11236684
+property|FreeSpaceInPagingFiles|5688920
+property|FreeVirtualMemory|16229492
+property|InstallDate|20260218171326.000000+000
+property|LastBootUpTime|20260906155541.500643+060
+property|LocalDateTime|20260907110904.636000+060
+property|Locale|0809
+property|Manufacturer|Microsoft Corporation
+property|MaxNumberOfProcesses|-1
+property|MaxProcessMemorySize|137438953344
+property|Name|Microsoft Windows 11 Pro|C:\WINDOWS|\Device\Harddisk0\Partition4
+property|NumberOfLicensedUsers|0
+property|NumberOfProcesses|186
+property|NumberOfUsers|2
+property|OSArchitecture|64-bit
+property|OSLanguage|1033
+property|OSProductSuite|256
+property|OSType|18
+property|OperatingSystemSKU|48
+property|PortableOperatingSystem|false
+property|Primary|true
+property|ProductType|1
+property|RegisteredUser|Alex
+property|SerialNumber|00330-80000-00000-AA096
+property|ServicePackMajorVersion|0
+property|ServicePackMinorVersion|0
+property|SizeStoredInPagingFiles|5767168
+property|Status|OK
+property|SuiteMask|272
+property|SystemDevice|\Device\HarddiskVolume4
+property|SystemDirectory|C:\WINDOWS\system32
+property|SystemDrive|C:
+property|TotalVirtualMemorySize|22456076
+property|TotalVisibleMemorySize|16688908
+property|Version|10.0.26200
+property|WindowsDirectory|C:\WINDOWS
+[result_status] UNDECLARED / UNKNOWN / 
+

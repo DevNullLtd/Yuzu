@@ -176,6 +176,22 @@ message CommandRequest {
   // carry it. Half A, Guardian gateway fix. See docs/guardian-mvp-contract.md
   // G2/G12.
   bytes payload = 8;
+
+  // Dispatch classification tag: v1|<class>|<mutability>|<plan_hash_hex>,
+  // with class in {ro, mut, dest} and mutability in {none, rev, irrev}. One
+  // opaque string, not three fields, so a future dispatch class costs no
+  // proto churn — frozen grammar, owned by
+  // server/core/src/command_capability_parsers.hpp
+  // (encode_dispatch_tag/decode_dispatch_tag). Mirrors the canonical
+  // proto/yuzu/agent/v1/agent.proto field 9. gpb DROPS any wire field
+  // absent from this proto, so both gateway copies (priv/proto/agent.proto
+  // and priv/proto/yuzu/agent/v1/agent.proto) must carry it, and the
+  // gateway must forward it untouched on the CommandRequest path (see
+  // yuzu_gw_proto:encode_command_request/1) or the server-side dispatch
+  // chokepoint sees an empty tag. CC-03: this gateway advertises
+  // "command_dispatch_tag_v1" in StreamStatusNotification.wire_capabilities
+  // (gateway.proto) as proof this field survives the hop.
+  string dispatch_tag = 9;
 }
 
 message CommandResponse {
@@ -211,6 +227,23 @@ message CommandResponse {
   string plugin  = 7;
   string action  = 8;
   bytes  payload = 9;
+
+  // CC-07 plugin→host typed result-status seam (ABI4, sdk/include/yuzu/plugin.h).
+  // Mirrors the canonical proto/yuzu/agent/v1/agent.proto field 10 (PR1.1) so
+  // gpb does not silently drop it in transit — both gateway copies (this
+  // file and priv/proto/yuzu/agent/v1/agent.proto) must carry it, and the
+  // gateway re-marshals this CommandResponse through gateway_pb when wrapping
+  // it, so gateway_pb's CommandResponse (via import) needs it too. This is the
+  // plugin→host CC-07 status ONLY — not the subprocess-runner
+  // termination-reason enum, which is a separate, out-of-scope concept.
+  enum PluginResultStatus {
+    PLUGIN_RESULT_UNDECLARED        = 0;
+    PLUGIN_RESULT_OK                = 1;
+    PLUGIN_RESULT_UNAVAILABLE       = 2;
+    PLUGIN_RESULT_PERMISSION_DENIED = 3;
+    PLUGIN_RESULT_CONSTRAINED       = 4;
+  }
+  PluginResultStatus plugin_result_status = 10;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
@@ -251,6 +284,17 @@ message CheckForUpdateResponse {
   bool   mandatory        = 4;  // If true, agent must update immediately
   bool   eligible         = 5;  // Rollout eligibility for this agent
   int64  file_size        = 6;  // Binary size in bytes
+
+  // Detached PEM CMS signature over the binary (#416/#3807). Vendored copy kept
+  // in step with proto/yuzu/agent/v1/agent.proto.
+  //
+  // The gateway does NOT proxy the OTA RPCs today — yuzu_gw_agent_service.erl
+  // exports register/subscribe/heartbeat/execute_command/report_inventory and
+  // nothing else, so a gateway-fronted agent cannot complete an OTA pull at all.
+  // The mirrors are kept in step anyway because gpb silently drops any field
+  // absent from a module's vendored proto: if the OTA RPCs are ever proxied, a
+  // stale copy would strip signatures in transit rather than fail loudly.
+  bytes  update_signature = 7;
 }
 
 message DownloadUpdateRequest {

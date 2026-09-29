@@ -69,6 +69,45 @@ message StreamStatusNotification {
   string peer_addr = 4;
   // Gateway node handling this agent.
   string gateway_node = 5;
+
+  // CC-03 wire-capability handshake: literals this gateway build supports on
+  // the wire, sent with every CONNECTED notification (the first message the
+  // gateway emits upstream when an agent's Subscribe stream establishes —
+  // see yuzu_gw_agent:init/1 -> yuzu_gw_upstream:notify_stream_status/5 in
+  // gateway/apps/yuzu_gw/src/). The dispatch chokepoint checks for the
+  // literal "command_dispatch_tag_v1": its presence means this gateway's
+  // vendored agent.proto carries CommandRequest.dispatch_tag = 9 (see
+  // proto/yuzu/agent/v1/agent.proto) and forwards it untouched, so the
+  // server may safely route dispatch-tagged commands to agents behind this
+  // gateway. Absence — an old gateway build, agent proto drift, or this
+  // field missing from a gateway mirror (gateway/priv/proto/gateway.proto,
+  // gateway/priv/proto/yuzu/gateway/v1/gateway.proto) — means the server
+  // must refuse to route tagged CommandRequests through this gateway.
+  repeated string wire_capabilities = 6;
+
+  // Gateway cluster this agent is connected through (trust zone / region).
+  // The gateway is the only party that knows this; the server records it in
+  // the agent→cluster routing directory (HA WS-4). Empty from a gateway
+  // build predating WS-4.
+  string cluster_id = 7;
+
+  // Opaque random id minted ONCE per gateway-side connection process
+  // instance (yuzu_gw_agent, one per agent Subscribe stream) — NOT a
+  // counter. Must be collision-safe across gateway nodes and across a
+  // rolling-upgrade mixed-version cluster, so it is generated from a CSPRNG
+  // (crypto:strong_rand_bytes/1), never a per-BEAM-node monotonic integer.
+  // The SAME value is stamped on both the CONNECTED and the DISCONNECTED
+  // notification a given process instance ever sends. The server uses it
+  // to fence a stale DISCONNECTED — one belonging to an already-torn-down
+  // placement — from tearing down a NEWER re-home under the same reused
+  // session id (HA WS-4, issue #4324). Absent/empty from an older gateway
+  // build means no fence is available (legacy behavior); this field is
+  // additive and optional-safe. This canonical file is mirrored verbatim into
+  // gateway/priv/proto/gateway.proto and gateway/priv/proto/yuzu/gateway/v1/
+  // gateway.proto — both gateway copies must carry this field identically or
+  // gpb drops it on one build path (docs/erlang-gateway-build.md's
+  // check-proto-codegen.sh section).
+  string stream_home_id = 8;
 }
 
 message StreamStatusAck {

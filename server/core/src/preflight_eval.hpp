@@ -51,6 +51,14 @@ std::vector<PreflightCheckResponses>
 collect_check_responses(ResponseStore& store, const std::string& run_id,
                         const std::vector<std::pair<std::string, std::string>>& applicable);
 
+/// True iff any check's read degraded (#2691 finding 10). Every caller that
+/// would build a grid from `checks` and persist it (the runner tick, the live
+/// result poll) MUST check this FIRST and skip persisting/completing when
+/// true — retry next tick/poll instead. `compute_device_results` itself stays
+/// unaware of degrade (it is the pure verdict layer); this is the gate in
+/// front of it.
+bool any_check_degraded(const std::vector<PreflightCheckResponses>& checks);
+
 /// (De)serialize a device's checks for run_device.checks_json. Agent-derived
 /// values → dump uses the replace error-handler (never throws on odd bytes).
 std::string checks_to_json(const std::vector<PreflightDeviceCheck>& checks);

@@ -1,0 +1,393 @@
+{
+  "actions": [
+    {
+      "action": "client_version",
+      "definition_ids": [
+        "security.sccm.client_version"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "registry+scm",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "site",
+      "definition_ids": [
+        "security.sccm.site"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "registry+com_dispatch",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows samples show the absent-client path only.** No host reachable for this capture (dev machine or the-rig) has a real SCCM client installed, so `not_found`/`not_configured`/`unknown` are the only Windows values ever observed; `test_sccm_win_actions.cpp` pins exactly these values for the same reason. The plugin's own source comment above `call_sms_client_method` (`sccm_plugin.cpp:238`) records the live-client COM success path as an unverified code path.",
+    "**Do not reintroduce the shell-outs.** `client_version` and `site` previously ran `sc query ccmexec` and two PowerShell `Microsoft.SMS.Client` ComObject calls; all three were retired for native Win32/COM calls in Wave 3 PR33d (`docs/agent-spawn-sink-manifest.md:326`), and zero spawn sites remain.",
+    "**The Authority-subkey fallback was previously dead code.** Before this migration, `site`'s management-point fallback matched a literal, never-substituted `\"SMS:{}\"` string and so never found a subkey; it now genuinely enumerates `HKLM\\SOFTWARE\\Microsoft\\CCM\\Authority` and prefers the subkey matching the resolved site code (`sccm_parsers.hpp:40`).",
+    "**No result status is set on any leg.** All three samples show `UNDECLARED / UNKNOWN /`; a caller cannot distinguish \"clean absent-client read\" from \"read failed\" via `plugin_result_status` today — only the per-field sentinel values (`not_found`, `unavailable`, `not_configured`) carry that signal.",
+    "**`classify_service_status` is a maintained mirror, not shared code.** It stays inside the plugin's `#ifdef _WIN32` block (Windows-typed `DWORD`/`SERVICE_*`) and is duplicated with plain types in `test_sccm_parsers.cpp`; a change to one must be mirrored in the other by hand (`sccm_plugin.cpp:85-95`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Check whether the SCCM/ConfigMgr client is installed, report its version from the registry, and check the CcmExec service status. Returns installed flag, version string, and service state. Useful for compliance verification that endpoints have the configuration management agent deployed.",
+      "display_name": "SCCM Client Version",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "security.sccm.client_version",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve the SCCM site assignment details including the assigned site code and current management point. Reads from the registry first, falling back to the COM object via PowerShell if registry values are not present.",
+      "display_name": "SCCM Site Assignment",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "security.sccm.site",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Reports SCCM/ConfigMgr client status, version, and site assignment",
+  "how_it_works": "`client_version` checks `HKLM\\SOFTWARE\\Microsoft\\SMS\\Mobile Client\\ProductVersion` for the installed SCCM client version, then queries the `ccmexec` service through the SCM (`OpenSCManagerW` → `OpenServiceW` → `QueryServiceStatusEx`) for its run state. `site` reads the assigned site code from the registry (`SMS\\Mobile Client\\AssignedSiteCode`, falling back to `CCM\\AssignedSiteCode`), then the management point (`CCM\\Authority`, falling back to enumerating `CCM\\Authority\\SMS:<code>` subkeys). If either registry path comes up empty, `site` lazily initializes a COM apartment and calls the late-bound `Microsoft.SMS.Client` IDispatch object (`GetAssignedSite` / `GetCurrentManagementPoint`) as a fallback. Both actions are pure reads: neither installs, repairs, nor reconfigures the SCCM client.\n\nThe plugin is Windows-only by design — SCCM/ConfigMgr has no macOS or Linux client — and deliberately returns an honest sentinel rather than an empty or fabricated result on those platforms.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "820bfb5e0176",
+  "manifest_version": 1,
+  "name": "sccm",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Whether the registry reports a ProductVersion for the SCCM client (Windows only; always false off-Windows). Values: true, false.",
+          "example": "false",
+          "name": "installed",
+          "platforms": [
+            "windows"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The installed SCCM client version from HKLM\\SOFTWARE\\Microsoft\\SMS\\Mobile Client\\ProductVersion, or \"-\" if not present. Values: free text or \"-\".",
+          "example": "-",
+          "name": "version",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The ccmexec Windows service state from a live SCM query (OpenSCManagerW/OpenServiceW/QueryServiceStatusEx). Values: running, stopped, exists, not_found, unavailable.",
+          "example": "not_found",
+          "name": "service_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.sccm.client_version"
+    },
+    {
+      "columns": [
+        {
+          "description": "The assigned SCCM site code, from the registry, the enumerated CCM\\Authority subkey, or the Microsoft.SMS.Client COM fallback; \"not_configured\" if none resolve. Values: free text or not_configured.",
+          "example": "not_configured",
+          "name": "site_code",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The current SCCM management point hostname, from the registry, the enumerated CCM\\Authority subkey, or the Microsoft.SMS.Client COM fallback; \"unknown\" if none resolve. Values: free text or unknown.",
+          "example": "unknown",
+          "name": "management_point",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.sccm.site"
+    }
+  ],
+  "outputs_note": "Pipe-delimited `key|value` rows, one per fact, written via `write_output()`. On Windows a missing value is reported through an explicit sentinel word (`false`, `-`, `not_found`, `not_configured`, `unknown`) chosen per field, never a blank or omitted row. On macOS and Linux each action emits one or two sentinel rows instead of the normal key/value set, naming the reason the platform has no client.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "unsupported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None.** Registry reads use `KEY_READ`; the SCM query uses `SC_MANAGER_CONNECT` / `SERVICE_QUERY_STATUS`; the COM call opens no elevated interface.",
+      "if_refused": "`client_version.version` reports `-`/`installed|false`; `service_status` reports `unavailable`; `site.site_code` reports `not_configured`",
+      "measured": "2026-09-07, bare-metal, SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "n/a — action returns the honest-unsupported sentinel unconditionally",
+      "if_refused": "n/a — no read is attempted",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "agent daemon, unprivileged"
+    },
+    {
+      "grant": "n/a — action returns the honest-unsupported sentinel unconditionally",
+      "if_refused": "n/a — no read is attempted",
+      "measured": "2026-09-06, container, euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon, unprivileged"
+    }
+  ],
+  "readme": "agents/plugins/sccm/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "client_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "installed|false",
+            "error|platform not supported"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "site",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|platform not supported"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "820bfb5e0176",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "client_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "site",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "820bfb5e0176",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "client_version",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "installed|false",
+            "version|-",
+            "service_status|not_found"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "site",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "site_code|not_configured",
+            "management_point|unknown"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "820bfb5e0176",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "client_version",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "site",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/sccm.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/sccm/src/sccm_parsers.hpp",
+      "agents/plugins/sccm/src/sccm_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_sccm_parsers.cpp",
+      "tests/unit/test_sccm_win_actions.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), rendered via `result_parsing.hpp`'s key-value schema (`Agent · Key · Value`) and queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; each definition's `gather.ttlSeconds: 60` only caps how often a repeat dispatch is served from cache, it does not trigger one.",
+    "**Sensitivity.** `client_version`'s `version` names the installed SCCM client software version; `site`'s `site_code`/`management_point` identify the device's organizational deployment grouping — no serial number, MAC, hostname, or username appears in any field.",
+    "**Siblings:** `msi_packages` (general software inventory), `agent_actions.info` (agent build/identity), `windows_updates` (patch state) — none join with `sccm`'s output.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.sccm.client_version\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

@@ -4,7 +4,8 @@
 # (build-linux/server/core/yuzu-server) into the UAT compose stack
 # without spinning the full image build (~25 min). Mirrors stage 3 of
 # Dockerfile.server. Build context must be the repo root so the local
-# build-linux/ tree is reachable:
+# build-linux/ tree is reachable (.dockerignore excludes every build-*/ tree
+# and re-admits exactly this one binary — keep the two in step):
 #
 #   docker build -t yuzu-server:fresh \
 #     -f deploy/docker/Dockerfile.server-local .

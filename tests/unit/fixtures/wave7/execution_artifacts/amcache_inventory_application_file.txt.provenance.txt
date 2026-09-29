@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg load HKLM\YuzuAmcacheProbe <amcache copy>; reg query HKLM\YuzuAmcacheProbe\Root\InventoryApplicationFile\<subkey> for 5 real subkeys (selected for having the full 18-value set); reg unload HKLM\YuzuAmcacheProbe
+date: 2026-09-06
+status: REAL CAPTURE
+note: 8889 total InventoryApplicationFile subkeys in the hive; 5 shown with all values (ProgramId, FileId, LowerCaseLongPath, Name, OriginalFileName, Publisher, Version, BinFileVersion, ProductName, ProductVersion, BinProductVersion, AppxPackageFullName, AppxPackageRelativeId, BinaryType, LinkDate, Size, Language, Usn).

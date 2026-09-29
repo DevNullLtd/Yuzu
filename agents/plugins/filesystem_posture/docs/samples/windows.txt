@@ -1,0 +1,24 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6094b93f5b9d
+== action=mounts
+mount|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|NTFS|-|524283904|509657088|509657088|rw
+mount|C:/|//?/Volume{c9a5f911-4689-41b2-b774-5b0e25b60e10}/|NTFS|-|248158089216|20788932608|20788932608|rw
+mount|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|NTFS|-|967831552|63561728|63561728|rw
+mount|D:/|//?/Volume{785383ef-b682-41d9-9b28-27c4b8882d65}/|NTFS|-|1000187359232|66670665728|66670665728|rw
+mount|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|FAT32|-|268435456|231624704|231624704|rw
+[result_status] CONSTRAINED / PARTIAL / windows:volume_enum
+
+== action=quotas
+quota|//?/Volume{0a35801e-3f40-4114-a073-3d7ea1dd7664}/|volume|unavailable|-|-|volume has no drive letter
+quota|C:/|volume|not_enabled|-|-|-
+quota|//?/Volume{daa59534-884a-4ce4-8fc8-4244f7bbe7ae}/|volume|unavailable|-|-|volume has no drive letter
+quota|D:/|volume|not_enabled|-|-|-
+quota|//?/Volume{b188886e-39bb-4915-a893-d61a3ca3c707}/|volume|unsupported_fs|-|-|-
+[result_status] CONSTRAINED / PARTIAL / windows:dskquota
+
+== action=snapshots
+snapshot|C:/|{9F2F924B-2DD2-46D5-A779-709B2F6FFB9B}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy1
+snapshot|C:/|{E6484C8F-1467-4FC8-8577-85677F599D41}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy2
+snapshot|C:/|{671203BF-A8FA-4ED5-9360-4CBB9B65272E}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy3
+snapshot|C:/|{21E68FE4-CB60-454D-A893-9420AD8EE750}|vss|//?/GLOBALROOT/Device/HarddiskVolumeShadowCopy4
+[result_status] UNDECLARED / UNKNOWN / 
+

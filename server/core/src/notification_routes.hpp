@@ -12,6 +12,8 @@
 
 namespace yuzu::server {
 
+class HttpRouteSink; // server/core/src/http_route_sink.hpp
+
 /// Notification REST endpoints extracted from server.cpp (Phase 4 decomposition).
 class NotificationRoutes {
 public:
@@ -25,6 +27,11 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         NotificationStore* notification_store);
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          NotificationStore* notification_store);
 };
 

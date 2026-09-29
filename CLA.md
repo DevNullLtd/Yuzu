@@ -152,3 +152,4 @@ You can sign this CLA in either of these ways:
 - Nathan Dornbrook, @Tr3kkR, 2026-04-22 (Project Steward)
 <!-- New signatories append below this line, one per PR. -->
 - Alex Young, @Doomgoose, 2026-06-10
+- Liam Somerville, @liamsomerville, 2026-09-15

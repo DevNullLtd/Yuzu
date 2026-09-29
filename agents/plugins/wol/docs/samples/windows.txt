@@ -1,0 +1,11 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash dcc02549b1eb
+== action=wake
+wake|error|Missing required parameter: mac
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=check host=127.0.0.1
+check|127.0.0.1|reachable|3
+mechanism|icmp
+[result_status] UNDECLARED / UNKNOWN / 
+

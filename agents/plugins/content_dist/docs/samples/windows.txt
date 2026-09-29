@@ -1,0 +1,23 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 590399d7174c
+== action=stage
+error|missing required parameters: url, filename, sha256
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=execute_staged
+error|missing required parameter: filename
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=list_staged
+count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=cleanup
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=upload_file
+error|missing required parameters: path, grant_id, grant_secret
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

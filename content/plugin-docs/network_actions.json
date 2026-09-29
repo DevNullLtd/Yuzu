@@ -1,0 +1,413 @@
+{
+  "actions": [
+    {
+      "action": "flush_dns",
+      "definition_ids": [
+        "device.network_actions.flush_dns"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present",
+          "mechanism": "resolvectl/systemd-resolve via bounded argv runner (sudo -n)",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "dscacheutil + killall via bounded argv runner (sudo -n)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "ipconfig via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "ping",
+      "definition_ids": [
+        "device.network_actions.ping"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "system ping via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system ping via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "system ping.exe via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`flush_dns` was never exercised live for these captures.** It is a `Mutating`/`Reversible` action, so the capture driver deliberately did not run it on any of the three hosts; every sample shows `[not captured] Mutating/Reversible: not executed on a live host` in its place.",
+    "**The Linux `ping` sample failed to spawn.** The capture container hit `subprocess_runner:spawn_error` (`[rc] 1`) rather than producing a working ping leg — this reflects the capture environment (no reachable `ping` binary or a blocked spawn), not a declared code defect; Linux `ping` is declared `supported` in the descriptor.",
+    "**The privilege-model doc names a different Windows mechanism than the code runs.** `docs/agent-privilege-model.md`'s `network_actions.flush_dns` row says Windows \"uses `Clear-DnsClientCache` cmdlet\"; the current implementation runs `ipconfig /flushdns` via the bounded argv runner. The code is authoritative; the doc row is stale.",
+    "**`ping` deliberately uses the system ping tool, not the shared `IcmpSession`.** System ping is typically setuid/cap-blessed and unconstrained by `net.ipv4.ping_group_range`; this is a confirmed design decision, not something to \"fix\" toward the shared mechanism.",
+    "**Linux `flush_dns`'s retry is on ANY failure, not just absence.** A `resolvectl` that is present but fails at runtime (service masked, dbus unreachable) still falls through to `systemd-resolve`, restoring the old `|| true` shell chain's retry semantics; this is pinned by `test_network_actions_parsers.cpp` and should not be narrowed back to a presence-only probe."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Flushes the local DNS resolver cache on the endpoint. On Windows runs ipconfig /flushdns. On Linux attempts resolvectl flush-caches then falls back to systemd-resolve --flush-caches on any failure of the first attempt (absent, or found but failing at runtime). On macOS runs both dscacheutil -flushcache and killall -HUP mDNSResponder — the SIGHUP is the step that actually resets the resolver, so a flush without it is incomplete. On every platform the status indicator reflects the real exit code(s) of the underlying command(s) — ok only if all of them succeed — never a blind success. This is a mutating action that clears cached DNS records, forcing fresh resolution on subsequent lookups.",
+      "display_name": "Flush DNS Cache",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 0
+      },
+      "id": "device.network_actions.flush_dns",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Pings a specified host from the endpoint and streams back the per-line output. Validates the host parameter to prevent command injection (alphanumeric, dots, hyphens, and colons only). The count parameter controls the number of ICMP echo requests. On Windows uses ping -n, on Linux/macOS uses ping -c. Returns the raw ping output line by line for diagnostics.",
+      "display_name": "Ping Host",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 0
+      },
+      "id": "device.network_actions.ping",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Network actions — DNS flush and ping",
+  "how_it_works": "`flush_dns` clears the OS DNS resolver cache: Windows runs `ipconfig /flushdns`; Linux tries `resolvectl flush-caches` and falls back to `systemd-resolve --flush-caches` on ANY failure of the first attempt (absent, or found but failing at runtime), both wrapped in `sudo -n`; macOS runs `dscacheutil -flushcache` then `killall -HUP mDNSResponder` under `sudo -n`, because the SIGHUP is the step that actually resets the resolver — a flush without it is incomplete. Every leg reports the real exit code(s) of the command(s) it ran, never a blind `status|ok`. `ping` validates the operator-supplied `host` against a tight charset and validates `count` as digits-only before running the platform's system `ping`/`ping.exe` tool and forwarding its raw output line by line; it deliberately uses the system tool rather than the shared `IcmpSession`, because system ping is typically setuid/cap-blessed and unconstrained by `net.ipv4.ping_group_range`. Both actions run through the bounded argv runner under a fixed 10-second deadline and report a runner failure (spawn error, deadline, cancellation, signal, or line-limit truncation) honestly via `forward_runner_failure`, never as a silent success. Neither action touches persistent agent state — `init()` is a no-op.",
+  "inputs": [
+    {
+      "constraints": {
+        "maxLength": 253,
+        "minLength": 1,
+        "pattern": "^[a-zA-Z0-9.:\\-]+$"
+      },
+      "default": null,
+      "definition_id": "device.network_actions.ping",
+      "description": "Hostname or IP address to ping. Must contain only alphanumeric characters, dots, hyphens, and colons. Maximum length 253 characters.\n",
+      "name": "host",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "pattern": "^[0-9]+$"
+      },
+      "default": "4",
+      "definition_id": "device.network_actions.ping",
+      "description": "Number of ICMP echo requests to send. Must be a positive integer. Defaults to 4 if not specified.\n",
+      "name": "count",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "a44c8631e3c1",
+  "manifest_version": 1,
+  "name": "network_actions",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Whether the flush succeeded (\"ok\") or failed (\"error\"); reflects the real exit code(s) of the underlying command(s), never a blind success. Values: ok, error.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Captured stdout+stderr of the underlying flush command(s), merged. On macOS this is a fixed \"dscacheutil rc={} mDNSResponder rc={}\" summary; on Windows and Linux it is the raw captured command output. Values: free text.",
+          "example": "dscacheutil rc={} mDNSResponder rc={}",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.network_actions.flush_dns"
+    },
+    {
+      "columns": [
+        {
+          "description": "One raw line of the system ping tool's stdout, emitted per line of output. Not present when host/count validation fails — that path emits a single \"error|<message>\" line instead, outside this schema. Values: free text (raw ping-tool output).",
+          "example": "PING 127.0.0.1 (127.0.0.1): 56 data bytes",
+          "name": "output",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.network_actions.ping"
+    }
+  ],
+  "outputs_note": "Each output is one `write_output()` call, one field per line as `<field>|<value>` — not a single multi-field pipe row per record. `flush_dns` emits a `status|ok`/`status|error` line and an `output|<captured text>` line, and on a failed macOS run adds a `detail|dscacheutil: ...` and/or `detail|mDNSResponder: ...` line carrying the raw command output for diagnosis. `ping` emits one `output|<line>` row per line of the system ping tool's stdout; a validation failure (missing/invalid `host`, non-numeric `count`) short-circuits before any subprocess runs and instead emits a single `error|<message>` line that is outside the declared result schema.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**None.** `ipconfig.exe` and `PING.EXE` are probed at their fixed `System32` paths and run unprivileged; no elevated cmdlet is used.",
+      "if_refused": "a spawn/deadline/signal failure reports `CONSTRAINED`/`UNAVAILABLE` via `forward_runner_failure`; a nonzero exit reports `status|error`",
+      "measured": "2026-09-07, bare-metal Windows 10.0.26200, SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "**`sudo -n` NOPASSWD grants** for `/usr/bin/dscacheutil -flushcache` and `/usr/bin/killall -HUP mDNSResponder`, installed by `install-agent-user.sh`; skipped only when the agent is already root.",
+      "if_refused": "a missing/refused sudo grant reports `status|error` plus a `detail|dscacheutil: ...` / `detail|mDNSResponder: ...` line carrying the captured command output",
+      "measured": "2026-09-07, bare-metal macOS 26.6.2, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "agent daemon (measured unprivileged)"
+    },
+    {
+      "grant": "**`sudo -n` NOPASSWD grants** for `/usr/bin/systemd-resolve --flush-caches` and `/usr/bin/resolvectl flush-caches`, installed by `install-agent-user.sh`; skipped only when the agent is already root.",
+      "if_refused": "neither tool found, or both found and fail: `status|error`, `output|neither resolvectl nor systemd-resolve found`",
+      "measured": "2026-09-06, container Debian GNU/Linux 13 (trixie), euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon"
+    }
+  ],
+  "readme": "agents/plugins/network_actions/README.md",
+  "result_status": [
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "`OK`",
+      "when": "subprocess exited normally (success or nonzero exit) — `execute()` owns exit-code semantics and never calls `set_result_status`; both `ping` samples show this as the agent's default `UNDECLARED / UNKNOWN`"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "the tool binary was not found or the runner failed to spawn it — the Linux `ping` sample hit this: `UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error`, `[rc] 1`"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled`",
+      "status": "`CONSTRAINED`",
+      "when": "the 10-second per-call deadline elapsed, the runner was cancelled, or the child was signaled"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:line_limit`",
+      "status": "`OK`",
+      "when": "the runner SIGKILLed a still-producing child once its output line cap was reached"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "flush_dns",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "host=127.0.0.1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "subprocess_runner:spawn_error",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "a44c8631e3c1",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "flush_dns",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "host=127.0.0.1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "output|PING 127.0.0.1 (127.0.0.1): 56 data bytes",
+            "output|64 bytes from 127.0.0.1: icmp_seq=0 ttl=64 time=0.063 ms",
+            "output|64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.146 ms",
+            "output|64 bytes from 127.0.0.1: icmp_seq=2 ttl=64 time=0.126 ms",
+            "output|64 bytes from 127.0.0.1: icmp_seq=3 ttl=64 time=0.137 ms"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "a44c8631e3c1",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "flush_dns",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "host=127.0.0.1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 9,
+          "rows": [
+            "output|Pinging 127.0.0.1 with 32 bytes of data:",
+            "output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128",
+            "output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128",
+            "output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128",
+            "output|Reply from 127.0.0.1: bytes=32 time<1ms TTL=128"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "a44c8631e3c1",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "flush_dns",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "ping",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/network_actions.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/network_actions/src/network_actions_parsers.hpp",
+      "agents/plugins/network_actions/src/network_actions_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_network_actions_parsers.cpp"
+    ]
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The dashboard renders `network_actions` as a generic key-value table (Agent/Key/Value), and a legacy static action-description registry names both actions for that rendering.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its two definitions.",
+    "**Sensitivity.** `ping`'s `output` rows echo the operator-supplied `host` back verbatim in the tool's own text (an IP or hostname the operator chose, not one discovered from the device); `flush_dns`'s `output`/`detail` rows carry only command exit codes and generic tool diagnostics. Neither action's rows name a person, an account, or installed software.",
+    "**Siblings:** `network.probe.icmp` (netprobe's read-only ICMP probe, an alternative mechanism to `ping`), `device.wol.check` (also performs ICMP as part of wake verification), `device.network_config.dns_cache` (the macOS DNS-honesty sibling that reports the resolver cache contents `flush_dns` clears).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.network_actions.ping\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

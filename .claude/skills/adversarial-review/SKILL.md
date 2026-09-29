@@ -72,7 +72,9 @@ State the resolved TARGET, ANCHORS, and REVIEW_DIR back to the operator before l
 
 ## Step 1 — Phase 1: independent review (parallel, then barrier)
 
-Launch **both reviewers concurrently**, in a single message with two tool calls:
+Launch **both reviewers concurrently**, in a single message with two tool calls. The standard pair is
+Claude + Codex; an orchestrating skill may substitute Kimi through the bundled adapter below as long
+as both reviewers receive the same prompt body, anchors, target, and phase barrier:
 
 - **Claude side** — `Agent` tool, `subagent_type: general-purpose` (it needs Bash/Read/Grep for
   empiricism). Prompt = `review-prompt.md` rendered with `SELF=claude`, `PEER=codex`, `PHASE=1`, and the
@@ -93,6 +95,28 @@ Launch **both reviewers concurrently**, in a single message with two tool calls:
 files. If Codex's phase file is missing after it exits, read `REVIEW_DIR/codex.phase1.summary.md` to see
 what happened (auth failure, sandbox-denied build, etc.) and surface it rather than proceeding with a
 one-sided review.
+
+### Kimi adapter and static-first mode
+
+`run-kimi-reviewer.sh` writes `kimi.phaseN.md` and `kimi.phaseN.summary.md` using the same prompt and
+schema. Its default is static and denies filesystem/search/write tools plus Bash. Trusted dynamic
+mode requires
+`--dynamic --i-trust-this-input`;
+`--sandboxed-dynamic` routes Bash through the no-network Docker boundary and fails closed to static
+when that boundary is unavailable. When Kimi replaces Claude, use `kimi.phase1.md`/`kimi.phase2.md`
+at the barriers and use a fresh Kimi invocation for each phase. Kimi 0.17 restricts writes to its
+workspace, so restricted modes require an excluded review directory inside the detached worktree;
+copy that evidence to external scratch before removing the worktree. Restricted Kimi receives a
+bounded materialized bundle (diff, relevant source context, anchors, prior reviews, and orchestrator
+evidence) in its prompt; all filesystem/search/write tools and direct Bash are denied. Sandboxed
+dynamic mode exposes only one fixed Docker collector through a fail-closed hook and returns its output
+in the denied tool result.
+
+An orchestrator may deliberately make Phase 1 a static safety gate before executing PR-controlled
+code. Pass Codex `--static-only --sandbox read-only`, leave Kimi static, record the static synthesis,
+and begin empirical work only after the trust gate. This explicit mode overrides the normal Phase-1
+empiricism requirement; Phase 2 must ingest the separately recorded dynamic evidence and disclose any
+remaining gap.
 
 ## Step 2 — Phase 2: cross-examination (parallel, then barrier)
 

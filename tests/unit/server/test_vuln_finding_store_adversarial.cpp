@@ -11,6 +11,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "software_inventory_store.hpp"
 #include "vuln_finding_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -21,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,10 +34,23 @@ using yuzu::server::FindingKey;
 using yuzu::server::FindingQuery;
 using yuzu::server::FindingRow;
 using yuzu::server::FindingUpsert;
+using yuzu::server::SoftwareInventoryStore;
 using yuzu::server::VulnFindingStore;
 using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_vuln_finding_store.cpp (identical setup — first build wins).
+yuzu::test::PgTestTemplate vuln_tpl{"vuln", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    SoftwareInventoryStore swinv{pool};
+    if (!swinv.is_open())
+        throw std::runtime_error("vuln template: SoftwareInventoryStore failed to migrate");
+    VulnFindingStore vuln{pool};
+    if (!vuln.is_open())
+        throw std::runtime_error("vuln template: VulnFindingStore failed to migrate");
+}};
 
 FindingUpsert mk_finding(const std::string& cve, const std::string& pkg,
                          const std::string& sev = "high", const std::string& status = "potential") {
@@ -81,7 +96,7 @@ std::optional<FindingRow> find_row(VulnFindingStore& s, const std::string& agent
 
 TEST_CASE("ADVERSARIAL: non-authoritative with non-empty findings leaves coverage untouched",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -126,7 +141,7 @@ TEST_CASE("ADVERSARIAL: non-authoritative with non-empty findings leaves coverag
 // treated as NON-authoritative — NO sweep, NO coverage clobber. Returns true.
 TEST_CASE("ADVERSARIAL: authoritative ZERO-total_packages pass over a prior-state agent is backstopped",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -167,7 +182,7 @@ TEST_CASE("ADVERSARIAL: authoritative ZERO-total_packages pass over a prior-stat
 // empty findings would strand these open forever = a false-positive.
 TEST_CASE("ADVERSARIAL: genuinely-patched agent (empty findings, total_packages>0) IS resolved",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -209,7 +224,7 @@ TEST_CASE("ADVERSARIAL: genuinely-patched agent (empty findings, total_packages>
 // requires prior open findings OR a prior non-zero package count).
 TEST_CASE("ADVERSARIAL: authoritative EMPTY pass over a prior-CLEAN agent still sweeps (backstop is narrow)",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -234,7 +249,7 @@ TEST_CASE("ADVERSARIAL: authoritative EMPTY pass over a prior-CLEAN agent still 
 
 TEST_CASE("ADVERSARIAL: concurrent same-agent authoritative passes with DIFFERING finding sets",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -285,7 +300,7 @@ TEST_CASE("ADVERSARIAL: concurrent same-agent authoritative passes with DIFFERIN
 
 TEST_CASE("ADVERSARIAL: different agents reconcile concurrently without cross-serialization stalls",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 8}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -316,7 +331,7 @@ TEST_CASE("ADVERSARIAL: different agents reconcile concurrently without cross-se
 
 TEST_CASE("ADVERSARIAL: a rolled-back reconcile releases the advisory lock (no deadlock after)",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -342,7 +357,7 @@ TEST_CASE("ADVERSARIAL: a rolled-back reconcile releases the advisory lock (no d
 
 TEST_CASE("ADVERSARIAL: rapid burst of reconciles yields strictly increasing run_ts",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -371,7 +386,7 @@ TEST_CASE("ADVERSARIAL: rapid burst of reconciles yields strictly increasing run
 
 TEST_CASE("ADVERSARIAL: finding inserted with future-skewed last_seen_ms is still swept later",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -420,7 +435,7 @@ TEST_CASE("ADVERSARIAL: finding inserted with future-skewed last_seen_ms is stil
 
 TEST_CASE("ADVERSARIAL: bad row in the MIDDLE of a 5-row batch rolls back ALL 5, not just the tail",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -441,7 +456,7 @@ TEST_CASE("ADVERSARIAL: bad row in the MIDDLE of a 5-row batch rolls back ALL 5,
 
 TEST_CASE("ADVERSARIAL: duplicate (cve_id, package_name) within one reconcile batch does not error",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -466,7 +481,7 @@ TEST_CASE("ADVERSARIAL: duplicate (cve_id, package_name) within one reconcile ba
 
 TEST_CASE("ADVERSARIAL: severity normalization — incidental whitespace is trimmed",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -520,7 +535,7 @@ TEST_CASE("ADVERSARIAL: severity normalization — incidental whitespace is trim
 
 TEST_CASE("ADVERSARIAL: get_agent_coverage returns Degraded (not NotFound) when the pool is exhausted",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     // Pool of size 1 so a single held lease starves every other acquire.
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());
@@ -560,7 +575,7 @@ TEST_CASE("ADVERSARIAL: get_agent_coverage returns Degraded (not NotFound) when 
 
 TEST_CASE("ADVERSARIAL: SQL metacharacters in agent_id/cve_id/package_name are safely parameterized",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -597,7 +612,7 @@ TEST_CASE("ADVERSARIAL: SQL metacharacters in agent_id/cve_id/package_name are s
 // onto one row; the store now boundary-checks and refuses.
 TEST_CASE("ADVERSARIAL: a NUL byte embedded in cve_id is rejected, not silently truncated",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -634,7 +649,7 @@ TEST_CASE("ADVERSARIAL: a NUL byte embedded in cve_id is rejected, not silently 
 
 TEST_CASE("ADVERSARIAL: disposed_clean overlapping the sweep set — DELETE wins, no double-processing",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -690,7 +705,7 @@ bool try_xact_lock(PGconn* conn, const std::string& lock_sql, const std::string&
 TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away from "
           "SoftwareInventoryStore's for the same agent_id",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -736,7 +751,7 @@ TEST_CASE("ADVERSARIAL: VulnFindingStore's advisory lock key is namespaced away 
 TEST_CASE("ADVERSARIAL: two vuln reconciles for the SAME agent still serialize "
           "(intra-store lock preserved)",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -774,7 +789,7 @@ TEST_CASE("ADVERSARIAL: two vuln reconciles for the SAME agent still serialize "
 
 TEST_CASE("ADVERSARIAL: disposed_clean naming a tuple that was never observed is a harmless no-op",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -795,7 +810,7 @@ TEST_CASE("ADVERSARIAL: disposed_clean naming a tuple that was never observed is
 // get_agent_coverage Degraded probe above.
 TEST_CASE("ADVERSARIAL: fleet_summary returns nullopt (not a zero summary) on an exhausted pool",
           "[pg][vuln][adversarial]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     // Pool of size 1 so a single held lease starves fleet_summary's acquire.
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());

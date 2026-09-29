@@ -1,0 +1,37 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/auto/deploy",
+    "capability_id": "get.fragments-auto-deploy",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/deployments/preview"
+    },
+    "mcp_twin": "get_deployment_preview",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/auto/deploy/delete",
+    "capability_id": "post.fragments-auto-deploy-delete",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/deploy/result",
+    "capability_id": "get.fragments-auto-deploy-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/auto/deploy/run",
+    "capability_id": "post.fragments-auto-deploy-run",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

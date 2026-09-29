@@ -1,5 +1,9 @@
 # Build artifacts
 builddir/
+build-*/
+# …except the one prebuilt binary deploy/docker/Dockerfile.server-local COPYs
+# out of the context (its header documents the repo-root context).
+!build-linux/server/core/yuzu-server
 vcpkg_installed/
 *.exe
 *.dll

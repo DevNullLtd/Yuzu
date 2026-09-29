@@ -1,0 +1,448 @@
+{
+  "actions": [
+    {
+      "action": "installed_count",
+      "definition_ids": [
+        "device.software_actions.installed_count"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "dpkg-query/rpm via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "pkgutil --pkgs via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "reads only the default (64-bit) registry view, matching the powershell payload it replaced; 32-bit applications registered under WOW6432Node are not counted",
+          "mechanism": "native Reg*W subkey count of the Uninstall key",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_upgradable",
+      "definition_ids": [
+        "device.software_actions.list_upgradable"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "apt/yum check-update via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "softwareupdate -l via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "winget is a PER-USER App Execution Alias under %LOCALAPPDATA%; under the shipped LocalSystem service account that path does not exist, so this leg resolves only when the agent runs in a user-session context. An unresolvable winget reports UNAVAILABLE, never a clean empty result",
+          "mechanism": "winget via bounded argv runner",
+          "rung": "2",
+          "support": "constrained"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**The Windows sample shows the real failure mode, not a synthetic one.** Captured under `SYSTEM`, `list_upgradable` fails with `subprocess_runner:spawn_error` — exactly the \"winget alias unresolvable under the service account\" case the descriptor's fallback text declares. Re-running this action under a user-session agent, per the matrix's `CONSTRAINED` note, is expected to succeed.",
+    "**The up-to-date sentinel abuses the `current_version` field.** `upgradable|none|System is up to date|-` puts the human sentence \"System is up to date\" in the `current_version` slot rather than a version string or `-`; a consumer parsing that field as a version must special-case the literal `none` name.",
+    "**`count|0` and a bare \"up to date\" line are reserved, never a default.** Every degrade path emits a typed `UNAVAILABLE`/`CONSTRAINED` status with no data line instead — do not reintroduce a fallback `count|0` or `upgradable|none|System is up to date|-` on a failed query; `installed_apps`' `exclusion_count|0`-style false-clean bug is the shape this guards against (`software_actions_plugin.cpp:430-436`, `:477-480`).",
+    "**Linux `installed_count` counts held packages, not just installed ones.** `hi` (held) counts alongside `ii` (installed) since Wave 4 PR4.3b, matching `installed_apps`/`vuln_scan`'s presence filter — a genuine value change from the pre-migration `dpkg --list | grep '^ii'` behaviour, not a silent contract break.",
+    "**`list_upgradable` is deliberately never dispatched from a unit test.** `softwareupdate -l` hits Apple's catalog over the network and can take tens of seconds; only `installed_count` is exercised end-to-end via `LocalDispatcher` (`tests/unit/test_software_actions_actions.cpp:10-16`)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns a quick count of installed packages or applications on the endpoint. On Windows queries the Uninstall registry, on Linux uses dpkg or rpm, on macOS uses pkgutil.",
+      "display_name": "Count Installed Software",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "device.software_actions.installed_count",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists packages and applications that have updates available. On Windows uses winget, on Linux tries apt then yum, on macOS uses softwareupdate. Reports the package name, current version, and available version for each upgradable package.",
+      "display_name": "List Upgradable Packages",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.software_actions.list_upgradable",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Lists upgradable packages and counts installed software",
+  "how_it_works": "`list_upgradable` asks the platform's own package manager what has an update pending: `winget upgrade` on Windows, `apt list --upgradable` then `yum`/`dnf check-update` on Linux, `softwareupdate -l` on macOS. `installed_count` asks the same class of tool for a raw record count, except on Windows, where it counts subkeys of the Uninstall registry key natively (no subprocess at all). Every acquisition goes through the shared bounded argv runner or a native OS read — never a shell, never `popen` (ADR-3002). A tool that ran but returned an ambiguous or truncated capture degrades the result rather than reporting it as clean, and a query that never ran (tool absent, spawn failed) reports `UNAVAILABLE`/`CONSTRAINED` with no `count|`/`upgradable|` data line that could be misread as a real answer — a `count|0` or \"System is up to date\" line is reserved for a tool that ran clean and genuinely found nothing.\n\nNeither action is a general software inventory: there is no publisher, install date, or per-user breakdown here, and Windows' `installed_count` deliberately reads only the default (64-bit) registry view, undercounting 32-bit apps under WOW6432Node rather than changing the reported number for every host. That inventory depth is `installed_apps`' job.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "c95c61957b6f",
+  "manifest_version": 1,
+  "name": "software_actions",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Non-negative count of installed packages or applications; the line is omitted entirely (never emitted as 0) when the underlying query failed. Values: non-negative integer.",
+          "example": "124",
+          "name": "count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.software_actions.installed_count"
+    },
+    {
+      "columns": [
+        {
+          "description": "The package or application name; the literal 'none' on the clean-scan sentinel row when nothing is upgradable. Values: free text, or the literal `none`.",
+          "example": "none",
+          "name": "package_name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The currently installed version, or '-' when not read; on the up-to-date sentinel row this field carries the literal sentence 'System is up to date' instead of a version. Values: free text, or `-`, or the literal `System is up to date`.",
+          "example": "System is up to date",
+          "name": "current_version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The version available to upgrade to, or '-' when not applicable or not read. Values: free text, or `-`.",
+          "example": "-",
+          "name": "available_version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.software_actions.list_upgradable"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one literal-discriminator field followed by the action's own fields. `list_upgradable` writes one `upgradable|...` line per upgradable package, or a single sentinel row when the query ran clean and nothing is pending; `installed_count` writes exactly one `count|N` line, or none at all on a degraded read — a `count|0` line is never emitted for a failed or absent query.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "`list_upgradable` needs a resolvable `%LOCALAPPDATA%` and a user-session context for the winget alias to exist; `installed_count`'s registry read needs no extra grant",
+      "if_refused": "`list_upgradable`: `UNAVAILABLE`/PARTIAL, e.g. `subprocess_runner:spawn_error` or `software_actions:localappdata_unset`; `installed_count`: `UNAVAILABLE`/PARTIAL/`software_actions:registry_query_failed`",
+      "measured": "2026-09-07 on bare metal, `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service identity — sample captured under `SYSTEM` (no row in `docs/agent-privilege-model.md` for this plugin)"
+    },
+    {
+      "grant": "None measured; both tools run unprivileged",
+      "if_refused": "`UNAVAILABLE`/PARTIAL/`software_actions:softwareupdate_not_present` or `:softwareupdate_failed`; `installed_count`: `:pkgutil_not_present` or `:pkgutil_query_failed`",
+      "measured": "2026-09-07 on macOS 26.6.2, euid 501",
+      "os": "macOS",
+      "runs_as": "agent daemon — sample captured at `euid 501 (jsmith)`, unprivileged"
+    },
+    {
+      "grant": "None measured; apt/yum/dpkg-query/rpm are read-only queries",
+      "if_refused": "`list_upgradable`: `UNAVAILABLE`/PARTIAL/`software_actions:no_supported_package_manager`, `:apt_list_upgradable_failed`, or `:yum_check_update_failed`; `installed_count`: `:dpkg_query_failed`, `:rpm_query_failed`, or `:no_supported_package_manager`",
+      "measured": "2026-09-06 in a container, euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon — sample captured at `euid 0` (container)"
+    }
+  ],
+  "readme": "agents/plugins/software_actions/README.md",
+  "result_status": [
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "`UNDECLARED` (sample shows `UNDECLARED / UNKNOWN /`)",
+      "when": "clean run: rows/count emitted, no `set_result_status` call — every captured sample except the Windows `list_upgradable` failure"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:localappdata_unset`",
+      "status": "`UNAVAILABLE`",
+      "when": "Windows `list_upgradable`: no `%LOCALAPPDATA%` in the token's environment"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:spawn_error` (forwarded via `forward_runner_failure`) or `software_actions:winget_failed` / `:softwareupdate_failed` / `:apt_list_upgradable_failed` / `:yum_check_update_failed`",
+      "status": "`UNAVAILABLE`",
+      "when": "the child process could not be spawned at all, or (the plugin fallback) a tool ran but its capture was otherwise unusable — timeout, truncation, or a failing exit with no rows parsed"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled` (forwarded via `forward_runner_failure`)",
+      "status": "`CONSTRAINED`",
+      "when": "the runner's deadline elapsed and the child was killed still running, the run was cancelled before finishing, or the child was killed by a signal rather than a clean exit"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:line_limit` (forwarded via `forward_runner_failure`)",
+      "status": "`OK`",
+      "when": "a deliberate bounded stop: the runner capped output at N lines and killed a still-producing child — not a failure, but incomplete"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:softwareupdate_not_present` / `software_actions:no_supported_package_manager`",
+      "status": "`UNAVAILABLE`",
+      "when": "the queried tool (or any supported package manager) is not present on this host"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:registry_query_failed` / `software_actions:dpkg_query_failed` / `software_actions:rpm_query_failed` / `software_actions:pkgutil_query_failed` / `software_actions:pkgutil_not_present`",
+      "status": "`UNAVAILABLE`",
+      "when": "`installed_count`: the native registry read or the package-manager query failed, or (`pkgutil_not_present`) `pkgutil` itself is absent on this host"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:winget_header_unrecognized` / `software_actions:winget_rows_unmapped` / `software_actions:winget_partial_exit` / `software_actions:winget_no_table`",
+      "status": "`CONSTRAINED`",
+      "when": "winget's table was found but partially unparseable, every matched row was dropped as unmapped, winget exited nonzero but real rows still parsed, or no recognisable table was found at all"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:softwareupdate_partial_exit`",
+      "status": "`CONSTRAINED`",
+      "when": "`softwareupdate -l` exited nonzero but real labels still parsed"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`software_actions:apt_list_upgradable_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: apt failed but yum/dnf still found rows — real data returned, apt's own failure flagged"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list_upgradable",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "upgradable|none|System is up to date|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "installed_count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|206"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "c95c61957b6f",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "list_upgradable",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "upgradable|none|System is up to date|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "installed_count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|68"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "c95c61957b6f",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "list_upgradable",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "subprocess_runner:spawn_error",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "installed_count",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "count|124"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "c95c61957b6f",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list_upgradable",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "installed_count",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/software_actions.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/software_actions/src/software_actions_parsers.hpp",
+      "agents/plugins/software_actions/src/software_actions_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_software_actions_actions.cpp",
+      "tests/unit/test_software_actions_parsers.cpp"
+    ]
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `kDefaultResponseRetentionDays`), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no grep hit for either definition id outside the plugin/definition/capability files themselves. Nothing runs on a schedule; each definition's `gather.ttlSeconds` (300 for `list_upgradable`, 120 for `installed_count`) only bounds result freshness for a dispatch, it does not trigger one.",
+    "**Sensitivity.** `list_upgradable` rows name specific installed software and its current/available versions (`package_name`/`current_version`/`available_version`) — an installed-software inventory by another route; `installed_count` carries only a record count, nothing identifying.",
+    "**Siblings:** `installed_apps` (`list`/`query`/`list_per_user`/`list_inventory`) is the general software inventory — name, version, publisher, install date, per-user breakdown, and the daily-sync `list_inventory` collector; `software_actions` answers only \"what needs upgrading\" and \"roughly how much software is here,\" with no publisher/version/date detail and no daily-sync leg of its own.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.software_actions.list_upgradable\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

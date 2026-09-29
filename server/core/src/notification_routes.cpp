@@ -1,14 +1,26 @@
 #include "notification_routes.hpp"
 
+#include "http_route_sink.hpp" // HttpRouteSink, HttplibRouteSink
+
 #include <nlohmann/json.hpp>
+
+#include <utility>
 
 namespace yuzu::server {
 
 void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                          AuditFn audit_fn,
                                          NotificationStore* notification_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    notification_store);
+}
+
+void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                         AuditFn audit_fn,
+                                         NotificationStore* notification_store) {
     // GET /api/notifications — list unread notifications
-    svr.Get("/api/notifications",
+    sink.Get("/api/notifications",
             [perm_fn, notification_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
@@ -52,7 +64,7 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
             });
 
     // POST /api/notifications/:id/read — mark notification as read
-    svr.Post(R"(/api/notifications/(\d+)/read)",
+    sink.Post(R"(/api/notifications/(\d+)/read)",
              [perm_fn, notification_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
                      return;
@@ -64,12 +76,17 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                      return;
                  }
                  auto id = std::stoll(req.matches[1].str());
-                 notification_store->mark_read(id);
+                 if (!notification_store->mark_read(id)) {
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
                  res.set_content(R"({"status":"ok"})", "application/json");
              });
 
     // POST /api/notifications/:id/dismiss — dismiss notification
-    svr.Post(R"(/api/notifications/(\d+)/dismiss)",
+    sink.Post(R"(/api/notifications/(\d+)/dismiss)",
              [perm_fn, audit_fn, notification_store](const httplib::Request& req,
                                                       httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
@@ -82,7 +99,14 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                      return;
                  }
                  auto id = std::stoll(req.matches[1].str());
-                 notification_store->dismiss(id);
+                 if (!notification_store->dismiss(id)) {
+                     audit_fn(req, "notification.dismiss", "failure", "notification",
+                              std::to_string(id), "");
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
                  audit_fn(req, "notification.dismiss", "success", "notification",
                           std::to_string(id), "");
                  res.set_content(R"({"status":"ok"})", "application/json");

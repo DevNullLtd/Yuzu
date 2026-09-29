@@ -33,7 +33,8 @@ spec:
         type: string
         displayName: Log Level
         description: >
-          The desired spdlog log level. Case-insensitive.
+          The desired spdlog log level, case-insensitive: trace, debug, info,
+          warn, error, critical, or off (e.g. "info").
         validation:
           enum: ["trace", "debug", "info", "warn", "error", "critical", "off"]
 
@@ -41,8 +42,16 @@ spec:
     columns:
       - name: status
         type: string
+        description: Literal "ok" once the level was applied. A missing or unrecognized level instead produces a single "error|<message>" line that carries neither this column nor level.
+        values: [ok]
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: level
         type: string
+        description: The log level the agent applied — a lowercased echo of the level parameter.
+        values: [trace, debug, info, warn, error, critical, 'off']
+        example: "info"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Set agent log level to ${level}"
 
@@ -93,14 +102,29 @@ spec:
     columns:
       - name: agent_id
         type: string
+        description: "The agent's agent.id config value, or the literal \"(not set)\" when the config context has not populated it. Values: free text, or literal \"(not set)\"."
+        example: "(not set)"
+        platforms: [windows, linux, darwin]
       - name: agent_version
         type: string
+        description: "The agent's agent.version config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
+        example: "(not set)"
+        platforms: [windows, linux, darwin]
       - name: server_address
         type: string
+        description: "The agent's agent.server_address config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
+        example: "(not set)"
+        platforms: [windows, linux, darwin]
       - name: heartbeat_interval
         type: string
+        description: "The agent's agent.heartbeat_interval config value, or the literal \"(not set)\" when unpopulated. Values: free text, or literal \"(not set)\"."
+        example: "(not set)"
+        platforms: [windows, linux, darwin]
       - name: plugins_count
         type: int32
+        description: "The agent's agent.plugins.count config value. Always emitted as text, never a JSON number — the raw config string or the literal \"(not set)\". Values: free text, or literal \"(not set)\"."
+        example: "(not set)"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get agent runtime info"
 

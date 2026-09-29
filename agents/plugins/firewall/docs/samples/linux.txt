@@ -1,0 +1,64 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash 8ef7b004fc8a
+== action=state
+backend|nftables
+state|active
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=rules
+backend|nftables
+rule|nftables|ip|filter|OUTPUT|output|accept
+rule|nftables|ip|filter|FORWARD|forward|accept
+rule|nftables|ip6|filter|OUTPUT|output|accept
+rule|nftables|ip6|filter|FORWARD|forward|accept
+rule|nftables|ip|nat|PREROUTING|prerouting|accept
+rule|nftables|ip|nat|OUTPUT|output|accept
+rule|nftables|ip|nat|POSTROUTING|postrouting|accept
+rule|nftables|ip6|nat|PREROUTING|prerouting|accept
+rule|nftables|ip6|nat|OUTPUT|output|accept
+rule|nftables|ip|raw|PREROUTING|prerouting|accept
+rule|nftables|ip|filter|DOCKER-USER|handle|2
+rule|nftables|ip|filter|DOCKER-USER|handle|3
+rule|nftables|ip|filter|DOCKER-USER|handle|4
+rule|nftables|ip|filter|DOCKER-USER|handle|5
+rule|nftables|ip|filter|DOCKER-USER|handle|6
+rule|nftables|ip|filter|DOCKER-USER|handle|7
+rule|nftables|ip|filter|OUTPUT|handle|9
+rule|nftables|ip|filter|OUTPUT|handle|10
+rule|nftables|ip|filter|OUTPUT|handle|11
+rule|nftables|ip|filter|OUTPUT|handle|12
+rule|nftables|ip|filter|DOCKER|handle|34
+rule|nftables|ip|filter|DOCKER|handle|29
+rule|nftables|ip|filter|DOCKER-FORWARD|handle|22
+rule|nftables|ip|filter|DOCKER-FORWARD|handle|21
+rule|nftables|ip|filter|DOCKER-FORWARD|handle|20
+rule|nftables|ip|filter|DOCKER-FORWARD|handle|28
+rule|nftables|ip|filter|DOCKER-BRIDGE|handle|31
+rule|nftables|ip|filter|DOCKER-CT|handle|30
+rule|nftables|ip|filter|FORWARD|handle|27
+rule|nftables|ip|filter|FORWARD|handle|19
+rule|nftables|ip6|filter|DOCKER-USER|handle|2
+rule|nftables|ip6|filter|DOCKER-USER|handle|3
+rule|nftables|ip6|filter|DOCKER-USER|handle|4
+rule|nftables|ip6|filter|DOCKER-USER|handle|5
+rule|nftables|ip6|filter|DOCKER-USER|handle|6
+rule|nftables|ip6|filter|DOCKER-USER|handle|7
+rule|nftables|ip6|filter|OUTPUT|handle|9
+rule|nftables|ip6|filter|OUTPUT|handle|10
+rule|nftables|ip6|filter|OUTPUT|handle|11
+rule|nftables|ip6|filter|OUTPUT|handle|12
+rule|nftables|ip6|filter|DOCKER-FORWARD|handle|22
+rule|nftables|ip6|filter|DOCKER-FORWARD|handle|21
+rule|nftables|ip6|filter|DOCKER-FORWARD|handle|20
+rule|nftables|ip6|filter|FORWARD|handle|23
+rule|nftables|ip6|filter|FORWARD|handle|19
+rule|nftables|ip|nat|DOCKER|handle|15
+rule|nftables|ip|nat|PREROUTING|handle|3
+rule|nftables|ip|nat|OUTPUT|handle|5
+rule|nftables|ip|nat|POSTROUTING|handle|10
+rule|nftables|ip|nat|POSTROUTING|handle|9
+rule|nftables|ip|nat|POSTROUTING|handle|16
+rule|nftables|ip6|nat|PREROUTING|handle|3
+rule|nftables|ip6|nat|OUTPUT|handle|5
+rule|nftables|ip|raw|PREROUTING|handle|3
+[result_status] UNDECLARED / UNKNOWN / 
+

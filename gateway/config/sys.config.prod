@@ -18,6 +18,7 @@
 %%   YUZU_GW_UPSTREAM_ADDR  — C++ server hostname (default: 127.0.0.1)
 %%   YUZU_GW_UPSTREAM_PORT  — C++ server port     (default: 50055)
 %%   YUZU_GW_PROMETHEUS_PORT / YUZU_GW_HEALTH_PORT — metrics / health ports
+%%   YUZU_GW_CLUSTER_ID     — trust-zone/region cluster id (default: "default")
 [
     {yuzu_gw, [
         %% Agent-facing gRPC listen address (agents connect here)
@@ -59,7 +60,46 @@
         {backpressure_threshold, 1000},
 
         %% Consistent hash ring: virtual nodes per physical node
-        {hash_ring_vnodes, 256}
+        {hash_ring_vnodes, 256},
+
+        %% HA WS-4 4.1 — the trust-zone/region cluster id this gateway belongs
+        %% to; agents are pinned to one cluster (ADR-2002 §7). Stamped onto
+        %% every StreamStatusNotification sent upstream so the server's
+        %% routing directory can record which cluster owns an agent's live
+        %% stream. Override: YUZU_GW_CLUSTER_ID
+        {cluster_id, <<"default">>},
+
+        %% Mgmt-plane peer pins (#1422): the identities the :50063 auth_fun
+        %% (yuzu_gw_authz:check_mgmt_peer/1, wired in the grpcbox block below)
+        %% accepts. {cert_file, Path} pins to the SPKI of the cert at Path and
+        %% re-reads it when the file changes (server leaf rotation self-heals);
+        %% for bring-your-own-cert installs point it at YOUR server cert, or use
+        %% {spki_sha256, "hex"} (openssl x509 -in cert.pem -pubkey -noout |
+        %% openssl pkey -pubin -outform DER | openssl dgst -sha256). List two
+        %% pins to overlap a rotation. Empty/unresolvable pins fail CLOSED.
+        {mgmt_peer_pins, [{cert_file, "/etc/yuzu/certs/default-server.pem"}]},
+
+        %% HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b),
+        %% distinct from `cluster_id` above: this is what to RESOLVE to find
+        %% peer addresses, not the logical cluster identifier. Default
+        %% `"gateway"` matches the reference Compose service name. Override:
+        %% YUZU_GW_SEED_DNS_NAME.
+        {cluster_seed_dns_name, <<"gateway">>},
+
+        %% An explicit comma-separated peer address list. When set (non-empty),
+        %% REPLACES DNS resolution outright — never merged with it. Override:
+        %% YUZU_GW_SEED_NODES (e.g. "10.0.0.1,10.0.0.2").
+        {cluster_seed_nodes, []},
+
+        %% Always-on redial loop interval (ms) — fixed, no backoff. `connect_all`
+        %% is `false` below, so this loop is what forms AND maintains the mesh.
+        %% Override: YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS.
+        {cluster_redial_interval_ms, 5000},
+
+        %% Lifetime cap on DISTINCT peer addresses ever atomized — see
+        %% config/sys.config's identical setting for the full rationale
+        %% (PR #4604 review round 2, atom-table exhaustion).
+        {cluster_max_lifetime_addrs, 1024}
     ]},
 
     {grpcbox, [
@@ -121,22 +161,27 @@
                                 verify => verify_none,
                                 fail_if_no_peer_cert => false}},
             %% Mgmt listener (:50063): the PRIVILEGED operator/command plane.
-            %% STRICT mTLS (#1314, HIGH-2). This listener binds 0.0.0.0, so a
-            %% one-way or plaintext posture would leave the command-fan-out plane
-            %% UNAUTHENTICATED (anyone routing to it could push commands to the
-            %% fleet). By OMITTING verify / fail_if_no_peer_cert below, the patched
-            %% grpcbox uses its strict defaults (verify_peer + fail_if_no_peer_cert=
-            %% true) so a client MUST present a CA-issued cert. The C++ server's
-            %% command-forwarding client presents its leaf, so mTLS works here with
-            %% no bootstrap problem, and a container with no CA-issued cert (e.g. a
-            %% compromised agent) is rejected at the TLS layer.
-            %% NOTE: verify_peer authenticates to the CA, not to the server's
-            %% identity, so ANY holder of a CA-issued cert (any agent's leaf, the
-            %% gateway/server leaves) passes; pinning the mgmt peer to the server's
-            %% identity is the PKI-ladder follow-up (#1314 residual).
+            %% STRICT mTLS (#1314, HIGH-2) + SPKI peer pin (#1422). This listener
+            %% binds 0.0.0.0, so a one-way or plaintext posture would leave the
+            %% command-fan-out plane UNAUTHENTICATED (anyone routing to it could
+            %% push commands to the fleet). By OMITTING verify /
+            %% fail_if_no_peer_cert below, the patched grpcbox uses its strict
+            %% defaults (verify_peer + fail_if_no_peer_cert=true) so a client MUST
+            %% present a CA-issued cert. The auth_fun then pins the peer to the
+            %% C++ server's KEY (mgmt_peer_pins in the yuzu_gw env above): CA
+            %% membership alone is NOT authorization — the same CA signs every
+            %% agent leaf and the gateway's own group-readable leaf, so without
+            %% the pin any compromised endpoint's cert could command the fleet
+            %% (the #1314 M-1 residual, closed by #1422). The auth_fun only runs
+            %% on a TLS listener — grpcbox silently drops it under ssl => false,
+            %% which the yuzu_gw_app boot guard refuses on a non-loopback bind.
+            %% NEVER copy auth_fun onto the :50051 agent listener: it is
+            %% verify_none (unenrolled agents bootstrap there), and grpcbox
+            %% rejects every certless peer once an auth_fun is installed.
             #{grpc_opts => #{
                 service_protos => [management_pb],
-                services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}
+                services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+                auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1
             },
             listen_opts => #{port => 50063, ip => {0,0,0,0}},
             transport_opts => #{ssl => true,
@@ -149,6 +194,11 @@
     {kernel, [
         {connect_all, false},
         {net_ticktime, 30},
+        %% HA WS-4 #4555: pin a small distribution port range so it can
+        %% actually be firewalled — see config/sys.config's identical block
+        %% for the full rationale.
+        {inet_dist_listen_min, 9100},
+        {inet_dist_listen_max, 9105},
         {logger_level, info},
         {logger, [
             {handler, default, logger_std_h, #{

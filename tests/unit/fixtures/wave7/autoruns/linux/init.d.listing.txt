@@ -1,0 +1,7 @@
+total 24
+-rwxr-xr-x 1 root root 2055 Sep 25  2023 anacron
+-rwxr-xr-x 1 root root 1071 Feb  5  2022 atd
+-rwxr-xr-x 1 root root 3103 Feb 27  2024 cron
+-rwxr-xr-x 1 root root 3152 Dec  5  2023 dbus
+-rwxr-xr-x 1 root root  959 Mar 24  2024 procps
+-rwxr-xr-x 1 root root 2762 Oct 19  2021 x11-common

@@ -15,6 +15,7 @@
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
+-export([evaluate_mgmt_posture/3]).                                      %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -51,18 +52,24 @@ do_start() ->
         {error, Reason} ->
             {error, Reason};
         ok ->
-            %% Attach telemetry/prometheus handlers.
-            yuzu_gw_telemetry:setup(),
-
-            %% Start Prometheus HTTP exporter for /metrics endpoint.
-            Port = application:get_env(yuzu_gw, prometheus_port, 9568),
-            application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
-            {ok, _} = prometheus_httpd:start(),
-            logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
-
-            %% Start the supervision tree.
-            yuzu_gw_sup:start_link()
+            case check_mgmt_listener_posture() of
+                {error, Reason2} -> {error, Reason2};
+                ok               -> do_start_services()
+            end
     end.
+
+do_start_services() ->
+    %% Attach telemetry/prometheus handlers.
+    yuzu_gw_telemetry:setup(),
+
+    %% Start Prometheus HTTP exporter for /metrics endpoint.
+    Port = application:get_env(yuzu_gw, prometheus_port, 9568),
+    application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
+    {ok, _} = prometheus_httpd:start(),
+    logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
+
+    %% Start the supervision tree.
+    yuzu_gw_sup:start_link().
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -77,10 +84,29 @@ check_distribution_cookie() ->
     Allow = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE") =:= "1",
     evaluate_cookie(node(), erlang:get_cookie(), Allow).
 
+%% Minimum distribution-cookie length (HA WS-4 #4555, ADR-2002 §7b). DNS-sourced
+%% discovery makes this node DIAL OUT to addresses it did not choose by hand —
+%% and the OTP distribution handshake has the INITIATOR send
+%% MD5(cookie ‖ peer_challenge) first, before the peer proves anything back. So
+%% anything able to influence what the seed name resolves to (a compromised or
+%% misconfigured DNS answer) gets an offline brute-force oracle against the
+%% cookie from a legitimately-configured node dialing out — a stronger position
+%% than an inbound attacker against a normal listener ever gets. 32 is HALF
+%% the output length of the `openssl rand -hex 32` this module's own
+%% guidance already recommends operators generate (that command emits 64
+%% hex characters, i.e. 256 bits) — the floor is comfortably cleared by the
+%% recommended generator, not merely equal to it. This is a LENGTH check
+%% only, not an entropy check: a hand-typed 32-character string that isn't
+%% genuinely random also clears it. That residual is a deliberate,
+%% documented trade-off (ADR-2002 §7b) — going further (mandating a
+%% specific generation method, or verifying character-class distribution)
+%% was judged disproportionate here.
+-define(MIN_COOKIE_LENGTH, 32).
+
 %% @doc Pure cookie policy decision — exported for testing.
 %% A non-distributed node ('nonode@nohost') has no inter-node attack surface,
-%% so any cookie is accepted. Otherwise the known-default and empty cookies
-%% are rejected unless explicitly overridden for dev/CI.
+%% so any cookie is accepted. Otherwise the known-default, empty, and
+%% too-short cookies are rejected unless explicitly overridden for dev/CI.
 -spec evaluate_cookie(node(), atom(), boolean()) ->
           ok | {error, insecure_distribution_cookie}.
 evaluate_cookie('nonode@nohost', _Cookie, _Allow) ->
@@ -94,10 +120,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
     %% unsubstituted `${...}` env placeholder. Substring (not exact) match is
     %% the #659 UP-1 hardening: an exact-match list would let the unsubstituted
     %% literal through and silently re-open the unauthenticated-RPC surface.
-    Insecure = CookieStr =:= ""
+    IsDefault = CookieStr =:= ""
         orelse string:find(CookieStr, "yuzu_gw_secret_change_me") =/= nomatch
         orelse string:find(CookieStr, "${") =/= nomatch,
+    TooShort = not IsDefault andalso length(CookieStr) < ?MIN_COOKIE_LENGTH,
+    Insecure = IsDefault orelse TooShort,
     case {Insecure, Allow} of
+        {true, false} when TooShort ->
+            logger:critical(
+                "Refusing to start: Erlang distribution cookie is shorter than "
+                "~p characters. DNS-based cluster discovery (#4555) means this "
+                "node dials addresses it did not choose by hand, and the "
+                "distribution handshake's INITIATOR sends the cookie hash "
+                "first — a short cookie is brute-forceable offline from a "
+                "legitimate node dialing out. Set a strong unique cookie via "
+                "the YUZU_GW_COOKIE environment variable (e.g. `openssl rand "
+                "-hex 32`). Dev/CI may override with "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1.", [?MIN_COOKIE_LENGTH]),
+            {error, insecure_distribution_cookie};
         {true, false} ->
             logger:critical(
                 "Refusing to start: Erlang distribution cookie is the insecure default. "
@@ -108,9 +148,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
                 "YUZU_GW_ALLOW_DEFAULT_COOKIE=1."),
             {error, insecure_distribution_cookie};
         {true, true} ->
+            %% Name WHICH condition(s) triggered — a bare "default or too
+            %% short" reads as one undifferentiated warning, and an operator
+            %% who set this override for a KNOWN-default cookie (low stakes,
+            %% isolated lab) may not register that a short-but-CUSTOM cookie
+            %% is what's actually flagged, leaving the DNS-dial-out
+            %% brute-force oracle #4555 introduces fully open (unhappy-path
+            %% UP-6, #4555 governance run).
+            Reason = case {IsDefault, TooShort} of
+                {true, true}  -> "the insecure default value AND shorter than the minimum length";
+                {true, false} -> "the insecure default value";
+                {false, true} -> "shorter than the minimum length"
+            end,
             logger:warning(
-                "Erlang distribution cookie is the insecure default, but "
-                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only)."),
+                "Erlang distribution cookie is insecure (~s), but "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only). "
+                "A short custom cookie remains brute-forceable via the DNS-based "
+                "cluster discovery dial-out even with this override set.",
+                [Reason]),
             ok;
         {false, _} ->
             ok
@@ -186,6 +241,19 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_FAILURE_THRESHOLD",   circuit_breaker_failure_threshold, fun list_to_integer/1},
         {"YUZU_GW_CB_RESET_TIMEOUT_MS",    circuit_breaker_reset_timeout_ms,  fun list_to_integer/1},
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
+        %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
+        %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
+        %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
+        {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
+        %% Explicit peer list; when non-empty REPLACES DNS resolution outright
+        %% (never merged). "10.0.0.1,10.0.0.2" -> [<<"10.0.0.1">>, <<"10.0.0.2">>].
+        {"YUZU_GW_SEED_NODES", cluster_seed_nodes, fun(V) ->
+            [list_to_binary(string:trim(N))
+             || N <- string:split(V, ",", all), string:trim(N) =/= ""]
+        end},
+        {"YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS", cluster_redial_interval_ms,
+         fun list_to_integer/1},
         {"YUZU_GW_TLS_ENABLED", tls_enabled, fun
             ("true")  -> true;
             ("false") -> false;
@@ -209,6 +277,32 @@ apply_env_overrides() ->
                 end
         end
     end, Overrides),
+
+    %% HA WS-4 #4555: YUZU_GW_SEED_NODES set but every entry was empty/
+    %% whitespace-only (a stray trailing comma, blank entries) parses to []
+    %% with no error — correct, one bad entry among good ones should not
+    %% abort the whole override — but the generic "ENV override: ... = []"
+    %% info line above is easy to miss and indistinguishable at a skim from
+    %% "operator never set this at all", which silently falls through
+    %% resolve_targets/0 to DNS discovery instead of the intended static
+    %% topology (unhappy-path UP-9, #4555 governance run). Surface it
+    %% distinctly.
+    case os:getenv("YUZU_GW_SEED_NODES") of
+        false ->
+            ok;
+        RawSeedNodes ->
+            case application:get_env(yuzu_gw, cluster_seed_nodes) of
+                {ok, []} ->
+                    logger:warning(
+                        "YUZU_GW_SEED_NODES was set ('~s') but every entry was "
+                        "empty after trimming — falling back to DNS discovery "
+                        "(YUZU_GW_SEED_DNS_NAME) instead of the intended static "
+                        "peer list. Check for a stray comma or blank entry.",
+                        [RawSeedNodes]);
+                _ ->
+                    ok
+            end
+    end,
 
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
@@ -338,6 +432,146 @@ check_upstream_tls_posture() ->
           ok | {error, unverified_upstream_tls}.
 evaluate_upstream_posture(unverified, false) -> {error, unverified_upstream_tls};
 evaluate_upstream_posture(_Posture, _Allow)  -> ok.
+
+%%--------------------------------------------------------------------
+%% Mgmt-listener posture guard (#1422)
+%%--------------------------------------------------------------------
+
+%% @private Fail-closed guard for the PRIVILEGED command plane: refuse to boot
+%% when a management_pb listener is network-reachable without the full #1422
+%% posture (strict mTLS + the SPKI-pin auth_fun + configured pins). A
+%% mgmt listener without it hands fleet-wide command execution to any peer
+%% that can reach the port — the finding this guard makes non-recurring.
+%%
+%% Placement caveat: grpcbox is an application DEPENDENCY, so its listeners
+%% are already up when this runs; refusing here halts the release moments
+%% after listen. In that window the router/registry are not yet started, so
+%% a mgmt RPC cannot dispatch — acceptable, and consistent with the other
+%% posture guards in this module. A pre-listen validator inside the vendored
+%% grpcbox is tracked follow-up hardening.
+%%
+%% Escape hatch: {yuzu_gw, allow_insecure_mgmt} set to the literal `true`
+%% boots anyway with a loud warning — an ACKNOWLEDGEMENT for lab/UAT rigs
+%% (which the tracked rig configs set explicitly), not a mitigation.
+-spec check_mgmt_listener_posture() -> ok | {error, insecure_mgmt_listener}.
+check_mgmt_listener_posture() ->
+    Servers = application:get_env(grpcbox, servers, []),
+    Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
+    Allow = application:get_env(yuzu_gw, allow_insecure_mgmt, false) =:= true,
+    case evaluate_mgmt_posture(Servers, Pins, Allow) of
+        ok ->
+            ok;
+        {ok_insecure, Details} ->
+            logger:warning(
+                "Management listener(s) ~p lack the #1422 secure posture but "
+                "{yuzu_gw, allow_insecure_mgmt} is true — booting anyway. This "
+                "plane fans commands to the ENTIRE fleet; this override is for "
+                "isolated lab/UAT rigs only, never production.", [Details]),
+            ok;
+        {error, {insecure_mgmt_listener, Details}} ->
+            logger:critical(
+                "Refusing to start: management listener(s) ~p are network-"
+                "reachable without the required posture (strict mTLS with "
+                "certfile+keyfile+cacertfile, verify_peer, fail_if_no_peer_cert, "
+                "auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1, and non-empty "
+                "{yuzu_gw, mgmt_peer_pins}). Anyone reaching this port could "
+                "otherwise command the entire fleet (#1422). Fix the grpcbox "
+                "listener config (see config/sys.config.prod), bind it to "
+                "loopback, or — isolated lab/UAT rigs ONLY — set "
+                "{yuzu_gw, allow_insecure_mgmt} to true.", [Details]),
+            {error, insecure_mgmt_listener}
+    end.
+
+%% @doc Pure mgmt-posture policy decision — exported for testing. Returns a
+%% per-listener defect list keyed by listen port; the escape hatch converts a
+%% refusal into {ok_insecure, Details} (boot + warn), never a silent pass.
+-spec evaluate_mgmt_posture(term(), term(), boolean()) ->
+          ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
+evaluate_mgmt_posture(Servers, Pins, Allow) when is_list(Servers) ->
+    Details = [{listener_port(S), D}
+               || S <- Servers, is_mgmt_listener(S),
+                  not loopback_bound(S),
+                  D <- [mgmt_defects(S, Pins)],
+                  D =/= []],
+    case {Details, Allow} of
+        {[], _}     -> ok;
+        {_, true}   -> {ok_insecure, Details};
+        {_, false}  -> {error, {insecure_mgmt_listener, Details}}
+    end;
+evaluate_mgmt_posture(_Servers, _Pins, _Allow) ->
+    %% Unrecognisable servers config: nothing provably exposes management_pb.
+    ok.
+
+%% @private A listener serving the management proto. Identified by
+%% service_protos — never by port or the advisory yuzu_gw env keys.
+-spec is_mgmt_listener(term()) -> boolean().
+is_mgmt_listener(S) when is_map(S) ->
+    Protos = opt_value(service_protos, maps:get(grpc_opts, S, #{})),
+    is_list(Protos) andalso lists:member(management_pb, Protos);
+is_mgmt_listener(_) ->
+    false.
+
+%% @private Loopback-only binds have no network attack surface. A missing or
+%% unrecognised ip is EXPOSED (grpcbox defaults to {0,0,0,0}). The map `ip` is
+%% authoritative ONLY when `socket_options` cannot override the bind: grpcbox
+%% DELETES the ip whenever socket_options carries an inherited `{fd, _}`
+%% descriptor (grpcbox_socket:maybe_adjust_port_opts_for_fdopt/2 — the socket
+%% binds wherever the fd points, e.g. systemd socket activation), and an
+%% `{ip, _}` inside socket_options is appended after the map ip in the inet
+%% option list, where the later occurrence wins. Either shape makes a nominal
+%% `ip => {127,0,0,1}` a dead letter, so both forfeit the exemption
+%% (PR #3905 review, Doomgoose blocking finding — verified live: the fd shape
+%% previously evaluated `ok` with zero TLS/auth_fun/pins).
+-spec loopback_bound(map()) -> boolean().
+loopback_bound(S) ->
+    ListenOpts = maps:get(listen_opts, S, #{}),
+    Overridable = case opt_value(socket_options, ListenOpts) of
+        undefined -> false;
+        L when is_list(L) ->
+            lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L);
+        _ -> true  % unrecognised shape: cannot prove the bind — exposed
+    end,
+    case {Overridable, maps:get(ip, ListenOpts, undefined)} of
+        {true, _}                        -> false;
+        {false, {127, _, _, _}}          -> true;
+        {false, {0, 0, 0, 0, 0, 0, 0, 1}} -> true;
+        _                                -> false
+    end.
+
+%% @private Everything wrong with one mgmt listener's posture. `ssl => true`
+%% alone is NOT TLS: grpcbox_pool silently falls back to TCP unless certfile,
+%% keyfile AND cacertfile are all present. TLS with verify_none would let a
+%% self-signed cert reach the auth_fun, and without fail_if_no_peer_cert a
+%% certless peer skips it entirely — both count as defects. The auth_fun must
+%% be exactly the approved pin callback, and the pin set non-empty.
+-spec mgmt_defects(map(), term()) -> [atom()].
+mgmt_defects(S, Pins) ->
+    T = maps:get(transport_opts, S, #{}),
+    GrpcOpts = maps:get(grpc_opts, S, #{}),
+    HasMaterial = lists:all(fun(K) -> has_material(K, T) end,
+                            [certfile, keyfile, cacertfile]),
+    %% verify / fail_if_no_peer_cert default to the patched grpcbox's strict
+    %% values when omitted, so absent is fine; an explicit relaxation is not.
+    Verify = case opt_value(verify, T) of undefined -> verify_peer; V -> V end,
+    FailNoPeer = case opt_value(fail_if_no_peer_cert, T) of
+                     undefined -> true;
+                     F -> F
+                 end,
+    %% grpcbox selects TLS only when transport_opts is a MAP with ssl => true —
+    %% a PROPLIST carrying {ssl, true} still serves plaintext TCP (the same
+    %% shape is_tls_trap/1 flags), so the guard must demand the map form.
+    Checks =
+        [{plaintext, not (is_map(T) andalso maps:get(ssl, T, undefined) =:= true)},
+         {missing_cert_material, not HasMaterial},
+         {verify_not_peer, opt_value(ssl, T) =:= true andalso
+                           Verify =/= verify_peer},
+         {peer_cert_not_required, opt_value(ssl, T) =:= true andalso
+                                  FailNoPeer =/= true},
+         {missing_or_wrong_auth_fun,
+          maps:get(auth_fun, GrpcOpts, undefined) =/=
+              fun yuzu_gw_authz:check_mgmt_peer/1},
+         {no_mgmt_peer_pins, not (is_list(Pins) andalso Pins =/= [])}],
+    [Defect || {Defect, true} <- Checks].
 
 -spec tls_word(boolean()) -> string().
 tls_word(true)  -> "TLS";

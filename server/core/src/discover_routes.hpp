@@ -9,14 +9,16 @@
 /// agentic worker should be able to learn what is possible from the live
 /// server alone, without a side-channel doc fetch."
 ///
-/// Five endpoints, modeled on the existing discovery precedent
+/// Seven endpoints, modeled on the existing discovery precedent
 /// `GET /api/v1/guaranteed-state/schemas` (rest_api_v1.cpp) — same
 /// ETag + `Cache-Control: public, max-age=300` + 304-revalidation contract:
-///   - `/discover/permissions`   — RBAC securable_type x operation catalog + role grid
-///   - `/discover/instructions`  — published InstructionDefinition subset
-///   - `/discover/routes`        — subset of the OpenAPI document (honesty-flagged)
-///   - `/discover/scope-kinds`   — Scope DSL kinds + operators (fully static)
-///   - `/discover/plugins`       — plugin/action catalog observed across the fleet
+///   - `/discover/permissions`         — RBAC securable_type x operation catalog + role grid
+///   - `/discover/instructions`        — published InstructionDefinition subset
+///   - `/discover/routes`              — subset of the OpenAPI document (honesty-flagged)
+///   - `/discover/scope-kinds`         — Scope DSL kinds + operators (fully static)
+///   - `/discover/plugins`             — plugin/action catalog observed across the fleet
+///   - `/discover/plugin-docs`         — per-plugin documentation manifest catalog (fully static)
+///   - `/discover/plugin-docs/{name}`  — one plugin's manifest, narrower (#4108, fully static)
 ///
 /// NAMING NOTE: the obvious filename `discovery_routes.{hpp,cpp}` /
 /// `DiscoveryRoutes` is already taken by an unrelated, pre-existing module
@@ -26,7 +28,7 @@
 /// `DiscoverRoutes` (singular, matching the `/api/v1/discover/*` URL prefix)
 /// to avoid clobbering it.
 ///
-/// The five builder functions (`build_*_catalog`) are pure — no I/O beyond
+/// The six builder functions (`build_*_catalog`) are pure — no I/O beyond
 /// reading the store/registry pointer passed in — and are declared here
 /// specifically so `mcp_server.cpp` can call the SAME functions for the
 /// mirrored `discover_*` MCP tools (A2: "Each is mirrored as an MCP tool...
@@ -72,13 +74,19 @@ struct DiscoveryDoc {
 /// list_operations, plus the full role -> permissions grid
 /// (list_roles + get_role_permissions). `rbac_store` must be non-null;
 /// callers null-check and answer 503 / a tool error before calling this.
-DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store);
+/// #2376: `include_roles` gates the `roles[].permissions[]` grid (the
+/// authorization topology) behind `UserManagement:Read`, while the
+/// securable/operation taxonomy stays readable at the route's own
+/// `Infrastructure:Read`. Callers PROBE for the second permission with a
+/// throwaway response — they must not 403 the whole route.
+DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles);
 
 /// `/discover/instructions`. Subsets InstructionStore::query_definitions
 /// (enabled_only=true — only invokable definitions are published) to
 /// {id, name, plugin, action, description, parameter_schema, platforms,
 /// approval_mode}. `parameter_schema` is parsed into a nested JSON Schema
-/// object when the stored value is valid JSON, else emitted as `null`.
+/// object when the stored value is valid JSON AND is itself an object, else
+/// emitted as `null` (an array/string/number/bool value is nulled out too).
 /// `instruction_store` must be non-null.
 DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store);
 
@@ -98,6 +106,46 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json);
 /// even when every store is down, like guardian_schema_catalog(). Built once
 /// (static local) and cached.
 const DiscoveryDoc& scope_kinds_catalog();
+
+/// `/discover/plugin-docs`. Fully static, like `scope_kinds_catalog()`: the
+/// per-plugin documentation manifests `tools/plugin-doc-gen` generates from
+/// each `agents/plugins/<name>/README.md` (docs/plugin-readme-standard.md
+/// rule 10), embedded at build time as `kBundledPluginDocs`
+/// (bundled_content.cpp) and served verbatim — compiled-in content only,
+/// never fleet-derived: no live agent, telemetry or operator-supplied text
+/// ever reaches this route at runtime (that's the property this route
+/// controls). It is still human-authored README prose per plugin, reviewed
+/// like any other source change, not literally hardcoded by the server
+/// team — the compiled-in guarantee bounds WHERE the content can come from,
+/// it is not a claim that the content is adversary-proof. One builder,
+/// three surfaces: this REST route, the MCP resource
+/// `yuzu://plugin-docs` (byte-identical), and the per-plugin `docs` summary
+/// `build_plugins_catalog` joins into `/discover/plugins` / `discover_plugins`.
+/// A manifest that fails to parse is skipped with a warning and counted in
+/// `skipped_invalid` so the gap is visible rather than silent. Built once and
+/// cached; answers even when every store is down.
+const DiscoveryDoc& plugin_docs_catalog();
+
+/// The per-plugin summary `build_plugins_catalog` joins by plugin name, or
+/// `nullptr` when no manifest documents that plugin. Exposed for the join and
+/// its tests; the full manifest is `plugin_docs_catalog()`.
+const nlohmann::json* plugin_docs_summary(std::string_view plugin_name);
+
+/// One plugin's manifest, pre-serialised with its own content ETag — the
+/// exact element `plugin_docs_catalog()` carries at `plugins[]` for this
+/// name, byte-identical after parse. Backs both `GET
+/// /api/v1/discover/plugin-docs/{name}` and the MCP resource template
+/// `yuzu://plugin-docs/{name}` (#4108) so the two transports cannot drift
+/// from each other (A2's shared-builder principle). This accessor itself is
+/// an exact-name lookup with no normalisation of its own — the two
+/// TRANSPORTS differ upstream of it: httplib decodes the REST path segment
+/// (`decode_path_component`) before routing, so `%5F` reaches here as `_`;
+/// the MCP `resources/read` branch passes the `uri` tail through unchanged.
+/// Immaterial in practice (generated plugin names are `[a-z0-9_]`), but a
+/// caller comparing behaviour across both transports should know the two
+/// answer differently for a percent-encoded name. `nullptr` when no
+/// manifest documents that plugin.
+const DiscoveryDoc* plugin_docs_manifest(std::string_view plugin_name);
 
 /// One row per `yuzu::scope::CompOp` value, hand-maintained (C++ has no enum
 /// reflection). Shared by `build_routes_catalog`'s scope-kinds sibling

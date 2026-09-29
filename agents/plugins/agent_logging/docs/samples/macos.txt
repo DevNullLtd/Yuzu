@@ -1,0 +1,10 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6e239e35ca05
+== action=get_log
+status|empty|agent log file not configured on this host
+line_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_key_files
+file|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|142208|1788774907
+[result_status] UNDECLARED / UNKNOWN / 
+

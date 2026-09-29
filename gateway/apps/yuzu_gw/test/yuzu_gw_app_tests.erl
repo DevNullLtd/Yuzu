@@ -51,3 +51,33 @@ literal_unsubstituted_default_rejected_test() ->
 unsubstituted_placeholder_rejected_test() ->
     ?assertEqual({error, insecure_distribution_cookie},
         yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', '${YUZU_GW_COOKIE}', false)).
+
+%%%===================================================================
+%%% HA WS-4 #4555 — minimum cookie length floor (ADR-2002 §7b)
+%%%===================================================================
+
+%% A short but otherwise well-formed custom cookie is still insecure: DNS-based
+%% discovery lets a node dial addresses it did not choose by hand, and the
+%% distribution handshake's initiator sends the cookie hash first — a short
+%% cookie is brute-forceable offline. Not the known-default substring, so this
+%% exercises the length floor specifically, not the #659 default-cookie check.
+short_custom_cookie_rejected_when_distributed_test() ->
+    ?assertEqual({error, insecure_distribution_cookie},
+        yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', 'too_short_cookie', false)).
+
+%% Exactly at the floor (32 chars) is accepted.
+cookie_at_minimum_length_accepted_test() ->
+    Cookie = list_to_atom(lists:duplicate(32, $a)),
+    ?assertEqual(ok,
+        yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', Cookie, false)).
+
+%% One character short of the floor is rejected.
+cookie_one_below_minimum_length_rejected_test() ->
+    Cookie = list_to_atom(lists:duplicate(31, $a)),
+    ?assertEqual({error, insecure_distribution_cookie},
+        yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', Cookie, false)).
+
+%% The existing dev/CI override also covers a too-short (not just default) cookie.
+override_allows_short_custom_cookie_test() ->
+    ?assertEqual(ok,
+        yuzu_gw_app:evaluate_cookie('yuzu_gw1@127.0.0.1', 'too_short_cookie', true)).

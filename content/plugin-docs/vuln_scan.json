@@ -1,0 +1,955 @@
+{
+  "actions": [
+    {
+      "action": "config_scan",
+      "definition_ids": [
+        "security.vuln_scan.config_scan"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "popen(iptables/nft/ufw)+procfs",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "popen(spctl/fdesetup/csrutil/socketfilterfw)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "cve_scan",
+      "definition_ids": [
+        "security.vuln_scan.cve_scan"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "popen(dpkg-query/rpm/pacman/apk)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "popen(system_profiler/brew)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "inventory",
+      "definition_ids": [
+        "security.vuln_scan.inventory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "popen(dpkg-query/rpm/pacman/apk)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "popen(system_profiler/brew)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "scan",
+      "definition_ids": [
+        "security.vuln_scan.scan"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "popen(pkg-manager+iptables/nft/ufw)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "popen(system_profiler/brew+security-checks)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "summary",
+      "definition_ids": [
+        "security.vuln_scan.summary"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "popen(pkg-manager+iptables/nft/ufw)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "popen(system_profiler/brew+security-checks)",
+          "rung": "3",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**CVE matching is a fixed, built-in rule table, not a live feed.** `cve_rules.hpp` lists a static set of CVEs per product; matching is a case-insensitive substring match on the installed app's name against a naive dot/dash-split numeric version comparator. A product whose installed name doesn't contain the rule's substring, or any CVE outside this table, is silently not reported.",
+    "**`summary`'s emitted shape doesn't match its declared result columns.** The code emits 3 pipe fields per row (`summary|<severity-or-TOTAL>|<count>`), but the definition YAML declares only 2 result columns, `severity` and `count`. The `TOTAL` row's `count` cell is also a formatted string (`\"<n> findings (<n> issues)\"`), not the declared `int32`.",
+    "**A denied or missing read never surfaces as an explicit error — it becomes the check's negative/default branch.** A failed Windows registry read returns an empty string, read as \"key not present\"; a failed `popen` on Linux/macOS returns empty output, read as \"command absent\" or \"feature disabled\". No sample capture observed an actual permission denial, so this is a code-path claim, not a measured one.",
+    "**`inventory` and `installed_apps` are two collectors for overlapping data.** They already share the same \"installed, held\" package-presence convention on Linux without being merged — a caller working from installed-software identity has two plugins to reconcile.",
+    "**No dedicated row in `docs/agent-privilege-model.md`.** The Privileges table above reflects only what each sample capture measured (SYSTEM on Windows, unprivileged on macOS, root in a Linux container), not a documented minimum grant."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Run security configuration compliance checks on the endpoint. Verifies settings such as firewall state, password policy, remote desktop configuration, and other hardening baselines. Returns findings classified by severity. Does not include CVE matching; use the full \"scan\" action for combined results.",
+      "display_name": "Configuration Compliance Scan",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "security.vuln_scan.config_scan",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Scan installed software against known CVE rules. Enumerates installed applications (registry on Windows, dpkg/rpm/pacman on Linux, system_profiler/brew on macOS) and compares versions against the built-in CVE database. Returns only CVE findings, not configuration checks. Use the full \"scan\" action for combined results.",
+      "display_name": "CVE Vulnerability Scan",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "security.vuln_scan.cve_scan",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Return the raw installed software inventory (name and version pairs) for server-side NVD matching. This is a lightweight alternative to client-side CVE scanning that enables the server to perform centralized vulnerability correlation against the full NVD database.",
+      "display_name": "Software Inventory for NVD Matching",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "security.vuln_scan.inventory",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Run a full host vulnerability scan combining CVE matching and configuration compliance checks. CVE matching compares installed software versions against a built-in rule database. Configuration checks verify security hardening settings (firewall state, password policy, remote desktop config, etc.). Each finding is classified by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). Reports progress at 0%, 50%, 90%, 100%.",
+      "display_name": "Full Vulnerability Scan",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "security.vuln_scan.scan",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Run a full vulnerability scan (CVE + configuration) and return only the severity summary counts. Provides a quick overview of the endpoint's security posture without the full finding details. Returns total findings, total issues, and per-severity counts (CRITICAL, HIGH, MEDIUM, LOW, INFO).",
+      "display_name": "Vulnerability Scan Summary",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "security.vuln_scan.summary",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Host vulnerability scanning — CVE matching and configuration compliance checks",
+  "how_it_works": "Every action is a read. `scan` runs the CVE match (`do_cve_scan_impl`) then the configuration\ncompliance checks (`do_config_scan_impl`), reporting progress at 0/50/90/100, and emits the union\nof both as findings. `cve_scan` and `config_scan` are `scan`'s two halves in isolation — CVE\nmatching only, or configuration checks only. `summary` runs the same combined scan as `scan` but\ndiscards the individual findings and emits only per-severity counts plus a `TOTAL` row. `inventory`\nruns neither scan: it enumerates installed software and returns raw `name|version` pairs with no\nCVE or configuration logic at all.\n\nCVE matching is a fixed, built-in table of software rules matched by case-insensitive product-name\nsubstring against a naive dot/dash-split numeric version comparator — it is deliberately not a\nconnection to a live vulnerability feed. `inventory` exists specifically to hand raw software\nidentity to the server for a heavier, centralized match instead: its own definition describes it as\n\"a lightweight alternative to client-side CVE scanning that enables the server to perform\ncentralized vulnerability correlation against the full NVD database\".",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "20c66f1c0618",
+  "manifest_version": 1,
+  "name": "vuln_scan",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Finding severity assigned by the compliance check that produced this row.",
+          "example": "HIGH",
+          "name": "severity",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "INFO"
+          ]
+        },
+        {
+          "description": "Always \"config\" for this action; \"scan\" only on the placeholder row emitted when there is nothing to report.",
+          "example": "config",
+          "name": "category",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "config",
+            "scan"
+          ]
+        },
+        {
+          "description": "The name of the compliance check, e.g. the setting it inspects. Values: free text.",
+          "example": "SMBv1 Protocol",
+          "name": "title",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The check's human-readable result text, including why a failing check failed. Values: free text.",
+          "example": "Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.vuln_scan.config_scan"
+    },
+    {
+      "columns": [
+        {
+          "description": "Finding severity assigned by the CVE rule that matched.",
+          "example": "HIGH",
+          "name": "severity",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "INFO"
+          ]
+        },
+        {
+          "description": "Always \"cve\" for a match; \"scan\" on the single placeholder row emitted when nothing matches.",
+          "example": "cve",
+          "name": "category",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "cve",
+            "scan"
+          ]
+        },
+        {
+          "description": "\"<CVE-ID>: <description>\" from the matched rule, or \"No vulnerabilities\" on the placeholder row. Values: free text.",
+          "example": "CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace",
+          "name": "title",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "<installed product> <version> (fixed in <fixed_ver>). Values: free text.",
+          "example": "Python 3.9.6 (fixed in 3.11.4)",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.vuln_scan.cve_scan"
+    },
+    {
+      "columns": [
+        {
+          "description": "Installed application or package name, as reported by the OS's own inventory source. Values: free text.",
+          "example": "curl",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Installed version string, or empty when the source reports none (e.g. a Windows uninstall entry with no DisplayVersion). Values: free text, or empty.",
+          "example": "8.14.1-2+deb13u4",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.vuln_scan.inventory"
+    },
+    {
+      "columns": [
+        {
+          "description": "Finding severity assigned by the check that produced this row.",
+          "example": "CRITICAL",
+          "name": "severity",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "INFO"
+          ]
+        },
+        {
+          "description": "Which half of the scan produced this row.",
+          "example": "cve",
+          "name": "category",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "cve",
+            "config",
+            "scan"
+          ]
+        },
+        {
+          "description": "For a cve row, \"<CVE-ID>: <description>\" from the matched rule; for a config row, the name of the compliance check; \"No vulnerabilities\" on the single placeholder row emitted when a run finds nothing. Values: free text.",
+          "example": "CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler",
+          "name": "title",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "For a cve row, \"<installed product> <version> (fixed in <fixed_ver>)\"; for a config row, the check's human-readable result text. Values: free text.",
+          "example": "Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.vuln_scan.scan"
+    },
+    {
+      "columns": [
+        {
+          "description": "The severity this row counts, or the literal \"TOTAL\" for the first row emitted by every run.\n",
+          "example": "CRITICAL",
+          "name": "severity",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "TOTAL",
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW",
+            "INFO"
+          ]
+        },
+        {
+          "description": "The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string \"<n> findings (<n> issues)\", not an integer. Values: integer, except a formatted string on the TOTAL row.",
+          "example": "17",
+          "name": "count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "security.vuln_scan.summary"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one per finding (or per installed package for `inventory`). `scan`,\n`cve_scan`, and `config_scan` share the same 4-field row shape,\n`severity|category|title|detail`; an empty result is never zero rows — a run that finds nothing\nstill emits one placeholder row, `INFO|scan|No vulnerabilities|No issues detected`. `summary` emits\na different, 3-field shape: a literal `summary` discriminator, then a severity name (or the\nliteral `TOTAL`), then a count — one field more than the two result columns (`severity`, `count`)\nthe definition declares. `inventory` emits raw `name|version` pairs with no discriminator.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "not established — no `docs/agent-privilege-model.md` row for this plugin",
+      "if_refused": "not observed in this capture; a denied `RegOpenKeyExW`/`RegQueryValueExW` fails silently and the read helper returns an empty string, so a blocked registry read surfaces as the check's default branch, not an explicit error",
+      "measured": "2026-09-07, bare metal, as SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent daemon identity (captured as `SYSTEM`)"
+    },
+    {
+      "grant": "not established — no privilege-model row",
+      "if_refused": "not observed; a failed `popen` command (`spctl`/`fdesetup`/`csrutil`/`socketfilterfw`) returns empty output, which every check parses as its negative/disabled branch",
+      "measured": "2026-09-07, bare metal, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "agent daemon (captured unprivileged, euid 501)"
+    },
+    {
+      "grant": "not established — no privilege-model row",
+      "if_refused": "not observed; a failed `popen` call or unreadable file returns empty, parsed as the check's negative/default branch",
+      "measured": "2026-09-06, container, euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon (captured as root, euid 0, container)"
+    }
+  ],
+  "readme": "agents/plugins/vuln_scan/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 10,
+          "rows": [
+            "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|python3-wheel 0.46.1-2 (fixed in 3.11.4)",
+            "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|python3-wheel 0.46.1-2 (fixed in 3.12.2)",
+            "CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git 1:2.47.3-0+deb13u1 (fixed in 2.45.1)",
+            "CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git-man 1:2.47.3-0+deb13u1 (fixed in 2.45.1)",
+            "HIGH|cve|CVE-2023-25652: git apply --reject writes outside worktree|git 1:2.47.3-0+deb13u1 (fixed in 2.40.1)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cve_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|python3-wheel 0.46.1-2 (fixed in 3.11.4)",
+            "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|python3-wheel 0.46.1-2 (fixed in 3.12.2)",
+            "CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git 1:2.47.3-0+deb13u1 (fixed in 2.45.1)",
+            "CRITICAL|cve|CVE-2024-32002: RCE via crafted repositories with submodules|git-man 1:2.47.3-0+deb13u1 (fixed in 2.45.1)",
+            "HIGH|cve|CVE-2023-25652: git apply --reject writes outside worktree|git 1:2.47.3-0+deb13u1 (fixed in 2.40.1)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "config_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "MEDIUM|config|SSH Root Login|PermitRootLogin not explicitly set - may default to prohibit-password",
+            "INFO|config|ASLR (Address Space Layout Randomization)|Full randomization enabled (value=2)",
+            "INFO|config|SUID Core Dumps|Restricted (suid_dumpable=0)",
+            "HIGH|config|Firewall|No firewall rules detected - host may be unprotected"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "summary|TOTAL|10 findings (8 issues)",
+            "summary|CRITICAL|2",
+            "summary|HIGH|4",
+            "summary|MEDIUM|2",
+            "summary|LOW|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 206,
+          "rows": [
+            "apt|3.0.3",
+            "autoconf|2.72-3.1",
+            "automake|1:1.17-4",
+            "autotools-dev|20240727.1",
+            "base-files|13.8+deb13u6"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "20c66f1c0618",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)",
+            "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)",
+            "INFO|config|Gatekeeper|Enabled - only verified apps can run",
+            "INFO|config|FileVault Disk Encryption|Enabled",
+            "INFO|config|System Integrity Protection (SIP)|Enabled"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cve_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)",
+            "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "config_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "INFO|config|Gatekeeper|Enabled - only verified apps can run",
+            "INFO|config|FileVault Disk Encryption|Enabled",
+            "INFO|config|System Integrity Protection (SIP)|Enabled",
+            "MEDIUM|config|Application Firewall|Disabled",
+            "MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "summary|TOTAL|8 findings (4 issues)",
+            "summary|CRITICAL|0",
+            "summary|HIGH|1",
+            "summary|MEDIUM|3",
+            "summary|LOW|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 387,
+          "rows": [
+            "App Store|3.0",
+            "Apps|1.0",
+            "Automator|2.10",
+            "Books|8.5",
+            "Calculator|12.0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "20c66f1c0618",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 24,
+          "rows": [
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5004945)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "cve_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 16,
+          "rows": [
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5004945)",
+            "CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5004945)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "config_scan",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "INFO|config|UAC (User Account Control)|Enabled",
+            "CRITICAL|config|SMBv1 Protocol|Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)",
+            "INFO|config|Auto-Logon|Disabled",
+            "INFO|config|RDP Network Level Authentication|Enabled",
+            "INFO|config|Windows Defender Real-Time Protection|Enabled"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 6,
+          "rows": [
+            "summary|TOTAL|24 findings (17 issues)",
+            "summary|CRITICAL|17",
+            "summary|HIGH|0",
+            "summary|MEDIUM|0",
+            "summary|LOW|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 226,
+          "rows": [
+            "7-Zip 26.02 (x64)|26.02",
+            "Age of Empires II: Definitive Edition|",
+            "Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705",
+            "Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705",
+            "Baldur's Gate 3|"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "20c66f1c0618",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "scan",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "cve_scan",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "config_scan",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "summary",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "inventory",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/vuln_scan.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/vuln_scan/src/config_checks.hpp",
+      "agents/plugins/vuln_scan/src/cve_rules.hpp",
+      "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, rendered by the dashboard/REST using either the plugin's default column schema (`Agent, Severity, Category, Title, Detail`) or, when the request carries a definition id, the definition's own YAML result-column schema.",
+    "**Server-side NVD matching.** `inventory`'s own definition states its data is for \"server-side NVD matching\" and \"centralized vulnerability correlation against the full NVD database\"; the server's independent version-comparison code notes it duplicates \"the same algorithm as agents/plugins/vuln_scan/src/cve_rules.hpp\".",
+    "**Not consumed by** daily-sync inventory or TAR; nothing runs on a schedule — every action is on-demand only.",
+    "**Sensitivity.** `scan`/`cve_scan`/`config_scan`'s `detail` field embeds installed application names and versions (e.g. `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823`) — an installed-software inventory by another route; `inventory`'s `name`/`version` rows are that inventory directly. Nothing in either row shape names a specific device or person.",
+    "**Siblings:** `installed_apps` — a separate installed-software collector; the two already share the same \"installed, held\" package-presence convention on Linux without being merged.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.vuln_scan.scan\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

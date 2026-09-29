@@ -234,6 +234,10 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
     IdTokenClaims claims;
     if (j.contains("sub") && j["sub"].is_string())
         claims.sub = j["sub"].get<std::string>();
+    // ADR-2001 §1 — Entra's `oid` claim (the AAD object id). Not parsed
+    // before this ADR; see `IdTokenClaims::oid`.
+    if (j.contains("oid") && j["oid"].is_string())
+        claims.oid = j["oid"].get<std::string>();
     if (j.contains("email") && j["email"].is_string())
         claims.email = j["email"].get<std::string>();
     if (j.contains("preferred_username") && j["preferred_username"].is_string())
@@ -382,6 +386,27 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
     for (unsigned char c : claims.sub) {
         if (c < 0x20 || c == 0x7F)
             return std::unexpected("sub claim contains control characters");
+    }
+
+    // ADR-2001 §1 — `oid` enters the trust path (it becomes the SCIM join
+    // key) ONLY when the operator selected it via `--oidc-scim-link-claim`.
+    // Mirrors the `sub` validation immediately above EXACTLY (same length
+    // cap, same control-byte rejection) — a malformed `oid` must be
+    // rejected the way a malformed `sub` is, since both flow unsanitized
+    // into a durable join key (`identity_links`/`oidc_login_observations`).
+    // When `sub` is the configured link claim (the default), a
+    // missing/empty `oid` is NOT an error — Okta and most non-Entra IdPs
+    // never send it, and this claim is otherwise unused.
+    if (config_.scim_link_claim == "oid") {
+        if (claims.oid.empty())
+            return std::unexpected("missing oid claim");
+        constexpr std::size_t kMaxOidLength = 255;
+        if (claims.oid.size() > kMaxOidLength)
+            return std::unexpected("oid claim exceeds maximum length");
+        for (unsigned char c : claims.oid) {
+            if (c < 0x20 || c == 0x7F)
+                return std::unexpected("oid claim contains control characters");
+        }
     }
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(

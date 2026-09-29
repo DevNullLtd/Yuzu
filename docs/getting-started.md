@@ -58,59 +58,50 @@ spec:
     action: os_name
 ```
 
-This YAML is the canonical authoring format. The server's import API accepts JSON, so you convert the relevant fields when posting.
+This YAML is the canonical authoring format. Post the file itself: the `yaml_source` form field carries the document verbatim, and the server derives the queryable columns (`metadata.id`, `spec.execution.plugin`, `spec.execution.action`, ...) from it — the YAML remains the definition's source of truth.
 
 ### Import it via the API
 
 ```bash
-curl -s -X POST http://localhost:8080/api/instructions/import \
+curl -s -X POST http://localhost:8080/api/instructions/yaml \
   -b "$COOKIE" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "hello.system.info",
-    "type": "question",
-    "plugin": "os_info",
-    "action": "os_name",
-    "description": "Returns basic OS information from all targeted endpoints.",
-    "version": "1.0.0"
-  }'
+  --data-urlencode "yaml_source@hello-system-info.yaml"
 ```
 
 Expected response:
 
-```json
-{"id":"a1b2c3d4-..."}
+```html
+<div class="alert alert-success">Definition created</div>
 ```
 
-The server assigns a unique ID and persists the definition in its SQLite store. An audit event is recorded: who imported it, when, and from where.
+The server uses `metadata.id` (`hello.system.info`) as the definition's ID, takes its display name from `metadata.displayName`, and records an audit event: who created it, when, and from where.
+
+> **Note:** there is also a JSON import endpoint, `POST /api/instructions/import`, meant for distributing definitions as signed envelopes (an Ed25519 `signature` + `publicKey` pair over the `yaml_source` bytes). On a default server, **unsigned** imports through that endpoint are rejected. Bypassing that with `--allow-unsigned-definitions` (or `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1`) is **dangerous** — unsigned instruction content is a fleet arbitrary-code-execution surface, the server emits a `server.unsigned_definitions_allowed` audit event at startup when it is set, and it should not be used outside isolated labs (see [Server Administration](user-manual/server-admin.md)). The endpoint used above is the authoring surface instead: it trusts your authenticated session's `InstructionDefinition:Write` permission, so it works on a default server with no signing bypass.
+>
+> Re-running the same import is safe: because the definition's ID comes from `metadata.id`, a second attempt returns **HTTP 409** with `Create failed: instruction definition 'hello.system.info' already exists` rather than creating a duplicate.
 
 ### Verify the definition exists
 
 ```bash
-curl -s http://localhost:8080/api/instructions?name=hello.system.info \
+curl -s http://localhost:8080/api/instructions/hello.system.info \
   -b "$COOKIE" | python -m json.tool
 ```
 
-Expected response:
+Expected response (abbreviated):
 
 ```json
 {
-    "definitions": [
-        {
-            "id": "a1b2c3d4-...",
-            "name": "hello.system.info",
-            "version": "1.0.0",
-            "type": "question",
-            "plugin": "os_info",
-            "action": "os_name",
-            "description": "Returns basic OS information from all targeted endpoints.",
-            "enabled": true,
-            "instruction_set_id": "",
-            "created_at": 1742300000,
-            "updated_at": 0
-        }
-    ],
-    "count": 1
+    "id": "hello.system.info",
+    "name": "Get System Info",
+    "version": "1.0.0",
+    "type": "question",
+    "plugin": "os_info",
+    "action": "os_name",
+    "description": "Returns basic OS information from all targeted endpoints.",
+    "enabled": true,
+    "instruction_set_id": "",
+    "created_at": 1742300000,
+    "updated_at": 1742300000
 }
 ```
 
@@ -171,7 +162,7 @@ Expected response:
 2. It constructed a gRPC `CommandRequest` with `plugin=os_info` and `action=os_name`.
 3. The request was dispatched to all connected agents over the bidirectional gRPC stream.
 4. Each agent's plugin host loaded the `os_info` plugin, invoked the `os_name` action, and streamed the result back as a `CommandResponse`.
-5. The server's `ResponseStore` persisted each response in SQLite with the command ID, agent ID, timestamp, status, and output.
+5. The server's `ResponseStore` persisted each response in PostgreSQL with the command ID, agent ID, timestamp, status, and output.
 6. An audit event was logged with your username, the action taken, and the number of agents targeted.
 
 ---
@@ -219,23 +210,15 @@ Key additions:
 ### Import it
 
 ```bash
-curl -s -X POST http://localhost:8080/api/instructions/import \
+curl -s -X POST http://localhost:8080/api/instructions/yaml \
   -b "$COOKIE" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "tutorial.service.inspect",
-    "type": "question",
-    "plugin": "services",
-    "action": "list",
-    "description": "Returns the current state of a named service.",
-    "version": "1.0.0"
-  }'
+  --data-urlencode "yaml_source@service-inspect.yaml"
 ```
 
 Expected response:
 
-```json
-{"id":"b2c3d4e5-..."}
+```html
+<div class="alert alert-success">Definition created</div>
 ```
 
 ### Execute with parameters
@@ -456,30 +439,30 @@ Key differences from a question:
 ### Import it
 
 ```bash
-curl -s -X POST http://localhost:8080/api/instructions/import \
+curl -s -X POST http://localhost:8080/api/instructions/yaml \
   -b "$COOKIE" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "tutorial.service.restart",
-    "type": "action",
-    "plugin": "services",
-    "action": "restart",
-    "description": "Restarts a named service. Requires approval.",
-    "version": "1.0.0"
-  }'
+  --data-urlencode "yaml_source@service-restart.yaml"
 ```
 
 Expected response:
 
-```json
-{"id":"c3d4e5f6-..."}
+```html
+<div class="alert alert-success">Definition created</div>
 ```
 
 ### Walk through the approval flow
 
+> **You need two accounts for this section.** A reviewer cannot approve or
+> reject their own submission — the server rejects self-review with HTTP 400
+> (`"reviewer cannot be the same as the submitter"`), and the dashboard shows
+> "You submitted this — another reviewer must approve" instead of buttons on
+> your own requests. If you have been following along as a single admin,
+> create a second operator account now and use it for the approve/reject
+> steps below.
+
 **1. Submit the action.**
 
-An operator submits the instruction for execution. Because the approval mode is `role-gated`, it does not execute immediately -- it enters the pending queue.
+An operator submits the instruction for execution. Because the approval mode is `role-gated`, it does not execute immediately -- it enters the pending queue. (`role-gated` queues *non-admin* submitters for approval; admins execute directly. To watch the queue while testing as an admin, use a definition with `approval.mode: always` instead.)
 
 **2. Check pending approvals.**
 
@@ -510,7 +493,7 @@ Expected response:
     "approvals": [
         {
             "id": "d4e5f6a7-...",
-            "definition_id": "c3d4e5f6-...",
+            "definition_id": "tutorial.service.restart",
             "status": "pending",
             "submitted_by": "operator1",
             "submitted_at": 1742300200,
@@ -641,7 +624,7 @@ Expected response:
 When creating or updating an instruction definition, set the `instruction_set_id` field to the set's ID. This binds the definition to the set's permission rules.
 
 ```bash
-curl -s -X PUT http://localhost:8080/api/instructions/b2c3d4e5-... \
+curl -s -X PUT http://localhost:8080/api/instructions/tutorial.service.inspect \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -785,7 +768,7 @@ curl -s -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Service health check (every 15m)",
-    "definition_id": "b2c3d4e5-...",
+    "definition_id": "tutorial.service.inspect",
     "frequency_type": "interval",
     "interval_minutes": 15,
     "scope_expression": "ostype == \"windows\"",
@@ -814,7 +797,7 @@ Expected response:
         {
             "id": "f6a7b8c9-...",
             "name": "Service health check (every 15m)",
-            "definition_id": "b2c3d4e5-...",
+            "definition_id": "tutorial.service.inspect",
             "enabled": true,
             "frequency_type": "interval",
             "next_execution_at": 1742301200,
@@ -880,7 +863,7 @@ Expected response:
 
 ## Step 8: Exporting Results
 
-Yuzu stores every response in its SQLite-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
+Yuzu stores every response in its PostgreSQL-backed ResponseStore. You can query, aggregate, and export this data through the REST API.
 
 ### Query responses for an instruction
 
@@ -965,7 +948,7 @@ Supported aggregation operations: `count`, `sum`, `avg`, `min`, `max`. Specify t
 For a higher-level view, query the execution tracker:
 
 ```bash
-curl -s http://localhost:8080/api/executions?definition_id=b2c3d4e5-... \
+curl -s http://localhost:8080/api/executions?definition_id=tutorial.service.inspect \
   -b "$COOKIE" | python -m json.tool
 ```
 
@@ -1002,7 +985,7 @@ This tutorial covered the core instruction lifecycle: define, import, execute, p
 
 - **Capability map** -- `docs/capability-map.md` tracks all 139 planned capabilities and which ones are implemented. Use this to understand the full scope of what Yuzu is building toward.
 
-- **Roadmap** -- `docs/roadmap.md` has the 56 issues across 7 phases. The features introduced in this tutorial span Phases 1-3.
+- **Roadmap** -- `docs/roadmap.md` has the 126 issues across 17 tracked phases (0–16). The features introduced in this tutorial span Phases 1-3.
 
 - **PolicyFragments and compliance automation (Phase 5)** -- PolicyFragments compose a check instruction, a compliance expression, and a fix instruction into a single unit. Policies bind fragments to triggers and scopes for continuous compliance enforcement.
 

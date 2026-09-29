@@ -819,6 +819,45 @@ bool is_valid_ip_literal(const std::string& s) {
     return true;
 }
 
+bool subject_key_meets_code_signing_floor(std::string_view csr_pem) {
+    X509_REQ_ptr req = load_csr(csr_pem);
+    if (!req) {
+        // Not this function's job to log a full error trace for an already-
+        // rejected/oversize CSR — just fail closed.
+        ERR_clear_error();
+        return false;
+    }
+    EVP_PKEY* pub = X509_REQ_get0_pubkey(req.get()); // borrowed
+    if (!pub)
+        return false;
+    const int base_id = EVP_PKEY_base_id(pub);
+    if (base_id == EVP_PKEY_RSA) {
+        const int bits = EVP_PKEY_get_bits(pub);
+        return bits >= 2048 && bits <= 16384;
+    }
+    if (base_id == EVP_PKEY_EC) {
+        char group[80] = {};
+        std::size_t group_len = 0;
+        if (EVP_PKEY_get_group_name(pub, group, sizeof(group), &group_len) != 1) {
+            ERR_clear_error();
+            return false; // can't identify the curve — fail closed
+        }
+        const std::string_view name(group, group_len);
+        // OpenSSL short-names for the three NIST curves TLS 1.3 treats as
+        // first-class (matches this file's own P-256/P-384 leaf/CA choice).
+        return name == "prime256v1" || name == "secp384r1" || name == "secp521r1";
+    }
+    // gov MED-2: Ed25519/Ed448 are REJECTED, not accepted. detached_signature.cpp's
+    // own CMS_verify tolerates them, but `openssl cms -sign` — the documented
+    // code-signing tool (docs/user-manual/agent-plugins.md,
+    // docs/user-manual/server-admin.md) — fails on an Ed25519/Ed448 codeSigning
+    // cert ("no default digest"), so issuing one would hand the operator a leaf
+    // the shipped tooling cannot use. The accepted set is RSA 2048-16384 and EC
+    // P-256/P-384/P-521 ONLY; any other key type (RSA-PSS, DH, X25519, Ed25519,
+    // Ed448, …) is rejected.
+    return false;
+}
+
 namespace {
 
 DistinguishedName name_to_dn(X509_NAME* nm) {
@@ -1075,6 +1114,10 @@ bool cert_is_ca(std::string_view) {
 bool verify_chain_to_bundle(std::string_view, std::string_view) {
     (void)unavailable();
     return false;
+}
+bool subject_key_meets_code_signing_floor(std::string_view) {
+    (void)unavailable();
+    return false; // fail closed — no OpenSSL means no issuance path either.
 }
 
 #endif // CPPHTTPLIB_OPENSSL_SUPPORT

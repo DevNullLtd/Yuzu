@@ -16,6 +16,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::PreflightRunDeviceRow;
@@ -28,6 +29,16 @@ using yuzu::server::preflight::PreflightTarget;
 namespace preflight = yuzu::server::preflight;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate preflight_tpl{"preflight", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    PreflightRunStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("preflight template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -55,7 +66,7 @@ PreflightTarget tgt(const std::string& aid) { return {aid, "host-" + aid, "windo
 } // namespace
 
 TEST_CASE("PreflightRunStore owner-scope boundary", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
@@ -97,7 +108,7 @@ TEST_CASE("PreflightRunStore owner-scope boundary", "[pg][preflight][store]") {
 }
 
 TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
@@ -142,10 +153,16 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
         CHECK(done->status == "complete");
     }
 
-    SECTION("prune removes old runs + cascades") {
-        const auto old_t = t - 100000;
+    SECTION("prune removes old runs + cascades (clock-guarded, bootstrap-declines once)") {
+        const auto old_t = t - 100000; // 100s ago (t == now_ms())
         REQUIRE(store.create_run(make_run("rOld", "carol", old_t), {tgt("o1")}));
-        int n = store.prune_older_than(t - 50000); // cutoff between old and new
+        // WS-10: run_retention_prune reads Postgres now() itself and takes the
+        // retention WINDOW, not a cutoff. 75s sits between rOld (100s) and the
+        // recent runs (~now). The clock guard's part-6 Decline means the FIRST
+        // pass on a store that has data but no persisted anchor DECLINES (records
+        // the anchor + settled marker, deletes nothing); the next pass proceeds.
+        CHECK(store.run_retention_prune(75000) == 0); // bootstrap decline
+        int n = store.run_retention_prune(75000);
         CHECK(n >= 1);
         CHECK_FALSE(store.get_run("rOld").has_value());
         CHECK(store.get_devices("rOld").empty()); // cascaded
@@ -159,7 +176,7 @@ TEST_CASE("PreflightRunStore lifecycle: create→persist→complete→prune", "[
 // stale route-persist can't overwrite it (#governance architect/consistency).
 TEST_CASE("persist_and_maybe_complete: completes only when settled; complete grid is immutable",
           "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     PreflightRunStore store{pool};
@@ -225,7 +242,7 @@ TEST_CASE("persist_and_maybe_complete: completes only when settled; complete gri
 // Force the failure by pre-seeding the store's schema with a conflicting table
 // and no schema_meta row: the migration runner's drift guard refuses.
 TEST_CASE("PreflightRunStore reports !is_open on a migration failure", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

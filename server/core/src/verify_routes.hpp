@@ -23,18 +23,20 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_app_perf_model.hpp" // AppPerfCohortFn
-#include "dex_routes.hpp"         // DexRoutes::AuditFn
+#include "verify_api.hpp"  // ADR-0031 WS-A4: the public in-process VERIFY API seam
 
 #include <httplib.h>
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace yuzu::server {
+
+class HttpRouteSink; // server/core/src/http_route_sink.hpp
 
 class VerifyRoutes {
 public:
@@ -44,17 +46,41 @@ public:
                                       const std::string& securable_type, const std::string& operation)>;
     /// (id, name) of the management groups offered as the cohort dropdown.
     using GroupsFn = std::function<std::vector<std::pair<std::string, std::string>>()>;
-    using AuditFn = DexRoutes::AuditFn;
+
+    /// Audit hook — same shape as `DexRoutes::AuditFn`/`NetworkRoutes::AuditFn`
+    /// (bool persist-signal), defined LOCALLY rather than borrowed from
+    /// `dex_routes.hpp` (ADR-0031 WS-A4 #4250) — that header transitively
+    /// reaches `app_perf_daily_store.hpp`/`app_perf_fleet_store.hpp` via
+    /// `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp`, which would defeat
+    /// the whole point of this family's include-closure seam for the sake of
+    /// one type alias. `detail::emit_behavioral_audit` (rest_audit.hpp) is
+    /// templated on the callable shape, so any of the three call
+    /// interchangeably.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+
+    /// The public in-process VERIFY API (ADR-0031 WS-A4) — the SAME seam
+    /// GET /api/v1/dex/perf/compare and the MCP `compare_app_perf_versions`
+    /// tool call, so this dashboard fragment can never disagree with those
+    /// siblings. Nullable → the fragments render an honest "still warming
+    /// up"/degrade note (the pre-seam behaviour of an unwired cohort_fn).
+    using VerifyApiPtr = std::shared_ptr<const VerifyApi>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, GroupsFn groups_fn,
-                         AppPerfCohortFn cohort_fn, AuditFn audit_fn);
+                         AuditFn audit_fn, VerifyApiPtr api = nullptr);
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, GroupsFn groups_fn,
+                         AuditFn audit_fn, VerifyApiPtr api = nullptr);
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     GroupsFn groups_fn_;
-    AppPerfCohortFn cohort_fn_;
     AuditFn audit_fn_;
+    VerifyApiPtr api_;
 };
 
 } // namespace yuzu::server

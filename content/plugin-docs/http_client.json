@@ -1,0 +1,609 @@
+{
+  "actions": [
+    {
+      "action": "download",
+      "definition_ids": [
+        "agent.http_client.download"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get",
+      "definition_ids": [
+        "agent.http_client.get"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "head",
+      "definition_ids": [
+        "agent.http_client.head"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "cpp-httplib (native sockets)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`head`'s declared result columns don't match what the code emits.** The definition YAML declares `status|content_length|content_type`; `do_head` (`http_client_plugin.cpp:535-545`) actually writes `status|headers`, where `headers` is the full raw header block. A consumer parsing by the declared schema will not find `content_length`/`content_type`.",
+    "**`get`'s size cap doesn't stop the transfer.** `download` streams to disk and aborts mid-transfer past 100 MiB (`content_receiver`, lines 265-273). `get` calls `cli.Get(parsed.path)` with no content receiver, so the full body is already downloaded in memory before the `res->body.size() > kMaxDownloadSize` check (line 350) replaces it with an error string — the cap limits what's returned, not what's fetched.",
+    "**No redirect following.** Neither `set_follow_location` nor any equivalent is called on any `httplib::Client`/`SSLClient` instance, so a 3xx response is returned as-is (status + whatever body/headers the redirect response itself carries), not followed.",
+    "**HTTPS on Windows depends on a build-time OpenSSL find.** Windows OpenSSL discovery is `required: false` (`meson.build`); when it isn't found, `CPPHTTPLIB_OPENSSL_SUPPORT` is undefined and every `https://` call on that build returns `status|0` with an \"HTTPS not supported\" message instead of connecting (lines 283-287, 334-337, 378-381). Linux/macOS require OpenSSL at configure time and always have it.",
+    "**This plugin does not set a typed result status.** Every sample shows `UNDECLARED / UNKNOWN /` regardless of outcome — a caller must parse the `status`/`error` output fields, not the result-status envelope, to detect failure."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Download a file from a URL to a local path with optional SHA256 hash verification.",
+      "display_name": "Download File",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "agent.http_client.download",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Perform an HTTP GET request and return the response status and body.",
+      "display_name": "HTTP GET",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "agent.http_client.get",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Perform an HTTP HEAD request and return the response status code and headers. Useful for checking file availability or size before downloading.",
+      "display_name": "HTTP HEAD",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "agent.http_client.head",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "HTTP client — download files, GET/HEAD requests with hash verification (no shell-out)",
+  "how_it_works": "All three actions parse the operator-supplied URL, reject anything but `http://`/`https://`, and run it through an SSRF filter before opening a connection: `hostname_resolves_to_private` resolves the hostname and rejects any IPv4/IPv6 result in a private, loopback, link-local, CGN, benchmarking, or unique-local range, and fails closed — blocking the request — if resolution itself fails. `get` and `head` then issue a single `httplib::Client`/`SSLClient` GET or HEAD and return the status plus body/headers as-is. `download` additionally canonicalizes the destination's parent directory and rejects any path containing a `..` component before streaming the response to disk, capping the transfer at 100 MiB by aborting mid-stream; it then SHA-256-hashes the file (BCrypt on Windows, OpenSSL EVP elsewhere) and, if `expected_hash` was supplied, deletes the file and fails on a mismatch. Every request goes through cpp-httplib's native in-process socket client — no shell invocation on any platform. The plugin deliberately does not follow HTTP redirects, does not accept custom headers/methods/auth, and does not retry a failed request.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.http_client.download",
+      "description": "HTTP or HTTPS URL to download.",
+      "name": "url",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.http_client.download",
+      "description": "Local file path to save the download.",
+      "name": "path",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.http_client.download",
+      "description": "Optional SHA256 hash for verification.",
+      "name": "expected_hash",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.http_client.get",
+      "description": "HTTP or HTTPS URL to request.",
+      "name": "url",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "agent.http_client.head",
+      "description": "HTTP or HTTPS URL to request.",
+      "name": "url",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": false,
+    "mutating": true
+  },
+  "leg_hash": "6e02e2f89c34",
+  "manifest_version": 1,
+  "name": "http_client",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Literal \"ok\" on success; a failed download emits a separate error output instead of a non-ok status row.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Absolute path the file was written to, after canonicalizing the parent directory and rejecting any \"..\" component. Values: absolute filesystem path.",
+          "example": "/tmp/yuzu_capture/yuzu_capture_download.html",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Size in bytes of the downloaded file on disk, read back with std::filesystem::file_size after the write completes. Values: non-negative integer, bytes.",
+          "example": 559,
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Lowercase hex SHA-256 digest of the downloaded file, computed via BCrypt on Windows and OpenSSL EVP on Linux/macOS. Values: 64-character lowercase hex string.",
+          "example": "ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d",
+          "name": "hash",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.http_client.download"
+    },
+    {
+      "columns": [
+        {
+          "description": "HTTP status code returned by the GET request, or 0 if the request could not be made (invalid URL, SSRF block, or connection failure). Values: HTTP status code, or 0 on request failure.",
+          "example": 200,
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Response body text; a body over the 100 MiB cap is replaced with an error string, though the full response is already received over the wire before that check runs. Values: free text, or an error string on failure.",
+          "example": "<!doctype html><html lang=\"en\"><head><title>Example Domain</title>...",
+          "name": "body",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.http_client.get"
+    },
+    {
+      "columns": [
+        {
+          "description": "HTTP status code returned by the HEAD request, or 0 if the request could not be made (invalid URL, SSRF block, or connection failure). Values: HTTP status code, or 0 on request failure.",
+          "example": 200,
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Declared here but not populated by the current head leg, which writes one combined \"headers\" field (the full raw response header block) instead of parsed content_length/content_type fields — see the plugin README's Caveats section. Values: not emitted by current code.",
+          "example": "-",
+          "name": "content_length",
+          "platforms": [],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Declared here but not populated by the current head leg, which writes one combined \"headers\" field (the full raw response header block) instead of parsed content_length/content_type fields — see the plugin README's Caveats section. Values: not emitted by current code.",
+          "example": "-",
+          "name": "content_type",
+          "platforms": [],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "agent.http_client.head"
+    }
+  ],
+  "outputs_note": "Rows are pipe-delimited `field|value` lines written one at a time via `ctx.write_output()`; there is no multi-row output for any of these three actions, and a validation or transport failure emits a single `error|<message>` line in place of the normal fields rather than a row with an error status. `download`'s four fields (`status|path|size|hash`) and `get`'s two fields (`status|body`) match their declared result columns exactly. `head`'s declared columns do **not** match what the code emits: the leg writes only `status` and a single `headers` field holding the full raw response header block (one `Name: value` pair per line, newline-joined) — `content_length` and `content_type` are declared in the definition YAML but never populated by `do_head` (`http_client_plugin.cpp:535-545`); see Caveats.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — outbound sockets and a write to an operator-chosen path need no elevated grant",
+      "if_refused": "`download`: `error|failed to open destination file for writing` if the destination directory isn't writable",
+      "measured": "2026-09-07 as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "same as above",
+      "measured": "2026-09-07 at euid 501 (alex, unprivileged)",
+      "os": "macOS",
+      "runs_as": "agent daemon"
+    },
+    {
+      "grant": "None",
+      "if_refused": "same as above",
+      "measured": "2026-09-06 at euid 0 (container)",
+      "os": "Linux",
+      "runs_as": "agent daemon"
+    }
+  ],
+  "readme": "agents/plugins/http_client/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "download",
+          "not_captured": null,
+          "params": "url=https://www.example.com/ path=/tmp/yuzu_capture/yuzu_capture_download.html",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "status|ok",
+            "path|/tmp/yuzu_capture/yuzu_capture_download.html",
+            "size|559",
+            "hash|ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|200",
+            "body|<!doctype html><html lang=\"en\"><head><title>Example Domain</title><link rel=\"icon\" href=\"data:,\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href=\"https://iana.org/domains/example\">Learn more</a></p></div></body></html>"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "head",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 11,
+          "rows": [
+            "status|200",
+            "headers|Content-Encoding: br",
+            "cf-cache-status: HIT",
+            "CF-RAY: a36fd1781c3488d3-MAN",
+            "Age: 8996"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "6e02e2f89c34",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "download",
+          "not_captured": null,
+          "params": "url=https://www.example.com/ path=/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_download.html",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "status|ok",
+            "path|/private/var/folders/hq/lc3t_rsx2blfc8rhys6kzh4r0000gn/T/yuzu_capture_h8zzfku8/yuzu_capture_download.html",
+            "size|559",
+            "hash|ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|200",
+            "body|<!doctype html><html lang=\"en\"><head><title>Example Domain</title><link rel=\"icon\" href=\"data:,\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href=\"https://iana.org/domains/example\">Learn more</a></p></div></body></html>"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "head",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 11,
+          "rows": [
+            "status|200",
+            "headers|CF-RAY: a374d6c43e292214-MAN",
+            "cf-cache-status: HIT",
+            "Age: 4039",
+            "Content-Encoding: br"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6e02e2f89c34",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "download",
+          "not_captured": null,
+          "params": "url=https://www.example.com/ path=C:\\WINDOWS\\TEMP\\yuzu_capture_87gld9cd/yuzu_capture_download.html",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "status|ok",
+            "path|C:\\Windows\\Temp\\yuzu_capture_87gld9cd\\yuzu_capture_download.html",
+            "size|559",
+            "hash|ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|200",
+            "body|<!doctype html><html lang=\"en\"><head><title>Example Domain</title><link rel=\"icon\" href=\"data:,\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href=\"https://iana.org/domains/example\">Learn more</a></p></div></body></html>"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "head",
+          "not_captured": null,
+          "params": "url=https://www.example.com/",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 11,
+          "rows": [
+            "status|200",
+            "headers|Content-Type: text/html",
+            "Date: Mon, 07 Sep 2026 10:08:23 GMT",
+            "last-modified: Sun, 30 Aug 2026 04:11:49 GMT",
+            "Connection: close"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6e02e2f89c34",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "download",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "High",
+      "securable": "FileRetrieval"
+    },
+    {
+      "action": "get",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "head",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/http_client.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/http_client/src/http_client_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `response_store.hpp:153`), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no server-side code references `agent.http_client.*` or `http_client` outside `agent_registry.cpp`'s instruction-catalogue description strings (`agent_registry.cpp:860-863`) and the capability declarations.",
+    "**Sensitivity.** `get`/`download` rows carry the fetched URL's response body verbatim, and `head`'s `headers` field carries the full raw response header block — whatever the remote endpoint returns rides through unfiltered, so a URL pointed at an internal system could surface usernames, credentials, or other personal data in the body/headers; the `path`/`hash` fields otherwise carry nothing beyond the operator-chosen destination.",
+    "**Siblings:** none — no other plugin performs outbound HTTP.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"agent.http_client.get\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

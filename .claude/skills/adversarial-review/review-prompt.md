@@ -32,6 +32,24 @@ Follow these five principles throughout:
    platform path the authors did not build locally), run the unit/integration tests, run linters/type
    checkers. Tag each finding's PROVENANCE as `compiled`, `test-run`, or `static-read`. State exactly
    what you executed and the result. Static-only claims are weighted lower at synthesis.
+
+   **Building a C++ review worktree — use this, do not infer one.** `scripts/setup.sh` runs
+   `vcpkg install`, which writes to `$VCPKG_ROOT` and will fail in a read-only/sandboxed
+   checkout; you do not need it, because a populated `vcpkg_installed` already exists in the
+   main working copy. Configure offline against it:
+   ```bash
+   VI=<main-checkout>/vcpkg_installed/x64-linux   # e.g. /home/fraser/Yuzu/vcpkg_installed/x64-linux
+   meson setup build-linux --buildtype=debug -Dbuild_tests=true \
+     -Dcmake_prefix_path=$VI -Dpkg_config_path=$VI/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
+   meson compile -C build-linux tests/yuzu_server_tests   # or tests/yuzu_agent_tests, tests/yuzu_tar_tests
+   ./build-linux/tests/yuzu_server_tests '[tag]'
+   ```
+   Both flags are required. `$VCPKG_ROOT/installed/<triplet>` is the WRONG prefix — this repo
+   uses vcpkg manifest mode, so that tree is near-empty and `meson setup` fails on
+   `Dependency PostgreSQL not found`. With `cmake_prefix_path` alone the configure succeeds and
+   the LINK then fails on `undefined reference to fmt::v12::…`, because spdlog/fmt come from
+   pkg-config. If a build genuinely cannot be produced, say so in RAN and grade your findings
+   `static-read` — never report a blocked build as though the axis were covered.
 5. **Pause and cross-examine, then return.** Phase 1 alone; Phase 2 against `{{PEER}}`; then stop and
    return to the orchestrator. Do not synthesize a merged verdict yourself — that is the orchestrator's
    job.

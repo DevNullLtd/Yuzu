@@ -1,0 +1,7 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash f5009a752233
+== action=listening
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=connections
+[result_status] UNDECLARED / UNKNOWN / 
+

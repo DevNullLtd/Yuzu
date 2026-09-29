@@ -1,9 +1,13 @@
 #pragma once
 
+#include "authz_model.hpp"    // #1788: VisibleSet — dispatch() confinement param
 #include "bundle_service.hpp" // BundleStepSpec, DispatchedStep, BundleAggregate
+#include "dispatch_caller.hpp" // PR1.9c: DispatchCaller — DispatchFn's caller param
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome — DispatchFn's return type
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -42,16 +46,39 @@ namespace yuzu::server {
 
 class ResponseStore; // collate reads responses by correlation id
 
+/// `collate()`'s error channel (#2691, Doomgoose finding #3). `kNotFoundOrDenied`
+/// deliberately conflates "unknown/expired correlation id" with "known but not
+/// owned by this principal" — existence must not become an enumeration oracle,
+/// so both map to the same caller-facing 404. `kDegraded` is a DISTINCT signal:
+/// the underlying ResponseStore read failed (store/pool/query error), which the
+/// caller must map to a retryable 503/kInternalError, never the same 404 a
+/// genuinely-absent bundle gets — conflating the two previously meant a poll
+/// hitting a transient store blip saw a terminal "not found" (and, on REST, a
+/// false "denied" audit row) instead of a signal to retry.
+enum class CollateError { kNotFoundOrDenied, kDegraded };
+
 class BundleOrchestrator {
 public:
     /// Per-command dispatcher — the SAME shape REST/MCP already use:
     /// returns {command_id, agents_reached}. agents_reached == 0 means the
     /// command did not reach any agent (offline) → that step is dispatch-failed.
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope,
         const std::unordered_map<std::string, std::string>& params,
-        const std::string& correlation_id)>;
+        const std::string& correlation_id,
+        // #1788: kept identical to McpServer::DispatchFn (the SAME lambda feeds
+        // both). The orchestrator never derives or re-decides this set itself
+        // (governance UP-8) — it threads through whatever `dispatch()`'s caller
+        // supplied unchanged; see that method's doc comment below.
+        //
+        // PR1.9c: this carries the whole CALLER, not just the visible set.
+        // `build_classified_command` refuses an empty `DispatchCaller::principal`
+        // as `AnonymousOperator` BEFORE the legacy-open bypass, so a
+        // VisibleSet-only shape made every bundle step undeliverable on both
+        // surfaces. `dispatch()` already receives `principal`, so the caller is
+        // assembled there — no new data crosses this boundary.
+        const yuzu::server::DispatchCaller& caller)>;
 
     /// Per-step audit sink, request-bound by the wrapper (so the core stays
     /// req-free). Called once per step with a transport-agnostic verb.
@@ -87,14 +114,45 @@ public:
     /// `bundle-…` correlation id, dispatches each step under it, records the
     /// step↔command_id map (with per-step dispatch outcome), audits each step,
     /// and returns immediately. `principal` owns the bundle (collate checks it).
+    ///
+    /// `exec_visible` is the CALLER's already-derived Execution:Execute visible
+    /// set (governance UP-8) — this method threads it into `DispatchFn`
+    /// unchanged for every step, it never derives or narrows it itself. The
+    /// wrapper (REST/MCP) has ALREADY confined `agent_id` before calling this
+    /// (the per-target scope gate — `scoped_perm_fn` on REST, `in_scope` on
+    /// MCP), so a defaulted `{}` (nullopt/unfiltered) preserves that model:
+    /// this orchestrator is not itself the confinement chokepoint, only a
+    /// faithful conduit for whichever caller-derived set the wrapper already
+    /// checked `agent_id` against.
+    ///
+    /// #1398 (adversarial-review finding, both reviewers independently):
+    /// `principal_is_admin`/`approval_provenance` are the SAME pass-through
+    /// contract as `exec_visible` above, for the two `DispatchCaller` fields
+    /// the dispatch chokepoint's `ExecuteGate` gate consults. Before this fix,
+    /// this method reconstructed a `DispatchCaller` carrying only `principal`
+    /// + `exec_visible`, so BOTH fields silently defaulted to `false`/`None`
+    /// regardless of who the real caller was — an admin's (or a
+    /// ticket-holding supervised MCP caller's) bundle step targeting any of
+    /// the ~42 `AdminOrApproval` pairs was refused `ApprovalRequired`
+    /// unconditionally, with no way to satisfy the gate via this surface at
+    /// all. Both wrappers already derive the caller's real values (the SAME
+    /// `derive_dispatch_caller`/`caller_fn` every other surface uses) before
+    /// calling this method; they must pass them through rather than let this
+    /// method drop them on the floor.
     DispatchResult dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
-                            const std::string& principal, const AuditSink& audit);
+                            const std::string& principal, const AuditSink& audit,
+                            const yuzu::server::authz::VisibleSet& exec_visible = {},
+                            bool principal_is_admin = false,
+                            ApprovalProvenance approval_provenance = ApprovalProvenance::None);
 
-    /// Collate the bundle's responses. Returns nullopt when the correlation id
-    /// is unknown/expired OR not owned by `principal` (and not `is_admin`) — the
-    /// caller maps nullopt to a 404 so existence isn't an enumeration oracle;
-    /// the real reason is audited by the wrapper.
-    [[nodiscard]] std::optional<BundleAggregate>
+    /// Collate the bundle's responses. Returns `unexpected(kNotFoundOrDenied)`
+    /// when the correlation id is unknown/expired OR not owned by `principal`
+    /// (and not `is_admin`) — the caller maps this to a 404 so existence isn't
+    /// an enumeration oracle; the real reason is audited by the wrapper.
+    /// Returns `unexpected(kDegraded)` when the manifest was found and owned
+    /// but the underlying ResponseStore read failed — the caller maps THIS to
+    /// a retryable 503/kInternalError, distinct from the terminal 404 above.
+    [[nodiscard]] std::expected<BundleAggregate, CollateError>
     collate(const std::string& correlation_id, const std::string& principal, bool is_admin);
 
     /// Correlation-id prefix. `notify_exec_tracker` skips ids with this prefix

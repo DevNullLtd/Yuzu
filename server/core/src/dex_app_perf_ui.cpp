@@ -27,6 +27,7 @@ namespace yuzu::server {
 
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_window_token(int window_days);
+std::string dex_subnav(const std::string& active, int window_days);
 
 namespace {
 
@@ -107,15 +108,43 @@ std::string spark(const std::vector<double>& vals) {
            "stroke-width=\"1.5\" points=\"" + pts + "\"/></svg>";
 }
 
+// Case-insensitive ASCII substring match helper — mirrors the ?q= search idiom
+// already used by the device list (device_routes.cpp's to_lower/matches).
+std::string ci_lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Best-effort Windows/Linux split for the picker's platform chips. `AppPerfAppSummary`
+// (app_perf_fleet_store.hpp) is keyed on (app_name, version, day) only — it carries
+// NO real platform column — so this is a NAME-SUFFIX heuristic, not an authoritative
+// field: a ".exe"-suffixed name is treated as Windows, anything else as Linux. It
+// cannot distinguish Linux from macOS, which is why the picker offers only
+// Windows/Linux chips (unlike the Catalogue OS filter's four). The rendered note
+// says so; revisit if/when a real per-app platform column lands.
+bool looks_windows(const std::string& app_name) {
+    const std::string lower = ci_lower(app_name);
+    return lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0;
+}
+
+// Canonical sort token — unrecognized/absent falls back to the default, mirroring
+// dex_window_token's validate-and-default idiom.
+std::string app_perf_sort_token(const std::string& sort) {
+    return (sort == "name" || sort == "versions") ? sort : "last_seen";
+}
+
 } // namespace
 
 std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& apps, bool truncated,
-                                       int window_days) {
+                                       int window_days, const std::string& q,
+                                       const std::string& platform, const std::string& sort) {
     const std::string w = dex_window_token(window_days);
+    const std::string plat = (platform == "windows" || platform == "linux") ? platform : "";
+    const std::string sortv = app_perf_sort_token(sort);
+
     std::string h;
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf?window=" + w +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Fleet performance</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("app_perf", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Application performance "
          "over time</h1></div><div class=\"gp-sub\">Per-application CPU &amp; memory across the "
          "fleet, broken out by version, over the retained window. Pick an application to compare "
@@ -128,9 +157,88 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
                                "opt-in (procperf_enabled, off by default) — enable it on the "
                                "devices you want to track.");
 
+    // -- Controls: search, platform, sort — CSP-safe (htmx core attrs only, no
+    // hx-on). Each control's hx-get carries every OTHER current param so a
+    // re-fetch never silently drops a sibling filter (the Catalogue OS-chip
+    // idiom in dex_routes.cpp). ------------------------------------------------
+    const std::string qs_plat = plat.empty() ? "" : "&platform=" + plat;
+    const std::string qs_q = q.empty() ? "" : "&q=" + url_encode(q);
+    const std::string qs_sort = "&sort=" + sortv;
+
+    h += "<div class=\"gp-filters\"><input name=\"q\" value=\"" + esc(q) +
+         "\" placeholder=\"Search applications\xE2\x80\xA6\" "
+         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+         "border-radius:.4rem;padding:.3rem .6rem;font-size:.78rem;min-width:220px\" "
+         "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort +
+         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+         "hx-trigger=\"keyup changed delay:300ms\"></div>";
+
+    {
+        auto chip = [&](const char* val, const char* label) {
+            const std::string on = (plat.empty() ? std::string("all") : plat) == val ? " on" : "";
+            const std::string val_qs = std::string(val) == "all" ? "" : "&platform=" + std::string(val);
+            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
+                   val_qs + qs_sort + qs_q +
+                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">Platform</span>" +
+             chip("all", "All") + chip("windows", "Windows") + chip("linux", "Linux") + "</div>";
+        h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.2rem\">Platform is "
+             "inferred from the app name (&quot;.exe&quot; = Windows) &mdash; it is not a "
+             "tracked field yet, so a mismatch is possible.</div>";
+    }
+
+    {
+        auto opt = [&](const char* val, const char* label) {
+            return "<option value=\"" + std::string(val) + "\"" +
+                   (sortv == val ? " selected" : "") + ">" + label + "</option>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">Sort</span><select name=\"sort\" "
+             "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_q +
+             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+             "border-radius:.35rem;padding:.15rem .4rem;\">" +
+             opt("last_seen", "Last seen (most recent)") + opt("name", "Name (A-Z)") +
+             opt("versions", "Versions (most first)") + "</select></div>";
+    }
+
+    // -- Filter + sort (in-memory over the fetched universe — see looks_windows) --
+    const std::string qlc = ci_lower(q);
+    std::vector<const AppPerfAppSummary*> filtered;
+    for (const auto& a : apps) {
+        if (!plat.empty() && looks_windows(a.app_name) != (plat == "windows"))
+            continue;
+        if (!qlc.empty() && ci_lower(a.app_name).find(qlc) == std::string::npos)
+            continue;
+        filtered.push_back(&a);
+    }
+    std::stable_sort(filtered.begin(), filtered.end(),
+                     [&](const AppPerfAppSummary* x, const AppPerfAppSummary* y) {
+                         if (sortv == "name")
+                             return ci_lower(x->app_name) < ci_lower(y->app_name);
+                         if (sortv == "versions")
+                             return x->versions > y->versions;
+                         return x->last_day > y->last_day; // last_seen (default)
+                     });
+
+    h += "<div class=\"gp-note\">" + std::to_string(filtered.size()) + " of " +
+         std::to_string(apps.size()) + " application" + (apps.size() == 1 ? "" : "s") +
+         (q.empty() ? "" : " match &quot;" + esc(q) + "&quot;") + "</div>";
+
+    if (filtered.empty()) {
+        h += placeholder("No applications match",
+                         q.empty() ? "No applications match the selected platform filter."
+                                  : "No applications match \"" + q + "\". Try a different search "
+                                    "term or clear the filters.");
+        return h;
+    }
+
     h += "<table class=\"gp-table\"><thead><tr><th>Application</th><th>Versions seen</th>"
          "<th>Last reported</th></tr></thead><tbody>";
-    for (const auto& a : apps) {
+    for (const auto* ap : filtered) {
+        const auto& a = *ap;
         h += "<tr><td>" +
              drill("/fragments/dex/perf/app?app=" + url_encode(a.app_name) + "&amp;window=" + w,
                    esc(a.app_name)) +
@@ -152,9 +260,14 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       const std::vector<AppPerfVersionSummary>& versions,
                                       const std::string& scope_group_id,
                                       const std::vector<DexGroupOption>& groups,
-                                      std::int64_t group_floor, int window_days) {
+                                      std::int64_t group_floor, int window_days,
+                                      const std::string& active_version,
+                                      const std::vector<std::string>& model_values,
+                                      const std::string& active_model) {
     const std::string w = dex_window_token(window_days);
     const bool is_group = !scope_group_id.empty();
+    const bool is_model = !is_group && !active_model.empty();
+    const bool is_filtered = !active_version.empty();
     std::string h;
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
@@ -170,6 +283,8 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 scope_name = esc(g.name);
                 break;
             }
+    } else if (is_model) {
+        scope_name = "devices modeled " + esc(active_model);
     }
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
          " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.85rem\">&mdash; by version, "
@@ -177,13 +292,43 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
          scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
          "headline is the most recent day.</div></div></div>";
 
+    // Version filter — click-through, not a dropdown: the only valid values are
+    // the versions already on screen, so a filtered version's own row links back
+    // to "All versions" and (below) each unfiltered row links to itself. Narrows
+    // server-side via the SAME `version` param the REST twin (`GET
+    // /dex/perf/app?version=`) accepts, an exact/canonicalized match — never a
+    // client-side slice of a wider fetch.
+    // Named-cohort query-string suffix shared by every link below (version
+    // filter, scope-empty back-link, per-row narrow) — group and model are
+    // mutually exclusive so exactly one (or neither) is ever appended.
+    const std::string cohort_qs = is_group ? "&amp;group=" + url_encode(scope_group_id)
+                                  : is_model ? "&amp;model=" + url_encode(active_model)
+                                             : "";
+    if (is_filtered) {
+        const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w + cohort_qs;
+        h += "<div class=\"gp-note\">Filtered to version <span style=\"font-family:var(--mono)\">" +
+             esc(active_version) + "</span> &mdash; " +
+             drill("/fragments/dex/perf/app?" + all_qs, "all versions &rarr;") + "</div>";
+    }
+
+    // Reverse cross-link to the crash/hang blast radius — same process-image key
+    // (app_name), exact match, no normalization (symmetric twin of the forward
+    // link on the Apps-tab detail page).
+    h += "<div class=\"gp-note\">" +
+         drill("/fragments/dex/app?name=" + url_encode(app_name) + "&amp;window=" + w,
+               "Crashes &amp; hangs for this application &rarr;") +
+         "</div>";
+
     // -- Scope selector (CSP-safe: htmx hx-get on change sends the select's
     // name=value, appended to the URL query — the proven cohort-picker idiom).
     if (!groups.empty()) {
-        const std::string base = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
-                                 "&amp;window=" + w;
+        std::string base = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
+                           "&amp;window=" + w;
+        if (is_filtered)
+            base += "&amp;version=" + url_encode(active_version); // preserve the version filter
         h += "<div class=\"gp-note\">Scope: <select name=\"group\" hx-get=\"" + base +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "hx-sync=\"#guardian-detail:replace\" "
              "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
              "border-radius:.35rem;padding:.15rem .4rem;\">";
         h += "<option value=\"\"" + std::string(is_group ? "" : " selected") +
@@ -196,12 +341,66 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         h += "</select></div>";
     }
 
-    if (versions.empty())
-        return h + placeholder("No performance history for this application",
-                               is_group ? "No member of this group reported retained performance "
-                                          "for this application in the window."
-                                        : "No device reported retained performance for this "
-                                          "application in the window.");
+    // Device-model cohort selector — independent of, and mutually exclusive
+    // with, the management-group one above (see this function's header
+    // comment): its own `hx-get` base carries no `group=`, so picking a model
+    // value always drops any active group scope, and vice versa.
+    if (!model_values.empty()) {
+        std::string mbase = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
+                            "&amp;window=" + w;
+        if (is_filtered)
+            mbase += "&amp;version=" + url_encode(active_version);
+        h += "<div class=\"gp-note\">Model: <select name=\"model\" hx-get=\"" + mbase +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "hx-sync=\"#guardian-detail:replace\" "
+             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+             "border-radius:.35rem;padding:.15rem .4rem;\">";
+        h += "<option value=\"\"" + std::string(is_model ? "" : " selected") +
+             ">Whole fleet</option>";
+        for (const auto& mv : model_values) {
+            const bool on = is_model && mv == active_model;
+            h += "<option value=\"" + esc(mv) + "\"" + (on ? " selected" : "") + ">" + esc(mv) +
+                 "</option>";
+        }
+        h += "</select></div>";
+    } else {
+        // #4857 D1: `fleet_snapshot` has no degrade channel, so a genuine
+        // zero-cohort-population read never claims a "degraded" state.
+        // Reaching THIS branch does NOT mean `dex_perf_api_` is unwired —
+        // the caller (dex_routes.cpp's route handler) already returned an
+        // "unavailable" placeholder earlier in that case, before this
+        // model-selector code runs at all; an unwired API never reaches
+        // here. Governance round-2 (G8-2, cpp-expert): the empty
+        // `model_values` this branch renders for is NOT uniformly "devices
+        // reporting with no model tag" — it is equally reached when ZERO
+        // devices report anything this cycle at all (a genuinely empty
+        // fleet snapshot, e.g. `DexPerfFn` returning no devices), which is
+        // not "reporting devices, just untagged". The wording below is
+        // deliberately neutral over both causes rather than presupposing
+        // reporting devices exist (the untagged residual is deliberately
+        // excluded from `model_values` either way, see the caller's
+        // comment) — disclose the absence honestly rather than silently
+        // omitting the selector (the pre-#4857 `TagValuesFn` convention this
+        // replaces).
+        h += "<div class=\"gp-note\">Model: no device-model values in the current fleet "
+             "snapshot.</div>";
+    }
+
+    if (versions.empty()) {
+        std::string empty_sub =
+            is_group ? "No member of this group reported retained performance for this "
+                       "application in the window."
+            : is_model ? "No device of this model reported retained performance for this "
+                        "application in the window."
+                     : "No device reported retained performance for this application in the "
+                       "window.";
+        if (is_filtered) {
+            const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w + cohort_qs;
+            h += "<div class=\"gp-note\">" +
+                 drill("/fragments/dex/perf/app?" + all_qs, "&larr; all versions") + "</div>";
+        }
+        return h + placeholder("No performance history for this application", empty_sub);
+    }
 
     // The version with the most recent day is tagged "latest" (a factual cue, not
     // a verdict) — compute the max latest_day once.
@@ -217,9 +416,20 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 ? " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);"
                   "border-radius:.3rem;padding:.03rem .35rem;font-weight:700\">latest</span>"
                 : "";
-        const std::string ver = v.version.empty() ? "<span class=\"gp-mute\">(no version)</span>"
-                                                  : "<span style=\"font-family:var(--mono)\">" +
-                                                        esc(v.version) + "</span>";
+        // Narrow-to-this-version link — skipped when already filtered (only one
+        // row anyway) or for the "(no version)" bucket, whose empty string can't
+        // be expressed as `?version=` without colliding with "unfiltered".
+        std::string ver;
+        if (v.version.empty()) {
+            ver = "<span class=\"gp-mute\">(no version)</span>";
+        } else if (is_filtered) {
+            ver = "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
+        } else {
+            std::string qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
+                             "&amp;version=" + url_encode(v.version) + cohort_qs;
+            ver = drill("/fragments/dex/perf/app?" + qs,
+                        "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
+        }
         if (v.suppressed) {
             // Sub-floor named-group slice → count only (works-council floor).
             h += "<tr><td>" + ver + tag +
@@ -228,10 +438,37 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                  "withheld)</td><td>" + std::to_string(v.device_count) + "</td></tr>";
             continue;
         }
+        // Devices-cell click-to-expand: fleet-wide ONLY (neither is_group nor
+        // is_model). A named-cohort-scoped trend (management group OR device
+        // model) does not (yet) narrow the version-devices drill to the
+        // cohort's own members — showing the affordance there would silently
+        // widen what "devices" means for that row (see dex_routes.cpp's route
+        // registration comment for the v1-scope reason), so it is omitted
+        // rather than shown-but-wrong. `hx-target="closest tr" hx-swap="afterend"`
+        // inserts the server's returned `<tr>` immediately below THIS row with
+        // no pre-existing placeholder and no client JS; `hx-trigger="click once"`
+        // means a second click is a no-op (reveal-only, no collapse — matches
+        // this row's own "latest tag" simplicity bar).
+        std::string devices_cell = std::to_string(v.device_count);
+        if (!is_group && !is_model) {
+            // `version=` with an EXPLICITLY EMPTY value is unambiguous here (unlike
+            // the trend's own version-filter link above): this route requires
+            // `version` PRESENT (not merely non-empty) and treats "" as the valid
+            // "unknown version" bucket, never "unfiltered" — so the `(no version)`
+            // row gets the affordance too (the ONLY bucket Linux procperf ever
+            // reports, tar_proc_perf.cpp).
+            const std::string devices_qs =
+                "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
+            devices_cell += " <a style=\"cursor:pointer;font-size:.68rem\" class=\"gp-mute\" "
+                            "hx-get=\"/fragments/dex/perf/app/devices?" +
+                            devices_qs +
+                            "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
+                            "hx-trigger=\"click once\">&#9656; devices</a>";
+        }
         h += "<tr><td>" + ver + tag + "</td><td>" + fmt_pct(v.cpu_mean) + "</td><td>" +
              pctile_cell(v.cpu_p95) + "</td><td>" + spark(v.cpu_series) + "</td><td>" +
-             fmt_bytes(static_cast<double>(v.ws_mean)) + "</td><td>" +
-             std::to_string(v.device_count) + "</td></tr>";
+             fmt_bytes(static_cast<double>(v.ws_mean)) + "</td><td>" + devices_cell +
+             "</td></tr>";
     }
     h += "</tbody></table>";
 
@@ -242,14 +479,56 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         "histogram (device p95s can't be averaged), shown as &ldquo;&ge; value&rdquo; when it "
         "lands in the open top bucket. <b>CPU trend</b> is the daily mean over the retained "
         "history. Per-version crashes/hangs are deferred (a separate crash store).";
-    if (is_group)
-        foot += " This is a <b>named group of specific devices</b>, so any version whose latest "
-                "day covers fewer than " +
+    if (is_group || is_model)
+        foot += " This is a <b>named cohort of specific devices</b>" +
+                std::string(is_model ? " (device model)" : " (management group)") +
+                ", so any version whose latest day covers fewer than " +
                 std::to_string(group_floor) +
-                " devices shows its count only (works-council co-determination). Group scope reads "
+                " devices shows its count only (works-council co-determination). Cohort scope reads "
                 "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
-                "<b>180-day</b> aggregate, so a group series is shorter for the same app.";
+                "<b>180-day</b> aggregate, so a cohort series is shorter for the same app.";
+    else
+        foot += " &ldquo;&#9656; devices&rdquo; on a version row lists the devices where this "
+                "exact version was among the device's own top resource consumers — not a full "
+                "inventory of every device running it, and per-device data is retained only 31 "
+                "days (shorter than this 180-day trend), so an old version row can legitimately "
+                "list none.";
     h += "<div class=\"gp-note\">" + foot + "</div>";
+    return h;
+}
+
+std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersionDeviceRow>& devices,
+                                                bool truncated) {
+    if (devices.empty()) {
+        // Two independent, equally-legitimate reasons collapse to the identical
+        // empty state (deliberately combined rather than guessed apart — see
+        // this fn's own doc comment in dex_app_perf_ui.hpp): the top-N sampling
+        // simply never named this app-version, OR the per-device (B1, 31-day)
+        // data has aged out even though the fleet trend (B2, 180-day) still
+        // shows it.
+        return "<div class=\"gp-note\">No device reported this exact app/version among its "
+               "retained top resource consumers. Either the device's daily top-N sampling "
+               "(procperf) never picked this app-version as resource-significant on any "
+               "reporting device, or this version's per-device data has aged past the "
+               "<b>31-day</b> retention window even though the fleet trend above covers up to "
+               "<b>180 days</b> &mdash; the two stores retain independently.</div>";
+    }
+    std::string h = "<table class=\"gp-table\" style=\"margin:.3rem 0 0 1.2rem;width:auto\">"
+                    "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
+                    "<th>Working set</th></tr></thead><tbody>";
+    for (const auto& d : devices) {
+        h += "<tr><td style=\"font-family:var(--mono);font-size:.78rem\">" + esc(d.agent_id) +
+             "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
+             fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">Devices where this exact "
+         "app-version was among the device's own top resource consumers &mdash; <b>not a full "
+         "inventory</b> of every device running it. &ldquo;Last seen&rdquo; is this version's "
+         "most recent reported day within the 31-day per-device retention.</div>";
+    if (truncated)
+        h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">List capped &mdash; showing "
+             "the highest-CPU devices only; more devices reported this version than shown.</div>";
     return h;
 }
 

@@ -1,7 +1,9 @@
 #include "discover_routes.hpp"
 
 #include "agent_registry.hpp"
+#include "bundled_content.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
 
@@ -14,6 +16,75 @@ namespace yuzu::server {
 namespace {
 
 using json = nlohmann::json;
+
+// Parsed once, shared by plugin_docs_catalog() and the /discover/plugins join.
+// A manifest that fails to parse is skipped and COUNTED — the catalog reports
+// `skipped_invalid` so an embed defect is visible to the reader, never a
+// silent gap — although embed_content.py already refuses to emit one, so the
+// count is expected to stay 0.
+DiscoveryDoc build_discovery_doc(json body); // forward decl: PluginDocsIndex below needs it
+                                               // per-manifest, ahead of its definition at file scope.
+
+struct PluginDocsIndex {
+    std::vector<json> manifests; // embed order (name-sorted by the embedder)
+    std::unordered_map<std::string, json> summary_by_name;
+    // Per-plugin manifest, pre-serialised with its own content ETag — same
+    // builder/idiom as the whole-catalog doc, so REST/MCP twins for
+    // /discover/plugin-docs/{name} serve byte-identical bytes to the matching
+    // plugins[] element (#4108).
+    std::unordered_map<std::string, DiscoveryDoc> manifest_by_name;
+    int skipped_invalid{0};
+};
+
+const PluginDocsIndex& plugin_docs_index() {
+    static const PluginDocsIndex idx = [] {
+        PluginDocsIndex out;
+        for (const auto& text : kBundledPluginDocs) {
+            auto m = json::parse(text, nullptr, /*allow_exceptions=*/false);
+            // The generator always writes name, description, platforms and
+            // readme; a manifest missing any of them is not one it produced, so
+            // it is skipped and counted rather than repaired here (the path
+            // rule has one home: plugin_doc_gen.py). Every key this index reads
+            // is checked here — nlohmann's value() throws on a present key of
+            // the wrong type, and a throw from this initialiser would 500
+            // every surface built on this index (the whole-catalog and
+            // per-plugin REST routes, the matching MCP resource and resource
+            // template, and the discover_plugins join) on every request.
+            const auto is_str = [&m](const char* key) {
+                return m.contains(key) && m[key].is_string();
+            };
+            const auto is_obj = [&m](const char* key) {
+                return m.contains(key) && m[key].is_object();
+            };
+            if (m.is_discarded() || !m.is_object() || !is_str("name") || !is_str("readme") ||
+                !is_str("description") || !is_obj("platforms") || !is_obj("kind")) {
+                ++out.skipped_invalid;
+                spdlog::warn("discover/plugin-docs: skipping embedded manifest #{} ({}…): not a JSON "
+                             "object with string name/description/readme and object platforms/kind",
+                             out.manifests.size() + out.skipped_invalid, text.substr(0, 64));
+                continue;
+            }
+            const std::string name = m["name"].get<std::string>();
+            // The summary is what discover_plugins joins per plugin: enough for
+            // an agentic caller to decide whether to read the full resource —
+            // what it is, whether it mutates, where it runs, where the README is.
+            // "resource" names the narrow per-plugin read path (#4108), not the
+            // whole catalog, matching the summary's own stated purpose.
+            json summary = {
+                {"summary", m["description"]},
+                {"kind", m["kind"]},
+                {"platforms", m["platforms"]},
+                {"readme", m["readme"]},
+                {"resource", "yuzu://plugin-docs/" + name},
+            };
+            out.summary_by_name.emplace(name, std::move(summary));
+            out.manifest_by_name.emplace(name, build_discovery_doc(m));
+            out.manifests.push_back(std::move(m));
+        }
+        return out;
+    }();
+    return idx;
+}
 
 // FNV-1a 64-bit content hash -> a strong ETag, same idiom as
 // guardian_schema_registry.cpp's content_etag (not shared directly — that
@@ -39,9 +110,42 @@ DiscoveryDoc build_discovery_doc(json body) {
 
 // Serve `doc` through the standard ETag / Cache-Control / 304 contract
 // (mirrors GET /api/v1/guaranteed-state/schemas, rest_api_v1.cpp).
-void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc) {
+/// Whether a discovery document is the SAME for every caller, or varies with the
+/// caller's own authorization.
+///
+/// This distinction is a security control, not a performance tunable (#2376,
+/// adversarial-review CDX-P2-002). A route whose body depends on the caller's
+/// permissions serves two different representations under ONE URL. Marked
+/// `public`, a shared/intermediary cache may store the privileged
+/// representation and hand it to an unprivileged caller — which walks the
+/// protected half straight across the authorization boundary that the
+/// per-request permission probe just enforced. `private` forbids shared caches
+/// from storing it at all; `Vary` additionally keeps a caller-local cache from
+/// reusing one credential's response for another.
+///
+/// Getting this wrong is invisible in every unit test — the handler returns the
+/// correct body to each caller, and the leak happens in an intermediary nobody
+/// mocks. Choose deliberately when adding a discovery route: if ANY part of the
+/// body is gated on the caller's grants, it is `PerCaller`.
+enum class DocAudience {
+    Everyone,  ///< identical for all callers — safe to share
+    PerCaller, ///< varies with the caller's grants — never shareable
+};
+
+void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc,
+               DocAudience audience) {
     res.set_header("ETag", doc.etag);
-    res.set_header("Cache-Control", "public, max-age=300");
+    if (audience == DocAudience::PerCaller) {
+        res.set_header("Cache-Control", "private, max-age=300");
+        // All THREE credential channels this server accepts must be named, or a
+        // caller-local cache keyed on the named ones alone can serve caller A's
+        // representation to caller B. `X-Yuzu-Token` was missing (Hermes pass 2):
+        // two API-token callers send neither Cookie nor Authorization, so their
+        // cache keys were identical. See auth_routes.cpp's credential resolution.
+        res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
+    } else {
+        res.set_header("Cache-Control", "public, max-age=300");
+    }
     if (req.get_header_value("If-None-Match") == doc.etag) {
         res.status = 304;
         return;
@@ -53,31 +157,65 @@ void serve_doc(const httplib::Request& req, httplib::Response& res, const Discov
 
 // ── /discover/permissions ──────────────────────────────────────────────────
 
-DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store) {
-    json roles_arr = json::array();
-    for (const auto& role : rbac_store.list_roles()) {
-        json perms_arr = json::array();
-        for (const auto& p : rbac_store.get_role_permissions(role.name)) {
-            perms_arr.push_back({{"securable_type", p.securable_type},
-                                 {"operation", p.operation},
-                                 {"effect", p.effect}});
-        }
-        roles_arr.push_back({{"name", role.name},
-                             {"description", role.description},
-                             {"is_system", role.is_system},
-                             {"permissions", std::move(perms_arr)}});
-    }
-
+DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles) {
+    // #2376: the catalogue is TWO things with different sensitivities, and the
+    // split is the whole point of this parameter.
+    //
+    //   * the TAXONOMY (`securable_types`, `operations`) — a static list of what
+    //     the RBAC model can express. Not authorization topology: it says nothing
+    //     about who holds what, and an agentic worker needs it to author a grant
+    //     at all (A2 discovery). Stays readable at the route's `Infrastructure:Read`.
+    //
+    //   * the ROLE GRID (`roles[].permissions[]`) — every role's actual granted
+    //     securable/operation/effect. That IS the authorization topology the
+    //     #2376 floor exists to protect, and it is strictly MORE than
+    //     `GET /api/v1/rbac/roles` discloses, which the floor already gates on
+    //     `UserManagement:Read`. Serving it here on the route's broader
+    //     `Infrastructure:Read` made this an alternate transport around the
+    //     floor: on an RBAC-off install (the default) the legacy fallback allows
+    //     every `Read` to any authenticated session, so a plain `user` refused at
+    //     /rbac/roles could read the entire grid here instead.
+    //
+    // Found by the adversarial-review panel (Codex) AFTER a 14-agent governance
+    // run passed the change — that run verified coverage of the floored
+    // SECURABLES and never asked which OTHER securable reaches the same DATA.
+    // Do not re-merge these two halves under one gate.
     json body = {
         {"version", 1},
         {"description",
          "RBAC permission catalog: every securable_type x operation pair the RBAC "
-         "store recognizes, plus the full role -> allowed-operations grid. "
-         "Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
+         "store recognizes. The full role -> allowed-operations grid is included "
+         "only for callers holding UserManagement:Read (#2376 authorization-topology "
+         "floor). Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
         {"securable_types", rbac_store.list_securable_types()},
         {"operations", rbac_store.list_operations()},
-        {"roles", std::move(roles_arr)},
     };
+
+    if (include_roles) {
+        json roles_arr = json::array();
+        for (const auto& role : rbac_store.list_roles()) {
+            json perms_arr = json::array();
+            for (const auto& p : rbac_store.get_role_permissions(role.name)) {
+                perms_arr.push_back({{"securable_type", p.securable_type},
+                                     {"operation", p.operation},
+                                     {"effect", p.effect}});
+            }
+            roles_arr.push_back({{"name", role.name},
+                                 {"description", role.description},
+                                 {"is_system", role.is_system},
+                                 {"permissions", std::move(perms_arr)}});
+        }
+        body["roles"] = std::move(roles_arr);
+    } else {
+        // Say so EXPLICITLY rather than omitting silently. An agentic worker that
+        // cannot tell "no roles exist" from "you may not see them" will report the
+        // fleet has no RBAC roles — the same absent-vs-empty trap the upgrade note
+        // warns evidence collectors about.
+        body["roles_omitted"] = true;
+        body["roles_omitted_reason"] =
+            "requires UserManagement:Read (#2376 authorization-topology floor); "
+            "the securable_types and operations taxonomy above is unaffected";
+    }
     return build_discovery_doc(std::move(body));
 }
 
@@ -89,13 +227,42 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
                            // no visible flag would be the misleading option here.
     q.limit = 5000;        // generous ceiling for a catalog read, not a paged list.
 
-    auto defs = instruction_store.query_definitions(q);
+    // ADR-0058: query_definitions now returns std::expected — a genuine DB error is
+    // surfaced as a thrown exception, which the sole caller (discover_routes.cpp's
+    // /api/v1/discover/instructions handler) already catches and turns into a 503
+    // (discover_503), matching this file's established degrade idiom (see
+    // build_plugins_catalog's identical pattern below).
+    auto defs_result = instruction_store.query_definitions(q);
+    if (!defs_result)
+        throw std::runtime_error(defs_result.error());
+    const auto& defs = *defs_result;
 
     json arr = json::array();
     for (const auto& d : defs) {
-        json param_schema; // null unless the stored value parses as JSON
+        // #2437-class guard: parameter_schema is stored VERBATIM at write
+        // time (instruction_store.cpp import path) with no depth check
+        // until this branch's own write-side guard shipped - a row written
+        // before that, or via any other write path, still reaches this
+        // read. nlohmann::json::parse handles very deep input fine, so
+        // parsed.is_object() below would be true and the poisoned tree
+        // would be moved into this array unnoticed; build_discovery_doc's
+        // body.dump() further down is the unboundedly recursive call that
+        // would then SIGSEGV the whole catalog response for every OTHER
+        // definition too. Exclude the poisoned definition instead of
+        // crashing the build; log its id, never its payload.
+        if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("discover/instructions: excluding instruction definition {} - "
+                         "parameter_schema nests too deeply (#2437-class)",
+                         d.id);
+            continue;
+        }
+        json param_schema; // null unless the stored value parses as a JSON object
         auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
-        if (!parsed.is_discarded())
+        // Attach only an OBJECT schema — a stored value that parses to
+        // null/number/array/string is not a usable JSON Schema (UP-9), and
+        // the #2986 typed outputSchema for this field advertises only
+        // object/null (mcp_server.cpp). Mirrors discover_plugins below.
+        if (!parsed.is_discarded() && parsed.is_object())
             param_schema = std::move(parsed);
 
         arr.push_back({
@@ -267,6 +434,43 @@ const DiscoveryDoc& scope_kinds_catalog() {
 
 // ── /discover/plugins ───────────────────────────────────────────────────────
 
+const DiscoveryDoc& plugin_docs_catalog() {
+    static const DiscoveryDoc doc = [] {
+        const auto& idx = plugin_docs_index();
+        json body = {
+            {"catalog", "plugin-docs"},
+            {"version", 1},
+            {"source", "build-embedded"},
+            {"description",
+             "Per-plugin documentation as data: one manifest per agent plugin that has "
+             "adopted the README standard (docs/plugin-readme-standard.md), generated by "
+             "tools/plugin-doc-gen from agents/plugins/<name>/README.md and embedded at build "
+             "time. Each manifest carries how the plugin works, per-OS support/rung/mechanism "
+             "per action, privileges, inputs, output columns with vocabularies, sample rows, "
+             "caveats and source paths. Compiled-in content only — never fleet-derived. A "
+             "plugin absent here has not adopted the standard yet; GET /discover/plugins "
+             "reports docs:null for it. Same bytes as the MCP resource yuzu://plugin-docs."},
+            {"plugin_count", idx.manifests.size()},
+            {"skipped_invalid", idx.skipped_invalid},
+            {"plugins", idx.manifests},
+        };
+        return build_discovery_doc(std::move(body));
+    }();
+    return doc;
+}
+
+const json* plugin_docs_summary(std::string_view plugin_name) {
+    const auto& idx = plugin_docs_index();
+    auto it = idx.summary_by_name.find(std::string{plugin_name});
+    return it == idx.summary_by_name.end() ? nullptr : &it->second;
+}
+
+const DiscoveryDoc* plugin_docs_manifest(std::string_view plugin_name) {
+    const auto& idx = plugin_docs_index();
+    auto it = idx.manifest_by_name.find(std::string{plugin_name});
+    return it == idx.manifest_by_name.end() ? nullptr : &it->second;
+}
+
 DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& agent_registry,
                                    InstructionStore* instruction_store) {
     auto help = json::parse(agent_registry.help_json(), nullptr, /*allow_exceptions=*/false);
@@ -280,18 +484,36 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
     int enriched = 0;
     if (instruction_store) {
         std::unordered_map<std::string, json> schema_by_action;
-        // Enrichment is BEST-EFFORT: a store read that throws (SQLite/PG error)
-        // degrades to name+description only rather than failing the whole catalog,
-        // so the MCP tool path — which has no route-level try/catch — cannot 500
-        // on it (UP-6). query_definitions returns {} on a closed handle without
-        // throwing; this guards the genuine-error case.
+        // Enrichment is BEST-EFFORT: a store read that throws (ADR-0058: a genuine
+        // std::expected DB error is turned into a throw immediately below) degrades to
+        // name+description only rather than failing the whole catalog, so the MCP tool
+        // path — which has no route-level try/catch — cannot 500 on it (UP-6).
         try {
             InstructionQuery q;
             q.enabled_only = true;
             q.limit = 5000;
-            for (const auto& d : instruction_store->query_definitions(q)) {
+            // ADR-0058: query_definitions now returns std::expected; a genuine DB error
+            // throws (caught immediately below), matching the pre-migration comment's
+            // already-stated intent for this exact best-effort enrichment path.
+            auto defs_result = instruction_store->query_definitions(q);
+            if (!defs_result)
+                throw std::runtime_error(defs_result.error());
+            for (const auto& d : *defs_result) {
                 if (d.plugin.empty() || d.action.empty())
                     continue;
+                // #2437-class guard: same hazard as build_instructions_catalog
+                // above - a too-deep stored parameter_schema would otherwise be
+                // moved into schema_by_action below, spliced into an action's
+                // entry further down, and crash on this catalog's own
+                // build_discovery_doc dump(). Skip enrichment for just this
+                // action rather than the whole catalog build; log the
+                // definition id, never its payload.
+                if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+                    spdlog::warn("discover/plugins: excluding parameter_schema enrichment for "
+                                "instruction definition {} - nests too deeply (#2437-class)",
+                                d.id);
+                    continue;
+                }
                 auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
                 // Attach only an OBJECT schema — a stored value that parses to
                 // null/number/array/string is not a usable JSON Schema (UP-9).
@@ -321,15 +543,34 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
         }
     }
 
+    // Documentation join (docs/plugin-readme-standard.md rule 10): every
+    // observed plugin carries a build-embedded `docs` summary when a manifest
+    // exists for it, else an explicit null — so a reader can tell "documented,
+    // read yuzu://plugin-docs" from "not yet documented" without a second
+    // request. Catalog version 3 (2 -> 3: the `docs` key).
+    if (plugins.is_array()) {
+        for (auto& p : plugins) {
+            if (!p.is_object())
+                continue;
+            const auto* summary = plugin_docs_summary(p.value("name", ""));
+            p["docs"] = summary ? *summary : json(nullptr);
+        }
+    }
+
     json body = {
-        {"version", 2},
+        {"version", 3},
         {"description",
          "Plugin/action catalog observed across currently-connected agents "
          "(deduplicated by plugin name; the richest reported action list wins). "
          "NOT a build-time manifest — a plugin no currently-connected agent "
          "reports is absent from this list. To dispatch an action, call "
          "execute_instruction / POST /api/v1/instructions/execute with its "
-         "plugin+action; supply the params from parameter_schema where present."},
+         "plugin+action; supply the params from parameter_schema where present. "
+         "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
+         "readme, resource} when the plugin has adopted the README standard, else "
+         "null; resource names that plugin's own GET /discover/plugin-docs/<name> / "
+         "yuzu://plugin-docs/<name> for the full manifest, or read the whole catalog "
+         "at GET /discover/plugin-docs / yuzu://plugin-docs."},
         {"limitation",
          "An action carries an inline parameter_schema ONLY when it has a "
          "published InstructionDefinition (matched on plugin+action). Actions "
@@ -377,7 +618,18 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // A corrupt/locked store row can throw mid-scan — a raw 500 would
                  // break the A4 contract this surface teaches (governance UP-11).
                  try {
-                     serve_doc(req, res, build_permissions_catalog(*rbac_store));
+                     // Probe for the grid permission with a throwaway response
+                     // (the established idiom — see the quarantine per-record
+                     // admit probe in rest_api_v1.cpp). A denial here must NOT
+                     // 403 the route: the taxonomy is still served.
+                     httplib::Response probe;
+                     const bool include_roles =
+                         perm_fn(req, probe, "UserManagement", "Read");
+                     serve_doc(req, res,
+                               build_permissions_catalog(*rbac_store, include_roles),
+                               // PerCaller: the role grid is present only for a
+                               // UserManagement:Read holder (see the probe above).
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -392,7 +644,8 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                      return;
                  }
                  try {
-                     serve_doc(req, res, build_instructions_catalog(*instruction_store));
+                     serve_doc(req, res, build_instructions_catalog(*instruction_store),
+                               DocAudience::Everyone);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -405,14 +658,43 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // openapi_spec_json() is compiled-in — no store dependency, always
                  // answerable (matches the scope-kinds "answers even when everything
                  // else is down" property).
-                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()));
+                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()), DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/scope-kinds",
              [perm_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 serve_doc(req, res, scope_kinds_catalog());
+                 serve_doc(req, res, scope_kinds_catalog(), DocAudience::Everyone);
+             });
+
+    // Plugin README standard (docs/plugin-readme-standard.md rule 10): the
+    // build-embedded per-plugin manifests. Static like scope-kinds — no store,
+    // answers during warmup — and caller-independent, so publicly cacheable.
+    sink.Get("/api/v1/discover/plugin-docs",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Infrastructure", "Read"))
+                     return;
+                 serve_doc(req, res, plugin_docs_catalog(), DocAudience::Everyone);
+             });
+
+    // Per-plugin narrow read (#4108): same manifest_by_name builder as the MCP
+    // resource template yuzu://plugin-docs/{name}. Gate BEFORE the lookup so a
+    // denied caller learns nothing about which plugin names exist.
+    sink.Get(R"(/api/v1/discover/plugin-docs/([^/]+))",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Infrastructure", "Read"))
+                     return;
+                 const auto* doc = plugin_docs_manifest(req.matches[1].str());
+                 if (!doc) {
+                     res.status = 404;
+                     res.set_content(detail::a4_error(res, "no documentation manifest for that plugin",
+                                                       {.remediation = "GET /api/v1/discover/plugin-docs "
+                                                                       "lists the documented plugins"}),
+                                     "application/json");
+                     return;
+                 }
+                 serve_doc(req, res, *doc, DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/plugins",
@@ -439,7 +721,13 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                          enrich = instruction_store;
                  }
                  try {
-                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich));
+                     // PerCaller: `enrich` gates parameter_schema on the caller's
+                     // InstructionDefinition:Read. That has varied per caller since the
+                     // enrichment gate landed, so this route was publicly cacheable while
+                     // permission-varying BEFORE #2376 — a pre-existing instance of the
+                     // same class, fixed here because the fix is the shared helper.
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich),
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }

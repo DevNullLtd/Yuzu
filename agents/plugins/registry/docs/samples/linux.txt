@@ -1,0 +1,40 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 6255117edeb8
+== action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_value hive=HKCU key=Software\YuzuCaptureTmp name=probe value=1
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=delete_value hive=HKCU key=Software\YuzuCaptureTmp name=probe
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=delete_key hive=HKCU key=Software\YuzuCaptureTmp
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=key_exists hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=enumerate_keys hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=enumerate_values hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=get_user_value username=jsmith key=Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced name=Hidden
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_profiles
+registry|unsupported|Windows registry is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" -Force (admin session profile)
+date: 2026-09-06
+status: REAL CAPTURE

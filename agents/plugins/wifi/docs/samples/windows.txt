@@ -1,0 +1,8 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 08531a51b9d2
+== action=list_networks
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=connected
+connected|none|Not connected|0|none|none
+[result_status] UNDECLARED / UNKNOWN / 
+

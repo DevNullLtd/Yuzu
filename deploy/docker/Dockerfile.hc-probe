@@ -1,0 +1,18 @@
+# Probe listener for the healthcheck-invariant gate (#751).
+#
+# THIS IMAGE IS NEVER BUILT AND NEVER SHIPPED. The file exists so that the
+# busybox digest pin below lives somewhere Dependabot can actually see it:
+# its `docker` ecosystem scans /deploy/docker (.github/dependabot.yml) and parses
+# Dockerfiles, but it cannot scan a shell script. With the pin inlined in
+# scripts/ci/verify-healthcheck-invariants.sh it was the one image reference in
+# the repo with no update path — frozen on whatever CVEs busybox 1.37.0 carries,
+# running on the Big Tam host, with nothing to ever open a bump PR.
+#
+# scripts/ci/verify-healthcheck-invariants.sh reads the digest straight out of the
+# FROM line below, so a Dependabot bump here takes effect with no other change.
+#
+# Why the official busybox image and not alpine: Alpine's busybox is built WITHOUT
+# the `httpd` applet (it is split out into busybox-extras), so an alpine listener
+# exits immediately and every probe then fails for the wrong reason. This image's
+# busybox has httpd, which is what serves the 200 the probes need.
+FROM busybox:1.38@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616

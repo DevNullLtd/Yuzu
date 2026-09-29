@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -164,6 +165,19 @@ private:
     // Dispatch helper (applies debounce and calls dispatch_)
     void fire_trigger(const TriggerConfig& trigger);
 
+    /// Wait up to `d` for stop(), waking IMMEDIATELY when it is called. Returns true if the
+    /// engine is stopping, so a worker loop can `break` on it directly.
+    ///
+    /// Replaces the sleep_for() polling the loops used to do. A worker took up to 5s to notice
+    /// the stop flag (the non-Windows registry loop slept a full 5s per iteration for a loop
+    /// that does nothing at all), and stop() joins the workers SERIALLY -- which was most of an
+    /// 8.6-13.5s agent shutdown. Docker's default stop grace is 10s, so containerised agents
+    /// were being SIGKILLed mid-teardown.
+    [[nodiscard]] bool wait_for_stop(std::chrono::milliseconds d);
+
+    /// Park until stop() is called. For workers with no periodic work of their own.
+    void await_stop();
+
     // Query service status (platform-specific)
     static std::string query_service_status(const std::string& service_name);
 
@@ -172,6 +186,19 @@ private:
     mutable std::mutex mu_;
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
+
+    // Shutdown signalling for the worker loops.
+    //
+    // LOST-WAKEUP CONTRACT, both halves load-bearing: stop() clears running_ *under* stop_mu_
+    // and only then notifies, and wait_for_stop() evaluates its predicate under that same mutex
+    // before blocking. Clear running_ outside the mutex and a worker can test it (still true),
+    // then block -- after the notify has already fired -- and sleep out its full interval.
+    //
+    // NEVER hold stop_mu_ across the joins in stop(): the workers need it to evaluate the
+    // predicate and exit, so holding it there deadlocks the join against the very threads it
+    // is waiting on.
+    std::mutex stop_mu_;
+    std::condition_variable stop_cv_;
     DispatchFn dispatch_;
     size_t max_triggers_ = kDefaultMaxTriggers;
 

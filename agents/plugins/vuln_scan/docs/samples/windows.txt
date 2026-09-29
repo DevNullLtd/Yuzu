@@ -1,0 +1,296 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 20c66f1c0618
+== action=scan
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows PC Health Check 3.6.2204.08001 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows PC Health Check 3.6.2204.08001 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5003637)
+INFO|config|UAC (User Account Control)|Enabled
+CRITICAL|config|SMBv1 Protocol|Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)
+INFO|config|Auto-Logon|Disabled
+INFO|config|RDP Network Level Authentication|Enabled
+INFO|config|Windows Defender Real-Time Protection|Enabled
+INFO|config|Windows Firewall|Domain profile: Enabled
+INFO|config|Windows Firewall|Private profile: Enabled
+INFO|config|Windows Firewall|Public profile: Enabled
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=cve_scan
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows PC Health Check 3.6.2204.08001 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5004945)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 6.0.20 (x86) 6.0.20.32621 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x64) 8.0.28.36119 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Microsoft Windows Desktop Runtime - 8.0.28 (x86) 8.0.28.36119 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Update for x64-based Windows Systems (KB5001716) 8.94.0.0 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows 11 Installation Assistant 1.4.19041.5003 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows PC Health Check 3.6.2204.08001 (fixed in KB5003637)
+CRITICAL|cve|CVE-2021-1675: Print Spooler privilege escalation|Windows Subsystem for Linux 2.6.3.0 (fixed in KB5003637)
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=config_scan
+INFO|config|UAC (User Account Control)|Enabled
+CRITICAL|config|SMBv1 Protocol|Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)
+INFO|config|Auto-Logon|Disabled
+INFO|config|RDP Network Level Authentication|Enabled
+INFO|config|Windows Defender Real-Time Protection|Enabled
+INFO|config|Windows Firewall|Domain profile: Enabled
+INFO|config|Windows Firewall|Private profile: Enabled
+INFO|config|Windows Firewall|Public profile: Enabled
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=summary
+summary|TOTAL|24 findings (17 issues)
+summary|CRITICAL|17
+summary|HIGH|0
+summary|MEDIUM|0
+summary|LOW|0
+summary|INFO|7
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=inventory
+7-Zip 26.02 (x64)|26.02
+Age of Empires II: Definitive Edition|
+Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705
+Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705
+Baldur's Gate 3|
+Battle.net|
+CCleaner 7|7.10.1464.1889
+CMake|4.3.3
+Cities: Skylines II|
+Crusader Kings III|
+DayZ|
+Defraggler|2.22
+Diablo IV|
+DiagnosticsHub_CollectionService|17.14.36412
+Docker Desktop|4.84.0
+Erlang OTP 28.5.0.1 (16.4.0.1)|28.5.0.1
+Flawless Widescreen version 1.0.15|1.0.15
+Football Manager 2024|
+Git|2.54.0
+GitHub CLI|2.89.0
+Google Chrome|149.0.7827.201
+Google Update Helper|1.3.101.0
+HELLDIVERS™ 2|
+Kits Configuration Installer|10.1.26100.7705
+Logi Options+|2.6.944893
+Logi Plugin Service|6.4.0.3079
+MSI Development Tools|10.1.26100.7705
+Magic: The Gathering Arena|
+Manor Lords|
+Microsoft .NET Host - 6.0.11 (x64)|48.47.50420
+Microsoft .NET Host - 6.0.20 (x86)|48.83.63169
+Microsoft .NET Host - 8.0.28 (x64)|64.112.53549
+Microsoft .NET Host - 8.0.28 (x86)|64.112.53549
+Microsoft .NET Host FX Resolver - 6.0.11 (x64)|48.47.50420
+Microsoft .NET Host FX Resolver - 6.0.20 (x86)|48.83.63169
+Microsoft .NET Host FX Resolver - 8.0.28 (x64)|64.112.53549
+Microsoft .NET Host FX Resolver - 8.0.28 (x86)|64.112.53549
+Microsoft .NET Runtime - 6.0.11 (x64)|48.47.50420
+Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169
+Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549
+Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549
+Microsoft 365 Apps for enterprise - en-us|16.0.19822.20114
+Microsoft Edge|152.0.4191.66
+Microsoft Edge WebView2 Runtime|152.0.4191.66
+Microsoft GameInput|3.3.221.0
+Microsoft Teams Meeting Add-in for Microsoft Office|1.25.28902
+Microsoft Update Health Tools|5.72.0.0
+Microsoft Visual C++ 2005 Redistributable|8.0.61001
+Microsoft Visual C++ 2005 Redistributable (x64)|8.0.61000
+Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219|10.0.40219
+Microsoft Visual C++ 2010  x86 Redistributable - 10.0.40219|10.0.40219
+Microsoft Visual C++ 2012 Redistributable (x64) - 11.0.61030|11.0.61030.0
+Microsoft Visual C++ 2012 Redistributable (x86) - 11.0.61030|11.0.61030.0
+Microsoft Visual C++ 2012 x64 Additional Runtime - 11.0.61030|11.0.61030
+Microsoft Visual C++ 2012 x64 Minimum Runtime - 11.0.61030|11.0.61030
+Microsoft Visual C++ 2012 x86 Additional Runtime - 11.0.61030|11.0.61030
+Microsoft Visual C++ 2012 x86 Minimum Runtime - 11.0.61030|11.0.61030
+Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.30501|12.0.30501.0
+Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40664|12.0.40664.0
+Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.30501|12.0.30501.0
+Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.40664|12.0.40664.0
+Microsoft Visual C++ 2013 x64 Additional Runtime - 12.0.40664|12.0.40664
+Microsoft Visual C++ 2013 x64 Minimum Runtime - 12.0.40664|12.0.40664
+Microsoft Visual C++ 2013 x86 Additional Runtime - 12.0.40664|12.0.40664
+Microsoft Visual C++ 2013 x86 Minimum Runtime - 12.0.40664|12.0.40664
+Microsoft Visual C++ 2022 X64 Additional Runtime - 14.51.36247|14.51.36247
+Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211|14.44.35211
+Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247
+Microsoft Visual C++ 2022 X86 Additional Runtime - 14.51.36247|14.51.36247
+Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211|14.44.35211
+Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.51.36247|14.51.36247
+Microsoft Visual C++ v14 Redistributable (x64) - 14.51.36247|14.51.36247.0
+Microsoft Visual C++ v14 Redistributable (x86) - 14.51.36247|14.51.36247.0
+Microsoft Visual Studio Installer|4.7.25.22189
+Microsoft Visual Studio Setup Configuration|3.12.2140.44225
+Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225
+Microsoft Windows Application Compatibility Fix Database|
+Microsoft Windows Desktop Runtime - 6.0.11 (x64)|48.47.50419
+Microsoft Windows Desktop Runtime - 6.0.11 (x64)|6.0.11.31823
+Microsoft Windows Desktop Runtime - 6.0.20 (x86)|48.83.63194
+Microsoft Windows Desktop Runtime - 6.0.20 (x86)|6.0.20.32621
+Microsoft Windows Desktop Runtime - 8.0.28 (x64)|64.112.53617
+Microsoft Windows Desktop Runtime - 8.0.28 (x64)|8.0.28.36119
+Microsoft Windows Desktop Runtime - 8.0.28 (x86)|64.112.53617
+Microsoft Windows Desktop Runtime - 8.0.28 (x86)|8.0.28.36119
+Mozilla Firefox (x64 en-GB)|154.0.1
+Mozilla Maintenance Service|106.0.1
+NVIDIA AIUser Container|1.48
+NVIDIA App 11.0.8.299|11.0.8.299
+NVIDIA App driver settings|1.0
+NVIDIA Backend|11.0.8.299
+NVIDIA Container|1.48
+NVIDIA FrameView SDK 1.8.12612.38276700|1.8.12612.38276700
+NVIDIA Graphics Driver 610.74|610.74
+NVIDIA HD Audio Driver 1.4.5.7|1.4.5.7
+NVIDIA Install Application|2.1002.463.0
+NVIDIA LocalSystem Container|1.48
+NVIDIA MessageBus 3 for NvApp|3.21
+NVIDIA NvDLISR|1.0
+NVIDIA PhysX System Software 9.23.1019|9.23.1019
+NVIDIA Session Container|1.48
+NVIDIA ShadowPlay 11.0.8.0|11.0.8.0
+NVIDIA Telemetry Client|19.6.6.0
+NVIDIA User Container|1.48
+NVIDIA Virtual Audio 4.65.0.12|4.65.0.12
+NVIDIA Watchdog Plugin for NvContainer|1.48
+NordUpdater|1.5.0.997
+NordVPN|7.60.1.0
+NordVPN network TAP|1.0.1
+NordVPN network TUN|1.0.1
+Notepad++ (64-bit x64)|8.9.6.4
+Office 16 Click-to-Run Extensibility Component|16.0.19822.20104
+PUBG: BATTLEGROUNDS|
+Paradox Launcher v2|2.4.0
+PlayStation® Accessories|2.0.0.13
+PostgreSQL 18 |18.2-1
+Project Zomboid|
+Python 3.12.10 Add to Path (64-bit)|3.12.10150.0
+Python 3.12.10 Core Interpreter (64-bit)|3.12.10150.0
+Python 3.12.10 Development Libraries (64-bit)|3.12.10150.0
+Python 3.12.10 Documentation (64-bit)|3.12.10150.0
+Python 3.12.10 Executables (64-bit)|3.12.10150.0
+Python 3.12.10 Standard Library (64-bit)|3.12.10150.0
+Python 3.12.10 Tcl/Tk Support (64-bit)|3.12.10150.0
+Python 3.12.10 Test Suite (64-bit)|3.12.10150.0
+Python 3.12.10 pip Bootstrap (64-bit)|3.12.10150.0
+Python Launcher|3.12.10150.0
+Razer Synapse|3.9.0430.042305
+Razer Virtual Ring Light|2.0.0.23
+Realtek USB Audio|6.3.9600.2370
+RimWorld|
+SDK ARM64 Additions|10.1.26100.7705
+SDK ARM64 Redistributables|10.1.26100.7705
+Sid Meier's Civilization VII|
+Speccy|1.33
+Steam|2.10.91.91
+Stellaris|
+Sunless Sea|
+Tabletop Simulator|
+Tailscale|1.102.2
+Universal CRT Extension SDK|10.1.26100.7705
+Universal CRT Headers Libraries and Sources|10.1.26100.7705
+Universal CRT Redistributable|10.0.26624
+Universal CRT Redistributable|10.1.26100.7705
+Universal CRT Tools x64|10.1.26100.7705
+Universal CRT Tools x86|10.1.26100.7705
+Universal General MIDI DLS Extension SDK|10.1.26100.7705
+Update for x64-based Windows Systems (KB5001716)|8.94.0.0
+VS Script Debugging Common|17.0.157.0
+Valheim|
+Visual Studio Build Tools 2022|17.14.34
+Warhammer 40,000: Rogue Trader|
+Warhammer 40,000: Space Marine 2|
+WinAppDeploy|10.1.26100.7705
+WinRT Intellisense Desktop - Other Languages|10.1.26100.7705
+WinRT Intellisense Desktop - en-us|10.1.26100.7705
+WinRT Intellisense IoT - Other Languages|10.1.26100.7705
+WinRT Intellisense IoT - en-us|10.1.26100.7705
+WinRT Intellisense Mobile - en-us|10.1.26100.7705
+WinRT Intellisense PPI - Other Languages|10.1.26100.7705
+WinRT Intellisense PPI - en-us|10.1.26100.7705
+WinRT Intellisense UAP - Other Languages|10.1.26100.7705
+WinRT Intellisense UAP - en-us|10.1.26100.7705
+Windows 11 Installation Assistant|1.4.19041.5003
+Windows App Certification Kit Native Components|10.1.26100.7705
+Windows App Certification Kit SupportedApiList x86|10.1.26100.7705
+Windows App Certification Kit x64|10.1.26100.7705
+Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705
+Windows Desktop Extension SDK|10.1.26100.7705
+Windows Desktop Extension SDK Contracts|10.1.26100.7705
+Windows IoT Extension SDK|10.1.26100.7705
+Windows IoT Extension SDK Contracts|10.1.26100.7705
+Windows Mobile Extension SDK|10.1.26100.7705
+Windows Mobile Extension SDK Contracts|10.1.26100.7705
+Windows PC Health Check|3.6.2204.08001
+Windows SDK|10.1.26100.7705
+Windows SDK ARM64 Desktop Tools|10.1.26100.7705
+Windows SDK AddOn|10.1.0.0
+Windows SDK Desktop Headers arm64|10.1.26100.7705
+Windows SDK Desktop Headers x64|10.1.26100.7705
+Windows SDK Desktop Headers x86|10.1.26100.7705
+Windows SDK Desktop Libs arm64|10.1.26100.7705
+Windows SDK Desktop Libs x64|10.1.26100.7705
+Windows SDK Desktop Libs x86|10.1.26100.7705
+Windows SDK Desktop Tools arm64|10.1.26100.7705
+Windows SDK Desktop Tools x64|10.1.26100.7705
+Windows SDK Desktop Tools x86|10.1.26100.7705
+Windows SDK DirectX x64 Remote|10.1.26100.7705
+Windows SDK DirectX x86 Remote|10.1.26100.7705
+Windows SDK EULA|10.1.26100.7705
+Windows SDK Facade Windows WinMD Versioned|10.1.26100.7705
+Windows SDK Modern Non-Versioned Developer Tools|10.1.26100.7705
+Windows SDK Modern Versioned Developer Tools|10.1.26100.7705
+Windows SDK OnecoreUap Headers arm64|10.1.26100.7705
+Windows SDK OnecoreUap Headers x64|10.1.26100.7705
+Windows SDK OnecoreUap Headers x86|10.1.26100.7705
+Windows SDK Redistributables|10.1.26100.7705
+Windows SDK Signing Tools|10.1.26100.7705
+Windows SDK for Windows Store Apps|10.1.26100.7705
+Windows SDK for Windows Store Apps Contracts|10.1.26100.7705
+Windows SDK for Windows Store Apps DirectX x86 Remote|10.1.26100.7705
+Windows SDK for Windows Store Apps Headers|10.1.26100.7705
+Windows SDK for Windows Store Apps Headers OnecoreUap|10.1.26100.7705
+Windows SDK for Windows Store Apps Libs|10.1.26100.7705
+Windows SDK for Windows Store Apps Metadata|10.1.26100.7705
+Windows SDK for Windows Store Apps Tools|10.1.26100.7705
+Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705
+Windows Software Development Kit - Windows 10.0.26100.7705|10.1.26100.7705
+Windows Subsystem for Linux|2.6.3.0
+Windows Team Extension SDK|10.1.26100.7705
+Windows Team Extension SDK Contracts|10.1.26100.7705
+vcpp_crt.redist.clickonce|14.44.35211
+vs_CoreEditorFonts|17.7.40001
+vs_FileTracker_Singleton|17.14.36015
+vs_communitymsires|17.14.36015
+vs_communitysharedmsi|17.14.36025
+vs_communityx64msi|17.14.36025
+vs_filehandler_amd64|17.14.36024
+vs_filehandler_x86|17.14.36024
+vs_githubprotocolhandlermsi|17.14.36015
+vs_minshellinteropmsi|17.14.36015
+vs_minshellinteropsharedmsi|17.14.36015
+vs_minshellmsi|17.14.36301
+vs_minshellmsires|17.14.36015
+vs_minshellsharedmsi|17.14.36024
+vs_vswebprotocolselectormsi|17.14.36323
+[result_status] UNDECLARED / UNKNOWN / 
+

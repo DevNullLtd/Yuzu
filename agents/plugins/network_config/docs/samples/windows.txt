@@ -1,0 +1,191 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 3b5c27bfec23
+== action=adapters
+adapter|Ethernet 2|FC:34:97:65:1E:0B|18446744073709|down
+adapter|Tailscale|-|100000|up
+adapter|Ethernet|FC:34:97:65:1E:0A|1000|up
+adapter|OpenVPN Data Channel Offload for NordVPN|-|1000|down
+adapter|Local Area Connection|00:FF:C1:08:92:E3|1000|down
+adapter|WiFi|84:1B:77:2B:DC:FC|18446744073709|down
+adapter|Local Area Connection* 1|84:1B:77:2B:DC:FD|18446744073709|down
+adapter|Local Area Connection* 2|86:1B:77:2B:DC:FC|18446744073709|down
+adapter|Bluetooth Network Connection|84:1B:77:2B:DD:00|3|down
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ip_addresses
+ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-
+ip|Ethernet 2|169.254.54.245|16|-
+ip|Tailscale|fd7a:115c:a1e0::1c32:357a|128|-
+ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-
+ip|Tailscale|198.51.100.121|32|-
+ip|Ethernet|fe80::d459:2883:492c:f3fc|64|203.0.113.1
+ip|Ethernet|203.0.113.131|24|203.0.113.1
+ip|OpenVPN Data Channel Offload for NordVPN|fe80::c5b0:bd45:79bc:bd97|64|-
+ip|OpenVPN Data Channel Offload for NordVPN|169.254.133.126|16|-
+ip|Local Area Connection|fe80::669f:e4fb:4130:c7de|64|-
+ip|Local Area Connection|169.254.70.46|16|-
+ip|WiFi|fe80::72f7:7266:9da0:e23c|64|-
+ip|WiFi|169.254.225.27|16|-
+ip|Local Area Connection* 1|fe80::a60d:9224:f8d0:abf7|64|-
+ip|Local Area Connection* 1|169.254.64.8|16|-
+ip|Local Area Connection* 2|fe80::81cf:c175:d2f7:359e|64|-
+ip|Local Area Connection* 2|169.254.218.5|16|-
+ip|Bluetooth Network Connection|fe80::4551:9b1a:5ad9:83a|64|-
+ip|Bluetooth Network Connection|169.254.75.142|16|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_servers
+dns|Ethernet 2|192.0.2.100|IPv4
+dns|Ethernet 2|192.0.2.101|IPv4
+dns|Tailscale|fec0:0:0:ffff::1|IPv6
+dns|Tailscale|fec0:0:0:ffff::2|IPv6
+dns|Tailscale|fec0:0:0:ffff::3|IPv6
+dns|Ethernet|192.0.2.100|IPv4
+dns|Ethernet|192.0.2.101|IPv4
+dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::1|IPv6
+dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::2|IPv6
+dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::3|IPv6
+dns|Local Area Connection|fec0:0:0:ffff::1|IPv6
+dns|Local Area Connection|fec0:0:0:ffff::2|IPv6
+dns|Local Area Connection|fec0:0:0:ffff::3|IPv6
+dns|WiFi|192.0.2.100|IPv4
+dns|WiFi|192.0.2.101|IPv4
+dns|Local Area Connection* 1|fec0:0:0:ffff::1|IPv6
+dns|Local Area Connection* 1|fec0:0:0:ffff::2|IPv6
+dns|Local Area Connection* 1|fec0:0:0:ffff::3|IPv6
+dns|Local Area Connection* 2|fec0:0:0:ffff::1|IPv6
+dns|Local Area Connection* 2|fec0:0:0:ffff::2|IPv6
+dns|Local Area Connection* 2|fec0:0:0:ffff::3|IPv6
+dns|Bluetooth Network Connection|fec0:0:0:ffff::1|IPv6
+dns|Bluetooth Network Connection|fec0:0:0:ffff::2|IPv6
+dns|Bluetooth Network Connection|fec0:0:0:ffff::3|IPv6
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=proxy
+proxy_type|auto_detect
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_cache
+cache_entry|66.24.104.213.in-addr.arpa|PTR|0|
+cache_entry|array514.prod.do.dsp.mp.microsoft.com|A|0|
+cache_entry|37.43.127.100.in-addr.arpa|PTR|0|
+cache_entry|121.53.123.100.in-addr.arpa|PTR|0|
+cache_entry|desktop-04dnsig.mshome.net|A|0|
+cache_entry|desktop-04dnsig.mshome.net|AAAA|0|
+cache_entry|77.177.109.100.in-addr.arpa|PTR|0|
+cache_entry|kubernetes.docker.internal|A|0|
+cache_entry|kubernetes.docker.internal|AAAA|0|
+cache_entry|ocsp.comodoca.com|A|0|
+cache_entry|buildhost1.tail0a0a0a.ts.net|A|0|
+cache_entry|buildhost1.tail0a0a0a.ts.net|AAAA|0|
+cache_entry|65.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|48.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|mobile1|CNAME|0|
+cache_entry|buildhost1|CNAME|0|
+cache_entry|windowsupdate.microsoft.com|A|0|
+cache_entry|254.92.58.176.in-addr.arpa|PTR|0|
+cache_entry|200.188.252.62.in-addr.arpa|PTR|0|
+cache_entry|www.example.com|A|0|
+cache_entry|9.168.252.62.in-addr.arpa|PTR|0|
+cache_entry|198.51.100.199.in-addr.arpa|PTR|0|
+cache_entry|198.51.100.199.in-addr.arpa|PTR|0|
+cache_entry|ocsp.sectigo.com|A|0|
+cache_entry|24.168.252.62.in-addr.arpa|PTR|0|
+cache_entry|host.docker.internal|A|0|
+cache_entry|host.docker.internal|AAAA|0|
+cache_entry|192.177.16.2.in-addr.arpa|PTR|0|
+cache_entry|218.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|1.0.0.127.in-addr.arpa|PTR|0|
+cache_entry|131.0.168.192.in-addr.arpa|PTR|0|
+cache_entry|81.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|98.167.75.100.in-addr.arpa|PTR|0|
+cache_entry|225.3.253.62.in-addr.arpa|PTR|0|
+cache_entry|gateway.docker.internal|A|0|
+cache_entry|gateway.docker.internal|AAAA|0|
+cache_entry|workstation1|CNAME|0|
+cache_entry|1.128.31.172.in-addr.arpa|PTR|0|
+cache_entry|workstation1.tail0a0a0a.ts.net|A|0|
+cache_entry|workstation1.tail0a0a0a.ts.net|AAAA|0|
+cache_entry|48.168.252.62.in-addr.arpa|PTR|0|
+cache_entry|184.188.252.62.in-addr.arpa|PTR|0|
+cache_entry|laptop1|CNAME|0|
+cache_entry|laptop1.tail0a0a0a.ts.net|A|0|
+cache_entry|laptop1.tail0a0a0a.ts.net|AAAA|0|
+cache_entry|update.microsoft.com|A|0|
+cache_entry|145.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|24.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|184.14.106.213.in-addr.arpa|PTR|0|
+cache_entry|216.188.252.62.in-addr.arpa|PTR|0|
+cache_entry|mobile1.tail0a0a0a.ts.net|A|0|
+cache_entry|mobile1.tail0a0a0a.ts.net|AAAA|0|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=arp
+arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static
+arp|Loopback Pseudo-Interface 1|239.255.255.250|-|static
+arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.22|-|static
+arp|WiFi|224.0.0.22|01:00:5e:00:00:16|static
+arp|Local Area Connection|224.0.0.22|01:00:5e:00:00:16|static
+arp|Tailscale|198.51.100.98|-|incomplete
+arp|Tailscale|100.100.100.100|-|incomplete
+arp|Tailscale|198.51.100.77|-|dynamic
+arp|Tailscale|224.0.0.22|-|static
+arp|Tailscale|224.0.0.251|-|static
+arp|Tailscale|239.255.255.250|-|static
+arp|Local Area Connection* 1|224.0.0.22|01:00:5e:00:00:16|static
+arp|Local Area Connection* 2|224.0.0.22|01:00:5e:00:00:16|static
+arp|Bluetooth Network Connection|224.0.0.22|01:00:5e:00:00:16|static
+arp|Ethernet|203.0.113.1|00:00:5e:00:53:0e|dynamic
+arp|Ethernet|203.0.113.61|00:00:5e:00:53:0f|dynamic
+arp|Ethernet|203.0.113.66|00:00:5e:00:53:04|dynamic
+arp|Ethernet|203.0.113.71|00:00:5e:00:53:10|dynamic
+arp|Ethernet|203.0.113.222|00:00:5e:00:53:17|incomplete
+arp|Ethernet|203.0.113.223|00:00:5e:00:53:1a|dynamic
+arp|Ethernet|203.0.113.237|00:00:5e:00:53:1b|dynamic
+arp|Ethernet|203.0.113.246|00:00:5e:00:53:19|dynamic
+arp|Ethernet|203.0.113.255|ff:ff:ff:ff:ff:ff|static
+arp|Ethernet|224.0.0.22|01:00:5e:00:00:16|static
+arp|Ethernet|224.0.0.251|01:00:5e:00:00:fb|static
+arp|Ethernet|224.0.0.252|01:00:5e:00:00:fc|static
+arp|Ethernet|239.255.255.250|01:00:5e:7f:ff:fa|static
+arp|Ethernet|255.255.255.255|ff:ff:ff:ff:ff:ff|static
+arp|Ethernet 2|224.0.0.22|01:00:5e:00:00:16|static
+arp|Loopback Pseudo-Interface 1|ff02::c|-|static
+arp|Loopback Pseudo-Interface 1|ff02::16|-|static
+arp|Loopback Pseudo-Interface 1|ff02::1:2|-|static
+arp|OpenVPN Data Channel Offload for NordVPN|fe80::c5b0:bd45:79bc:bd97|-|dynamic
+arp|OpenVPN Data Channel Offload for NordVPN|ff02::16|-|static
+arp|OpenVPN Data Channel Offload for NordVPN|ff02::1:2|-|static
+arp|WiFi|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|WiFi|ff02::16|33:33:00:00:00:16|static
+arp|WiFi|ff02::1:2|33:33:00:01:00:02|static
+arp|Local Area Connection|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Local Area Connection|ff02::16|33:33:00:00:00:16|static
+arp|Local Area Connection|ff02::1:2|33:33:00:01:00:02|static
+arp|Tailscale|fd7a:115c:a1e0::53|-|incomplete
+arp|Tailscale|fe80::c5b0:bd45:79bc:bd97|-|dynamic
+arp|Tailscale|ff02::c|-|static
+arp|Tailscale|ff02::16|-|static
+arp|Tailscale|ff02::fb|-|static
+arp|Tailscale|ff02::1:ffbc:bd97|-|static
+arp|Local Area Connection* 1|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Local Area Connection* 1|ff02::16|33:33:00:00:00:16|static
+arp|Local Area Connection* 1|ff02::1:2|33:33:00:01:00:02|static
+arp|Local Area Connection* 2|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Local Area Connection* 2|ff02::16|33:33:00:00:00:16|static
+arp|Bluetooth Network Connection|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Bluetooth Network Connection|ff02::16|33:33:00:00:00:16|static
+arp|Bluetooth Network Connection|ff02::1:2|33:33:00:01:00:02|static
+arp|Ethernet|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Ethernet|ff02::1|33:33:00:00:00:01|static
+arp|Ethernet|ff02::2|33:33:00:00:00:02|static
+arp|Ethernet|ff02::c|33:33:00:00:00:0c|static
+arp|Ethernet|ff02::16|33:33:00:00:00:16|static
+arp|Ethernet|ff02::fb|33:33:00:00:00:fb|static
+arp|Ethernet|ff02::1:2|33:33:00:01:00:02|static
+arp|Ethernet|ff02::1:3|33:33:00:01:00:03|static
+arp|Ethernet|ff02::1:ff2c:f3fc|33:33:ff:2c:f3:fc|static
+arp|Ethernet 2|fe80::c5b0:bd45:79bc:bd97|00:00:00:00:00:00|incomplete
+arp|Ethernet 2|ff02::16|33:33:00:00:00:16|static
+arp|Ethernet 2|ff02::1:2|33:33:00:01:00:02|static
+[result_status] UNDECLARED / UNKNOWN / 
+

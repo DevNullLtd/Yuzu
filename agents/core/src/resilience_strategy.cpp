@@ -34,7 +34,8 @@ std::uint64_t seconds_to_ms(std::uint64_t secs) {
 } // namespace
 
 ResilienceConfig parse_resilience_params(const std::function<std::string(std::string_view)>& get,
-                                         std::uint64_t& event_debounce_ms_out) {
+                                         std::uint64_t& event_debounce_ms_out,
+                                         std::uint64_t default_event_debounce_ms) {
     using namespace resilience_keys;
     ResilienceConfig c;
     c.mode = parse_resilience_mode(get(kMode));
@@ -43,7 +44,7 @@ ResilienceConfig parse_resilience_params(const std::function<std::string(std::st
     c.resume_after_ms = seconds_to_ms(to_u64(get(kResumeAfterS), 0)); // authored in seconds
     c.backoff_initial_ms = to_u64(get(kBackoffInitialMs), 1000);
     c.backoff_max_ms = to_u64(get(kBackoffMaxMs), 60000);
-    event_debounce_ms_out = to_u64(get(kEventDebounceMs), 1000);
+    event_debounce_ms_out = to_u64(get(kEventDebounceMs), default_event_debounce_ms);
     return c;
 }
 

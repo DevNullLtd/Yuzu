@@ -1,6 +1,6 @@
 ## Device Quarantine (Network Isolation) Definitions
 ## Manages network isolation of endpoints via firewall rules.
-## Windows: netsh advfirewall, Linux: iptables, macOS: pf anchors.
+## Windows: netsh advfirewall, Linux: iptables, macOS: pf main ruleset (atomic pfctl -f load).
 ## All quarantine rules are prefixed with "YuzuQuarantine_" for identification.
 
 ---
@@ -11,11 +11,17 @@ metadata:
   displayName: Quarantine Device
   version: 1.0.0
   description: >
-    Isolate the device from the network by applying firewall rules that
-    block all inbound and outbound traffic except loopback and explicitly
-    whitelisted IP addresses. The management server IP should always be
-    whitelisted to maintain remote control. On Windows this creates netsh
-    advfirewall rules, on Linux iptables chains, and on macOS pf anchors.
+    Isolate the device from the network by blocking all inbound and
+    outbound traffic except loopback and the whitelisted IP addresses
+    (server_ip plus whitelist_ips, merged with the agent's own known
+    server address). On Windows this blocks via the all-profiles firewall
+    policy (not a rule) plus explicit per-IP and loopback Allow rules,
+    covering both IPv4 and IPv6; on Linux it builds a yuzu-quarantine
+    iptables chain, mirrored to ip6tables when the host has a live IPv6
+    stack; on macOS it atomically loads a full pf main ruleset via
+    `pfctl -f` (never a named anchor). Waits up to 2s for any other
+    in-flight quarantine/unquarantine/whitelist mutation on this device to
+    finish before running.
   tags: [security, quarantine, incident-response, network]
 
 spec:
@@ -47,8 +53,22 @@ spec:
     columns:
       - name: status
         type: string
+        description: >
+          The quarantine action's outcome: quarantined (full containment
+          applied), quarantined_partial (containment applied but at least
+          one loopback/whitelist exception or v6 mirror failed), failed (no
+          containment applied), or busy (another mutating quarantine
+          action was already in flight). An aborted run before any
+          mutation instead emits an error field with no status field.
+        values: [quarantined, quarantined_partial, failed, busy]
+        example: "not observed — quarantine was never executed for these samples"
+        platforms: [windows, linux, darwin]
       - name: rules_applied
         type: int32
+        description: >-
+          Count of firewall rules the action attempted-and-applied this call (Windows/Linux: the mutation tally's succeeded count; macOS: the pf ruleset line count), reported alongside status. Values: integer >= 0.
+        example: "4"
+        platforms: [windows, linux, darwin]
 
   readablePayload: >
     Quarantine device (server=${server_ip}, whitelist=${whitelist_ips})
@@ -78,10 +98,17 @@ metadata:
   displayName: Release Device from Quarantine
   version: 1.0.0
   description: >
-    Remove all quarantine firewall rules and restore normal network access.
-    On Windows this deletes all netsh rules prefixed with "YuzuQuarantine_",
-    on Linux it flushes and removes the yuzu-quarantine iptables chain,
-    and on macOS it flushes the yuzu-quarantine pf anchor.
+    Remove this plugin's quarantine containment and restore network
+    access. On Windows this deletes the named YuzuQuarantine_* Allow rules
+    and replays the firewall profile policy captured at quarantine time
+    (or Microsoft's default policy if nothing was captured); on Linux it
+    flushes and deletes the yuzu-quarantine iptables chain and its
+    ip6tables mirror if one was applied; on macOS it reloads the system
+    default `/etc/pf.conf`, falling back to disabling pf entirely if that
+    reload fails. Reports release_uncertain rather than released when the
+    teardown could not be confirmed complete, and on Windows/macOS this is
+    not guaranteed to restore the device's exact pre-quarantine state (see
+    the plugin README's Caveats).
   tags: [security, quarantine, incident-response, network]
 
 spec:
@@ -101,6 +128,17 @@ spec:
     columns:
       - name: status
         type: string
+        description: >
+          The unquarantine action's outcome: released (teardown/policy
+          restore confirmed) or release_uncertain (a genuine runner
+          failure, or a clean rule-delete/policy-restore failure, means
+          the device may still be firewalled). A Windows released result
+          additionally appends a note field when no captured
+          pre-quarantine policy existed to replay; a macOS failure before
+          either restore path succeeds emits an error field instead.
+        values: [released, release_uncertain]
+        example: "not observed — unquarantine was never executed for these samples"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Release device from quarantine"
 
@@ -129,8 +167,11 @@ metadata:
   displayName: Quarantine Status
   version: 1.0.0
   description: >
-    Check whether quarantine firewall rules are currently active on the
-    device and report the current whitelist of allowed IP addresses.
+    Re-read the live OS firewall state and report the containment verdict
+    (active/partial/degraded/uncertain/inactive) plus the current
+    whitelist of allowed IP addresses when the device is not inactive.
+    Always runs immediately, even while a quarantine/unquarantine/
+    whitelist mutation is in flight on the same device.
   tags: [security, quarantine, diagnostics]
 
 spec:
@@ -150,8 +191,23 @@ spec:
     columns:
       - name: state
         type: string
+        description: >
+          Current containment verdict from a live re-read of the OS
+          firewall state: active (fully contained), partial (some but not
+          all expected rules/policy present), degraded (macOS only - the
+          pf ruleset is loaded but pf itself is disabled, so nothing is
+          actually blocked), uncertain (the read itself failed or
+          returned nothing recognisable), or inactive (no containment
+          present).
+        values: [active, partial, degraded, uncertain, inactive]
+        example: "uncertain"
+        platforms: [windows, linux, darwin]
       - name: whitelist
         type: string
+        description: >-
+          Comma-separated whitelist of currently-allowed IPs, read fresh from the firewall. Reported only when state is not inactive, and empty when the device is contained with no additional whitelist entries. Values: free text - comma-separated IP list, or empty.
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Query quarantine status"
 
@@ -180,9 +236,13 @@ metadata:
   displayName: Modify Quarantine Whitelist
   version: 1.0.0
   description: >
-    Add or remove IP addresses from an active quarantine whitelist without
-    fully releasing or re-applying the quarantine. Reports the resulting
-    whitelist after the modification.
+    Add or remove IP addresses from an active quarantine's whitelist
+    without fully releasing or re-applying the quarantine, reporting the
+    resulting whitelist after the modification. On macOS there is no
+    per-rule granularity: this action rebuilds and reloads the entire pf
+    main ruleset (including the block-all default-deny) and enables pf,
+    so running it against a device that is not already quarantined will
+    isolate it.
   tags: [security, quarantine, incident-response, network]
 
 spec:
@@ -215,8 +275,21 @@ spec:
     columns:
       - name: status
         type: string
+        description: >
+          The whitelist action's outcome: updated (every add/remove
+          mutation succeeded) or update_uncertain (a genuine runner
+          failure, or a clean per-IP mutation failure, means the
+          whitelist may be partially applied). Missing/invalid parameters
+          instead return an error field before any mutation is attempted.
+        values: [updated, update_uncertain]
+        example: "updated"
+        platforms: [windows, linux, darwin]
       - name: whitelist
         type: string
+        description: >-
+          Comma-separated whitelist after the add/remove, read fresh from the firewall (on macOS this is the full pf ruleset whitelist, since add/remove rebuilds the entire main ruleset there). Values: free text - comma-separated IP list, or empty.
+        example: ""
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Quarantine whitelist: ${action} IPs ${ips}"
 

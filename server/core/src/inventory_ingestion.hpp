@@ -28,6 +28,13 @@ namespace yuzu::server {
 
 class SoftwareInventoryStore;
 
+/// Validate the untrusted report's map cardinality before any generic or
+/// typed store write. Returns false after logging/counting a whole-report
+/// rejection; callers acknowledge without requesting a resend.
+[[nodiscard]] bool validate_inventory_report_source_count(
+    const std::string& agent_id, const ::yuzu::agent::v1::InventoryReport& report,
+    ::yuzu::MetricsRegistry* metrics = nullptr);
+
 /// Ingest the normalized sources of `report` for `agent_id` into `store`
 /// (slice 1: `installed_software`); appends any source needing a full resend to
 /// `ack.need_full`. Does NOT set `ack.received` and does NOT touch generic

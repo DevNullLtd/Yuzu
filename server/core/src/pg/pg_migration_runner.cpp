@@ -163,6 +163,47 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
     }
     const std::string store{store_name};
 
+    // #3013 (found in review, #2961/#2964): two independently-authored
+    // branches can each allocate the SAME "next" version number for the
+    // SAME store — nothing here previously stopped that. Before this check,
+    // the loop below's `if (m.version <= current) continue;` treated
+    // whichever migration landed SECOND as "already applied" and silently
+    // skipped it — `run()` still returned true, `any_applied` could still be
+    // true for the OTHER migrations in the vector, so the store opened
+    // clean while missing schema every runtime query written against it
+    // assumes exists. Checked once, up front, against the CALLER-SUPPLIED
+    // vector order — never a re-sorted copy — so an author who lists two
+    // migrations out of numeric order gets the same loud refusal a genuine
+    // duplicate does, rather than the runner quietly reordering intent.
+    // The pairwise check below only orders migrations against EACH OTHER —
+    // it never anchors the vector against `read_version`'s own floor. Since
+    // `read_version` returns 0 for an untracked store, a vector beginning
+    // `{0, 1, 2, ...}` is strictly increasing and passes the pairwise check,
+    // but the apply loop's `m.version <= current` treats version 0 as
+    // already-applied and skips it forever — the same silent-skip shape
+    // #3013 closed for a duplicate/non-monotonic pair, at index 0 instead.
+    if (migrations.front().version <= 0) {
+        spdlog::error(
+            "PgMigrationRunner: store '{}' has a non-positive first migration version ({}) — "
+            "refusing to run any migration for this store. Migration versions must start at 1: "
+            "version 0 is indistinguishable from an untracked store and would be skipped "
+            "forever by the apply loop's <= current check.",
+            store, migrations.front().version);
+        return false;
+    }
+    for (std::size_t i = 1; i < migrations.size(); ++i) {
+        if (migrations[i].version <= migrations[i - 1].version) {
+            spdlog::error(
+                "PgMigrationRunner: store '{}' has a non-monotonic or duplicate migration "
+                "version in its migrations() vector (version {} at index {} does not exceed "
+                "version {} at index {}) — refusing to run any migration for this store. Two "
+                "migrations were likely allocated the same version number by independent "
+                "branches (#3013) — renumber one of them.",
+                store, migrations[i].version, i, migrations[i - 1].version, i - 1);
+            return false;
+        }
+    }
+
     if (!ensure_meta_and_schema(conn, store))
         return false;
 

@@ -61,12 +61,24 @@ spec:
     columns:
       - name: status
         type: string
+        description: 'Outcome of the magic-packet send attempt. Values: error, success.'
+        example: "error"
+        platforms: [windows, linux, darwin]
       - name: message
         type: string
+        description: 'Failure reason on `error`, or a confirmation of the packet sent on `success`. Values: free text.'
+        example: "Missing required parameter: mac"
+        platforms: [windows, linux, darwin]
       - name: port
         type: string
+        description: 'The UDP port the magic packet was sent to, formatted as `port <n>`; emitted only on `success`. Values: `port <n>` (formatted string, not a bare number).'
+        example: "not observed in any capture (code: wol_plugin.cpp:249)"
+        platforms: [windows, linux, darwin]
       - name: bytes_sent
         type: string
+        description: 'Number of bytes sent, formatted as `<n> bytes`; emitted only on `success`. Values: `<n> bytes` (formatted string, not a bare number).'
+        example: "not observed in any capture (code: wol_plugin.cpp:249)"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Send Wake-on-LAN packet to ${mac}"
 
@@ -74,7 +86,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -95,11 +107,16 @@ metadata:
   displayName: Check Host Reachability
   version: 1.0.0
   description: >
-    Pings a host to verify it is reachable, typically used after
+    Checks whether a host has become reachable, typically used after
     sending a Wake-on-LAN packet to confirm the target machine has
-    booted. Validates the host parameter to prevent command injection.
-    Returns reachability status and raw ping output. The count
-    parameter controls the number of ICMP echo requests sent.
+    booted. Probes over unprivileged ICMP echo, falling back to a TCP
+    connect on port 443 when ICMP cannot be used or gets no reply
+    (e.g. Linux net.ipv4.ping_group_range denying the process an ICMP
+    socket) — no shell-out, no ping binary. Validates the host
+    parameter to prevent command injection. Returns a reachability
+    status plus a mechanism row naming which probe produced the
+    verdict. The count parameter controls how many samples are
+    attempted per mechanism.
   tags: [wol, network, diagnostics, connectivity, action]
 
 spec:
@@ -119,8 +136,9 @@ spec:
         type: string
         displayName: Target Host
         description: >
-          Hostname or IP address to ping. Must contain only
-          alphanumeric characters, dots, hyphens, and colons.
+          Hostname or IPv4/IPv6 address to check for reachability,
+          e.g. 192.168.1.50 or desktop-01.example.com. Must contain
+          only alphanumeric characters, dots, hyphens, and colons.
         validation:
           minLength: 1
           maxLength: 253
@@ -129,8 +147,9 @@ spec:
         type: string
         displayName: Ping Count
         description: >
-          Number of ICMP echo requests to send (1-10).
-          Defaults to 3 if not specified.
+          Number of probe samples attempted per mechanism (1-10);
+          each mechanism stops early on a positive result. Defaults
+          to 3 if not specified.
         default: "3"
         validation:
           pattern: "^[0-9]+$"
@@ -139,10 +158,20 @@ spec:
     columns:
       - name: host
         type: string
+        description: 'The `host` parameter value, echoed back unmodified. Values: free text (hostname or IP literal).'
+        example: "127.0.0.1"
+        platforms: [windows, linux, darwin]
       - name: status
         type: string
+        description: >-
+          Reachability verdict: `reachable` if either mechanism produced a positive result, `unreachable` if both were genuinely attempted with no positive result, or `unavailable` if neither mechanism could even be attempted. Values: reachable, unreachable, unavailable.
+        example: "reachable"
+        platforms: [windows, linux, darwin]
       - name: count
         type: string
+        description: 'The `count` parameter value, echoed back as a string. Values: integer 1-10, as a string.'
+        example: "3"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Ping ${host} (${count} packets)"
 
@@ -150,7 +179,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]

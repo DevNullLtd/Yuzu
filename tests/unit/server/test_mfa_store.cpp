@@ -18,9 +18,11 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "pg/pg_exec.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <filesystem>
@@ -33,35 +35,18 @@ using yuzu::server::auth::Role;
 namespace {
 
 struct MfaFixture {
-    std::filesystem::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    // AuthDbPg defaults to cleanup_interval_secs=0 (reaper disabled) — see
+    // its ctor doc comment; this fixture is instantiated once per
+    // TEST_CASE_METHOD across the whole file.
+    yuzu::test::AuthDbPg db;
 
     MfaFixture() {
-        // Construct AuthDB with cleanup_interval_secs=0 so the background
-        // reaper jthread is not spawned. Catch2 instantiates this fixture
-        // once per TEST_CASE_METHOD; with the production 60 s cadence the
-        // jthread is spawned + joined ~100 times in a single test process,
-        // which triggers a non-deterministic macOS-arm64 SIGSEGV (Linux
-        // gcc-13 and Windows MSVC are unaffected). Diagnosed in PR #1199
-        // via env-var experiment, then promoted to this constructor
-        // parameter so production behaviour is untouched.
-        data_dir = yuzu::test::unique_temp_path("yuzu-mfa-");
-        std::filesystem::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         // Seed a user — mfa_* methods key by username and require an
         // is_active row to exist.
         auto salt = AuthManager::random_bytes(16);
         auto salt_hex = AuthManager::bytes_to_hex(salt);
         auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
         REQUIRE(db->upsert_user("alice", hash, salt_hex, Role::admin).has_value());
-    }
-
-    ~MfaFixture() {
-        db.reset();
-        std::error_code ec;
-        std::filesystem::remove_all(data_dir, ec);
     }
 
     /// Decode the base32 secret from the enrollment-init result and emit a
@@ -78,7 +63,7 @@ struct MfaFixture {
 
 } // namespace
 
-TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[pg][mfa][store]") {
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
     REQUIRE_FALSE(s->enrolled);
@@ -87,7 +72,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[mfa][store]"
     REQUIRE(s->recovery_codes_remaining == 0);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     REQUIRE_FALSE(init->secret_base32.empty());
@@ -101,7 +86,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[mf
 }
 
 TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and issues codes",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -116,7 +101,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and 
     REQUIRE(s->recovery_codes_remaining == 10);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
 
@@ -129,7 +114,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[mfa][
 }
 
 TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rotation, #1227)",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     auto first = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(first.has_value());
     auto second = db->mfa_init_enrollment("alice", "Yuzu");
@@ -148,7 +133,7 @@ TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rota
     CHECK(db->mfa_verify_enrollment("alice", code).has_value());
 }
 
-TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -159,7 +144,7 @@ TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[mfa][store]")
     REQUIRE(reinit.error() == AuthDBError::MfaAlreadyEnrolled);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -173,7 +158,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[mfa][st
 
 TEST_CASE_METHOD(MfaFixture,
                  "mfa_verify_login_code stamps last_counter so a successful login cannot be replayed",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     // security Gate 2 LOW follow-up: the route-test `totp_at(offset=1)`
     // workaround sidesteps the post-enrollment floor. To prove that the
     // *post-login* floor is also enforced, drive a login that succeeds
@@ -201,7 +186,7 @@ TEST_CASE_METHOD(MfaFixture,
     REQUIRE_FALSE(*replay);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -216,7 +201,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[mfa][sto
     REQUIRE_FALSE(*r2);
 }
 
-TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[mfa][store][recovery]") {
+TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -239,7 +224,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[mfa][store][reco
 }
 
 TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
-                 "[mfa][store][recovery]") {
+                 "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     auto recovery_res = db->mfa_verify_enrollment("alice", code);
@@ -266,7 +251,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
     REQUIRE(*matched);
 }
 
-TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[mfa][store][recovery]") {
+TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     auto first_set = db->mfa_verify_enrollment("alice", code);
@@ -287,7 +272,7 @@ TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[mfa][store][reco
     REQUIRE(*fresh);
 }
 
-TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
@@ -312,7 +297,7 @@ TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[mfa][
     CHECK(db->mfa_verify_enrollment("alice", new_code).has_value());
 }
 
-TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
@@ -321,4 +306,58 @@ TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", 
     auto r = db->mfa_verify_login_code("alice", code);
     REQUIRE(r.has_value());
     REQUIRE_FALSE(*r);
+}
+
+// Quality SHOULD (governance hardening round): mfa_init_enrollment's fresh-
+// secret path already had a comment claiming "encrypt failure aborts here —
+// never write plaintext, never write anything at all" (auth_db.cpp), but no
+// test exercised it. Uses AuthDbPg's FaultyKekProvider option
+// (test_auth_db_pg_helper.hpp) to force SecretCodec::encrypt's wrap_dek call
+// to fail deterministically — AFTER the DEK is minted and the plaintext is
+// GCM-encrypted into a local buffer, BEFORE any database write — and
+// confirms the row is left exactly as it started: no secret column write at
+// all, not even a truncated/partial one.
+TEST_CASE("mfa_init_enrollment aborts with no plaintext/partial write when encrypt fails",
+         "[pg][mfa][store][fault]") {
+    yuzu::test::AuthDbPg db{/*cleanup_interval_secs=*/0, /*inject_encrypt_faults=*/true};
+    auto* fault = db.fault_provider();
+    REQUIRE(fault != nullptr);
+
+    auto salt = AuthManager::random_bytes(16);
+    auto salt_hex = AuthManager::bytes_to_hex(salt);
+    auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
+    REQUIRE(db->upsert_user("alice", hash, salt_hex, Role::admin).has_value());
+
+    fault->set_fail_wrap(true);
+    auto init = db->mfa_init_enrollment("alice", "Yuzu");
+    REQUIRE_FALSE(init.has_value());
+    CHECK(init.error() == yuzu::server::AuthDBError::WriteFailed);
+
+    // No partial write: mfa_totp_secret is still genuinely NULL, not a
+    // truncated/garbage blob — check the column directly rather than
+    // trusting mfa_status alone (a successful provisional-secret write would
+    // ALSO report enrolled=false, so that check alone can't distinguish
+    // "aborted, nothing written" from "wrote a provisional secret").
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT mfa_totp_secret IS NULL, mfa_enrolled_at IS NULL FROM auth.users WHERE username = $1",
+            std::vector<std::string>{"alice"});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "t"); // secret column still NULL
+        CHECK(std::string(PQgetvalue(res.get(), 0, 1)) == "t"); // never stamped enrolled
+    }
+
+    auto status = db->mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+
+    // Recovering: with the fault cleared, a normal enrollment now succeeds
+    // cleanly — the aborted attempt left nothing behind to interfere.
+    fault->set_fail_wrap(false);
+    auto retry = db->mfa_init_enrollment("alice", "Yuzu");
+    REQUIRE(retry.has_value());
+    CHECK_FALSE(retry->secret_base32.empty());
 }

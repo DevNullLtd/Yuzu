@@ -163,6 +163,14 @@ extern const char* const kDashboardIndexHtml =
       font-family: var(--font-mono);
     }
     .filter-bar select:focus, .filter-bar input:focus { border-color: var(--mds-color-theme-accent-primary-normal); outline: none; }
+    /* #2691 (Gate 8 consistency-auditor): a degraded facet-values() read
+       disables the column filter dropdown — give it the same amber degrade
+       treatment as .result-degrade-banner rather than plain browser-default
+       styling, so it doesn't visually read as an unrelated form quirk. */
+    .filter-bar select:disabled {
+      color: var(--yellow, #ffcc00); border-color: rgba(255, 204, 0, 0.4);
+      background: rgba(255, 204, 0, 0.08); opacity: 1;
+    }
 
     /* Sortable column headers */
     th.sortable { cursor: pointer; user-select: none; }
@@ -199,7 +207,11 @@ extern const char* const kDashboardIndexHtml =
     }
     .form-hint { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; }
     .feedback-error { color: var(--mds-color-theme-indicator-error); font-size: 0.75rem; }
-
+)HTM"
+    // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
+    // limit — this session's degrade-banner/filter-bar CSS additions pushed
+    // Part 1 over it, CI-measured C2026).
+    R"HTM(
     /* Scope section headers */
     .scope-section-header {
       padding: 0.3rem 0.75rem; font-size: 0.6rem; font-weight: 600;
@@ -243,6 +255,17 @@ extern const char* const kDashboardIndexHtml =
     .empty-state {
       text-align: center; padding: 3rem 1rem; color: var(--mds-color-theme-outline-secondary);
       font-size: 0.85rem;
+    }
+    /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
+       distinct from .empty-state so it doesn't visually read as "nothing here".
+       Amber, not alarm-red (#2691 Gate 6 enterprise-readiness): this is a
+       "temporarily unavailable, retrying" state, not a confirmed failure —
+       red is reserved for that, so it works against the calm/accurate copy
+       every degrade banner already carries. */
+    .result-degrade-banner {
+      color: var(--yellow, #ffcc00); background: rgba(255, 204, 0, 0.08);
+      border: 1px solid rgba(255, 204, 0, 0.4); border-radius: 0.5rem;
+      padding: 0.6rem 0.9rem; font-size: 0.8rem;
     }
 
     /* ── Scope Panel ─────────────────────────────────────────── */
@@ -380,7 +403,8 @@ extern const char* const kDashboardIndexHtml =
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>

@@ -11,6 +11,7 @@
  * constexpr, no link (see tests/meson.build).
  */
 
+#include "guardian_push_builder.hpp" // guardian::kKnownGuardSparkTypes (cross-check)
 #include "guardian_resilience_schema.hpp"
 #include "guardian_rule_spec.hpp" // derive_rule_spec + dangerous-key denylist (H1)
 #include "guardian_schema_registry.hpp"
@@ -294,6 +295,43 @@ TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent s
     }
 }
 
+TEST_CASE("CROSS-CHECK: spark-kind schema catalog == guardian::kKnownGuardSparkTypes "
+          "(#4252 consolidated-round drift guard)",
+          "[guardian][spark][crosscheck]") {
+    // Governance Gate 4 (consistency-auditor) finding on the #4252 double-count fix:
+    // the new platform-support-stale counter's closed label set was a THIRD
+    // independent enumeration of Guardian spark types, alongside the published
+    // schema catalog (build_catalog(), guardian_schema_registry.cpp) and
+    // guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp) — with nothing
+    // binding them, unlike this file's existing G9/H2 cross-checks for the same
+    // class of drift. guardian_routes.cpp's counter now aliases
+    // kKnownGuardSparkTypes instead of keeping its own list, so this test binds
+    // the REMAINING two: the schema catalog's "spark"-kind entries must be
+    // exactly kKnownGuardSparkTypes.
+    //
+    // This does NOT bind guardian_guard_supported_on_platform's actual if-chain
+    // (governance Gate 8 re-review, architect + consistency-auditor) — that
+    // function matches string LITERALS, not this array, so a 4th entry added
+    // here and to the catalog with no corresponding branch there would pass
+    // THIS test while the platform-support matrix silently defaults the new
+    // type to Windows-only. test_guardian_push_builder.cpp's platform test
+    // pins the array against those literal branches directly; both tests must
+    // be updated when a spark type is added, not just this one.
+    auto j = json::parse(guardian_schema_catalog().json);
+    std::vector<std::string> published;
+    for (const auto& e : j["schemas"])
+        if (e["kind"] == "spark")
+            published.push_back(e["type"].get<std::string>());
+    std::sort(published.begin(), published.end());
+
+    std::vector<std::string> matrix;
+    for (std::string_view t : yuzu::server::guardian::kKnownGuardSparkTypes)
+        matrix.emplace_back(t);
+    std::sort(matrix.begin(), matrix.end());
+
+    CHECK(published == matrix);
+}
+
 TEST_CASE("CROSS-CHECK: service-state schema == server set == agent set (H2 drift guard)",
           "[guardian][service][crosscheck]") {
     using namespace yuzu::agent;
@@ -345,7 +383,98 @@ json service_rule_body(const std::string& assertion_type, const std::string& ser
         {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
     };
 }
+
+// Build a file-hash-equals rule body for derive_rule_spec. `max_bytes_str`, if
+// non-null, is authored as a JSON STRING (the dashboard form's wire shape,
+// test_guardian_form_render.cpp); the #2233 item 6 ceiling check fires
+// regardless of wire encoding (see guardian_rule_spec.cpp's
+// validate_assertion_params) — `max_bytes_str` only selects which of that
+// function's two branches (string vs numeric) a given test case exercises.
+json file_hash_rule_body(const char* max_bytes_str) {
+    json params = {{"path", "/etc/hosts"}};
+    if (max_bytes_str)
+        params["max_bytes"] = max_bytes_str;
+    return json{
+        {"spark", {{"type", "file-change"}, {"params", {{"path", "/etc/hosts"}}}}},
+        {"assertion", {{"type", "file-hash-equals"}, {"params", params}}},
+        {"remediation", {{"type", "alert-only"}, {"params", json::object()}}},
+    };
+}
 } // namespace
+
+TEST_CASE("#2233 item 6: file-hash-equals max_bytes above the 1 GiB ceiling is "
+          "rejected at authoring time (string form)",
+          "[guardian][file][derive][max_bytes]") {
+    // Exactly at the ceiling: accepted.
+    auto at = derive_rule_spec(file_hash_rule_body("1073741824"), "fh", 1, true, "audit");
+    CHECK_FALSE(at.error.has_value());
+    CHECK(at.structured);
+
+    // One byte over: rejected, naming the ceiling.
+    auto over = derive_rule_spec(file_hash_rule_body("1073741825"), "fh", 1, true, "audit");
+    REQUIRE(over.error.has_value());
+    CHECK(over.error->message.find("1 GiB") != std::string::npos);
+
+    // Absent: accepted (agent default applies).
+    CHECK_FALSE(derive_rule_spec(file_hash_rule_body(nullptr), "fh", 1, true, "audit")
+                    .error.has_value());
+
+    // Zero: still rejected by the pre-existing check, not this new one.
+    auto zero = derive_rule_spec(file_hash_rule_body("0"), "fh", 1, true, "audit");
+    REQUIRE(zero.error.has_value());
+    CHECK(zero.error->message.find("positive integer") != std::string::npos);
+
+    // A JSON-integer (unsigned) max_bytes is checked against the ceiling too, so
+    // the two wire forms can't drift apart on enforcement (its zero-check stays
+    // deferred to the agent, matching this file's pre-existing design for that
+    // form — only the new ceiling closes for both).
+    json int_over = file_hash_rule_body(nullptr);
+    int_over["assertion"]["params"]["max_bytes"] = 5ull * 1024 * 1024 * 1024; // 5 GiB, as int
+    REQUIRE(derive_rule_spec(int_over, "fh", 1, true, "audit").error.has_value());
+
+    json int_at = file_hash_rule_body(nullptr);
+    int_at["assertion"]["params"]["max_bytes"] = 1073741824ull; // exactly at ceiling, as int
+    CHECK_FALSE(derive_rule_spec(int_at, "fh", 1, true, "audit").error.has_value());
+
+    // One over the ceiling, as an int: rejected, same message shape as the string form.
+    json int_over_by_one = file_hash_rule_body(nullptr);
+    int_over_by_one["assertion"]["params"]["max_bytes"] = 1073741825ull;
+    auto int_over_res = derive_rule_spec(int_over_by_one, "fh", 1, true, "audit");
+    REQUIRE(int_over_res.error.has_value());
+    CHECK(int_over_res.error->message.find("1 GiB") != std::string::npos);
+}
+
+TEST_CASE("#2233 item 6 / Gate 8: a JSON float or negative max_bytes is rejected as "
+          "malformed, not silently substituted with the default (unhappy-path UP8-1)",
+          "[guardian][file][derive][max_bytes]") {
+    // A float, even one comfortably under the ceiling, was previously accepted and
+    // then silently discarded (server AND agent both fell through to the 64 MiB
+    // default) with no signal anywhere - reject it outright instead.
+    json flt = file_hash_rule_body(nullptr);
+    flt["assertion"]["params"]["max_bytes"] = 10000000.0; // 10 MB, as a JSON float
+    auto flt_res = derive_rule_spec(flt, "fh", 1, true, "audit");
+    REQUIRE(flt_res.error.has_value());
+    CHECK(flt_res.error->message.find("positive integer") != std::string::npos);
+
+    // Negative: same rejection, not a silent fallback either.
+    json neg = file_hash_rule_body(nullptr);
+    neg["assertion"]["params"]["max_bytes"] = -1;
+    auto neg_res = derive_rule_spec(neg, "fh", 1, true, "audit");
+    REQUIRE(neg_res.error.has_value());
+    CHECK(neg_res.error->message.find("positive integer") != std::string::npos);
+
+    // A literal that overflows uint64_t: nlohmann parses this as number_float (no
+    // C++ literal can construct it directly - std::numeric_limits<uint64_t>::max()
+    // is 18446744073709551615, one less), so it hits the same !is_number_unsigned()
+    // shape reject as the float/negative cases above, not the ceiling check.
+    json overflow = json::parse(R"({"assertion":{"params":{"max_bytes":18446744073709551616}}})");
+    json over_body = file_hash_rule_body(nullptr);
+    over_body["assertion"]["params"]["max_bytes"] = overflow["assertion"]["params"]["max_bytes"];
+    REQUIRE(over_body["assertion"]["params"]["max_bytes"].is_number_float());
+    auto over_res = derive_rule_spec(over_body, "fh", 1, true, "audit");
+    REQUIRE(over_res.error.has_value());
+    CHECK(over_res.error->message.find("positive integer") != std::string::npos);
+}
 
 TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",
           "[guardian][service][derive]") {

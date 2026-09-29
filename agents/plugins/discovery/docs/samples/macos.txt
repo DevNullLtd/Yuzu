@@ -1,0 +1,6 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 77514adb726f
+== action=scan_subnet subnet=127.0.0.0/30
+host|127.0.0.1|unknown|localhost|unknown
+scan_complete|1|2
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,649 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 9139daeb45d2
+== action=list
+proc|0|[System Process]
+proc|4|System
+proc|332|Secure System
+proc|376|Registry
+proc|1052|smss.exe
+proc|1504|csrss.exe
+proc|1596|wininit.exe
+proc|1604|csrss.exe
+proc|1676|services.exe
+proc|1716|winlogon.exe
+proc|1724|LsaIso.exe
+proc|1740|lsass.exe
+proc|1936|svchost.exe
+proc|1968|fontdrvhost.exe
+proc|1976|fontdrvhost.exe
+proc|2016|WUDFHost.exe
+proc|1008|svchost.exe
+proc|1500|svchost.exe
+proc|2060|LogonUI.exe
+proc|2068|dwm.exe
+proc|2128|svchost.exe
+proc|2136|svchost.exe
+proc|2176|svchost.exe
+proc|2192|svchost.exe
+proc|2212|svchost.exe
+proc|2232|svchost.exe
+proc|2448|svchost.exe
+proc|2456|svchost.exe
+proc|2464|svchost.exe
+proc|2472|svchost.exe
+proc|2644|svchost.exe
+proc|2652|svchost.exe
+proc|2704|svchost.exe
+proc|2812|svchost.exe
+proc|2904|svchost.exe
+proc|2984|powershell.exe
+proc|3032|powershell.exe
+proc|3056|powershell.exe
+proc|3136|NVDisplay.Container.exe
+proc|3184|svchost.exe
+proc|3192|svchost.exe
+proc|3304|svchost.exe
+proc|3352|svchost.exe
+proc|3416|svchost.exe
+proc|3424|svchost.exe
+proc|3432|svchost.exe
+proc|3600|svchost.exe
+proc|3676|Memory Compression
+proc|3736|svchost.exe
+proc|3796|svchost.exe
+proc|3804|svchost.exe
+proc|3812|svchost.exe
+proc|3856|svchost.exe
+proc|3868|svchost.exe
+proc|4012|svchost.exe
+proc|4048|svchost.exe
+proc|4212|svchost.exe
+proc|4220|svchost.exe
+proc|4392|svchost.exe
+proc|4440|svchost.exe
+proc|4512|spoolsv.exe
+proc|4552|svchost.exe
+proc|4600|WUDFHost.exe
+proc|4608|svchost.exe
+proc|4628|svchost.exe
+proc|4848|NVDisplay.Container.exe
+proc|4996|svchost.exe
+proc|5016|svchost.exe
+proc|5036|CCleaner_service.exe
+proc|5044|svchost.exe
+proc|5052|svchost.exe
+proc|5060|NahimicService.exe
+proc|5068|nvcontainer.exe
+proc|5080|svchost.exe
+proc|5088|svchost.exe
+proc|5096|svchost.exe
+proc|5104|RtkAudUService64.exe
+proc|5112|svchost.exe
+proc|4280|GameManagerService.exe
+proc|1952|RazerCentralService.exe
+proc|5132|svchost.exe
+proc|5140|pg_ctl.exe
+proc|5148|sshd.exe
+proc|5164|RzUpdateEngineService.exe
+proc|5192|logioptionsplus_updater.exe
+proc|5216|MsMpEng.exe
+proc|5232|MpDefenderCoreService.exe
+proc|5448|svchost.exe
+proc|5808|tailscaled.exe
+proc|5868|conhost.exe
+proc|5884|conhost.exe
+proc|5892|conhost.exe
+proc|6436|postgres.exe
+proc|6444|conhost.exe
+proc|6644|svchost.exe
+proc|7028|svchost.exe
+proc|7124|dasHost.exe
+proc|5832|svchost.exe
+proc|6004|AggregatorHost.exe
+proc|7448|postgres.exe
+proc|7496|postgres.exe
+proc|7504|postgres.exe
+proc|7524|postgres.exe
+proc|7560|postgres.exe
+proc|7580|postgres.exe
+proc|7728|svchost.exe
+proc|9064|svchost.exe
+proc|9092|svchost.exe
+proc|8504|Razer Synapse Service.exe
+proc|8668|postgres.exe
+proc|8628|postgres.exe
+proc|8760|postgres.exe
+proc|9024|svchost.exe
+proc|9048|svchost.exe
+proc|9372|gamingservicesnet.exe
+proc|9380|gamingservices.exe
+proc|9392|svchost.exe
+proc|9676|svchost.exe
+proc|9976|svchost.exe
+proc|10096|svchost.exe
+proc|10108|wlanext.exe
+proc|10768|svchost.exe
+proc|5268|nvcontainer.exe
+proc|11532|svchost.exe
+proc|11660|svchost.exe
+proc|11688|svchost.exe
+proc|12612|NisSrv.exe
+proc|12852|GameInputSvc.exe
+proc|12880|GameInputSvc.exe
+proc|12984|tailscaled.exe
+proc|13084|svchost.exe
+proc|8256|svchost.exe
+proc|9616|svchost.exe
+proc|7604|svchost.exe
+proc|12836|svchost.exe
+proc|13468|powershell.exe
+proc|13496|yuzu-agent.exe
+proc|13676|yuzu-server.exe
+proc|13776|python.exe
+proc|13800|python.exe
+proc|14108|postgres.exe
+proc|14268|postgres.exe
+proc|14216|svchost.exe
+proc|8948|svchost.exe
+proc|8564|svchost.exe
+proc|2080|svchost.exe
+proc|3836|svchost.exe
+proc|4940|SearchIndexer.exe
+proc|7676|svchost.exe
+proc|12240|svchost.exe
+proc|7776|svchost.exe
+proc|12900|postgres.exe
+proc|12160|svchost.exe
+proc|5672|vctip.exe
+proc|6680|svchost.exe
+proc|11708|SearchProtocolHost.exe
+proc|9696|WmiPrvSE.exe
+proc|4264|cmd.exe
+proc|11244|conhost.exe
+proc|12424|bash.exe
+proc|1220|bash.exe
+proc|3472|bash.exe
+proc|4428|mspdbsrv.exe
+proc|9224|bash.exe
+proc|3948|meson.exe
+proc|6768|python.exe
+proc|11804|ninja.exe
+proc|9964|VSSVC.exe
+proc|12032|svchost.exe
+proc|11616|cl.exe
+proc|10184|sshd.exe
+proc|12276|sshd.exe
+proc|11296|powershell.exe
+proc|13268|conhost.exe
+proc|10236|bash.exe
+proc|12152|conhost.exe
+proc|2788|bash.exe
+proc|2416|bash.exe
+proc|3176|bash.exe
+proc|5760|python.exe
+proc|3524|WmiPrvSE.exe
+proc|5608|sppsvc.exe
+proc|14188|cl.exe
+proc|9404|plugin_capture.exe
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_hashed
+proc|0|[System Process]||
+proc|4|System||
+proc|332|Secure System||
+proc|376|Registry||
+proc|1052|smss.exe|f87219d8e2b4a890dc81c52a089ebd9eac660d7ea7c3e0c13082e0c6a3137e3c|C:\Windows\System32\smss.exe
+proc|1504|csrss.exe|a958083fd4982697973d1f4a05a8f51b1f5d551a558cfa0097cfb6867fdce3ba|C:\Windows\System32\csrss.exe
+proc|1596|wininit.exe|e368636ad52479e832cf51902b520215a5326bc6e4151097a3bd668a02750bed|C:\Windows\System32\wininit.exe
+proc|1604|csrss.exe|a958083fd4982697973d1f4a05a8f51b1f5d551a558cfa0097cfb6867fdce3ba|C:\Windows\System32\csrss.exe
+proc|1676|services.exe|ea75ad4d7c72a25d7284311e33b8f31a89aa35a779e1ad9b2c81af4fde45af5b|C:\Windows\System32\services.exe
+proc|1716|winlogon.exe|8d0719298efb3289c8df3987ff21933a56617a6c6bbbcee392e80b3b56816838|C:\Windows\System32\winlogon.exe
+proc|1724|LsaIso.exe|324b4d8c93c46033c24c240cae5c325d4fd12aab2d6e528eb53d4cdd76ddb679|C:\Windows\System32\LsaIso.exe
+proc|1740|lsass.exe|b112d00d1b4db2d49d971dbb04484917c673ed747f8811c7d257a81878c7be2a|C:\Windows\System32\lsass.exe
+proc|1936|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|1968|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
+proc|1976|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
+proc|2016|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
+proc|1008|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|1500|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2060|LogonUI.exe|56346443a0d60b793c9a15b49dc12b885d21aa835e4b22e3d66d30158b70c1ab|C:\Windows\System32\LogonUI.exe
+proc|2068|dwm.exe|00eb3d5e6092e1246bd0956ff0a341c2afa6f96bb805b93d36a7192a9c29e475|C:\Windows\System32\dwm.exe
+proc|2128|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2136|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2176|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2192|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2212|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2232|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2448|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2456|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2464|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2472|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2644|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2652|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2704|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2812|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2904|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2984|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3032|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3056|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3136|NVDisplay.Container.exe|c503995d5982873062083716db4f7865e2093218d8d3861984a1834e81681bf1|C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_b26cc1edfbb8f4d0\Display.NvContainer\NVDisplay.Container.exe
+proc|3184|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3192|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3304|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3352|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3416|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3424|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3432|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3600|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3676|Memory Compression||
+proc|3736|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3796|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3804|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3812|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3856|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3868|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4012|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4048|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4212|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4220|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4392|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4440|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4512|spoolsv.exe|ea9ddc1cb73e09420b45d6aaaaf366eaefd4ddc5e8f38269012f29f8485809b0|C:\Windows\System32\spoolsv.exe
+proc|4552|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4600|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
+proc|4608|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4628|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4848|NVDisplay.Container.exe|c503995d5982873062083716db4f7865e2093218d8d3861984a1834e81681bf1|C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_b26cc1edfbb8f4d0\Display.NvContainer\NVDisplay.Container.exe
+proc|4996|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5016|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5036|CCleaner_service.exe|d556b6bbe2ac787d521efc5bd86afdf5358788af31cfec926051c47e50893ec2|C:\Program Files\Piriform\CCleaner 7\CCleaner_service.exe
+proc|5044|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5052|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5060|NahimicService.exe|8a8b5329afc5c2ce17b05089c7b2ce3ac35a7bd6b81e4baf236787b647cb056d|C:\Windows\System32\NahimicService.exe
+proc|5068|nvcontainer.exe|7168361755ec552a77169a47eb7df5c4e3a13c63f7ccc43fade15abf19ef1c43|C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe
+proc|5080|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5088|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5096|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5104|RtkAudUService64.exe|b3a071c48967178d1730e3909af4dcfa1abd10079d135dea07aa9f977a96ed50|C:\Windows\System32\DriverStore\FileRepository\realtekservice.inf_amd64_c607c18cb15933d8\RtkAudUService64.exe
+proc|5112|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4280|GameManagerService.exe|c90f1a3390bf29b10d8e543c7bfd6a9cc140fdcf80931b869e1c11ad1cf7ead0|C:\Program Files (x86)\Razer\Razer Services\GMS\GameManagerService.exe
+proc|1952|RazerCentralService.exe|09736deaba88d7aefc297be59993e60ed58a9ed96573f33b6e3189b2f8d7c006|C:\Program Files (x86)\Razer\Razer Services\Razer Central\RazerCentralService.exe
+proc|5132|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5140|pg_ctl.exe|b9ac03882819c01ea27c8fb6259857dc63a2e63cb315f50b9f510f7e4b337349|C:\Program Files\PostgreSQL\18\bin\pg_ctl.exe
+proc|5148|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|5164|RzUpdateEngineService.exe|acfa31c2bfbd526268d0f8039c5190fcdb6c7f8ba18e959e12b08d40d9325594|C:\Program Files (x86)\Razer\RzUpdateEngineService\RzUpdateEngineService.exe
+proc|5192|logioptionsplus_updater.exe|0867cd4449e63ce95a513c8f34b4772c41bef6ce319a68ad094a98284810e6be|C:\Program Files\LogiOptionsPlus\logioptionsplus_updater.exe
+proc|5216|MsMpEng.exe|a5eb49c99a7785f6084594cf0609371d6d6d38e370a41b70e36bb3b571117fcd|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MsMpEng.exe
+proc|5232|MpDefenderCoreService.exe|0b956bde8df5ca2a2e9bbdbedffc8e486de1cd2cd45eecc01c3b94d0b1cb2eb2|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpDefenderCoreService.exe
+proc|5448|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5808|tailscaled.exe|dc1aa013ae85f2e31a2b680977e732e18cf9af31f03d18cf09480f0d48ee5699|C:\Program Files\Tailscale\tailscaled.exe
+proc|5868|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|5884|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|5892|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|6444|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|6644|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7028|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7124|dasHost.exe|ab90cefc7658ca1d7492f95228fb5f7d7fe5f19ff6242b881f27bb8b43e2867e|C:\Windows\System32\dasHost.exe
+proc|5832|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|6004|AggregatorHost.exe|a7844bf1e1245087f62affd45361e91fdb4634bff455cc65f867840d5fb0eecc|C:\Windows\System32\AggregatorHost.exe
+proc|7448|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7496|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7504|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7524|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7560|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7580|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7728|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9064|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9092|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8504|Razer Synapse Service.exe|38b1e993dc273afd9d22c5c1198059a058ebfa256b3c6886bc016b54bc52b403|C:\Program Files (x86)\Razer\Synapse3\Service\Razer Synapse Service.exe
+proc|8668|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|8628|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|8760|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|9024|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9048|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9372|gamingservicesnet.exe|1ebf3a03350daa7e462c558fc89aa5a04e53f81afb9cc2f09f030fe5a8e5eae6|C:\Program Files\WindowsApps\Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe\gamingservicesnet.exe
+proc|9380|gamingservices.exe|1ebf3a03350daa7e462c558fc89aa5a04e53f81afb9cc2f09f030fe5a8e5eae6|C:\Program Files\WindowsApps\Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe\gamingservices.exe
+proc|9392|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9976|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|10096|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|10108|wlanext.exe|c181905d90262ceb8d7843b62d75ee200b13856d9c9061aca68e3d444f0e38ba|C:\Windows\System32\wlanext.exe
+proc|10768|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5268|nvcontainer.exe|7168361755ec552a77169a47eb7df5c4e3a13c63f7ccc43fade15abf19ef1c43|C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe
+proc|11532|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11660|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11688|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12612|NisSrv.exe|1d4470622bce054f85fa6ca9f3278db9b29cf27efb333778cca5400e208158ad|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\NisSrv.exe
+proc|12852|GameInputSvc.exe|83ba5166dd6397ade67f4b6fddae6be61a694f487ed88ea83ee204f20be6d075|C:\Windows\System32\GameInputSvc.exe
+proc|12880|GameInputSvc.exe|83ba5166dd6397ade67f4b6fddae6be61a694f487ed88ea83ee204f20be6d075|C:\Windows\System32\GameInputSvc.exe
+proc|12984|tailscaled.exe|dc1aa013ae85f2e31a2b680977e732e18cf9af31f03d18cf09480f0d48ee5699|C:\Program Files\Tailscale\tailscaled.exe
+proc|13084|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8256|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9616|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7604|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12836|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|13468|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|13496|yuzu-agent.exe|fdd10d0477819cad07b4190d0f6e73fa62523a2a95c4ec073ad159d040fb2f35|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-agent.exe
+proc|13676|yuzu-server.exe|f012f08cce5cebbb2eb93d52f2a63b7856764c2205939a4e10ef0743f1940d71|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+proc|13776|python.exe|0b471133e110cfb53a061cad528ce8e517d7b9ac41a0a396c39ad795a487fc14|C:\yuzu-rig\Yuzu-Demos\.venv\Scripts\python.exe
+proc|13800|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|14108|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|14268|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|14216|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8948|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8564|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2080|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3836|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4940|SearchIndexer.exe|3455014b6753e4d08b2635f976b5f3bb8898b45345f4dede59ff5c659049e6d3|C:\Windows\System32\SearchIndexer.exe
+proc|7676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12240|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7776|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12900|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|12160|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5672|vctip.exe|e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe
+proc|6680|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11708|SearchProtocolHost.exe|848b43836bf524c8268517dbf9f0e4e15c4eea3185df7ba1645258a0f83fe930|C:\Windows\System32\SearchProtocolHost.exe
+proc|9696|WmiPrvSE.exe|bfa975bc3423f8628cb0072eb21088d5c97d37a6318b3476dab5f8778c6afddc|C:\Windows\System32\wbem\WmiPrvSE.exe
+proc|4264|cmd.exe|97ac98b1a92c286054cce55239cfccdfc23a5517bd07fe693072c9ca96c7dabb|C:\Windows\System32\cmd.exe
+proc|11244|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|12424|bash.exe|9aa00217a92def5fed1b15c6e2b34a7f89e3781af822ecc00960fe5340df093e|C:\Program Files\Git\bin\bash.exe
+proc|1220|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3472|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|4428|mspdbsrv.exe|9221dbe740f39a1059dfe6e917984effad6f97312636f001c9191a6bccb34f93|C:\PROGRA~2\MICROS~2\2022\BUILDT~1\VC\Tools\MSVC\1444~1.352\bin\Hostx64\x64\mspdbsrv.exe
+proc|9224|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3948|meson.exe|292f1fe7a70feea0c6b74f75bfe73ffed25df14757892123aa2a67d355b11b2f|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\meson.exe
+proc|6768|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|11804|ninja.exe|cb4590bad18f01607e819908d536fba71afbe36eb0f1d5a13c60d88d635ca959|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\ninja.exe
+proc|9964|VSSVC.exe|b909c6b68d00209484deb3e7a6c9305152ef9598d754436089a77954dd48228d|C:\Windows\System32\VSSVC.exe
+proc|12032|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11616|cl.exe|88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+proc|10184|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|12276|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|11296|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|13268|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|10236|bash.exe|9aa00217a92def5fed1b15c6e2b34a7f89e3781af822ecc00960fe5340df093e|C:\Program Files\Git\bin\bash.exe
+proc|12152|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|2788|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|2416|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3176|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|5760|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|3524|WmiPrvSE.exe|bfa975bc3423f8628cb0072eb21088d5c97d37a6318b3476dab5f8778c6afddc|C:\Windows\System32\wbem\WmiPrvSE.exe
+proc|5608|sppsvc.exe|3944e5e9281150b4506b54fd56d7c1392885e9a6c87d1e520c38de34ab79bcba|C:\Windows\System32\sppsvc.exe
+proc|14188|cl.exe|88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+proc|3220|plugin_capture.exe|373b5e5e4ed3fff60e4f0e3b8aac0e8ac5f5457909bd164e0b6edec739930a6b|D:\yuzu-dev\Yuzu-worktrees\docs-plugin-readme-sweep\build-windows\tools\plugin-capture-tmp\plugin_capture.exe
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=list_tree
+proc|0|0|[System Process]||
+proc|4|0|System||
+proc|332|4|Secure System||
+proc|376|4|Registry||
+proc|1052|4|smss.exe|f87219d8e2b4a890dc81c52a089ebd9eac660d7ea7c3e0c13082e0c6a3137e3c|C:\Windows\System32\smss.exe
+proc|1504|1496|csrss.exe|a958083fd4982697973d1f4a05a8f51b1f5d551a558cfa0097cfb6867fdce3ba|C:\Windows\System32\csrss.exe
+proc|1596|1496|wininit.exe|e368636ad52479e832cf51902b520215a5326bc6e4151097a3bd668a02750bed|C:\Windows\System32\wininit.exe
+proc|1604|1588|csrss.exe|a958083fd4982697973d1f4a05a8f51b1f5d551a558cfa0097cfb6867fdce3ba|C:\Windows\System32\csrss.exe
+proc|1676|1596|services.exe|ea75ad4d7c72a25d7284311e33b8f31a89aa35a779e1ad9b2c81af4fde45af5b|C:\Windows\System32\services.exe
+proc|1716|1588|winlogon.exe|8d0719298efb3289c8df3987ff21933a56617a6c6bbbcee392e80b3b56816838|C:\Windows\System32\winlogon.exe
+proc|1724|1596|LsaIso.exe|324b4d8c93c46033c24c240cae5c325d4fd12aab2d6e528eb53d4cdd76ddb679|C:\Windows\System32\LsaIso.exe
+proc|1740|1596|lsass.exe|b112d00d1b4db2d49d971dbb04484917c673ed747f8811c7d257a81878c7be2a|C:\Windows\System32\lsass.exe
+proc|1936|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|1968|1596|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
+proc|1976|1716|fontdrvhost.exe|953a875bfb2fc970dba06fb2cce6cbedec839c9478c4a159f39267e5b08ef460|C:\Windows\System32\fontdrvhost.exe
+proc|2016|1676|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
+proc|1008|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|1500|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2060|1716|LogonUI.exe|56346443a0d60b793c9a15b49dc12b885d21aa835e4b22e3d66d30158b70c1ab|C:\Windows\System32\LogonUI.exe
+proc|2068|1716|dwm.exe|00eb3d5e6092e1246bd0956ff0a341c2afa6f96bb805b93d36a7192a9c29e475|C:\Windows\System32\dwm.exe
+proc|2128|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2136|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2176|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2192|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2212|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2232|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2448|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2456|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2464|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2472|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2644|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2652|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2704|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2812|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2904|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2984|2448|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3032|2448|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3056|2448|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|3136|1676|NVDisplay.Container.exe|c503995d5982873062083716db4f7865e2093218d8d3861984a1834e81681bf1|C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_b26cc1edfbb8f4d0\Display.NvContainer\NVDisplay.Container.exe
+proc|3184|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3192|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3304|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3352|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3416|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3424|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3432|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3600|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3676|4|Memory Compression||
+proc|3736|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3796|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3804|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3812|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3856|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3868|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4012|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4048|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4212|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4220|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4392|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4440|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4512|1676|spoolsv.exe|ea9ddc1cb73e09420b45d6aaaaf366eaefd4ddc5e8f38269012f29f8485809b0|C:\Windows\System32\spoolsv.exe
+proc|4552|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4600|1676|WUDFHost.exe|ce5ccbb7806fa3ba2075d736812833d6e0d25cb4f3346f0b205f126d30e3e1c2|C:\Windows\System32\WUDFHost.exe
+proc|4608|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4628|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4848|3136|NVDisplay.Container.exe|c503995d5982873062083716db4f7865e2093218d8d3861984a1834e81681bf1|C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_b26cc1edfbb8f4d0\Display.NvContainer\NVDisplay.Container.exe
+proc|4996|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5016|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5036|1676|CCleaner_service.exe|d556b6bbe2ac787d521efc5bd86afdf5358788af31cfec926051c47e50893ec2|C:\Program Files\Piriform\CCleaner 7\CCleaner_service.exe
+proc|5044|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5052|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5060|1676|NahimicService.exe|8a8b5329afc5c2ce17b05089c7b2ce3ac35a7bd6b81e4baf236787b647cb056d|C:\Windows\System32\NahimicService.exe
+proc|5068|1676|nvcontainer.exe|7168361755ec552a77169a47eb7df5c4e3a13c63f7ccc43fade15abf19ef1c43|C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe
+proc|5080|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5088|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5096|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5104|1676|RtkAudUService64.exe|b3a071c48967178d1730e3909af4dcfa1abd10079d135dea07aa9f977a96ed50|C:\Windows\System32\DriverStore\FileRepository\realtekservice.inf_amd64_c607c18cb15933d8\RtkAudUService64.exe
+proc|5112|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4280|1676|GameManagerService.exe|c90f1a3390bf29b10d8e543c7bfd6a9cc140fdcf80931b869e1c11ad1cf7ead0|C:\Program Files (x86)\Razer\Razer Services\GMS\GameManagerService.exe
+proc|1952|1676|RazerCentralService.exe|09736deaba88d7aefc297be59993e60ed58a9ed96573f33b6e3189b2f8d7c006|C:\Program Files (x86)\Razer\Razer Services\Razer Central\RazerCentralService.exe
+proc|5132|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5140|1676|pg_ctl.exe|b9ac03882819c01ea27c8fb6259857dc63a2e63cb315f50b9f510f7e4b337349|C:\Program Files\PostgreSQL\18\bin\pg_ctl.exe
+proc|5148|1676|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|5164|1676|RzUpdateEngineService.exe|acfa31c2bfbd526268d0f8039c5190fcdb6c7f8ba18e959e12b08d40d9325594|C:\Program Files (x86)\Razer\RzUpdateEngineService\RzUpdateEngineService.exe
+proc|5192|1676|logioptionsplus_updater.exe|0867cd4449e63ce95a513c8f34b4772c41bef6ce319a68ad094a98284810e6be|C:\Program Files\LogiOptionsPlus\logioptionsplus_updater.exe
+proc|5216|1676|MsMpEng.exe|a5eb49c99a7785f6084594cf0609371d6d6d38e370a41b70e36bb3b571117fcd|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MsMpEng.exe
+proc|5232|1676|MpDefenderCoreService.exe|0b956bde8df5ca2a2e9bbdbedffc8e486de1cd2cd45eecc01c3b94d0b1cb2eb2|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpDefenderCoreService.exe
+proc|5448|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5808|1676|tailscaled.exe|dc1aa013ae85f2e31a2b680977e732e18cf9af31f03d18cf09480f0d48ee5699|C:\Program Files\Tailscale\tailscaled.exe
+proc|5868|3056|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|5884|3032|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|5892|2984|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|6436|5140|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|6444|6436|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|6644|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7028|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7124|3192|dasHost.exe|ab90cefc7658ca1d7492f95228fb5f7d7fe5f19ff6242b881f27bb8b43e2867e|C:\Windows\System32\dasHost.exe
+proc|5832|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|6004|4996|AggregatorHost.exe|a7844bf1e1245087f62affd45361e91fdb4634bff455cc65f867840d5fb0eecc|C:\Windows\System32\AggregatorHost.exe
+proc|7448|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7496|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7504|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7524|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7560|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7580|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|7728|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9064|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9092|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8504|1676|Razer Synapse Service.exe|38b1e993dc273afd9d22c5c1198059a058ebfa256b3c6886bc016b54bc52b403|C:\Program Files (x86)\Razer\Synapse3\Service\Razer Synapse Service.exe
+proc|8668|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|8628|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|8760|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|9024|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9048|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9372|1676|gamingservicesnet.exe|1ebf3a03350daa7e462c558fc89aa5a04e53f81afb9cc2f09f030fe5a8e5eae6|C:\Program Files\WindowsApps\Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe\gamingservicesnet.exe
+proc|9380|1676|gamingservices.exe|1ebf3a03350daa7e462c558fc89aa5a04e53f81afb9cc2f09f030fe5a8e5eae6|C:\Program Files\WindowsApps\Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe\gamingservices.exe
+proc|9392|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9676|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9976|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|10096|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|10108|4392|wlanext.exe|c181905d90262ceb8d7843b62d75ee200b13856d9c9061aca68e3d444f0e38ba|C:\Windows\System32\wlanext.exe
+proc|10768|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5268|5068|nvcontainer.exe|7168361755ec552a77169a47eb7df5c4e3a13c63f7ccc43fade15abf19ef1c43|C:\Program Files\NVIDIA Corporation\NvContainer\nvcontainer.exe
+proc|11532|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11660|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11688|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12612|1676|NisSrv.exe|1d4470622bce054f85fa6ca9f3278db9b29cf27efb333778cca5400e208158ad|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\NisSrv.exe
+proc|12852|1676|GameInputSvc.exe|83ba5166dd6397ade67f4b6fddae6be61a694f487ed88ea83ee204f20be6d075|C:\Windows\System32\GameInputSvc.exe
+proc|12880|12852|GameInputSvc.exe|83ba5166dd6397ade67f4b6fddae6be61a694f487ed88ea83ee204f20be6d075|C:\Windows\System32\GameInputSvc.exe
+proc|12984|5808|tailscaled.exe|dc1aa013ae85f2e31a2b680977e732e18cf9af31f03d18cf09480f0d48ee5699|C:\Program Files\Tailscale\tailscaled.exe
+proc|13084|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8256|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|9616|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7604|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12836|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|13468|2984|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|13496|3056|yuzu-agent.exe|fdd10d0477819cad07b4190d0f6e73fa62523a2a95c4ec073ad159d040fb2f35|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-agent.exe
+proc|13676|3032|yuzu-server.exe|f012f08cce5cebbb2eb93d52f2a63b7856764c2205939a4e10ef0743f1940d71|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe
+proc|13776|13468|python.exe|0b471133e110cfb53a061cad528ce8e517d7b9ac41a0a396c39ad795a487fc14|C:\yuzu-rig\Yuzu-Demos\.venv\Scripts\python.exe
+proc|13800|13776|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|14108|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|14268|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|14216|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8948|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|8564|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|2080|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|3836|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|4940|1676|SearchIndexer.exe|3455014b6753e4d08b2635f976b5f3bb8898b45345f4dede59ff5c659049e6d3|C:\Windows\System32\SearchIndexer.exe
+proc|7676|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12240|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|7776|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|12900|6436|postgres.exe|6ad0b64d62d5ee581aab9b60d095bede9f8f629a23391adec8bb74729d23ac83|C:\Program Files\PostgreSQL\18\bin\postgres.exe
+proc|12160|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|5672|5760|vctip.exe|e175c981ca866689bf8f8d9bd5ba1e71e2eb1c9d389de555744b0cb439250996|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe
+proc|6680|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11708|4940|SearchProtocolHost.exe|848b43836bf524c8268517dbf9f0e4e15c4eea3185df7ba1645258a0f83fe930|C:\Windows\System32\SearchProtocolHost.exe
+proc|9696|1936|WmiPrvSE.exe|bfa975bc3423f8628cb0072eb21088d5c97d37a6318b3476dab5f8778c6afddc|C:\Windows\System32\wbem\WmiPrvSE.exe
+proc|4264|2448|cmd.exe|97ac98b1a92c286054cce55239cfccdfc23a5517bd07fe693072c9ca96c7dabb|C:\Windows\System32\cmd.exe
+proc|11244|4264|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|12424|4264|bash.exe|9aa00217a92def5fed1b15c6e2b34a7f89e3781af822ecc00960fe5340df093e|C:\Program Files\Git\bin\bash.exe
+proc|1220|12424|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3472|1220|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|4428|6760|mspdbsrv.exe|9221dbe740f39a1059dfe6e917984effad6f97312636f001c9191a6bccb34f93|C:\PROGRA~2\MICROS~2\2022\BUILDT~1\VC\Tools\MSVC\1444~1.352\bin\Hostx64\x64\mspdbsrv.exe
+proc|9224|3472|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3948|9224|meson.exe|292f1fe7a70feea0c6b74f75bfe73ffed25df14757892123aa2a67d355b11b2f|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\meson.exe
+proc|6768|3948|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|11804|6768|ninja.exe|cb4590bad18f01607e819908d536fba71afbe36eb0f1d5a13c60d88d635ca959|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\ninja.exe
+proc|9964|1676|VSSVC.exe|b909c6b68d00209484deb3e7a6c9305152ef9598d754436089a77954dd48228d|C:\Windows\System32\VSSVC.exe
+proc|12032|1676|svchost.exe|1222a44a5fdb4efde4dfcb41093648627950e7ec02d8667f1c26ccae31d922e2|C:\Windows\System32\svchost.exe
+proc|11616|11804|cl.exe|88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+proc|10184|5148|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|12276|10184|sshd.exe|98bbbdd8d159824056bd6d401b7c1cbb78a812b253ae51431cd2ae39f2983d98|C:\Windows\System32\OpenSSH\sshd.exe
+proc|11296|12276|powershell.exe|8bb6fa8c283b4d92120b1ef249a9b311b0f804d4cabbe9981159976c8be76a5e|C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+proc|13268|11296|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|10236|2448|bash.exe|9aa00217a92def5fed1b15c6e2b34a7f89e3781af822ecc00960fe5340df093e|C:\Program Files\Git\bin\bash.exe
+proc|12152|10236|conhost.exe|c6ef62b52ac783b90e220f85fab04b90fde8091d2a46f6780f8c4f88fe8b71fe|C:\Windows\System32\conhost.exe
+proc|2788|10236|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|2416|2788|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|3176|2416|bash.exe|92cff5f145d42f85b55aa3be8d3ad9827844a21ec4fbeaa1ddfe1dd4d76c6474|C:\Program Files\Git\usr\bin\bash.exe
+proc|5760|3176|python.exe|4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe
+proc|3524|1936|WmiPrvSE.exe|bfa975bc3423f8628cb0072eb21088d5c97d37a6318b3476dab5f8778c6afddc|C:\Windows\System32\wbem\WmiPrvSE.exe
+proc|5608|1676|sppsvc.exe|3944e5e9281150b4506b54fd56d7c1392885e9a6c87d1e520c38de34ab79bcba|C:\Windows\System32\sppsvc.exe
+proc|14188|11804|cl.exe|88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+proc|11876|5760|plugin_capture.exe|373b5e5e4ed3fff60e4f0e3b8aac0e8ac5f5457909bd164e0b6edec739930a6b|D:\yuzu-dev\Yuzu-worktrees\docs-plugin-readme-sweep\build-windows\tools\plugin-capture-tmp\plugin_capture.exe
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=query name=svchost.exe
+found|true
+proc|1936|svchost.exe
+proc|1008|svchost.exe
+proc|1500|svchost.exe
+proc|2128|svchost.exe
+proc|2136|svchost.exe
+proc|2176|svchost.exe
+proc|2192|svchost.exe
+proc|2212|svchost.exe
+proc|2232|svchost.exe
+proc|2448|svchost.exe
+proc|2456|svchost.exe
+proc|2464|svchost.exe
+proc|2472|svchost.exe
+proc|2644|svchost.exe
+proc|2652|svchost.exe
+proc|2704|svchost.exe
+proc|2812|svchost.exe
+proc|2904|svchost.exe
+proc|3184|svchost.exe
+proc|3192|svchost.exe
+proc|3304|svchost.exe
+proc|3352|svchost.exe
+proc|3416|svchost.exe
+proc|3424|svchost.exe
+proc|3432|svchost.exe
+proc|3600|svchost.exe
+proc|3736|svchost.exe
+proc|3796|svchost.exe
+proc|3804|svchost.exe
+proc|3812|svchost.exe
+proc|3856|svchost.exe
+proc|3868|svchost.exe
+proc|4012|svchost.exe
+proc|4048|svchost.exe
+proc|4212|svchost.exe
+proc|4220|svchost.exe
+proc|4392|svchost.exe
+proc|4440|svchost.exe
+proc|4552|svchost.exe
+proc|4608|svchost.exe
+proc|4628|svchost.exe
+proc|4996|svchost.exe
+proc|5016|svchost.exe
+proc|5044|svchost.exe
+proc|5052|svchost.exe
+proc|5080|svchost.exe
+proc|5088|svchost.exe
+proc|5096|svchost.exe
+proc|5112|svchost.exe
+proc|5132|svchost.exe
+proc|5448|svchost.exe
+proc|6644|svchost.exe
+proc|7028|svchost.exe
+proc|5832|svchost.exe
+proc|7728|svchost.exe
+proc|9064|svchost.exe
+proc|9092|svchost.exe
+proc|9024|svchost.exe
+proc|9048|svchost.exe
+proc|9392|svchost.exe
+proc|9676|svchost.exe
+proc|9976|svchost.exe
+proc|10096|svchost.exe
+proc|10768|svchost.exe
+proc|11532|svchost.exe
+proc|11660|svchost.exe
+proc|11688|svchost.exe
+proc|13084|svchost.exe
+proc|8256|svchost.exe
+proc|9616|svchost.exe
+proc|7604|svchost.exe
+proc|12836|svchost.exe
+proc|14216|svchost.exe
+proc|8948|svchost.exe
+proc|8564|svchost.exe
+proc|2080|svchost.exe
+proc|3836|svchost.exe
+proc|7676|svchost.exe
+proc|12240|svchost.exe
+proc|7776|svchost.exe
+proc|12160|svchost.exe
+proc|6680|svchost.exe
+proc|12032|svchost.exe
+[result_status] UNDECLARED / UNKNOWN / 
+

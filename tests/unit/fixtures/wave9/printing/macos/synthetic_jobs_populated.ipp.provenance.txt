@@ -1,0 +1,31 @@
+status: SYNTHETIC — hand-assembled against this plugin's own
+printing_ipp.hpp wire grammar. It exercises decoder group/attribute/bounds
+logic. It is NOT evidence of cupsd behaviour and MUST NOT be cited in a
+descriptor note, README sentence, or code comment as though it were.
+
+What this file is: a byte-accurate Get-Jobs response (status
+successful-ok 0x0000, request-id 18) hand-assembled against
+printing_ipp.hpp's wire grammar — one job-attributes group: job-id=2,
+job-printer-uri=ipp://localhost/printers/yuzu_test,
+job-originating-user-name=alex, job-name=hosts, job-state=5 (processing),
+date-time-at-creation=2026-09-08T12:00:00Z (RFC 2911 dateTime, 11 raw
+octets — updated from time-at-creation after a real cupsd capture proved
+that attribute is printer-uptime-relative, not Unix epoch; see
+printing_parsers.hpp's iso8601_from_ipp_datetime doc comment),
+job-k-octets=1. It exercises jobs_from_ipp's field mapping
+(owner/document/status/submitted_at/size_bytes) for a shape the real
+Tier A captures cannot reach (this host has no configured queues, so no
+real Get-Jobs response here can ever contain a populated job-attributes
+group).
+Coverage of the full job-state range (3..9) and additional-value
+continuation is exercised separately by this-file's-sibling hand-built
+unit tests in test_printing_parsers.cpp ("decode: additional-value
+continuation..."), not by this fixture's single job-state=5 group.
+
+Promotion path: Phase B (`bash capture.sh --phase-b`, requires sudo)
+submits a real job to a throwaway `yuzu_test` queue and replaces this file
+with a genuine capture, at which point this provenance file is rewritten
+to `status: REAL CAPTURE`. Until Phase B runs, this fixture stays
+SYNTHETIC.
+
+identity (of this synthetic construction): id -u = 501 (alex)

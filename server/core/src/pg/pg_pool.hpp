@@ -97,6 +97,29 @@ public:
         /// connection (NAT/firewall reap) as a failed statement instead of an
         /// indefinite hang. 0 leaves libpq defaults.
         int keepalives_idle_s = 30;
+        /// TCP_USER_TIMEOUT (ms, libpq 12+ — a no-op where the platform lacks
+        /// the socket option, e.g. macOS). Linux support is confirmed against
+        /// this project's vendored libpq (`fe-connect.c` sets `TCP_USER_TIMEOUT`
+        /// under `__linux__`). **Windows is unconfirmed, not confirmed
+        /// unsupported** — Gate 3 review (#2703) produced disagreeing reads
+        /// of libpq's own Windows conditional compilation and neither could be
+        /// fully settled from available evidence; treat it as a documented
+        /// open question rather than an established fact either way until
+        /// someone verifies against a live Windows build. Injected as
+        /// `tcp_user_timeout=`
+        /// unless the conninfo sets its own. Distinct from keepalives_idle
+        /// above: keepalives only start probing once the connection goes
+        /// IDLE (no traffic either direction) and, with `keepalives_interval`/
+        /// `keepalives_count` left at OS defaults, total detection can run to
+        /// several minutes; this bounds how long UNACKNOWLEDGED data (e.g. a
+        /// query already sent, awaiting a reply that a dead network path will
+        /// never deliver) may sit before the OS gives up, independent of any
+        /// keepalive cycle. Does NOT race statement_timeout on a live
+        /// connection — TCP ACKs happen at the transport layer regardless of
+        /// how long the server takes to produce a response, so this only
+        /// fires on a genuinely dark path, never on an alive-but-slow query.
+        /// 0 leaves libpq defaults (unbounded).
+        int tcp_user_timeout_ms = 10000;
         /// Connect-failure circuit breaker (#1368 cheap-idle): after a failed
         /// connect, suppress further connect attempts for an
         /// exponentially-growing window (`base × 2^(failures-1)`, capped, with
@@ -107,6 +130,60 @@ public:
         /// not blocked). A successful connect resets the breaker.
         std::chrono::milliseconds connect_backoff_base{200};
         std::chrono::milliseconds connect_backoff_cap{5000};
+        /// Fast-fail-on-saturation ceiling for a bounded acquire (#2146 gov
+        /// sre finding `up-2146-a2r1-httplib-worker-cascade`). Checked ONCE,
+        /// at entry, inside `try_acquire_for`/`with_txn_for` (never the
+        /// unbounded `acquire()`/`with_txn()`): if the pool is ALREADY
+        /// saturated at that instant (no idle connection, no spare capacity
+        /// to open a new one -- exactly the condition under which the
+        /// acquire loop would otherwise block a caller), the wait is clamped
+        /// to `min(caller's own timeout, this value)`, so a caller that
+        /// arrives after saturation gets its degrade response back quickly
+        /// rather than pinning its thread (often an httplib worker for a
+        /// REST route, but any caller of a bounded acquire) for the full
+        /// timeout waiting on a connection that is very unlikely to free up
+        /// in time anyway. A caller that arrives BEFORE
+        /// saturation is unaffected -- this never shortens a wait that would
+        /// otherwise have succeeded quickly.
+        ///
+        /// Default 500ms, not a smaller "near-zero" value, DELIBERATELY:
+        /// this is a SHARED chokepoint every bounded acquire in the codebase
+        /// goes through, and several callers already pick a short timeout on
+        /// purpose for reasons unrelated to this finding -- most notably
+        /// `auth_db.cpp`'s `#2396` login-resilience retry
+        /// (`kAcquireRetryTimeout{150}`), whose own doc comment explains it
+        /// is sized to be >= its retry backoff SPECIFICALLY so a retry has
+        /// time to catch a just-freed connection, after a prior review
+        /// (Gate 4 UP-3) rejected a narrower window for causing false
+        /// `StoreBusy` under mere contention. 500ms sits AT OR ABOVE every
+        /// deliberately-short acquire/retry timeout already in this codebase
+        /// at the time of writing (audited: the largest is
+        /// `kCreateAcquireTimeout`/`kIngestAcquireTimeout`/gateway_route_
+        /// store's `kWriteTimeout`, all exactly 500ms -- a tie, not a gap) so
+        /// this fix only compresses the LONG budgets the finding is actually
+        /// about, never an already-tuned short one. Those long budgets span a
+        /// wider range than the `kReadTimeout`/`kWriteTimeout` shorthand
+        /// above suggests: several stores' own `with_txn_for`/`try_acquire_
+        /// for` call sites reach `AuditStore::kReapTimeout{8000}` (the
+        /// retention reaper), `LicenseStore::kValidateTimeout{10000}`,
+        /// `AppPerfRollup::kRollAcquireTimeout{5000}`, and
+        /// `AnalyticsEventStore::kDrainClaimTimeout{5000}` -- up to a 20x
+        /// compression at the extreme, not merely 3-8x (#2146 A2-R1 Gate 8
+        /// round 4, architect). This clamp is a SHARED chokepoint with no
+        /// read/write distinction: it applies identically to security- and
+        /// audit-critical WRITE paths sharing this pool (RbacStore, AuditStore,
+        /// QuarantineStore, SessionStore, EnginePrincipalStore among them, all
+        /// with `kWriteTimeout` well above 500ms) -- a deliberate, uniform
+        /// chokepoint-level policy rather than a read-only-scoped one, reviewed
+        /// and accepted in Gate 8 round 4 on the basis that a failed
+        /// `with_txn_for` already means "transaction never began" either way
+        /// (no partial-mutation risk is introduced), the only change being the
+        /// RATE of that pre-existing failure mode under sustained saturation.
+        /// It mirrors `kContainmentReadSlotWait` (server.cpp)'s own reasoning
+        /// for the same number: a healthy store's read is milliseconds, so
+        /// 500ms is unobservable there, while a stalled one is rejected
+        /// quickly instead of pinning a worker.
+        std::chrono::milliseconds saturated_fast_fail{500};
         /// Observability hooks; see Observer. All optional.
         Observer observer;
     };
@@ -180,11 +257,23 @@ public:
     /// failure reason is in `last_error()`).
     [[nodiscard]] Lease acquire();
 
+    /// The `connect_timeout` (seconds) this pool adds to a new connection when
+    /// the conninfo and PGCONNECT_TIMEOUT set none. The /readyz probe applies the
+    /// same default so it gives up on a host exactly when the pool does (HA WS-8).
+    [[nodiscard]] int connect_timeout_s() const noexcept { return connect_timeout_s_; }
+
     /// As `acquire()`, but gives up after `timeout` when the pool is
     /// exhausted and nothing is released in time. Bound caveat: a fresh
     /// connection attempt is only STARTED before the deadline, but once
-    /// started it runs to completion — worst case is roughly
+    /// started it runs to completion -- worst case is roughly
     /// `timeout + connect_timeout_s`.
+    ///
+    /// Fast-fail-on-saturation (Options::saturated_fast_fail): when the pool
+    /// is ALREADY saturated at the moment this is called, the effective wait
+    /// is `min(timeout, saturated_fast_fail)`, not the full `timeout` --
+    /// see the option's doc comment. A caller depending on the full
+    /// `timeout` being honoured under saturation (there should be none --
+    /// that is the failure mode this exists to close) needs to know this.
     [[nodiscard]] Lease try_acquire_for(std::chrono::milliseconds timeout);
 
     /// Pin one connection for a transaction: BEGIN, run `fn`, COMMIT when it
@@ -212,8 +301,41 @@ public:
     /// writes (e.g. the inventory full-payload replace) MUST use this so a
     /// saturated pool — e.g. a fleet-wide need_full storm — cannot block a gRPC
     /// worker indefinitely (ADR-0012 bounded-acquire discipline; gov UP-3).
+    /// Inherits `try_acquire_for`'s fast-fail-on-saturation clamp
+    /// (Options::saturated_fast_fail) since it acquires through that call.
     bool with_txn_for(std::chrono::milliseconds timeout,
                       const std::function<bool(PGconn*)>& fn);
+
+    /// As `with_txn`/`with_txn_for`, but the caller supplies an ALREADY-ACQUIRED lease
+    /// instead of this call doing its own acquire. Exists so a caller can tell apart "the
+    /// connection was never acquired, nothing ambiguous" from "a connection was held and the
+    /// transaction itself reported failure" — the two `with_txn*` overloads collapse both into
+    /// one `false`, which is fine for callers that only need to know success/failure, but is
+    /// NOT safe for a caller whose failure-handling includes a DESTRUCTIVE step (e.g. undoing
+    /// prior side effects): a lost COMMIT response after Postgres actually committed reports
+    /// `false` here exactly like a genuine rollback does, and destructive failure-handling built
+    /// on the WRONG assumption ("false always means nothing landed") can delete data that is
+    /// actually there (gov Gate 5 CHAOS-1, #3481 — `ProductPackStore::install`'s compensating
+    /// rollback is the first consumer: acquire via `try_acquire_for` first, and only treat a
+    /// subsequent `with_txn_on` failure as "safe to compensate" after CONFIRMING via
+    /// `pg_xact_status()` (see `ProductPackStore::check_transaction_outcome`) — NOT via a
+    /// fresh row-existence read, which CHAOS-1b (gov Gate 8) found is itself unreliable: the
+    /// client-observed connection failure that triggers this check is not ordered relative to
+    /// the backend's own commit progress, so row-absence can mean "aborted" OR "not yet
+    /// committed" — the exact ambiguity this whole mechanism exists to resolve).
+    ///
+    /// Gov Gate 8 review (architect): unlike `with_txn_for`, the bounded-acquire discipline
+    /// (ADR-0012 §2a) is NOT baked into this call — it depends entirely on the CALLER acquiring
+    /// via `try_acquire_for` immediately beforehand, with nothing in between. Three rules for
+    /// any new caller: (1) acquire the lease via `try_acquire_for`, never the blocking
+    /// `acquire()` — this call has no timeout of its own to fall back on; (2) do NOTHING between
+    /// the acquire and this call — no I/O, no other store call, nothing that could block or run
+    /// its own transaction on the same lease first (a nested `BEGIN` on a connection already
+    /// mid-transaction only WARNs and silently continues the EXISTING transaction — this call's
+    /// COMMIT would then sweep in whatever was left uncommitted); (3) never reuse `lease` after
+    /// passing it here — it is consumed by value and MUST be a connection this call alone owns
+    /// for its lifetime.
+    bool with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn);
 
     /// False when the conninfo failed to parse at construction.
     [[nodiscard]] bool valid() const noexcept { return valid_; }
@@ -264,10 +386,13 @@ private:
     int statement_timeout_ms_{30000};
     int lock_timeout_ms_{10000};
     int keepalives_idle_s_{30};
+    int tcp_user_timeout_ms_{10000};
     bool valid_{false};
     bool conninfo_has_timeout_{false};
     bool conninfo_has_options_{false};
     bool conninfo_has_keepalives_{false};
+    bool conninfo_has_tcp_user_timeout_{false};
+    std::chrono::milliseconds saturated_fast_fail_{500};
     Observer observer_;
 
     mutable std::mutex mu_;

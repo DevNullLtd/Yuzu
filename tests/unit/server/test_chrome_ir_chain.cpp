@@ -32,6 +32,7 @@
 
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
 #include "test_route_sink.hpp"
@@ -41,10 +42,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -53,8 +54,19 @@
 #include "../test_helpers.hpp"
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
+// "resultset" template key with test_result_set_store.cpp (identical setup:
+// construct a ResultSetStore against the pool; the registry builds it once).
+yuzu::test::PgTestTemplate result_set_tpl{"resultset", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("resultset template: store failed to migrate");
+}};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -67,20 +79,10 @@ struct AuditRecord {
     std::string action, result, target_type, target_id, detail;
 };
 
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 // Real ResultSetStore + ExecutionTracker + InstructionStore, in-process route
 // dispatch, a recording fake command-dispatch, and an audit sink that captures
 // every emitted row. Mirrors AsyncHarness in test_rest_result_sets_async.cpp.
 struct ChromeIrHarness {
-    yuzu::test::TempDbFile rs_db{std::string_view("rs-chrome-ir-")};
-    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
     std::unique_ptr<ResultSetStore> store;
@@ -93,15 +95,16 @@ struct ChromeIrHarness {
     std::vector<AuditRecord> audit_log;
     int dispatch_sent{2}; // agents "reached" by each dispatch
 
-    ChromeIrHarness() {
-        store = std::make_unique<ResultSetStore>(rs_db.path);
+    explicit ChromeIrHarness(pg::PgPool& pool) {
+        store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
-        REQUIRE(sqlite3_open(":memory:", &tracker_guard.db) == SQLITE_OK);
-        tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-        tracker->create_tables();
+        tracker = std::make_unique<ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
 
-        instr = std::make_unique<InstructionStore>(":memory:");
+        // ADR-0058: InstructionStore is now a migrated Postgres store — shares
+        // the same pool/database as ResultSetStore above (schema-per-store).
+        instr = std::make_unique<InstructionStore>(pool);
         REQUIRE(instr->is_open());
 
         auto auth_fn = [](const httplib::Request&,
@@ -124,9 +127,10 @@ struct ChromeIrHarness {
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& params,
-                   const std::string& exec_id) -> std::pair<std::string, int> {
+                   const std::string& exec_id,
+                   const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope_expr, agent_ids, params, exec_id});
-            return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+            return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -138,7 +142,25 @@ struct ChromeIrHarness {
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
-                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn);
+                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn,
+                            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
+                            /*network_api=*/{}, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
+                            /*response_scope_fn=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr,
+                            // #1788: the async result-set producers now REFUSE
+                            // (audited 500) when the visibility derivation is
+                            // unwired — it is their only per-device gate. This
+                            // file exercises the lineage/audit/GC chain, not
+                            // confinement, so wire a derivation that ANSWERS
+                            // "unfiltered" (nullopt) rather than leaving it
+                            // empty, which is a missing gate and not a synonym.
+                            [](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+                                return std::nullopt;
+                            });
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
@@ -192,8 +214,11 @@ std::string make_instruction(InstructionStore& s) {
 } // namespace
 
 TEST_CASE("chrome-ir: composable-scope chain — lineage, audit, pin-prevents-GC, clean teardown",
-          "[result_set][chrome_ir][walkthrough]") {
-    ChromeIrHarness h;
+          "[pg][result_set][chrome_ir][walkthrough]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ChromeIrHarness h(pool);
     int st = 0;
 
     // ── Step 1: ground set "all-windows" (inventory-query stand-in via direct create). ──
@@ -264,7 +289,9 @@ TEST_CASE("chrome-ir: composable-scope chain — lineage, audit, pin-prevents-GC
 
     // ── Pinning prevents mid-incident GC: a sweep removes nothing and rs3 survives. ──
     CHECK(h.store->gc_sweep() == 0);
-    REQUIRE(h.store->get(rs3).has_value());
+    auto rs3_row = h.store->get(rs3);
+    REQUIRE(rs3_row.has_value());  // no DB error (ADR-0036 std::expected)
+    REQUIRE(rs3_row->has_value()); // the row itself is still present
 
     // ── A pinned set cannot be deleted until it is unpinned. ──
     h.del("/api/v1/result-sets/" + rs3, st);

@@ -1,0 +1,847 @@
+{
+  "actions": [
+    {
+      "action": "changes",
+      "definition_ids": [
+        "device.asset_tags.changes"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get",
+      "definition_ids": [
+        "device.asset_tags.get"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "status",
+      "definition_ids": [
+        "device.asset_tags.status"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "sync",
+      "definition_ids": [
+        "device.asset_tags.sync"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "local_json_store",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Typed result status on `sync` only.** `status`, `get` and `changes` never call `set_result_status`, so every captured sample shows `UNDECLARED / UNKNOWN /` for them.",
+    "**`sync`'s output is broader than its declared schema, and was never captured.** Beyond the 4-column `event`/`key`/`old_value`/`new_value` shape, every real `sync` call also emits 4 `tag|<key>|<value>` rows and a `last_sync|<epoch>` line that `content/definitions/asset_tags.yaml`'s `result.columns` (`asset_tags.yaml:51-60`) does not describe. All three samples show `[not captured]` for `sync` under the mutator capture policy.",
+    "**The capture harness never calls `init()`.** Every sample reflects the plugin's cold-boot default state (empty tags, `last_sync=0`, `stale=true`, `check_interval=300`) because `load_state()` and the config read only run from `init()` (`asset_tags_plugin.cpp:152-175`), which the capture driver's `PluginHandle::load` + `LocalDispatcher::run` path does not call. `get key=role`'s captured `tag|role|` is therefore an empty value from a never-loaded store, not evidence the category is unset in practice — the samples do not reflect any real on-disk `asset_tags.json`.",
+    "**The lock-ordering test is POSIX-only by mechanism, not by leg.** `tests/unit/test_asset_tags_actions.cpp` drives the real plugin through `LocalDispatcher` on every OS (cap, escaping, the bounded log, `init()` recovery, the typed `sync` status), and `tests/unit/test_asset_tags_sync_lock.cpp` proves the state file is written while the state mutex is held by parking the write on a pre-filled FIFO — there is no Windows twin of that parking trick, so the Windows leg relies on the code being identical (there is no per-OS branch in the write path)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the change history for structured asset tags on this device. Each entry records the category key, old value, new value, and timestamp of the change. Useful for compliance auditing and drift detection.",
+      "display_name": "Asset Tag Change Log",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.asset_tags.changes",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve a single structured tag value by category key. Valid keys: role, environment, location, service.",
+      "display_name": "Get Asset Tag",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.asset_tags.get",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Query the agent's locally cached structured tags, last sync time, staleness flag, and change count. No server-side state is modified.",
+      "display_name": "Asset Tag Status",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.asset_tags.status",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Push the server-assigned structured tags (role, environment, location, service) to an agent. The agent stores them locally and reports any changes from the previous state. Typically invoked automatically by the server when a tag category value changes.",
+      "display_name": "Sync Structured Asset Tags",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.asset_tags.sync",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Structured asset tag awareness — syncs server-assigned tags locally and detects changes",
+  "how_it_works": "`asset_tags` gives an agent awareness of the four structured tag categories the server treats as authoritative — `role`, `environment`, `location`, `service` (`asset_tags_parsers.hpp:46`). `sync` is the only mutating action: the server calls it, pushing all four category values as parameters; the plugin diffs them against its cached copy, appends any differences to a change log (bounded at the newest 50 entries in memory and on disk, evicting the oldest on every append), and — inside one critical section with the diff — writes the new state to `<data_dir>/asset_tags.json` via a randomly-named, exclusively-created temp file renamed into place (`asset_tags_plugin.cpp:207-266`, `asset_tags_parsers.hpp:113-137`, `asset_tags_store.hpp:149-244`). Values are capped at 448 bytes on a UTF-8 codepoint boundary (the server's own tag-value limit) and stored raw (`asset_tags_parsers.hpp:88`). `status` reports the cached tags plus sync metadata — last-sync epoch, a staleness flag, the configured check interval, and the change-log length (`asset_tags_plugin.cpp:260-272`). `get` returns a single category's cached value, rejecting any key outside the fixed four (`asset_tags_plugin.cpp:274-289`). `changes` lists the change log, each field escaped (`asset_tags_plugin.cpp:291-303`). A background thread wakes every `check_interval` seconds (default 300, floored at 30) purely to flip `stale` to `true` if no sync has landed in that window — it never re-requests a sync itself (`asset_tags_plugin.cpp:84-107`).\n\nIt deliberately is not the general-purpose tag store: arbitrary free-form key/value tags are the sibling `tags` plugin (`content/definitions/tags.yaml`). `asset_tags` only ever holds the four server-authoritative categories, and the agent never initiates a sync — it only reacts to one the server pushes.",
+  "inputs": [
+    {
+      "constraints": {
+        "enum": [
+          "role",
+          "environment",
+          "location",
+          "service"
+        ]
+      },
+      "default": null,
+      "definition_id": "device.asset_tags.get",
+      "description": "One of the 4 structured tag categories (e.g. \"role\").",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.asset_tags.sync",
+      "description": "The device's operational role, free-form text (e.g. \"db-primary\").",
+      "name": "role",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "Dev",
+          "UAT",
+          "Production"
+        ]
+      },
+      "default": null,
+      "definition_id": "device.asset_tags.sync",
+      "description": "Deployment stage for this device — one of \"Dev\", \"UAT\", \"Production\".",
+      "name": "environment",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.asset_tags.sync",
+      "description": "Physical or logical location of the device, free-form text (e.g. \"us-east-dc2\").",
+      "name": "location",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.asset_tags.sync",
+      "description": "IT service this device belongs to, free-form text (e.g. \"billing-api\").",
+      "name": "service",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "d276d67e9d65",
+  "manifest_version": 1,
+  "name": "asset_tags",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The tag category the change record is for.",
+          "example": "-",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "role",
+            "environment",
+            "location",
+            "service"
+          ]
+        },
+        {
+          "description": "The value before the change. Values: free text.",
+          "example": "-",
+          "name": "old_value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The value after the change. Values: free text.",
+          "example": "-",
+          "name": "new_value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Epoch seconds when the change was recorded. Values: integer (unix epoch seconds).",
+          "example": "-",
+          "name": "timestamp",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.asset_tags.changes"
+    },
+    {
+      "columns": [
+        {
+          "description": "The category key that was requested, echoed back.",
+          "example": "role",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "role",
+            "environment",
+            "location",
+            "service"
+          ]
+        },
+        {
+          "description": "The cached value for that category; empty string if never set. Values: free text or empty.",
+          "example": "",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.asset_tags.get"
+    },
+    {
+      "columns": [
+        {
+          "description": "The tag category named on a \"tag|key|value\" line.",
+          "example": "role",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "role",
+            "environment",
+            "location",
+            "service"
+          ]
+        },
+        {
+          "description": "The cached value for that category; empty string if the category has never been synced. Values: free text or empty.",
+          "example": "",
+          "name": "value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Epoch seconds of the last successful sync; 0 before any sync has landed. Values: integer (unix epoch seconds).",
+          "example": "0",
+          "name": "last_sync",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "True when no sync has landed within check_interval seconds of the last one, or none has ever landed.",
+          "example": "true",
+          "name": "stale",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "The configured staleness-check interval in seconds, read from asset_tags.check_interval and floored at 30; default 300. Values: integer seconds, >= 30.",
+          "example": "300",
+          "name": "check_interval",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Number of entries currently in the change log (in memory and persisted, capped at the last 50). Values: integer 0-50.",
+          "example": "0",
+          "name": "change_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.asset_tags.status"
+    },
+    {
+      "columns": [
+        {
+          "description": "What changed in this sync call, relative to the previously cached value.",
+          "example": "-",
+          "name": "event",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "no_changes",
+            "tag_added",
+            "tag_removed",
+            "tag_changed"
+          ]
+        },
+        {
+          "description": "The tag category this change applies to. Absent from the wire line when event is no_changes.",
+          "example": "-",
+          "name": "key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "role",
+            "environment",
+            "location",
+            "service"
+          ]
+        },
+        {
+          "description": "The category's value before this sync call. Omitted from the wire line (not merely empty) when event is tag_added or no_changes. Values: free text.",
+          "example": "-",
+          "name": "old_value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The category's value after this sync call. Omitted from the wire line when event is tag_removed or no_changes. Values: free text.",
+          "example": "-",
+          "name": "new_value",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.asset_tags.sync"
+    }
+  ],
+  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`. There is no single row shape shared across an action's own output: `get` emits exactly one `tag|<key>|<value>` line per call, and `changes` emits one `change|<key>|<old_value>|<new_value>|<timestamp>` line per recorded change (or the sentinel line `changes|none` when the log is empty, with no trailing count on that path). `status` and `sync` each emit several *different* line shapes in one response — see Caveats. There is no shared empty-result placeholder convention: an unset tag reports as an empty string, never `-`. Every string field on every row — values, keys, and the echoed text of the two error rows (`unknown action: …`, `error|unknown category: …`) — is escaped with the shared `safe_output_field` (`|` becomes `\\|`, CR/LF become a space, a literal backslash is folded to `/`), so a value such as `Rack A|3` renders as `Rack A\\|3` in a stable row shape. The stored value is never rejected or stripped; the backslash fold is a limitation of the shared server decoder and applies on the wire only. Values are capped at 448 bytes on `sync` and again on load from disk.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — plain file I/O under `<data_dir>`, no OS API, no elevated right",
+      "if_refused": "No refusal path exists; a write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync` (see below); an unreadable or corrupt state file is logged and ignored",
+      "measured": "2026-09-07 on bare metal as SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account — LocalSystem today, not yet the intended `NT SERVICE\\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "Same as Windows",
+      "measured": "2026-09-07 on bare metal at euid 501 (jsmith) — unprivileged, not the production root daemon",
+      "os": "macOS",
+      "runs_as": "agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:14`)"
+    },
+    {
+      "grant": "None",
+      "if_refused": "Same as Windows",
+      "measured": "2026-09-07 in a container at euid 0 — more privileged than the production account",
+      "os": "Linux",
+      "runs_as": "dedicated unprivileged account (`_yuzu`/`yuzu`; `docs/agent-privilege-model.md:12`)"
+    }
+  ],
+  "readme": "agents/plugins/asset_tags/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "(empty)",
+      "status": "`OK`",
+      "when": "`sync`: the new state was written to `<data_dir>/asset_tags.json`, or no data dir is configured and there is nothing to write"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`asset_tags:persist_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "`sync`: the temp-file write or the rename over `asset_tags.json` failed (data dir not creatable, not a directory, disk error, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "sync",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "tag|role|",
+            "tag|environment|",
+            "tag|location|",
+            "tag|service|",
+            "last_sync|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=role",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|role|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "changes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "changes|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "container",
+        "leg_hash": "d276d67e9d65",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "sync",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "tag|role|",
+            "tag|environment|",
+            "tag|location|",
+            "tag|service|",
+            "last_sync|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=role",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|role|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "changes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "changes|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "d276d67e9d65",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "sync",
+          "not_captured": "Mutating/Reversible: not executed on a live host",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "tag|role|",
+            "tag|environment|",
+            "tag|location|",
+            "tag|service|",
+            "last_sync|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get",
+          "not_captured": null,
+          "params": "key=role",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "tag|role|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "changes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "changes|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "d276d67e9d65",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "sync",
+      "dispatch_class": "Mutating",
+      "execute_gate": "None",
+      "mutability": "Reversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Tag"
+    },
+    {
+      "action": "status",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    },
+    {
+      "action": "get",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    },
+    {
+      "action": "changes",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Tag"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/asset_tags.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/asset_tags/src/asset_tags_parsers.hpp",
+      "agents/plugins/asset_tags/src/asset_tags_plugin.cpp",
+      "agents/plugins/asset_tags/src/asset_tags_store.hpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_asset_tags_actions.cpp",
+      "tests/unit/test_asset_tags_parsers.cpp",
+      "tests/unit/test_asset_tags_store.cpp",
+      "tests/unit/test_asset_tags_sync_lock.cpp"
+    ]
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`, same as any other plugin.",
+    "`sync`'s trigger additionally increments the Prometheus counter `yuzu_server_system_reserved_push_total{capability=\"asset_tags.sync\"}` (`server.cpp:10771-10779`) — a delivery metric, not row data.",
+    "`sync` is invoked by the server, never directly by an operator: a structured tag-category write via the dashboard `tag.set` handler (`server.cpp:15550-15574`), the REST API v1 tags route (`server.cpp:21177-21193`), or MCP `set_tag` (`server.cpp:21777-21785`) all call the same `push_asset_tags_to_agent` closure (`server.cpp:11456-11494`).",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, or DEX.",
+    "**Sensitivity.** `role`/`environment`/`location`/`service` are free-form organizational tags an operator assigns — they can reveal a device's physical site or business role. The values are not content-validated (only byte-capped, `asset_tags_parsers.hpp:88`): an operator can type anything into them, including a hostname, a serial, or a person's name, so classify by what is actually assigned, not by the category name. The on-disk copy is owner-only (`0600`) on POSIX (see above).",
+    "**Siblings:** `tags` (`content/definitions/tags.yaml`) — the general-purpose, agent-authoritative free-form key/value tag store; `asset_tags` is deliberately narrower, holding only the 4 server-authoritative categories.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.asset_tags.status\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

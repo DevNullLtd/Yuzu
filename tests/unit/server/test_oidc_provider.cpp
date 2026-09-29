@@ -666,6 +666,136 @@ TEST_CASE("OIDC: validate_claims — two tokens with empty sub are BOTH rejected
     CHECK_FALSE(provider.validate_claims(claims_b, "n").has_value());
 }
 
+// ── oid validation (ADR-2001 §1) ────────────────────────────────────────────
+//
+// `oid` mirrors `sub`'s sub-equivalent fail-closed validation EXACTLY, but
+// ONLY when the operator selected `oid` as the SCIM link claim
+// (`--oidc-scim-link-claim`, `OidcConfig::scim_link_claim`) — the default
+// `sub` link claim must not fail a login over a missing/malformed `oid`
+// that most IdPs (Okta) never send.
+
+TEST_CASE("OIDC: validate_claims — missing oid is rejected when oid is the link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "oid";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+    // claims.oid left at its default-constructed empty string.
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("oid") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — missing oid does NOT fail login when sub is the link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "sub"; // default
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+    // claims.oid left empty — Okta typically never sends this claim.
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — oid containing a control/newline char is rejected when "
+          "oid is the link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "oid";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.oid = "aad-obj\n456"; // would corrupt a durable join key
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("oid") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — over-length oid is rejected when oid is the link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "oid";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.oid = std::string(256, 'a'); // 1 over the 255-char cap
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("oid") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — a 255-char oid is accepted (boundary) when oid is the "
+          "link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "oid";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.oid = std::string(255, 'a'); // exactly the cap
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — a valid oid is accepted when oid is the link claim",
+          "[oidc][oid]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    cfg.scim_link_claim = "oid";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.oid = "aad-object-id-456";
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
 // ── Auth flow ────────────────────────────────────────────────────────────────
 
 TEST_CASE("OIDC: start_auth_flow generates valid URL", "[oidc]") {

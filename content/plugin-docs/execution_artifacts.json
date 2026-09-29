@@ -1,0 +1,618 @@
+{
+  "actions": [
+    {
+      "action": "amcache",
+      "definition_ids": [
+        "windows.execution_artifacts.amcache"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "A1's the-rig probe (2026-09-06) found the copy succeeds as a PLAIN Copy-Item in every session tested (admin and LocalSystem) — the sharing violation that would require CreateFile(FILE_SHARE_READ|WRITE|DELETE, FILE_FLAG_BACKUP_SEMANTICS) + SeBackupPrivilege was never hit, so that fallback path is unexercised on this hardware. RegLoadAppKeyW does NOT require SeBackupPrivilege: it succeeded (LSTATUS 0x00000000) with the privilege explicitly disabled via AdjustTokenPrivileges, in both the admin session and under LocalSystem, against all 8889 real InventoryApplicationFile subkeys. Reported CONSTRAINED because the plain-copy path is a best-effort acquisition method not guaranteed on every host (a locked/exclusively-held hive on another machine could still need the backup-semantics fallback), not because anything failed on the probe host",
+          "mechanism": "copy Amcache.hve(+.LOG1/.LOG2) then RegLoadAppKeyW; whole sequence serialised by offline_hive_mutex",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    },
+    {
+      "action": "prefetch",
+      "definition_ids": [
+        "windows.execution_artifacts.prefetch"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "A1's the-rig LocalSystem probe (2026-09-06): GetProcAddress resolved both ntdll entry points to non-null addresses in every session (admin and LocalSystem); all four decompression attempts across the three real MAM .pf captures returned NTSTATUS 0x00000000 (STATUS_SUCCESS) from both RtlGetCompressionWorkSpaceSize (workspace size 166495 bytes, format COMPRESSION_FORMAT_XPRESS_HUFF, engine standard) and RtlDecompressBufferEx, with every decompressed payload's bytes 4-7 reading 'SCCA'. Real captures parsed as prefetch format version 31 (Windows 10/11), not version 30 as originally planned — see execution_artifacts_parsers.hpp's file header",
+          "mechanism": "CreateFileW read + ntdll RtlGetCompressionWorkSpaceSize/RtlDecompressBufferEx(COMPRESSION_FORMAT_XPRESS_HUFF)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "shimcache",
+      "definition_ids": [
+        "windows.execution_artifacts.shimcache"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "Windows-only artefact; no equivalent exists",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "Windows 10/11 layout only ('win10' header scheme, DWORD 0x34 or 0x30); no exec-flag bit exists in this layout, so every row's insert_flag is '-'. A1's real capture (the-rig, 2026-09-06) was 7886 bytes, well under the 16 MiB bound, and parsed with the header-size DWORD reading 0x34",
+          "mechanism": "RegQueryValueExW HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Session Manager\\\\AppCompatCache (local bounded reader, 16 MiB)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Prefetch v17 (Windows XP/2003) is deliberately rejected, not decoded.** Its magic/header shape resembles v23's (Vista/7) closely enough that treating it as \"close enough\" would silently misparse a real v17 file using the wrong field offsets — worse than reporting `unknown_version`. Re-adding it needs its own byte-level capture, the way v23/26/30/31 were bound against real fixtures. Separately, v23/26's volume-entry stride (104 bytes, per libscca) is documentation-derived, not byte-verified against a real capture — every real fixture on this hardware is v31 (96-byte stride, verified against real two-volume files). A NATURALLY wrong stride for v23/26 fails closed (`truncated_entry`/`oversize_count`) rather than fabricating a count — both reviewers of PR #4444's round-3 review independently confirmed this in both directions — but this is not an unconditional guarantee: a deliberately crafted file can still coincidentally satisfy every bounds/size/version check at the wrong offset and produce a fabricated success (issue #4467 tracks this as a permanent, documented residual and its regression test). The realistic risk is low — the adversarial case needs SYSTEM/admin-tier write access to `C:\\Windows\\Prefetch\\`, a privilege tier that already has far more direct ways to feed this plugin bad data.",
+    "**Amcache's `SeBackupPrivilege` + backup-semantics fallback is unexercised on real hardware.** A1's the-rig probe (2026-09-06) found a plain `CopyFileW` always sufficient — `RegLoadAppKeyW` never needed the privilege, in an admin session or under LocalSystem, against all 8889 real subkeys — so the `ERROR_SHARING_VIOLATION` fallback path exists only for a host where the hive is genuinely exclusively locked elsewhere, and that path itself has not been probed. Separately: some `amcache` rows legitimately carry an empty path/size/date/publisher/binary-type/product fields, non-empty `FileId` only — root-caused live on the-rig (2026-09-17) via `reg load`+`reg query` against a copy of the real hive: several `InventoryApplicationFile` subkeys (observed for built-in driver files, e.g. `1394kdbg.sys`/`1394ohci.sys`) genuinely carry only `ProgramId`+`FileId` in the registry itself, nothing else — real AmCache data sparseness on this Windows build, not a read defect (confirmed: `get_or_empty` correctly returns `\"\"` for a value that is genuinely absent from that subkey).",
+    "**ShimCache carries no execution-confirmation bit on Windows 10/11.** The AppCompatCache layout this plugin decodes ('win10' scheme, header DWORD 0x34/0x30) has no insert/execute flag field — `insert_flag` is therefore always the literal `-`, never a real per-entry value, on every capture this leg can produce.",
+    "**DEFAULT-OFF behind the server-side plugin-config kill switch.** None of the three actions dispatch until an operator explicitly `PUT`s `/api/v1/plugin-config/execution_artifacts/kill-switch {\"enabled\":true}` — on a fresh install or an unconfigured fleet, every dispatch attempt is refused at the server layer, not reported as a plugin-level failure.",
+    "**`amcache` reports `constrained|data_dir_unset` when `agent.data_dir` isn't configured, and `constrained|dest_dir_acl` on the rare chance its freshly-created per-dispatch scratch directory fails an owner/reparse-point safety check.** `agent.data_dir` is always set by the agent daemon in production (`agent.cpp`) — `data_dir_unset` should only ever fire outside that context (a test/tool harness that didn't configure it). The scratch directory itself is a 128-bit crypto-random name created fresh per dispatch and removed on completion — never reused, never a fixed path — so `dest_dir_acl` covers only the narrow window between that create and this leg re-opening it as a handle; no operator action is needed for either token beyond re-dispatching (a new scratch directory is created every time). A repeated `note|temp_cleanup_failed` line (e.g. an AV/EDR product holding `amcache.hve` open past this action's own lifetime) means a scratch directory was left behind instead — and a directory a killed or crashed agent process left behind (no destructor runs on a process kill) is reclaimed by a bounded sweep of `agent.data_dir` that runs at agent start and again immediately before each `amcache` dispatch: an `execution_artifacts-<32 hex>` directory whose last-write time is more than one hour old, that is a real directory (never a junction or symlink), that this process's token owner owns, and that contains only files is removed — handle-relative through the agent's confined-filesystem primitives, never by path, never recursing (`execution_artifacts_scratch_sweep_win.cpp`). Anything else of that name is left in place and counted. A directory younger than an hour is left alone (the age floor covers the moment between a concurrent dispatch creating its directory and opening the handle that then protects it), so an orphan is reclaimed at the first agent start or `amcache` dispatch at least one hour after it was left — not necessarily at the very next start. The sweep is capped per pass (entries enumerated, directories removed, wall time); what it could not reach waits for the next pass. Nothing today alerts on either accumulation if it keeps happening (a fleet-wide agent-metrics gap, not specific to this plugin: no Prometheus-style counter exists for `g_temp_cleanup_failed_total` or the sweep's own removed/failed counts, only their log lines and the `note|` row)."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Root\\InventoryApplicationFile entries from a private, process-scoped copy of Amcache.hve (RegLoadAppKeyW) — per-executable SHA-1, size, link date, publisher, and product identity. FileId is normalised to a plain 40-hex-character SHA-1 (\"-\" when absent or malformed). Never surfaces file contents.",
+      "display_name": "Amcache Inventory",
+      "execute_roles": [
+        "admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.execution_artifacts.amcache",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Per-executable run history decoded from C:\\Windows\\Prefetch .pf files (decompressed with ntdll's RtlDecompressBufferEx where MAM-compressed): executable name, file hash, prefetch format version, run count, up to 8 most-recent run timestamps, and volume/file-reference counts. Never surfaces file contents.",
+      "display_name": "Prefetch Execution History",
+      "execute_roles": [
+        "admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.execution_artifacts.prefetch",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Application Compatibility Cache entries from HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache — evidence that a named executable path existed on disk at a given time, commonly used to show program presence even when the program has since been deleted. Windows 10/11 layout only. Never surfaces file contents; this layout carries no execution-confirmation flag, so insert_flag is always \"-\".",
+      "display_name": "ShimCache (AppCompatCache)",
+      "execute_roles": [
+        "admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.execution_artifacts.shimcache",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off",
+  "how_it_works": "All three actions are independent Windows-only reads, dispatched and gated separately — a failure in one never blocks the other two. `shimcache` opens `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache` and decodes the Windows 10/11 AppCompatCache blob into one row per cached executable path, last-modified time, and data size; this layout carries no execution-confirmation bit, so `insert_flag` is always `-`. `amcache` copies `Amcache.hve` (plain `CopyFileW` first, falling back to a `SeBackupPrivilege` + backup-semantics read only on a sharing violation), loads the copy privately and read-only via `RegLoadAppKeyW`, and enumerates every `Root\\InventoryApplicationFile` subkey into a row of path, SHA-1, size, link date, publisher, binary type, and product identity. `prefetch` globs `C:\\Windows\\Prefetch\\*.pf`, MAM-decompresses each file via `ntdll`'s `RtlDecompressBufferEx`, and parses the Windows 10/11 (version 31) file-information layout into exe name, hash, run count, up to eight last-run timestamps, and volume/file-reference counts. None of the three ever reads or emits file contents — only paths, hashes, and timestamps. Every action authorizes at `Forensics:Read`/`AdminOrApproval`, is refused for anything but a single explicit target, and is DEFAULT-OFF behind the server-side plugin-config kill switch until an operator explicitly enables it.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "421f7d82a099",
+  "manifest_version": 1,
+  "name": "execution_artifacts",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Lower-cased full executable path from the InventoryApplicationFile subkey, escaped.",
+          "example": "c:/program files/app/app.exe",
+          "name": "lower_case_long_path",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Normalised 40-hex-character SHA-1 from the subkey's FileId; \"-\" when absent or malformed.\n",
+          "example": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+          "name": "sha1",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "File size as recorded by Amcache (raw string form, not re-parsed).",
+          "example": "2048576",
+          "name": "size",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Linker timestamp as recorded by Amcache.",
+          "example": "01/02/2026 03:04:05",
+          "name": "link_date",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Publisher string as recorded by Amcache, escaped.",
+          "example": "Example Corp",
+          "name": "publisher",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Binary type as recorded by Amcache.",
+          "example": "pe32_amd64",
+          "name": "binary_type",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Product name as recorded by Amcache, escaped.",
+          "example": "Example App",
+          "name": "product_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Product version as recorded by Amcache.",
+          "example": "1.2.3.4",
+          "name": "product_version",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.execution_artifacts.amcache"
+    },
+    {
+      "columns": [
+        {
+          "description": "Executable name recorded in the Prefetch file's header, escaped.",
+          "example": "NOTEPAD.EXE",
+          "name": "exe_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "8-uppercase-hex-digit Prefetch hash from the filename/header.",
+          "example": "DDFD0A8D",
+          "name": "hash_hex",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Prefetch format version; only 23, 26, 30 and 31 decode — see Caveats.\n",
+          "example": 31,
+          "name": "version",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Recorded run count.",
+          "example": 42,
+          "name": "run_count",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Comma-separated last-run timestamps (up to 8 on versions 26/30/31, 1 on version 23), epoch milliseconds.\n",
+          "example": "1690000000000,1689999999000",
+          "name": "last_runs_epoch_ms",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of volume entries in the file-information block.",
+          "example": 1,
+          "name": "volume_count",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Total number of NTFS file references, summed across every declared volume entry in the file-information block (not just the first).",
+          "example": 12,
+          "name": "file_ref_count",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.execution_artifacts.prefetch"
+    },
+    {
+      "columns": [
+        {
+          "description": "Executable path recorded in the AppCompatCache entry, escaped.",
+          "example": "C:/Windows/System32/notepad.exe",
+          "name": "path",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Cached last-modified timestamp from the entry, epoch milliseconds.",
+          "example": 1690000000000,
+          "name": "last_modified_epoch_ms",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Cached file size in bytes, from the entry.",
+          "example": 175616,
+          "name": "data_size",
+          "platforms": [
+            "windows"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Always \"-\": the Windows 10/11 AppCompatCache layout this plugin decodes carries no execution-confirmation bit.\n",
+          "example": "-",
+          "name": "insert_flag",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "-"
+          ]
+        }
+      ],
+      "definition_id": "windows.execution_artifacts.shimcache"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one discriminator-prefixed row per artefact entry (`shimcache|...`, `amcache|...`, `prefetch|...`); every untrusted string field is escaped through `safe_output_field`. A source that fails outright never emits a row — it emits `constrained|<token>` instead and sets the matching typed status. A source that reads some entries and fails on others (Amcache's per-subkey walk, Prefetch's per-file walk) emits every row it could read, plus one `constrained|<reason>` line (Amcache, when the walk itself was truncated) or one `prefetch_error|<file>|<reason>` line per skipped file (Prefetch, when the walk completed but individual files failed), and folds every accumulated reason into the terminal typed status through the shared `ConstraintAccumulator`. Amcache additionally emits `note|malformed_fileid_count=<n>` when one or more `FileId` values could not be normalised to a 40-hex-character SHA-1, and either leg's temp-file cleanup emits `note|temp_cleanup_failed` on a (non-fatal) deletion failure — both `note|` lines are diagnostic, not data rows, and a consumer parsing `amcache|` rows skips any line that does not start with that discriminator. `shimcache`'s `insert_flag` is always `-` (no execution-confirmation bit exists in the Windows 10/11 AppCompatCache layout); every other field is either the artefact's real decoded value or absent (`-`) when that specific field could not be read.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "unsupported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None for `shimcache` (a bounded `HKLM` value read) or `prefetch` (a directory glob plus per-file reads under `C:\\Windows\\Prefetch`). `amcache` needs no elevation either: A1's the-rig probe found `RegLoadAppKeyW` succeeds without `SeBackupPrivilege`, in both an admin session and under LocalSystem; the `SeBackupPrivilege` + backup-semantics fallback (reached only on `ERROR_SHARING_VIOLATION`) exists for a host where the hive is exclusively locked elsewhere, but grants itself no new privilege beyond what the service account can already request.",
+      "if_refused": "`constrained` with a named reason (`reg_<code>`, `hive_locked`, `regload_<code>`, `subkey_open_failed`, …) — this plugin does not distinguish \"access denied\" from \"not found\"/\"vanished mid-walk\" in its tokens; a refused open and a missing key report through the same per-source token family",
+      "measured": "A1's the-rig probe, 2026-09-06, admin session and LocalSystem (see this plugin's `execution_artifacts_win.cpp` file header for the full probe findings)",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `unsupported` / `windows_only_artefact`, rc 1",
+      "measured": "not measured (no macOS mechanism exists)",
+      "os": "macOS",
+      "runs_as": "n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `unsupported` / `windows_only_artefact`, rc 1",
+      "measured": "not measured (no Linux mechanism exists)",
+      "os": "Linux",
+      "runs_as": "n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome"
+    }
+  ],
+  "readme": "agents/plugins/execution_artifacts/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "*(empty)*",
+      "status": "`OK`",
+      "when": "`shimcache`: the AppCompatCache value opened, read within the 16 MiB bound, and parsed to at least one row. `amcache`: every enumerated subkey and value read cleanly, no cap hit. `prefetch`: every `.pf` file was enumerated, read, decompressed and parsed with no per-file error and no cap hit."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`file_oversized` · `read_failed` · `ntdll_symbol_missing` · `ntstatus_<hex>` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` (comma-joined when several fire)",
+      "status": "`OK`",
+      "when": "`prefetch` only: the directory enumeration completed in full but one or more individual `.pf` files failed to open, read, decompress or parse; each failed file is already on the stream as its own `prefetch_error|<file>|<reason>` row, so the run is reported as a degraded success rather than a failure — one truncated file must never fail every other good row."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`shimcache`: `reg_<code>` · `oversized` · `reg_changed_during_read` · `shimcache_empty` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` · `internal_error`. `amcache`: `data_dir_unset` · `dest_dir_create_<code>` · `dest_dir_open_<code>` · `dest_dir_acl` · `hive_missing` · `hive_oversized` · `hive_locked` · `win32_<code>` · `hive_short_write` · `regload_<code>` · `amcache_root_missing` · `subkey_cap` · `enum_<code>` · `subkey_open_failed` · `value_enum_incomplete` · `value_read_failed` · `amcache_empty` · `internal_error` (comma-joined; `amcache_empty` is always composed with any other accumulated reason via `reason_with`, never reported alone when a real cause is known). `prefetch`: `prefetch_disabled` · `prefetch_evidence_absent` · `prefetch_state_unknown` · `prefetch_enum_<code>` · `file_cap` · `byte_cap` · `internal_error` (plus any of the `OK`/partial per-file tokens above, accumulated alongside a cap).",
+      "status": "`CONSTRAINED`",
+      "when": "`shimcache`: the key/value could not be opened or read, the blob exceeded the 16 MiB cap, changed mid-read, parsed to zero rows, failed header parsing, or an unexpected exception was caught. `amcache`: `agent.data_dir` was never configured for this host (`data_dir_unset`); its per-dispatch random scratch directory could not be created (`dest_dir_create_<code>`) or could not be re-opened as a handle immediately afterward (`dest_dir_open_<code>`); or that freshly-created directory failed an owner/reparse-point safety check proving it is really the object this process just created (`dest_dir_acl`) — otherwise the hive could not be found, copied, size-checked, loaded, or enumerated within `kAmcacheMaxSubkeys` (20000), or an unexpected exception was caught. `prefetch`: no `.pf` file exists under `C:\\Windows\\Prefetch` — reported as `prefetch_disabled` when `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters\\EnablePrefetcher` reads `0` (prefetching is configured off), `prefetch_evidence_absent` when it reads `1`, `2` or `3` (prefetching is configured on, yet no file exists — consistent with, but not proof of, removal after the fact: the SysMain service state is not consulted, and a disabled SysMain leaves the directory legitimately empty with the value still `3`), or `prefetch_state_unknown` when the best-effort registry read failed or returned an undocumented value (a read failure never blocks or fails the action); otherwise the Prefetch directory could not be enumerated, or the per-file-count (2048) or total-byte (256 MiB) cap truncated the walk before every file was seen, or an unexpected exception was caught."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`windows_only_artefact`",
+      "status": "`UNAVAILABLE`",
+      "when": "All three actions, on every non-Windows build — this plugin has no macOS or Linux mechanism for ShimCache, Amcache, or Prefetch; the fixed fallback reports this token and rc 1 without attempting any OS call. The row itself is `<action>|unsupported|windows_only_artefact` — action-name-prefixed, the same leading-discriminator shape as every other row this plugin emits and the `registry`/`rdp_control` sibling convention."
+    }
+  ],
+  "samples": {
+    "macos": {
+      "actions": [
+        {
+          "action": "shimcache",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_artefact",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "shimcache|unsupported|windows_only_artefact"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "amcache",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_artefact",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "amcache|unsupported|windows_only_artefact"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "prefetch",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "windows_only_artefact",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "prefetch|unsupported|windows_only_artefact"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-17",
+        "host_class": "bare-metal",
+        "leg_hash": "421f7d82a099",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "shimcache",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 26,
+          "rows": [
+            "shimcache|00000009\t03e865f424f10000\t000a00007fff0000\t8664\tMicrosoftWindows.Client.CoreAI\tcw5n1h2txyewy\t|0|100|-",
+            "shimcache|C:/Program Files/Git/usr/bin/file.exe|1776703804000|72|-",
+            "shimcache|C:/Program Files/Git/usr/bin/sed.exe|1776703722000|72|-",
+            "shimcache|C:/WINDOWS/system32/la57setup.exe|1771278093368|72|-",
+            "shimcache|C:/WINDOWS/SoftwareDistribution/Download/Install/AM_Delta_Patch_1.459.111.0.exe|1788939517775|72|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "amcache",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 26,
+          "rows": [
+            "amcache||69cb415403de1ae2d4af937c0d2b6927a24a7553||||||",
+            "amcache||3a73d566a6bcd68518fe786ae33d25b2cb0b6473||||||",
+            "amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||",
+            "amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||",
+            "amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "prefetch",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unknown_version,truncated_header",
+            "status": "OK"
+          },
+          "row_count": 26,
+          "rows": [
+            "prefetch|ACROBAT.EXE|4E1700B6|31|17|1782139503883,1782139502989,1781888840096,1781532567812,1781532568325,1778602224391,1778602225066,1775144109458|1|65",
+            "prefetch|ACROBAT.EXE|4E1700B7|31|13|1782139503088,1781888840199,1781532877455,1781532606215,1781532603318,1781532577675,1781532579663,1781532567890|1|150",
+            "prefetch|ADOBEARM_UCB.EXE|699477AF|31|8|1781888881590,1781532923846,1781532763225,1781532746374,1781532732471,1781532722873,1781532714314,1781532691179|1|86",
+            "prefetch|AM_DELTA_PATCH_1.459.235.0.EX|2A451206|31|1|1789608233479|1|28",
+            "prefetch|AM_DELTA_PATCH_1.459.242.0.EX|7DEB36D4|31|1|1789643346854|1|29"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-17",
+        "host_class": "bare-metal",
+        "leg_hash": "421f7d82a099",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "interactive user (elevated)"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "shimcache",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "High",
+      "securable": "Forensics"
+    },
+    {
+      "action": "amcache",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "High",
+      "securable": "Forensics"
+    },
+    {
+      "action": "prefetch",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "High",
+      "securable": "Forensics"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/execution_artifacts.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/execution_artifacts/src/execution_artifacts_legs.hpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_parsers.hpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_plugin.cpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_scratch_identity.hpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_scratch_sweep.hpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_scratch_sweep_win.cpp",
+      "agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_execution_artifacts_local_dispatcher.cpp",
+      "tests/unit/test_execution_artifacts_parsers.cpp",
+      "tests/unit/test_execution_artifacts_scratch_sweep.cpp",
+      "tests/unit/test_execution_artifacts_win_internals.cpp",
+      "tests/unit/test_execution_artifacts_win_local.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response, land in the ResponseStore, and are queryable at `/api/responses/{id}` — single-target only; fleet or scope targeting is refused at the server dispatch layer before this plugin ever runs.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing here runs on a schedule; each action dispatches only when an operator or workflow explicitly requests it, and only once the plugin-config kill switch is enabled.",
+    "**Sensitivity.** ShimCache/Amcache/Prefetch rows are forensic evidence: real executable paths (which may embed a Windows profile/username segment), Amcache's SHA-1 hashes and product/publisher identity, and Prefetch's precise run counts and last-run timestamps together let a reader reconstruct what software ran on a single named machine and when — the kind of evidence an incident responder pulls during an active investigation, and exactly what an unauthorized reader could use to fingerprint a target's activity. No row ever carries file contents.",
+    "**Siblings:** `app_usage` (planned, same `Forensics:Read`/`AdminOrApproval` boundary) and `autoruns` (persistence-point evidence) are the other execution/activity-evidence sources in the catalogue; none share a store or a format with this plugin.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.execution_artifacts.shimcache\")`. Run: `execute_instruction {definition_id, parameters}` (single explicit `agent_id` required). Read: `/api/responses/{id}`."
+  ]
+}

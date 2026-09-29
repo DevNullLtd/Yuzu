@@ -1,0 +1,6 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash ba3cbe6a5b56
+== action=state
+volume|C:|Fully Decrypted|0%|None|Protection Off
+volume|D:|Fully Decrypted|0%|None|Protection Off
+[result_status] UNDECLARED / UNKNOWN / 
+

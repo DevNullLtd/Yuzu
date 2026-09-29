@@ -75,7 +75,7 @@ spec:
     ttlSeconds: 60
 
   approval:
-    mode: manual
+    mode: always
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -140,7 +140,7 @@ spec:
     ttlSeconds: 30
 
   approval:
-    mode: none
+    mode: auto
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]

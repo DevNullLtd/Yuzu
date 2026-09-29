@@ -6,6 +6,8 @@
  * cover the validation helpers and edge cases.
  */
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdio>
@@ -53,12 +55,30 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
     return canonical.string();
 }
 
+// Every fixture below lives under ONE process-salted base dir — same
+// rationale as test_filesystem_actions.cpp: the fixed literal names stay,
+// but concurrent CI jobs on a shared-identity box no longer collide (#1883).
+// NOTE for "validate_path outside base_dir": TempFile and TempDir become
+// SIBLINGS under this base, which the canonical-prefix check still correctly
+// rejects — do not nest the file inside the dir (or make the base the dir).
+const fs::path& read_base() {
+    static yuzu::test::TempDir base{"yuzu_test_read-"};
+    static const bool created = [] {
+        std::error_code ec;
+        fs::create_directories(base.path, ec);
+        return fs::exists(base.path);
+    }();
+    // Fail loudly if the base could not be created (gov safe-2).
+    REQUIRE(created);
+    return base.path;
+}
+
 struct TempFile {
     fs::path path;
 
     explicit TempFile(const std::string& content = "",
                       const std::string& name = "yuzu_test_read.txt") {
-        path = fs::temp_directory_path() / name;
+        path = read_base() / name;
         std::ofstream f(path);
         f << content;
     }
@@ -73,7 +93,7 @@ struct TempDir {
     fs::path path;
 
     explicit TempDir(const std::string& name = "yuzu_test_read_dir") {
-        path = fs::temp_directory_path() / name;
+        path = read_base() / name;
         std::error_code ec;
         fs::create_directories(path, ec);
     }

@@ -7,8 +7,11 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <string_view>
 
 namespace yuzu::server {
@@ -16,7 +19,7 @@ namespace yuzu::server {
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db, int window_secs,
                          const StepUpAuditFn& audit_fn, const std::string& action_label,
-                         std::string_view mfa_enforcement) {
+                         std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
     // Escape hatch — operator disabled the gate. Treated as fresh.
     if (window_secs <= 0) {
         return true;
@@ -25,6 +28,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Bearer-credential principals are step-up-exempt by design. Token
     // issuance was the step-up moment; the token itself does not
     // re-prompt. Mirrors the /auth-and-authz skill's documented scope.
+    //
+    // `engine_token` (auth-engine-principals-design.md §6) is deliberately
+    // NOT added here, even though it is also a bearer credential. It falls
+    // through to the local `mfa_status()` lookup below, which returns
+    // `UserNotFound` (an engine session has no `users` row) and fails
+    // CLOSED. That is the correct posture, not an oversight: an engine
+    // session has no MFA-enrolled user to step up, so it must never be
+    // treated as already-proven the way a human-attributed api_token/
+    // mcp_token session is (§9's structural-denial posture). Do not extend
+    // this exemption to engine_token.
     if (session.auth_source == "api_token" || session.auth_source == "mcp_token") {
         return true;
     }
@@ -36,6 +49,12 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // would fail (UserNotFound) and emit a confusing "auth_db unavailable"
     // message. Do NOT add an exemption here; SAML MFA attestation is
     // deferred to a follow-up slice.
+    //
+    // `auth_source == "engine_token"` never matches this branch (an engine
+    // session's auth_source is exactly "engine_token", never "saml") — it
+    // falls through to the local `mfa_status()` lookup below and fails
+    // closed there, same correct posture as the api_token/mcp_token
+    // comment above.
     if (session.auth_source == "saml") {
         const auto cid = detail::make_correlation_id();
         nlohmann::json envelope = {
@@ -76,6 +95,10 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // is meaningless for an external identity, so the remediation steers
     // the operator back through SSO (see the source-specific challenge
     // URL on the failure path below).
+    // `engine_token` never equals "oidc", so `is_oidc` is false for an engine
+    // session — it takes the `!is_oidc` branch below and hits the local
+    // `mfa_status()` lookup, which fails closed (UserNotFound), matching the
+    // two comments above.
     const bool is_oidc = session.auth_source == "oidc";
 
     if (!is_oidc) {
@@ -98,6 +121,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         if (!status) {
             // Fail closed. Emit a distinct audit verb so SRE can grep for
             // store-error events vs legitimate stale-session denials.
+            //
+            // ★ SECURITY (architect BLOCK, Postgres migration): this branch
+            // already fails closed for EVERY `mfa_status` error (never falls
+            // to the `!status->enrolled` pass-through below) — the tri-state
+            // `SecretUnavailable`/`QueryFailed` outcomes are folded into the
+            // same deny. The only refinement is the wire status: a
+            // store/decrypt outage is 503 (retryable, distinct from "please
+            // step up"), never the 401 challenge that implies a fresh proof
+            // would fix it.
+            const bool store_unavailable = is_store_unavailable(status.error());
             if (audit_fn) {
                 try {
                     (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint",
@@ -112,6 +145,22 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
             }
             spdlog::error("require_mfa_step_up: mfa_status({}) failed — failing closed",
                           session.username);
+            if (store_unavailable) {
+                nlohmann::json envelope_503 = {
+                    {"error",
+                     {{"code", 503},
+                      {"message", "authentication store is temporarily unavailable"},
+                      {"correlation_id", detail::make_correlation_id()},
+                      {"remediation", "retry shortly or contact an administrator"}}},
+                    {"meta", {{"api_version", "v1"}, {"mfa_step_up_required", true}}}};
+                res.status = 503;
+                res.set_content(envelope_503.dump(), "application/json");
+                if (metrics) {
+                    metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+                        .increment();
+                }
+                return false;
+            }
             nlohmann::json envelope_fail = {
                 {"error",
                  {{"code", 401},
@@ -132,11 +181,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         }
     }
 
-    // Compute proof age. A default-constructed `mfa_verified_at`
-    // (time_since_epoch() == 0) signals "no MFA proof on this
-    // session yet" — treat as infinitely stale.
+    // Compute proof age against the LOCAL MONOTONIC anchor derived at
+    // cache-populate from the DB clock (ADR-2002 §4 DB-clock authority, WS-1/1a):
+    // `steady_mfa_verified` is set to `steady_now - (db_now - mfa_verified_ms)` in
+    // derive_session_deadlines, immune to local wall skew/steps. Its {} sentinel
+    // means "no usable MFA proof" — derive sets it {} for BOTH an absent proof AND
+    // a FUTURE-DATED proof (`mfa_verified_ms > db_now`, a backward DB step below
+    // the proof instant → fail CLOSED, never a spurious-fresh window). So the
+    // future-dated rejection is already applied; this just reads the sentinel.
     const auto now = std::chrono::steady_clock::now();
-    const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0;
+    const bool no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
 
     // OIDC sessions whose IdP did not attest MFA carry no seeded proof
     // (no `amr` → `/auth/callback` never set `mfa_verified_at`). Whether
@@ -164,8 +218,31 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 
     const auto age = no_proof ? std::chrono::seconds::max()
                               : std::chrono::duration_cast<std::chrono::seconds>(
-                                    now - session.mfa_verified_at);
-    if (!no_proof && age <= std::chrono::seconds(window_secs)) {
+                                    now - session.steady_mfa_verified);
+    // Hard wall-clock ceiling on the step-up window (ADR-2002 §4 mitigation (b),
+    // parity with JIT elevation's kMaxElevationWindow). The effective freshness
+    // window is min(configured window_secs, kMaxMfaStepUpWindowSecs): a proof
+    // older than the hard ceiling never counts, regardless of a large/misconfigured
+    // window_secs — a defense-in-depth bound independent of the operator setting,
+    // mirroring is_elevated()'s `(elevated_until - issued) <= kMaxElevationWindow`.
+    // (mfa_verified_at is the issued-at anchor.) The residual smaller-backward-
+    // clock-step risk — which this ceiling, like JIT's, does not resist because
+    // `age` is computed against `now` — is the WS-11 DB-clock-integrity monitor's
+    // job (see the reap clock-anomaly signal), the same residual JIT carries.
+    constexpr std::int64_t kMaxMfaStepUpWindowSecs = 24 * 3600; // 24h backstop
+    const auto effective_window =
+        std::chrono::seconds((std::min<std::int64_t>)(window_secs, kMaxMfaStepUpWindowSecs));
+    // Suspend backstop (parity with is_elevated / validate, ADR-2002 §4 / design-
+    // review H5 + LOW-1): the freshness age above is on steady_clock, which pauses
+    // across host/VM suspend — so a stale proof could read fresh after a resume.
+    // Also require the ABSOLUTE (wall) proof age not be grossly past the window,
+    // consulted only with the generous auth::kWallSanitySkew slack so a merely
+    // clock-SKEWED (non-suspended) replica is never affected (only a long suspend,
+    // where wall advanced far past the window while steady froze, trips it).
+    const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now() - session.mfa_verified_at);
+    const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
+    if (!no_proof && age <= effective_window && !wall_stale) {
         return true;
     }
 

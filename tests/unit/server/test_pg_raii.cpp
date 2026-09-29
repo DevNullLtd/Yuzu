@@ -71,7 +71,7 @@ void insert_row(PGconn* conn, int id) {
 
 } // namespace
 
-TEST_CASE("PgConn/PgResult basics", "[pg][raii]") {
+TEST_CASE("PgConn/PgResult basics", "[pg][raii][pg-smoke]") {
     SECTION("default-constructed owners are empty and safe to destroy") {
         PgConn conn;
         PgResult res;
@@ -113,7 +113,7 @@ TEST_CASE("PgConn/PgResult basics", "[pg][raii]") {
     }
 }
 
-TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii]") {
+TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgConn conn = connect_with_table(db.dsn());
 

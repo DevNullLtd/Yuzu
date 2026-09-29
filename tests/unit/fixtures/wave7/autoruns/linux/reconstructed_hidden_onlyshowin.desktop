@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AT-SPI D-Bus Bus
+Exec=/usr/libexec/at-spi-bus-launcher --launch-immediately
+NoDisplay=true
+Hidden=true
+OnlyShowIn=GNOME;
+X-GNOME-AutoRestart=true
+X-GNOME-Autostart-Phase=Initialization

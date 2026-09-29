@@ -116,7 +116,8 @@ function detectPortConflicts() {
   }
   if (chk('include-gateway')) {
     ports[num('gw-agent-port')] = 'Gateway Agent';
-    ports[num('gw-mgmt-port')] = 'Gateway Management';
+    // #1422: the gateway mgmt plane (:50063) is never published, so it holds
+    // no host port to collide.
     ports[num('gw-health-port')] = 'Gateway Health';
     ports[num('gw-metrics-port')] = 'Gateway Metrics';
   }

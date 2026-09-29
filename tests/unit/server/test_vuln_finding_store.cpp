@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,6 +41,20 @@ using yuzu::server::VulnFindingStore;
 using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): shared key
+// with test_vuln_finding_store_adversarial.cpp (identical setup — first build
+// wins). The two migration-idempotency tests stay on plain YUZU_REQUIRE_PG_DB —
+// they assert the fresh-database migrate-then-re-open transition itself.
+yuzu::test::PgTestTemplate vuln_tpl{"vuln", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    SoftwareInventoryStore swinv{pool};
+    if (!swinv.is_open())
+        throw std::runtime_error("vuln template: SoftwareInventoryStore failed to migrate");
+    VulnFindingStore vuln{pool};
+    if (!vuln.is_open())
+        throw std::runtime_error("vuln template: VulnFindingStore failed to migrate");
+}};
 
 FindingUpsert mk_finding(const std::string& cve, const std::string& pkg,
                          const std::string& sev = "high", const std::string& status = "potential") {
@@ -91,7 +106,18 @@ TEST_CASE("VulnFindingStore ctor fail-closed + idempotent migration", "[pg][vuln
         CHECK_FALSE(store.is_open());
     }
     SECTION("good pool → is_open; re-construct is idempotent") {
-        YUZU_REQUIRE_PG_DB(db);
+        // YUZU_REQUIRE_PG_MIGRATION_DB is NOT this TEST_CASE's first
+        // statement (unlike every other of the 44 migration-skip sites) —
+        // safe ONLY because this is Catch2's LAST SECTION in this
+        // TEST_CASE with nothing shared following it: each SECTION gets
+        // its own full re-invocation of the TEST_CASE body, so a Windows
+        // SKIP here unwinds only THIS invocation (this section never runs
+        // on Windows) and never touches the sibling "broken pool" SECTION
+        // above, which runs to completion in its own separate invocation
+        // either way. If a third SECTION or trailing shared code is ever
+        // added to this TEST_CASE, move this macro to guard only itself —
+        // do not assume this placement generalizes.
+        YUZU_REQUIRE_PG_MIGRATION_DB(db);
         PgPool pool{{.conninfo = db.dsn(), .size = 4}};
         REQUIRE(pool.valid());
         VulnFindingStore s1{pool};
@@ -103,7 +129,7 @@ TEST_CASE("VulnFindingStore ctor fail-closed + idempotent migration", "[pg][vuln
 
 // (2) insert → re-observe: last_seen_ms bumps, first_seen_ms preserved, still open.
 TEST_CASE("VulnFindingStore re-observe bumps last_seen, preserves first_seen", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -126,7 +152,7 @@ TEST_CASE("VulnFindingStore re-observe bumps last_seen, preserves first_seen", "
 
 // (3) disappear → authoritative sweep resolves; open query excludes it.
 TEST_CASE("VulnFindingStore authoritative sweep resolves disappeared findings", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -148,7 +174,7 @@ TEST_CASE("VulnFindingStore authoritative sweep resolves disappeared findings", 
 
 // (4) authoritative=false → NO resolve AND NO coverage clobber (the B1 guard).
 TEST_CASE("VulnFindingStore non-authoritative preserves findings and coverage", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -176,7 +202,7 @@ TEST_CASE("VulnFindingStore non-authoritative preserves findings and coverage", 
 
 // (5) re-observe clears resolved_at_ms.
 TEST_CASE("VulnFindingStore re-observe clears resolved_at", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -198,7 +224,7 @@ TEST_CASE("VulnFindingStore re-observe clears resolved_at", "[pg][vuln][store]")
 
 // (6) status upgrade in place (potential → vulnerable): one row, first_seen kept.
 TEST_CASE("VulnFindingStore status upgrade in place", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -220,7 +246,7 @@ TEST_CASE("VulnFindingStore status upgrade in place", "[pg][vuln][store]") {
 
 // (7) disposed_clean DELETE ≠ resolve; authoritative=false skips the delete.
 TEST_CASE("VulnFindingStore disposed_clean deletes (authoritative only)", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -246,7 +272,7 @@ TEST_CASE("VulnFindingStore disposed_clean deletes (authoritative only)", "[pg][
 
 // (8) coverage counts + all na_* reason counters round-trip.
 TEST_CASE("VulnFindingStore coverage counters round-trip", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -284,7 +310,7 @@ TEST_CASE("VulnFindingStore coverage counters round-trip", "[pg][vuln][store]") 
 
 // (9) fleet_summary aggregates across agents and EXCLUDES resolved rows.
 TEST_CASE("VulnFindingStore fleet_summary aggregates, excludes resolved", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -318,7 +344,7 @@ TEST_CASE("VulnFindingStore fleet_summary aggregates, excludes resolved", "[pg][
 
 // (10) cvss/fixed_in NULL round-trip (nullopt, not 0.0/"").
 TEST_CASE("VulnFindingStore cvss/fixed_in NULL round-trip", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -350,7 +376,7 @@ TEST_CASE("VulnFindingStore cvss/fixed_in NULL round-trip", "[pg][vuln][store]")
 // (11) get_agent_coverage tri-state: Ok / NotFound / Degraded.
 TEST_CASE("VulnFindingStore get_agent_coverage tri-state", "[pg][vuln][store]") {
     SECTION("Ok vs NotFound") {
-        YUZU_REQUIRE_PG_DB(db);
+        YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
         PgPool pool{{.conninfo = db.dsn(), .size = 4}};
         REQUIRE(pool.valid());
         VulnFindingStore store{pool};
@@ -374,7 +400,7 @@ TEST_CASE("VulnFindingStore get_agent_coverage tri-state", "[pg][vuln][store]") 
 // (12) concurrency: two overlapping same-agent reconciles serialize via the
 // advisory lock — no phantom resolve of a freshly-observed row.
 TEST_CASE("VulnFindingStore concurrent same-agent reconciles serialize", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -402,7 +428,7 @@ TEST_CASE("VulnFindingStore concurrent same-agent reconciles serialize", "[pg][v
 
 // (13) partial mid-loop failure → whole-batch rollback (zero findings persisted).
 TEST_CASE("VulnFindingStore bad row rolls the whole batch back", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -421,7 +447,7 @@ TEST_CASE("VulnFindingStore bad row rolls the whole batch back", "[pg][vuln][sto
 
 // (14) migration idempotency (construct twice on the same DB).
 TEST_CASE("VulnFindingStore migration is idempotent", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore a{pool};
@@ -435,7 +461,7 @@ TEST_CASE("VulnFindingStore migration is idempotent", "[pg][vuln][store]") {
 // (15) CHECK enforcement vs severity normalization: bad status/confidence roll
 // back; a bad severity is NORMALIZED to 'unknown' (not rejected).
 TEST_CASE("VulnFindingStore CHECK enforcement vs severity normalization", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -465,7 +491,7 @@ TEST_CASE("VulnFindingStore CHECK enforcement vs severity normalization", "[pg][
 // (16) ms-collision / step-back: a future stored last_run_at_ms still yields a
 // strictly greater run_ts, so the sweep fires — no missed resolve (S4).
 TEST_CASE("VulnFindingStore monotonic run_ts survives a clock step-back", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -503,7 +529,7 @@ TEST_CASE("VulnFindingStore monotonic run_ts survives a clock step-back", "[pg][
 
 // (17) SoftwareInventoryStore::list_agent_ids keyset paging returns all, no dupes.
 TEST_CASE("SoftwareInventoryStore list_agent_ids keyset pages the fleet", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
@@ -544,7 +570,7 @@ TEST_CASE("SoftwareInventoryStore list_agent_ids keyset pages the fleet", "[pg][
 // abort. std::to_string(NaN) would emit "nan" → PG 22P02 → the whole reconcile
 // rolls back every pass; the finite-guard binds NULL instead (cvss is optional).
 TEST_CASE("VulnFindingStore non-finite cvss persists as NULL, not a batch abort", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -578,7 +604,7 @@ TEST_CASE("VulnFindingStore non-finite cvss persists as NULL, not a batch abort"
 // (20) FIX 6: a mixed-case severity/status filter matches the canonically-stored
 // (normalized) value — "HIGH" must return the 'high' rows, not empty.
 TEST_CASE("VulnFindingStore query filter normalizes severity/status case", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};
@@ -615,7 +641,7 @@ TEST_CASE("VulnFindingStore query filter normalizes severity/status case", "[pg]
 
 // (18) delete_agent removes both tables.
 TEST_CASE("VulnFindingStore delete_agent clears findings and coverage", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, vuln_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore store{pool};

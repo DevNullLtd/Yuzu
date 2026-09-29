@@ -126,7 +126,11 @@ async function main() {
 
   let scanned = 0;
   for (const e of ENTRIES) {
-    const fp = path.join(docsRoot, `${e.file}.md`);
+    // Plugin READMEs are manifest entries keyed by repo-relative path
+    // (agents/plugins/<name>/README); everything else is docs-relative.
+    const fp = e.file.startsWith('agents/')
+      ? path.join(repoRoot, `${e.file}.md`)
+      : path.join(docsRoot, `${e.file}.md`);
     if (!fs.existsSync(fp)) { failures.push(`manifest entry "${e.file}" -> ${rel(fp)} does not exist`); continue; }
     lintFile(rel(fp), fs.readFileSync(fp, 'utf8'), 'md');
     scanned++;

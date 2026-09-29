@@ -307,6 +307,15 @@ TEST_CASE("tar parse_ts_param: epoch, datetime-local, and rejection", "[tar][tre
     CHECK(parse_ts_param("2026-13-01T00:00") == 0);     // invalid month
     CHECK(parse_ts_param("99999-01-01T00:00") == 0);    // year out of [1970,9999]
     CHECK(parse_ts_param("not-a-time") == 0);
+    // Pin the exact sscanf("%d-%d-%dT%d:%d:%d", n >= 5) semantics the strtol
+    // rewrite preserves (glibc __isoc23_sscanf removal):
+    CHECK(parse_ts_param(" 2026-06-18T12:00:00") == 1781784000); // %d-style leading whitespace
+    CHECK(parse_ts_param("2026-06-18T12:00:") == 1781784000);    // bare trailing ':' → Se stays 0
+    CHECK(parse_ts_param("2026-06-18T12:00:30xyz") == 1781784030); // trailing junk ignored
+    CHECK(parse_ts_param("2026-06-18 12:00:00") == 0);           // space instead of 'T' rejected
+    CHECK(parse_ts_param("2026-06-18T12-00") == 0);              // wrong time delimiter rejected
+    CHECK(parse_ts_param("2026-+6-+18T+12:+00:+30") == 1781784030); // %d-style sign acceptance
+    CHECK(parse_ts_param("2026-06-18T12:00:30.123") == 1781784030); // fractional suffix ignored
 }
 
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {

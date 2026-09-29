@@ -1,0 +1,1006 @@
+{
+  "actions": [
+    {
+      "action": "installed",
+      "definition_ids": [
+        "device.windows_updates.installed"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "rpm+apt",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "system_profiler",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wmi_bounded_query",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "missing",
+      "definition_ids": [
+        "device.windows_updates.missing"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "apt+yum",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "softwareupdate",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wua_com_async_search",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "patch_connectivity",
+      "definition_ids": [
+        "device.windows_updates.patch_connectivity",
+        "workflow.patch_connectivity_audit"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "raw_sockets",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "raw_sockets",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "raw_sockets",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "pending_reboot",
+      "definition_ids": [
+        "device.windows_updates.pending_reboot"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "filesystem+uname+vmlinuz_ls+needs_restarting",
+          "rung": "3",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "bounded (60s deadline) since this migration, but still a slow network call -- no longer able to hang indefinitely on an offline/headless Mac",
+          "mechanism": "softwareupdate",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**macOS `missing` can return zero rows with no placeholder.** `do_missing`'s macOS branch only writes an `available|none|...` placeholder when `softwareupdate -l`'s raw output is empty (`windows_updates_plugin.cpp:569-575`); when the raw output is non-empty but entirely banner/status text, `parse_softwareupdate_list` filters every line out (`windows_updates_parsers.hpp:228-243`, drops `\"Software Update\"`/`\"Finding\"`/`\"No new\"` lines) and nothing is written at all — exactly what the macOS sample above shows for `missing`. A consumer cannot distinguish \"no updates\" from \"the tool produced nothing recognisable\" for this action on macOS.",
+    "**`installed`/`missing` have no single field schema.** The `identifier|description|install_date` and `title|severity` shapes declared in the definition YAML fit the Windows leg; on Linux and macOS both actions emit two data fields, not three (`installed`) or the raw tool line (`missing`/yum and macOS), and on Linux `installed`'s third field is a package version, not a date, whenever the `apt` fallback ran instead of `rpm` (`windows_updates_plugin.cpp:252-272`).",
+    "**`installed`'s row order and cap changed with the WMI migration.** The retired PowerShell path returned the 50 most-recently-installed hotfixes, newest first; the WMI-sourced path returns up to 512 rows in whatever order the provider yields (WQL has no `ORDER BY` for a data-class query) — disclosed in `windows_updates_plugin.cpp:200-207` and the `wave3-pr33d` changelog entry, not a defect.",
+    "**The `raw_sockets` mechanism name is ordinary TCP, not `SOCK_RAW`.** `test_dns`/`test_tcp` (`windows_updates_plugin.cpp:788-881`) use `getaddrinfo` + a plain `SOCK_STREAM` `connect()`; the descriptor's mechanism string is a convention shared across plugins for \"direct BSD/Winsock sockets\", not a literal raw-socket claim.",
+    "**`missing`'s Windows leg is unverified on real Windows.** The header comment above `do_missing`'s WUA branch (`windows_updates_plugin.cpp:309-320`) states it \"could not be verified on this (non-Windows) host\" and was written from the documented COM API surface; `test_windows_updates_win_actions.cpp` deliberately exercises only `installed`, not `missing`, to avoid a network-dependent unit test."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists installed OS updates and packages on the endpoint. On Windows uses a bounded WMI Win32_QuickFixEngineering query (KB ID, description, install date; capped at 512 rows with no sort order -- not the 50 most-recent-first list the retired PowerShell Get-HotFix path returned). On Linux tries rpm --last (capped 50 lines) then falls back to apt list --installed (capped 50 lines) if rpm reports nothing. On macOS uses system_profiler SPInstallHistoryDataType (capped to the first 100 matched lines).",
+      "display_name": "List Installed Updates",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.windows_updates.installed",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists available OS updates and packages that are not yet installed. On Windows uses the Windows Update Agent COM API's asynchronous BeginSearch/ISearchJob call to search for updates where IsInstalled=0 (title and MSRC severity), polled under a 120s deadline so a wedged search is aborted rather than hung on. On Linux tries apt list --upgradable then falls back to yum check-update if apt finds nothing to upgrade. On macOS uses softwareupdate -l under a 60s deadline (it contacts Apple's servers); if that call's raw output is entirely banner/status text, this action returns zero rows rather than an explicit \"up to date\" row.",
+      "display_name": "List Missing Updates",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 600
+      },
+      "id": "device.windows_updates.missing",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Test network connectivity to patch/update servers. Performs DNS resolution, TCP connect, and optionally HTTPS handshake for each target URL. Targets can be explicitly provided or default to the platform's standard update servers (Windows Update, WSUS, apt/yum repos, macOS SUS). Returns per-target DNS and TCP results plus an overall summary of reachable vs failed targets.",
+      "display_name": "Test Patch Server Connectivity",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.windows_updates.patch_connectivity",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Detects whether the endpoint requires a reboot, typically after OS updates. On Windows checks three registry keys for existence only (no value is decoded): WindowsUpdate Auto Update RebootRequired, Component Based Servicing RebootPending, and Session Manager PendingFileRenameOperations. On Linux checks /var/run/reboot-required (Debian/Ubuntu) and compares the running kernel (uname -r) against the newest installed kernel (ls -t /boot/vmlinuz-*); falls back to needs-restarting -r on RHEL/Fedora when no /boot/vmlinuz-* is found. On macOS checks softwareupdate -l output (60s deadline; contacts Apple's servers) for a case-insensitive \"restart\" match. Every OS emits one row per check plus a trailing summary row; this action never sets a typed result status.",
+      "display_name": "Pending Reboot Detection",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.windows_updates.pending_reboot",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Two-step compliance workflow. First tests connectivity to all configured patch/update servers and reports DNS resolution, TCP connect latency, and overall reachability. Second, uploads a local diagnostic log file to the Yuzu server for centralized evidence collection. Designed for audit evidence gathering during compliance checks. Chain with a PolicyFragment to auto-remediate connectivity failures via network_actions.set_dns.",
+      "display_name": "Workflow: Patch Connectivity Audit with Log Upload",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "workflow.patch_connectivity_audit",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Updates/packages: installed, available, pending-reboot, patch connectivity",
+  "how_it_works": "`installed` and `missing` each read update state through a different mechanism per OS and emit\nwhatever shape that mechanism naturally returns — there is no shared cross-platform schema. `installed`\nruns first: a bounded WMI query on Windows, `rpm --last` falling back to `apt list --installed` on\nLinux, `system_profiler SPInstallHistoryDataType` on macOS. `missing` mirrors that fan-out with a\ndifferent mechanism per OS (WUA COM search, `apt`/`yum`, `softwareupdate -l`). On Windows this is not a\nsingle blocking call: `do_missing` calls `IUpdateSearcher::BeginSearch` (async) then polls\n`ISearchJob::get_IsCompleted` every 500ms until it returns true or a 120s deadline elapses\n(`windows_updates_plugin.cpp:381-398`) — the real WUA search against the Windows Update service is what\nmakes this action's measured runtime (~12s in the capture below) far longer than every other action\nhere, all of which are local reads. `pending_reboot` is\nindependent of both — three-to-four per-OS existence/comparison checks, each written as its own row,\nfolded into one trailing `reboot_required` summary row. `patch_connectivity` is the odd one out: a pure\nnetwork probe (DNS + TCP, no update-manager call at all) against either the caller's `targets` parameter\nor a built-in per-OS default list, so it is the plugin's only action that takes parameters and the only\none whose mechanism is identical on every OS.\n\nThis plugin is deliberately never a mutator: it has no install/patch-apply action anywhere in it (that\nlives in other plugins, e.g. `sccm`, `software_actions`). It is also deliberately not an exhaustive\nhistory: `installed` is bounded (512 rows on Windows, 50 lines on Linux, 100 matched lines on macOS),\nnever a full historical log.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "device.windows_updates.patch_connectivity",
+      "description": "Comma-separated list of URLs to test connectivity against. If empty, uses platform-default patch servers (e.g. Windows Update endpoints, apt/yum/dnf repos, macOS Software Update). Example: \"https://update.microsoft.com,https://download.windowsupdate.com\"\n",
+      "name": "targets",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 60,
+        "minimum": 1
+      },
+      "default": 10,
+      "definition_id": "device.windows_updates.patch_connectivity",
+      "description": "TCP connection timeout per target. Default: 10, min: 1, max: 60.\n",
+      "name": "timeout_seconds",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "workflow.patch_connectivity_audit",
+      "description": "Comma-separated list of patch server URLs to test. Leave empty to use platform defaults.\n",
+      "name": "targets",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 60,
+        "minimum": 1
+      },
+      "default": 10,
+      "definition_id": "workflow.patch_connectivity_audit",
+      "description": "TCP connection timeout per target.",
+      "name": "timeout_seconds",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": {
+        "maxLength": 4096
+      },
+      "default": null,
+      "definition_id": "workflow.patch_connectivity_audit",
+      "description": "Optional. Path to a local diagnostic log file to upload to the server after the connectivity test. If provided, the log will be uploaded via agent.content_dist.upload_file in a chained step.\n",
+      "name": "upload_log_path",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "007b2e86015f",
+  "manifest_version": 1,
+  "name": "windows_updates",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The updated item's identifier: a Windows KB number, an installed Linux package name, or a macOS update/app name. Values: free text.",
+          "example": "KB5122385",
+          "name": "identifier",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "A short human-readable label for the item. Populated only on Windows (the WMI Description field); Linux and macOS rows carry only two data fields (identifier + install_date), so this column is always empty there. Values: free text or empty.",
+          "example": "Update",
+          "name": "description",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The date or version string the source reports, verbatim: Windows WMI InstalledOn, macOS's \"Install Date:\" text, or Linux's rpm --last date -- but a package VERSION string (not a date) when the apt list --installed fallback ran instead of rpm, since apt has no install-date field. Values: free text (a date string, or a package version on Linux/apt).",
+          "example": "9/1/2026",
+          "name": "install_date",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.windows_updates.installed"
+    },
+    {
+      "columns": [
+        {
+          "description": "The available update's title or name. Windows: the WUA update Title. Linux: the package name (apt path) or the raw yum check-update line (yum fallback). macOS: the raw softwareupdate -l line. Values: free text.",
+          "example": "Security Intelligence Update for Microsoft Defender Antivirus - KB2267602 (Version 1.459.91.0) - Current Channel (Broad)",
+          "name": "title",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The MSRC severity rating. Populated only on Windows (IUpdate::MsrcSeverity, itself often empty for a non-security update); Linux and macOS have no equivalent field, so this column is always empty there. Values: free text or empty.",
+          "example": "(empty)",
+          "name": "severity",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.windows_updates.missing"
+    },
+    {
+      "columns": [
+        {
+          "description": "The target URL tested for connectivity; repeated across its own DNS and TCP result rows. Values: free text (URL).",
+          "example": "https://windowsupdate.microsoft.com",
+          "name": "target",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether DNS resolution of the target host succeeded.",
+          "example": true,
+          "name": "dns_ok",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "DNS resolution time in milliseconds. Values: integer (milliseconds).",
+          "example": 3,
+          "name": "dns_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Resolved IP address when dns_ok is true; carries the DNS error text instead when dns_ok is false (windows_updates_plugin.cpp:990-992). Values: IP address string, or free-text DNS error on failure.",
+          "example": "128.85.102.70",
+          "name": "ip",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the TCP connect to the target succeeded within timeout_seconds.",
+          "example": true,
+          "name": "tcp_ok",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "TCP connect time in milliseconds. Values: integer (milliseconds).",
+          "example": 160,
+          "name": "tcp_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "TCP connect error text, emitted as an additional row only when tcp_ok is false; the row is omitted entirely on a successful connect (windows_updates_plugin.cpp:1002). Values: free text.",
+          "example": "not observed in any capture (every capture's TCP connects succeeded)",
+          "name": "tcp_error",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Total number of targets tested in this run. Values: integer.",
+          "example": 3,
+          "name": "targets_tested",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Count of targets whose DNS and TCP checks both succeeded. Values: integer.",
+          "example": 3,
+          "name": "targets_reachable",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Count of targets that failed DNS resolution or TCP connect. Values: integer.",
+          "example": 0,
+          "name": "targets_failed",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "device.windows_updates.patch_connectivity"
+    },
+    {
+      "columns": [
+        {
+          "description": "Which check produced this row: a per-check probe name for every row but the last, or the literal \"reboot_required\" for the trailing summary row. Values: windows_update_reboot, cbs_reboot, pending_file_rename, reboot_required_file, kernel_mismatch, needs_restarting, softwareupdate_restart, reboot_required.",
+          "example": "pending_file_rename",
+          "name": "source",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether this specific check (or, on the summary row, any check) found a pending reboot. Values: true, false.",
+          "example": "true",
+          "name": "pending",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "Free text explaining a true `pending` on a per-check row (which registry key existed, which kernel versions mismatched); a comma-separated list of the triggering check names on the summary row; empty when `pending` is false. Values: free text or empty.",
+          "example": "Non-empty value",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.windows_updates.pending_reboot"
+    },
+    {
+      "columns": [
+        {
+          "description": null,
+          "example": null,
+          "name": "target",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "dns_ok",
+          "platforms": null,
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "dns_ms",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "tcp_ok",
+          "platforms": null,
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "tcp_ms",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "targets_tested",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "targets_reachable",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": null,
+          "example": null,
+          "name": "targets_failed",
+          "platforms": null,
+          "type": "int32",
+          "values": null
+        }
+      ],
+      "definition_id": "workflow.patch_connectivity_audit"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows, one `write_output()` call per line. `installed` and `missing` are **not** a single\nstable schema: the field count and the meaning of each field vary by OS, and on Linux by which tool ran\n(`rpm` vs its `apt` fallback for `installed`; `apt` vs its `yum` fallback for `missing`). `pending_reboot`\nis a stable 3-field `source|pending|detail` shape for every row including the summary. `patch_connectivity`\nmultiplexes three distinct row shapes (DNS, TCP, summary) as `tag|value` pairs after a shared\n`target|<url>|` (or `summary|`) prefix — an unpopulated field is simply absent from that row, never a `-`\nplaceholder.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None documented in this plugin's code: the WMI query and WUA COM search are daemon-mediated broker calls, and the three registry reads are presence-only `RegOpenKeyExA(..., KEY_READ)` calls against HKLM.",
+      "if_refused": "`installed`/`missing`: `WMI query failed: ...` / `Failed to ... (0x...)` rows plus `UNAVAILABLE`/`CONSTRAINED`; `pending_reboot`: the affected check's row reads `false` (key not found reads the same as key inaccessible — no distinct refusal shape)",
+      "measured": "2026-09-07, bare-metal, `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None measured: `system_profiler`, `softwareupdate -l`, and the DNS/TCP probes all returned real data unprivileged.",
+      "if_refused": "tool spawn/timeout is forwarded via `forward_runner_failure`; a fully-filtered `softwareupdate -l` output returns zero `missing` rows with no explicit refusal marker (see Caveats)",
+      "measured": "2026-09-07, euid 501 (`alex`)",
+      "os": "macOS",
+      "runs_as": "agent daemon, unprivileged"
+    },
+    {
+      "grant": "None measured: `rpm`/`apt`/`yum` and the filesystem/kernel checks all ran successfully. Sample was captured as `euid 0` in a container, so this is not evidence the agent's usual non-root identity is sufficient — only that the code makes no explicit privilege check.",
+      "if_refused": "a spawn/timeout failure is forwarded via `forward_runner_failure`; a clean \"nothing to report\" exit (e.g. `apt` finding no upgrades) is not distinguishable from a refusal in the row data alone",
+      "measured": "2026-09-06, container, `euid 0`",
+      "os": "Linux",
+      "runs_as": "agent daemon (`_yuzu`/`yuzu` per `docs/agent-privilege-model.md`'s general convention — no dedicated row exists for this plugin)"
+    }
+  ],
+  "readme": "agents/plugins/windows_updates/README.md",
+  "result_status": [
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`wmi_bounded:<token>`",
+      "status": "`UNAVAILABLE` / `CONSTRAINED`",
+      "when": "`installed`/Windows — the WMI connection or query itself failed"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`wmi_bounded:row_cap_truncated`",
+      "status": "`OK`",
+      "when": "`installed`/Windows — the 512-row cap was hit"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "(forwarded runner outcome, e.g. `subprocess_runner:line_limit`)",
+      "status": "`OK`",
+      "when": "`installed`/Linux — `rpm`/`apt` output hit the 50-line cap"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`windows_updates:com_init_failed` / `windows_updates:cocreate_updatesession_failed` / `windows_updates:create_searcher_failed` / `windows_updates:begin_search_failed` / `windows_updates:end_search_failed` / `windows_updates:get_updates_failed`",
+      "status": "`UNAVAILABLE`",
+      "when": "`missing`/Windows — a WUA COM stage failed outright: COM init, update-session creation, searcher creation, `BeginSearch`, `EndSearch`, or enumerating the result's updates collection"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`windows_updates:search_deadline_exceeded` / `windows_updates:get_result_code_failed` / `windows_updates:search_result_failed` / `windows_updates:get_update_count_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "`missing`/Windows — the 120s search deadline elapsed before completion, or a result/count accessor itself failed, leaving the outcome unknown rather than confirmed-zero"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`windows_updates:search_result_partial`",
+      "status": "`OK`",
+      "when": "`missing`/Windows — the search partially succeeded (`orcSucceededWithErrors` or a per-item read failure)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:spawn_error`",
+      "status": "`UNAVAILABLE`",
+      "when": "`missing`/Linux, `missing`/macOS, `installed`/macOS — the child process (rpm/apt/yum, system_profiler, softwareupdate) could not be spawned at all, forwarded via `forward_runner_failure`"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`subprocess_runner:deadline` / `subprocess_runner:cancelled` / `subprocess_runner:signaled`",
+      "status": "`CONSTRAINED`",
+      "when": "`missing`/Linux, `missing`/macOS, `installed`/macOS — the runner's deadline elapsed and the child was killed still running, the run was cancelled before finishing, or the child was killed by a signal rather than a clean exit, forwarded via `forward_runner_failure`"
+    },
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "(forwarded runner outcome, or none)",
+      "when": "`missing`/Linux, `missing`/macOS, `installed`/macOS — `forward_runner_failure` only reports a status for a genuine spawn/deadline/truncation degradation; a clean tool exit leaves the status `UNDECLARED`"
+    },
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "—",
+      "when": "`pending_reboot` (all OSes) and `patch_connectivity` (all OSes) never call `set_result_status`; the agent records `UNDECLARED` and every sample shows `UNDECLARED / UNKNOWN /` for these two actions"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "installed",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "subprocess_runner:line_limit",
+            "status": "OK"
+          },
+          "row_count": 49,
+          "rows": [
+            "package|apt|3.0.3",
+            "package|autoconf|2.72-3.1",
+            "package|automake|1:1.17-4",
+            "package|autotools-dev|20240727.1",
+            "package|base-files|13.8+deb13u6"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "missing",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "available|none|System is up to date"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pending_reboot",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "reboot_required_file|false|",
+            "needs_restarting|false|",
+            "reboot_required|false|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "patch_connectivity",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 5,
+          "rows": [
+            "target|https://archive.ubuntu.com|dns_ok|true|dns_ms|37|ip|185.125.190.83",
+            "target|https://archive.ubuntu.com|tcp_ok|true|tcp_ms|14",
+            "target|https://security.ubuntu.com|dns_ok|true|dns_ms|12|ip|185.125.190.82",
+            "target|https://security.ubuntu.com|tcp_ok|true|tcp_ms|19",
+            "summary|targets_tested|2|targets_reachable|2|targets_failed|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "007b2e86015f",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "installed",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 50,
+          "rows": [
+            "update|macOS 26.5.1|18/07/2026, 01:41",
+            "update|MAContent10_AssetPack_0048_AlchemyPadsDigitalHolyGhost|18/07/2026, 01:44",
+            "update|MAContent10_AssetPack_0310_UB_DrumMachineDesignerGB|18/07/2026, 01:44",
+            "update|MAContent10_AssetPack_0312_UB_UltrabeatKitsGBLogic|18/07/2026, 01:44",
+            "update|MAContent10_AssetPack_0314_AppleLoopsHipHop1|18/07/2026, 01:44"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "missing",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "pending_reboot",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "softwareupdate_restart|false|",
+            "reboot_required|false|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "patch_connectivity",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 5,
+          "rows": [
+            "target|https://swscan.apple.com|dns_ok|true|dns_ms|12|ip|2.16.176.247",
+            "target|https://swscan.apple.com|tcp_ok|true|tcp_ms|22",
+            "target|https://swdist.apple.com|dns_ok|true|dns_ms|2|ip|17.253.29.150",
+            "target|https://swdist.apple.com|tcp_ok|true|tcp_ms|23",
+            "summary|targets_tested|2|targets_reachable|2|targets_failed|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "007b2e86015f",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "installed",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "update|KB5122385|Update|9/1/2026",
+            "update|KB5054156|Update|2/16/2026",
+            "update|KB5120998|Update|9/1/2026",
+            "update|KB5120997|Update|8/31/2026"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "missing",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "available|Security Intelligence Update for Microsoft Defender Antivirus - KB2267602 (Version 1.459.91.0) - Current Channel (Broad)|"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pending_reboot",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "windows_update_reboot|false|",
+            "cbs_reboot|false|",
+            "pending_file_rename|true|Non-empty value",
+            "reboot_required|true|pending_file_rename"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "patch_connectivity",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 7,
+          "rows": [
+            "target|https://windowsupdate.microsoft.com|dns_ok|true|dns_ms|3|ip|128.85.102.70",
+            "target|https://windowsupdate.microsoft.com|tcp_ok|true|tcp_ms|160",
+            "target|https://update.microsoft.com|dns_ok|true|dns_ms|0|ip|128.85.102.70",
+            "target|https://update.microsoft.com|tcp_ok|true|tcp_ms|170",
+            "target|https://download.windowsupdate.com|dns_ok|true|dns_ms|7|ip|199.232.54.172"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "007b2e86015f",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "installed",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "missing",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "pending_reboot",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    },
+    {
+      "action": "patch_connectivity",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "SoftwareDeployment"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/t2_capabilities.yaml",
+      "content/definitions/t2_chaining_examples.yaml",
+      "content/definitions/windows_updates.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/windows_updates/src/windows_updates_parsers.hpp",
+      "agents/plugins/windows_updates/src/windows_updates_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_windows_updates_parsers.cpp",
+      "tests/unit/test_windows_updates_posix_actions.cpp",
+      "tests/unit/test_windows_updates_win_actions.cpp"
+    ]
+  },
+  "version": "1.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. The dashboard renders every action of this plugin generically as Agent/Key/Value rows (`result_parsing.hpp`'s `kKeyValuePlugins`), not a plugin-specific table.",
+    "**`pending_reboot` also feeds `/auto` Pre-flight.** `preflight_parse.hpp` parses its trailing `reboot_required|<bool>|<reasons>` row as an unconditional summary for the \"reboot\" readiness check.",
+    "**Not consumed by** the daily-sync inventory framework (ADR-0016), TAR, DEX, or metrics.",
+    "**Sensitivity.** `installed`/`missing` rows can name specific installed software indirectly — a Windows KB title/description often embeds a product name (e.g. \"...for Microsoft Defender Antivirus...\") — an installed-software signal by another route; `pending_reboot` and `patch_connectivity` rows carry nothing beyond boolean/timing/target-URL data and the device id.",
+    "**Siblings:** `content/definitions/t2_capabilities.yaml` (`device.windows_updates.patch_connectivity`, the definition that actually declares this action's parameters and result columns) and `content/definitions/t2_chaining_examples.yaml` (`workflow.patch_connectivity_audit`, a two-step compliance workflow chaining `patch_connectivity` into a log upload). `sccm` and `software_actions` cover the mutating side (deploying/applying updates) this plugin deliberately does not.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.windows_updates.installed\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`, plus the `/auto` Pre-flight page for `pending_reboot`."
+  ]
+}

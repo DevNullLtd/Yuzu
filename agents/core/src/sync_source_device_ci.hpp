@@ -107,7 +107,7 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 YUZU_EXPORT bool core_identity_unavailable(const CiRecord& rec);
 
 /// Build the `device_ci` SyncSource. Each argument is a loaded plugin descriptor;
-/// if ANY required plugin is null (not built/loaded — e.g. `build_examples=false`)
+/// if ANY required plugin is null (not built/loaded — e.g. `build_agent=false`)
 /// the source's collect returns `std::nullopt` and the scheduler no-ops it (a
 /// partial CI record is never synced).
 YUZU_EXPORT SyncSource make_device_ci_source(const YuzuPluginDescriptor* hardware,

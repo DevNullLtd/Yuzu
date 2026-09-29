@@ -1,0 +1,23 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 45e627d9dfa2
+== action=os_name
+os_name|macOS 26.6.2
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_version
+os_version|25.6.0
+os_product_version|26.6.2
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_build
+os_build|25G83
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=os_arch
+os_arch|arm64
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=uptime
+uptime_seconds|48996
+uptime_display|0d 13h 36m
+[result_status] UNDECLARED / UNKNOWN / 
+

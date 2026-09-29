@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Get-CimInstance -Namespace root\subscription -ClassName __EventFilter|__EventConsumer|__FilterToConsumerBinding | Format-List *
+date: 2026-09-06
+status: REAL CAPTURE
+note: root\subscription is NOT empty on the-rig -- it holds the stock Windows "SCM Event Log Filter" / "SCM Event Log Consumer" / binding triple (FilterCount=1 ConsumerCount=1 BindingCount=1), a built-in Windows subscription, not something registered for this capture. No RECONSTRUCTION triple was needed.

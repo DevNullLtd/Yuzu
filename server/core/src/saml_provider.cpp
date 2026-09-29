@@ -2,6 +2,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <yuzu/secure_zero.hpp> // sanctioned std::string zeroizer — used on BOTH platform branches
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Windows: compile stubs only — SAML is unsupported on Windows (N4).
 // Never return success-without-verify; is_enabled() returns false so callers
@@ -12,6 +14,10 @@
 namespace yuzu::server::saml {
 
 SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
+    // Wipe any transit SP signing PEM even on the (never-constructed-in-prod)
+    // Windows path, so a future Windows-port test that hands one in cannot leave
+    // raw key bytes in the config_ member. (Hermes pass-2 LOW; wipe-on-all-paths)
+    yuzu::secure_zero(config_.sp_signing_key_pem);
     spdlog::info("SamlProvider: SAML is not supported on Windows — provider disabled");
 }
 
@@ -24,6 +30,14 @@ bool SamlProvider::is_enabled() const {
 SamlProvider::AuthnRequestResult
 SamlProvider::build_authn_request(const std::string& /*relay_state*/) {
     return {}; // url="" and cookie_secret="" — callers check url.empty()
+}
+
+bool SamlProvider::signing_configured_but_broken() const {
+    return false; // N4: SP signing key is never parsed on Windows
+}
+
+const std::string& SamlProvider::signing_init_error() const {
+    return signing_init_error_; // always empty on Windows
 }
 
 std::expected<SamlAssertion, std::string>
@@ -50,9 +64,13 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <xmlsec/openssl/app.h>
 #include <xmlsec/openssl/crypto.h>
 
+#include <openssl/bio.h>
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
 
 #include <zlib.h>
 
@@ -68,6 +86,7 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -237,6 +256,39 @@ static std::string sha256_hex(const std::string& input) {
         hex.append(buf, 2);
     }
     return hex;
+}
+
+// ── RSA PKCS#1 v1.5 + SHA-256 signing (HTTP-Redirect binding AuthnRequest) ────
+
+/// Returns the raw signature bytes over `octets`, or an empty vector on any
+/// OpenSSL failure. Uses EXPLICIT RSA_PKCS1_PADDING — EVP_DigestSignInit with
+/// EVP_sha256() alone does not itself pin the padding scheme, so the padding
+/// is set on the derived EVP_PKEY_CTX before signing.
+static std::vector<unsigned char> rsa_sha256_sign(EVP_PKEY* key, std::string_view octets) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return {};
+    struct CtxGuard { EVP_MD_CTX* c; ~CtxGuard() { EVP_MD_CTX_free(c); } } guard{ctx};
+
+    EVP_PKEY_CTX* pctx = nullptr;
+    if (EVP_DigestSignInit(ctx, &pctx, EVP_sha256(), nullptr, key) != 1 || !pctx) {
+        return {};
+    }
+    if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) <= 0) {
+        return {};
+    }
+    if (EVP_DigestSignUpdate(ctx, octets.data(), octets.size()) != 1) {
+        return {};
+    }
+    std::size_t sig_len = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) != 1 || sig_len == 0) {
+        return {};
+    }
+    std::vector<unsigned char> sig(sig_len);
+    if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) != 1) {
+        return {};
+    }
+    sig.resize(sig_len);
+    return sig;
 }
 
 /// Constant-time comparison of two SHA-256 hex strings. Length is compared
@@ -429,6 +481,83 @@ static std::vector<std::string> extract_group_values(xmlNodePtr assertion,
     return groups;
 }
 
+/// Max stored length of an IdP-attested display/email attribute value, and a
+/// sanitiser applied at the parse boundary. These values are semi-trusted (a
+/// compromised IdP, or an Entra/AD tenant where `displayName` is user-settable,
+/// controls them) and flow to the operational log (spdlog), the dashboard, and
+/// `/whoami`. An internal newline would let a value forge a second log record
+/// (Gate 4 UP-1/2), and an unbounded value would be retained in the session and
+/// logged in full (UP-3). So strip C0 controls (incl. `\n`/`\r`/`\t`) and DEL,
+/// then clamp — WITHOUT splitting a UTF-8 multibyte sequence (a split byte would
+/// be invalid UTF-8 and could break JSON serialisation of `/whoami`). Sanitise
+/// ONCE here so every downstream sink is safe. Group values need no such
+/// treatment: `extract_group_values` matches them by exact equality and only
+/// ever counts them — they are never displayed or logged verbatim.
+constexpr std::size_t kMaxAttributeValueLen = 256;
+
+static std::string sanitize_attribute_value(std::string s) {
+    std::erase_if(s, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    if (s.size() > kMaxAttributeValueLen) {
+        std::size_t cut = kMaxAttributeValueLen;
+        // Back up over UTF-8 continuation bytes (0b10xxxxxx) so the clamp lands
+        // on a codepoint boundary, never mid-sequence.
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+        s.resize(cut);
+    }
+    return s;
+}
+
+/// Extract the FIRST non-empty `<AttributeValue>` text of the verified
+/// assertion's `<AttributeStatement>/<Attribute Name="attr_name">`.
+///
+/// SECURITY (N2 parity): reads ONLY from `assertion` — the SAME XSW-verified
+/// node `name_id` and the groups are read from — never a second XPath/search
+/// over the document. Callers MUST pass the single verified assertion node,
+/// never `root`. It reuses `extract_group_values`'s exact three-level,
+/// namespace-checked descent so a new attribute cannot drift off the verified
+/// subtree. Returns "" when `attr_name` is empty (feature off), the attribute
+/// is absent, or it carries no non-empty value. Bounded by construction: it
+/// stops at the first match, so there is no DoS-cap concern (a single scalar,
+/// not an unbounded multi-value list like groups).
+static std::string extract_first_attribute_value(xmlNodePtr assertion,
+                                                  const std::string& attr_name) {
+    if (attr_name.empty()) return {};
+
+    for (xmlNodePtr stmt = xmlFirstElementChild(assertion); stmt;
+         stmt = xmlNextElementSibling(stmt)) {
+        if (stmt->type != XML_ELEMENT_NODE || !stmt->name ||
+            !xmlStrEqual(stmt->name, BAD_CAST "AttributeStatement") || !stmt->ns ||
+            !stmt->ns->href || !xmlStrEqual(stmt->ns->href, BAD_CAST kSamlAssertionNs)) {
+            continue;
+        }
+        for (xmlNodePtr attr = xmlFirstElementChild(stmt); attr;
+             attr = xmlNextElementSibling(attr)) {
+            if (attr->type != XML_ELEMENT_NODE || !attr->name ||
+                !xmlStrEqual(attr->name, BAD_CAST "Attribute") || !attr->ns || !attr->ns->href ||
+                !xmlStrEqual(attr->ns->href, BAD_CAST kSamlAssertionNs)) {
+                continue;
+            }
+            if (get_attr(attr, "Name") != attr_name) continue;
+            for (xmlNodePtr val = xmlFirstElementChild(attr); val;
+                 val = xmlNextElementSibling(val)) {
+                if (val->type != XML_ELEMENT_NODE || !val->name ||
+                    !xmlStrEqual(val->name, BAD_CAST "AttributeValue") || !val->ns ||
+                    !val->ns->href || !xmlStrEqual(val->ns->href, BAD_CAST kSamlAssertionNs)) {
+                    continue;
+                }
+                // Sanitise at the parse boundary (control chars stripped,
+                // length clamped) so a newline can't forge a log record and a
+                // huge value can't be retained/logged (Gate 4 UP-1/2/3). A
+                // value that is empty AFTER sanitising (e.g. all control chars)
+                // is skipped, exactly like an empty raw value.
+                std::string text = sanitize_attribute_value(get_text(val));
+                if (!text.empty()) return text; // first non-empty (sanitised) value wins
+            }
+        }
+    }
+    return {};
+}
+
 /// Maximum element-nesting depth we will traverse in the XSW walks. libxml2
 /// already caps parse depth (XML_PARSE_HUGE is off → default 256), but we bound
 /// our own recursion explicitly so these walks are provably stack-safe
@@ -501,6 +630,15 @@ static bool has_duplicate_id(xmlNodePtr node, xmlNodePtr exclude,
 namespace yuzu::server::saml {
 
 SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
+    // Wipe + clear the transit PEM on EVERY ctor exit path — declared FIRST so it
+    // also covers the !config_.enabled early-return and the xmlsec-init failure
+    // path below (both skip the parse block) — so raw private-key bytes never
+    // linger in the by-value config_ member. (security-guardian LOW / cpp-safety INFO)
+    struct PemCleanser {
+        std::string& pem;
+        ~PemCleanser() { yuzu::secure_zero(pem); } // wipes + clears; no-op when empty
+    } pem_cleanser{config_.sp_signing_key_pem};
+
     if (!config_.enabled) return;
     try {
         ensure_xmlsec_initialized();
@@ -509,9 +647,79 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
         spdlog::error("SamlProvider: initialization failed: {} — disabling", e.what());
         config_.enabled = false;
     }
+
+    // Parse the SP AuthnRequest signing key (if configured) exactly once, at
+    // construction — never per-request. Configured-but-broken (malformed PEM,
+    // or a non-RSA key) sets signing_init_failed_ rather than falling back to
+    // unsigned; server.cpp checks signing_configured_but_broken() and disables
+    // SAML loudly rather than shipping a silent unsigned fallback.
+    if (config_.enabled && !config_.sp_signing_key_pem.empty()) {
+        struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } };
+        // static_cast<int> is safe only because server.cpp caps the key-file
+        // read at kSamlCertMaxBytes (64 KiB) before populating this field, so
+        // the size never approaches INT_MAX. (cpp-expert N1)
+        BioGuard bio{BIO_new_mem_buf(config_.sp_signing_key_pem.data(),
+                                     static_cast<int>(config_.sp_signing_key_pem.size()))};
+        // Explicit no-op password callback (returns a zero-length password): a
+        // passphrase-protected key then fails deterministically here instead of
+        // falling back to OpenSSL's default callback, which prompts on /dev/tty
+        // — hanging an interactive boot, misleading a headless one. (UP-1)
+        auto no_password = [](char*, int, int, void*) -> int { return 0; };
+        EVP_PKEY* raw_key = bio.b ? PEM_read_bio_PrivateKey(bio.b, nullptr, no_password, nullptr)
+                                  : nullptr;
+        if (!raw_key) {
+            // Clear the thread-local OpenSSL error queue so our own parse failure
+            // does not leak into unrelated later diagnostics. (Hermes pass-2 LOW)
+            ERR_clear_error();
+            signing_init_failed_ = true;
+            signing_init_error_  = "SAML SP signing key: failed to parse PEM private key "
+                                   "(an encrypted/passphrase-protected key is not supported; "
+                                   "provide an unencrypted RSA private key)";
+            spdlog::error("SamlProvider: {}", signing_init_error_);
+        } else {
+            std::shared_ptr<EVP_PKEY> parsed(raw_key, EVP_PKEY_free);
+            const int base_id = EVP_PKEY_base_id(parsed.get());
+            const int bits    = EVP_PKEY_bits(parsed.get());
+            if (base_id != EVP_PKEY_RSA) {
+                // Reject EC and RSA-PSS (base id EVP_PKEY_RSA_PSS) and anything
+                // else — only plain RSA (PKCS#1 v1.5) is supported. `parsed`
+                // destructs here (EVP_PKEY_free) — the rejected key is never retained.
+                signing_init_failed_ = true;
+                signing_init_error_  = "SAML SP signing key must be an RSA key";
+                spdlog::error("SamlProvider: {} (EVP_PKEY base id={})", signing_init_error_,
+                              base_id);
+            } else if (bits < 2048 || bits > 16384) {
+                // Floor: a sub-2048-bit RSA key is factorable, letting an attacker
+                // forge AuthnRequests and defeat the SP->IdP signing binding.
+                // Ceiling: an absurdly large key makes each per-request signature
+                // pathologically slow — an amplification vector on the
+                // unauthenticated /auth/saml/start. (Hermes HIGH + partial UP-3)
+                signing_init_failed_ = true;
+                signing_init_error_  = "SAML SP signing key size out of range "
+                                       "(RSA modulus must be 2048-16384 bits)";
+                spdlog::error("SamlProvider: {} ({} bits)", signing_init_error_, bits);
+            } else {
+                sp_signing_key_ = std::move(parsed);
+                spdlog::info("SamlProvider: SP AuthnRequest signing enabled (RSA-{} key configured)",
+                             bits);
+            }
+        }
+
+        // The transit PEM is wiped + cleared by pem_cleanser on ctor exit
+        // (declared above) on every path — never logged, never retained past
+        // parse (config_ is a by-value member; the owned EVP_PKEY stays live).
+    }
 }
 
 SamlProvider::~SamlProvider() = default;
+
+bool SamlProvider::signing_configured_but_broken() const {
+    return signing_init_failed_;
+}
+
+const std::string& SamlProvider::signing_init_error() const {
+    return signing_init_error_;
+}
 
 bool SamlProvider::is_enabled() const {
     // H-F: Require all config fields that the flow and the Issuer/Audience/
@@ -558,7 +766,9 @@ SamlProvider::build_authn_request(const std::string& relay_state) {
                                          binding_hash};
     }
 
-    // Unsigned AuthnRequest XML (HTTP-Redirect binding signing is a follow-up).
+    // AuthnRequest XML. Signed on the wire via the detached HTTP-Redirect
+    // binding query-string signature below when an SP signing key is
+    // configured (sp_signing_key_); otherwise unsigned (backward-compatible).
     // clang-format off
     const std::string xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -579,11 +789,37 @@ SamlProvider::build_authn_request(const std::string& relay_state) {
     const auto b64 = b64_encode(
         reinterpret_cast<const unsigned char*>(compressed.data()),
         compressed.size());
+    const auto enc_req = url_encode(b64);
 
-    std::string url = config_.idp_sso_url + "?SAMLRequest=" + url_encode(b64);
-    if (!relay_state.empty()) url += "&RelayState=" + url_encode(relay_state);
+    std::string url;
+    if (sp_signing_key_) {
+        // HTTP-Redirect binding signing (SAML 2.0 core §3.4.4.1): the
+        // signature is computed over the ALREADY percent-encoded,
+        // '&'-joined query parameters in exactly this order —
+        // SAMLRequest, RelayState (omitted entirely when empty, never
+        // "RelayState="), SigAlg — with no leading '?' and no Signature
+        // param. The signed bytes and the sent bytes must be byte-identical,
+        // so `base` becomes the URL's query string verbatim.
+        std::string base = "SAMLRequest=" + enc_req;
+        if (!relay_state.empty()) base += "&RelayState=" + url_encode(relay_state);
+        base += "&SigAlg=" + url_encode("http://www.w3.org/2001/04/xmldsig-more#rsa-sha256");
 
-    spdlog::debug("SamlProvider: AuthnRequest id={}", request_id);
+        const auto sig = rsa_sha256_sign(sp_signing_key_.get(), base);
+        if (sig.empty()) {
+            // Per-request signing failure: never emit an unsigned redirect
+            // when signing is configured — fail this request instead.
+            spdlog::error("SamlProvider: AuthnRequest signing failed (id={})", request_id);
+            return {};
+        }
+        const auto sig_b64 = b64_encode(sig.data(), sig.size());
+        url = config_.idp_sso_url + "?" + base + "&Signature=" + url_encode(sig_b64);
+    } else {
+        url = config_.idp_sso_url + "?SAMLRequest=" + enc_req;
+        if (!relay_state.empty()) url += "&RelayState=" + url_encode(relay_state);
+    }
+
+    spdlog::debug("SamlProvider: AuthnRequest id={} signed={}", request_id,
+                  sp_signing_key_ != nullptr);
     return {std::move(url), cookie_secret};
 }
 
@@ -1110,10 +1346,14 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     // ── 14. Extract NameID (all reads from the verified 'assertion' node) ─────
     // subject is guaranteed non-null at this point (mandatory check above).
     std::string name_id;
+    std::string name_id_format; // ADR-2001 PR4a — see SamlAssertion::name_id_format
     {
         const xmlNodePtr name_id_node =
             find_child_ns(subject, "NameID", kSamlAssertionNs);
-        if (name_id_node) name_id = get_text(name_id_node);
+        if (name_id_node) {
+            name_id = get_text(name_id_node);
+            name_id_format = get_attr(name_id_node, "Format");
+        }
     }
     if (name_id.empty()) {
         return std::unexpected("no NameID found in verified assertion");
@@ -1127,9 +1367,18 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     std::vector<std::string> groups =
         extract_group_values(assertion, config_.group_attribute, &group_cap_truncated);
 
-    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={})", name_id,
-                 groups.size());
-    return SamlAssertion{std::move(name_id), std::move(groups), group_cap_truncated};
+    // Session-enrichment attributes (display name, email) — read from the SAME
+    // verified 'assertion' node (N2 parity). Empty config (default) yields
+    // empty strings, preserving the raw-NameID display fallback. These NEVER
+    // feed identity/authz/SCIM-linkage — only Session::display_name rendering.
+    std::string display_name = extract_first_attribute_value(assertion, config_.name_attribute);
+    std::string email        = extract_first_attribute_value(assertion, config_.email_attribute);
+
+    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={}, has_display={}, "
+                 "has_email={})",
+                 name_id, groups.size(), !display_name.empty(), !email.empty());
+    return SamlAssertion{std::move(name_id),   std::move(name_id_format), std::move(groups),
+                         group_cap_truncated,  std::move(display_name),   std::move(email)};
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────

@@ -32,6 +32,16 @@ logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
 absent on some builds) — the catalogue row then honestly reads zero for that
 device while other devices still report.
 
+**Machine-readable access to one family.** `GET /api/v1/dex/catalogue/group`
+and the MCP twin `get_dex_catalogue_group` (#4035, api-parity #2146 Batch A)
+each take a `name` parameter that must **exactly** match one of the 13
+display-group names `dex_signal_groups()` defines (e.g. `App reliability`,
+`System stability`, `Network`) — the same names the `/dex` Catalogue dashboard
+tab's family cards use. An unknown name is rejected (`404` on REST,
+`kInvalidParams` on MCP) rather than silently returning an empty result. See
+`docs/user-manual/rest-api.md` "DEX (Digital Employee Experience)" for the
+full response shape.
+
 ## Uniform observation shape
 
 Every signal maps onto the same shape — on the wire (`detail_json`), in the
@@ -44,6 +54,7 @@ projection (`guardian_observations`), and in the dashboard:
 | `symbolic` | Human name for reason | `ACCESS_VIOLATION`, `WIFI_DISCONNECT` |
 | `component` | Secondary entity | `ntdll.dll` (faulting module), NIC description, MAC |
 | `metric` | Numeric payload where the signal IS a number | boot duration ms |
+| `version` | Failing app's version on crash/hang signals, canonicalised to the 4-group quad by `yuzu::util::canon_version` — Windows WER `AppVersion`, macOS `.ips` `app_version` / `bundleInfo.CFBundleShortVersionString`; `""` = the shared unknown bucket (Linux; unversioned binaries) | `3.2.1.0` |
 
 `process.crashed` additionally dual-emits the legacy slice-1 keys
 (`process`/`exception_code`/`faulting_module`) for the PR #1311 transition;
@@ -573,7 +584,10 @@ crashes, the OOM-killer) are **shipped** — see the Linux collector section abo
   (route a′); the gateway forwards `GuaranteedStateEvent` opaquely.
 - The projection (`guardian_observations`, migration {7}) is written **inside
   the event transaction** — duplicate `event_id` rolls back both (at-least-once
-  dedup), and the reaper deletes projection rows in lockstep with events.
+  dedup - the dedup-by-`event_id` mechanism itself, not the lifecycle journal's
+  overall delivery guarantee; see `docs/user-manual/guaranteed-state.md`'s
+  "Reconnect replay traffic" section for that), and the reaper deletes
+  projection rows in lockstep with events.
 - Observations are facts, not alerts: severity is uniformly `info`; DEX applies
   its own framing and ignores Guardian severity.
 - The headline dashboard rate stays **crash-free devices** (crash-scoped);

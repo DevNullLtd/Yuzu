@@ -1,11 +1,20 @@
 # MFA (TOTP) — Yuzu design reference
 
-Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+)** — self-service
+Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
+encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
 high-risk REST + Settings surfaces (PR 2); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
-bootstrap (PR 3). The MFA ladder is complete; the remaining MFA-adjacent
-work is the at-rest secret encryption follow-up (see "At-rest protection").
+bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
+encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
+cutover (`SecretCodec`'s first production consumer, ADR-0010) — see
+"At-rest protection" below, which previously described this as a planned
+follow-up and now describes the shipped mechanism. Bundled with the same
+cutover: MFA state reads now fail **closed** (a distinct
+`AuthDBError::SecretUnavailable` outcome) on a store/decrypt failure,
+closing a latent bypass class where a read error could previously collapse
+to "not enrolled" — see `docs/auth-architecture.md` "MFA fails closed on
+secret-read failure".
 
 This doc is the single design reference for Yuzu's MFA implementation.
 For why MFA matters at all and where it sits in the broader A&A roadmap,
@@ -36,30 +45,33 @@ CC6.6 — privileged access).
   Recovery codes share the same endpoint (heuristic: `-` separator or
   non-6-digit length).
 - **Step-up window** (PR 2). On a successful TOTP proof the session's
-  `mfa_verified_at` is bumped to `steady_clock::now()`. High-risk
+  `mfa_verified_at` is bumped to `system_clock::now()` (wall-clock since
+  HA WS-1/1a — see the corrected hard invariant #5). High-risk
   endpoints reject the session as "stale" if the gap exceeds
   `cfg.mfa_step_up_window_secs` (default 300 s) and prompt for a fresh
   code via `POST /login/mfa/stepup`.
 - **Audit chain.** Every state transition emits an audit row through
   `AuthRoutes::audit_log`. The verbs are: `mfa.enroll.initiated`,
-  `mfa.enroll.verified`, `mfa.enroll.failed`, `mfa.disabled`,
-  `mfa.login.required`, `mfa.login.verified`, `mfa.login.failed`,
-  `mfa.recovery_codes.generated`, `mfa.recovery_code.used` (PR 2 adds
-  `mfa.step_up.*`).
+  `mfa.enroll.verified`, `mfa.enroll.failed`, `mfa.enroll.race`,
+  `mfa.disabled`, `mfa.login.required`, `mfa.login.verified`,
+  `mfa.login.failed`, `mfa.recovery_codes.generated`,
+  `mfa.recovery_code.used` (PR 2 adds `mfa.step_up.*`).
 
 ---
 
 ## What ships in PR 1
 
-The slice of the design that is live as of v0.12.
+The slice of the design that is live as of v0.12 — **table is historical
+(SQLite `auth.db` era); see the callouts for what the 2026-07-16 Postgres
+cutover changed.**
 
 | Surface | File(s) | Notes |
 |---|---|---|
-| RFC 6238 TOTP + RFC 4648 base32 + otpauth URI | `server/core/src/totp.{hpp,cpp}` | Tested against RFC 6238 Appendix B SHA-1 vectors |
-| Schema migration v2 | `server/core/src/auth_db.cpp` (`kMigrations`) | `users.mfa_*`, `sessions.mfa_verified_at`, `mfa_recovery_codes`, `auth_kv` |
-| MFA accessors on `AuthDB` | `server/core/{src,include}/yuzu/server/auth_db.{cpp,hpp}` | `mfa_init_enrollment` / `mfa_verify_enrollment` / `mfa_verify_login_code` / `mfa_consume_recovery_code` / `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` / `mfa_mark_session_stepup` |
+| RFC 6238 TOTP + RFC 4648 base32 + otpauth URI | `server/core/src/totp.{hpp,cpp}` | Tested against RFC 6238 Appendix B SHA-1 vectors; unaffected by the Postgres cutover |
+| Schema migration v2 (SQLite era) | `server/core/src/auth_db.cpp` (`kMigrations`) | `users.mfa_*`, `sessions.mfa_verified_at`, `mfa_recovery_codes`, `auth_kv` — `sessions`/`auth_kv` were **dropped** (not carried) into the single Postgres `auth` migration; see "Schema" below |
+| MFA accessors on `AuthDB` | `server/core/{src,include}/yuzu/server/auth_db.{cpp,hpp}` | `mfa_init_enrollment` / `mfa_verify_enrollment` / `mfa_verify_login_code` / `mfa_consume_recovery_code` / `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` still exist on the Postgres-backed `AuthDB`; **`mfa_mark_session_stepup` was removed** in the Postgres cutover along with `AuthDB`'s session surface (step-up state is `Session::mfa_verified_at`, now a durable `mfa_verified_ms` column on the `SessionStore` row for Postgres deployments — HA WS-1/1a) |
 | AuthManager glue | `server/core/{src,include}/yuzu/server/auth.{cpp,hpp}` | `verify_password`, `create_local_session(user, role, mfa_verified)`, `mark_session_mfa_verified`, `auth_db_ptr()` |
-| `Session::mfa_verified_at` | `server/core/include/yuzu/server/auth.hpp` | `steady_clock::time_point`; default-constructed = not verified |
+| `Session::mfa_verified_at` | `server/core/include/yuzu/server/auth.hpp` | `system_clock::time_point` (wall-clock since HA WS-1/1a, ADR-2002 §4 — see invariant #5); default-constructed = not verified |
 | Login flow | `server/core/src/auth_routes.{cpp,hpp}` | `POST /login` returns 202 + pending token on MFA-enrolled users; new `POST /login/mfa` route; `MfaPending` map with TTL reaper |
 | Login page | `server/core/src/login_ui.cpp` | Hidden MFA form revealed on 202 response |
 | Settings panel | `server/core/src/settings_routes.{cpp,hpp}`, `settings_ui.cpp` | `render_mfa_fragment` + four `/api/settings/mfa/*` POST routes; new "Multi-Factor Authentication" section |
@@ -70,13 +82,14 @@ The slice of the design that is live as of v0.12.
 
 ## Schema
 
-v2 migration in `auth_db.cpp:kMigrations`. The columns are all nullable
-so existing rows survive the migration unchanged; `mfa_last_counter` has
+**Historical (SQLite `auth.db`, pre-2026-07-16 Postgres cutover).** v2
+migration in `auth_db.cpp:kMigrations`. The columns were all nullable so
+existing rows survived the migration unchanged; `mfa_last_counter` had
 `DEFAULT 0` to keep its `NOT NULL` honest.
 
 ```
 users:
-  mfa_totp_secret BLOB          -- raw 20-byte HMAC-SHA1 key
+  mfa_totp_secret BLOB          -- raw 20-byte HMAC-SHA1 key, PLAINTEXT
   mfa_enrolled_at DATETIME      -- NULL = provisional or never enrolled
   mfa_disabled_at DATETIME      -- NULL = active or never enrolled
   mfa_last_counter INTEGER      -- replay floor; updated on every verify
@@ -98,33 +111,77 @@ auth_kv:
   created_at / updated_at DATETIME
 ```
 
-`auth_kv` is provisioned empty for the future at-rest encryption work
-(see "At-rest protection" below). v1 has no writes against it.
+`auth_kv` was provisioned empty for the at-rest encryption work below, but
+was **never used** — see "At-rest protection".
+
+**Current (Postgres, schema `auth`, ADR-0006).** The single-migration
+`auth.users` table carries the same MFA columns, minus `sessions` (dropped
+from `AuthDB` — operator sessions are now durable in the separate `SessionStore`
+(HA WS-1/1a, ADR-2002 §4), not on `AuthDB`; see `docs/auth-architecture.md`
+"Durable operator sessions")
+and `auth_kv` (dropped, unused scaffolding, superseded outright by
+`SecretCodec` — never reused for anything else):
+
+```
+auth.users:
+  mfa_totp_secret BYTEA         -- SecretCodec envelope-encrypted (see below), NOT plaintext
+  mfa_enrolled_at TIMESTAMPTZ   -- NULL = provisional or never enrolled
+  mfa_disabled_at TIMESTAMPTZ   -- NULL = active or never enrolled
+  mfa_last_counter BIGINT       -- replay floor; updated on every verify
+
+auth.mfa_recovery_codes:
+  id BIGINT PK
+  username TEXT
+  code_hash TEXT                -- PBKDF2-SHA256 (matches password_hash), unaffected by SecretCodec
+  code_salt TEXT
+  consumed_at TIMESTAMPTZ       -- NULL = unused
+  created_at TIMESTAMPTZ
+```
 
 ---
 
-## At-rest protection
+## At-rest protection — SHIPPED (2026-07-16, ADR-0010)
 
-The TOTP secret is plaintext in `users.mfa_totp_secret`. The compensating
-controls are:
+**The TOTP secret is now envelope-encrypted, not plaintext.**
+`auth.users.mfa_totp_secret` is AES-256-GCM ciphertext via `pg::SecretCodec`
+— `AuthDB` is `SecretCodec`'s first production consumer. The DEK is wrapped
+by the install-level KEK (`FileKeyProvider`, the same 0600-PEM-in-0700-dir
+custody the CA root private key already uses), and the AAD binds the
+`{schema, table, column, row id}` tuple (`{"auth", "users",
+"mfa_totp_secret", <users.id>}`) so a ciphertext blob cannot be swapped
+between rows even by someone with raw SQL access. A read/decrypt failure
+(tamper, an unresolvable/rotated KEK, a corrupt blob, or a transient
+Postgres outage mid-read) surfaces as `AuthDBError::SecretUnavailable` and
+every caller fails **closed** — see `docs/auth-architecture.md` "MFA fails
+closed on secret-read failure" for the full call-site list and rationale.
 
-- `auth.db` is created and re-chmod'd to **0600** on every open
-  (`auth_db.cpp:236`). Same posture as password hashes.
-- The parent directory is **0700** on Unix (`auth_db.cpp:204`).
+**Everything below this line describes the retired SQLite-era posture, kept
+for history.** The TOTP secret used to be plaintext in `users.mfa_totp_secret`,
+with these compensating controls:
+
+- `auth.db` was created and re-chmod'd to **0600** on every open. Same
+  posture as password hashes.
+- The parent directory was **0700** on Unix.
 - The agent process runs as a dedicated non-root account (`docs/agent-
-  privilege-model.md`).
+  privilege-model.md`) — this control is unrelated to storage substrate and
+  still applies today.
 
-Threat model: an attacker with read access to `auth.db` already has the
-password-hash store, the session cookie store, the enrollment-token
-hashes, and every API-token row. Adding plaintext TOTP secrets does not
-materially worsen that posture — both PBKDF2-cracking a password and
-reading a TOTP secret give the attacker indefinite account access.
-
-A follow-up encrypts the secret with **AES-256-GCM** using a per-server
-master key stored in `auth_kv` under `key='mfa_master_key'`. The
-plaintext column becomes `mfa_totp_secret_enc + nonce + tag`. Tracked as
-a v3 schema migration; the `auth_kv` scaffolding is in place so the
-later PR is purely additive.
+Threat model at the time: an attacker with read access to `auth.db` already
+had the password-hash store, the session cookie store, the enrollment-token
+hashes, and every API-token row, so plaintext TOTP secrets did not
+materially worsen that posture on their own — but a `pg_dump`/backup/
+snapshot exposure of the **Postgres** substrate is a materially different
+threat surface than a single 0600 SQLite file (ADR-0010's motivating
+rationale for the whole `SecretCodec` mechanism), which is why the
+encryption landed as a hard requirement of the Postgres cutover rather than
+staying an indefinitely-deferred follow-up. The originally-sketched
+mechanism — a per-server AES-256-GCM master key stored in `auth_kv` under
+`key='mfa_master_key'`, `mfa_totp_secret_enc + nonce + tag` columns, a v3
+SQLite migration — was **superseded outright**, not implemented: `auth_kv`
+carries no rows in the shipped schema at all (it does not exist in Postgres;
+see "Schema" above), and the actual mechanism is `SecretCodec`'s generic
+envelope-encryption seam, shared with every other secret-bearing store on
+the Postgres substrate rather than an auth-specific one-off.
 
 ---
 
@@ -143,6 +200,20 @@ later PR is purely additive.
 updated to the matched counter, so the same code cannot be reused within
 its 90 s window even via clock-skew accommodation.
 
+The login verify (`AuthDB::mfa_verify_login_code`) advances the counter
+under a **two-layer** replay guard: the SELECT-verify-UPDATE runs as one
+`SELECT … FOR UPDATE` row-locked transaction (so two concurrent submissions
+of one still-valid code cannot both pass), and the counter-advancing UPDATE
+additionally carries the same `RETURNING`-gated atomic-UPDATE idiom the
+recovery-code path uses below (recovery has no preceding lock stage, since it
+needs an app-side PBKDF2 compare first) —
+`… WHERE mfa_last_counter < $matched RETURNING id`. A zero-row `RETURNING`
+result means the stored counter already reached the matched value and the
+submission is graded an already-consumed code — never a burned success and
+never a store error. The `WHERE` guard is defense-in-depth behind the row
+lock: it keeps the advance monotonic even if that isolation were ever
+weakened (a read replica, a future lock-free refactor).
+
 The constant-time string compare inside `verify_window` is moot for
 6-digit codes (length leak is bounded) but defends against timing
 oracles in case a future change widens the truncation.
@@ -156,17 +227,39 @@ a `-` separator inserted for readability). Stored as PBKDF2-SHA256
 hashes against per-row 16-byte salts (same PBKDF2 parameters as the
 password store: 100 000 iterations).
 
-Single-use enforcement: `mfa_consume_recovery_code` finds an unconsumed
-row, constant-time-compares the salted hash, and `UPDATE … SET
-consumed_at = CURRENT_TIMESTAMP WHERE id = ? AND consumed_at IS NULL`.
-The `WHERE consumed_at IS NULL` guard plus `sqlite3_changes()` check
-means a concurrent consume that wins the race is treated as no-match by
-the loser — race-safe without a transaction.
+Single-use enforcement: `mfa_consume_recovery_code` finds every unconsumed
+row for the user, constant-time-compares the salted hash against each
+candidate (bounded wall time regardless of which row matches — no early
+break, avoids leaking match position via timing), then on a Postgres schema
+`UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND
+consumed_at IS NULL RETURNING id` (originally, on SQLite, a
+`sqlite3_changes()` check served the same role — see the root `CLAUDE.md`
+`sqlite3_changes()` race note, #1033; Postgres's `RETURNING` was adopted
+directly rather than porting that idiom). The `WHERE consumed_at IS NULL`
+guard plus a zero-row `RETURNING` result means a concurrent consume that
+wins the race is treated as no-match by the loser — race-safe without an
+explicit transaction.
 
 `mfa_regenerate_recovery_codes` deletes every row for the user (consumed
 or otherwise) and issues 10 fresh ones. The UI surfaces this when
 recovery_codes_remaining drops below 5 or when the operator presses
-"Regenerate recovery codes".
+"Regenerate recovery codes". Unlike the consume path, DELETE-all + INSERT-10
+is **not** self-serializing, so it takes a `SELECT … FOR UPDATE` on the
+`auth.users` row first (#3779): without it two concurrent regenerates each
+delete the committed rows and insert 10 (20 persist under READ COMMITTED), and
+each caller is handed a set that no longer matches storage. The row lock — the
+same one `mfa_verify_enrollment`, `mfa_verify_login_code`, `mfa_disable` and
+`remove_user` already take for the user — orders them into clean sequential
+last-writer-wins (returned == persisted for each caller in turn). The
+`is_active = TRUE` predicate additionally **refuses** a regenerate once
+`remove_user` has deactivated the account: the loser re-reads `is_active =
+FALSE`, matches zero rows, and returns `UserNotFound` — so a regenerate racing an
+account **deactivation** can never leave live recovery codes on a disabled
+account. (An `mfa_disable` leaves `is_active = TRUE`, so a regenerate racing it is
+serialized by the row lock but still issues codes; those are inert — a recovery
+code is only consumable through an MFA challenge, which a disabled account cannot
+present — and the next enroll/disable clears them. The `is_active` refusal is
+specific to `remove_user`, not `mfa_disable`.)
 
 `mfa_disable` deletes the user's recovery codes alongside clearing the
 secret — leaving them around would let a disabled user authenticate via
@@ -401,16 +494,19 @@ Entra and most OIDC IdPs assert the methods used to authenticate via the
    never wrongly admitted).
 3. `/auth/callback` seeds the new session's `mfa_verified_at` only when
    `amr_asserts_mfa(claims.amr)` is true **and `iat > 0`**. **Clock-domain
-   note:** the design originally said `mfa_verified_at = iat`, but `iat` is
-   wall-clock and `Session::mfa_verified_at` is `steady_clock` (hard
-   invariant #5, NTP-step resistance). The handler computes the
-   assertion's age (`system_now − iat`, clamped at 0 for IdP-clock-ahead
-   skew) **in the system-clock domain before** the cast to
-   `steady_clock::duration`, then sets `mfa_verified_at = steady_now −
-   age`, so a stale IdP assertion still re-prompts. A missing/zero `iat`
-   is **not** seeded (fabricating a fresh window from a timestampless
-   assertion would let a replayed `amr`-without-`iat` token look fresh —
-   governance UP-9); such a session simply falls into the "no proof"
+   note:** since HA WS-1/1a (ADR-2002 §4) `Session::mfa_verified_at` is a
+   `system_clock` (wall-clock) instant, so the handler seeds it **directly
+   from the IdP `iat`** (`mfa_verified_at = system_clock::time_point{iat}`) —
+   the earlier steady-clock age-projection algorithm (`steady_now − age`) has
+   been removed. A stale IdP assertion still re-prompts because its seeded
+   wall-clock instant is already old relative to the step-up window. A future
+   `iat` is **clamped to now** (`iat > system_now` → `mfa_verified_at =
+   system_now`) so an IdP-clock-ahead skew cannot mint a proof that stays
+   fresh past the window; the downstream step-up gate additionally fails
+   closed on any `mfa_verified_at > now` residue (see hard invariant #5). A
+   missing/zero `iat` is **not** seeded (fabricating a fresh window from a
+   timestampless assertion would let a replayed `amr`-without-`iat` token look
+   fresh — governance UP-9); such a session simply falls into the "no proof"
    branch below, which passes.
 4. `require_mfa_step_up` no longer early-exempts `oidc`. It skips the local
    `mfa_status` lookup for OIDC sessions (there is no `users` row) and:
@@ -459,6 +555,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
 | `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap) |
+| `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (`error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
@@ -506,10 +603,11 @@ MFA-verified" assertion auditors look for.
 
 ## Hard invariants (do not regress)
 
-When extending the MFA surface (the remaining encryption-at-rest PR, or
-any later auth work) make sure none of these regress:
+When extending the MFA surface (now that at-rest encryption has shipped —
+see "At-rest protection" — or any later auth work) make sure none of these
+regress:
 
-1. **TOTP secrets never leave `auth.db` after enrollment confirms.**
+1. **TOTP secrets never leave the auth store after enrollment confirms.**
    Once a user is **enrolled**, no read path returns the secret bytes —
    even `mfa_status` only reports `enrolled / disabled / count`, and
    `mfa_init_enrollment` refuses (`MfaAlreadyEnrolled`). A **provisional**
@@ -522,19 +620,25 @@ any later auth work) make sure none of these regress:
    window. Break-glass (`--mfa-reset`, #1226) clears the secret entirely
    (it never reveals it).
 
-   **TOCTOU guard (do not remove).** The reuse path reads the row twice
-   on a `SQLITE_OPEN_FULLMUTEX` connection with no surrounding
-   transaction: `mfa_status()` (enrolled-check) then `load_mfa_row()`
-   (secret fetch). A concurrent `mfa_verify_enrollment` on another thread
-   can stamp `mfa_enrolled_at` between those two statements. Because
-   `load_mfa_row` reads `mfa_totp_secret` and `mfa_enrolled_at` in the
-   **same** SELECT, its `enrolled` flag is a consistent snapshot — so the
-   reuse branch re-checks `!existing->enrolled` and returns
-   `MfaAlreadyEnrolled` if the row enrolled mid-init, rather than
+   **TOCTOU guard (do not remove).** `mfa_init_enrollment` reads
+   `mfa_enrolled_at IS NOT NULL` and `mfa_totp_secret` in the **same**
+   `SELECT` (`auth_db.cpp`) — historically (SQLite era) this was two
+   sequential statements on a `SQLITE_OPEN_FULLMUTEX` connection
+   (`mfa_status()` then `load_mfa_row()`), so the "enrolled" flag and the
+   secret bytes could in principle observe different points in time if a
+   concurrent `mfa_verify_enrollment` stamped `mfa_enrolled_at` between
+   them; the single-SELECT form now used on Postgres removes that window
+   structurally rather than relying on read-ordering discipline alone. The
+   reuse branch still re-checks `!existing->enrolled` before re-revealing —
+   a row observed enrolled returns `MfaAlreadyEnrolled` rather than
    re-revealing a now-**confirmed** secret. Reuse is gated on a
    genuinely-provisional snapshot only; this is what keeps the "enrolled
    secrets never re-revealed" half of the invariant true under
-   concurrency.
+   concurrency. A decrypt failure on the fetched blob (`SecretCodec`) is
+   its own `SecretUnavailable` outcome — see the file header note in
+   `auth_db.cpp` and `docs/auth-architecture.md` "MFA fails closed on
+   secret-read failure" — never folded into either "not enrolled" or a
+   successful reveal.
 
    **Re-reveal grants no new capability.** Reaching `mfa_init_enrollment`
    requires already being authenticated *as that user* (settings session,
@@ -559,9 +663,18 @@ any later auth work) make sure none of these regress:
    `reap_mfa_pending_locked`. A 5-minute window between password
    success and TOTP submission is a credential-stuffing surface — keep
    the default tight.
-5. **`Session::mfa_verified_at` is `steady_clock`, not wall clock.**
-   The step-up window math must use `steady_clock::now()` so an NTP
-   step (or operator clock fiddling) cannot extend the window.
+5. **`Session::mfa_verified_at` is `system_clock` (wall-clock), and the
+   step-up window is defended two other ways.** Since HA WS-1/1a (ADR-2002
+   §4) the session lifetime fields moved off `steady_clock` to wall-clock so
+   they survive the durable `SessionStore` round-trip (see
+   `docs/auth-architecture.md` → "Durable operator sessions (HA WS-1/1a,
+   ADR-2002 §4)"). The former monotonic NTP-step resistance is replaced by:
+   (a) `mfa_step_up.cpp` **fails closed on a future-dated proof** — a
+   `mfa_verified_at > now` value is treated as **no proof** (re-prompt),
+   never as an extended-into-the-future window; and (b) the step-up window
+   is deliberately short (`mfa_step_up_window_secs`, default 300 s), so the
+   blast radius of any residual clock movement is bounded to a few minutes.
+   DB-primary wall-clock integrity is a monitored dependency (HA WS-11).
 6. **Audit on every gate.** `audit_log` is called on success AND
    failure for `mfa.enroll`, `mfa.login`, and `mfa.step_up`. The
    CC6.6 evidence chain is the success row + the failure row together
@@ -583,5 +696,6 @@ any later auth work) make sure none of these regress:
    `optional`** — the UP-5 livelock for the default deployment; (c)
    *passing* the no-proof case **under `required`** — the CC6.6 enforcement
    gap (Hermes A4/B1). The enforcement mode must stay threaded into the
-   gate. The seeded timestamp must stay in the `steady_clock` domain (#5),
-   and `/login/mfa/stepup` must keep rejecting OIDC callers.
+   gate. The seeded timestamp is a wall-clock (`system_clock`) instant and must
+   keep its future-dated-proof fail-closed handling (#5), and `/login/mfa/stepup`
+   must keep rejecting OIDC callers.

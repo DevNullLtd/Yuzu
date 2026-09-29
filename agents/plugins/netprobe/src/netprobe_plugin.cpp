@@ -424,6 +424,41 @@ int do_dns(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// All three actions are native, in-process socket work on every platform —
+// zero subprocesses (rung 1). icmp on Linux depends on
+// net.ipv4.ping_group_range admitting an unprivileged SOCK_DGRAM ICMP
+// socket; when the kernel refuses it the row reports the honest
+// `not-permitted` status rather than a fabricated 100% loss (IcmpSession's
+// own comment), so that leg is CONSTRAINED rather than unconditionally
+// SUPPORTED. macOS's ping-socket support "works out of the box" per this
+// file's header comment.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "icmp",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "SOCK_DGRAM ICMP ping socket",
+         "requires net.ipv4.ping_group_range to admit the process group; reports "
+         "not-permitted otherwise"},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "SOCK_DGRAM ICMP ping socket", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "IcmpSendEcho", nullptr},
+    },
+    {
+        /* .action      = */ "tcp",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "non-blocking connect() timing", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "non-blocking connect() timing", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "non-blocking connect() timing", nullptr},
+    },
+    {
+        /* .action      = */ "dns",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "getaddrinfo", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "getaddrinfo", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "getaddrinfo", nullptr},
+    },
+};
+
 } // namespace
 
 class NetprobePlugin final : public yuzu::Plugin {
@@ -438,6 +473,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"icmp", "tcp", "dns", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {

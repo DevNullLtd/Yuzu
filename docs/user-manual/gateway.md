@@ -12,7 +12,7 @@ single server process.
 - [GatewayUpstream Service](#gatewayupstream-service) -- PARTIALLY IMPLEMENTED
 - [Configuration](#configuration)
 - [Building and Testing](#building-and-testing)
-- [Gateway Clustering](#gateway-clustering) -- PLANNED
+- [Gateway Clustering](#gateway-clustering) -- PARTIALLY IMPLEMENTED
 - [Prometheus Metrics](#prometheus-metrics) -- PARTIALLY IMPLEMENTED
 - [Reference](#reference)
 
@@ -257,9 +257,56 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {telemetry_gauge_interval_ms, 10000},
 
     %% Consistent hash ring: virtual nodes per physical node
-    {hash_ring_vnodes, 256}
+    {hash_ring_vnodes, 256},
+
+    %% HA WS-4 4.1 -- the trust-zone/region cluster id this gateway belongs
+    %% to; agents are pinned to one cluster (ADR-2002 §7). Stamped onto
+    %% every StreamStatusNotification sent upstream so the server's
+    %% routing directory can record which cluster owns an agent's live
+    %% stream. Override: YUZU_GW_CLUSTER_ID
+    {cluster_id, <<"default">>},
+
+    %% HA WS-4 #4555 -- gateway multi-node cluster FORMATION (ADR-2002 §7b),
+    %% distinct from cluster_id above: what to RESOLVE to find peer
+    %% addresses, not the logical cluster identifier. Override:
+    %% YUZU_GW_SEED_DNS_NAME
+    {cluster_seed_dns_name, <<"gateway">>},
+
+    %% Explicit peer address list; when non-empty REPLACES DNS resolution
+    %% outright (never merged). Override: YUZU_GW_SEED_NODES
+    %% (e.g. "10.0.0.1,10.0.0.2")
+    {cluster_seed_nodes, []},
+
+    %% Always-on redial loop interval (ms), fixed, no backoff. Override:
+    %% YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS
+    {cluster_redial_interval_ms, 5000},
+
+    %% Lifetime cap on distinct peer addresses ever turned into an Erlang
+    %% atom (atoms are never garbage-collected) — defends against a
+    %% hostile/misconfigured seed DNS name rotating through fresh
+    %% addresses forever. No env override; edit sys.config directly if a
+    %% real deployment's lifetime address churn needs a higher ceiling.
+    {cluster_max_lifetime_addrs, 1024}
 ]}
 ```
+
+**`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
+`deploy/docker/gateway-entrypoint.sh` before the BEAM starts, not by
+application code): overrides auto-detection of this node's own advertised
+distribution address. Needed on a bare-VM/multi-NIC host or a container
+behind NAT where auto-detection is ambiguous or wrong; every gateway node
+otherwise auto-detects it with zero configuration under Docker Compose.
+
+Auto-detection order (first success wins — useful when debugging why a
+container picked a surprising address):
+1. `YUZU_GW_ADVERTISE_ADDR` itself, if already set — wins outright.
+2. Resolve `YUZU_GW_SEED_DNS_NAME` (default `gateway`) to A records and
+   intersect them with this container's own local interface addresses —
+   "which of the addresses my peers would also see is mine."
+3. Resolve this container's own hostname to an address.
+4. Default `127.0.0.1` (matches the pre-`#4555` single-node behavior).
+
+See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 
 ### TLS posture (M1)
 
@@ -281,7 +328,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
 | agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. |
-| operator → gateway mgmt (`:50063`) | **plaintext / strict mTLS** | Do NOT one-way-TLS the privileged mgmt plane (would be unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (omit `verify`/`fail_if_no_peer_cert`). |
+| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
 TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
 config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
@@ -380,6 +427,36 @@ default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
 unauthenticated RCE (#659). For local dev/CI where distribution is not
 exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
 in a cluster must share the same cookie.
+
+The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
+`#4555`): DNS-based cluster discovery means a node dials addresses it did not
+choose by hand, and the distribution handshake's initiator sends the cookie
+hash first — a short cookie is brute-forceable offline from a
+legitimately-dialing node, a materially different exposure than a hand-typed
+static seed list carried. `openssl rand -hex 32` above already clears this
+floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
+bypasses the length check too.
+
+**Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
+EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
+distribution listener range **TCP 9100-9105** (`inet_dist_listen_min`/`_max`
+in `config/sys.config`) reachable between every node. This range is
+per-HOST, not per-cluster: one container is one network namespace, so every
+containerized node binds the same first port (9100) with no collision — the
+6-port range only matters for a dev/test rig running multiple gateway nodes
+on ONE host, where each needs its own port from the range. Both EPMD and the
+distribution range should be firewalled to ONLY the other gateway nodes,
+never exposed publicly — the cookie is the authentication, but a closed
+network is still the first line of defense.
+
+> **IPv4-only.** Cluster discovery (DNS seed-name resolution, the
+> entrypoint's local-interface intersection, and the static
+> `YUZU_GW_SEED_NODES` override) is IPv4-only in this release. An
+> IPv6-only Docker network degrades to N isolated single-node gateways —
+> each resolves zero peers and boots standalone (fail-open, per design),
+> rather than failing to start. `yuzu_gw_cluster_peers_resolved` staying
+> at 0 is the signal to check for this. AAAA support is tracked as a
+> follow-up.
 
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
 > boot guard and restores the unauthenticated inter-node RPC surface (#659); it
@@ -494,11 +571,51 @@ Test-only dependencies (loaded in the `test` profile):
 
 ## Gateway Clustering
 
-> **Status: PLANNED -- NOT YET IMPLEMENTED (Issue 7.1.1)**
+> **Status: cluster FORMATION implemented (HA WS-4 `#4555`, ADR-2002 §7b);
+> adjacency/load-shedding/latency-redistribution below remain PLANNED
+> (Issue 7.1.1 / WS-4 4.4).**
 
-The current gateway runs as a single Erlang node. Planned clustering support
-will enable multiple gateway nodes to form a distributed cluster for
-horizontal scaling and fault tolerance.
+Multiple gateway nodes now form a real distributed-Erlang mesh: each node
+runs an always-on redial loop (`yuzu_gw_cluster_discovery`) that resolves
+peer addresses — by default a DNS lookup on a configurable seed name
+(`YUZU_GW_SEED_DNS_NAME`, default `gateway`, matching the reference Compose
+service name — a scaled `docker compose up --scale gateway=N` needs zero
+extra config), or an explicit `YUZU_GW_SEED_NODES` address list for a no-DNS
+deployment — and connects to each via `net_kernel:connect_node/1`, forever,
+on a fixed interval (no backoff). Every gateway replica shares one fixed
+short name and is distinguished only by an address resolved at boot
+(`YUZU_GW_ADVERTISE_ADDR`, auto-detected by default); nodes are otherwise
+interchangeable. A node that finds no peers boots standalone anyway and
+keeps retrying — cluster formation is fail-open, never a new way for a
+discovery hiccup to become an agent-facing outage. See ADR-2002 §7b for the
+full mechanism-choice record and `docker-compose.reference-gateway-cluster.yml`
+for a runnable demo.
+
+**Retry has no backoff, by design** (self-healing must stay prompt), which
+also means a persistently misconfigured `YUZU_GW_SEED_DNS_NAME` causes every
+node to re-query the seed name every 5s indefinitely — DNS query volume
+scales linearly with cluster size. Bounded/negligible at the reference rig's
+scale; if you operate a cluster large enough for this to matter against
+shared DNS infrastructure, treat the redial interval
+(`YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS`) as a tuning knob.
+
+Forming the mesh is what makes HA WS-4 4.3a's per-agent cross-node `pg`
+routing (agents connecting to a *different* node than the one dispatching a
+command) actually take effect — before `#4555`, that routing code was
+component-complete but inert, since `pg` group membership only replicates
+across *connected* nodes.
+
+**Not yet implemented** — the adjacency table, load-shedding, and
+latency-based redistribution features below, which build ON TOP OF the mesh
+`#4555` forms, remain the rest of WS-4 4.3 and 4.4:
+
+> **Note:** the `cluster_id` config key (see [Configuration](#configuration))
+> is a separate, logical trust-zone/region identifier — a database key for
+> the routing directory (HA WS-4 4.1, ADR-2002 §7) — distinct from
+> `YUZU_GW_SEED_DNS_NAME` above, which is what to *resolve* to find peers.
+> Two gateway nodes can share a `cluster_id` without being meshed, or (in a
+> misconfiguration) be meshed without sharing one — the mesh and the logical
+> cluster identity are independently configured.
 
 ### Planned Features
 
@@ -556,6 +673,10 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
 | `yuzu_gw_registration_replay_total` | counter | Agents re-proxied upstream by the registration-replay drip after an upstream reconnect |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains — alert on it. |
+| `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
+| `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
+| `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
+| `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in
@@ -566,9 +687,12 @@ for the canonical catalogue.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_gw_cluster_nodes` | gauge | Number of nodes in the gateway cluster |
 | `yuzu_gw_agent_migrations_total` | counter | Agents migrated between nodes |
 | `yuzu_gw_goaway_sent_total` | counter | GOAWAY frames sent for load shedding |
+
+(`yuzu_gw_cluster_nodes` — cluster size — is superseded by
+`yuzu_gw_cluster_peers_connected` above, shipped with `#4555`; this node's
+total cluster size is `peers_connected + 1`.)
 
 ### Scrape Configuration
 

@@ -102,8 +102,10 @@ struct SoftwareVersionCount {
 };
 
 /// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
-/// titles; empty matches all. `limit` caps the returned rows (ordered by install
-/// count); the store also enforces a hard ceiling independent of `limit`.
+/// rows by matching EITHER the title OR the publisher (round-3 item 8 — "adobe"
+/// surfaces every Adobe title, not only ones with "adobe" in the name itself);
+/// empty matches all. `limit` caps the returned rows (ordered by install count);
+/// the store also enforces a hard ceiling independent of `limit`.
 struct SoftwareCatalogQuery {
     std::string name_filter;
     int limit{200};
@@ -185,6 +187,13 @@ public:
     [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
     get_agent_software(std::string_view agent_id);
 
+    /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
+    /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade; `0` = no
+    /// row yet (never synced). Backs the Hardware CI record's "Sync now" poll.
+    [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
+                                                               std::string_view source);
+
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
@@ -227,8 +236,11 @@ public:
     /// (the "building" sentinel), so a successful read always returns a value.
     [[nodiscard]] std::optional<CatalogRollupMeta> catalog_rollup_meta();
 
-    /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
-    void delete_agent(std::string_view agent_id);
+    /// Drop an agent's software inventory (e.g. on agent removal). Returns true
+    /// iff the transaction committed both deletes; false on a closed store, a
+    /// lease timeout, or a SQL failure — so the decommission cascade records the
+    /// store Failed rather than a false "erased".
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// KEYSET-paged enumeration of the agent_ids that have reported a given
     /// `source` (`inventory_state.source`). Returns up to `limit` ids with

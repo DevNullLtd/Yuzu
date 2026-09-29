@@ -162,6 +162,12 @@ std::vector<ProcessInfo> enumerate_processes() {
             // Get full image path as cmdline (best effort)
             auto path = get_process_image_path(pe.th32ProcessID);
             pi.cmdline = path.empty() ? pi.name : path;
+            // exec_path (P-004): the SAME resolved path, but with NO name
+            // fallback -- empty here means genuinely unresolvable, never a
+            // guess. cmdline's fallback-to-name above exists for display; a
+            // removable-media correlation must not treat a bare process name
+            // as a filesystem path.
+            pi.exec_path = path;
 
             // Get user (best effort -- will fail for system/protected processes)
             pi.user = get_process_user(pe.th32ProcessID);
@@ -258,6 +264,19 @@ std::vector<ProcessInfo> enumerate_processes() {
         if (pi.cmdline.empty())
             pi.cmdline = pi.name;
 
+        // exec_path (P-004): resolve the /proc/<pid>/exe symlink -- the
+        // kernel-verified canonical executable path, distinct from argv[0]
+        // (cmdline above), which is user-controlled and often relative or a
+        // bare basename. readlink returns -1/EACCES for another user's
+        // process (or a zombie with no /exe target) -- left empty rather than
+        // guessed, per the header contract.
+        {
+            char buf[4096];
+            ssize_t n = readlink((base + "/exe").c_str(), buf, sizeof(buf) - 1);
+            if (n > 0)
+                pi.exec_path.assign(buf, static_cast<size_t>(n));
+        }
+
         procs.push_back(std::move(pi));
     }
     closedir(proc_dir);
@@ -302,6 +321,9 @@ std::vector<ProcessInfo> enumerate_processes() {
         int ret = proc_pidpath(static_cast<int>(pi.pid), pathbuf, sizeof(pathbuf));
         if (ret > 0) {
             pi.cmdline = pathbuf;
+            // exec_path (P-004): store the SAME proc_pidpath result already
+            // fetched above -- no second syscall, no name fallback.
+            pi.exec_path = pathbuf;
         } else {
             pi.cmdline = pi.name;
         }

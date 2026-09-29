@@ -1,29 +1,121 @@
 #include "patch_manager.hpp"
-#include "migration_runner.hpp"
 
-#include <nlohmann/json.hpp>
+#include "pg/pg_array.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <random>
 #include <regex>
-#include <shared_mutex>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace yuzu::server {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 namespace {
+
+constexpr const char* kStoreName = "patch_manager";
+constexpr const char* kInventoryCols =
+    "agent_id, kb_id, title, severity, status, released_at, scanned_at";
+constexpr const char* kDeploymentCols =
+    "id, kb_id, title, status, created_by, reboot_needed, created_at, completed_at, "
+    "total_targets, completed_targets, failed_targets, reboot_delay_seconds, reboot_at";
+constexpr const char* kTargetCols = "agent_id, status, error, started_at, completed_at";
+
+// Bounded acquires (ADR-0012 §2). No hot-path caller here (unlike
+// OffloadTargetStore's fire_event) — every runtime acquire uses the
+// ordinary CRUD budget.
+constexpr std::chrono::milliseconds kReadTimeout{1500};
+constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
+// Bounds deploy_patch's unnest()-driven target batch insert. An
+// unbounded agent_ids list would hold the shared pool connection for
+// the duration of the insert, contributing to pool starvation for
+// unrelated stores under a near-fleet-wide deploy request. 5000
+// matches the DoS-cap default used for the same class of bulk
+// operator-supplied fleet-wide list elsewhere (fleet-viz machines_max).
+constexpr std::size_t kMaxDeployTargets = 5000;
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for
+    // the migration txn. Runtime statements below schema-qualify explicitly.
+    //
+    // Folds the SQLite-era out-of-ledger `ALTER TABLE patch_deployments ADD
+    // COLUMN reboot_delay_seconds/reboot_at` hack (patch_manager.cpp:81-87
+    // pre-migration) directly into this single v1 DDL — no separate
+    // migration step needed on a fresh Postgres schema.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE patch_inventory ("
+         "  agent_id    TEXT   NOT NULL,"
+         "  kb_id       TEXT   NOT NULL,"
+         "  title       TEXT   NOT NULL DEFAULT '',"
+         "  severity    TEXT   NOT NULL DEFAULT 'Unspecified',"
+         "  status      TEXT   NOT NULL DEFAULT 'missing',"
+         "  released_at BIGINT NOT NULL DEFAULT 0,"
+         "  scanned_at  BIGINT NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (agent_id, kb_id)"
+         ");"
+         "CREATE TABLE patch_deployments ("
+         "  id                   TEXT    PRIMARY KEY,"
+         "  kb_id                TEXT    NOT NULL,"
+         "  title                TEXT    NOT NULL DEFAULT '',"
+         "  status               TEXT    NOT NULL DEFAULT 'pending',"
+         "  created_by           TEXT    NOT NULL DEFAULT '',"
+         "  reboot_needed        BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  reboot_delay_seconds INTEGER NOT NULL DEFAULT 300,"
+         "  reboot_at            BIGINT  NOT NULL DEFAULT 0,"
+         "  created_at           BIGINT  NOT NULL DEFAULT 0,"
+         "  completed_at         BIGINT  NOT NULL DEFAULT 0,"
+         "  total_targets        INTEGER NOT NULL DEFAULT 0,"
+         "  completed_targets    INTEGER NOT NULL DEFAULT 0,"
+         "  failed_targets       INTEGER NOT NULL DEFAULT 0"
+         ");"
+         "CREATE TABLE patch_deployment_targets ("
+         "  deployment_id TEXT    NOT NULL REFERENCES patch_deployments(id) ON DELETE CASCADE,"
+         "  agent_id      TEXT    NOT NULL,"
+         "  status        TEXT    NOT NULL DEFAULT 'pending',"
+         "  error         TEXT    NOT NULL DEFAULT '',"
+         "  started_at    BIGINT  NOT NULL DEFAULT 0,"
+         "  completed_at  BIGINT  NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (deployment_id, agent_id)"
+         ");"
+         "CREATE INDEX idx_patch_inv_kb ON patch_inventory(kb_id);"
+         "CREATE INDEX idx_patch_inv_status ON patch_inventory(status);"
+         "CREATE INDEX idx_patch_inv_agent ON patch_inventory(agent_id);"
+         "CREATE INDEX idx_patch_depl_status ON patch_deployments(status);"
+         "CREATE INDEX idx_patch_depl_targets ON patch_deployment_targets(deployment_id);"},
+    };
+    return kMigrations;
+}
+
+// ── PG result helpers (file-local — no shared header across stores; mirrors
+//    offload_target_store.cpp / auth_db.cpp's own file-local copies) ───────
+
+const char* col(PGresult* res, int row, int c) {
+    return PQgetisnull(res, row, c) ? "" : PQgetvalue(res, row, c);
+}
+std::string col_str(PGresult* res, int row, int c) { return std::string(col(res, row, c)); }
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-std::string col_text(sqlite3_stmt* stmt, int col) {
-    auto p = sqlite3_column_text(stmt, col);
-    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
 }
 
 std::string gen_id() {
@@ -38,105 +130,50 @@ std::string gen_id() {
     return std::string(buf, 32);
 }
 
+PatchDeployment row_to_deployment(PGresult* r, int i) {
+    PatchDeployment d;
+    d.id = col_str(r, i, 0);
+    d.kb_id = col_str(r, i, 1);
+    d.title = col_str(r, i, 2);
+    d.status = col_str(r, i, 3);
+    d.created_by = col_str(r, i, 4);
+    d.reboot_if_needed = to_bool(col(r, i, 5));
+    d.created_at = to_i64(col(r, i, 6));
+    d.completed_at = to_i64(col(r, i, 7));
+    d.total_targets = static_cast<int>(to_i64(col(r, i, 8)));
+    d.completed_targets = static_cast<int>(to_i64(col(r, i, 9)));
+    d.failed_targets = static_cast<int>(to_i64(col(r, i, 10)));
+    d.reboot_delay_seconds = static_cast<int>(to_i64(col(r, i, 11)));
+    d.reboot_at = to_i64(col(r, i, 12));
+    return d;
+}
+
 } // namespace
 
-// ── Construction / teardown ──────────────────────────────────────────────────
+// ── Construction ─────────────────────────────────────────────────────────────
 
-PatchManager::PatchManager(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("PatchManager: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+PatchManager::PatchManager(pg::PgPool& pool) : pool_(pool) {
+    // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
+    // acquire elsewhere in this file is bounded.
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("PatchManager: no database connection at construction ({}) — patch "
+                      "manager disabled",
+                      pool_.last_error());
         return;
     }
-
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("PatchManager: opened {}", db_path.string());
-}
-
-PatchManager::~PatchManager() {
-    if (db_)
-        sqlite3_close(db_);
-}
-
-bool PatchManager::is_open() const {
-    return db_ != nullptr;
-}
-
-// ── DDL ──────────────────────────────────────────────────────────────────────
-
-void PatchManager::create_tables() {
-    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
-    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so reboot
-    // orchestration columns added historically must still be applied here.
-    sqlite3_exec(db_,
-        "ALTER TABLE patch_deployments ADD COLUMN reboot_delay_seconds INTEGER NOT NULL DEFAULT 300;",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(db_,
-        "ALTER TABLE patch_deployments ADD COLUMN reboot_at INTEGER NOT NULL DEFAULT 0;",
-        nullptr, nullptr, nullptr);
-
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS patch_inventory (
-                agent_id    TEXT NOT NULL,
-                kb_id       TEXT NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                severity    TEXT NOT NULL DEFAULT 'Unspecified',
-                status      TEXT NOT NULL DEFAULT 'missing',
-                released_at INTEGER NOT NULL DEFAULT 0,
-                scanned_at  INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (agent_id, kb_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS patch_deployments (
-                id                    TEXT PRIMARY KEY,
-                kb_id                 TEXT NOT NULL,
-                title                 TEXT NOT NULL DEFAULT '',
-                status                TEXT NOT NULL DEFAULT 'pending',
-                created_by            TEXT NOT NULL DEFAULT '',
-                reboot_needed         INTEGER NOT NULL DEFAULT 0,
-                reboot_delay_seconds  INTEGER NOT NULL DEFAULT 300,
-                reboot_at             INTEGER NOT NULL DEFAULT 0,
-                created_at            INTEGER NOT NULL DEFAULT 0,
-                completed_at          INTEGER NOT NULL DEFAULT 0,
-                total_targets         INTEGER NOT NULL DEFAULT 0,
-                completed_targets     INTEGER NOT NULL DEFAULT 0,
-                failed_targets        INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS patch_deployment_targets (
-                deployment_id TEXT NOT NULL,
-                agent_id      TEXT NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'pending',
-                error         TEXT NOT NULL DEFAULT '',
-                started_at    INTEGER NOT NULL DEFAULT 0,
-                completed_at  INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (deployment_id, agent_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_patch_inv_kb ON patch_inventory(kb_id);
-            CREATE INDEX IF NOT EXISTS idx_patch_inv_status ON patch_inventory(status);
-            CREATE INDEX IF NOT EXISTS idx_patch_inv_agent ON patch_inventory(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_patch_depl_status ON patch_deployments(status);
-            CREATE INDEX IF NOT EXISTS idx_patch_depl_targets ON patch_deployment_targets(deployment_id);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "patch_manager", kMigrations)) {
-        spdlog::error("PatchManager: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("PatchManager: schema migration failed — patch manager disabled");
+        return;
     }
+    open_ = true;
+    // ADR-0009's 2026-08-25 fresh-start-by-default amendment: no
+    // migrate_from_sqlite here, unconditionally, no flag. The caller
+    // (server.cpp) separately runs legacy_sqlite_probe::warn_if_legacy_rows()
+    // over the legacy patches.db so a locally-wrong "no production fleet"
+    // premise still gets a loud signal.
+    spdlog::info("PatchManager initialized (schema {}) — fresh start, no legacy backfill",
+                 kStoreName);
 }
 
 std::string PatchManager::generate_id() const {
@@ -147,131 +184,170 @@ std::string PatchManager::generate_id() const {
 
 void PatchManager::record_patches(const std::string& agent_id,
                                   const std::vector<PatchInfo>& patches) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_ || patches.empty())
         return;
 
-    auto now = now_epoch();
+    // De-duplicate on kb_id, LAST occurrence wins — matches the SQLite era's
+    // per-row INSERT OR REPLACE semantics (a later row for the same kb_id
+    // silently overwrote an earlier one within the same call). A single
+    // batch INSERT ... ON CONFLICT DO UPDATE cannot express that: Postgres
+    // rejects a statement that would affect the same conflict target twice
+    // ("ON CONFLICT DO UPDATE command cannot affect row a second time"),
+    // which would otherwise fail the WHOLE upsert — silently stalling this
+    // agent's entire inventory report, not just the duplicated row — on a
+    // scan report containing the same kb_id more than once.
+    std::unordered_map<std::string, const PatchInfo*> latest;
+    latest.reserve(patches.size());
+    for (const auto& p : patches)
+        latest[p.kb_id] = &p;
 
-    const char* sql = R"(
-        INSERT OR REPLACE INTO patch_inventory
-            (agent_id, kb_id, title, severity, status, released_at, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return;
+    std::vector<std::string_view> kb_ids, titles, severities, statuses;
+    std::vector<std::string> released_ats;
+    kb_ids.reserve(latest.size());
+    titles.reserve(latest.size());
+    severities.reserve(latest.size());
+    statuses.reserve(latest.size());
+    released_ats.reserve(latest.size());
+    for (const auto& [kb_id, p] : latest) {
+        kb_ids.emplace_back(p->kb_id);
+        titles.emplace_back(p->title);
+        severities.emplace_back(p->severity);
+        statuses.emplace_back(p->status);
+        released_ats.push_back(std::to_string(p->released_at));
     }
+    std::vector<std::string_view> released_at_views(released_ats.begin(), released_ats.end());
 
-    for (const auto& p : patches) {
-        sqlite3_reset(stmt);
-        sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, p.kb_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, p.title.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, p.severity.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, p.status.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 6, p.released_at);
-        sqlite3_bind_int64(stmt, 7, now);
-        sqlite3_step(stmt);
+    const std::string now_str = std::to_string(now_epoch());
+
+    // Whole batch in one transaction — translated 1:1 from the SQLite-era
+    // explicit BEGIN TRANSACTION/COMMIT wrapping this same per-patch loop.
+    // A single unnest()-driven batch INSERT (rather than N round trips
+    // inside the txn) keeps a large scan report from paying N statement
+    // round trips (preflight_run_store.cpp's run_device seed insert is the
+    // existing precedent for this shape).
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "INSERT INTO patch_manager.patch_inventory "
+            "(agent_id, kb_id, title, severity, status, released_at, scanned_at) "
+            "SELECT $1, u.kb_id, u.title, u.severity, u.status, u.released_at::bigint, $7::bigint "
+            "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) "
+            "  AS u(kb_id, title, severity, status, released_at) "
+            "ON CONFLICT (agent_id, kb_id) DO UPDATE SET "
+            "  title = EXCLUDED.title, severity = EXCLUDED.severity, "
+            "  status = EXCLUDED.status, released_at = EXCLUDED.released_at, "
+            "  scanned_at = EXCLUDED.scanned_at",
+            std::vector<std::string>{agent_id, pg::to_text_array(kb_ids), pg::to_text_array(titles),
+                                     pg::to_text_array(severities), pg::to_text_array(statuses),
+                                     pg::to_text_array(released_at_views), now_str});
+        if (res.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::record_patches: insert failed for agent {}: {}",
+                          agent_id, PQresultErrorMessage(res.get()));
+            return false;
+        }
+        return true;
+    });
+
+    if (ok) {
+        spdlog::info("PatchManager: recorded {} patches for agent {}", patches.size(), agent_id);
+    } else {
+        // with_txn_for returns false silently on a lease-acquire/BEGIN
+        // failure too (not just an INSERT failure, which already logs its
+        // own line above) — log here so a degraded pool doesn't drop an
+        // agent's whole inventory report with zero trace.
+        spdlog::warn("PatchManager::record_patches: failed to record {} patches for agent {} "
+                    "(pool degraded or transaction failed)",
+                    patches.size(), agent_id);
     }
-
-    sqlite3_finalize(stmt);
-    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
-
-    spdlog::info("PatchManager: recorded {} patches for agent {}", patches.size(), agent_id);
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "record_patches"}, {"result", ok ? "success" : "failed"}})
+            .increment();
 }
 
 std::vector<PatchInfo> PatchManager::query_patches(const PatchQuery& query,
                                                     const std::string& status_filter) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return {};
-
-    // Build dynamic query
-    std::string sql = R"(
-        SELECT agent_id, kb_id, title, severity, status, released_at, scanned_at
-        FROM patch_inventory WHERE 1=1
-    )";
-
-    if (!status_filter.empty())
-        sql += " AND status = ?";
-    if (!query.agent_id.empty())
-        sql += " AND agent_id = ?";
-    if (!query.severity.empty())
-        sql += " AND severity = ?";
-
-    sql += " ORDER BY scanned_at DESC LIMIT ?";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return {};
-
-    int idx = 1;
-    if (!status_filter.empty())
-        sqlite3_bind_text(stmt, idx++, status_filter.c_str(), -1, SQLITE_TRANSIENT);
-    if (!query.agent_id.empty())
-        sqlite3_bind_text(stmt, idx++, query.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (!query.severity.empty())
-        sqlite3_bind_text(stmt, idx++, query.severity.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, idx, query.limit);
-
     std::vector<PatchInfo> result;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        PatchInfo p;
-        p.agent_id = col_text(stmt, 0);
-        p.kb_id = col_text(stmt, 1);
-        p.title = col_text(stmt, 2);
-        p.severity = col_text(stmt, 3);
-        p.status = col_text(stmt, 4);
-        p.released_at = sqlite3_column_int64(stmt, 5);
-        p.scanned_at = sqlite3_column_int64(stmt, 6);
-        result.push_back(std::move(p));
+    if (!open_)
+        return result;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return result;
+
+    std::string sql =
+        std::string("SELECT ") + kInventoryCols + " FROM patch_manager.patch_inventory WHERE 1=1";
+    std::vector<std::string> params;
+    int idx = 1;
+    if (!status_filter.empty()) {
+        sql += " AND status = $" + std::to_string(idx++);
+        params.push_back(status_filter);
+    }
+    if (!query.agent_id.empty()) {
+        sql += " AND agent_id = $" + std::to_string(idx++);
+        params.push_back(query.agent_id);
+    }
+    if (!query.severity.empty()) {
+        sql += " AND severity = $" + std::to_string(idx++);
+        params.push_back(query.severity);
+    }
+    sql += " ORDER BY scanned_at DESC LIMIT $" + std::to_string(idx);
+    params.push_back(std::to_string(query.limit));
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PatchManager::query_patches: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return result;
     }
 
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        PatchInfo p;
+        p.agent_id = col_str(res.get(), i, 0);
+        p.kb_id = col_str(res.get(), i, 1);
+        p.title = col_str(res.get(), i, 2);
+        p.severity = col_str(res.get(), i, 3);
+        p.status = col_str(res.get(), i, 4);
+        p.released_at = to_i64(col(res.get(), i, 5));
+        p.scanned_at = to_i64(col(res.get(), i, 6));
+        result.push_back(std::move(p));
+    }
     return result;
 }
 
 std::vector<PatchInfo> PatchManager::get_missing_patches(const PatchQuery& query) const {
-    auto q = query;
-    return query_patches(q, "missing");
+    return query_patches(query, "missing");
 }
 
 std::vector<PatchInfo> PatchManager::get_installed_patches(const PatchQuery& query) const {
-    auto q = query;
-    return query_patches(q, "installed");
+    return query_patches(query, "installed");
 }
 
 std::vector<std::pair<std::string, int>> PatchManager::get_fleet_patch_summary(int limit) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return {};
-
-    const char* sql = R"(
-        SELECT kb_id, COUNT(DISTINCT agent_id) as agent_count
-        FROM patch_inventory
-        WHERE status = 'missing'
-        GROUP BY kb_id
-        ORDER BY agent_count DESC
-        LIMIT ?
-    )";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return {};
-
-    sqlite3_bind_int(stmt, 1, limit);
-
     std::vector<std::pair<std::string, int>> result;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        result.emplace_back(col_text(stmt, 0), sqlite3_column_int(stmt, 1));
+    if (!open_)
+        return result;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return result;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT kb_id, COUNT(DISTINCT agent_id) AS agent_count "
+        "FROM patch_manager.patch_inventory WHERE status = 'missing' "
+        "GROUP BY kb_id ORDER BY agent_count DESC LIMIT $1",
+        std::vector<std::string>{std::to_string(limit)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PatchManager::get_fleet_patch_summary: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return result;
     }
 
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        result.emplace_back(col_str(res.get(), i, 0), static_cast<int>(to_i64(col(res.get(), i, 1))));
     return result;
 }
 
@@ -291,7 +367,6 @@ PatchManager::deploy_patch(const std::string& kb_id,
 std::expected<std::string, std::string>
 PatchManager::deploy_patch(const DeploymentRequest& req) {
     const auto& kb_id = req.kb_id;
-    const auto& agent_ids = req.agent_ids;
     bool reboot_if_needed = req.reboot_if_needed;
     const auto& created_by = req.created_by;
     int reboot_delay_seconds = req.reboot_delay_seconds;
@@ -302,442 +377,171 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
 
     // KB IDs must be KBnnnnn format — reject anything else to prevent
     // PowerShell -match injection when the kb_id is interpolated into scripts
-    std::regex kb_pattern("^KB\\d{4,10}$", std::regex::icase);
+    static const std::regex kb_pattern("^KB\\d{4,10}$", std::regex::icase);
     if (!std::regex_match(kb_id, kb_pattern))
         return std::unexpected("invalid KB ID format (must be KBnnnnnnn)");
 
-    if (agent_ids.empty())
+    if (req.agent_ids.empty())
         return std::unexpected("at least one agent_id is required");
 
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    // De-duplicate, preserving order. The SQLite era inserted target rows
+    // via an unchecked sqlite3_step() per agent_id — a caller-supplied
+    // duplicate silently failed its own INSERT (PK collision on
+    // (deployment_id, agent_id)) while total_targets was still set from
+    // agent_ids.size(), leaving total_targets inconsistent with the actual
+    // row count. This migration wraps the deployment + target inserts in
+    // one transaction (new atomicity — see ADR-0062), so a duplicate would
+    // now fail the WHOLE deploy instead of silently under-counting; de-dup
+    // up front keeps a duplicate agent_id from being a hard error and keeps
+    // total_targets accurate.
+    std::vector<std::string> agent_ids;
+    agent_ids.reserve(req.agent_ids.size());
+    std::unordered_set<std::string_view> seen;
+    seen.reserve(req.agent_ids.size());
+    for (const auto& id : req.agent_ids) {
+        if (seen.insert(id).second)
+            agent_ids.push_back(id);
+    }
+
+    if (agent_ids.size() > kMaxDeployTargets) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_patch_manager_writes_total",
+                              {{"op", "deploy_patch"}, {"result", "rejected_oversized"}})
+                .increment();
+        return std::unexpected("too many target agents (max " +
+                               std::to_string(kMaxDeployTargets) + ")");
+    }
+
+    if (!open_)
         return std::unexpected("patch manager not available");
 
-    auto id = generate_id();
-    auto now = now_epoch();
+    reboot_delay_seconds = std::clamp(reboot_delay_seconds, 60, 86400);
+    const auto id = generate_id();
+    const auto now = now_epoch();
 
-    // Find title from inventory
-    std::string title;
-    {
-        const char* sql = "SELECT title FROM patch_inventory WHERE kb_id = ? LIMIT 1";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, kb_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(stmt) == SQLITE_ROW)
-                title = col_text(stmt, 0);
-            sqlite3_finalize(stmt);
+    std::vector<std::string_view> agent_id_views(agent_ids.begin(), agent_ids.end());
+
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Title enrichment from inventory — same transaction as the writes
+        // below, so the stored title is consistent with whatever inventory
+        // row this read observed.
+        std::string title;
+        {
+            pg::PgResult tres = pg::exec_params(
+                conn, "SELECT title FROM patch_manager.patch_inventory WHERE kb_id = $1 LIMIT 1",
+                std::vector<std::string>{kb_id});
+            if (tres.status() == PGRES_TUPLES_OK && PQntuples(tres.get()) > 0)
+                title = col_str(tres.get(), 0, 0);
         }
-    }
 
-    // Create deployment record
-    {
-        const char* sql = R"(
-            INSERT INTO patch_deployments
-                (id, kb_id, title, status, created_by, reboot_needed,
-                 reboot_delay_seconds, reboot_at, created_at, total_targets)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
-        )";
-
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            return std::unexpected("failed to create deployment");
-
-        // Clamp delay to [60, 86400]
-        reboot_delay_seconds = std::clamp(reboot_delay_seconds, 60, 86400);
-
-        sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, kb_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, title.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, created_by.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 5, reboot_if_needed ? 1 : 0);
-        sqlite3_bind_int(stmt, 6, reboot_delay_seconds);
-        sqlite3_bind_int64(stmt, 7, reboot_at);
-        sqlite3_bind_int64(stmt, 8, now);
-        sqlite3_bind_int(stmt, 9, static_cast<int>(agent_ids.size()));
-
-        if (sqlite3_step(stmt) != SQLITE_DONE) {
-            sqlite3_finalize(stmt);
-            return std::unexpected("failed to insert deployment");
+        pg::PgResult dres = pg::exec_params(
+            conn,
+            "INSERT INTO patch_manager.patch_deployments "
+            "(id, kb_id, title, status, created_by, reboot_needed, "
+            " reboot_delay_seconds, reboot_at, created_at, total_targets) "
+            "VALUES ($1, $2, $3, 'pending', $4, $5::boolean, $6::integer, $7::bigint, "
+            "        $8::bigint, $9::integer)",
+            std::vector<std::string>{id, kb_id, title, created_by,
+                                     reboot_if_needed ? "true" : "false",
+                                     std::to_string(reboot_delay_seconds),
+                                     std::to_string(reboot_at), std::to_string(now),
+                                     std::to_string(agent_ids.size())});
+        if (dres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::deploy_patch: deployment insert failed: {}",
+                          PQresultErrorMessage(dres.get()));
+            return false;
         }
-        sqlite3_finalize(stmt);
-    }
 
-    // Create target records
-    {
-        const char* sql = R"(
-            INSERT INTO patch_deployment_targets (deployment_id, agent_id, status)
-            VALUES (?, ?, 'pending')
-        )";
-
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            return std::unexpected("failed to create target records");
-
-        for (const auto& aid : agent_ids) {
-            sqlite3_reset(stmt);
-            sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(stmt, 2, aid.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
+        pg::PgResult ttres = pg::exec_params(
+            conn,
+            "INSERT INTO patch_manager.patch_deployment_targets (deployment_id, agent_id, status) "
+            "SELECT $1, a, 'pending' FROM unnest($2::text[]) AS t(a)",
+            std::vector<std::string>{id, pg::to_text_array(agent_id_views)});
+        if (ttres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::deploy_patch: target rows insert failed: {}",
+                          PQresultErrorMessage(ttres.get()));
+            return false;
         }
-        sqlite3_finalize(stmt);
-    }
+        return true;
+    });
+
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "deploy_patch"}, {"result", ok ? "success" : "failed"}})
+            .increment();
+    if (!ok)
+        return std::unexpected("failed to create deployment");
 
     spdlog::info("PatchManager: created deployment {} for {} targeting {} agents",
                  id, kb_id, agent_ids.size());
     return id;
 }
 
-std::expected<void, std::string>
-PatchManager::execute_deployment(const std::string& deployment_id,
-                                 PatchDispatchFn dispatch_fn,
-                                 AgentOsLookupFn os_lookup) {
-    auto depl = get_deployment(deployment_id);
-    if (!depl)
-        return std::unexpected("deployment not found");
-
-    if (depl->status == "completed" || depl->status == "cancelled")
-        return std::unexpected("deployment already " + depl->status);
-
-    if (!dispatch_fn)
-        return std::unexpected("no dispatch function provided");
-
-    // Defense-in-depth: validate kb_id format before constructing shell commands
-    static const std::regex kb_re(R"(^KB\d{4,10}$)");
-    if (!std::regex_match(depl->kb_id, kb_re)) {
-        spdlog::error("PatchManager: deployment {} has invalid kb_id '{}'",
-                       deployment_id, depl->kb_id);
-        return std::unexpected("invalid kb_id format");
-    }
-
-    update_deployment_status(deployment_id, "scanning");
-
-    // Workflow for each target:
-    // Step 1: Scan for missing patches (windows_updates.missing)
-    // Step 2: Install the patch (windows_updates.install or script_exec)
-    // Step 3: Verify installation (windows_updates.installed)
-    // Step 4: Reboot if needed (script_exec.run with reboot command)
-
-    // TODO: Parallelize target dispatch (thread pool or std::async with
-    // concurrency limit) before wiring to REST API. Sequential dispatch
-    // does not scale beyond ~10 targets.
-    for (const auto& target : depl->targets) {
-        if (target.status == "completed" || target.status == "failed")
-            continue;
-
-        auto agent_id = target.agent_id;
-        update_target_status(deployment_id, agent_id, "scanning");
-
-        // Step 1: Check if patch is actually missing on this agent
-        {
-            nlohmann::json params = {{"kb_id", depl->kb_id}};
-            auto result = dispatch_fn("device.windows_updates.missing",
-                                      agent_id, params.dump());
-            if (!result) {
-                update_target_status(deployment_id, agent_id, "failed",
-                                     "scan failed: " + result.error());
-                continue;
-            }
-
-            // Parse scan result — check if the patch is listed as missing
-            try {
-                auto scan = nlohmann::json::parse(*result);
-                bool found = false;
-                if (scan.contains("rows") && scan["rows"].is_array()) {
-                    for (const auto& row : scan["rows"]) {
-                        auto title = row.value("title", "");
-                        if (title.find(depl->kb_id) != std::string::npos) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    // Patch is already installed or not applicable
-                    update_target_status(deployment_id, agent_id, "completed");
-                    spdlog::info("PatchManager: {} already has {} or not applicable",
-                                 agent_id, depl->kb_id);
-                    continue;
-                }
-            } catch (const std::exception&) {
-                // If we can't parse, continue with installation anyway
-            }
-        }
-
-        // Step 2: Install the patch
-        update_target_status(deployment_id, agent_id, "installing");
-        {
-            nlohmann::json params = {
-                {"kb_id", depl->kb_id},
-                {"reboot", depl->reboot_if_needed}
-            };
-
-            // Use script_exec to run installation — select script by agent OS at
-            // runtime (not server compile-time) so a Linux server can deploy
-            // Windows patches to Windows agents.
-            std::string agent_os = os_lookup ? os_lookup(agent_id) : "";
-            nlohmann::json exec_params;
-            if (agent_os == "windows") {
-                std::string install_script =
-                    "$criteria = 'IsInstalled=0 and Type=\\'Software\\'';"
-                    "$searcher = (New-Object -ComObject Microsoft.Update.Searcher);"
-                    "$results = $searcher.Search($criteria);"
-                    "foreach ($update in $results.Updates) {"
-                    "  if ($update.Title -match '" + depl->kb_id + "') {"
-                    "    $collection = New-Object -ComObject Microsoft.Update.UpdateColl;"
-                    "    $collection.Add($update);"
-                    "    $installer = New-Object -ComObject Microsoft.Update.Installer;"
-                    "    $installer.Updates = $collection;"
-                    "    $result = $installer.Install();"
-                    "    Write-Output \"Install result: $($result.ResultCode)\";"
-                    "  }"
-                    "}";
-                exec_params = {
-                    {"command", "powershell"},
-                    {"args", "-NoProfile -ExecutionPolicy Bypass -Command \"" + install_script + "\""},
-                    {"timeout", "600"}
-                };
-            } else {
-                exec_params = {
-                    {"command", "echo"},
-                    {"args", "Windows Update installation not supported on this platform"},
-                    {"timeout", "30"}
-                };
-            }
-
-            auto result = dispatch_fn("device.script_exec.run",
-                                      agent_id, exec_params.dump());
-            if (!result) {
-                update_target_status(deployment_id, agent_id, "failed",
-                                     "install failed: " + result.error());
-                continue;
-            }
-        }
-
-        // Step 3: Verify installation
-        update_target_status(deployment_id, agent_id, "verifying");
-        {
-            nlohmann::json params = {};
-            auto result = dispatch_fn("device.windows_updates.installed",
-                                      agent_id, params.dump());
-            if (!result) {
-                update_target_status(deployment_id, agent_id, "failed",
-                                     "verification failed: " + result.error());
-                continue;
-            }
-
-            // Check if the KB now appears in installed updates
-            try {
-                auto verify = nlohmann::json::parse(*result);
-                bool found = false;
-                if (verify.contains("rows") && verify["rows"].is_array()) {
-                    for (const auto& row : verify["rows"]) {
-                        auto identifier = row.value("identifier", "");
-                        if (identifier.find(depl->kb_id) != std::string::npos) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    update_target_status(deployment_id, agent_id, "failed",
-                                         "patch not found after installation");
-                    continue;
-                }
-            } catch (const std::exception&) {
-                // Verification parse failure — mark as potentially successful
-            }
-        }
-
-        // Step 4: Reboot orchestration — notify user, then cross-platform reboot
-        if (depl->reboot_if_needed) {
-            // Compute effective delay — clamp int64_t BEFORE static_cast<int>
-            // to prevent overflow when reboot_at is far in the future.
-            int delay_seconds = depl->reboot_delay_seconds;
-            if (depl->reboot_at > 0) {
-                auto now_ts = now_epoch();
-                if (depl->reboot_at > now_ts) {
-                    int64_t diff = depl->reboot_at - now_ts;
-                    delay_seconds = static_cast<int>(
-                        std::clamp(diff, int64_t{60}, int64_t{86400}));
-                }
-            }
-            delay_seconds = std::clamp(delay_seconds, 60, 86400);
-
-            update_target_status(deployment_id, agent_id, "rebooting");
-
-            // 4a: Notify user (best-effort)
-            int delay_minutes = delay_seconds / 60;
-            if (delay_minutes < 1) delay_minutes = 1;
-            nlohmann::json notify_params = {
-                {"title", "System Reboot"},
-                {"message", "Your computer will restart in " +
-                            std::to_string(delay_minutes) +
-                            " minutes for security updates (" +
-                            depl->kb_id + ")."},
-                {"type", "warning"}
-            };
-            auto notify_result = dispatch_fn("device.interaction.notify",
-                                             agent_id, notify_params.dump());
-            if (!notify_result) {
-                spdlog::info("PatchManager: notification failed for {} (headless?): {}",
-                             agent_id, notify_result.error());
-            }
-            // Audit: reboot notification dispatched
-            // TODO: Wire AuditStore when execute_deployment is connected to routes
-            spdlog::info("PatchManager: audit: deployment={} agent={} action=reboot.notify delay={}s notify_ok={}",
-                         deployment_id, agent_id, delay_seconds, notify_result.has_value());
-
-            // 4b: Cross-platform reboot command
-            std::string os = os_lookup ? os_lookup(agent_id) : "";
-            if (os.empty()) {
-                spdlog::warn("PatchManager: os_lookup not provided for {}, skipping reboot", agent_id);
-                update_target_status(deployment_id, agent_id, "completed",
-                                     "reboot skipped: unknown OS");
-                continue; // Skip reboot dispatch — target already marked completed
-            }
-            nlohmann::json reboot_params;
-            if (os == "linux" || os == "darwin") {
-                int delay_minutes_cmd = std::max(1, delay_seconds / 60);
-                reboot_params = {
-                    {"command", "shutdown"},
-                    {"args", "-r +" + std::to_string(delay_minutes_cmd) +
-                             " \"Yuzu: rebooting after " + depl->kb_id + "\""},
-                    {"timeout", "30"}
-                };
-            } else if (os == "windows") {
-                reboot_params = {
-                    {"command", "shutdown"},
-                    {"args", "/r /t " + std::to_string(delay_seconds) +
-                             " /c \"Yuzu patch deployment: rebooting after " +
-                             depl->kb_id + "\""},
-                    {"timeout", "30"}
-                };
-            }
-            // Only dispatch if we have a valid OS-specific command
-            if (!reboot_params.empty()) {
-                auto result = dispatch_fn("device.script_exec.run",
-                                          agent_id, reboot_params.dump());
-                spdlog::info("PatchManager: audit: deployment={} agent={} action=reboot.command os={} delay={}s success={}",
-                             deployment_id, agent_id, os, delay_seconds, result.has_value());
-                if (!result) {
-                    spdlog::warn("PatchManager: reboot command failed for {}: {}",
-                                 agent_id, result.error());
-                    // Don't mark as failed — patch was installed successfully
-                }
-            }
-        }
-
-        update_target_status(deployment_id, agent_id, "completed");
-    }
-
-    // Recalculate overall deployment status
-    recalculate_deployment_progress(deployment_id);
-    return {};
-}
-
 std::optional<PatchDeployment> PatchManager::get_deployment(const std::string& id) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return std::nullopt;
 
-    const char* sql = R"(
-        SELECT id, kb_id, title, status, created_by, reboot_needed,
-               created_at, completed_at, total_targets, completed_targets, failed_targets,
-               reboot_delay_seconds, reboot_at
-        FROM patch_deployments WHERE id = ?
-    )";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        (std::string("SELECT ") + kDeploymentCols +
+         " FROM patch_manager.patch_deployments WHERE id = $1")
+            .c_str(),
+        std::vector<std::string>{id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
 
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    PatchDeployment d = row_to_deployment(res.get(), 0);
 
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return std::nullopt;
-    }
-
-    PatchDeployment d;
-    d.id = col_text(stmt, 0);
-    d.kb_id = col_text(stmt, 1);
-    d.title = col_text(stmt, 2);
-    d.status = col_text(stmt, 3);
-    d.created_by = col_text(stmt, 4);
-    d.reboot_if_needed = sqlite3_column_int(stmt, 5) != 0;
-    d.created_at = sqlite3_column_int64(stmt, 6);
-    d.completed_at = sqlite3_column_int64(stmt, 7);
-    d.total_targets = sqlite3_column_int(stmt, 8);
-    d.completed_targets = sqlite3_column_int(stmt, 9);
-    d.failed_targets = sqlite3_column_int(stmt, 10);
-    d.reboot_delay_seconds = sqlite3_column_int(stmt, 11);
-    d.reboot_at = sqlite3_column_int64(stmt, 12);
-    sqlite3_finalize(stmt);
-
-    // Load targets
-    const char* tsql = R"(
-        SELECT agent_id, status, error, started_at, completed_at
-        FROM patch_deployment_targets WHERE deployment_id = ?
-    )";
-
-    sqlite3_stmt* tstmt = nullptr;
-    if (sqlite3_prepare_v2(db_, tsql, -1, &tstmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(tstmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-        while (sqlite3_step(tstmt) == SQLITE_ROW) {
+    pg::PgResult tres = pg::exec_params(
+        lease.get(),
+        (std::string("SELECT ") + kTargetCols +
+         " FROM patch_manager.patch_deployment_targets WHERE deployment_id = $1")
+            .c_str(),
+        std::vector<std::string>{id});
+    if (tres.status() == PGRES_TUPLES_OK) {
+        const int rows = PQntuples(tres.get());
+        d.targets.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
             PatchDeploymentTarget t;
-            t.agent_id = col_text(tstmt, 0);
-            t.status = col_text(tstmt, 1);
-            t.error = col_text(tstmt, 2);
-            t.started_at = sqlite3_column_int64(tstmt, 3);
-            t.completed_at = sqlite3_column_int64(tstmt, 4);
+            t.agent_id = col_str(tres.get(), i, 0);
+            t.status = col_str(tres.get(), i, 1);
+            t.error = col_str(tres.get(), i, 2);
+            t.started_at = to_i64(col(tres.get(), i, 3));
+            t.completed_at = to_i64(col(tres.get(), i, 4));
             d.targets.push_back(std::move(t));
         }
-        sqlite3_finalize(tstmt);
     }
 
     return d;
 }
 
 std::vector<PatchDeployment> PatchManager::list_deployments(int limit) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return {};
-
-    const char* sql = R"(
-        SELECT id, kb_id, title, status, created_by, reboot_needed,
-               created_at, completed_at, total_targets, completed_targets, failed_targets,
-               reboot_delay_seconds, reboot_at
-        FROM patch_deployments
-        ORDER BY created_at DESC
-        LIMIT ?
-    )";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return {};
-
-    sqlite3_bind_int(stmt, 1, limit);
-
     std::vector<PatchDeployment> result;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        PatchDeployment d;
-        d.id = col_text(stmt, 0);
-        d.kb_id = col_text(stmt, 1);
-        d.title = col_text(stmt, 2);
-        d.status = col_text(stmt, 3);
-        d.created_by = col_text(stmt, 4);
-        d.reboot_if_needed = sqlite3_column_int(stmt, 5) != 0;
-        d.created_at = sqlite3_column_int64(stmt, 6);
-        d.completed_at = sqlite3_column_int64(stmt, 7);
-        d.total_targets = sqlite3_column_int(stmt, 8);
-        d.completed_targets = sqlite3_column_int(stmt, 9);
-        d.failed_targets = sqlite3_column_int(stmt, 10);
-        d.reboot_delay_seconds = sqlite3_column_int(stmt, 11);
-        d.reboot_at = sqlite3_column_int64(stmt, 12);
-        result.push_back(std::move(d));
+    if (!open_)
+        return result;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return result;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        (std::string("SELECT ") + kDeploymentCols +
+         " FROM patch_manager.patch_deployments ORDER BY created_at DESC LIMIT $1")
+            .c_str(),
+        std::vector<std::string>{std::to_string(limit)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("PatchManager::list_deployments: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return result;
     }
 
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        result.push_back(row_to_deployment(res.get(), i));
     return result;
 }
 
@@ -750,27 +554,53 @@ PatchManager::cancel_deployment(const std::string& id) {
     if (depl->status == "completed" || depl->status == "cancelled")
         return std::unexpected("deployment already " + depl->status);
 
-    update_deployment_status(id, "cancelled");
-
-    // Mark all pending targets as cancelled
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not available");
 
-    const char* sql = R"(
-        UPDATE patch_deployment_targets
-        SET status = 'cancelled', completed_at = ?
-        WHERE deployment_id = ? AND status IN ('pending', 'scanning', 'downloading', 'installing', 'verifying', 'rebooting')
-    )";
+    // Both writes in ONE transaction — governance Gate 4 unhappy-path fix.
+    // The SQLite-era shape (and this migration's own first draft) issued the
+    // deployment-status UPDATE and the target-rows UPDATE as two SEPARATE
+    // lease acquisitions. A lease failure on the FIRST (silently returning,
+    // no error surfaced) while the SECOND still succeeded reported overall
+    // SUCCESS to the caller with the deployment's own `status` column never
+    // actually changed — a false-success report with no reconciler left to
+    // ever correct it (execute_deployment/recalculate_deployment_progress,
+    // the only code that ever revisited a deployment's state, are both
+    // deleted in this same migration). One transaction makes this
+    // all-or-nothing instead.
+    const auto now = std::to_string(now_epoch());
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult dres = pg::exec_params(
+            conn,
+            "UPDATE patch_manager.patch_deployments SET status = 'cancelled', completed_at = $1 "
+            "WHERE id = $2",
+            std::vector<std::string>{now, id});
+        if (dres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::cancel_deployment: deployment status update failed: {}",
+                          PQresultErrorMessage(dres.get()));
+            return false;
+        }
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected("failed to cancel targets");
+        pg::PgResult tres = pg::exec_params(
+            conn,
+            "UPDATE patch_manager.patch_deployment_targets SET status = 'cancelled', "
+            "completed_at = $1 WHERE deployment_id = $2 AND status IN "
+            "('pending', 'scanning', 'downloading', 'installing', 'verifying', 'rebooting')",
+            std::vector<std::string>{now, id});
+        if (tres.status() != PGRES_COMMAND_OK) {
+            spdlog::error("PatchManager::cancel_deployment: target update failed: {}",
+                          PQresultErrorMessage(tres.get()));
+            return false;
+        }
+        return true;
+    });
 
-    sqlite3_bind_int64(stmt, 1, now_epoch());
-    sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    if (metrics_)
+        metrics_->counter("yuzu_server_patch_manager_writes_total",
+                          {{"op", "cancel_deployment"}, {"result", ok ? "success" : "failed"}})
+            .increment();
+    if (!ok)
+        return std::unexpected("failed to cancel deployment");
 
     spdlog::info("PatchManager: cancelled deployment {}", id);
     return {};
@@ -780,125 +610,25 @@ void PatchManager::update_target_status(const std::string& deployment_id,
                                         const std::string& agent_id,
                                         const std::string& status,
                                         const std::string& error) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return;
 
-    auto now = now_epoch();
-
-    const char* sql = R"(
-        UPDATE patch_deployment_targets
-        SET status = ?, error = ?, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END,
-            completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled') THEN ? ELSE completed_at END
-        WHERE deployment_id = ? AND agent_id = ?
-    )";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, error.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, now);
-    sqlite3_bind_text(stmt, 4, status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 5, now);
-    sqlite3_bind_text(stmt, 6, deployment_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-}
-
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-void PatchManager::update_deployment_status(const std::string& id,
-                                            const std::string& status) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
-
-    auto now = now_epoch();
-    bool is_terminal = (status == "completed" || status == "failed" || status == "cancelled");
-
-    const char* sql = is_terminal
-        ? "UPDATE patch_deployments SET status = ?, completed_at = ? WHERE id = ?"
-        : "UPDATE patch_deployments SET status = ? WHERE id = ?";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
-    if (is_terminal) {
-        sqlite3_bind_int64(stmt, 2, now);
-        sqlite3_bind_text(stmt, 3, id.c_str(), -1, SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    }
-
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-}
-
-void PatchManager::recalculate_deployment_progress(const std::string& id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
-
-    // Count completed and failed targets
-    const char* sql = R"(
-        SELECT
-            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-            COUNT(*) as total
-        FROM patch_deployment_targets
-        WHERE deployment_id = ?
-    )";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int completed = sqlite3_column_int(stmt, 0);
-        int failed = sqlite3_column_int(stmt, 1);
-        int total = sqlite3_column_int(stmt, 2);
-        sqlite3_finalize(stmt);
-
-        // Update deployment counters
-        const char* update_sql = R"(
-            UPDATE patch_deployments
-            SET completed_targets = ?, failed_targets = ?, total_targets = ?,
-                status = CASE
-                    WHEN ? + ? = ? THEN CASE WHEN ? > 0 THEN 'failed' ELSE 'completed' END
-                    ELSE status
-                END,
-                completed_at = CASE WHEN ? + ? = ? THEN ? ELSE completed_at END
-            WHERE id = ?
-        )";
-
-        sqlite3_stmt* ustmt = nullptr;
-        if (sqlite3_prepare_v2(db_, update_sql, -1, &ustmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int(ustmt, 1, completed);
-            sqlite3_bind_int(ustmt, 2, failed);
-            sqlite3_bind_int(ustmt, 3, total);
-            sqlite3_bind_int(ustmt, 4, completed);
-            sqlite3_bind_int(ustmt, 5, failed);
-            sqlite3_bind_int(ustmt, 6, total);
-            sqlite3_bind_int(ustmt, 7, failed);
-            sqlite3_bind_int(ustmt, 8, completed);
-            sqlite3_bind_int(ustmt, 9, failed);
-            sqlite3_bind_int(ustmt, 10, total);
-            sqlite3_bind_int64(ustmt, 11, now_epoch());
-            sqlite3_bind_text(ustmt, 12, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(ustmt);
-            sqlite3_finalize(ustmt);
-        }
-    } else {
-        sqlite3_finalize(stmt);
-    }
+    const auto now = std::to_string(now_epoch());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE patch_manager.patch_deployment_targets "
+        "SET status = $1, error = $2, "
+        "    started_at = CASE WHEN started_at = 0 THEN $3::bigint ELSE started_at END, "
+        "    completed_at = CASE WHEN $1 IN ('completed', 'failed', 'cancelled') "
+        "                        THEN $3::bigint ELSE completed_at END "
+        "WHERE deployment_id = $4 AND agent_id = $5",
+        std::vector<std::string>{status, error, now, deployment_id, agent_id});
+    if (res.status() != PGRES_COMMAND_OK)
+        spdlog::warn("PatchManager::update_target_status: update failed for {}/{}: {}",
+                    deployment_id, agent_id, PQresultErrorMessage(res.get()));
 }
 
 } // namespace yuzu::server

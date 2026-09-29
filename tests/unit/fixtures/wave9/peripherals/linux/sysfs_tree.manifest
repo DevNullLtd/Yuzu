@@ -1,0 +1,58 @@
+sys/bus/pci/devices/0000:00:01.0/class	0x020000
+sys/bus/pci/devices/0000:00:01.0/device	0x1041
+sys/bus/pci/devices/0000:00:01.0/driver	virtio-pci
+sys/bus/pci/devices/0000:00:01.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:05.0/class	0x078000
+sys/bus/pci/devices/0000:00:05.0/device	0x1043
+sys/bus/pci/devices/0000:00:05.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:06.0/class	0x018000
+sys/bus/pci/devices/0000:00:06.0/device	0x1042
+sys/bus/pci/devices/0000:00:06.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:07.0/class	0x018000
+sys/bus/pci/devices/0000:00:07.0/device	0x1042
+sys/bus/pci/devices/0000:00:07.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:08.0/class	0x018000
+sys/bus/pci/devices/0000:00:08.0/device	0x105a
+sys/bus/pci/devices/0000:00:08.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:09.0/class	0x018000
+sys/bus/pci/devices/0000:00:09.0/device	0x105a
+sys/bus/pci/devices/0000:00:09.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:0a.0/class	0x018000
+sys/bus/pci/devices/0000:00:0a.0/device	0x105a
+sys/bus/pci/devices/0000:00:0a.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:0b.0/class	0x018000
+sys/bus/pci/devices/0000:00:0b.0/device	0x105a
+sys/bus/pci/devices/0000:00:0b.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:0c.0/class	0x018000
+sys/bus/pci/devices/0000:00:0c.0/device	0x105a
+sys/bus/pci/devices/0000:00:0c.0/vendor	0x1af4
+sys/bus/pci/devices/0000:00:0e.0/class	0x078000
+sys/bus/pci/devices/0000:00:0e.0/device	0x1053
+sys/bus/pci/devices/0000:00:0e.0/driver	virtio-pci
+sys/bus/pci/devices/0000:00:0e.0/vendor	0x1af4
+sys/bus/thunderbolt/devices/0-0/authorized	1
+sys/bus/thunderbolt/devices/0-0/device_name	MacBook Pro
+sys/bus/thunderbolt/devices/0-0/generation	4
+sys/bus/thunderbolt/devices/0-0/unique_id	00340000-0044-0000-0000-000000000000
+sys/bus/thunderbolt/devices/0-0/vendor_name	Apple Inc.
+sys/bus/thunderbolt/devices/0-0:1.1/device_name	Retimer
+sys/bus/thunderbolt/devices/0-1/authorized	1
+sys/bus/thunderbolt/devices/0-1/device_name	Thunderbolt Dock
+sys/bus/thunderbolt/devices/0-1/generation	4
+sys/bus/thunderbolt/devices/0-1/unique_id	00340000-0055-0000-0000-000000000000
+sys/bus/thunderbolt/devices/0-1/vendor_name	Apple Inc.
+sys/bus/thunderbolt/devices/domain0/security	user
+sys/bus/usb/devices/1-0:1.0/bInterfaceClass	09
+sys/bus/usb/devices/2-0:1.0/bInterfaceClass	09
+sys/bus/usb/devices/usb1/bDeviceClass	09
+sys/bus/usb/devices/usb1/bDeviceSubClass	00
+sys/bus/usb/devices/usb1/idProduct	0002
+sys/bus/usb/devices/usb1/idVendor	1d6b
+sys/bus/usb/devices/usb1/manufacturer	Linux 7.0.12-linuxkit vhci_hcd
+sys/bus/usb/devices/usb1/product	USB/IP Virtual Host Controller
+sys/bus/usb/devices/usb1/serial	vhci_hcd.0
+sys/bus/usb/devices/usb1/speed	480
+sys/bus/usb/devices/usb2/bDeviceClass	09
+sys/bus/usb/devices/usb2/bDeviceSubClass	00
+sys/bus/usb/devices/usb2/idProduct	0003
+sys/bus/usb/devices/usb2/idVendor	1d6b

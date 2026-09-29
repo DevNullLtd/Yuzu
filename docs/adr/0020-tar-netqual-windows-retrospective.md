@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-07-03
+**Authors:** Alex Young
 **Relates to:** ADR-0015 (ARP/DNS capture sources), `docs/tar-implementer.md`,
 `docs/user-manual/network.md` (netqual tier), ADR-0003 (telemetry capture model)
 

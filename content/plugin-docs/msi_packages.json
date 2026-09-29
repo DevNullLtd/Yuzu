@@ -1,0 +1,420 @@
+{
+  "actions": [
+    {
+      "action": "list",
+      "definition_ids": [
+        "windows.software.msi.list"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "pkgutil via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "msi_api",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "product_codes",
+      "definition_ids": [
+        "windows.software.msi.product_codes"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "pkgutil via bounded argv runner",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "msi_api",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows has no typed permission-denied path.** A failed `MsiEnumProductsA` loop looks identical to a genuinely empty product table — both fall through to the \"no packages\" sentinel row. Only the macOS leg distinguishes a degraded acquisition from a truly empty result.",
+    "**macOS never reports a partial or empty list as complete.** A killed, timed-out, truncated, or nonzero-exit pkgutil run — checked across the whole walk, including every per-receipt `--pkg-info` call — emits a single `error|msi_packages: acquisition degraded (...)` row and rc=1 instead. Do not reintroduce a per-row emit-as-you-go loop; rows are buffered and committed only after the health verdict is known, because `write_output` cannot retract an already-appended row.",
+    "**macOS `list` caps at 500 receipts.** A receipt DB with more entries than `kMaxPackages` gets an honest `msi|__truncated__|<total_seen>|-|-` sentinel row rather than a silently incomplete list.",
+    "**Linux is unimplemented, not merely leg-unsupported.** Both actions unconditionally return `error|platform not supported` and rc=1; no mechanism was bound.",
+    "**Windows `install_location` is usually empty.** In the captured sample only 4 of 137 packages carry a real path (NordVPN network TAP, NordVPN network TUN, PlayStation Accessories, CMake); MSI's `InstallLocation` property is frequently left unset by the installer — a `-` here reflects the source data, not a plugin gap."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enumerates installed software packages: on Windows, Windows Installer (MSI) products via the MsiEnumProducts API, returning each package's product code GUID, display name, version string, and install location; on macOS, `pkgutil` package receipts, returning each package's reverse-domain identifier, a derived display name, version string, and install location. Useful for software inventory, patch compliance, and license auditing.",
+      "display_name": "List MSI Packages",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.software.msi.list",
+      "platforms": [
+        "windows",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns a compact list of installed package identifiers with their associated product names: MSI product code GUIDs on Windows, reverse-domain pkgutil package identifiers on macOS. This is a lightweight alternative to the full list when only product identification is needed, such as for uninstall targeting or compliance matching.",
+      "display_name": "List MSI Product Codes",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.software.msi.product_codes",
+      "platforms": [
+        "windows",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Enumerates installed packages and product codes (Windows MSI / macOS pkgutil)",
+  "how_it_works": "`list` enumerates installed packages and reports name, version, and install location per package. On Windows it walks `MsiEnumProductsA` and pulls `InstalledProductName`/`VersionString`/`InstallLocation` per product code via `MsiGetProductInfoA`. On macOS it runs `pkgutil --pkgs` to get the receipt ID list, then issues one `pkgutil --pkg-info <id>` call per receipt (bounded at 500 receipts) and derives a display name from the identifier's last dot-segment, since a receipt carries no separate name field. `product_codes` is the lighter sibling: it returns only the identifier and name, so on macOS it skips the per-id `--pkg-info` round trip entirely (the name is derived from the identifier alone).\n\nThe macOS legs buffer every row locally and commit only after the whole acquisition completes, because `write_output` only appends — a mid-walk pkgutil failure can never leave a partial mix of real rows and an error line. A degraded run (pkgutil timeout, kill, spawn failure, truncation, or nonzero exit) emits a single `error|...` row and returns rc=1 instead of a partial or empty list read as complete.\n\nThis plugin is deliberately narrow: it is the honest MSI/pkgutil view only, never coercing a macOS reverse-domain identifier into a fabricated Windows-shaped GUID, and it does not attempt the broader dpkg/rpm/pacman/Homebrew/registry inventory that `installed_apps` already covers.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "ece0243d8d74",
+  "manifest_version": 1,
+  "name": "msi_packages",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).",
+          "example": "{90160000-008C-0000-1000-0000000FF1CE}",
+          "name": "product_code",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The package's display name — the Windows MsiGetProductInfoA `InstalledProductName` property, or a name derived from the last dot-segment of the macOS pkgutil identifier. Values: free text, or `-` when the underlying property is empty.",
+          "example": "Office 16 Click-to-Run Extensibility Component",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The package's version string — the Windows MsiGetProductInfoA `VersionString` property, or the macOS pkgutil receipt's `version:` field. Values: free text version string, or `-` when unavailable.",
+          "example": "16.0.19822.20104",
+          "name": "version",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The package's install path — the Windows MsiGetProductInfoA `InstallLocation` property (frequently unset by the installer), or the macOS receipt's volume and location joined. Values: filesystem path, or `-` when the property is empty or absent.",
+          "example": "C:\\Program Files (x86)\\NordVPN network TAP\\",
+          "name": "install_location",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.software.msi.list"
+    },
+    {
+      "columns": [
+        {
+          "description": "The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).",
+          "example": "com.tailscale.ipn.macsys",
+          "name": "product_code",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The package's display name, matching the `list` action's `name` field (see `windows.software.msi.list`). Values: free text, or `-`.",
+          "example": "Tailscale",
+          "name": "name",
+          "platforms": [
+            "windows",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.software.msi.product_codes"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_codes` rows use the literal discriminator `product_code`. Every dynamic macOS field is pipe/newline-escaped before being written, so an identifier, version, or path containing `|` or a newline can never shift columns or inject a row. `-` means the underlying property was empty or absent — it never means the plugin failed to read it (a failed acquisition is instead reported as a single `error|...` row and a nonzero return code, never as a placeholder data row).\n\n\n\nTwo additional macOS-only sentinel rows exist outside the schema above: `msi|__truncated__|<total_seen>|-|-` when a `list` receipt walk exceeds the 500-receipt cap (the tail is dropped, and this row states how many receipts were actually seen), and `msi|No packages found|-|-|-` / `product_code|none|-` when a clean walk finds zero receipts.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — `MsiEnumProductsA`/`MsiGetProductInfoA` read the per-machine product registration table; the source requests no elevation.",
+      "if_refused": "No explicit permission-denied handling in the leg; an empty enumeration falls through to the honest \"no packages\" sentinel row (`msi|No MSI packages found|-|-|-` / `product_code|none|-`) rather than a typed error.",
+      "measured": "2026-09-07 on bare metal as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None — `pkgutil` reads local receipt databases that do not require root. The captured sample below was taken unprivileged.",
+      "if_refused": "A degraded pkgutil run (timeout, kill, spawn failure, truncation, or nonzero exit) emits one `error|msi_packages: acquisition degraded (...)` row and rc=1 rather than a partial or empty list read as complete.",
+      "measured": "2026-09-07 on bare metal, unprivileged (euid 501, alex)",
+      "os": "macOS",
+      "runs_as": "agent daemon, root by default today (`docs/agent-privilege-model.md` TL;DR; narrowing tracked in #1455)"
+    },
+    {
+      "grant": "n/a — leg not implemented",
+      "if_refused": "Both actions unconditionally return `error|platform not supported` and rc=1.",
+      "measured": "2026-09-06 in a container, euid 0",
+      "os": "Linux",
+      "runs_as": "n/a"
+    }
+  ],
+  "readme": "agents/plugins/msi_packages/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|platform not supported"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "product_codes",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|platform not supported"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "ece0243d8d74",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 68,
+          "rows": [
+            "msi|com.apple.pkg.CLTools_SDK_macOS13|CLTools_SDK_macOS13|26.6.0.0.1781586384|/",
+            "msi|com.apple.pkg.CLTools_SDK_macOS12|CLTools_SDK_macOS12|26.6.0.0.1781586378|/",
+            "msi|com.apple.pkg.MAContent10_AssetPack_0637_AppleLoopsDrummerKyle|MAContent10_AssetPack_0637_AppleLoopsDrummerKyle|3.1.0.0.1.1601920555|/",
+            "msi|com.apple.pkg.MAContent10_AssetPack_0593_DrummerSoCalGBLogic|MAContent10_AssetPack_0593_DrummerSoCalGBLogic|2.0.0.0.1.1602002531|/",
+            "msi|com.apple.pkg.CLTools_Executables|CLTools_Executables|26.6.0.0.1781586589|/"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "product_codes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 68,
+          "rows": [
+            "product_code|com.apple.pkg.CLTools_SDK_macOS13|CLTools_SDK_macOS13",
+            "product_code|com.apple.pkg.CLTools_SDK_macOS12|CLTools_SDK_macOS12",
+            "product_code|com.apple.pkg.MAContent10_AssetPack_0637_AppleLoopsDrummerKyle|MAContent10_AssetPack_0637_AppleLoopsDrummerKyle",
+            "product_code|com.apple.pkg.MAContent10_AssetPack_0593_DrummerSoCalGBLogic|MAContent10_AssetPack_0593_DrummerSoCalGBLogic",
+            "product_code|com.apple.pkg.CLTools_Executables|CLTools_Executables"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "ece0243d8d74",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 137,
+          "rows": [
+            "msi|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|-",
+            "msi|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|-",
+            "msi|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput|3.3.221.0|-",
+            "msi|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)|8.94.0.0|-",
+            "msi|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "product_codes",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 137,
+          "rows": [
+            "product_code|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component",
+            "product_code|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider",
+            "product_code|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput",
+            "product_code|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)",
+            "product_code|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "ece0243d8d74",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "product_codes",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/msi_packages.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/msi_packages/src/msi_packages_macos.hpp",
+      "agents/plugins/msi_packages/src/msi_packages_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_msi_packages_actions.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`. `list` is additionally aggregatable by `name` with a `count` operation; `product_codes` carries no aggregation.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing runs on a schedule, and the only other production references to `msi_packages` are the server's dashboard key-value column-rendering fallback and its MCP workflow-catalog blurb, both cosmetic.",
+    "**Sensitivity.** `list`/`product_codes` rows are an installed-software inventory: `product_code`, `name`, and `version` name specific installed packages (e.g. `Office 16 Click-to-Run Extensibility Component`); `install_location` is a filesystem path that could occasionally embed a username under a user profile, though no row in the sample captures does. No device id, MAC, or hostname is emitted.",
+    "**Siblings:** `installed_apps.list` / `.query` (the broader dpkg/rpm/pacman/apk/Homebrew/registry software inventory this plugin deliberately does not duplicate).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.software.msi.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

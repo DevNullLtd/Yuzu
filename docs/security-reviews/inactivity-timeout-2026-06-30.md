@@ -1,5 +1,13 @@
 # Security review — Inactivity (idle) session timeout (SOC 2 CC6.3)
 
+> ⚠️ **Superseded in part by HA WS-1/1a (ADR-2002 §4).** This review describes
+> `last_activity_at` as a monotonic `steady_clock` stamp held only in memory. As
+> of HA WS-1/1a it is wall-clock (`system_clock`) and durably mirrored to the
+> `SessionStore` row via `touch_activity` (which deliberately does not bump the
+> validate-cache generation), so the idle window survives a restart and ages a
+> session consistently on any replica. See `docs/auth-architecture.md` "Durable
+> operator sessions".
+
 **Date:** 2026-06-30
 **Change:** `--session-inactivity-secs` — a sliding idle-timeout for operator
 dashboard cookie sessions, under the absolute 8h session lifetime. Wires the
@@ -30,8 +38,10 @@ Closes `/auth-and-authz` gap-matrix **P1 #8**.
 - **No auth weakening.** The absolute `expires_at` check is unchanged and runs
   first; the idle path only ever *adds* a rejection. Idle-disabled (default) is
   byte-identical to prior behaviour.
-- **Monotonic window.** `steady_clock` throughout — an NTP/system-clock step can
-  neither extend nor collapse the window.
+- **Monotonic window.** _[SUPERSEDED by HA WS-1/1a — see the top banner: since
+  ADR-2002 §4 `last_activity_at` is durable wall-clock (`system_clock`), not
+  `steady_clock`. The line below describes the pre-HA design.]_ `steady_clock`
+  throughout — an NTP/system-clock step can neither extend nor collapse the window.
 - **No session-resurrection / UAF.** The shared→unique lock upgrade copies the
   `Session` before releasing the shared lock and re-`find`s the token under the
   write lock; an evict re-checks idle-ness (a concurrent boundary refresh keeps

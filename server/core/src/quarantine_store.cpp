@@ -1,226 +1,401 @@
 #include "quarantine_store.hpp"
-#include "migration_runner.hpp"
 
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "utf8_sanitize.hpp"
+
+#include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <mutex>
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <unordered_set>
+#include <vector>
 
 namespace yuzu::server {
 
-static int64_t now_epoch() {
+namespace {
+
+constexpr const char* kStoreName = "quarantine_store";
+
+// Bounded acquires (ADR-0012 §2(a)). Quarantine is an operator/dashboard +
+// MCP surface, not a per-heartbeat hot path — budgets are generous relative
+// to e.g. the gRPC ingest path.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+
+// Read-degrade observability (mirrors DiscoveryStore/ManagementGroupStore).
+constexpr const char* kReasonStoreClosed = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
-static const char* safe(const char* p) {
-    return p ? p : "";
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}})
+            .increment();
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
 }
 
-// ── Construction / teardown ──────────────────────────────────────────────────
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
 
-QuarantineStore::QuarantineStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("QuarantineStore: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+std::string text_col(PGresult* res, int row, int col) {
+    if (PQgetisnull(res, row, col))
+        return {};
+    return std::string(PQgetvalue(res, row, col),
+                       static_cast<std::size_t>(PQgetlength(res, row, col)));
+}
+
+// Applied to every free-text column reaching Postgres, including the
+// backfill path (a bad byte at-rest in a legacy quarantine.db must not
+// brick the mandatory backfill). Scrubs invalid UTF-8 to U+FFFD, then
+// replaces any embedded NUL (PostgreSQL TEXT cannot store one; libpq's text
+// bind C-string-truncates at the first one).
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
+    }
+    return out;
+}
+
+QuarantineRecord read_record(PGresult* res, int row) {
+    QuarantineRecord r;
+    int c = 0;
+    r.id = to_i64(PQgetvalue(res, row, c++));
+    r.agent_id = text_col(res, row, c++);
+    r.status = text_col(res, row, c++);
+    r.quarantined_by = text_col(res, row, c++);
+    r.quarantined_at = to_i64(PQgetvalue(res, row, c++));
+    r.released_at = to_i64(PQgetvalue(res, row, c++));
+    r.whitelist = text_col(res, row, c++);
+    r.reason = text_col(res, row, c++);
+    r.last_applied_at = to_i64(PQgetvalue(res, row, c++));
+    r.last_confirmed_at = to_i64(PQgetvalue(res, row, c++));
+    return r;
+}
+
+constexpr const char* kRecordCols =
+    "id, agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason, "
+    "last_applied_at, last_confirmed_at";
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets `search_path` to the store schema for
+    // the migration transaction, so this table lands in `quarantine_store`.
+    // Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE quarantine_records ("
+         "  id              BIGSERIAL PRIMARY KEY,"
+         "  agent_id        TEXT NOT NULL,"
+         "  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', "
+         "'released')),"
+         "  quarantined_by  TEXT NOT NULL DEFAULT '',"
+         "  quarantined_at  BIGINT NOT NULL DEFAULT 0,"
+         "  released_at     BIGINT NOT NULL DEFAULT 0,"
+         "  whitelist       TEXT NOT NULL DEFAULT '',"
+         "  reason          TEXT NOT NULL DEFAULT '');"
+         "CREATE INDEX idx_quarantine_agent ON quarantine_records(agent_id);"
+         // gov-fix(architect, Gate 3): a plain index on `status` (ported
+         // column-for-column from the legacy SQLite schema) was dropped — the
+         // only status-predicated query is `list_quarantined`'s
+         // `WHERE status = 'active'`, already servable by the partial unique
+         // index below (Postgres can use a partial index whose predicate
+         // matches a query's WHERE clause even when the query doesn't filter
+         // on the index's own key column). No query filters on any other
+         // status value. A second, redundant btree on a 2-value column would
+         // be pure write amplification on this append-only history table.
+         //
+         // Enforces "at most one active record per agent" at the database
+         // level — quarantine_device's ON CONFLICT target.
+         "CREATE UNIQUE INDEX idx_quarantine_agent_active ON quarantine_records(agent_id) "
+         "WHERE status = 'active';"
+         // Durable one-time backfill markers (ADR-0009/0040 pattern). Marker-only; the sole
+         // writer (migrate_from_sqlite) was retired (#3623, ADR-0047 Update).
+         "CREATE TABLE quarantine_meta ("
+         "  key   TEXT PRIMARY KEY,"
+         "  value TEXT NOT NULL"
+         ");"},
+        // #3425: endpoint-containment confirmation state for
+        // QuarantineContainmentReconciler. 0 = never, matching this table's
+        // existing `released_at` never-happened sentinel — no optional
+        // plumbing, no nullable column. A brief ACCESS EXCLUSIVE lock during
+        // the ALTER is negligible at this table's size (manually-curated
+        // security events, not a telemetry stream — this table is
+        // operator-curated, not a high-volume stream).
+        {2,
+         "ALTER TABLE quarantine_records ADD COLUMN last_applied_at BIGINT NOT NULL DEFAULT 0;"
+         "ALTER TABLE quarantine_records ADD COLUMN last_confirmed_at BIGINT NOT NULL DEFAULT 0;"},
+        // migrate_from_sqlite() retired (#3623, ADR-0047 Update) — quarantine_meta was its
+        // sole idempotency marker. Appended at the next free slot, never renumbering v1/v2
+        // (PgMigrationRunner applies only version > current — renumbering an already-shipped
+        // version re-applies it against a database that already ran it).
+        {3, "DROP TABLE IF EXISTS quarantine_meta;"},
+    };
+    return kMigrations;
+}
+
+} // namespace
+
+// ── Construction ──────────────────────────────────────────────────────────
+
+QuarantineStore::QuarantineStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("QuarantineStore: no database connection at construction ({}) — "
+                      "quarantine persistence disabled",
+                      pool_.last_error());
         return;
     }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("QuarantineStore: opened {}", db_path.string());
-}
-
-QuarantineStore::~QuarantineStore() {
-    if (db_)
-        sqlite3_close(db_);
-}
-
-bool QuarantineStore::is_open() const {
-    return db_ != nullptr;
-}
-
-void QuarantineStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS quarantine_records (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id        TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'active',
-                quarantined_by  TEXT,
-                quarantined_at  INTEGER NOT NULL DEFAULT 0,
-                released_at     INTEGER NOT NULL DEFAULT 0,
-                whitelist       TEXT NOT NULL DEFAULT '',
-                reason          TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_quarantine_agent ON quarantine_records(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine_records(status);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "quarantine_store", kMigrations)) {
-        spdlog::error("QuarantineStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("QuarantineStore: schema migration failed — quarantine persistence "
+                      "disabled");
+        return;
     }
+    open_ = true;
 }
 
 // ── Operations ───────────────────────────────────────────────────────────────
 
-std::expected<void, std::string> QuarantineStore::quarantine_device(const std::string& agent_id,
-                                                                    const std::string& by,
-                                                                    const std::string& reason,
-                                                                    const std::string& whitelist) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return std::unexpected("database not open");
+std::expected<void, std::string>
+QuarantineStore::quarantine_device(const std::string& agent_id, const std::string& by,
+                                   const std::string& reason, const std::string& whitelist) {
+    if (!open_)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
+    if (agent_id.empty())
+        return std::unexpected("agent_id is required");
 
-    // Check if already quarantined — atomic check+insert under lock
-    auto current = get_status_impl(agent_id);
-    if (current && current->status == "active")
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    // Single race-safe statement: the partial unique index
+    // idx_quarantine_agent_active is the ON CONFLICT target, replacing the
+    // legacy check-then-insert-under-mutex. PQntuples()==0 means the
+    // conflict fired (an active record already exists).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO quarantine_store.quarantine_records "
+        "(agent_id, status, quarantined_by, quarantined_at, whitelist, reason) "
+        "VALUES ($1, 'active', $2, $3::bigint, $4, $5) "
+        "ON CONFLICT (agent_id) WHERE status = 'active' DO NOTHING "
+        "RETURNING id",
+        std::vector<std::string>{sanitize_pg_text(agent_id), sanitize_pg_text(by),
+                                 std::to_string(now_secs()), sanitize_pg_text(whitelist),
+                                 sanitize_pg_text(reason)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "quarantine_device failed: " +
+                               PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
         return std::unexpected("device is already quarantined");
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO quarantine_records "
-                           "(agent_id, status, quarantined_by, quarantined_at, whitelist, reason) "
-                           "VALUES (?, 'active', ?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-
-    auto now = now_epoch();
-    sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 3, now);
-    sqlite3_bind_text(s, 4, whitelist.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, reason.c_str(), -1, SQLITE_TRANSIENT);
-
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(sqlite3_errmsg(db_));
     return {};
 }
 
 std::expected<void, std::string> QuarantineStore::release_device(const std::string& agent_id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
-        return std::unexpected("database not open");
+    if (!open_)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
+    if (agent_id.empty())
+        return std::unexpected("agent_id is required");
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE quarantine_records SET status = 'released', released_at = ? "
-                           "WHERE agent_id = ? AND status = 'active';",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
+                               "database unavailable — try again");
 
-    sqlite3_bind_int64(s, 1, now_epoch());
-    sqlite3_bind_text(s, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-
-    if (sqlite3_changes(db_) == 0)
+    // Single guarded UPDATE (the #3062 cancel_job pattern) — not
+    // lock-then-check. RETURNING replaces sqlite3_changes() (#1033).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE quarantine_store.quarantine_records SET status = 'released', released_at = "
+        "$1::bigint "
+        "WHERE agent_id = $2 AND status = 'active' RETURNING id",
+        std::vector<std::string>{std::to_string(now_secs()), sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "release_device failed: " +
+                               PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
         return std::unexpected("device is not quarantined");
     return {};
 }
 
-std::optional<QuarantineRecord> QuarantineStore::get_status(const std::string& agent_id) const {
-    std::shared_lock lock(mtx_);
-    return get_status_impl(agent_id);
+namespace {
+// Shared body for mark_endpoint_applied/mark_endpoint_confirmed — same
+// guarded-UPDATE-WHERE-active shape as release_device (the #3062 cancel_job
+// pattern), differing only in which column is stamped. `record_id` scopes
+// the write to the SPECIFIC row a dispatch/status-read was actually about
+// (governance Gate 4, unhappy-path Finding A) — `agent_id`+`status='active'`
+// alone is not a stable identity across a release-then-requarantine race.
+std::expected<void, std::string> mark_endpoint_column(pg::PgPool& pool, const char* column,
+                                                       const std::string& agent_id,
+                                                       std::int64_t record_id, std::int64_t at,
+                                                       bool open) {
+    if (!open)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
+    if (agent_id.empty())
+        return std::unexpected("agent_id is required");
+
+    auto lease = pool.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    std::string sql = std::string("UPDATE quarantine_store.quarantine_records SET ") + column +
+                      " = $1::bigint WHERE agent_id = $2 AND id = $3::bigint AND status = "
+                      "'active' RETURNING id";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(at), sanitize_pg_text(agent_id),
+                                 std::to_string(record_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + column +
+                               " update failed: " + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected("device is not quarantined");
+    return {};
+}
+} // namespace
+
+std::expected<void, std::string>
+QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id,
+                                       std::int64_t at) {
+    return mark_endpoint_column(pool_, "last_applied_at", agent_id, record_id, at, open_);
 }
 
-std::optional<QuarantineRecord> QuarantineStore::get_status_impl(const std::string& agent_id) const {
-    if (!db_)
+std::expected<void, std::string>
+QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id,
+                                         std::int64_t at) {
+    return mark_endpoint_column(pool_, "last_confirmed_at", agent_id, record_id, at, open_);
+}
+
+std::expected<std::optional<QuarantineRecord>, std::string>
+QuarantineStore::get_status(const std::string& agent_id) {
+    if (!open_)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "database not open");
+    if (agent_id.empty())
+        return std::optional<QuarantineRecord>{std::nullopt};
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
+                               "database unavailable — try again");
+
+    std::string sql = std::string("SELECT ") + kRecordCols +
+                      " FROM quarantine_store.quarantine_records WHERE agent_id = $1 AND status "
+                      "= 'active' LIMIT 1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "get_status failed: " +
+                               PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<QuarantineRecord>{std::nullopt};
+    return std::optional<QuarantineRecord>{read_record(res.get(), 0)};
+}
+
+std::optional<std::vector<QuarantineRecord>> QuarantineStore::list_quarantined() {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined degraded — store not open");
         return std::nullopt;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
-            "reason "
-            "FROM quarantine_records WHERE agent_id = ? AND status = 'active' LIMIT 1;",
-            -1, &s, nullptr) != SQLITE_OK)
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined degraded — pool acquire timed out "
+                         "({})",
+                         pool_.last_error());
         return std::nullopt;
-    sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    std::optional<QuarantineRecord> result;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        QuarantineRecord r;
-        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at = sqlite3_column_int64(s, 4);
-        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        result = std::move(r);
     }
-    sqlite3_finalize(s);
-    return result;
+
+    std::string sql = std::string("SELECT ") + kRecordCols +
+                      " FROM quarantine_store.quarantine_records WHERE status = 'active' "
+                      "ORDER BY quarantined_at DESC, id DESC";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("QuarantineStore: list_quarantined degraded — query failed: {}",
+                        PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    std::vector<QuarantineRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_record(res.get(), i));
+    return out;
 }
 
-std::vector<QuarantineRecord> QuarantineStore::list_quarantined() const {
-    std::shared_lock lock(mtx_);
-    std::vector<QuarantineRecord> result;
-    if (!db_)
-        return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
-            "reason "
-            "FROM quarantine_records WHERE status = 'active' ORDER BY quarantined_at DESC;",
-            -1, &s, nullptr) != SQLITE_OK)
-        return result;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        QuarantineRecord r;
-        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at = sqlite3_column_int64(s, 4);
-        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        result.push_back(std::move(r));
+std::optional<std::vector<QuarantineRecord>>
+QuarantineStore::get_history(const std::string& agent_id) {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("QuarantineStore: get_history degraded — store not open");
+        return std::nullopt;
     }
-    sqlite3_finalize(s);
-    return result;
-}
+    if (agent_id.empty())
+        return std::vector<QuarantineRecord>{};
 
-std::vector<QuarantineRecord> QuarantineStore::get_history(const std::string& agent_id) const {
-    std::shared_lock lock(mtx_);
-    std::vector<QuarantineRecord> result;
-    if (!db_)
-        return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
-            "reason "
-            "FROM quarantine_records WHERE agent_id = ? ORDER BY quarantined_at DESC, rowid DESC;",
-            -1, &s, nullptr) != SQLITE_OK)
-        return result;
-    sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        QuarantineRecord r;
-        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at = sqlite3_column_int64(s, 4);
-        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        result.push_back(std::move(r));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("QuarantineStore: get_history degraded — pool acquire timed out ({})",
+                        pool_.last_error());
+        return std::nullopt;
     }
-    sqlite3_finalize(s);
-    return result;
+
+    std::string sql = std::string("SELECT ") + kRecordCols +
+                      " FROM quarantine_store.quarantine_records WHERE agent_id = $1 "
+                      "ORDER BY quarantined_at DESC, id DESC";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{sanitize_pg_text(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("QuarantineStore: get_history degraded — query failed: {}",
+                        PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    const int rows = PQntuples(res.get());
+    std::vector<QuarantineRecord> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.push_back(read_record(res.get(), i));
+    return out;
 }
 
 } // namespace yuzu::server

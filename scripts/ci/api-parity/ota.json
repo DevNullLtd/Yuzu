@@ -1,0 +1,122 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/deployment-jobs",
+    "capability_id": "get.api-deployment-jobs",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/deployment-jobs",
+    "capability_id": "post.api-deployment-jobs",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/deployment-jobs/{param}",
+    "capability_id": "delete.api-deployment-jobs-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/deployment-jobs/{param}",
+    "capability_id": "get.api-deployment-jobs-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/discovery/results",
+    "capability_id": "get.api-discovery-results",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/discovery/scan",
+    "capability_id": "post.api-discovery-scan",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/patches",
+    "capability_id": "get.api-patches",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/patches/deploy",
+    "capability_id": "post.api-patches-deploy",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/patches/deployments",
+    "capability_id": "get.api-patches-deployments",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/patches/deployments/{param}",
+    "capability_id": "get.api-patches-deployments-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/patches/deployments/{param}/cancel",
+    "capability_id": "post.api-patches-deployments-param-cancel",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/updates/upload",
+    "capability_id": "post.api-settings-updates-upload",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/updates/{param}/{param}/{param}",
+    "capability_id": "delete.api-settings-updates-param-param-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/updates/{param}/{param}/{param}/rollout",
+    "capability_id": "post.api-settings-updates-param-param-param-rollout",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/updates",
+    "capability_id": "get.fragments-settings-updates",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

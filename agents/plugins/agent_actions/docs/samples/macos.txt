@@ -1,0 +1,14 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2688724a5dd5
+== action=set_log_level level=info
+status|ok
+level|info
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=info
+agent.id|(not set)
+agent.version|(not set)
+agent.server_address|(not set)
+agent.heartbeat_interval|(not set)
+agent.plugins.count|(not set)
+[result_status] UNDECLARED / UNKNOWN / 
+

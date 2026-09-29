@@ -1,0 +1,9 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash c95c61957b6f
+== action=list_upgradable
+upgradable|none|System is up to date|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=installed_count
+count|68
+[result_status] UNDECLARED / UNKNOWN / 
+

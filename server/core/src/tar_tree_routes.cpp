@@ -5,9 +5,13 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
+
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +26,18 @@
 namespace yuzu::server {
 
 namespace {
+using json = nlohmann::json;
+
+// A4 success envelope — mirrors rest_api_v1.cpp's `ok_json` (rest_api_v1.cpp:211):
+// takes an ALREADY-SERIALIZED JSON `data` payload and wraps it, no re-parse. Not
+// shared via a header (see docs/api-twin-recipe.md §2: `ok_json`/`list_json` are
+// rest_api_v1.cpp-local; other self-registering `*_routes.cpp` modules —
+// ca_routes.cpp, viz_routes.cpp — each hand-roll their own envelope the same way
+// rather than reach across translation units for it).
+std::string ok_json(std::string_view data_json) {
+    return std::string("{\"data\":") + std::string(data_json) +
+          ",\"meta\":{\"api_version\":\"v1\"}}";
+}
 
 // Percent-encode for query values (mirrors device_routes' url_enc).
 std::string url_enc(const std::string& s) {
@@ -242,6 +258,118 @@ PollResult poll_command(const TarTreeRoutes::ResponsesFn& responses_fn, const st
 
 } // namespace
 
+namespace {
+
+// Shared row shape behind BOTH tar_process_tree_frame_json and
+// tar_capture_sources_devices_json — the two public builders are separate names
+// (matching the AC's own naming; the two frames are distinct capabilities) but must
+// not become two independently-maintained JSON shapes for the same DeviceRow (Rule
+// 1). Sort matches render_frame/render_cap_frame's own device sort (display name
+// ascending) so the JSON twin and the HTML picker present devices in the same order.
+std::string device_picker_json(const std::vector<DeviceRow>& devices) {
+    std::vector<DeviceRow> rows = devices;
+    std::sort(rows.begin(), rows.end(), [](const DeviceRow& a, const DeviceRow& b) {
+        return (a.hostname.empty() ? a.agent_id : a.hostname) <
+               (b.hostname.empty() ? b.agent_id : b.hostname);
+    });
+    json arr = json::array();
+    for (const auto& d : rows) {
+        arr.push_back({{"agent_id", d.agent_id},
+                       {"hostname", d.hostname},
+                       {"os", d.os},
+                       {"arch", d.arch},
+                       {"agent_version", d.agent_version},
+                       {"online", d.online}});
+    }
+    return arr.dump();
+}
+
+} // namespace
+
+std::string tar_process_tree_frame_json(const std::vector<DeviceRow>& devices) {
+    return device_picker_json(devices);
+}
+
+std::string tar_capture_sources_devices_json(const std::vector<DeviceRow>& devices) {
+    return device_picker_json(devices);
+}
+
+std::string tar_retention_paused_json(const TarRetentionPausedScan& scan) {
+    // Same sort as DashboardRoutes::render_tar_retention_paused: value-error rows
+    // float to the top, then oldest-paused-first (0 == oldest, per #558), then by
+    // display name — kept in lockstep with the HTML renderer's own std::sort so the
+    // two surfaces agree on row order (see gather_tar_retention_paused's doc comment
+    // for why the SORT itself still lives twice: the HTML renderer sorts its own
+    // internal PausedRow vector, and duplicating a five-line comparator is far lower
+    // risk than threading a shared-order guarantee through two different row types).
+    std::vector<TarPausedSourceRow> rows = scan.rows;
+    std::sort(rows.begin(), rows.end(),
+              [](const TarPausedSourceRow& a, const TarPausedSourceRow& b) {
+                  if (a.value_error != b.value_error)
+                      return a.value_error;
+                  if (a.paused_at != b.paused_at)
+                      return a.paused_at < b.paused_at;
+                  return a.agent_display < b.agent_display;
+              });
+    json rows_json = json::array();
+    for (const auto& r : rows) {
+        rows_json.push_back({{"agent_id", r.agent_id},
+                             {"agent_display", r.agent_display},
+                             {"source", r.source},
+                             {"paused_at", r.paused_at},
+                             {"live_rows", r.live_rows},
+                             {"oldest_ts", r.oldest_ts},
+                             {"value_error", r.value_error},
+                             {"enabled_raw", r.enabled_raw}});
+    }
+    return json{{"scan_id", scan.scan_id},
+               {"scan_count", scan.scan_count},
+               {"scan_at", scan.scan_at},
+               {"agents_responded", scan.agents_responded},
+               {"agents_with_no_paused_sources", scan.agents_with_no_paused_sources},
+               {"agents_filtered_out_of_scope", scan.agents_filtered_out_of_scope},
+               {"store_degraded", scan.store_degraded},
+               {"rows", rows_json}}
+        .dump();
+}
+
+bool TarTreeRoutes::deny_fleet_wide_device_enumeration(const httplib::Request& req,
+                                                       httplib::Response& res,
+                                                       std::optional<auth::Session>* out_session) {
+    auto session = auth_fn_(req, res);
+    if (!session) {
+        // #4027 fix (adversarial review round 1, CDX-P1-03/K2): `auth_fn_`
+        // (require_auth) already wrote a correct A4 JSON 401 body onto `res`
+        // — do NOT overwrite it with plain text here. This helper feeds both
+        // the pre-existing HTML fragment routes and the new `/api/v1/tar/*`
+        // JSON REST twins; the fragments already accept a JSON error body on
+        // their 403 path (see `deny_fleet_wide_device_enumeration`'s own 403
+        // branch just below, and `/fragments/results`' identical convention
+        // in dashboard_routes.cpp), so this is not a new content-type
+        // surprise for an HTMX consumer — just a return-without-overwrite.
+        return true;
+    }
+    if (!session->token_scope_service.empty()) {
+        // Write the 403 FIRST, audit after (normalized — #3167). `.permission`
+        // omitted: kServiceScopeGlobalSafe is compile-time-empty, so no grant admits
+        // a service-scoped caller here; naming one would be a false
+        // self-remediation claim.
+        res.status = 403;
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens may not read the fleet-wide device list"),
+            "application/json");
+        (void)detail::try_persist_audit(
+            audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+            "fleet-wide TAR device picker denied to a service-scoped token "
+            "(path=" + req.path + ")");
+        return true;
+    }
+    if (out_session)
+        *out_session = std::move(session);
+    return false;
+}
+
 void TarTreeRoutes::cache_put(const std::string& token, ReconEntry entry) {
     std::lock_guard<std::mutex> lk(cache_mu_);
     const std::int64_t now = now_epoch_seconds();
@@ -294,17 +422,19 @@ std::optional<std::string> TarTreeRoutes::cache_render_detail(const std::string&
 void TarTreeRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                     ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                                     LookupFn lookup_fn, DispatchFn dispatch_fn,
-                                    ResponsesFn responses_fn, AuditFn audit_fn) {
+                                    ResponsesFn responses_fn, AuditFn audit_fn,
+                                    CallerFn caller_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
                     std::move(devices_fn), std::move(lookup_fn), std::move(dispatch_fn),
-                    std::move(responses_fn), std::move(audit_fn));
+                    std::move(responses_fn), std::move(audit_fn), std::move(caller_fn));
 }
 
 void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                     ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                                     LookupFn lookup_fn, DispatchFn dispatch_fn,
-                                    ResponsesFn responses_fn, AuditFn audit_fn) {
+                                    ResponsesFn responses_fn, AuditFn audit_fn,
+                                    CallerFn caller_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -313,6 +443,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
     audit_fn_ = std::move(audit_fn);
+    caller_fn_ = std::move(caller_fn);
 
     // Soft Execute probe (htmx swallows a raw 403 → render an in-panel note instead).
     auto can_execute = [this](const httplib::Request& req, const std::string& id) {
@@ -321,19 +452,80 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     };
 
     // -- Frame body: toolbar + targets (host list is operator-scoped). --
+    // #4027 fix round (recorded exception, Kimi K4): stays on perm_fn_, NOT
+    // migrated to fleet_read_fn_ this round — out of scope (this round fixes
+    // only the six brand-new #4027 list surfaces: the two REST device-picker
+    // twins below, the REST retention twin, and their three MCP tools). This
+    // pre-existing HTML fragment route shares the exact same bare-
+    // require_permission gap the REST twin below no longer has; migrating it
+    // is a deliberate follow-up, not an oversight.
     sink.Get("/fragments/tar/process-tree", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-        auto session = auth_fn_(req, res);
-        if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
         res.set_content(render_frame(devices), "text/html; charset=utf-8");
+    });
+
+    // -- REST v1 twin: fleet device list, JSON (#4027). Gate sequence:
+    // deny_fleet_wide_device_enumeration (service-scoped tokens denied outright,
+    // unchanged), THEN fleet_read_fn_ — the ADR-0017 admit-then-filter chokepoint
+    // (#4027 fix round, CDX-P1-01/K4), NOT perm_fn_. perm_fn_/require_permission is
+    // a bare GLOBAL grant check that 403s a caller whose Infrastructure:Read is
+    // management-group-scoped before any row source ever runs (auth_routes.hpp's
+    // own require_list_read doc comment names this exact stacking mistake);
+    // fleet_read_fn_/require_fleet_read admits that caller with a real, composed
+    // meet(management-group, service-scope) VisibleSet instead. The
+    // unaudited-on-success posture is unchanged — a device identity/online list,
+    // not per-device behavioral content (api-twin-recipe.md's
+    // list_software_deployments precedent).
+    //
+    // #4143 review fix (external colleague review, BLOCKING, confirmed against
+    // ADR-0017 INV-4/INV-7 by direct source inspection): gate.scope is now the
+    // SOLE filter, applied over an UNFILTERED registry snapshot (all_devices_fn_ —
+    // the SAME source GET /api/v1/devices (#4033) and MCP's list_agents read
+    // from), not an intersection with devices_fn_'s older, direct-membership-only
+    // pre-filter. The prior "intersection, never widens" design let admit and the
+    // row filter disagree for a management-group-scoped-but-not-direct-member
+    // grant (INV-4) via two divergent resolvers (INV-7) — a real defect, not a
+    // merely-conservative one: an ADMITTED operator seeing an incomplete/empty
+    // list is a functional-correctness break. devices_fn_ remains wired for the
+    // un-migrated fragment route above only (see its own registration comment).
+    sink.Get("/api/v1/tar/process-tree", [this](const httplib::Request& req,
+                                                httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
+            return;
+        if (!fleet_read_fn_ || !all_devices_fn_) {
+            spdlog::error("tar.process_tree.device_picker: fleet_read_fn_/"
+                          "all_devices_fn_ unwired — misconfigured call site; "
+                          "failing closed; cid={}", cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the A4 error body + status
+        std::vector<DeviceRow> devices = all_devices_fn_();
+        if (gate.scope) {
+            std::vector<DeviceRow> visible;
+            visible.reserve(devices.size());
+            for (auto& d : devices)
+                if (authz::in_scope(gate.scope, d.agent_id))
+                    visible.push_back(std::move(d));
+            devices.swap(visible);
+        }
+        res.set_content(
+            ok_json(std::string("{\"devices\":") + tar_process_tree_frame_json(devices) + "}"),
+            "application/json");
     });
 
     // -- Run: scope + execute gate -> dispatch two canned tar.sql -> poll fragment. --
@@ -379,8 +571,13 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             "SELECT pid, process_name, proto, local_port, remote_addr, remote_port, state, ts, "
             "action FROM $TCP_Live" +
             where + " ORDER BY ts DESC LIMIT 5000";
-        const auto [pcmd, psent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}});
-        const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}});
+        const auto caller = caller_fn_(req);
+        const auto pout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}}, caller);
+        const auto tout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}}, caller);
+        const auto& pcmd = pout.command_id;
+        const auto psent = pout.sent;
+        const auto& tcmd = tout.command_id;
+        const auto tsent = tout.sent;
         // Audit at DISPATCH (parity with device-live-info / DEX-perf): the live query
         // hitting the endpoint is the access event and must be recorded even when it
         // reaches no agent or the later poll never completes. Shared #1647 chokepoint:
@@ -577,8 +774,13 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             const std::string asql =
                 "SELECT interface, ip_address, mac_address, entry_type, ts, action "
                 "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
-            const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}});
-            const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}});
+            const auto caller = caller_fn_(req);
+            const auto dout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}}, caller);
+            const auto aout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}}, caller);
+            const auto& dc = dout.command_id;
+            const auto dsent = dout.sent;
+            const auto& ac = aout.command_id;
+            const auto asent = aout.sent;
             // Shared #1647 chokepoint: catch-arm parity + Sec-Audit-Failed per verb
             // (DNS is usage-class PII, kept separately countable). Dispatch posture
             // unchanged; if either evidence row drops, the header is set.
@@ -642,19 +844,56 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     // `tar configure <src>_enabled=<bool>` per staged change. Same scoped Read +
     // Execute-probe tier as the tree; the staged-then-push guardrail lives in the
     // page JS (a toggle never dispatches — only Push does). ──
+    // #4027 fix round (recorded exception, Kimi K4): stays on perm_fn_ — see
+    // the identical note on /fragments/tar/process-tree above.
     sink.Get("/fragments/tar/capture-sources", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
-        auto session = auth_fn_(req, res);
-        if (!session) {
-            res.status = 401;
-            res.set_content("auth required", "text/plain");
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
             return;
-        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
         res.set_content(render_cap_frame(devices), "text/html; charset=utf-8");
+    });
+
+    // -- REST v1 twin: fleet device list, JSON (#4027). Same gate sequence
+    // (deny_fleet_wide_device_enumeration then fleet_read_fn_, NOT perm_fn_) +
+    // unaudited success-path posture + the #4143 review fix (gate.scope as the
+    // SOLE filter over all_devices_fn_'s unfiltered snapshot) as
+    // GET /api/v1/tar/process-tree above — see that route's comment. --
+    sink.Get("/api/v1/tar/capture-sources", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        std::optional<auth::Session> session;
+        if (deny_fleet_wide_device_enumeration(req, res, &session))
+            return;
+        if (!fleet_read_fn_ || !all_devices_fn_) {
+            spdlog::error("tar.capture_sources.device_picker: fleet_read_fn_/"
+                          "all_devices_fn_ unwired — misconfigured call site; "
+                          "failing closed; cid={}", cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the A4 error body + status
+        std::vector<DeviceRow> devices = all_devices_fn_();
+        if (gate.scope) {
+            std::vector<DeviceRow> visible;
+            visible.reserve(devices.size());
+            for (auto& d : devices)
+                if (authz::in_scope(gate.scope, d.agent_id))
+                    visible.push_back(std::move(d));
+            devices.swap(visible);
+        }
+        res.set_content(
+            ok_json(std::string("{\"devices\":") + tar_capture_sources_devices_json(devices) + "}"),
+            "application/json");
     });
 
     sink.Get("/fragments/tar/capture-sources/load", [this, can_execute](const httplib::Request& req,
@@ -686,8 +925,13 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::string scmd = get_param(req, "scmd");
         std::string ccmd = get_param(req, "ccmd");
         if (scmd.empty() || ccmd.empty()) {
-            const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {});
-            const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {});
+            const auto caller = caller_fn_(req);
+            const auto sout = dispatch_fn_("tar", "status", {device}, "", {}, caller);
+            const auto cout = dispatch_fn_("tar", "compatibility", {device}, "", {}, caller);
+            const auto& sc = sout.command_id;
+            const auto ssent = sout.sent;
+            const auto& cc = cout.command_id;
+            const auto csent = cout.sent;
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
@@ -725,7 +969,17 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             return;
         }
         if (st.failed || st.output.starts_with("error|")) {
-            note(res, "The device failed the status query.");
+            // Carry the agent's REASON, not just the fact of failure. The
+            // storage-offline line names why collection stopped and which read
+            // path still works (`tar sql`); a generic "failed" here discarded
+            // that sentence on the one frame an operator opens to ask why a
+            // device's data is missing. Same shape as the process query above --
+            // strip the `error|` prefix, cap, escape -- but a longer cap,
+            // because 200 bytes truncates that message mid-recovery-advice.
+            note(res, st.output.starts_with("error|")
+                          ? "The device failed the status query: " +
+                                html_escape(agent_error_display(st.output))
+                          : "The device failed the status query.");
             return;
         }
         const std::string compat = (!cp.failed && !cp.output.starts_with("error|")) ? cp.output : "";
@@ -765,7 +1019,15 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             "process", "tcp", "service", "user",   "perf",
             "procperf", "netqual", "module", "arp", "dns"};
         const std::string changes = get_param(req, "changes");
+        // Review finding (#3133): this route gates only Infrastructure:Read above,
+        // but `tar.configure` is classified Infrastructure:Write — the route relied
+        // on the chokepoint to enforce Write, and the chokepoint only does that when
+        // handed a real, non-system caller. Deriving it here (not a bare Read-only
+        // gate) is the complete fix: an operator who lacks Write is refused by
+        // build_classified_command exactly like every other Write-classified action.
+        const auto caller = caller_fn_(req);
         int applied = 0;
+        int refused_or_unreached = 0;
         std::size_t pos = 0;
         while (pos < changes.size()) {
             const auto comma = changes.find(',', pos);
@@ -782,8 +1044,10 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             if (val != "on" && val != "off")
                 continue;
             const std::string enabled = (val == "on") ? "true" : "false";
-            const auto [cmd, sent] =
-                dispatch_fn_("tar", "configure", {device}, "", {{src + "_enabled", enabled}});
+            const auto outcome = dispatch_fn_("tar", "configure", {device}, "",
+                                              {{src + "_enabled", enabled}}, caller);
+            const auto& cmd = outcome.command_id;
+            const auto sent = outcome.sent;
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
@@ -793,6 +1057,27 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             // not claim it was pushed (ADR-0015 review LOW-D).
             if (sent > 0)
                 ++applied;
+            else
+                ++refused_or_unreached;
+        }
+        // #3133 round-2 review minor: a chokepoint denial (the operator lacks
+        // the Infrastructure:Write that tar.configure is classified as) used
+        // to render the same "0 change(s) pushed" as an offline agent. The
+        // dispatch return can't distinguish the two ({command_id, 0} either
+        // way), so when nothing landed, probe scoped Write the same soft way
+        // can_execute probes Execute — for the MESSAGE only. The probe
+        // approximates the chokepoint's decision for display; the chokepoint
+        // itself remains the enforcement authority either way.
+        if (applied == 0 && refused_or_unreached > 0) {
+            httplib::Response probe;
+            const bool likely_authorized =
+                scoped_perm_fn_ && scoped_perm_fn_(req, probe, "Infrastructure", "Write", device);
+            if (!likely_authorized) {
+                note(res, "No changes pushed: modifying capture sources dispatches "
+                          "<code>tar.configure</code>, which needs the <b>Infrastructure "
+                          "Write</b> permission.");
+                return;
+            }
         }
         res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
                                     applied),

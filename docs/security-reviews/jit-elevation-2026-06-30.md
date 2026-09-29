@@ -1,5 +1,13 @@
 # Security review — JIT admin elevation (SOC 2 CC6.3/CC6.6)
 
+> ⚠️ **Superseded in part by HA WS-1/1a (ADR-2002 §4).** This review describes
+> the elevation window as `steady_clock` (monotonic) and in-memory, dropped on
+> restart. As of HA WS-1/1a the window is wall-clock (`system_clock`) and
+> **durably persisted** to the `SessionStore` row (survives a restart, bounded
+> by a hard `kMaxElevationWindow` 24h ceiling + the session's absolute expiry);
+> the monotonic NTP-step resistance is replaced by that ceiling + a backward-step
+> guard. See `docs/auth-architecture.md` "Durable operator sessions".
+
 > ⚠️ **Superseded in part by #1837/#1857 (OIDC principal re-key).** The OIDC-amr
 > elevation portions of this review are **temporarily inactive**: an OIDC session
 > is now keyed on the immutable `oidc:<iss>#<sub>` principal, which has no local
@@ -64,7 +72,11 @@ auto-reverts. Eligibility is the per-user `users.elevation_eligible` flag
   active elevation) cannot set their own eligibility, so a temporary admin window
   can't manufacture a durable self-elevation right. Eligibility is always granted
   by another admin, and the grant records the granting actor.
-- **Monotonic, in-memory window.** `elevated_until` is `steady_clock` (an NTP
+- **Monotonic, in-memory window.** _[SUPERSEDED by HA WS-1/1a — see the banner at
+  the top of this file. As of ADR-2002 §4 `elevated_until` is durable wall-clock
+  (`system_clock`), survives a restart, and is bounded by `kMaxElevationWindow` +
+  `elevation_issued_at`; the paragraph below describes the pre-HA design.]_
+  `elevated_until` is `steady_clock` (an NTP
   step can't extend it) and per-session in-memory — a restart or logout drops the
   elevation (fail-safe; nothing in auth.db resurrects it). It cannot outlive the
   session's absolute expiry (`validate_session` rejects past `expires_at`).

@@ -1,0 +1,4 @@
+REAL CAPTURE
+host/image: docker run --rm ubuntu:24.04 (Docker Desktop on macOS, host braga.local)
+date: 2026-09-06
+command: cat /usr/lib/systemd/system/anacron.service

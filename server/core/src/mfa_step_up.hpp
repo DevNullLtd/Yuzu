@@ -68,6 +68,10 @@ struct Request;
 struct Response;
 } // namespace httplib
 
+namespace yuzu {
+class MetricsRegistry; // yuzu/metrics.hpp — observability counters (optional)
+}
+
 namespace yuzu::server {
 
 /// Audit callback typedef — matches `RestApiV1::AuditFn` shape so
@@ -82,11 +86,17 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
                                          const std::string& target_id,
                                          const std::string& detail)>;
 
+/// `metrics` (optional — nullptr is a no-op) increments
+/// `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` on the fail-
+/// closed 503 branch (store/decrypt outage), so an operator can see this
+/// gate's outage rate on the same series as the other fail-closed auth
+/// routes (sre BLOCKING, governance hardening round).
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db,
                          int window_secs, const StepUpAuditFn& audit_fn,
                          const std::string& action_label,
-                         std::string_view mfa_enforcement = "optional");
+                         std::string_view mfa_enforcement = "optional",
+                         yuzu::MetricsRegistry* metrics = nullptr);
 
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
 /// strong) authentication that should seed a session's MFA-verified

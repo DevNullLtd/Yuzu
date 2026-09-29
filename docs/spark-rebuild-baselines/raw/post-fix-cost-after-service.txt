@@ -1,0 +1,7 @@
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (Registry) n=200 min=214 p50=243 p90=351 p99=594 max=741 us
+post-fix-cost bulk arm: 200 arms, wall clock total = 79ms (compare against CH-5-UAT's spark_p99 <= 15s gate once this same case is re-run on the PR-B build)
+post-fix-cost Registry re-arm: 200 value-writes, all observed (got.count()= 217), wall clock total = 7ms
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (File) n=200 min=121 p50=125 p90=143 p99=384 max=884 us
+post-fix-cost bulk arm (File): 200 arms, wall clock total = 76ms
+ESTABLISH post-fix-cost bulk arm (TODAY's baseline - re-run on PR-B build) SparkEngine::arm (Service) n=199 min=25 p50=49 p90=74 p99=93 max=106 us
+post-fix-cost bulk arm (Service): 200 arms over 320 real services (wraps=0 - a wrap means later arms are coalescing re-arms of an already-held key, NOT fresh arms; 1 arm(s) failed and are excluded from the timing series above), wall clock total = 10ms

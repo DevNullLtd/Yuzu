@@ -8,6 +8,8 @@
 
 #include "thread_pool.hpp"
 
+#include "test_helpers.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +19,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::agent::ThreadPool;
+using yuzu::test::ScopeExit;
 
 namespace {
 
@@ -26,14 +29,6 @@ template <typename Pred> bool wait_for(std::mutex& m, std::condition_variable& c
     std::unique_lock lock(m);
     return cv.wait_for(lock, std::chrono::seconds(10), pred);
 }
-
-// RAII cleanup that also runs on exception unwind. Used so a failing REQUIRE
-// mid-test still releases parked worker threads before ~ThreadPool joins them.
-template <typename F> struct ScopeExit {
-    F f;
-    ~ScopeExit() { f(); }
-};
-template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // namespace
 

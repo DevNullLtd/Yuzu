@@ -169,6 +169,15 @@ TEST_CASE("redact_module_dir scrubs the legacy 'Documents and Settings' root",
           R"(C:\DOCUMENTS AND SETTINGS\<redacted>\App)");
 }
 
+TEST_CASE("redact_module_dir scrubs removable-media mount points (PR #4023 review round 2, "
+          "blocker #4 -- shared with the removable exec-from-removable path)",
+          "[tar][module][redact][removable]") {
+    CHECK(redact_module_dir("/media/alice/USB") == "/media/<redacted>/USB");
+    CHECK(redact_module_dir("/run/media/bob/STICK") == "/run/media/<redacted>/STICK");
+    CHECK(redact_module_dir("/Volumes/carol") == "/Volumes/<redacted>");
+    CHECK(redact_module_dir("/Volumes/UNTITLED/tools") == "/Volumes/<redacted>/tools");
+}
+
 // ── EventRing::drain() exception-safety post-condition (review S2) ───────────
 
 TEST_CASE("EventRing<ModuleEvent> retains capacity across drain", "[tar][module]") {

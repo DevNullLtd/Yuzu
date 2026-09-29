@@ -1,0 +1,65 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3094b2651318
+== action=status
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=query
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=snapshot
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=export
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=configure
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=collect_fast
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=collect_slow
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=collect_perf
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=collect_software
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=rollup
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=sql sql="SELECT 1"
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=compatibility
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=fleet_snapshot
+error|TAR database not initialized
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=purge_source
+[not captured] Destructive/Irreversible: not executed on a live host
+

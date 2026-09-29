@@ -22,7 +22,7 @@
  *   Windows — GetExtendedTcpTable/GetExtendedUdpTable, DnsGetCacheDataTable,
  *             GetFileAttributesExA
  *   Linux   — /proc/net/tcp, /proc/net/tcp6, /etc/hosts, stat()
- *   macOS   — lsof -i, file system APIs
+ *   macOS   — libproc via agents/shared/macos_socket_walk.hpp, file system APIs
  */
 
 #include <yuzu/plugin.hpp>
@@ -32,7 +32,6 @@
 #include <cctype>
 #include <charconv>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -62,6 +61,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <sys/stat.h>
+#include <macos_socket_walk.hpp>
 #endif
 
 namespace {
@@ -116,26 +116,6 @@ std::string escape_pipes(std::string_view s) {
     }
     return out;
 }
-
-// ── Subprocess helper (macOS) ────────────────────────────────────────────────
-
-#if defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
-#endif
 
 // ── Active connection record ─────────────────────────────────────────────────
 
@@ -374,65 +354,14 @@ std::vector<ConnectionInfo> get_connections() {
 
 std::vector<ConnectionInfo> get_connections() {
     std::vector<ConnectionInfo> conns;
+    conns.reserve(32);
 
-    // Use lsof to enumerate network connections
-    auto output = run_command("lsof -i -n -P 2>/dev/null");
-    if (output.empty())
-        return conns;
-
-    std::istringstream ss(output);
-    std::string line;
-    std::getline(ss, line); // skip header
-
-    while (std::getline(ss, line)) {
-        // lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-        std::istringstream ls(line);
-        std::string command, pid_str, user, fd, type, device, size_off, node, name;
-        ls >> command >> pid_str >> user >> fd >> type >> device >> size_off >> node >> name;
-
-        if (node != "TCP" && node != "UDP")
-            continue;
-
-        uint32_t pid = 0;
-        std::from_chars(pid_str.data(), pid_str.data() + pid_str.size(), pid);
-
-        // NAME format: "local_addr:port->remote_addr:port (STATE)" or
-        //              "local_addr:port" for listening
-        std::string state;
-        auto paren = name.find('(');
-        if (paren != std::string::npos) {
-            auto end_paren = name.find(')', paren);
-            if (end_paren != std::string::npos)
-                state = name.substr(paren + 1, end_paren - paren - 1);
-            name = name.substr(0, paren);
-        }
-
-        // Trim trailing space from name
-        while (!name.empty() && name.back() == ' ')
-            name.pop_back();
-
-        auto arrow = name.find("->");
-        std::string local_part = (arrow != std::string::npos) ? name.substr(0, arrow) : name;
-        std::string remote_part = (arrow != std::string::npos) ? name.substr(arrow + 2) : "*:0";
-
-        // Split addr:port (handle IPv6 [addr]:port)
-        auto split_addr_port = [](const std::string& s) -> std::pair<std::string, uint16_t> {
-            auto last_colon = s.rfind(':');
-            if (last_colon == std::string::npos)
-                return {s, 0};
-            uint16_t port = 0;
-            auto port_str = s.substr(last_colon + 1);
-            std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-            return {s.substr(0, last_colon), port};
-        };
-
-        auto [la, lp] = split_addr_port(local_part);
-        auto [ra, rp] = split_addr_port(remote_part);
-
-        if (state.empty())
-            state = "LISTEN";
-
-        conns.push_back({std::move(la), lp, std::move(ra), rp, std::move(state), pid});
+    for (const auto& s : yuzu::shared::walk_sockets(/*dedup=*/true)) {
+        // TCP/TCP6 keep their real state; UDP is connectionless and carries no
+        // meaningful state, so it stays empty (the walk's own convention) —
+        // never a fabricated "LISTEN" the old lsof-parsing fallback used.
+        conns.push_back({s.local_addr, s.local_port, s.remote_addr, s.remote_port, s.state,
+                         static_cast<uint32_t>(s.pid)});
     }
     return conns;
 }
@@ -645,10 +574,13 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
         for (const auto& conn : conns) {
             if (conn.remote_addr == ip || conn.local_addr == ip) {
                 found = true;
+                // conn.state is empty for UDP (connectionless — no fabricated "LISTEN");
+                // drop the " - " separator rather than render a bare trailing dash.
+                std::string state_suffix = conn.state.empty() ? std::string{} : " - " + conn.state;
                 if (conn.pid > 0) {
-                    detail = std::format("Active connection - {} (pid {})", conn.state, conn.pid);
+                    detail = std::format("Active connection{} (pid {})", state_suffix, conn.pid);
                 } else {
-                    detail = std::format("Active connection - {}", conn.state);
+                    detail = std::format("Active connection{}", state_suffix);
                 }
                 break;
             }
@@ -772,13 +704,22 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
         std::string detail;
 
         for (const auto& conn : conns) {
+            // UDP rows carry an empty state (never a fabricated "LISTEN" — see
+            // get_connections()/walk_sockets()): UDP is connectionless, so a row's mere
+            // presence here already means a process is bound to that local port, the same
+            // fact "LISTEN" records for TCP. Treat empty state as a match for that reason,
+            // not as a wildcard — every other state string (TIME_WAIT, CLOSE_WAIT, ...)
+            // still correctly fails to match.
             if (conn.local_port == target_port &&
-                (iequals(conn.state, "LISTEN") || iequals(conn.state, "ESTABLISHED"))) {
+                (conn.state.empty() || iequals(conn.state, "LISTEN") ||
+                 iequals(conn.state, "ESTABLISHED"))) {
                 found = true;
                 if (conn.pid > 0) {
                     detail = std::format("Listening (pid {})", conn.pid);
-                } else {
+                } else if (!conn.state.empty()) {
                     detail = std::format("{} on {}", conn.state, conn.local_addr);
+                } else {
+                    detail = std::format("Bound on {}", conn.local_addr);
                 }
                 break;
             }
@@ -791,6 +732,27 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
                                      found ? "true" : "false", escape_pipes(detail)));
     }
 }
+
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: GetExtendedTcpTable/GetExtendedUdpTable + DnsGetCacheDataTable +
+// GetFileAttributesEx-family filesystem calls -- native Win32 APIs, rung 1.
+// linux: /proc/net/tcp[6] parsing + /etc/hosts read + stat()-based
+// filesystem checks -- native kernel-published surfaces, rung 1.
+// macos: connection enumeration walks libproc via
+// agents/shared/macos_socket_walk.hpp; domain/file checks stay native --
+// rung 1 throughout.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"check",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_SUPPORTED, 1, "libproc",
+      "UDP rows carry an empty state (no fabricated \"LISTEN\") — a real UDP listener still "
+      "matches a port check, but its detail text differs from a TCP match; a port shared by "
+      "more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen "
+      "owner in its match detail, not every owner"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "iphlpapi_dnsapi", nullptr}},
+};
 
 } // namespace
 
@@ -807,6 +769,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"check", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

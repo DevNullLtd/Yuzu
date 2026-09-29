@@ -1,0 +1,58 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 0e82a6f385ea
+== action=version
+version|0.13.1+0
+build_number|0
+git_commit|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=info
+os|Linux
+arch|aarch64
+hostname|988e0b888baf
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=health
+uptime_seconds|184122
+timestamp_epoch_ms|1788722304837
+memory_rss_kb|15020
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=plugins
+plugins_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=modules
+modules_count|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=connection
+server_address|
+tls_enabled|
+encrypted|true
+debug_mode|
+verbose_logging|
+log_level|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=switch
+switch_address|
+session_id|
+connected_since|
+reconnect_count|
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=config
+agent_id|
+agent_version|
+build_number|
+git_commit|
+server_address|
+tls_enabled|
+heartbeat_interval|
+plugin_dir|
+data_dir|
+log_level|
+debug_mode|
+verbose_logging|
+[result_status] UNDECLARED / UNKNOWN / 
+

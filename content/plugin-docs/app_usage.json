@@ -1,0 +1,755 @@
+{
+  "actions": [
+    {
+      "action": "foreground",
+      "definition_ids": [
+        "crossplatform.app_usage.foreground"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change",
+          "mechanism": "not captured",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change",
+          "mechanism": "not captured",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change",
+          "mechanism": "not captured",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    },
+    {
+      "action": "last_used",
+      "definition_ids": [
+        "crossplatform.app_usage.last_used"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "tar.db usage_daily (derived from TAR process/procfs)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "inherits the process source's names-only constraint; ES entitlement absent -> poll granularity",
+          "mechanism": "tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "tar.db usage_daily (derived from TAR process/etw)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "summary",
+      "definition_ids": [
+        "crossplatform.app_usage.summary"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "tar.db usage_daily (derived from TAR process/procfs)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "inherits the process source's names-only constraint; ES entitlement absent -> poll granularity",
+          "mechanism": "tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll)",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "tar.db usage_daily (derived from TAR process/etw)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Default-ON, diverging from most plugins.** `usage` ships `tar_config.usage_enabled = true` by default (`tar_schema_registry.cpp`'s `usage` source entry), per Alex's 2026-09-04 operator ruling (`docs/tar-implementer.md` \"Amended (Wave 6, operator ruling 2026-09-04)\") that extended the `power`/`removable` default-on precedent to further TAR sources as the roadmap brings each one in for change — this plugin is a read-only view over that already-default-on fold, not a separate opt-in decision of its own.",
+    "**`foreground` is always constrained, pending a user-context bridge.** Per-session focus-time and per-session attribution are not captured by any of the three platform legs today; the action exists in the descriptor and definition set so the roadmap can fill it in without a schema change once session-scope attribution lands, but every call to it reports `CONSTRAINED`/`foreground_not_captured` (rc 0) unconditionally.",
+    "**macOS granularity inherits the underlying TAR process source's ES-or-poll behaviour.** `usage_daily` is derived from TAR's `process` fold, not captured independently — when the Endpoint Security entitlement is present TAR observes real start/stop events; when it is absent TAR falls back to polling, which can miss short-lived processes and coarsens `first_seen`/`last_seen`/`run_count` accordingly. This plugin has no way to distinguish which regime produced a given row.",
+    "**Coverage is forward-only from source activation.** `usage_daily`/`usage_daily_user` only contain rows from the point the `usage` fold started running on a given host — a freshly enrolled agent, or one where `usage_enabled` was flipped on after a period off, has no history for the gap, and `summary`/`last_used` report exactly what is present, never a synthesized \"since install\" baseline.",
+    "**`first_seen`/`last_seen` are bounded by TAR's retention window, never all-time.** TAR prunes `usage_daily` on its own retention cadence (31-day default) — both timestamp fields are MIN/MAX over whatever rows are currently retained, not over every run this executable has ever had. Once a day's rows age out, this plugin has no way to see past them; do not read either field as a lifetime first/last-seen."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reserved for a future foreground/focus-time and per-session attribution capability. This source does not capture per-session focus state on any platform today; every call reports constrained|foreground_not_captured. Promoted here (rather than left unimplemented) by the user-context-bridge roadmap, which will fill this action in without a schema change once session-scope attribution lands.",
+      "display_name": "App Foreground Time",
+      "execute_roles": [
+        "endpoint-admin",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.app_usage.foreground",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Per-executable last/first-seen within TAR's retained usage window (31 days by default, not every run ever recorded) plus a trailing-30-day run_count/total_seconds window, aggregated from TAR's usage_daily table. Optional `exe` parameter narrows the result to one executable, normalised with the same rule TAR uses to write exe_key (lowercased basename, trimmed). Machine scope only — no pid, cmdline, or user name is ever surfaced. Reports `constrained|usage_feeder_disabled` (or `usage_feeder_errored`) instead of data when TAR's own usage fold is not actually advancing (its process or usage collector is off), since this action has no separate health row to carry that signal. The unfiltered form is capped at 5000 executables and appends a trailing `constrained|last_used_truncated|<cap>` row if the cap was reached.",
+      "display_name": "App Last Used",
+      "execute_roles": [
+        "endpoint-admin",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.app_usage.last_used",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Machine-scope summary of application run activity over a window of days, aggregated from TAR's usage_daily table, within TAR's retained usage window (31 days by default). One row per executable: run_count, total_seconds, first_seen, last_seen, distinct_users (a COUNT(DISTINCT user) only — no user name ever leaves the agent's SQLite database), superseded_runs, and expired_runs. Preceded by one meta row carrying the fold's own health counters (coverage window, open runs, unmatched stops, clock anomalies, capture gaps, feeder state). If the machine's TAR usage source is disabled, or the host's TAR schema predates this table, this reports an explicit constrained reason rather than an empty result.",
+      "display_name": "App Usage Summary",
+      "execute_roles": [
+        "endpoint-admin",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "crossplatform.app_usage.summary",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Read-only machine-scope app usage inventory derived from TAR's usage fold (no pid, command line, or user names in output)",
+  "how_it_works": "`summary` aggregates `usage_daily` over a trailing window (`days`, default 30, clamped 1-365; `top`, default 25, clamped 1-500; sorted `by` `run_time` or `run_count`), merges in a `usage_daily_user` `COUNT(DISTINCT user)` per executable, and is preceded by one `meta` row carrying the fold's own health counters (coverage window, open runs, unmatched stops, clock anomalies, capture gaps, feeder state). `last_used` reports per-`exe_key` first/last-seen within TAR's retained window plus a trailing-30-day `run_count`/`total_seconds`, optionally narrowed to one executable via `exe` (normalised with the identical rule TAR writes `exe_key` under). `foreground` always reports `CONSTRAINED`/`foreground_not_captured` with rc 0 — a permanent, by-design degraded outcome rather than a hard failure, since no per-session focus-time source exists on any platform yet. Every action first classifies `tar_config.usage_enabled`'s tri-state (Enabled/Disabled/Errored, mirroring TAR's own #560 `canonical_source_enabled` fix) and checks the `usage_daily` table exists, reporting a typed constrained reason rather than an empty result when the source is off, mis-set, or the schema predates this fold.\n\nDeliberately not: never opens `tar.db` for write (`SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX`, `PRAGMA query_only=1`); never selects a pid, command line, or user name — `usage_daily_user` contributes a distinct-user count only and `usage_live` contributes an open-run count only; never accepts an operator-supplied db path (would be an arbitrary-file read).",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "crossplatform.app_usage.last_used",
+      "description": "Optional executable name (or path — only the basename is used) to narrow the result to. Omit to return every executable TAR has recorded within its retained usage window.\n",
+      "name": "exe",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": 30,
+      "definition_id": "crossplatform.app_usage.summary",
+      "description": "Number of trailing days to summarise. Clamped to 1-365.",
+      "name": "days",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": 25,
+      "definition_id": "crossplatform.app_usage.summary",
+      "description": "Maximum number of executables to return. Clamped to 1-500.",
+      "name": "top",
+      "required": false,
+      "type": "int32"
+    },
+    {
+      "constraints": null,
+      "default": "run_time",
+      "definition_id": "crossplatform.app_usage.summary",
+      "description": "Ranking metric: \"run_time\" (total_seconds, default) or \"run_count\". Any other value is rejected with error|bad_param|by.\n",
+      "name": "by",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "21254047acbd",
+  "manifest_version": 1,
+  "name": "app_usage",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Always \"constrained\" — this action never returns a success row. Values: constrained.",
+          "example": "constrained",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Always \"foreground_not_captured\". Values: foreground_not_captured.",
+          "example": "foreground_not_captured",
+          "name": "reason",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Free-text pointer to the roadmap item that will fill this action in. Values: human-readable text.",
+          "example": "user-context-bridge roadmap (session-scope attribution)",
+          "name": "detail",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.app_usage.foreground"
+    },
+    {
+      "columns": [
+        {
+          "description": "Lowercased basename of the executable (P5-escaped, same rule as summary's exe_key column). Never a full path, pid, or command line.",
+          "example": "chrome.exe",
+          "name": "exe_key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Unix timestamp of the most recent run within TAR's retained usage window. Values: unix seconds.",
+          "example": 1717286400,
+          "name": "last_seen",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix timestamp of the earliest run within TAR's retained usage window. Values: unix seconds.",
+          "example": 1717200000,
+          "name": "first_seen",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Number of runs recorded in the trailing 30 days. Values: non-negative integer.",
+          "example": 8,
+          "name": "run_count_30d",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Total wall-clock seconds observed running in the trailing 30 days. Values: non-negative integer.",
+          "example": 28800,
+          "name": "total_seconds_30d",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.app_usage.last_used"
+    },
+    {
+      "columns": [
+        {
+          "description": "Lowercased basename of the executable (P5-escaped: a literal \"|\" becomes \"\\|\", CR/LF fold to a space, \"\\\" folds to \"/\"). Never a full path, pid, or command line.",
+          "example": "chrome.exe",
+          "name": "exe_key",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of runs recorded for this executable within the window. Values: non-negative integer.",
+          "example": 12,
+          "name": "run_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Total wall-clock seconds this executable was observed running within the window. Values: non-negative integer.",
+          "example": 43200,
+          "name": "total_seconds",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix timestamp of the earliest run within TAR's retained usage window (not every run ever recorded — rows older than TAR's retention are already gone). Values: unix seconds.",
+          "example": 1717200000,
+          "name": "first_seen",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix timestamp of the most recent run within TAR's retained usage window. Values: unix seconds.",
+          "example": 1717286400,
+          "name": "last_seen",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "COUNT(DISTINCT user) over the window — a count only; no user name ever leaves the agent's SQLite database. Values: non-negative integer.",
+          "example": 2,
+          "name": "distinct_users",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Runs whose stop event was superseded by a newer start for the same pid before a clean stop was observed. Values: non-negative integer.",
+          "example": 0,
+          "name": "superseded_runs",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Runs closed by the fold's own timeout rather than an observed stop event. Values: non-negative integer.",
+          "example": 1,
+          "name": "expired_runs",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "crossplatform.app_usage.summary"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows via `write_output()`. `summary` emits exactly one `meta` row (fold health counters) followed by zero or more `usage` rows, most-active-first. `last_used` emits zero or more `last_used` rows, one per executable, ordered by `exe_key`. Every action's failure path instead emits a single row in the shared `<class>|<reason>[|<detail>]` shape (`constrained|...`, `unavailable|...`, `error|...`) — described row-by-row in Result status below — never mixed with a `meta`/`usage`/`last_used` row in the same call.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "constrained",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — opening `tar.db` read-only needs only whatever access LocalSystem already has (the file is created and owned by the agent via the `tar` plugin)",
+      "if_refused": "result status `UNAVAILABLE`/`PARTIAL`, row `constrained|tar_db_unavailable|<path>|<sqlite error>`",
+      "measured": "captured 2026-09-15 as interactive user (elevated) (`docs/samples/windows.txt`) — the capture ran under the operator's own elevated session, not the agent's LocalSystem posture",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, `#1442`)"
+    },
+    {
+      "grant": "None beyond that — the read-only open needs no additional entitlement of its own",
+      "if_refused": "result status `UNAVAILABLE`/`PARTIAL`, row `constrained|tar_db_unavailable|<path>|<sqlite error>`; a schema-missing or disabled host instead reports `CONSTRAINED`/`PARTIAL`, row `constrained|usage_schema_missing` / `constrained|usage_source_disabled`",
+      "measured": "captured 2026-09-15 at euid 501 (`docs/samples/macos.txt`) — a lower-privilege posture than the agent's actual root LaunchDaemon; no live `tar.db` at the default path on the capture host",
+      "os": "macOS",
+      "runs_as": "agent daemon, root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md` \"macOS is the current exception\", required today for TAR's Endpoint Security client)"
+    },
+    {
+      "grant": "None — same read-only open",
+      "if_refused": "same shape as Windows/macOS",
+      "measured": "captured 2026-09-15 (`docs/samples/linux.txt`)",
+      "os": "Linux",
+      "runs_as": "agent daemon, dedicated unprivileged `yuzu` account by design (`docs/agent-privilege-model.md` TL;DR)"
+    }
+  ],
+  "readme": "agents/plugins/app_usage/README.md",
+  "result_status": [
+    {
+      "completeness": "full",
+      "provenance": "—",
+      "status": "`OK`",
+      "when": "`summary`/`last_used`: the query succeeded (rows may legitimately be empty on a quiet host)."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_source_disabled`",
+      "status": "`CONSTRAINED`",
+      "when": "`tar_config.usage_enabled` reads `\"false\"` — the host has turned the fold off."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_source_errored`",
+      "status": "`CONSTRAINED`",
+      "when": "`tar_config.usage_enabled` holds a value that is neither `\"true\"` nor `\"false\"` (TAR itself is in an inconsistent tri-state, mirrors #560's `canonical_source_enabled`), or the `tar_config` read itself failed to prepare/step — a read failure maps here, fail-closed, and is never treated as an absent key (which falls through to `Enabled`, TAR's own default)."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_schema_missing`",
+      "status": "`CONSTRAINED`",
+      "when": "The `usage_daily` table does not exist — the host's TAR schema predates this fold."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_feeder_disabled`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used` only: `tar_config.usage_feeder_enabled` reads `\"false\"` **or is absent** — TAR's own fold has stopped advancing (its `usage`/`process` collector is off), so `usage_daily` would otherwise silently serve a frozen, aging window as if it were live. Unlike `usage_enabled`, an absent feeder key is deliberately NOT treated as enabled — a missing key here is itself anomalous (a hand-restored or hand-edited `tar.db`), so it fails closed the same as an explicit `\"false\"`. `summary` surfaces the same signal via its `meta` row's `feeder_enabled` field instead of refusing to run."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_feeder_errored`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used` only: `tar_config.usage_feeder_enabled` holds a value that is neither `\"true\"` nor `\"false\"`, or the read itself failed to prepare/step — same fail-closed tri-state as `usage_source_errored`, applied to the feeder key."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`tar_db_unavailable`",
+      "status": "`UNAVAILABLE`",
+      "when": "`tar.db` failed to open read-only (missing file, permission denied, lock contention) — every capture in this package hits this branch, since none of the capture hosts had a live `tar.db` with usage collection enabled at the default path."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`tar_db_corrupt`",
+      "status": "`UNAVAILABLE`",
+      "when": "`tar.db` opened successfully but failed `PRAGMA quick_check(1)` — a distinct token from `tar_db_unavailable` (governance Gate 6 sre finding) so an operator can tell \"benign, often transient\" apart from \"possible disk corruption, worth investigating\" without parsing the free-text error detail."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`bad_param`",
+      "status": "`UNAVAILABLE`",
+      "when": "`summary`'s `by` parameter is neither `run_time` nor `run_count`."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`query_failed`",
+      "status": "`UNAVAILABLE`",
+      "when": "A prepared statement failed against an otherwise open, enabled, schema-correct db — `read_meta`'s accumulated `open_runs_query_failed`/`days_present_query_failed` reasons (`yuzu::shared::ConstraintAccumulator`), or a raw sqlite error surfaced from `run_summary`/`run_last_used`."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`last_used_truncated`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used`, unfiltered form only: the result hit `kMaxLastUsedRows` (5000) distinct executables and was cut off there — a trailing row, not a replacement for the real `last_used` rows already emitted. Bounds the C++-side result-set size (row count returned to the caller, and the SQL `LIMIT` itself) against an unprivileged local user minting unboundedly many exe_keys — it does **not** bound the underlying query's own scan/sort cost against the same growth (`EXPLAIN QUERY PLAN` still shows a full scan+group before `LIMIT` trims the output; round-3 review CDX-R2-04/K6), which is a separate, still-open concern."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`foreground_not_captured`",
+      "status": "`CONSTRAINED`",
+      "when": "`foreground`: always, rc 0 — a permanent degraded outcome, never a hard failure; this source has no per-session focus-time capture on any platform (see Caveats)."
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "last_used",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "foreground",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "foreground/focus attribution not captured by this source",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-15",
+        "host_class": "container",
+        "leg_hash": "pending",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "last_used",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "foreground",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "foreground/focus attribution not captured by this source",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-15",
+        "host_class": "bare-metal",
+        "leg_hash": "21254047acbd",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "summary",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|C:\\ProgramData\\yuzu\\agent\\tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "last_used",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "unable to open database file",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|tar_db_unavailable|C:\\ProgramData\\yuzu\\agent\\tar.db|unable to open database file"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "foreground",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "foreground/focus attribution not captured by this source",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 1,
+          "rows": [
+            "constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-15",
+        "host_class": "bare-metal",
+        "leg_hash": "pending",
+        "os": "windows",
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "interactive user (elevated)"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "summary",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Forensics"
+    },
+    {
+      "action": "last_used",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Forensics"
+    },
+    {
+      "action": "foreground",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Forensics"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/app_usage.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/app_usage/src/app_usage_parsers.hpp",
+      "agents/plugins/app_usage/src/app_usage_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/server/test_app_usage_ingestion.cpp",
+      "tests/unit/server/test_app_usage_routes.cpp",
+      "tests/unit/server/test_app_usage_store.cpp",
+      "tests/unit/test_app_usage_local_dispatcher.cpp",
+      "tests/unit/test_app_usage_parsers.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result.** Every action's rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
+    "**Also consumed by daily-sync.** `last_used` is additionally invoked in-process (`LocalDispatcher`, no extra network hop) once per sync cycle by `sync_source_app_usage.cpp` (ADR-0016) — the companion server-side PR persists the projection in `AppUsageStore`. A `constrained` capture is parsed and skipped (`collect()` returns `std::nullopt`) rather than sent as an empty replace, so a disabled/errored/schema-missing host never overwrites a previously-good server view with \"zero usage\". `summary` and `foreground` are not sync sources — instruction-result only.",
+    "**Not consumed by** TAR itself, DEX, or metrics — `app_usage` only reads `tar.db`; it emits no Prometheus series of its own.",
+    "**Sensitivity.** Executable names and run times are a working-hours/presence proxy even with no user column at all — a host whose interactive tools (shell, editor, browser) cluster their `usage_daily` rows in a narrow daily window says something about when its operator is active, regardless of who that operator is. `distinct_users` is a `COUNT(DISTINCT user)` only; no user name, pid, or command line ever leaves the agent's SQLite database — enforced by a grep-based test over the plugin's own sources (`test_app_usage_parsers.cpp`) for the raw process-event table name and `cmdline`.",
+    "**Siblings:** the `tar` plugin's own `usage`-source `query`/`export` actions read the identical tables through TAR's general-purpose action surface; `app_usage` is a narrower, purpose-built read with its own Forensics-gated approval posture and daily-sync integration."
+  ]
+}

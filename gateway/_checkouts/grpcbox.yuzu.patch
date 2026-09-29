@@ -1,6 +1,8 @@
---- a/src/grpcbox_pool.erl	2026-06-04 22:17:05.972841831 +0100
-+++ b/src/grpcbox_pool.erl	2026-06-04 21:56:12.137683967 +0100
-@@ -19,12 +19,18 @@
+diff --git a/src/grpcbox_pool.erl b/src/grpcbox_pool.erl
+index 2adc28f..97f677a 100644
+--- a/src/grpcbox_pool.erl
++++ b/src/grpcbox_pool.erl
+@@ -19,12 +19,18 @@ init([ServerOpts, ChatterboxOpts, TransportOpts]) ->
                                   keyfile := KeyFile,
                                   certfile := CertFile,
                                   cacertfile := CACertFile} ->
@@ -21,3 +23,23 @@
                                            {versions, ['tlsv1.2']},
                                            {next_protocols_advertised, [<<"h2">>]}]};
                                 _ ->
+diff --git a/src/grpcbox_stream.erl b/src/grpcbox_stream.erl
+index 7e9fa10..e21cf6c 100644
+--- a/src/grpcbox_stream.erl
++++ b/src/grpcbox_stream.erl
+@@ -220,6 +220,15 @@ from_ctx(Ctx) ->
+ 
+ on_receive_data(_, State=#state{method=undefined}) ->
+     {ok, State};
++%% YUZU PATCH (#1422): once the server has terminated the stream (auth_fun
++%% rejection, unimplemented method, ...) its trailers are sent, but stock
++%% grpcbox v0.17.1 still delivers subsequent DATA frames to handle_message —
++%% which EXECUTES the service handler and merely discards the response
++%% (end_stream is a no-op at trailers_sent=true). For an UNAUTHENTICATED-
++%% rejected peer that is an authorization bypass: the RPC's side effects
++%% still run. Drop all data on a terminated stream. See YUZU_PATCH.md.
++on_receive_data(_, State=#state{trailers_sent=true}) ->
++    {ok, State};
+ on_receive_data(Bin, State=#state{request_encoding=Encoding,
+                                   buffer=Buffer}) ->
+     try

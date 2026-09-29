@@ -1,0 +1,320 @@
+{
+  "actions": [
+    {
+      "action": "state",
+      "definition_ids": [
+        "security.encryption.state"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "libblkid+sysfs",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "fdesetup+diskutil",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "wmi_encryptable_volume",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**The Linux fixtures backing the parser are synthetic, not captured.** `bitlocker_linux_parsers.hpp`'s file header states a privileged Docker loopback-LUKS capture was attempted for this migration but no Docker daemon was reachable in the sandbox it was written in, so the dm-crypt `/sys/class/block/dm-*/dm/uuid` fixtures are built to the documented `CRYPT-<SUBSYS>-<uuid>-<name>` shape rather than a real capture. The live sample above (`docs/samples/linux.txt`) has zero LUKS volumes, so it does not exercise this code path either.",
+    "**The YAML's `result.columns` are Windows-shaped only.** `conversion_status`, `percentage_encrypted`, `encryption_method`, and `protection_status` are populated exclusively by the Windows leg; Linux and macOS rows carry a different field count and different (non-BitLocker) values in those positions. See the Outputs paragraph above.",
+    "**macOS's global FileVault row is invisible to the fleet chart.** The `whereField: 0, whereEquals: volume` visualization filter excludes the `filevault|...` row emitted once per macOS run, because that row's first field is `filevault`, not `volume` (tracked generally under issue #626, which covers the same plugin's coarser labelField limitation).",
+    "**The Windows grant is the `Administrators` group, not a privilege.** Both privilege-model rows (`docs/agent-privilege-model.md:99` and `:122`) name the `Administrators` group, matching the admin-ACL'd `root\\CIMV2\\Security\\MicrosoftVolumeEncryption` namespace the plugin queries (`bitlocker_windows_wmi.hpp:270-278`); an unprivileged caller gets the typed `permission_denied` sentinel (`bitlocker_plugin.cpp:114-115`), not a raw WMI error.",
+    "**`DeviceIoControl`-style WMI calls have no explicit per-call timeout.** `run_bounded_wmi_query` / `exec_object_method` are the shared helper's responsibility, not this plugin's; a wedged WMI provider is bounded only by whatever deadline `wmi_bounded.hpp` applies, which this plugin's code does not override."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Query disk encryption status on the endpoint. On Windows, queries Win32_EncryptableVolume in-process via WMI to report BitLocker status per volume including conversion status, percentage encrypted, encryption method, and protection state. On Linux, enumerates LUKS volumes in-process via libblkid and reads open/mapped state from /sys/class/block/dm-*. On macOS, queries FileVault status via fdesetup and diskutil. Essential for compliance verification that endpoint storage is encrypted at rest.",
+      "display_name": "Disk Encryption Status",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "security.encryption.state",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Disk encryption status — BitLocker, LUKS, FileVault",
+  "how_it_works": "The plugin has one action, `state`, which branches to a different acquisition path per OS behind `#ifdef` and always emits an honest \"nothing found\" row rather than silence. On Windows it queries `Win32_EncryptableVolume` in-process over WMI for every BitLocker-encryptable volume, then makes two further in-process WMI method calls per volume — `GetConversionStatus` and `GetEncryptionMethod`; either call failing degrades only that one field to `Unknown` rather than aborting the scan. On Linux it enumerates raw `crypto_LUKS` superblocks via libblkid and separately reads `/sys/class/block/dm-*/dm/uuid` to learn which of those devices are currently open (mapped) — no subprocess either way. On macOS it runs `fdesetup status` for a global on/off signal and `diskutil apfs list` for per-volume detail, both as direct argv through the bounded subprocess runner with a 20-second deadline, then parses the diskutil transcript with a pure text parser. It is deliberately not an encrypt/decrypt/enable action — every leg is a pure status read — and it never fabricates a value it can't verify: an unreadable field reports `unknown`/`Unknown` rather than a guess.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "ba3cbe6a5b56",
+  "manifest_version": 1,
+  "name": "bitlocker",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Per-OS volume identifier: drive letter on Windows, block-device basename on Linux, or the APFS volume's display label on macOS. Values: free text.",
+          "example": "C:",
+          "name": "volume",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "BitLocker's live conversion/encryption state for the volume, decoded from Win32_EncryptableVolume::GetConversionStatus(). Populated only on Windows; Linux and macOS rows do not carry this field.\n",
+          "example": "Fully Decrypted",
+          "name": "conversion_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "Fully Decrypted",
+            "Fully Encrypted",
+            "Encryption In Progress",
+            "Decryption In Progress",
+            "Encryption Paused",
+            "Decryption Paused",
+            "Unknown"
+          ]
+        },
+        {
+          "description": "Percentage of the volume currently encrypted, from BitLocker's EncryptionPercentage out-parameter. Populated only on Windows. Values: `<integer>%` or `unknown`.",
+          "example": "0%",
+          "name": "percentage_encrypted",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The disk-encryption cipher/mode BitLocker is using for the volume, from GetEncryptionMethod(). Populated only on Windows.\n",
+          "example": "None",
+          "name": "encryption_method",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "None",
+            "AES 128 with Diffuser",
+            "AES 256 with Diffuser",
+            "AES 128",
+            "AES 256",
+            "Hardware Encryption",
+            "XTS-AES 128",
+            "XTS-AES 256",
+            "Unknown"
+          ]
+        },
+        {
+          "description": "Whether BitLocker protection is currently on or off for the volume, from Win32_EncryptableVolume::ProtectionStatus. Populated only on Windows.\n",
+          "example": "Protection Off",
+          "name": "protection_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "Protection On",
+            "Protection Off",
+            "Protection Unknown"
+          ]
+        }
+      ],
+      "definition_id": "security.encryption.state"
+    }
+  ],
+  "outputs_note": "Rows are pipe-delimited, but the row shape is genuinely different per OS, not one schema with blanks. Windows emits `volume|<drive>|<conversion>|<pct>|<method>|<protection>` — six fields, one row per encryptable volume (`bitlocker_windows_wmi.hpp` `format_volume_row`). Linux emits `volume|<device>|crypto_LUKS|<active|inactive>` — four fields, one row per LUKS superblock (`bitlocker_linux_parsers.hpp` `format_volume_row`). macOS emits a single global `filevault|enabled` / `filevault|disabled` / `filevault|unknown|<diagnostic>` row, followed by zero or more `volume|<label>|<type>|<encrypted|not_encrypted|unknown>` rows, one per APFS volume `diskutil` reported (`bitlocker_plugin.cpp:300-333`). The YAML's five declared `result.columns` (`volume`, `conversion_status`, `percentage_encrypted`, `encryption_method`, `protection_status`) match the Windows row's five post-prefix fields exactly; Linux and macOS populate only the `volume` identifier field from that set — their other fields carry a type/role/state string, not a BitLocker-shaped value, so this table's `Platforms` column is genuinely narrow rather than a stylistic omission. A host that finds nothing still emits one row (`volume|none|no_encryptable_volumes` on Windows, `volume|none|no_encrypted_volumes` on Linux) rather than zero rows, so an empty result is never misread as \"the query didn't run\".",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "The WMI namespace `root\\CIMV2\\Security\\MicrosoftVolumeEncryption` is admin-only per Microsoft's docs (`bitlocker_plugin.cpp:97-99`); `docs/agent-privilege-model.md` names the `Administrators` group at both its rows for `bitlocker.state` (lines 99 and 122), matching that ACL — see Caveat 4",
+      "if_refused": "typed sentinel row `error|permission_denied: administrator privilege required to read BitLocker status` (`bitlocker_plugin.cpp:114-115`); `execute()` returns 1",
+      "measured": "2026-09-07, bare-metal, `SYSTEM` (`docs/samples/windows.txt:1`)",
+      "os": "Windows",
+      "runs_as": "LocalSystem today (#1442; intended target is the virtual service account `NT SERVICE\\YuzuAgent`)"
+    },
+    {
+      "grant": "none observed in this plugin's code — both `fdesetup` and `diskutil` calls are unprivileged reads",
+      "if_refused": "no distinct denial path: a timed-out or failed tool call still returns whatever text it produced, logged via `spdlog::warn` (`bitlocker_plugin.cpp:78-83`); the parser reports `filevault|unknown|<diagnostic>` rather than a typed permission error",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) — unprivileged (`docs/samples/macos.txt:1`)",
+      "os": "macOS",
+      "runs_as": "root — the shipped LaunchDaemon has no `UserName` key (`docs/agent-privilege-model.md:15`)"
+    },
+    {
+      "grant": "none — libblkid `TYPE` probing and `/sys/class/block/dm-*/dm/uuid` reads need no elevated capability (not listed in either `agent-privilege-model.md` table)",
+      "if_refused": "no distinct denial path: a `blkid_get_cache` failure or unreadable `/sys` entry silently yields fewer devices/mappings (`bitlocker_plugin.cpp:187-189, 253-256`), surfacing as `volume|none|no_encrypted_volumes` if nothing is found",
+      "measured": "2026-09-06, container, `euid 0` (`docs/samples/linux.txt:1`) — captured privileged, not representative of the production account",
+      "os": "Linux",
+      "runs_as": "`yuzu`, an unprivileged system account by design (`docs/agent-privilege-model.md:47-52`); the sample below was captured as root in a container, not the account's real identity"
+    }
+  ],
+  "readme": "agents/plugins/bitlocker/README.md",
+  "result_status": [
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`bitlocker:volume_enumeration_truncated`",
+      "status": "`OK`",
+      "when": "Windows only — the shared bounded-WMI-query row cap truncated the encryptable-volume list (`bitlocker_plugin.cpp:136-137`)"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "state",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "volume|none|no_encrypted_volumes"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "ba3cbe6a5b56",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "state",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "filevault|enabled"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "ba3cbe6a5b56",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "state",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "volume|C:|Fully Decrypted|0%|None|Protection Off",
+            "volume|D:|Fully Decrypted|0%|None|Protection Off"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "ba3cbe6a5b56",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "state",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Security"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/bitlocker.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/bitlocker/src/bitlocker_linux_parsers.hpp",
+      "agents/plugins/bitlocker/src/bitlocker_macos_apfs.hpp",
+      "agents/plugins/bitlocker/src/bitlocker_plugin.cpp",
+      "agents/plugins/bitlocker/src/bitlocker_windows_wmi.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/agent/test_bitlocker_macos.cpp",
+      "tests/unit/test_bitlocker_linux_parsers.cpp",
+      "tests/unit/test_bitlocker_local_dispatcher.cpp",
+      "tests/unit/test_bitlocker_windows_wmi.cpp"
+    ]
+  },
+  "version": "0.2.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore at the DSL default 90-day retention (`docs/yaml-dsl-spec.md` `spec.response.retentionDays`, not overridden by this definition), queryable at `/api/responses/{id}` and chartable via the `pie` / `single_series` visualization declared in the YAML (`content/definitions/bitlocker.yaml:69-76`).",
+    "**Visualization caveat.** `result_parsing.hpp` treats `bitlocker` as a key|value-schema plugin, and the chart filters on `whereField: 0, whereEquals: volume` (`content/definitions/bitlocker.yaml:72-73`). That filter matches every Windows and Linux row and every macOS per-volume `volume|` row, but macOS's global `filevault|...` row has `filevault`, not `volume`, in field 0 — it is silently excluded from the \"BitLocker volumes seen across the fleet\" pie chart.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — `bitlocker`/`security.encryption.state` do not appear in `typed_inventory_sources.hpp`, `software_inventory_store.cpp`, or the TAR sources. (DEX's `security.bitlocker_error` observation type, `server/core/src/dex_routes.cpp:109`, is an unrelated tamper/health event taxonomy label, not a consumer of this plugin's rows.)",
+    "**Sensitivity.** `volume` rows carry a drive letter, block-device basename, or APFS volume label — not a device serial, MAC, hostname, username, or installed-software name; `conversion_status`/`percentage_encrypted`/`encryption_method`/`protection_status` describe the encryption state only.",
+    "**Bundled in** (not siblings — instruction-set references, not data producers): `core.security.endpoint-security` (`content/definitions/security_set.yaml:30`) and the visualization demo set `demo.visualization.fleet-posture` (`content/definitions/visualization_demo_set.yaml:48`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.encryption.state\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

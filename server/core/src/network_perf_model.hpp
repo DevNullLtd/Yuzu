@@ -94,6 +94,12 @@ struct NetPerfFleetNow {
     int64_t rtt_reporting{0}; ///< the honest RTT denominator (devices with smoothed RTT)
     int64_t online{0};        ///< total devices in the snapshot
     NetCooccurrence cooc;     ///< the overview headline
+    /// Distinct tag keys available for the cohort picker (mirrors
+    /// `NetPerfSnapshot::available_keys` — carried through here, ADR-0031
+    /// WS-A4, so a public-API caller with no access to the raw snapshot can
+    /// still populate the cohort-key picker; see DexPerfSnapshot's analogous
+    /// field for the existing REST/MCP precedent).
+    std::vector<std::string> available_keys;
 };
 
 NetPerfFleetNow net_perf_fleet_now(const NetPerfSnapshot& snap);

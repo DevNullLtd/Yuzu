@@ -6,8 +6,38 @@ documents in both CycloneDX and SPDX formats. This page documents the
 commands an operator or procurement reviewer runs to verify each piece.
 
 All examples assume you have downloaded the release assets from
-<https://github.com/Tr3kkR/Yuzu/releases> into the current directory, and
+<https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
 that the tag under verification is `v0.11.0`. Substitute as needed.
+
+## Which owner applies to your release
+
+Yuzu moved from the personal account `Tr3kkR` to the `DevNullLtd` organisation
+on **2026-09-28**. That changes two things a verifier must get right, and they
+move together:
+
+| | Releases up to **v0.13.0** | Releases after **2026-09-28** |
+|---|---|---|
+| Image namespace (`OWNER`) | `tr3kkr` | `devnullltd` |
+| Signing identity (`SIGNER_REPO`) | `Tr3kkR/Yuzu` | `DevNullLtd/Yuzu` |
+
+The signing identity is baked into the Fulcio certificate's SAN at build time
+and is **not** rewritten by GitHub's redirect, so verifying a v0.13.0 artifact
+against `DevNullLtd/Yuzu` fails, and vice versa. Every command below reads
+these two shell variables — set them once for the release you are verifying:
+
+```bash
+# Releases up to v0.13.0 (the worked example below, v0.11.0, is one of these):
+OWNER=tr3kkr;      SIGNER_REPO=Tr3kkR/Yuzu
+
+# Releases after 2026-09-28:
+# OWNER=devnullltd; SIGNER_REPO=DevNullLtd/Yuzu
+```
+
+Image *pulls* do **not** follow this split: every historical tag was mirrored
+into `ghcr.io/devnullltd/` on 2026-09-29, so `OWNER=devnullltd` works for every
+release. `ghcr.io/tr3kkr/` is retained read-only for anything already pinned to
+it. Only the SIGNING IDENTITY is era-dependent, because it is fixed in the
+certificate at build time and cannot be restamped.
 
 ## What ships with every release
 
@@ -20,7 +50,7 @@ that the tag under verification is `v0.11.0`. Substitute as needed.
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, `yuzu-{server,gateway}-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, `yuzu-{server,gateway}-image.spdx.json` | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
-| Docker images | `ghcr.io/tr3kkr/yuzu-{server,gateway}:<tag>` | `cosign verify` |
+| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway}:<tag>` | `cosign verify` |
 
 ## Prerequisites
 
@@ -63,7 +93,7 @@ was signed by the GitHub Actions workflow that produced this release.
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
+  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```
@@ -75,32 +105,32 @@ listed asset is exactly what the workflow produced.
 regex for a literal match:
 
 ```bash
-  --certificate-identity https://github.com/Tr3kkR/Yuzu/.github/workflows/release.yml@refs/tags/v0.11.0
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0"
 ```
 
 ## 3. Verify Docker image signatures (cosign)
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
+  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tr3kkr/yuzu-server:0.11.0
+  ghcr.io/${OWNER}/yuzu-server:0.11.0
 
 cosign verify \
-  --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
+  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tr3kkr/yuzu-gateway:0.11.0
+  ghcr.io/${OWNER}/yuzu-gateway:0.11.0
 ```
 
 Output includes the signing certificate's SAN
-(`https://github.com/Tr3kkR/Yuzu/.github/workflows/release.yml@refs/tags/v0.11.0`),
+(`https://github.com/<SIGNER_REPO>/.github/workflows/release.yml@refs/tags/v0.11.0`),
 the Rekor log entry, and the image digest. Pin by digest for production
 deployments:
 
 ```bash
-docker pull ghcr.io/tr3kkr/yuzu-server:0.11.0
-docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/tr3kkr/yuzu-server:0.11.0
-# → ghcr.io/tr3kkr/yuzu-server@sha256:...
+docker pull ghcr.io/${OWNER}/yuzu-server:0.11.0
+docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${OWNER}/yuzu-server:0.11.0
+# → ghcr.io/${OWNER}/yuzu-server@sha256:...
 ```
 
 ## 4. Verify SLSA build provenance (GitHub attestations)
@@ -112,14 +142,14 @@ inputs used to produce the artifact.
 
 ```bash
 # Binary archives / installers
-gh attestation verify yuzu-linux-x64.tar.gz --repo Tr3kkR/Yuzu
-gh attestation verify YuzuAgentSetup-0.11.0.exe --repo Tr3kkR/Yuzu
-gh attestation verify yuzu-macos-arm64.tar.gz --repo Tr3kkR/Yuzu
+gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
+gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}"
+gh attestation verify yuzu-macos-arm64.tar.gz --repo "${SIGNER_REPO}"
 
 # Docker images (by digest)
 gh attestation verify \
-  oci://ghcr.io/tr3kkr/yuzu-server@sha256:<digest> \
-  --repo Tr3kkR/Yuzu
+  oci://ghcr.io/${OWNER}/yuzu-server@sha256:<digest> \
+  --repo "${SIGNER_REPO}"
 ```
 
 Success prints the attestation's predicate type
@@ -128,7 +158,7 @@ Success prints the attestation's predicate type
 commit SHA that produced the artifact.
 
 **Offline / air-gapped verification.** Download the attestation bundle
-with `gh attestation download <file> --repo Tr3kkR/Yuzu -o
+with `gh attestation download <file> --repo "$SIGNER_REPO" -o
 <file>.jsonl`, then verify offline with
 `gh attestation verify --bundle <file>.jsonl <file>`.
 
@@ -174,7 +204,14 @@ Drop-in script that runs steps 1–4 for a Linux x64 release download:
 set -euo pipefail
 
 VERSION="${1:?usage: verify.sh <version, e.g. 0.11.0>}"
-IDENTITY_RE="https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*"
+
+# Pick the pair for the release under verification -- see "Which owner applies
+# to your release". These MUST move together: OWNER decides where the image
+# lives, SIGNER_REPO decides what the certificate SAN must say.
+OWNER="${OWNER:-tr3kkr}"                   # devnullltd for releases after 2026-09-28
+SIGNER_REPO="${SIGNER_REPO:-Tr3kkR/Yuzu}"  # DevNullLtd/Yuzu for the same
+
+IDENTITY_RE="https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 echo "→ sha256sum -c SHA256SUMS"
@@ -192,13 +229,13 @@ for img in server gateway; do
   cosign verify \
     --certificate-identity-regexp "$IDENTITY_RE" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
-    "ghcr.io/tr3kkr/yuzu-${img}:${VERSION}" >/dev/null
-  echo "  ghcr.io/tr3kkr/yuzu-${img}:${VERSION} OK"
+    "ghcr.io/${OWNER}/yuzu-${img}:${VERSION}" >/dev/null
+  echo "  ghcr.io/${OWNER}/yuzu-${img}:${VERSION} OK"
 done
 
 echo "→ gh attestation verify (binary archives)"
 for f in yuzu-linux-x64.tar.gz yuzu-gateway-linux-x64.tar.gz; do
-  [[ -f "$f" ]] && gh attestation verify "$f" --repo Tr3kkR/Yuzu
+  [[ -f "$f" ]] && gh attestation verify "$f" --repo "${SIGNER_REPO}"
 done
 
 echo "✓ all checks passed for v${VERSION}"
@@ -232,7 +269,7 @@ the canonical `.sigstore` filename.
 
 **`gh attestation verify: no attestations found`** — run `gh auth login`
 first; the GitHub CLI must be able to query
-`/repos/Tr3kkR/Yuzu/attestations`. Unauthenticated queries are
+`/repos/<SIGNER_REPO>/attestations`. Unauthenticated queries are
 rate-limited and can return empty lists.
 
 **`cyclonedx validate: unable to parse`** — the CycloneDX CLI pins to

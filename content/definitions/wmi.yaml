@@ -9,7 +9,9 @@ metadata:
   version: 1.0.0
   description: >
     Execute a WQL SELECT query against Windows Management Instrumentation.
-    Only SELECT statements are allowed.
+    Only SELECT statements are allowed, and the namespace must be one of
+    root\cimv2, root\wmi, or root\standardcimv2. Windows only — the wmi
+    plugin is unsupported on Linux and macOS.
   tags: [wmi, windows, inventory]
 spec:
   type: question
@@ -25,17 +27,23 @@ spec:
       wql:
         type: string
         displayName: WQL Query
-        description: A WQL SELECT statement (e.g., "SELECT * FROM Win32_OperatingSystem").
+        description: A WQL SELECT statement (e.g., "SELECT * FROM Win32_OperatingSystem"). Only SELECT statements are allowed; anything else is rejected before the query runs.
       namespace:
         type: string
         displayName: WMI Namespace
-        description: WMI namespace (default root\cimv2).
+        description: WMI namespace to query — one of root\cimv2 (default), root\wmi, or root\standardcimv2; any other value is rejected.
   result:
     columns:
       - name: property
         type: string
+        description: 'The non-system WMI property name for one output row; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name).'
+        example: Caption
+        platforms: [windows]
       - name: value
         type: string
+        description: 'The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text.'
+        example: Microsoft Windows 11 Pro
+        platforms: [windows]
   approval:
     mode: auto
   permissions:
@@ -55,7 +63,10 @@ metadata:
   displayName: WMI Get Instance
   version: 1.0.0
   description: >
-    Get all properties of the first instance of a WMI class.
+    Return the non-null, non-empty, non-array properties of the first
+    instance of a WMI class in the given namespace, bounded to a single
+    instance and a ~5s enumeration deadline. Windows only — the wmi plugin
+    is unsupported on Linux and macOS.
   tags: [wmi, windows, inventory]
 spec:
   type: question
@@ -71,16 +82,23 @@ spec:
       class:
         type: string
         displayName: WMI Class
-        description: WMI class name (e.g., Win32_OperatingSystem).
+        description: WMI class name, alphanumeric and underscores only (e.g., Win32_OperatingSystem) — the plugin runs `SELECT * FROM <class>` against it.
       namespace:
         type: string
         displayName: WMI Namespace
+        description: WMI namespace to query — one of root\cimv2 (default), root\wmi, or root\standardcimv2; any other value is rejected.
   result:
     columns:
       - name: property
         type: string
+        description: 'The non-system WMI property name for one property of the first matching instance; null/empty/array-typed properties are omitted rather than reported as empty. Values: free text (WMI property name).'
+        example: BootDevice
+        platforms: [windows]
       - name: value
         type: string
+        description: 'The stringified WMI property value — BSTR text passed through, numeric VARIANTs formatted as decimal text, booleans as `true`/`false`. Values: free text.'
+        example: \Device\HarddiskVolume1
+        platforms: [windows]
   approval:
     mode: auto
   permissions:

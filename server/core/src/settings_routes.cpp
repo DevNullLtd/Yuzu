@@ -4,17 +4,36 @@
 
 #include "settings_routes.hpp"
 
+#include "ota_signature_sidecar.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
+
+#include <atomic>
+#include <cstdio>
+
+#include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
+#include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
+#include "deprovision_revoke.hpp" // ADR-2001 §§1,3: dashboard user DELETE revoke seam
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
+#include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
+#include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
+#include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
+#include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
+#include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
+#include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
+#include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/scim_store.hpp> // ScimStore::is_open (deprovision resolver, ADR-2001)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -209,14 +228,21 @@ std::string highlight_yaml_kv(const std::string& line) {
     return errors;
 }
 
-std::string extract_json_string(const std::string& body, const std::string& key) {
-    try {
-        auto j = nlohmann::json::parse(body);
-        if (j.contains(key) && j[key].is_string()) {
-            return j[key].get<std::string>();
-        }
-    } catch (...) {}
-    return {};
+// extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
+// lives in namespace yuzu::server, so this unqualified name still resolves.
+
+// #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
+// shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
+// is TU-local to rest_api_v1.cpp (declared in its own anonymous namespace,
+// not a shared header), so this file — which already builds every response
+// via nlohmann::json rather than rest_api_v1.cpp's local JObj/JArr string
+// builders (see the existing /api/v1/agent/plugin-policy handler below) —
+// gets its own copy of the same shape rather than reaching across TUs.
+nlohmann::json settings_ok_envelope(nlohmann::json data) {
+    nlohmann::json out;
+    out["data"] = std::move(data);
+    out["meta"] = {{"api_version", "v1"}};
+    return out;
 }
 
 } // anonymous namespace
@@ -224,53 +250,96 @@ std::string extract_json_string(const std::string& body, const std::string& key)
 // ── Fragment renderers ──────────────────────────────────────────────────────
 
 std::string SettingsRoutes::render_server_config_fragment() {
+    // #4028 — shared builder (settings_model.hpp); the REST twin
+    // GET /api/v1/settings/server-config formats the SAME JSON as its
+    // response body instead of re-deriving these fields from cfg_.
+    const auto v = settings_model::build_server_config_settings(*cfg_);
+
     std::string html;
 
     html += "<table class=\"user-table\" style=\"font-size:0.8rem\">"
             "<thead><tr><th>Setting</th><th>Value</th></tr></thead>"
             "<tbody>";
 
-    html += "<tr><td>Agent gRPC Address</td><td><code>" + html_escape(cfg_->listen_address) +
-            "</code></td></tr>";
+    html += "<tr><td>Agent gRPC Address</td><td><code>" +
+            html_escape(v.at("agent_grpc_address").get<std::string>()) + "</code></td></tr>";
     html += "<tr><td>Management gRPC Address</td><td><code>" +
-            html_escape(cfg_->management_address) + "</code></td></tr>";
-    html += "<tr><td>Web UI Address</td><td><code>" + html_escape(cfg_->web_address) +
+            html_escape(v.at("management_grpc_address").get<std::string>()) + "</code></td></tr>";
+    html += "<tr><td>Web UI Address</td><td><code>" +
+            html_escape(v.at("web_address").get<std::string>()) + "</code></td></tr>";
+    html += "<tr><td>Web UI Port</td><td><code>" + std::to_string(v.at("web_port").get<int>()) +
             "</code></td></tr>";
-    html +=
-        "<tr><td>Web UI Port</td><td><code>" + std::to_string(cfg_->web_port) + "</code></td></tr>";
 
     html += "<tr><td>Session Timeout</td><td><code>" +
-            std::to_string(cfg_->session_timeout.count()) + "s</code></td></tr>";
-    html += "<tr><td>Max Agents</td><td><code>" + std::to_string(cfg_->max_agents) +
-            "</code></td></tr>";
+            std::to_string(v.at("session_timeout_seconds").get<std::int64_t>()) +
+            "s</code></td></tr>";
+    html += "<tr><td>Max Agents</td><td><code>" +
+            std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
 
-    std::string auth_path_str = cfg_->auth_config_path.empty()
-                                    ? std::string("(default)")
-                                    : html_escape(cfg_->auth_config_path.string());
+    std::string auth_path = v.at("auth_config_path").get<std::string>();
+    std::string auth_path_str =
+        auth_path.empty() ? std::string("(default)") : html_escape(auth_path);
     html += "<tr><td>Auth Config Path</td><td><span class=\"file-name\">" + auth_path_str +
             "</span></td></tr>";
 
-    html += "<tr><td>API Rate Limit</td><td><code>" + std::to_string(cfg_->rate_limit) +
+    html += "<tr><td>API Rate Limit</td><td><code>" +
+            std::to_string(v.at("rate_limit_per_ip").get<int>()) + "</code> req/s per IP</td></tr>";
+    html += "<tr><td>Login Rate Limit</td><td><code>" +
+            std::to_string(v.at("login_rate_limit_per_ip").get<int>()) +
             "</code> req/s per IP</td></tr>";
-    html += "<tr><td>Login Rate Limit</td><td><code>" + std::to_string(cfg_->login_rate_limit) +
-            "</code> req/s per IP</td></tr>";
+
+    // Agent OTA pull bounds (#913 / #911). Read-only, like every row here.
+    html += "<tr><td>OTA Concurrency (per peer)</td><td><code>" +
+            std::to_string(v.at("ota_max_concurrent_per_peer").get<int>()) +
+            "</code> parallel downloads</td></tr>";
+    // Format the two doubles to one decimal place: std::to_string renders a
+    // double as "1.000000", which is the only row on this fragment that does not
+    // read like a configured value.
+    {
+        char rate_buf[64];
+        std::snprintf(rate_buf, sizeof(rate_buf), "%.1f",
+                      v.at("ota_rate_refill_per_min").get<double>());
+        char burst_buf[64];
+        std::snprintf(burst_buf, sizeof(burst_buf), "%.1f", v.at("ota_rate_capacity").get<double>());
+        html += std::string("<tr><td>OTA Rate (per peer)</td><td><code>") + rate_buf +
+                "</code>/min, burst <code>" + burst_buf + "</code></td></tr>";
+    }
+    html += "<tr><td>OTA Transfers (server-wide)</td><td><code>" +
+            std::to_string(v.at("ota_max_concurrent_total").get<int>()) +
+            "</code> concurrent</td></tr>";
+    html += "<tr><td>OTA Peer Map Cap</td><td><code>" +
+            std::to_string(v.at("ota_max_peers_tracked").get<int>()) + "</code> keys</td></tr>";
+    html += "<tr><td>OTA Transfer Deadline</td><td><code>" +
+            std::to_string(v.at("ota_transfer_deadline_secs").get<int>()) +
+            "</code> s (chunk <code>" +
+            std::to_string(v.at("ota_chunk_write_deadline_secs").get<int>()) + "</code> s)</td></tr>";
+    html += "<tr><td>gRPC Stream Cap</td><td><code>" +
+            std::to_string(v.at("grpc_max_concurrent_streams").get<int>()) +
+            "</code> streams/connection, quota <code>" +
+            std::to_string(v.at("grpc_max_resource_memory_mb").get<int>()) + "</code> MiB</td></tr>";
 
     html += "</tbody></table>";
     return html;
 }
 
 std::string SettingsRoutes::render_tls_fragment() {
-    std::string checked = cfg_->tls_enabled ? " checked" : "";
-    std::string status_color = cfg_->tls_enabled ? "#3fb950" : "#f85149";
-    std::string status_text = cfg_->tls_enabled ? "Enabled" : "Disabled";
-    std::string fields_opacity = cfg_->tls_enabled ? "1" : "0.4";
+    // #4028 — shared builder; GET /api/v1/settings/tls formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_tls_settings(*cfg_);
+    const bool tls_enabled = v.at("enabled").get<bool>();
 
-    std::string cert_name =
-        cfg_->tls_server_cert.empty() ? "No file" : html_escape(cfg_->tls_server_cert.string());
-    std::string key_name =
-        cfg_->tls_server_key.empty() ? "No file" : html_escape(cfg_->tls_server_key.string());
-    std::string ca_name =
-        cfg_->tls_ca_cert.empty() ? "No file" : html_escape(cfg_->tls_ca_cert.string());
+    std::string checked = tls_enabled ? " checked" : "";
+    std::string status_color = tls_enabled ? "#3fb950" : "#f85149";
+    std::string status_text = tls_enabled ? "Enabled" : "Disabled";
+    std::string fields_opacity = tls_enabled ? "1" : "0.4";
+
+    auto path_or_no_file = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "No file" : html_escape(s);
+    };
+    std::string cert_name = path_or_no_file(v.at("server_cert_path"));
+    std::string key_name = path_or_no_file(v.at("server_key_path"));
+    std::string ca_name = path_or_no_file(v.at("ca_cert_path"));
 
     std::string html =
         "<form id=\"tls-form\">"
@@ -409,8 +478,9 @@ std::string SettingsRoutes::render_tls_fragment() {
 
     // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
     // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    std::string owt_color = cfg_->allow_one_way_tls ? "#f85149" : "#8b949e";
-    std::string owt_text = cfg_->allow_one_way_tls
+    const bool insecure_skip = v.at("insecure_skip_client_verify").get<bool>();
+    std::string owt_color = insecure_skip ? "#f85149" : "#8b949e";
+    std::string owt_text = insecure_skip
                                ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
                                : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
@@ -421,15 +491,13 @@ std::string SettingsRoutes::render_tls_fragment() {
             "</div>";
 
     // Management TLS overrides
-    std::string mgmt_cert = cfg_->mgmt_tls_server_cert.empty()
-                                ? "Using agent TLS"
-                                : html_escape(cfg_->mgmt_tls_server_cert.string());
-    std::string mgmt_key = cfg_->mgmt_tls_server_key.empty()
-                               ? "Using agent TLS"
-                               : html_escape(cfg_->mgmt_tls_server_key.string());
-    std::string mgmt_ca = cfg_->mgmt_tls_ca_cert.empty()
-                              ? "Using agent TLS"
-                              : html_escape(cfg_->mgmt_tls_ca_cert.string());
+    auto path_or_using_agent = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "Using agent TLS" : html_escape(s);
+    };
+    std::string mgmt_cert = path_or_using_agent(v.at("mgmt_server_cert_path"));
+    std::string mgmt_key = path_or_using_agent(v.at("mgmt_server_key_path"));
+    std::string mgmt_ca = path_or_using_agent(v.at("mgmt_ca_cert_path"));
 
     html +=
         "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
@@ -732,13 +800,21 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     // fleet view while regular users see only their own tokens. Closes the
     // cross-user token enumeration path that governance Gate 4 consistency
     // auditor flagged as BLOCKING (finding C1).
-    auto tokens = api_token_store_->list_tokens(filter_principal);
+    auto tokens_res = api_token_store_->list_tokens(filter_principal);
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Owner</th>"
                        "  <th>Created</th><th>Expires</th><th>Last Used</th>"
                        "  <th>Status</th><th></th></tr></thead>"
                        "  <tbody>";
 
+    if (!tokens_res.has_value()) {
+        // Authoritative store (ADR-0012 §1): surface a read failure rather than
+        // render an empty "No API tokens" table that could hide a live credential.
+        html += "<tr><td colspan=\"9\" style=\"color:#f85149\">"
+                "Token store unavailable — please retry.</td></tr></tbody></table>";
+        return html;
+    }
+    const auto& tokens = *tokens_res;
     if (tokens.empty()) {
         html += "<tr><td colspan=\"9\" style=\"color:#484f58\">No API tokens created</td></tr>";
     } else {
@@ -851,6 +927,626 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+std::string SettingsRoutes::render_engine_principals_fragment() {
+    if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+        return "<span style=\"color:#484f58\">Engine Principals store unavailable "
+               "(not configured — requires PostgreSQL, design doc §3.1).</span>";
+    }
+
+    auto fmt_epoch = [](int64_t epoch) -> std::string {
+        if (epoch == 0)
+            return "—";
+        auto tt = static_cast<std::time_t>(epoch);
+        std::tm tm_buf{};
+#ifdef _WIN32
+        gmtime_s(&tm_buf, &tt);
+#else
+        gmtime_r(&tt, &tm_buf);
+#endif
+        char buf[32]{};
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
+        return std::string(buf) + " UTC";
+    };
+
+    // Admin/auditor list surface — every engine principal, any lifecycle
+    // state, so revoked rows stay visible (never quietly dropped from the
+    // console — design doc §3.1 / §12 decision 1).
+    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+
+    std::string html = "<table class=\"user-table\">"
+                       "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
+                       "  <th>Classification</th><th>Lifecycle</th><th>Active Creds</th>"
+                       "  <th>Revocation</th><th></th></tr></thead>"
+                       "  <tbody>";
+
+    if (principals.empty()) {
+        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">No engine principals</td></tr>";
+    } else {
+        for (const auto& p : principals) {
+            const bool active = p.lifecycle_state == "active";
+            const std::string status_cls = active ? "role-admin" : "role-user";
+            const std::string status_txt = active ? "Active" : "Revoked";
+
+            std::size_t active_creds = 0;
+            if (api_token_store_ && api_token_store_->is_open()) {
+                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            }
+
+            // Revoked rows MUST surface the `superseded_by` linkage AND the
+            // recorded revoke detail explicitly (design doc §3.1 / §12
+            // decision 1) — never a seamless merged history that hides that
+            // a revocation occurred. `EnginePrincipalRow` carries no reason
+            // column of its own (`revoke()` takes no reason parameter —
+            // store schema is frozen for this PR); best-effort recover the
+            // audit trail's own detail string, which the REAL REST DELETE
+            // route (rest_api_v1.cpp) records as
+            // "credentials_revoked=N[; superseded_by=X]" — NOT an
+            // operator-supplied free-text reason (the route has no such
+            // field; an earlier draft of this fragment assumed one).
+            // Two DIFFERENT outcomes, distinguished: "(not recorded)" when the
+            // store answered and had no such row, "(unavailable)" when it could
+            // not answer at all. Collapsing them would state an absence the read
+            // never established — the revocation facts beside it come from the
+            // principal store and are unaffected either way.
+            std::string revocation_cell = "—";
+            if (!active) {
+                std::string linkage =
+                    p.superseded_by.empty()
+                        ? "<em style=\"color:#484f58\">no successor recorded</em>"
+                        : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
+                std::string audit_detail = "(not recorded)";
+                if (audit_store_) {
+                    AuditQuery q;
+                    q.target_type = "EnginePrincipal";
+                    q.target_id = p.principal_id;
+                    q.action_prefixes = {"engine_principal.revoke"};
+                    q.limit = 1;
+                    // Best-effort HTML cell (not an evidence endpoint): on a
+                    // degrade (nullopt, ADR-0040) say so rather than 503-ing the
+                    // whole settings page.
+                    auto events = audit_store_->query(q);
+                    if (!events)
+                        audit_detail = "(unavailable)";
+                    else if (!events->empty() && !events->front().detail.empty())
+                        audit_detail = events->front().detail;
+                }
+                revocation_cell = linkage +
+                                  "<br><span style=\"font-size:0.7rem;color:"
+                                  "var(--mds-color-theme-text-tertiary)\">Detail: " +
+                                  html_escape(audit_detail) + "</span>";
+                if (p.revoked_at > 0) {
+                    revocation_cell += "<br><span style=\"font-size:0.7rem;color:"
+                                        "var(--mds-color-theme-text-tertiary)\">" +
+                                        fmt_epoch(p.revoked_at) + "</span>";
+                }
+            }
+
+            html += "<tr><td><code>" + html_escape(p.principal_id) +
+                    "</code></td>"
+                    "<td>" +
+                    html_escape(p.display_name) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(p.owner_username) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(p.classification) +
+                    "</td>"
+                    "<td><span class=\"role-badge " +
+                    status_cls + "\">" + status_txt +
+                    "</span></td>"
+                    "<td>" +
+                    std::to_string(active_creds) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    revocation_cell +
+                    "</td>"
+                    "<td>";
+
+            if (active) {
+                // Every mutation form below is a PLAIN <form> — deliberately
+                // NO hx-post/hx-target/hx-swap. The real REST surface
+                // (rest_api_v1.cpp's /api/v1/engine-principals/*) parses a
+                // JSON body (`nlohmann::json::parse(req.body, ...)`), but
+                // htmx's native form submission serializes
+                // `application/x-www-form-urlencoded` — every one of those
+                // routes would 400 "invalid JSON" if htmx submitted them
+                // directly (there is no bundled json-enc extension). The
+                // page's body-level delegated `submit` listener
+                // (settings_ui.cpp) intercepts these via their
+                // `data-engine-action`/`data-principal-id` markers, builds
+                // the JSON body itself, and does a plain `fetch()` — the
+                // SAME pattern instruction_ui.cpp's execute-instruction
+                // button already uses for a JSON REST endpoint. That
+                // listener also fires `refreshEnginePrincipals` on success
+                // (the fragment's own `hx-trigger` above listens for it) and
+                // extracts a freshly-minted/rotated secret from the response
+                // body's real key (`data.token`, under the `ok_json`
+                // envelope's `data` wrapper) into #engine-principal-reveal
+                // below — never the guessed `token|raw_token|secret|
+                // raw_secret` union an earlier draft used before the actual
+                // route was read.
+                //
+                // `data-confirm` is a plain string the same listener passes
+                // to `window.confirm()` before firing the request — NOT
+                // htmx's own `hx-confirm` (that only fires for htmx-owned
+                // hx-post/hx-get triggers, which these forms deliberately
+                // are not).
+                if (active_creds == 0) {
+                    // No live credential yet — this principal needs an
+                    // initial mint (POST .../credentials), not a rotate
+                    // (rotate_engine_credential requires exactly one active
+                    // credential already).
+                    html += "<form style=\"display:inline\" data-engine-action=\"mint\" "
+                            "data-principal-id=\"" +
+                            html_escape(p.principal_id) +
+                            "\">"
+                            "<input type=\"hidden\" name=\"ttl_days\" value=\"90\">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                            "Mint</button></form> ";
+                } else {
+                    // Rotate credential — overlap-pair rotation (design doc §7).
+                    html += "<form style=\"display:inline\" data-engine-action=\"rotate\" "
+                            "data-principal-id=\"" +
+                            html_escape(p.principal_id) +
+                            "\">"
+                            "<input type=\"hidden\" name=\"overlap_secs\" value=\"86400\">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "data-confirm=\"Rotate credential for &quot;" +
+                            html_escape(p.principal_id) +
+                            "&quot;? A 24h overlap window keeps both credentials valid.\">"
+                            "Rotate</button></form> ";
+                }
+
+                // Admin-forced owner transfer — never depends on the
+                // outgoing owner's cooperation (design doc §3.1).
+                html += "<form style=\"display:inline\" data-engine-action=\"transfer\" "
+                        "data-principal-id=\"" +
+                        html_escape(p.principal_id) +
+                        "\">"
+                        "<input type=\"text\" name=\"new_owner\" placeholder=\"new owner\" "
+                        "style=\"width:90px;font-size:0.7rem\" required>"
+                        "<button class=\"btn btn-secondary\" type=\"submit\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                        "Transfer</button></form> ";
+
+                // Revoke — terminal, never un-revocable (design doc §3.1 /
+                // §12 decision 1). The REST DELETE route's only body field
+                // is the OPTIONAL `superseded_by` (a revoke-and-replace
+                // link) — it has no operator-reason field at all, so this
+                // input is optional, not required (an earlier draft
+                // required a free-text "reason" the route never consumed).
+                html += "<form style=\"display:inline\" data-engine-action=\"revoke\" "
+                        "data-principal-id=\"" +
+                        html_escape(p.principal_id) +
+                        "\">"
+                        "<input type=\"text\" name=\"superseded_by\" "
+                        "placeholder=\"successor id (optional)\" "
+                        "style=\"width:130px;font-size:0.7rem\">"
+                        "<button class=\"btn btn-danger\" type=\"submit\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "data-confirm=\"Revoke engine principal &quot;" +
+                        html_escape(p.principal_id) +
+                        "&quot;? This is TERMINAL — never un-revocable; recovery mints a "
+                        "successor.\">Revoke</button></form>";
+            }
+
+            html += "</td></tr>";
+        }
+    }
+
+    html += "  </tbody></table>";
+
+    // NOTE: the one-time-reveal target (#engine-principal-reveal) is
+    // DELIBERATELY NOT emitted here — it lives in the static page shell
+    // (settings_ui.cpp), OUTSIDE this fragment's own auto-refreshing
+    // container. This fragment's entire innerHTML is replaced on every
+    // `refreshEnginePrincipals` trigger — including the one a successful
+    // mint/rotate fires immediately after populating the reveal panel — so
+    // a reveal element nested in here would be wiped the instant it
+    // appeared. See settings_ui.cpp's comment at the same id.
+
+    // Plain <form> (no hx-post) — same JSON-vs-form-urlencoded reasoning as
+    // the per-row mutation forms above; the body-level submit listener
+    // (settings_ui.cpp) builds the REST route's actual JSON body
+    // `{slug, display_name, owner_username, justification, classification}`
+    // (the route derives `principal_id = "engine:" + slug` itself — the
+    // field the form submits is the bare slug, not a pre-built
+    // "engine:"-prefixed principal_id).
+    html += "<form class=\"add-user-form\" data-engine-action=\"create\">"
+            "  <div class=\"mini-field\">"
+            "    <label>Slug</label>"
+            "    <input type=\"text\" name=\"slug\" placeholder=\"vuln-uce\" "
+            "style=\"width:140px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Display Name</label>"
+            "    <input type=\"text\" name=\"display_name\" placeholder=\"Vuln UCE\" "
+            "style=\"width:120px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Owner</label>"
+            "    <input type=\"text\" name=\"owner_username\" placeholder=\"username\" "
+            "style=\"width:100px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Classification</label>"
+            "    <select name=\"classification\" style=\"width:90px\" required>"
+            "      <option value=\"internal\">internal</option>"
+            "      <option value=\"external\">external</option>"
+            "    </select>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Justification</label>"
+            "    <input type=\"text\" name=\"justification\" placeholder=\"grant reason\" "
+            "style=\"width:140px\" required>"
+            "  </div>"
+            "  <button class=\"btn btn-primary\" type=\"submit\">Create</button>"
+            "</form>"
+            "<div class=\"feedback\" id=\"engine-principal-feedback\"></div>";
+
+    return html;
+}
+
+namespace {
+
+/// Format an epoch-milliseconds timestamp for display; 0 -> "n/a" (matches
+/// AccessReviewRow::last_activity_ms / AccessReviewAttestationRow::
+/// decided_at_ms's "0 = unknown/not yet" convention).
+std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
+    if (epoch_ms == 0)
+        return "n/a";
+    auto tt = static_cast<std::time_t>(epoch_ms / 1000);
+    std::tm tm_buf{};
+#ifdef _WIN32
+    gmtime_s(&tm_buf, &tt);
+#else
+    gmtime_r(&tt, &tm_buf);
+#endif
+    char buf[32]{};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
+    return std::string(buf) + " UTC";
+}
+
+/// The self-contained JS helper block for the Access Reviews fragment's
+/// write actions. Emitted ONCE, inside the top-level fragment
+/// (render_access_review_fragment) — the campaign sub-fragment is always
+/// swapped as a DESCENDANT of that fragment's DOM (see #ar-campaign below),
+/// so these globals stay available across every `arLoadCampaign` refresh
+/// without re-declaring them. htmx re-executes inline <script> tags found in
+/// swapped content (`allowScriptTags` default true — see static_js_bundle.cpp),
+/// but redeclaring `function` statements is itself harmless in JS, so a
+/// double-load (e.g. re-selecting the Settings nav item) is not a bug either
+/// way.
+///
+/// Deliberately plain `fetch()`, not `hx-post` — the target REST endpoints
+/// (rest_api_v1.cpp) parse a JSON body (`nlohmann::json::parse(req.body)`,
+/// no bundled json-enc extension), while htmx's native form/attribute
+/// submission serializes `application/x-www-form-urlencoded` and would 400
+/// "invalid JSON". Same reasoning + precedent as the Engine Principals
+/// fragment's data-engine-action forms above. Also CSP-safe: a plain
+/// `onclick="arFoo(this)"` attribute (allowed by `unsafe-inline`), never
+/// `hx-on` (blocked — compiles via `new Function()`, `unsafe-eval` is not
+/// granted).
+const char* const kAccessReviewScript = R"JS(
+<script>
+function arFeedback(msg, isError) {
+  var fb = document.getElementById('ar-feedback');
+  if (!fb) return;
+  fb.textContent = msg;
+  fb.style.color = isError ? '#f85149' : '#3fb950';
+}
+function arPost(url, body, onSuccess) {
+  fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  }).then(function (r) {
+    return r.text().then(function (t) {
+      var data = {};
+      try { data = JSON.parse(t); } catch (e) {}
+      if (!r.ok) {
+        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        arFeedback(msg, true);
+        return;
+      }
+      arFeedback('Done.', false);
+      if (onSuccess) onSuccess(data);
+    });
+  }).catch(function () {
+    arFeedback('Network error — the action may not have applied', true);
+  });
+}
+function arLoadCampaign(id) {
+  htmx.ajax('GET', '/fragments/settings/access-reviews/campaign?id=' + encodeURIComponent(id),
+            {target: '#ar-campaign', swap: 'innerHTML'});
+}
+function arOpenCampaign(form) {
+  var title = (form.elements['title'].value || '').trim();
+  if (!title) return false;
+  arPost('/api/v1/access-reviews', {title: title}, function (data) {
+    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+  });
+  return false;
+}
+function arAttest(btn) {
+  var d = btn.dataset;
+  if (d.decision === 'flagged_revoke' &&
+      !window.confirm('Flag ' + d.principalType + ' "' + d.principalId + '" role "' + d.roleName +
+                       '" for revocation? This records evidence only — it does NOT revoke the grant.')) {
+    return;
+  }
+  var row = btn.closest('tr');
+  var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
+    principal_type: d.principalType,
+    principal_id: d.principalId,
+    role_name: d.roleName,
+    decision: d.decision,
+    justification: justEl ? justEl.value : ''
+  }, function () { arLoadCampaign(d.campaignId); });
+}
+function arCloseCampaign(btn) {
+  var id = btn.dataset.campaignId;
+  if (!window.confirm('Close review campaign ' + id + '? An incomplete review can still be closed.'))
+    return;
+  arPost('/api/v1/access-reviews/' + encodeURIComponent(id) + '/close', null,
+         function () { arLoadCampaign(id); });
+}
+</script>
+)JS";
+
+} // namespace
+
+std::string SettingsRoutes::render_access_review_fragment(const httplib::Request& req) {
+    // Periodic Access Reviews (SOC 2 CC6.2). This dashboard fragment is a
+    // CONVENIENCE surface only — GET /api/v1/access-reviews/export and the
+    // full /api/v1/access-reviews* campaign lifecycle (rest_api_v1.cpp) plus
+    // their MCP twins are the ADR-1005 API-parity surface; the write
+    // controls below call those same REST routes directly (see
+    // kAccessReviewScript) rather than duplicating AccessReviewStore writes
+    // in this file.
+    // NOTE: deliberately no outer `<div id="access-review-section">` wrapper
+    // here — that id belongs to the STATIC shell div in settings_ui.cpp
+    // (hx-swap="innerHTML" target); this fragment's output becomes that
+    // div's inner content, mirroring render_api_tokens_fragment's convention.
+    std::string html;
+    html += kAccessReviewScript;
+    html += "<div class=\"feedback\" id=\"ar-feedback\"></div>";
+
+    html += "<div style=\"margin-bottom:0.75rem\">"
+            "<a class=\"btn btn-secondary\" style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
+            "href=\"/api/v1/access-reviews/export?format=csv\">Download CSV</a>"
+            "</div>";
+
+    auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+    auto rows_res = build_access_review(auth_db, rbac_store_, engine_principal_store_,
+                                        api_token_store_, directory_sync_);
+
+    html += "<table class=\"user-table\">"
+            "<thead><tr><th>Principal</th><th>Roles</th><th>Perms</th>"
+            "<th>Last activity</th><th>Classification</th><th>Lifecycle</th><th>Source</th>"
+            "</tr></thead><tbody>";
+
+    if (!rows_res.has_value()) {
+        // Mirrors render_api_tokens_fragment's read-failure posture (ADR-0012
+        // §1): surface the failure rather than render an empty table that
+        // could be misread as "zero grants exist" — a false negative in
+        // exactly the evidence this feature exists to produce.
+        html += "<tr><td colspan=\"7\" style=\"color:#f85149\">Access review data unavailable (" +
+                html_escape(rows_res.error()) + ") — please retry.</td></tr></tbody></table>";
+        return html;
+    }
+
+    const auto& rows = *rows_res;
+    if (rows.empty()) {
+        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">No principals found</td></tr>";
+    } else {
+        // Render-capped so a large RBAC population can't emit an unbounded
+        // HTML fragment (mirrors inventory_ui.cpp's kDeviceRenderCap
+        // pattern) — the CSV export above is the authoritative full-set
+        // evidence surface, not this table.
+        constexpr std::size_t kAccessReviewRenderCap = 1000;
+        const std::size_t total = rows.size();
+        const std::size_t shown = total > kAccessReviewRenderCap ? kAccessReviewRenderCap : total;
+        for (std::size_t i = 0; i < shown; ++i) {
+            const auto& r = rows[i];
+            std::string roles_joined;
+            for (std::size_t j = 0; j < r.roles.size(); ++j) {
+                if (j)
+                    roles_joined += ", ";
+                roles_joined += r.roles[j];
+            }
+            std::string principal_label =
+                r.display_name.empty() ? r.principal_id : r.display_name;
+            std::string last_activity = r.last_activity_ms == 0
+                                            ? "n/a"
+                                            : ar_fmt_epoch_ms(r.last_activity_ms) + " (" +
+                                                  r.last_activity_kind + ")";
+
+            html += "<tr><td><span class=\"role-badge\">" + html_escape(r.principal_type) +
+                    "</span> " + html_escape(principal_label);
+            if (!r.owner_or_email.empty()) {
+                html += "<br><span style=\"font-size:0.7rem;color:"
+                        "var(--mds-color-theme-text-tertiary)\">" +
+                        html_escape(r.owner_or_email) + "</span>";
+            }
+            html += "</td>"
+                    "<td style=\"font-size:0.8rem\">" +
+                    html_escape(roles_joined) +
+                    "</td>"
+                    "<td>" +
+                    std::to_string(r.effective_permission_count) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    html_escape(last_activity) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.classification) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.lifecycle_state) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.source) +
+                    "</td></tr>";
+        }
+        html += "</tbody></table>";
+        if (total > kAccessReviewRenderCap) {
+            html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.3rem\">Showing " +
+                    std::to_string(shown) + " of " + std::to_string(total) +
+                    " principals — the CSV export above has the complete evidence set.</div>";
+        }
+    }
+    if (rows.empty())
+        html += "</tbody></table>";
+
+    // Open-review-campaign control — probed against a throwaway response so
+    // a read-only auditor gets an honest omission rather than a swallowed
+    // 403 (mirrors dex_routes.cpp's can_execute pattern). The probe is
+    // against the SAME securable:operation the REST POST route itself
+    // gates (AccessReview:Attest).
+    httplib::Response probe;
+    bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
+
+    if (can_attest) {
+        html += "<form onsubmit=\"return arOpenCampaign(this)\" "
+                "style=\"display:flex;gap:0.5rem;align-items:flex-end;margin-top:1rem\">"
+                "<div class=\"mini-field\" style=\"flex:1\">"
+                "<label>Campaign title</label>"
+                "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
+                "required>"
+                "</div>"
+                "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
+                "</form>";
+    }
+
+    std::string campaign_id = req.has_param("campaign_id") ? req.get_param_value("campaign_id") : "";
+    html += render_access_review_campaign_fragment(req, campaign_id);
+
+    return html;
+}
+
+std::string
+SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& req,
+                                                        const std::string& campaign_id) {
+    std::string html = "<div id=\"ar-campaign\">";
+    if (campaign_id.empty()) {
+        html += "</div>";
+        return html;
+    }
+
+    if (!access_review_store_ || !access_review_store_->is_open()) {
+        html += "<div style=\"color:#f85149\">Access review campaign store unavailable — "
+                "please retry.</div></div>";
+        return html;
+    }
+
+    auto view_res = access_review_store_->get_campaign(campaign_id);
+    if (!view_res.has_value()) {
+        // Covers both the store's machine-checkable "not_found: ..." (unknown
+        // campaign id) and a genuine read failure — either way, an honest
+        // notice rather than a blank panel.
+        html += "<div style=\"color:#f85149\">" + html_escape(view_res.error()) + "</div></div>";
+        return html;
+    }
+    const auto& view = *view_res;
+
+    httplib::Response probe;
+    bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
+    bool is_open_campaign = view.campaign.status == "open";
+
+    html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
+            " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
+            "\">" + html_escape(view.campaign.status) + "</span></h4>";
+    html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+            "margin-bottom:0.5rem\">" +
+            std::to_string(view.pending_count) + " pending of " +
+            std::to_string(view.attestations.size()) + " grant(s) reviewed — opened by " +
+            html_escape(view.campaign.created_by);
+    if (!view.campaign.closed_by.empty()) {
+        html += ", closed by " + html_escape(view.campaign.closed_by);
+    }
+    html += "</div>";
+
+    if (can_attest && is_open_campaign) {
+        html += "<button class=\"btn btn-secondary\" "
+                "style=\"padding:0.3rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem\" "
+                "data-campaign-id=\"" +
+                html_escape(campaign_id) + "\" onclick=\"arCloseCampaign(this)\">Close campaign</button>";
+    }
+
+    html += "<table class=\"user-table\"><thead><tr><th>Principal</th><th>Role</th>"
+            "<th>Decision</th><th>Reviewer</th><th>Decided</th>";
+    if (can_attest)
+        html += "<th>Justification</th><th></th>";
+    html += "</tr></thead><tbody>";
+
+    if (view.attestations.empty()) {
+        html += "<tr><td colspan=\"" + std::to_string(can_attest ? 7 : 5) +
+                "\" style=\"color:#484f58\">No frozen grants in this campaign</td></tr>";
+    } else {
+        for (const auto& a : view.attestations) {
+            bool pending = a.decision == "pending";
+            std::string decision_cls = pending || a.decision == "flagged_revoke" ? "role-user"
+                                                                                  : "role-admin";
+            html += "<tr><td><span class=\"role-badge\">" + html_escape(a.principal_type) +
+                    "</span> " + html_escape(a.principal_id) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(a.role_name) +
+                    "</td>"
+                    "<td><span class=\"role-badge " +
+                    decision_cls + "\">" + html_escape(a.decision) +
+                    "</span></td>"
+                    "<td>" +
+                    (a.reviewer.empty() ? "—" : html_escape(a.reviewer)) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
+            if (can_attest) {
+                html += "<td>";
+                if (pending && is_open_campaign) {
+                    html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
+                            "style=\"width:110px;font-size:0.7rem\">";
+                } else {
+                    html += a.justification.empty() ? "—" : html_escape(a.justification);
+                }
+                html += "</td><td>";
+                if (pending && is_open_campaign) {
+                    html += "<button class=\"btn btn-primary\" "
+                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                            "data-campaign-id=\"" +
+                            html_escape(campaign_id) + "\" data-principal-type=\"" +
+                            html_escape(a.principal_type) + "\" data-principal-id=\"" +
+                            html_escape(a.principal_id) + "\" data-role-name=\"" +
+                            html_escape(a.role_name) +
+                            "\" data-decision=\"attested\" "
+                            "onclick=\"arAttest(this)\">Attest</button> "
+                            "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                            "data-campaign-id=\"" +
+                            html_escape(campaign_id) + "\" data-principal-type=\"" +
+                            html_escape(a.principal_type) + "\" data-principal-id=\"" +
+                            html_escape(a.principal_id) + "\" data-role-name=\"" +
+                            html_escape(a.role_name) +
+                            "\" data-decision=\"flagged_revoke\" "
+                            "onclick=\"arAttest(this)\">Flag for revocation (records evidence; "
+                            "does not revoke)</button>";
+                }
+                html += "</td>";
+            }
+            html += "</tr>";
+        }
+    }
+    html += "</tbody></table></div>";
+    return html;
+}
+
 std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
@@ -947,7 +1643,23 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 
     auto status_res = auth_db->mfa_status(username);
     if (!status_res) {
-        return html + "<span style=\"color:#484f58\">User not found for MFA status.</span>";
+        // Read-only display path — no session/MFA-skip decision is made
+        // here either way, but ★ (architect BLOCK follow-through) the
+        // message must not misreport a store/decrypt failure
+        // (SecretUnavailable/QueryFailed) as "user not found" — that would
+        // mislead an operator into thinking the account is gone rather than
+        // that MFA state is temporarily unreadable (retry, don't panic).
+        const bool store_unavailable = is_store_unavailable(status_res.error());
+        if (store_unavailable && metrics_registry_) {
+            metrics_registry_
+                ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
+                .increment();
+        }
+        return html +
+               (store_unavailable
+                    ? "<span style=\"color:#484f58\">MFA status is temporarily unavailable "
+                      "(authentication store error) — retry shortly.</span>"
+                    : "<span style=\"color:#484f58\">User not found for MFA status.</span>");
     }
     const auto& status = *status_res;
 
@@ -1231,8 +1943,33 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             "<th>Allowed Values</th>"
             "</tr></thead><tbody>";
 
-    auto gaps = tag_store_ ? tag_store_->get_compliance_gaps()
-                           : std::vector<std::pair<std::string, std::vector<std::string>>>{};
+    // Two bulk reads (ADR-0050 — the pre-migration version issued up to nine
+    // queries per render: gaps + agents_with_tag per category twice over).
+    // Dashboard render caller: a degraded read returns an explicit error
+    // fragment rather than silently rendering "0 tagged / 0 missing" as if
+    // the fleet were compliant.
+    std::vector<std::pair<std::string, std::vector<std::string>>> gaps;
+    std::unordered_map<std::string, int> tagged_count;
+    size_t total_agents = 0;
+    if (tag_store_) {
+        auto gaps_res = tag_store_->get_compliance_gaps();
+        auto values_res = tag_store_->get_values_for_keys(
+            std::vector<std::string>(std::begin(kCategoryKeys), std::end(kCategoryKeys)));
+        if (!gaps_res || !values_res) {
+            return "<div style=\"color:#f85149\">Tag store unavailable — tag-compliance data "
+                   "cannot be read right now.</div>";
+        }
+        gaps = std::move(*gaps_res);
+        std::unordered_set<std::string> seen;
+        for (const auto& [aid, m] : gaps)
+            seen.insert(aid);
+        for (const auto& [aid, keys] : *values_res) {
+            seen.insert(aid);
+            for (const auto& [k, v] : keys)
+                tagged_count[k]++;
+        }
+        total_agents = seen.size();
+    }
 
     std::unordered_map<std::string, int> missing_count;
     for (const auto& [agent_id, missing] : gaps) {
@@ -1240,24 +1977,9 @@ std::string SettingsRoutes::render_tag_compliance_fragment() {
             missing_count[k]++;
     }
 
-    size_t total_agents = 0;
-    if (tag_store_) {
-        std::unordered_set<std::string> seen;
-        for (const auto& [aid, m] : gaps)
-            seen.insert(aid);
-        for (auto cat_key : kCategoryKeys) {
-            auto agents = tag_store_->agents_with_tag(std::string(cat_key));
-            for (const auto& a : agents)
-                seen.insert(a);
-        }
-        total_agents = seen.size();
-    }
-
     for (const auto& cat : categories) {
         std::string key_str(cat.key);
-        int tagged = 0;
-        if (tag_store_)
-            tagged = static_cast<int>(tag_store_->agents_with_tag(key_str).size());
+        int tagged = tagged_count.count(key_str) ? tagged_count[key_str] : 0;
         int missing = missing_count.count(key_str) ? missing_count[key_str] : 0;
 
         std::string vals_str;
@@ -1352,18 +2074,19 @@ std::string SettingsRoutes::render_management_groups_fragment() {
         }
 
         html += "<tr>";
-        html += "<td>" + indent + "<span style=\"" + name_style + "\">" + g->name + "</span></td>";
+        html += "<td>" + indent + "<span style=\"" + name_style + "\">" + html_escape(g->name) +
+                "</span></td>";
         html += "<td>" + type_badge + "</td>";
         html += "<td>" + std::to_string(member_count) + "</td>";
         html += "<td>";
         if (!is_root) {
             html += "<button class=\"btn btn-sm\" "
                     "hx-delete=\"/api/settings/management-groups/" +
-                    g->id +
+                    html_escape(g->id) +
                     "\" "
                     "hx-target=\"#mgmt-groups-section\" "
                     "hx-confirm=\"Delete group '" +
-                    g->name +
+                    html_escape(g->name) +
                     "' and all children?\" "
                     "style=\"font-size:0.7rem;padding:1px 6px;color:#f85149;border-color:#f85149"
                     "\">Delete</button>";
@@ -1404,7 +2127,7 @@ std::string SettingsRoutes::render_management_groups_fragment() {
             "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
             "<option value=\"\">— root —</option>";
     for (const auto& g : groups) {
-        html += "<option value=\"" + g.id + "\">" + g.name + "</option>";
+        html += "<option value=\"" + html_escape(g.id) + "\">" + html_escape(g.name) + "</option>";
     }
     html += "</select></div>"
             "<div><label style=\"font-size:0.7rem;color:#8b949e\">Type</label>"
@@ -1479,11 +2202,12 @@ std::string SettingsRoutes::render_updates_fragment() {
 
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Platform</th><th>Arch</th><th>Version</th>"
-            "<th>Size</th><th>Rollout</th><th>Mandatory</th><th></th></tr></thead>"
+            "<th>Size</th><th>Signed</th><th>Rollout</th><th>Mandatory</th><th></th>"
+            "</tr></thead>"
             "<tbody>";
 
     if (packages.empty()) {
-        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">"
+        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">"
                 "No update packages uploaded</td></tr>";
     } else {
         for (const auto& pkg : packages) {
@@ -1503,6 +2227,46 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "</code></td>"
                     "<td style=\"font-size:0.75rem\">" +
                     size_str +
+                    "</td>"
+                    // Read from disk, not from a stored flag: the sidecar is the
+                    // artifact an agent is actually served, so this shows what the
+                    // fleet will see rather than what the upload intended. Without
+                    // it an operator has no way to tell a signed package from an
+                    // unsigned one short of reading server logs.
+                    "<td style=\"font-size:0.75rem\">" +
+                    // The SAME decision CheckForUpdate makes, not just exists():
+                    // an over-cap, unreadable or zero-byte sidecar is present on
+                    // disk but served as UNSIGNED, so exists() alone would tell
+                    // the operator "signed" while every agent is told otherwise —
+                    // the one thing this column exists to prevent.
+                    (update_registry_ &&
+                     signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
+                         SidecarOutcome::kServed
+                         // A served signature that CANNOT cover the binary beside
+                         // it gets its own state. Reporting it as "signed" is the
+                         // worst of the three: the docs nominate this column as
+                         // the confirmation check, so the operator reads success
+                         // while every anchored agent refuses the package.
+                         ? (signature_sidecar_covers_binary(
+                                update_registry_->binary_path(pkg),
+                                update_registry_->signature_path(pkg))
+                                ? std::string("<span title=\"A detached signature is stored "
+                                              "for this package\">signed</span>")
+                                : std::string(
+                                      "<span style=\"color:#d29922\" title=\"The stored "
+                                      "signature is NEWER than the binary beside it, so it "
+                                      "cannot be confirmed to cover it. Usually an upload that "
+                                      "did not complete; a restore that did not preserve "
+                                      "timestamps looks the same. Agents refuse a signature "
+                                      "that does not verify, in both modes. Re-upload the "
+                                      "binary and its signature together to clear "
+                                      "it.\">signature mismatch</span>"))
+                         : std::string("<span style=\"color:#8b949e\" title=\"No usable "
+                                       "signature is being served: either none is stored, or "
+                                       "the stored one is unreadable, empty or over the size "
+                                       "cap (see the server log). Agents running "
+                                       "--update-require-signature will refuse this "
+                                       "package.\">unsigned</span>")) +
                     "</td>"
                     "<td>"
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
@@ -1564,6 +2328,17 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<div class=\"mini-field\">"
             "<label>Binary</label>"
             "<input type=\"file\" name=\"file\" required></div>"
+            // Optional detached CMS signature (#416/#3807). Without this input
+            // the documented signing workflow is unreachable from the UI and an
+            // operator would ship an unsigned package believing it signed.
+            // `mini-field`, matching every sibling in this inline row — `form-row`
+            // is the stacked full-width variant and breaks the row's layout.
+            "<div class=\"mini-field\">"
+            "<label>Signature <span class=\"muted\">(optional, .sig)</span></label>"
+            // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
+            // common names for the same detached CMS blob, and filtering the picker
+            // to one suffix hides the operator's actual file.
+            "<input type=\"file\" name=\"signature\"></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
             "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
@@ -1578,7 +2353,11 @@ std::string SettingsRoutes::render_updates_fragment() {
 }
 
 std::string SettingsRoutes::render_gateway_fragment() {
-    bool enabled = gateway_enabled_;
+    // #4028 — shared builder; GET /api/v1/settings/gateway formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+    const auto v = settings_model::build_gateway_settings(*cfg_, gateway_enabled_, count);
+    bool enabled = v.at("enabled").get<bool>();
     std::string status_color = enabled ? "#3fb950" : "#484f58";
     std::string status_text = enabled ? "Enabled" : "Disabled";
 
@@ -1595,23 +2374,24 @@ std::string SettingsRoutes::render_gateway_fragment() {
         html += "<div class=\"form-row\">"
                 "  <label>Listen Address</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->gateway_upstream_address) +
+                html_escape(v.at("listen_address").get<std::string>()) +
                 "</code>"
                 "</div>";
 
+        const bool gw_mode = v.at("gateway_mode").get<bool>();
         html += "<div class=\"form-row\">"
                 "  <label>Gateway Mode</label>"
                 "  <span style=\"font-size:0.8rem;color:" +
-                std::string(cfg_->gateway_mode ? "#3fb950" : "#8b949e") + "\">" +
-                (cfg_->gateway_mode ? "Active" : "Inactive") +
+                std::string(gw_mode ? "#3fb950" : "#8b949e") + "\">" +
+                (gw_mode ? "Active" : "Inactive") +
                 "</span>"
                 "</div>";
 
-        auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+        auto shown_count = v.at("active_sessions").get<std::int64_t>();
         html += "<div class=\"form-row\">"
                 "  <label>Active Sessions</label>"
                 "  <span style=\"font-size:0.8rem\">" +
-                std::to_string(count) + " agent" + (count != 1 ? "s" : "") +
+                std::to_string(shown_count) + " agent" + (shown_count != 1 ? "s" : "") +
                 " via gateway</span>"
                 "</div>";
     } else {
@@ -1654,10 +2434,15 @@ std::string SettingsRoutes::render_gateway_fragment() {
 }
 
 std::string SettingsRoutes::render_https_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/https formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_https_settings(*cfg_);
+    const bool https_enabled = v.at("enabled").get<bool>();
+
     std::string html;
 
-    std::string status_color = cfg_->https_enabled ? "#3fb950" : "#484f58";
-    std::string status_text = cfg_->https_enabled ? "Enabled" : "Disabled";
+    std::string status_color = https_enabled ? "#3fb950" : "#484f58";
+    std::string status_text = https_enabled ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>HTTPS</label>"
@@ -1669,16 +2454,16 @@ std::string SettingsRoutes::render_https_fragment() {
     html += "<div class=\"form-row\">"
             "  <label>HTTPS Port</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->https_port) +
+            std::to_string(v.at("port").get<int>()) +
             "</code>"
             "</div>";
 
-    std::string https_cert = cfg_->https_cert_path.empty()
-                                 ? "Not configured"
-                                 : html_escape(cfg_->https_cert_path.string());
-    std::string https_key = cfg_->https_key_path.empty()
-                                ? "Not configured"
-                                : html_escape(cfg_->https_key_path.string());
+    auto path_or_not_configured = [](const nlohmann::json& j) -> std::string {
+        auto s = j.get<std::string>();
+        return s.empty() ? "Not configured" : html_escape(s);
+    };
+    std::string https_cert = path_or_not_configured(v.at("cert_path"));
+    std::string https_key = path_or_not_configured(v.at("key_path"));
 
     html += "<div class=\"form-row\">"
             "  <label>Certificate</label>"
@@ -1693,8 +2478,9 @@ std::string SettingsRoutes::render_https_fragment() {
             "</span>"
             "</div>";
 
-    std::string redir_color = cfg_->https_redirect ? "#3fb950" : "#8b949e";
-    std::string redir_text = cfg_->https_redirect ? "Enabled" : "Disabled";
+    const bool redirect = v.at("redirect").get<bool>();
+    std::string redir_color = redirect ? "#3fb950" : "#8b949e";
+    std::string redir_text = redirect ? "Enabled" : "Disabled";
     html += "<div class=\"form-row\">"
             "  <label>HTTP Redirect</label>"
             "  <span style=\"font-size:0.8rem;color:" +
@@ -1702,7 +2488,7 @@ std::string SettingsRoutes::render_https_fragment() {
             "</span>"
             "</div>";
 
-    if (!cfg_->https_enabled) {
+    if (!https_enabled) {
         html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
                 "Start the server with <code>--https --https-cert &lt;path&gt; --https-key "
                 "&lt;path&gt;</code> to enable.</p>";
@@ -1712,10 +2498,19 @@ std::string SettingsRoutes::render_https_fragment() {
 }
 
 std::string SettingsRoutes::render_analytics_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/analytics formats the
+    // SAME JSON as its response body instead of re-deriving these fields.
+    // SECURITY FIX (#4028 Evidence): the ClickHouse URL is now sanitized of
+    // embedded userinfo credentials by the builder before it ever reaches
+    // this renderer — previously this fragment rendered cfg_->clickhouse_url
+    // verbatim, leaking a credential embedded in the URL even though the
+    // separate clickhouse_password field was masked below.
+    const auto v = settings_model::build_analytics_settings(*cfg_);
+
     std::string html;
 
-    std::string status_color = cfg_->analytics_enabled ? "#3fb950" : "#484f58";
-    std::string status_text = cfg_->analytics_enabled ? "Enabled" : "Disabled";
+    std::string status_color = v.at("enabled").get<bool>() ? "#3fb950" : "#484f58";
+    std::string status_text = v.at("enabled").get<bool>() ? "Enabled" : "Disabled";
 
     html += "<div class=\"form-row\">"
             "  <label>Analytics</label>"
@@ -1727,20 +2522,21 @@ std::string SettingsRoutes::render_analytics_fragment() {
     html += "<div class=\"form-row\">"
             "  <label>Drain Interval</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->analytics_drain_interval_seconds) +
+            std::to_string(v.at("drain_interval_seconds").get<int>()) +
             "s</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Batch Size</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->analytics_batch_size) +
+            std::to_string(v.at("batch_size").get<int>()) +
             "</code>"
             "</div>";
 
-    bool ch_configured = !cfg_->clickhouse_url.empty();
+    bool ch_configured = v.at("clickhouse_configured").get<bool>();
     std::string ch_color = ch_configured ? "#3fb950" : "#484f58";
-    std::string ch_text = ch_configured ? html_escape(cfg_->clickhouse_url) : "Not configured";
+    std::string ch_text =
+        ch_configured ? html_escape(v.at("clickhouse_url").get<std::string>()) : "Not configured";
 
     html +=
         "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
@@ -1757,33 +2553,32 @@ std::string SettingsRoutes::render_analytics_fragment() {
         html += "<div class=\"form-row\">"
                 "  <label>Database</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->clickhouse_database) +
+                html_escape(v.at("clickhouse_database").get<std::string>()) +
                 "</code>"
                 "</div>";
         html += "<div class=\"form-row\">"
                 "  <label>Table</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                html_escape(cfg_->clickhouse_table) +
+                html_escape(v.at("clickhouse_table").get<std::string>()) +
                 "</code>"
                 "</div>";
+        std::string username = v.at("clickhouse_username").get<std::string>();
         html += "<div class=\"form-row\">"
                 "  <label>Username</label>"
                 "  <code style=\"font-size:0.8rem\">" +
-                (cfg_->clickhouse_username.empty() ? std::string("(default)")
-                                                   : html_escape(cfg_->clickhouse_username)) +
+                (username.empty() ? std::string("(default)") : html_escape(username)) +
                 "</code></div>";
         html += "<div class=\"form-row\">"
                 "  <label>Password</label>"
                 "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
-                (cfg_->clickhouse_password.empty() ? std::string("(not set)")
-                                                   : std::string("********")) +
+                (v.at("clickhouse_password_set").get<bool>() ? std::string("********")
+                                                              : std::string("(not set)")) +
                 "</span></div>";
     }
     html += "</div>";
 
-    std::string jsonl_path = cfg_->analytics_jsonl_path.empty()
-                                 ? "Not configured"
-                                 : html_escape(cfg_->analytics_jsonl_path.string());
+    std::string jsonl = v.at("jsonl_export_path").get<std::string>();
+    std::string jsonl_path = jsonl.empty() ? "Not configured" : html_escape(jsonl);
     html += "<div class=\"form-row\" style=\"margin-top:0.5rem\">"
             "  <label>JSONL Export</label>"
             "  <span class=\"file-name\">" +
@@ -1795,19 +2590,23 @@ std::string SettingsRoutes::render_analytics_fragment() {
 }
 
 std::string SettingsRoutes::render_data_retention_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/data-retention formats
+    // the SAME JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_data_retention_settings(*cfg_);
+
     std::string html;
 
     html += "<div class=\"form-row\">"
             "  <label>Response Data</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->response_retention_days) +
+            std::to_string(v.at("response_retention_days").get<int>()) +
             " days</code>"
             "</div>";
 
     html += "<div class=\"form-row\">"
             "  <label>Audit Logs</label>"
             "  <code style=\"font-size:0.8rem\">" +
-            std::to_string(cfg_->audit_retention_days) +
+            std::to_string(v.at("audit_retention_days").get<int>()) +
             " days</code>"
             "</div>";
 
@@ -1927,8 +2726,12 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
 }
 
 std::string SettingsRoutes::render_mcp_fragment() {
+    // #4028 — shared builder; GET /api/v1/settings/mcp formats the SAME
+    // JSON as its response body instead of re-deriving these fields.
+    const auto v = settings_model::build_mcp_settings(*cfg_);
+
     std::string html;
-    bool mcp_enabled = !cfg_->mcp_disable;
+    bool mcp_enabled = v.at("enabled").get<bool>();
 
     std::string status_color = mcp_enabled ? "#3fb950" : "#484f58";
     std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
@@ -1959,9 +2762,10 @@ std::string SettingsRoutes::render_mcp_fragment() {
             "  </label>"
             "</div>";
 
-    std::string readonly_checked = cfg_->mcp_read_only ? " checked" : "";
-    std::string readonly_color = cfg_->mcp_read_only ? "#d29922" : "#484f58";
-    std::string readonly_text = cfg_->mcp_read_only ? "Read-Only" : "Full Access";
+    const bool mcp_read_only = v.at("read_only").get<bool>();
+    std::string readonly_checked = mcp_read_only ? " checked" : "";
+    std::string readonly_color = mcp_read_only ? "#d29922" : "#484f58";
+    std::string readonly_text = mcp_read_only ? "Read-Only" : "Full Access";
     html += "<div class=\"form-row\">"
             "  <label>Access Mode</label>"
             "  <label class=\"toggle\">"
@@ -1985,10 +2789,7 @@ std::string SettingsRoutes::render_mcp_fragment() {
             "select an MCP tier (readonly, operator, or supervised) from the dropdown."
             "</p>";
 
-    std::string proto = cfg_->https_enabled ? "https" : "http";
-    std::string host = cfg_->web_address == "0.0.0.0" ? "localhost" : cfg_->web_address;
-    auto port = cfg_->https_enabled ? cfg_->https_port : cfg_->web_port;
-    std::string url = proto + "://" + host + ":" + std::to_string(port) + "/mcp/v1/";
+    std::string url = v.at("endpoint_url").get<std::string>();
 
     html += "<div style=\"margin-top:0.75rem;padding:0.75rem;background:#0d1117;"
             "border:1px solid var(--border);border-radius:0.3rem\">"
@@ -2196,15 +2997,51 @@ std::optional<std::expected<TrustBundleStats, std::string>> read_on_disk_bundle(
 std::string SettingsRoutes::render_plugin_signing_fragment() {
     std::string html;
 
+    // #4028 — shared builder (also feeds the hardened
+    // GET /api/v2/agent/plugin-policy, plugin-signing's only REST twin —
+    // #4144 moved it from /v1/, now deprecated);
+    // this renderer reads the view's fields rather than `bundle`/`required`
+    // directly, so both surfaces present the identical underlying data.
     auto bundle = read_on_disk_bundle();
-    const bool enabled = bundle && bundle->has_value();
-    const bool required =
-        runtime_config_store_ &&
-        runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+    // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived by
+    // sre/compliance-officer/enterprise-readiness): `get_value()` collapses
+    // a genuine runtime_config_store read failure to "", identically to a
+    // healthy "not required" — and this badge/toggle IS the deliverable an
+    // operator reads to know the require-signature state (I3: the caller
+    // cannot tell degraded from healthy). This flag is a status RECORD
+    // only — no server-side check consumes it today (see the corrected
+    // runtime_config_store.hpp file header; an earlier round of this fix
+    // wrongly cited ProductPackStore::require_signed_packs_ here, which
+    // governs YAML product-pack content, a different artifact from
+    // compiled plugin binaries — consistency-auditor's Gate 8 catch).
+    // Plugin-binary signature verification, where configured, is local to
+    // each agent via its own --plugin-require-signature/--plugin-trust-
+    // bundle flags. So this is a display-honesty fix, not an
+    // enforcement-bypass fix. `get()` lets a degraded read say so instead
+    // of silently reporting "false". The REST handler below applies the
+    // identical `get()` switch — keep both in sync (sre finding: a
+    // REST/dashboard divergence here would be worse than the original
+    // bug).
+    bool required = false;
+    bool required_status_unknown = false;
+    if (runtime_config_store_) {
+        auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+        if (!rc.has_value()) {
+            required_status_unknown = true;
+        } else {
+            required = rc->has_value() && rc->value().value == "true";
+        }
+    }
+    const auto v = settings_model::build_plugin_signing_settings(required, bundle);
+    const bool enabled = v.at("enabled").get<bool>();
 
     // Status badge
     std::string badge_color, badge_text;
-    if (enabled && required) {
+    if (required_status_unknown) {
+        badge_color = "#da3633"; // red -- distinct from every real state below
+        badge_text = "Require-signature status unknown (config store unavailable)";
+    } else if (enabled && required) {
         badge_color = "#238636"; // green
         badge_text = "Enforced (required)";
     } else if (enabled) {
@@ -2218,21 +3055,31 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "  <span style=\"font-size:0.75rem;background:" +
             badge_color + ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
             badge_text + "</span></div>";
+    if (required_status_unknown) {
+        html += "<div class=\"feedback feedback-error\">Runtime config store is unavailable, "
+                "so the Require-signature toggle's saved value could not be read. This flag "
+                "is a status record only -- no server-side check consumes it today. Plugin "
+                "signature verification, where an agent is configured for it, is local to "
+                "that agent (its own <code>--plugin-require-signature</code> / "
+                "<code>--plugin-trust-bundle</code> flags) and is unaffected by this outage. "
+                "It means this page cannot currently show whether Require is on or off. "
+                "Retry shortly.</div>";
+    }
 
     // Current state
-    if (enabled && bundle->has_value()) {
-        const auto& stats = bundle->value();
+    if (enabled) {
         html += "<div class=\"form-row\"><label>Trust anchors</label>"
                 "<span style=\"font-size:0.8rem\">" +
-                std::to_string(stats.cert_count) + " certificate(s)</span></div>";
+                std::to_string(v.at("cert_count").get<int>()) + " certificate(s)</span></div>";
         html += "<div class=\"form-row\"><label>Bundle SHA-256</label>"
                 "<code style=\"font-size:0.7rem;word-break:break-all\">" +
-                stats.sha256_hex + "</code></div>";
-        if (!stats.subjects.empty()) {
+                v.at("sha256").get<std::string>() + "</code></div>";
+        const auto subjects = v.at("subjects").get<std::vector<std::string>>();
+        if (!subjects.empty()) {
             html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
                     "<label>Subjects</label>"
                     "<div style=\"font-size:0.75rem;flex:1;min-width:0\">";
-            for (const auto& s : stats.subjects) {
+            for (const auto& s : subjects) {
                 html += "<div "
                         "style=\"font-family:monospace;color:var(--mds-color-theme-text-secondary);"
                         "overflow-wrap:anywhere\">" +
@@ -2240,9 +3087,9 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             }
             html += "</div></div>";
         }
-    } else if (bundle && !bundle->has_value()) {
+    } else if (v.at("bundle_unreadable").get<bool>()) {
         html += "<div class=\"feedback feedback-error\">Bundle on disk is unreadable: " +
-                html_escape(bundle->error()) + "</div>";
+                html_escape(v.at("bundle_error").get<std::string>()) + "</div>";
     } else {
         html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
                 "No trust bundle uploaded. Plugin signature verification is off "
@@ -2280,8 +3127,18 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "Upload &amp; verify</button></div>";
     html += "</form>";
 
-    // Toggle: require signature (only meaningful when bundle is loaded)
-    if (enabled) {
+    // Toggle: require signature (only meaningful when bundle is loaded).
+    // #4028 fix-round finding (consistency-auditor/unhappy-path, Gate 8):
+    // also gated on !required_status_unknown -- otherwise this form
+    // renders with the checkbox defaulted UNCHECKED (since `required`
+    // stays false when its true value could not be read) while the
+    // banner above says the value is unknown, and submitting Save writes
+    // "false" unconditionally, silently discarding whatever the real
+    // prior value was the moment the store recovers. Suppress the whole
+    // form (and the Clear button below it) until a real read succeeds --
+    // forcing a retry is strictly safer than presenting a write control
+    // whose displayed state the page itself just declared untrustworthy.
+    if (enabled && !required_status_unknown) {
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
                 "style=\"margin-top:0.75rem\">";
@@ -2324,9 +3181,11 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "margin:1rem 0\">";
     html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
-            "is served at <code>GET /api/v1/agent/plugin-policy</code> "
+            "is served at <code>GET /api/v2/agent/plugin-policy</code> "
             "(<em>admin-only</em> — operators distribute to agents via the "
-            "standard config-management flow). Agents are pointed at a local "
+            "standard config-management flow; the deprecated "
+            "<code>/v1/</code> shape still works during its announced "
+            "removal window). Agents are pointed at a local "
             "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
             "fetch is a forthcoming change, at which point this endpoint will "
             "gain a dedicated agent identity.</p>";
@@ -2352,13 +3211,14 @@ void SettingsRoutes::register_routes(
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
     std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
-    StepUpFn step_up_fn) {
+    StepUpFn step_up_fn, AuditReadFn audit_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn));
+                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn),
+                    std::move(audit_read_fn));
 }
 
 void SettingsRoutes::register_routes(
@@ -2369,12 +3229,13 @@ void SettingsRoutes::register_routes(
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
     std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
-    StepUpFn step_up_fn) {
+    StepUpFn step_up_fn, AuditReadFn audit_read_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
+    audit_read_fn_ = std::move(audit_read_fn);
     cfg_ = &cfg;
     auth_mgr_ = &auth_mgr;
     auto_approve_ = &auto_approve;
@@ -2414,6 +3275,32 @@ void SettingsRoutes::register_routes(
                      return;
                  res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
              });
+
+    // #4028 — REST v1 read-twin. TlsConfig:Read (Administrator-only via the
+    // rbac_store.cpp seed, floored in authz_topology_floor.hpp so an
+    // RBAC-off deployment stays admin-gated). Audited fail-closed (§4):
+    // TLS/mTLS posture + cert paths are named recon value in #4028's
+    // Evidence section (same reasoning the plugin-signing route below
+    // already carries in its own comment).
+    sink.Get("/api/v1/settings/tls", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "TlsConfig", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.tls.read",
+                                           "success", "TlsConfig", "tls", "REST settings read")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+        res.set_content(settings_ok_envelope(settings_model::build_tls_settings(*cfg_)).dump(),
+                        "application/json");
+    });
 
     sink.Get(
         "/fragments/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2483,6 +3370,48 @@ void SettingsRoutes::register_routes(
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
+    // Engine Principals admin console (design doc §3.1, plan PR 4.3). Read-
+    // only render — every mutation (create/rotate/revoke/transfer-owner)
+    // posts directly to the REST surface at /api/v1/engine-principals/...
+    // (built alongside this task); this fragment refreshes on the
+    // `refreshEnginePrincipals` body event that REST mutation's `HX-Trigger`
+    // response header fires, mirroring the API-tokens block's refresh
+    // pattern. Admin-only, same posture as /fragments/settings/tokens.
+    sink.Get("/fragments/settings/engine-principals",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!admin_fn_(req, res))
+                     return;
+                 res.set_content(render_engine_principals_fragment(), "text/html; charset=utf-8");
+             });
+
+    // Periodic Access Reviews (SOC 2 CC6.2) — Settings convenience surface.
+    // Gated on AccessReview:Read (matches the REST export/get routes); the
+    // fragment renderer itself probes AccessReview:Attest to decide whether
+    // to show the write controls (open/attest/flag/close) — see
+    // render_access_review_fragment()'s doc comment. The REST endpoints
+    // under /api/v1/access-reviews* (rest_api_v1.cpp) and their MCP twins
+    // are the ADR-1005 API-parity surface this fragment is a convenience
+    // layer over, not a replacement for.
+    sink.Get("/fragments/settings/access-reviews",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AccessReview", "Read"))
+                     return;
+                 res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
+             });
+
+    // Campaign-view sub-fragment — used both for the `?campaign_id=` deep
+    // link (e.g. an auditor following an access_review.campaign_opened
+    // audit-log row to its target_id) and for the JS-driven refresh after
+    // an attest/flag/close action (arLoadCampaign in kAccessReviewScript).
+    sink.Get("/fragments/settings/access-reviews/campaign",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AccessReview", "Read"))
+                     return;
+                 std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+                 res.set_content(render_access_review_campaign_fragment(req, id),
+                                 "text/html; charset=utf-8");
+             });
+
     sink.Get("/fragments/settings/management-groups",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ManagementGroup", "Read"))
@@ -2511,11 +3440,37 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_gateway_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. ServerConfig:Read (Administrator-only,
+    // floored in authz_topology_floor.hpp). NOT audited — "nothing secret"
+    // per #4028's Evidence section (operational/infra config), matching this
+    // fragment's own unaudited posture today.
+    sink.Get("/api/v1/settings/gateway",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 auto count = gateway_session_count_fn_ ? gateway_session_count_fn_() : 0;
+                 res.set_content(settings_ok_envelope(settings_model::build_gateway_settings(
+                                                          *cfg_, gateway_enabled_, count))
+                                     .dump(),
+                                 "application/json");
+             });
+
     sink.Get("/fragments/settings/server-config",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_server_config_fragment(), "text/html; charset=utf-8");
+             });
+
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "nothing
+    // secret" per #4028's Evidence section.
+    sink.Get("/api/v1/settings/server-config",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 res.set_content(
+                     settings_ok_envelope(settings_model::build_server_config_settings(*cfg_)).dump(),
+                     "application/json");
              });
 
     sink.Get("/fragments/settings/https",
@@ -2525,11 +3480,65 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_https_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. TlsConfig:Read (grouped with tls — same
+    // sub-area, #4028 acceptance criteria). Audited fail-closed (§4) — same
+    // recon-value reasoning as GET /api/v1/settings/tls.
+    sink.Get("/api/v1/settings/https", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "TlsConfig", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.https.read",
+                                           "success", "TlsConfig", "https", "REST settings read")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+        res.set_content(settings_ok_envelope(settings_model::build_https_settings(*cfg_)).dump(),
+                        "application/json");
+    });
+
     sink.Get("/fragments/settings/analytics",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
+             });
+
+    // #4028 — REST v1 read-twin. AnalyticsConfig:Read. Audited fail-closed
+    // (§4) — "mixed, leans high (embedded credential risk)" per #4028's
+    // Evidence section. The ClickHouse URL is sanitized of userinfo by the
+    // shared builder before it reaches this response (see
+    // settings_model::sanitize_url_userinfo); the raw password is never
+    // read into the payload at all.
+    sink.Get("/api/v1/settings/analytics",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AnalyticsConfig", "Read"))
+                     return;
+                 if (!detail::emit_behavioral_audit(audit_read_fn_, req, res,
+                                                    "settings.analytics.read", "success",
+                                                    "AnalyticsConfig", "analytics",
+                                                    "REST settings read")) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res,
+                                          "audit subsystem unavailable; refusing to serve "
+                                          "settings data without durable evidence",
+                                          detail::A4ErrorOpts{
+                                              .retry_after_ms = 5000,
+                                              .remediation = "retry after the audit subsystem "
+                                                             "recovers"}),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(
+                     settings_ok_envelope(settings_model::build_analytics_settings(*cfg_)).dump(),
+                     "application/json");
              });
 
     sink.Get("/fragments/settings/data-retention",
@@ -2539,12 +3548,37 @@ void SettingsRoutes::register_routes(
                  res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
              });
 
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "lowest
+    // sensitivity of the eight" per #4028's Evidence section.
+    sink.Get("/api/v1/settings/data-retention",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "ServerConfig", "Read"))
+                     return;
+                 res.set_content(settings_ok_envelope(
+                                     settings_model::build_data_retention_settings(*cfg_))
+                                     .dump(),
+                                 "application/json");
+             });
+
     sink.Get("/fragments/settings/mcp",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
              });
+
+    // #4028 — REST v1 read-twin. ServerConfig:Read. NOT audited — "low
+    // sensitivity... an MCP client with a valid token already knows this
+    // endpoint exists" per #4028's Evidence section. #520 (see this PR's
+    // commit message / docs/mcp-server.md): this route stays REST-only —
+    // NOT itself a candidate MCP tool, since #520 explicitly bars MCP
+    // tokens from server administration surfaces including "settings".
+    sink.Get("/api/v1/settings/mcp", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "ServerConfig", "Read"))
+            return;
+        res.set_content(settings_ok_envelope(settings_model::build_mcp_settings(*cfg_)).dump(),
+                        "application/json");
+    });
 
     // -- F1: DEX alerting (per-signal routing + blast-radius thresholds) ------
     sink.Get("/fragments/settings/dex-alerts",
@@ -2562,6 +3596,15 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            // A4 body alongside the dashboard's own HX-Trigger toast (NOT
+            // redundant/dead — do not strip): the dashboard's global htmx
+            // config sets responseHandling swap:false for every 4xx/5xx
+            // response (see dex_routes.cpp/guardian_routes.cpp), so htmx
+            // never renders this body — but a non-htmx caller (REST client,
+            // agentic worker) hitting this same /api/settings/* endpoint
+            // gets a real A4 envelope instead of an empty body.
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // Collect every checked "types" value from the urlencoded body and
@@ -2621,9 +3664,9 @@ void SettingsRoutes::register_routes(
             res.status = 500;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Failed to save routing","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
-                                "</span>",
-                            "text/html; charset=utf-8");
+            // A4 body alongside the toast (swap:false discards it on the
+            // dashboard, but a non-htmx caller now gets a real envelope).
+            res.set_content(detail::a4_error(res, rc.error()), "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -2646,6 +3689,8 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // Clamp server-side to the same ranges update_alert_shape enforces, so
@@ -2677,8 +3722,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Failed to save thresholds","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">Failed to persist thresholds.</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Failed to save thresholds"),
+                            "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -2702,6 +3747,8 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Config store unavailable","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Config store unavailable"),
+                            "application/json");
             return;
         }
         // extract_form_value already percent-decodes (':' → %3A is in the
@@ -2715,8 +3762,9 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"j({"showToast":{"message":"Invalid tag key ([A-Za-z0-9_.:-], max 64)","level":"error"}})j");
-            res.set_content("<span class=\"feedback-error\">Invalid tag key.</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Invalid tag key ([A-Za-z0-9_.:-], max 64)"),
+                "application/json");
             return;
         }
         auto session = auth_fn_(req, res);
@@ -2727,9 +3775,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Failed to save export key","level":"error"}})");
-            res.set_content("<span class=\"feedback-error\">" + html_escape(rc.error()) +
-                                "</span>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, rc.error()), "application/json");
             return;
         }
         if (dex_alert_apply_fn_)
@@ -2749,6 +3795,12 @@ void SettingsRoutes::register_routes(
                      return;
                  res.set_content(render_plugin_signing_fragment(), "text/html; charset=utf-8");
              });
+
+    // #4028 — no parallel `/api/v1/settings/plugin-signing` route: the
+    // acceptance criteria is explicit that plugin-signing's REST twin is the
+    // hardened `GET /api/v2/agent/plugin-policy` below (already existed
+    // off-ledger at /v1/; #4144 moved the hardening there — see that
+    // handler's own comment), not a second route duplicating its data.
 
     // -- Plugin Code Signing: upload PEM trust bundle (admin) -----------------
     sink.Post("/api/settings/plugin-signing/upload", [this](const httplib::Request& req,
@@ -2939,21 +3991,33 @@ void SettingsRoutes::register_routes(
         res.set_content(render_plugin_signing_fragment(), "text/html; charset=utf-8");
     });
 
-    // -- Plugin Code Signing: distribution endpoint --------------------------
+    // -- Plugin Code Signing: distribution endpoint (v1, FROZEN) -------------
     //
-    // Returns the current trust bundle and require flag as JSON for
-    // out-of-band distribution to agents (operators curl this into
-    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
-    // --plugin-trust-bundle to the agent). Future automatic agent-side
-    // fetch will use the same shape.
+    // #4144 review fix (external colleague review, BLOCKING, confirmed
+    // against docs/api-versioning-policy.md by direct fetch): this route
+    // predates #4028 (present since the F2 OpenAPI backfill), and #4028's
+    // hardening reshaped its response envelope (flat body -> data/meta) and
+    // added new fields/error codes IN PLACE at this same /api/v1/ path — a
+    // breaking change per the policy's own "changing an error envelope's
+    // shape" clause, shipped with no version bump, no deprecation cycle, and
+    // no ADR-1005 exception-ledger entry. The policy's narrow
+    // security-tightening carve-out doesn't apply here (it requires a
+    // CHANGELOG Security entry citing a tracked vulnerability; this PR's own
+    // changelog carries a SEPARATE .security.md fragment for its actual
+    // security fix — the ClickHouse sanitizer — proving the classification
+    // was deliberate, not an oversight).
     //
-    // Authorization: admin only. The bundle PEM holds X.509 certificates
-    // (no private keys) so the security blast radius of disclosure is
-    // small, but a non-admin token holder learning when the trust anchor
-    // rotates (sha256 changes) is useful reconnaissance for a
-    // supply-chain attacker. CC6.1 least-privilege requires we restrict
-    // even read access to security-critical config to admin principals
-    // (governance hardening round 1: sec-LOW-4 / UP-13 / CC6.1).
+    // Fix: this handler is now FROZEN at exactly its pre-#4028 shape (see
+    // git show <pre-#4028 SHA>:server/core/src/settings_routes.cpp for the
+    // byte-for-byte source) — flat body, admin_fn_ gate, no audit call, the
+    // old ad hoc error envelope. All of #4028's hardening (RBAC securable,
+    // audit-fail-closed, A4 envelope, new fields, the TOCTOU fix) lives
+    // ONLY at GET /api/v2/agent/plugin-policy below. Per
+    // docs/api-versioning-policy.md's deprecation cycle: this v1 route is
+    // formally deprecated (see changelog.d/4144-plugin-policy-v1-deprecated
+    // .deprecated.md + docs/user-manual/upgrading.md) and stays live for the
+    // full window (>= 90 days AND >= one intervening feature release) before
+    // removal.
     sink.Get("/api/v1/agent/plugin-policy", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!admin_fn_(req, res))
@@ -2977,14 +4041,11 @@ void SettingsRoutes::register_routes(
             return;
         }
         if (!disk->has_value()) {
-            // Structured envelope (A4 / CONS-B1) — same shape as
-            // every other /api/v1/* error site (auth_routes,
-            // rest_api_v1, etc.).
+            // A4 envelope — same shape as every other error site
+            // (auth_routes, rest_api_v1, etc.).
             res.status = 500;
-            nlohmann::json err = {
-                {"error", {{"code", 500}, {"message", "Trust bundle on disk is unreadable"}}},
-                {"meta", {{"api_version", "v1"}}}};
-            res.set_content(err.dump(), "application/json");
+            res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
+                            "application/json");
             return;
         }
 
@@ -2999,6 +4060,165 @@ void SettingsRoutes::register_routes(
         out["cert_count"] = disk->value().cert_count;
         out["sha256"] = disk->value().sha256_hex;
         res.set_content(out.dump(), "application/json");
+    });
+
+    // -- Plugin Code Signing: distribution endpoint (v2) ----------------------
+    //
+    // Returns the current trust bundle and require flag as JSON for
+    // out-of-band distribution to agents (operators curl this into
+    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
+    // --plugin-trust-bundle to the agent). Future automatic agent-side
+    // fetch will use the same shape.
+    //
+    // #4028 — HARDENED onto the A4 envelope + the shared
+    // settings_model::build_plugin_signing_settings builder (the SAME
+    // builder the /fragments/settings/plugin-signing HTML fragment calls)
+    // rather than duplicating a second bespoke JSON shape for this route.
+    // This route stays the SUPERSET over the fragment's own data: it alone
+    // adds `trust_bundle_pem` (the raw bundle bytes), applied as an explicit
+    // override below rather than via the builder's own omit-when-empty
+    // default (the fragment renderer passes an empty string on purpose so
+    // the field is absent there).
+    //
+    // #4144 review fix: promoted to /api/v2/ — see the v1 handler above's
+    // comment for why. #4144 ALSO fixed the TOCTOU the earlier #4028 fix
+    // round only partially closed (Important finding, confirmed by direct
+    // source read): the old two-read design (read_on_disk_bundle() for
+    // stats, a SEPARATE ifstream re-read for the raw PEM bytes) guarded
+    // against the bundle being DELETED between the two reads, but not
+    // REPLACED (the upload handler does write-temp-then-atomic-rename(), so
+    // a second read against a concurrently-replaced file simply succeeds —
+    // against the NEW file). That let a response pair the OLD read's
+    // sha256/cert_count/subjects with the NEW read's trust_bundle_pem bytes,
+    // defeating the integrity property (sha256 describes trust_bundle_pem)
+    // this route exists to provide. Fixed: ONE read of the raw bytes,
+    // validate_trust_bundle_pem() derives cert_count/sha256/subjects from
+    // THOSE SAME bytes — sha256 and trust_bundle_pem can no longer disagree,
+    // by construction.
+    //
+    // Authorization: PluginSigning:Read (dedicated securable, minted by
+    // #4028 — Administrator-only via the rbac_store.cpp seed, floored in
+    // authz_topology_floor.hpp so an RBAC-off deployment stays admin-gated).
+    // That flooring alone is NOT the same practical posture the prior
+    // admin_fn_ (require_admin) gate had for an MCP-tier token: require_admin
+    // rejects every mcp_tier session outright regardless of role, while the
+    // topology floor's legacy-role fallback admits an admin-owned MCP token
+    // exactly like an interactive admin session (mcp_policy.hpp's tier_allows()
+    // comment). The actual parity fix is at that chokepoint: TlsConfig/
+    // PluginSigning/ServerConfig/AnalyticsConfig are denied at every MCP tier
+    // there, so an MCP token 403s before it ever reaches this route's
+    // perm_fn_ call. The bundle PEM holds X.509 certificates (no private
+    // keys) so the security
+    // blast radius of disclosure is small, but a non-admin token holder
+    // learning when the trust anchor rotates (sha256 changes) is useful
+    // reconnaissance for a supply-chain attacker. CC6.1 least-privilege
+    // requires we restrict even read access to security-critical config to
+    // admin principals (governance hardening round 1: sec-LOW-4 / UP-13 /
+    // CC6.1) — now also audited fail-closed (§4) under the
+    // `settings.plugin_signing.read` verb.
+    sink.Get("/api/v2/agent/plugin-policy", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        if (!perm_fn_(req, res, "PluginSigning", "Read"))
+            return;
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.plugin_signing.read",
+                                           "success", "PluginSigning", "trust_bundle",
+                                           "agent plugin-policy fetch")) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
+                            "application/json");
+            return;
+        }
+
+        // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived
+        // by sre/compliance-officer/enterprise-readiness): this route's
+        // `required` field IS the deliverable an operator or automation
+        // polls to learn the require-signature state -- `get_value()`
+        // collapsed a genuine runtime_config_store read failure to "",
+        // identical to a healthy "not required" (I3: the caller cannot
+        // tell degraded from healthy). This flag is a status RECORD only
+        // -- no server-side check consumes it today (an earlier round of
+        // this fix wrongly cited ProductPackStore::require_signed_packs_
+        // here, which governs YAML product-pack content, a different
+        // artifact from compiled plugin binaries -- consistency-auditor's
+        // Gate 8 catch; see the corrected runtime_config_store.hpp file
+        // header). Plugin-binary signature verification, where
+        // configured, is local to each agent via its own
+        // --plugin-require-signature/--plugin-trust-bundle flags. So this
+        // is a display-honesty fix, not an enforcement-bypass fix: a
+        // degraded read now fails the REQUEST closed (503) rather than
+        // answer with a value it cannot stand behind. The dashboard
+        // fragment renderer above applies the identical `get()` switch --
+        // keep both in sync.
+        bool required = false;
+        if (runtime_config_store_) {
+            auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+            if (!rc.has_value()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        "runtime config store unavailable; plugin-signing required status "
+                        "could not be determined",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 5000,
+                            .remediation =
+                                "Retry shortly; if this persists, check Postgres connectivity "
+                                "for the runtime_config_store schema. This flag is a status "
+                                "record only -- no server-side check consumes it, and "
+                                "plugin-binary verification (where an agent is configured for "
+                                "it, via that agent's own local flags) is unaffected by this "
+                                "outage."}),
+                    "application/json");
+                return;
+            }
+            required = rc->has_value() && rc->value().value == "true";
+        }
+
+        // #4144 review fix: ONE filesystem read for both the raw PEM bytes
+        // and the derived stats — see this route's header comment above for
+        // the TOCTOU this closes. Bundle absent (does not exist on disk) is
+        // a normal operational state (CONS-B1 part 2): falls through with
+        // enabled=false, empty pem.
+        std::error_code ec;
+        auto bundle_path = trust_bundle_path();
+        std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>> stats;
+        std::string pem;
+        if (std::filesystem::exists(bundle_path, ec)) {
+            std::ifstream f(bundle_path, std::ios::binary);
+            if (!f) {
+                // Existed a moment ago (exists() above); a concurrent
+                // upload/clear removed it before this open() — same
+                // "changed while serving this request" fail-closed posture
+                // #4028 introduced, just guarding the (now sole) read.
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "trust bundle changed while serving this request",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 1000,
+                            .remediation = "retry -- the bundle was modified concurrently"}),
+                    "application/json");
+                return;
+            }
+            pem.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            stats = plugin_signing::validate_trust_bundle_pem(pem);
+            if (!stats->has_value()) {
+                // Bundle unreadable (exists on disk, failed to parse) → 500.
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "Trust bundle on disk is unreadable"),
+                                "application/json");
+                return;
+            }
+        }
+        auto data = settings_model::build_plugin_signing_settings(required, stats);
+        data["trust_bundle_pem"] = pem; // superset field — always present on this route alone
+        res.set_content(settings_ok_envelope(std::move(data)).dump(), "application/json");
     });
 
     sink.Get("/fragments/settings/nvd",
@@ -3235,6 +4455,26 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // The redaction placeholder is not a credential. It reaches this handler when an
+        // operator copies it out of the startup log or a config.update audit detail -- the
+        // two surfaces that emit it. GET /api/config is NOT one of them: it omits a
+        // secret's value rather than substituting a placeholder. So an exact one is treated
+        // like a blank field, meaning "leave the stored secret alone". Without that the
+        // store still refuses it further down -- but by then cfg_ and the live provider
+        // have already been updated, so the two would diverge behind a "saved" toast.
+        //
+        // The predicate here and the one at the sink are deliberately DIFFERENT, and both
+        // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
+        // form renders the field with `value=""` unconditionally, so the literal never
+        // originates here -- only the greyed placeholder ATTRIBUTE varies with whether a
+        // secret is stored, and an attribute is never submitted). A secret that merely
+        // CONTAINS the token falls through on purpose -- the sink refuses it and the
+        // failure branch below tells the operator. Clearing it here instead discarded a
+        // real credential and reported SAVED, the same false-success this change exists to
+        // remove (found by four reviewers). The sink's predicate is the broad CONTAINMENT
+        // one, and it covers every other caller (PUT /api/config included).
+        if (is_exactly_redaction_placeholder(client_secret))
+            client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
@@ -3247,6 +4487,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
+            // own local OidcConfig and previously left scim_link_claim at its
+            // struct default ("sub"), silently reverting an operator's
+            // `--oidc-scim-link-claim oid` (Entra) to `sub` the moment they saved
+            // ANY OIDC setting via this form — until the next process restart
+            // re-read the flag. Mirrors server.cpp's boot-time wiring
+            // (`oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;`).
+            oidc_cfg.scim_link_claim = cfg_->oidc_scim_link_claim;
             if (skip_tls)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -3290,18 +4538,66 @@ void SettingsRoutes::register_routes(
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
-        if (runtime_config_store_ && runtime_config_store_->is_open()) {
+        std::vector<std::string> persist_errors;
+        // NO silent else. Guarding the whole persist block on is_open() and falling
+        // through to the success toast is the same false-success this fold exists to
+        // remove -- a degraded store would report "saved" for a save that never
+        // happened. A null store is recorded as an error here; a store that is merely
+        // not open reports itself, because every set() below returns "store not open"
+        // and the failure branch renders it (the DEX siblings at :3300/:3351 already
+        // rely on that and carry no is_open() guard).
+        if (!runtime_config_store_) {
+            persist_errors.emplace_back("store: runtime configuration store unavailable");
+        } else {
             auto who = std::string("admin");
             auto session = auth_fn_(req, res);
             if (session)
                 who = session->username;
-            runtime_config_store_->set("oidc_issuer", issuer, who);
-            runtime_config_store_->set("oidc_client_id", client_id, who);
+            // Every result is observed. `set()` is [[nodiscard]] for this reason: a
+            // discarded rejection reported "saved" for a write the store refused.
+            auto note = [&](const char* k, std::expected<void, std::string> r) {
+                if (!r)
+                    persist_errors.push_back(std::string(k) + ": " + r.error());
+            };
+            note("oidc_issuer", runtime_config_store_->set("oidc_issuer", issuer, who));
+            note("oidc_client_id", runtime_config_store_->set("oidc_client_id", client_id, who));
             if (!client_secret.empty())
-                runtime_config_store_->set("oidc_client_secret", client_secret, who);
-            runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who);
-            runtime_config_store_->set("oidc_admin_group", admin_group, who);
-            runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who);
+                note("oidc_client_secret",
+                     runtime_config_store_->set("oidc_client_secret", client_secret, who));
+            note("oidc_redirect_uri",
+                 runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who));
+            note("oidc_admin_group",
+                 runtime_config_store_->set("oidc_admin_group", admin_group, who));
+            note("oidc_skip_tls_verify",
+                 runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who));
+        }
+
+        if (!persist_errors.empty()) {
+            // The live provider is already swapped in, but the store refused part of the
+            // write, so the running config and the persisted config disagree and a restart
+            // would silently revert. Say so instead of reporting success.
+            // Every component is a hardcoded key plus a fixed error literal -- no value
+            // is ever in here -- so there is no disclosure reason to collapse the list,
+            // and collapsing it discarded WHICH key failed from the one audit row that
+            // documents a partial persist.
+            std::string joined;
+            for (const auto& e : persist_errors) {
+                if (!joined.empty())
+                    joined += ", ";
+                joined += e;
+            }
+            audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
+                      "persist failed: " + joined);
+            auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">OIDC applied to the running server, but these "
+                        "settings could NOT be saved: " +
+                        html_escape(joined) +
+                        ". Any other settings in this form WERE saved, so the stored "
+                        "configuration is now inconsistent with the running server. Fix the "
+                        "cause and save again.</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+            return;
         }
 
         audit_fn_(req, "oidc.configure", "success", "OidcConfig", issuer, "");
@@ -3456,7 +4752,10 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username: must be 1-64 chars, alphanumeric + ._- only","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Invalid username: must be 1-64 chars, alphanumeric + ._- "
+                                       "only"),
+                "application/json");
             return;
         }
 
@@ -3474,7 +4773,10 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Username cannot begin with a reserved prefix: oidc:, saml:, or ad:","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(
+                detail::a4_error(res, "Username cannot begin with a reserved prefix: oidc:, "
+                                       "saml:, or ad:"),
+                "application/json");
             return;
         }
 
@@ -3487,7 +4789,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Username already exists","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Username already exists"),
+                            "application/json");
             return;
         }
         // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
@@ -3503,7 +4806,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Password must be at least 12 characters"),
+                            "application/json");
             return;
         }
         if (!auth_mgr_->save_config()) {
@@ -3561,7 +4865,7 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username format","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid username format"), "application/json");
             return;
         }
         // Self-deletion lockout guard (#397). Deleting the currently
@@ -3571,7 +4875,10 @@ void SettingsRoutes::register_routes(
         // The UI suppresses the Remove button for the self row (#403),
         // but the handler must reject independently because a hand-
         // crafted HTTP DELETE bypasses the dashboard entirely.
-        if (username == session->username) {
+        //
+        // Shared comparison (rbac_admin_predicate.hpp's is_self_target) —
+        // this is call site #1 of the third-call-site trigger named below.
+        if (is_self_target(*session, username)) {
             spdlog::warn("User '{}' attempted to delete their own account via "
                          "/api/settings/users — rejected",
                          session->username);
@@ -3586,27 +4893,178 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Cannot delete your own account"),
+                            "application/json");
             return;
         }
+        // Owner-delete guard (design doc §3.1, GOVERNANCE HARD PRECONDITION).
+        // A user who owns an active engine principal must transfer that
+        // ownership (via the engine-principal transfer-owner surface) before
+        // their account can be deleted — otherwise the principal's audit
+        // trail loses its named responsible human. FAIL CLOSED: once the
+        // store is wired, treat `count_active_owned_by`'s nullopt
+        // (store-unreachable / cannot verify) the SAME as ">0 owned" — both
+        // block the delete. There is no downgrade path from "cannot verify"
+        // to "safe to delete".
+        //
+        // G6 (governance hardening, security-guardian): a null
+        // `engine_principal_store_` skips this guard entirely rather than
+        // failing closed — deliberately, and ONLY defensible because it is
+        // provably unreachable in production. server.cpp constructs
+        // EnginePrincipalStore unconditionally whenever `pg_pool_` is set
+        // (server.cpp's boot sequence, "EnginePrincipalStore — born-on-PG
+        // identity store") and sets `startup_failed_ = true` — refusing to
+        // start serving at all — if it fails to open; a live server
+        // therefore NEVER reaches this handler with a null store. The null
+        // path exists solely so `test_settings_routes_users.cpp`'s
+        // pre-existing harness (which predates this feature and does not
+        // wire an EnginePrincipalStore) keeps passing — see
+        // SettingsOwnerDeleteHarness in test_engine_principal_lifecycle.cpp
+        // for the wired-store coverage of the 409/nullopt paths themselves.
+        // If a future change ever makes EnginePrincipalStore constructible
+        // without a hard-fail boot path (e.g. an optional/feature-flagged
+        // deployment mode), this skip becomes a real fail-open and MUST be
+        // revisited — do not carry this comment forward unexamined.
+        if (engine_principal_store_) {
+            auto owned = engine_principal_store_->count_active_owned_by(username);
+            if (!owned.has_value() || *owned > 0) {
+                audit_fn_(req, "user.delete", "denied", "User", username,
+                          owned.has_value() ? "owns_active_engine_principal"
+                                             : "engine_store_unreachable");
+                res.status = 409;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Cannot delete: user owns an active engine )"
+                    R"(principal — transfer ownership first","level":"error"}})");
+                res.set_content(
+                    detail::a4_error(res, "Cannot delete: user owns an active engine "
+                                           "principal — transfer ownership first"),
+                    "application/json");
+                return;
+            }
+        }
+        // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
+        // principal set (the deleted username + every OIDC identity linked
+        // to it via SCIM, if any) BEFORE the account is removed. Mirrors
+        // the SCIM deprovision seams' ordering and fail-closed posture:
+        // `resolve_deprovision_principals_for_username` fails closed
+        // (nullopt) only on a genuine link-lookup failure for a KNOWN SCIM
+        // user — never on "not a SCIM user"/"SCIM store unwired", which
+        // degrade to the slug-only set (see its doc comment).
+        std::string revoke_detail;
+        if (api_token_store_) {
+            auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
+            if (!principals.has_value()) {
+                spdlog::error("DELETE /api/settings/users: identity-link resolution failed for "
+                             "'{}' — refusing to delete (a store blip must not read as \"no "
+                             "linked identities to revoke\")",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "identity_link_resolution_failed");
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to resolve linked identities — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(
+                    detail::a4_error(res, "Failed to resolve linked identities — try again"),
+                    "application/json");
+                return;
+            }
+            if (!api_token_store_->is_open()) {
+                spdlog::error("DELETE /api/settings/users: ApiTokenStore unavailable — "
+                             "refusing to delete '{}' without being able to revoke its "
+                             "credentials",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "api_token_store_unavailable");
+                res.status = 503;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Credential store unavailable — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(detail::a4_error(res, "Credential store unavailable — try again"),
+                                "application/json");
+                return;
+            }
+            auto revoke_result =
+                revoke_deprovision_credentials(*api_token_store_, *auth_mgr_, *principals);
+            revoke_detail =
+                "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
+                " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count — mirrors the SCIM
+                // seam's `revoke_linked_credentials_or_fail`.
+                enumerate_principals_for_audit(*principals);
+            if (!revoke_result.api_tokens_persisted) {
+                revoke_detail += " api_tokens_db_error=true";
+                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
+                             "persist for one or more principals linked to '{}' — refusing to "
+                             "report a clean delete (ADR-2001 §3 fail-closed)",
+                             username);
+                audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
+                    R"(linked identities — try again","level":"error"}})");
+                res.set_content(
+                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
+                                           "identities — try again"),
+                    "application/json");
+                return;
+            }
+        } else {
+            // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
+            // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
+            // (scim_routes.cpp), which 503s + audits
+            // "api_token_store_unavailable" rather than skip-and-proceed
+            // when its token_store is null/not open. A null ApiTokenStore
+            // means credentials CANNOT be revoked, and proceeding to
+            // `remove_user` below anyway would silently leave every linked
+            // principal's API tokens live — exactly the CC6.8 gap ADR-2001
+            // exists to close. server.cpp constructs ApiTokenStore
+            // unconditionally whenever pg_pool_ is set and fails the whole
+            // boot otherwise, so a live server NEVER reaches this handler
+            // with a null store — this branch is test-harness-only
+            // (SettingsRoutesHarness/SettingsOwnerDeleteHarness, which
+            // predate ADR-2001) and every wired-store outcome is covered by
+            // SettingsAdr2001Harness's PG-backed tests.
+            spdlog::error("DELETE /api/settings/users: no ApiTokenStore wired — refusing to "
+                         "delete '{}' without being able to revoke its credentials (ADR-2001)",
+                         username);
+            audit_fn_(req, "user.delete", "failure", "User", username,
+                     "api_token_store_unavailable");
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Credential store unavailable — try )"
+                R"(again","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Credential store unavailable — try again"),
+                            "application/json");
+            return;
+        }
+
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, "");
+            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
-        } else {
-            // remove_user() returns false when the username is not in the
-            // user store. A no-op DELETE is still a privileged-mutation
-            // attempt and must surface in the audit chain.
-            audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
-            res.status = 404;
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"User not found","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
         }
-        res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+        // remove_user() returns false when the username is not in the
+        // user store. A no-op DELETE is still a privileged-mutation
+        // attempt and must surface in the audit chain.
+        audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
+        res.status = 404;
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"User not found","level":"error"}})");
+        res.set_content(detail::a4_error(res, "User not found"), "application/json");
     });
 
     // -- Settings API: Role change (admin only, C1 fix) -------------------------
@@ -3644,12 +5102,16 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid username format","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid username format"), "application/json");
             return;
         }
 
-        // Self-demotion guard — can't change your own role
-        if (target_username == session->username) {
+        // Self-demotion guard — can't change your own role. Shared
+        // comparison (rbac_admin_predicate.hpp's is_self_target) — call site
+        // #2 of the third-call-site trigger named at the DELETE handler
+        // above (#397/#403); A2's unassign-own-Administrator-grant guard is
+        // the third, per that guard's own doc comment.
+        if (is_self_target(*session, target_username)) {
             spdlog::warn("User '{}' attempted to change their own role via "
                          "/api/settings/users/:username/role — rejected",
                          session->username);
@@ -3659,7 +5121,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Cannot change your own role"),
+                            "application/json");
             return;
         }
 
@@ -3674,8 +5137,8 @@ void SettingsRoutes::register_routes(
                 res.set_header(
                     "HX-Trigger",
                     R"({"showToast":{"message":"Missing or invalid 'role' field","level":"error"}})");
-                res.set_content(render_users_fragment(session->username),
-                                "text/html; charset=utf-8");
+                res.set_content(detail::a4_error(res, "Missing or invalid 'role' field"),
+                                "application/json");
                 return;
             }
             requested_role = json["role"].get<std::string>();
@@ -3684,7 +5147,7 @@ void SettingsRoutes::register_routes(
             res.status = 400;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Invalid JSON body","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid JSON body"), "application/json");
             return;
         }
 
@@ -3700,7 +5163,8 @@ void SettingsRoutes::register_routes(
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Invalid role: must be 'admin' or 'user'","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Invalid role: must be 'admin' or 'user'"),
+                            "application/json");
             return;
         }
 
@@ -3711,7 +5175,7 @@ void SettingsRoutes::register_routes(
             res.status = 404;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User not found","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "User not found"), "application/json");
             return;
         }
         auth::Role old_role = *current_entry_opt;
@@ -3736,7 +5200,7 @@ void SettingsRoutes::register_routes(
             res.status = 500;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Failed to update role","level":"error"}})");
-            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Failed to update role"), "application/json");
             return;
         }
 
@@ -3770,9 +5234,8 @@ void SettingsRoutes::register_routes(
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
             return;
         }
 
@@ -3818,17 +5281,14 @@ void SettingsRoutes::register_routes(
                 ttl_hours = std::stoi(ttl_s);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                            "application/json");
             return;
         }
 
         if (count < 1 || count > 10000) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"count must be 1-10000"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "count must be 1-10000"), "application/json");
             return;
         }
 
@@ -4012,9 +5472,26 @@ void SettingsRoutes::register_routes(
         // fragment in both the missing-id and the not-owner cases
         // so the dashboard does not become an enumeration oracle.
         auto existing = api_token_store_->get_token(token_id);
-        bool denied = existing && existing->principal_id != session->username &&
+        if (!existing.has_value()) {
+            // DB error on the ownership pre-check — surface a retryable error,
+            // not a misleading "Token not found" that reads as already-gone
+            // while the token may still be live (ADR-0012 §1).
+            spdlog::error("API token '{}' ownership check failed for {}: {}", token_id,
+                          session->username, existing.error());
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(
+                detail::a4_error(res, "Token store unavailable — please retry", {.retry_after_ms = 2000}),
+                "application/json");
+            return;
+        }
+        auto& tok = *existing; // std::optional<ApiToken>
+        bool denied = tok && tok->principal_id != session->username &&
                       auth::effective_role(*session) != auth::Role::admin; // honour JIT elevation
-        if (!existing || denied) {
+        if (!tok || denied) {
             if (denied && audit_store_) {
                 // [[nodiscard]] on AuditStore::log is the SOC 2 CC6.6
                 // evidence-integrity flag (PR #883 HIGH-2 pattern); the
@@ -4025,7 +5502,7 @@ void SettingsRoutes::register_routes(
                                          .action = "api_token.revoke",
                                          .target_type = "ApiToken",
                                          .target_id = token_id,
-                                         .detail = "owner=" + existing->principal_id,
+                                         .detail = "owner=" + tok->principal_id,
                                          .source_ip = req.remote_addr,
                                          .result = "denied"});
             }
@@ -4042,13 +5519,50 @@ void SettingsRoutes::register_routes(
             res.status = 404;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Token not found","level":"error"}})");
-            res.set_content("<div class=\"error-fragment\" style=\"color:#f85149\">"
-                            "Token not found.</div>",
-                            "text/html; charset=utf-8");
+            res.set_content(detail::a4_error(res, "Token not found"), "application/json");
             return;
         }
 
-        api_token_store_->revoke_token(token_id);
+        auto revoked = api_token_store_->revoke_token(token_id);
+        if (!revoked.has_value()) {
+            // The revoke did NOT persist (lease timeout / query error). Do NOT
+            // toast or audit success — that would tell an operator revoking a
+            // stolen laptop's token that it died when it did not (ADR-0030
+            // §Posture; the old code discarded this bool and always claimed
+            // success). Audit the failure and surface a retryable error.
+            spdlog::error("API token '{}' revoke did not persist (requested by {}): {}", token_id,
+                          session->username, revoked.error());
+            if (audit_store_) {
+                (void)audit_store_->log(
+                    {.principal = session->username,
+                     .principal_role = auth::role_to_string(auth::effective_role(*session)),
+                     .action = "api_token.revoke",
+                     .target_type = "ApiToken",
+                     .target_id = token_id,
+                     .detail = "owner=" + tok->principal_id + " db_error=true",
+                     .source_ip = req.remote_addr,
+                     .result = "failure"});
+            }
+            res.status = 503;
+            res.set_header("Retry-After", "2");
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Revoke did not persist — please retry","level":"error"}})");
+            res.set_content(
+                detail::a4_error(res, "Revoke did not persist — please retry", {.retry_after_ms = 2000}),
+                "application/json");
+            return;
+        }
+        if (!*revoked) {
+            // DB write succeeded but no row matched — the token was already gone
+            // (a concurrent revoke/delete after the ownership check). Mirror the
+            // not-found fragment rather than claim a fresh revoke.
+            res.status = 404;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Token not found","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Token not found"), "application/json");
+            return;
+        }
 
         spdlog::info("API token '{}' revoked by {}", token_id, session->username);
 
@@ -4058,7 +5572,7 @@ void SettingsRoutes::register_routes(
                                      .action = "api_token.revoke",
                                      .target_type = "ApiToken",
                                      .target_id = token_id,
-                                     .detail = "owner=" + existing->principal_id,
+                                     .detail = "owner=" + tok->principal_id,
                                      .source_ip = req.remote_addr,
                                      .result = "success"});
         }
@@ -4309,7 +5823,47 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        // Optional detached CMS signature (#416/#3807). Optional because a fleet
+        // that has not adopted signing yet must still be able to upload, and
+        // because the agent — not this server — decides whether an unsigned
+        // package is acceptable. Uploading one here does not make it trusted:
+        // the agent checks it against an anchor this server never supplies.
+        std::string signature_pem;
+        if (SETTINGS_REQ_HAS_FILE(req, "signature")) {
+            signature_pem = SETTINGS_REQ_GET_FILE(req, "signature").content;
+            if (signature_pem.size() > kMaxSignatureBytes) {
+                res.status = 400;
+                res.set_content("<span class=\"feedback-error\">Signature file is too large "
+                                "(max 64 KB). A detached CMS signature is a few KB — check you "
+                                "selected the .sig file and not the binary.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
+
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+        // Case-INSENSITIVE: the server may store packages on a case-insensitive
+        // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
+        // same file, so a case-sensitive guard is bypassable there.
+        auto ends_with_sig = [](std::string n) {
+            if (n.size() < 4)
+                return false;
+            n = n.substr(n.size() - 4);
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return n == ".sig";
+        };
+        if (ends_with_sig(uploaded.filename)) {
+            // Signature sidecars are derived as "<binary>.sig", so a package
+            // literally named X.sig would occupy package X's sidecar slot. It
+            // fails closed (X's agents then see a signature over the wrong
+            // bytes and refuse), but the cause would be invisible.
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">Package filenames may not end in "
+                            "'.sig' — that suffix is reserved for signature sidecars.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (uploaded.content.empty()) {
             res.status = 400;
             res.set_content("<span class=\"feedback-error\">Empty file.</span>",
@@ -4327,22 +5881,163 @@ void SettingsRoutes::register_routes(
         if (rollout_pct > 100)
             rollout_pct = 100;
 
+        // Shape-check the signature BEFORE the binary is written. A well-sized
+        // file of garbage would otherwise be stored, reported "signed" by the
+        // settings column, served by CheckForUpdate, and then refused by every
+        // anchored agent in BOTH enforcement modes — including permissive, where
+        // the documented contract is that unsigned packages are accepted with a
+        // warning. The operator's only signal would be a fleet gauge rising after
+        // the fact.
+        //
+        // Placed here, ahead of the write, so a rejection leaves the PREVIOUS
+        // package and its signature completely untouched: the operator retries an
+        // upload rather than recovering a half-replaced package.
+        if (!signature_pem.empty() && !looks_like_pem_cms(signature_pem)) {
+            spdlog::warn("OTA upload for {}/{}: rejected — the signature is not PEM-armoured CMS",
+                         platform, arch);
+            // 400, not the httplib default. Leaving the status unset answered 200
+            // for an upload that wrote nothing, so a scripted uploader recorded
+            // success and the fleet silently kept the old package. 400 rather than
+            // 500 because the input is malformed — the server is fine.
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"That signature file is not a PEM CMS )"
+                           R"(signature (expected a -----BEGIN CMS----- block). Nothing was )"
+                           R"(changed.","level":"error"}})");
+            res.set_content(
+                detail::a4_error(res, "That signature file is not a PEM CMS signature "
+                                       "(expected a -----BEGIN CMS----- block). Nothing was "
+                                       "changed."),
+                "application/json");
+            return;
+        }
+
         auto orig_name =
             uploaded.filename.empty() ? "yuzu-agent-" + platform + "-" + arch : uploaded.filename;
+
+        // #3863: the name is operator-supplied and every artifact path is built
+        // from it — the binary, its .sig sidecar and the .upload staging file —
+        // so a traversal or absolute name writes all three outside update_dir_.
+        // Rejected BEFORE any path is derived from it.
+        if (!is_safe_package_filename(orig_name)) {
+            spdlog::warn("OTA upload for {}/{}: rejected unsafe package filename", platform, arch);
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The package filename must be a plain "
+                            "filename \u2014 no directory separators, drive letters, or "
+                            "<code>..</code>.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
 
         auto out_path =
             update_registry_->binary_path(UpdatePackage{platform, arch, "", "", orig_name});
         std::error_code ec;
         std::filesystem::create_directories(out_path.parent_path(), ec);
+
+        // ORDERING RULE: THE STEP THAT WEAKENS THE SIGNATURE GOES LAST.
+        //
+        // Which step that is depends on the upload, so the order is not fixed:
+        //
+        //   signed upload   -> sidecar, then binary. Writing the binary first
+        //                      leaves new-binary + no-signature if we die in
+        //                      between, and on the FIRST signed upload of a
+        //                      filename there is no predecessor to fall back on,
+        //                      so that window spans the whole signing rollout.
+        //
+        //   unsigned upload -> binary, then remove the sidecar. Removing first
+        //                      leaves OLD-binary + no-signature if the binary
+        //                      write then fails, which strips protection from a
+        //                      package still being served. (This is the hole the
+        //                      first version of this reorder left: it removed
+        //                      unconditionally up front.)
+        //
+        // Both orders leave only fail-closed intermediates: a mismatched pair,
+        // which every anchored agent refuses. Never the unprotected pair.
+        //
+        // The sidecar path derives from the filename alone (UpdateRegistry::
+        // signature_path -> binary_path = update_dir_ / filename), so it is known
+        // here, before `pkg` exists.
+        const auto sidecar_path = signature_sidecar_path(out_path);
+        const bool signed_upload = !signature_pem.empty();
+
+        if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            // Nothing has been written yet: the previous binary and its signature
+            // are both untouched, so this is a clean refusal, not a partial state.
+            spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
+                          "the previous package is unchanged",
+                          platform, arch);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not store the signature. "
+                            "Nothing was changed \u2014 retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // STAGE AND RENAME, for the same reason the sidecar does. Writing in place
+        // with ios::trunc means an ENOSPC part-way through leaves a TRUNCATED
+        // binary on the live path — and one whose mtime is NEWER than the sidecar,
+        // so the mtime consistency check sees a well-ordered pair and the column
+        // reports "signed" for a package whose signature covers nothing that is
+        // there. Staging keeps a partial write off the served path entirely.
+        //
+        // The staging name carries the request's own suffix: a fixed name lets two
+        // concurrent uploads of the same filename interleave into one file, and
+        // whichever rename loses publishes bytes that do not match its own row.
+        static std::atomic<unsigned long long> upload_seq{0};
+        auto bin_tmp = out_path;
+        bin_tmp += ".upload." + std::to_string(upload_seq.fetch_add(1)) + ".tmp";
+
+        const auto fail_binary = [&](const char* msg) {
+            std::error_code rm_ec;
+            std::filesystem::remove(bin_tmp, rm_ec);
+            res.status = 500;
+            res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
+                            "text/html; charset=utf-8");
+        };
+
         {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            std::ofstream f(bin_tmp, std::ios::binary | std::ios::trunc);
             if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
-                                "text/html; charset=utf-8");
+                fail_binary("Cannot write file.");
                 return;
             }
             f.write(uploaded.content.data(), static_cast<std::streamsize>(uploaded.content.size()));
+            // Same reasoning as the sidecar's own close: testing before
+            // destruction misses whatever ~ofstream flushes, and a truncated
+            // agent binary that reports success is a fleet-wide apply failure.
+            f.close();
+            if (!f) {
+                fail_binary("Could not write the binary completely.");
+                return;
+            }
+        }
+        // Durable before publication, matching the sidecar. Without this a crash
+        // just after the rename can expose the live name pointing at unflushed
+        // (zero-length) bytes.
+        if (!fsync_file(bin_tmp)) {
+            fail_binary("Could not flush the uploaded binary to disk.");
+            return;
+        }
+        std::error_code bin_ren_ec;
+        std::filesystem::rename(bin_tmp, out_path, bin_ren_ec);
+        if (bin_ren_ec) {
+            fail_binary("Could not publish the uploaded binary.");
+            return;
+        }
+
+        // The binary is live. NOW drop the signature, if this upload is unsigned —
+        // last, per the ordering rule above, so no failure above this line could
+        // have left the served package unprotected.
+        if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
+                          "the package is served with a signature that does not cover it",
+                          platform, arch);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">The binary was published but its "
+                            "old signature could not be removed. Agents will refuse this "
+                            "package until you retry.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         auto sha = auth::AuthManager::sha256_hex(uploaded.content);
@@ -4365,9 +6060,29 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        update_registry_->upsert_package(pkg);
+        // Upload path: the row is best-effort here and the failure is already
+        // visible in the log; the rollout path is the one that audits a committed
+        // transition and therefore must not discard this.
+        (void)update_registry_->upsert_package(pkg);
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
+
+        if (!signature_pem.empty())
+            spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
+                         signature_pem.size());
+
+        // AUDIT. This changes what code the fleet will execute, so it belongs in
+        // the evidence store, not only in the server log. `signed=` is the field
+        // that matters: an upload with the Signature field left empty silently
+        // downgrades the package from signed to unsigned for every endpoint, and
+        // without this row that transition has no actor, no timestamp and no
+        // outcome. The sibling plugin_signing.bundle.* handler in this same file
+        // has recorded exactly this for its own trust artifact all along.
+        audit_fn_(req, "ota.package.uploaded", "success", "UpdatePackage",
+                  platform + "/" + arch + "/" + version,
+                  "file=" + orig_name + " sha256=" + sha +
+                      " signed=" + (signature_pem.empty() ? "false" : "true") +
+                      " rollout=" + std::to_string(rollout_pct) + "%");
 
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
@@ -4385,19 +6100,55 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    PackageDeleteOutcome outcome;
+                    // Each remove gets its OWN error_code. Sharing one lets the
+                    // second call's result overwrite the first, so a failed
+                    // binary delete followed by a clean sidecar delete reads as
+                    // wholly successful.
+                    std::error_code bin_ec;
+                    std::error_code sig_ec;
                     auto packages = update_registry_->list_packages();
                     for (const auto& pkg : packages) {
                         if (pkg.platform == platform && pkg.arch == arch &&
                             pkg.version == version) {
+                            outcome.matched = true;
                             auto bin_path = update_registry_->binary_path(pkg);
-                            std::error_code ec;
-                            std::filesystem::remove(bin_path, ec);
+                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
+                            // Remove the signature sidecar with it. Leaving it
+                            // behind would let a later upload of a same-named
+                            // package inherit a signature made over DIFFERENT
+                            // bytes — which the agent would then reject as
+                            // tampered, with no obvious cause.
+                            outcome.signature_removed = std::filesystem::remove(
+                                update_registry_->signature_path(pkg), sig_ec);
+                            if (bin_ec) {
+                                outcome.binary_error = bin_ec.message();
+                            }
+                            if (sig_ec) {
+                                outcome.signature_error = sig_ec.message();
+                            }
                             break;
                         }
                     }
 
                     update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
+                    // Audited for the same reason as the upload: this removes a
+                    // binary AND its signature from the fleet's update surface.
+                    // Report what actually happened. A delete naming a package that
+                    // is not there removes nothing, and recording that as a
+                    // successful removal puts a fictional event in the evidence
+                    // store — and hides probing of the endpoint from a SIEM rule.
+                    //
+                    // The result/detail derivation is a pure function in
+                    // ota_signature_sidecar.hpp — including why a failed unlink is
+                    // never audited as a removal, and why the rejection token is
+                    // `denied` rather than a bespoke `not_found`. It lives there
+                    // because the failed-unlink branch cannot be reached from a
+                    // unit test of this route.
+                    const auto audit = describe_package_delete(outcome);
+                    audit_fn_(req, "ota.package.deleted", audit.result, "UpdatePackage",
+                              platform + "/" + arch + "/" + version, audit.detail);
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -4425,16 +6176,106 @@ void SettingsRoutes::register_routes(
                   if (pct > 100)
                       pct = 100;
 
-                  auto packages = update_registry_->list_packages();
-                  for (auto pkg : packages) {
-                      if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
-                          pkg.rollout_pct = pct;
-                          update_registry_->upsert_package(pkg);
-                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                       version, pct);
-                          break;
-                      }
+                  // Capture the PRIOR percentage before the write. It is the whole
+                  // evidentiary value of this row: #3692's scenario is an admin —
+                  // or a compromised admin session — silently de-prioritising a
+                  // mandatory security patch, and "rollout is 0%" does not
+                  // distinguish that from a package that was never rolled out.
+                  // "from=100% to=0%" does. `mandatory` is carried for the same
+                  // reason: it is what makes the de-prioritisation consequential.
+                  // A CHECKED read, NOT list_packages: the ordinary reads on
+                  // this store fail SOFT, returning an empty vector on a closed
+                  // store, a pool-acquire timeout or a query error. That carve-out
+                  // (ADR-0061) was granted because no downstream branch treated an
+                  // empty list as a signal — and an audit branch does. Deriving
+                  // "not_found" from a soft-failed read would let a PG blip during
+                  // a legitimate admin rollout both manufacture key-enumeration
+                  // alerts (audit-log.md names `denied` as that filter) and assert,
+                  // in the evidence record, that a package which exists did not.
+                  // ONE store call, not a find-then-upsert pair. Read and write
+                  // are the same row-locked transaction, so the `from=` this row
+                  // reports is provably the value the commit replaced. As two
+                  // autocommit statements a concurrent write to the same key
+                  // could land between them — and it does not take two admins:
+                  // one session firing two near-simultaneous requests is enough,
+                  // which is exactly the compromised-admin case #3692 exists to
+                  // catch. Same shape as `AuditStore::stamp_complete` (ADR-0040,
+                  // #2697); see update_registry.hpp.
+                  auto change =
+                      update_registry_->update_rollout_checked(platform, arch, version, pct);
+                  // NOT `status == kFound`: the row can be found inside the
+                  // transaction and the write still fail to commit, which is a
+                  // distinct outcome the audit row reports differently.
+                  const bool committed = change.committed;
+                  if (committed)
+                      spdlog::info("OTA rollout updated: {}/{} v{} {}% -> {}%", platform, arch,
+                                   version, change.prior_rollout_pct, pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kFound)
+                      spdlog::error("OTA rollout NOT applied for {}/{} v{}: the package exists "
+                                    "at {}% but the registry write did not commit",
+                                    platform, arch, version, change.prior_rollout_pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kUnavailable)
+                      spdlog::error("OTA rollout for {}/{} v{}: the registry could not be read; "
+                                    "the package's existence is UNKNOWN, not absent",
+                                    platform, arch, version);
+
+                  // Audited AFTER the write, and reporting what actually happened.
+                  // A rollout change alters which endpoints receive a given binary,
+                  // so it belongs in the same evidence chain as the upload and the
+                  // delete; `spdlog::info` is the application log, not the audit
+                  // log, and nothing else in the request path emits an audit row.
+                  //
+                  // A request naming a package that does not exist changes nothing,
+                  // so it must not record a fictional success. The token is
+                  // `denied` with the reason in `detail`, NOT a bespoke
+                  // `not_found` result: this file's own rejection branches use
+                  // that shape (`user.delete` -> "denied" / "invalid_username"),
+                  // and audit-log.md's probe-detection recipe tells operators to
+                  // filter on `result == "denied"` to surface enumeration — a
+                  // fourth token would be invisible to exactly the rule this row
+                  // exists to feed.
+                  // THE RESULT IS DERIVED FROM THE COMMIT, NOT FROM THE LOOKUP.
+                  // `upsert_package` degrades silently on a closed store, a
+                  // pool-acquire timeout or a query error, so deriving `success`
+                  // from "we found the package" would let this row assert a
+                  // "from=100% to=0%" transition that never reached the database —
+                  // evidence disagreeing with state, in the one record an incident
+                  // responder is meant to be able to trust. `failure` is the
+                  // documented token for a failure the handler audits itself.
+                  // THREE DISTINCT OUTCOMES, and the store-degraded one is NOT
+                  // absence. `denied` is reserved for a package the store actually
+                  // reported as absent, because audit-log.md tells operators to
+                  // filter on it to surface enumeration; a degraded read reports
+                  // `failure`, which is the documented token for a failure the
+                  // handler audits itself. Neither the degraded nor the
+                  // uncommitted branch may claim a `from=`/`to=` transition — the
+                  // detail records what was ATTEMPTED, which asserts nothing false.
+                  const char* result = "failure";
+                  std::string detail;
+                  switch (change.status) {
+                  case UpdateRegistry::PackageLookup::kFound:
+                      result = committed ? "success" : "failure";
+                      // `from=` is now provably the value this write replaced —
+                      // it was read under a row lock in the same transaction, so
+                      // no concurrent writer can have changed it in between.
+                      detail = (committed ? "from=" : "attempted_from=") +
+                               std::to_string(change.prior_rollout_pct) +
+                               (committed ? "% to=" : "% attempted_to=") + std::to_string(pct) +
+                               "% mandatory=" + (change.prior_mandatory ? "true" : "false") +
+                               (committed ? "" : " outcome=write_not_committed");
+                      break;
+                  case UpdateRegistry::PackageLookup::kAbsent:
+                      result = "denied";
+                      detail = "not_found";
+                      break;
+                  case UpdateRegistry::PackageLookup::kUnavailable:
+                      result = "failure";
+                      detail = "attempted_to=" + std::to_string(pct) +
+                               "% outcome=store_unavailable existence_unknown=true";
+                      break;
                   }
+                  audit_fn_(req, "ota.package.rollout_changed", result, "UpdatePackage",
+                            platform + "/" + arch + "/" + version, detail);
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });
@@ -4464,9 +6305,20 @@ void SettingsRoutes::register_routes(
 
     // Origin/Referer CSRF gate — Hermes Agent red-team finding MEDIUM #2
     // (2026-05-29). Every Settings MFA POST mutates per-user MFA state
-    // using session-cookie auth alone; SameSite=Lax is not strict enough
-    // to stop a cross-site form POST from disabling MFA on a victim
-    // session. We require Origin (or Referer as fallback) to carry the
+    // using session-cookie auth alone.
+    //
+    // Corrected on #2641 review: an earlier version of this comment said
+    // `SameSite=Lax` "is not strict enough to stop a cross-site form POST".
+    // That is wrong. Lax sends the cookie on a cross-site top-level
+    // navigation only for SAFE methods; POST is not safe, so a purely
+    // cross-site form POST arrives with no cookie at all. (Chrome's
+    // Lax+POST intervention applies only to cookies with NO SameSite
+    // attribute — `auth_routes.cpp` sets it explicitly.) What the gate
+    // closes is a SAME-SITE sibling origin: subdomain takeover, XSS on a
+    // neighbour, a shared-domain deployment. Those carry the cookie and
+    // are a different origin, which is what Origin/Referer catches.
+    //
+    // We require Origin (or Referer as fallback) to carry the
     // same host as the request's Host header; absence means a non-
     // browser caller (curl, automation) which is explicitly allowed
     // because programmatic admin clients post without an Origin header.
@@ -4518,13 +6370,19 @@ void SettingsRoutes::register_routes(
         // Shared same-site comparison (web_utils) — one implementation across
         // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
         // audit; ca_routes' dashboard revoke calls the same helper.
-        if (origin_is_same_site(host, origin, referer)) {
+        //
+        // The operator-declared external-origin allowlist (#2537) comes straight
+        // from Config here, because this owner already holds one. CaRoutes and
+        // DashboardRoutes take theirs via set_csrf_trusted_origins() rather than
+        // acquire a Config dependency they otherwise have no use for. A null
+        // cfg_ yields an empty span — same-host only, fail-closed, never open.
+        if (origin_is_same_site(host, origin, referer,
+                                cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                     : std::span<const std::string>{})) {
             return true;
         }
         res.status = 403;
-        res.set_content(
-            R"({"error":{"code":403,"message":"cross-origin POST refused"},"meta":{"api_version":"v1"}})",
-            "application/json");
+        res.set_content(detail::a4_error(res, "cross-origin POST refused"), "application/json");
         audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
                   "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
                       " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
@@ -4567,6 +6425,17 @@ void SettingsRoutes::register_routes(
             const char* msg = "Enrollment failed";
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
                 msg = "MFA is already enabled — disable it first to re-enroll";
+            } else if (is_store_unavailable(init.error())) {
+                // ★ SECURITY (architect BLOCK follow-through): distinguish a
+                // store/decrypt failure from a generic enrollment error —
+                // never mislead the operator into retrying a fundamentally
+                // broken step; no MFA state changes either way.
+                msg = "Authentication store is temporarily unavailable — retry shortly";
+                if (metrics_registry_) {
+                    metrics_registry_
+                        ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
+                        .increment();
+                }
             }
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
             res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
@@ -4609,10 +6478,48 @@ void SettingsRoutes::register_routes(
                       // routes the renderer to the retry shape; leaving
                       // `new_otpauth_uri` empty suppresses the
                       // one-time secret reveal (Gate 4 happy-path B3).
+                      //
+                      // ★ SECURITY (architect BLOCK follow-through): a
+                      // store/decrypt failure is NOT "code rejected" — never
+                      // conflate the two (no enrollment completes / no
+                      // recovery codes are issued either way, but the
+                      // operator-facing message and audit detail must be
+                      // honest about which happened).
+                      // The account is already enrolled — a concurrent verify won
+                      // the race (or it was already enrolled). It is NOT a rejected
+                      // code and NOT a store outage — audit it distinctly so it
+                      // does not inflate bad-code-attempt counts (#3777, CC7.2),
+                      // and tell the operator the true state rather than "code
+                      // rejected". `MfaAlreadyEnrolled` is not in
+                      // is_store_unavailable(), so no false 503/degrade path. (A
+                      // bare disable+re-init without a subsequent winning verify
+                      // leaves mfa_enrolled_at NULL, so it does NOT reach here — it
+                      // stays fail-closed WriteFailed.)
+                      if (codes_res.error() == AuthDBError::MfaAlreadyEnrolled) {
+                          audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
+                                    "already enrolled by a concurrent verify; no duplicate "
+                                    "enrollment");
+                          res.set_content(
+                              render_mfa_fragment(session->username, {}, {}, {}, session->username,
+                                                  "MFA is already enrolled on this account."),
+                              "text/html; charset=utf-8");
+                          return;
+                      }
+                      const bool store_unavailable = is_store_unavailable(codes_res.error());
+                      if (store_unavailable && metrics_registry_) {
+                          metrics_registry_
+                              ->counter("yuzu_auth_secret_unavailable_total",
+                                       {{"route", "mfa_enroll"}})
+                              .increment();
+                      }
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                "code rejected");
-                      const char* msg = "Code rejected. Try the next code shown by your "
-                                        "authenticator (codes refresh every 30 seconds).";
+                                store_unavailable ? "secret/store unavailable (fail-closed)"
+                                                  : "code rejected");
+                      const char* msg =
+                          store_unavailable
+                              ? "Authentication store is temporarily unavailable — retry shortly."
+                              : "Code rejected. Try the next code shown by your authenticator "
+                                "(codes refresh every 30 seconds).";
                       res.set_content(render_mfa_fragment(session->username, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");

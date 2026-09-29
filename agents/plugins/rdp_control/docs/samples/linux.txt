@@ -1,0 +1,10 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e17062cd8474
+== action=set_state
+rdp_control|unsupported|Windows Remote Desktop is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=status
+rdp_control|unsupported|Windows Remote Desktop is not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+

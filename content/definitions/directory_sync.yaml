@@ -72,7 +72,7 @@ spec:
     ttlSeconds: 3600
 
   approval:
-    mode: manual
+    mode: always
 
   permissions:
     executeRoles: [admin, directory-admin]
@@ -260,7 +260,7 @@ spec:
     ttlSeconds: 30
 
   approval:
-    mode: manual
+    mode: always
 
   permissions:
     executeRoles: [admin]

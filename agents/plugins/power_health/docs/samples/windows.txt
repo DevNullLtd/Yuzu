@@ -1,0 +1,21 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 082db96f6e05
+== action=battery
+battery|0|ac_no_battery|-1|-1|-1|-1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=thermal
+thermal|unavailable|pdh_collect_failed
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=power_plan
+power_plan|381b4222-f694-41f0-9685-ff5bb260df2e|Balanced|1|ok
+power_plan|8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c|High performance|0|ok
+power_plan|a1841308-3541-4fab-bc81-f71556f20b4a|Power saver|0|ok
+power_plan|b1000fa2-4bc5-4da1-b3b1-27c753763a67|AMD Ryzen™ Balanced|0|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=set_power_plan
+set_power_plan|error|missing_param|-|-
+[result_status] UNAVAILABLE / PARTIAL / missing required param 'scheme'
+[rc] 1
+

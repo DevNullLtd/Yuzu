@@ -1,0 +1,4 @@
+total 24
+-rw-r--r--@ 1 root  wheel  672 Aug 19 16:27 com.docker.socket.plist
+-rw-r--r--@ 1 root  wheel  667 Aug 19 16:27 com.docker.vmnetd.plist
+-rwx------  1 root  wheel  661 Sep  6 14:56 com.nordvpn.macos.helper.plist

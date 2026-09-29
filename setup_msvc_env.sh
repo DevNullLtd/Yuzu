@@ -9,7 +9,7 @@
 
 # ── Version pins (update when toolchain upgrades) ────────────────────────────
 _MSVC_VER="14.44.35207"
-_SDK_VER="10.0.22621.0"
+_SDK_VER="10.0.26100.0"
 
 # ── Base directories (Unix-style paths for MSYS2) ────────────────────────────
 _VS_ROOT="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
@@ -21,6 +21,37 @@ _PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _CMAKE_DIR="/c/Program Files/CMake/bin"
 _PYTHON_DIR="/c/Python314"
 _MESON_DIR="/c/Python314/Scripts"
+
+# ── Fail-closed SDK admission ────────────────────────────────────────────────
+# A stale SDK earlier on PATH can make `which rc.exe` look healthy while the
+# pinned INCLUDE/LIB directories do not exist.  Validate the three live
+# artifacts that define the reviewed SDK target before exporting any build
+# environment.  Keep this at the top of the sourced script so callers fail in
+# seconds rather than at the first Windows.h include or kernel32 link.
+_SDK_HEADER="${_WIN_SDK}/Include/${_SDK_VER}/um/Windows.h"
+_SDK_LIB="${_WIN_SDK}/Lib/${_SDK_VER}/um/x64/kernel32.lib"
+_SDK_RC="${_WIN_SDK}/bin/${_SDK_VER}/x64/rc.exe"
+_SDK_MISSING=0
+_require_sdk_artifact() {
+    local name="$1"
+    local path="$2"
+    if [ ! -f "$path" ]; then
+        printf "ERROR: Windows SDK %s missing required %s: %s\n" \
+            "${_SDK_VER}" "$name" "$path" >&2
+        _SDK_MISSING=1
+    fi
+}
+_require_sdk_artifact Windows.h "${_SDK_HEADER}"
+_require_sdk_artifact kernel32.lib "${_SDK_LIB}"
+_require_sdk_artifact rc.exe "${_SDK_RC}"
+unset -f _require_sdk_artifact
+if [ "${_SDK_MISSING}" -ne 0 ]; then
+    unset _MSVC_VER _SDK_VER _VS_ROOT _VS_INSTALLER _VC_TOOLS _WIN_SDK _VCPKG
+    unset _PROJECT_ROOT _CMAKE_DIR _PYTHON_DIR _MESON_DIR
+    unset _SDK_HEADER _SDK_LIB _SDK_RC _SDK_MISSING
+    return 1 2>/dev/null || exit 1
+fi
+unset _SDK_HEADER _SDK_LIB _SDK_RC _SDK_MISSING
 
 # ── Compiler selection (force MSVC, never Clang) ─────────────────────────────
 export CC="cl.exe"

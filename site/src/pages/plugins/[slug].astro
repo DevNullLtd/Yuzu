@@ -1,0 +1,30 @@
+---
+import { getCollection, render } from 'astro:content';
+import Manual from '../../layouts/Manual.astro';
+import { PLUGIN_ENTRIES } from '../../nav.plugins.mjs';
+
+// One page per plugin README that has adopted docs/plugin-readme-standard.md.
+// The entry list is generated (src/nav.plugins.mjs, by tools/plugin-doc-gen);
+// the Markdown is read straight from agents/plugins/<name>/README.md via the
+// `plugins` collection (content.config.ts) — no copy, no drift.
+export async function getStaticPaths() {
+  const all = await getCollection('plugins');
+  const find = (e) =>
+    all.find((d) => (d.filePath || '').replace(/\\/g, '/').endsWith(`${e.file}.md`)) ||
+    all.find((d) => d.id === e.file.replace(/^agents\/plugins\//, ''));
+
+  return PLUGIN_ENTRIES
+    .map((e) => {
+      const entry = find(e);
+      // Slugs are 'plugins/<name>'; the route already carries the prefix.
+      return entry ? { params: { slug: e.slug.replace(/^plugins\//, '') }, props: { entry, meta: e } } : null;
+    })
+    .filter(Boolean);
+}
+
+const { entry, meta } = Astro.props;
+const { Content } = await render(entry);
+---
+<Manual title={meta.title} slug={meta.slug}>
+  <Content />
+</Manual>

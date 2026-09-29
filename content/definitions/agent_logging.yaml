@@ -13,8 +13,11 @@ metadata:
     Returns the last N lines of the agent's log file. The log file
     path is discovered from agent config (agent.log_file or
     agent.data_dir), falling back to platform default paths
-    (/var/log/yuzu on Linux, ProgramData/Yuzu on Windows). The
-    number of lines is configurable (default 50, max 500).
+    (/var/log/yuzu or /opt/yuzu on Linux, /Library/Application
+    Support/Yuzu or /var/log/yuzu on macOS, ProgramData/Yuzu on
+    Windows). Returns status|empty with zero lines when no log file
+    resolves on this host. The number of lines is configurable
+    (default 50, max 500).
   tags: [diagnostics, logging, agent]
 
 spec:
@@ -31,7 +34,10 @@ spec:
     properties:
       lines:
         type: int32
-        description: Number of log lines to return (1-500)
+        description: >
+          Number of trailing log lines to return, 1-500 (e.g. 100).
+          Defaults to 50; values above 500 are clamped, values below
+          1 are rejected with a status|error result.
         default: 50
         minimum: 1
         maximum: 500
@@ -40,10 +46,21 @@ spec:
     columns:
       - name: log_file
         type: string
+        description: >-
+          Absolute path to the log file that was read; the field is omitted from the output entirely when no log file resolves on this host. Values: absolute path, or field absent.
+        example: field omitted in every captured sample — no capture has resolved a log file (see status|empty)
+        platforms: [windows, linux, darwin]
       - name: line_count
         type: int32
+        description: 'Count of line entries returned; 0 when no log file resolves. Values: non-negative integer.'
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: line
         type: string
+        description: >-
+          One raw line from the tailed log file, unescaped and in file order; omitted entirely when no log file resolves. Values: free text, or field absent.
+        example: field omitted in every captured sample — no capture has resolved a log file
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get last {{lines}} lines of agent log"
 
@@ -96,10 +113,20 @@ spec:
     columns:
       - name: path
         type: string
+        description: >-
+          Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path.
+        example: "/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture"
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: 'File size in bytes; 0 if the size read failed. Values: non-negative integer (bytes).'
+        example: "142208"
+        platforms: [windows, linux, darwin]
       - name: modified
         type: int64
+        description: 'Last-write time as Unix epoch seconds; 0 if the mtime read failed. Values: non-negative integer (unix epoch seconds).'
+        example: "1788774907"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List agent key files"
 

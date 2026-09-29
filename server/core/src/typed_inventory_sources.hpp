@@ -21,7 +21,18 @@
 namespace yuzu::server {
 
 [[nodiscard]] inline bool is_typed_inventory_source(std::string_view source) {
-    return source == "installed_software" || source == "app_perf" || source == "device_ci";
+    // software_licensing (ADR-0024 Decision 5): registered in the SAME change
+    // as its seam (software_licensing_ingestion) — omission would double-store
+    // detected-licence rows (incl. `user_ref`) into the generic store on the
+    // gateway path, readable under Infrastructure:Read, i.e. a leak past the
+    // SoftwareLicensing securable.
+    // app_usage (Wave 7b, Part 20): this identical hunk lives in BOTH PR7b.2 and PR7b.3 so
+    // no release can carry the agent-side app_usage daily-sync source without this skip —
+    // otherwise a gateway-proxied blob lands in the generic InventoryStore, readable under
+    // Infrastructure:Read (query_inventory/get_agent_inventory), i.e. a leak past the
+    // Forensics securable. Registered here, never inline in the gateway loop.
+    return source == "installed_software" || source == "app_perf" || source == "device_ci" ||
+           source == "software_licensing" || source == "app_usage";
 }
 
 } // namespace yuzu::server

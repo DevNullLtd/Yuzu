@@ -1,0 +1,297 @@
+## App Usage Definitions
+## Read-only, machine-scope application usage inventory derived from TAR's
+## usage fold (usage_daily / usage_daily_user / usage_live inside tar.db).
+## No pid, cmdline, or user name is ever surfaced by this source — user
+## identity is folded into a COUNT(DISTINCT user) only, and open-run state
+## is a plain count. Default-ON: this reads TAR's own default-on usage
+## fold; it requires no separate opt-in beyond TAR itself and
+## `usage_enabled` (tar_config, default true).
+## Plugin: app_usage | Actions: summary, last_used, foreground
+##
+## Gated behind the Forensics securable (Administrator / approval-gated) —
+## per-executable usage history is forensics-sensitive even with names
+## redacted. See server/core/src/capability_decls/
+## plugin_action_catalogue_app_usage.hpp.
+##
+## RETENTION: every timestamp field below (first_seen/last_seen) is
+## MIN/MAX over the usage_daily rows currently retained by TAR (31-day
+## default window; TAR prunes usage_daily on its own retention cadence).
+## Never described as spanning every run ever recorded — once TAR's retention prunes a day's rows, this
+## source has no way to see past them.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.summary
+  displayName: App Usage Summary
+  version: 1.0.0
+  description: >
+    Machine-scope summary of application run activity over a window of
+    days, aggregated from TAR's usage_daily table, within TAR's retained
+    usage window (31 days by default). One row per executable: run_count,
+    total_seconds, first_seen, last_seen, distinct_users (a
+    COUNT(DISTINCT user) only — no user name ever leaves the agent's
+    SQLite database), superseded_runs, and expired_runs. Preceded by one
+    meta row carrying the fold's own health counters (coverage window,
+    open runs, unmatched stops, clock anomalies, capture gaps, feeder
+    state). If the machine's TAR usage source is disabled, or the host's
+    TAR schema predates this table, this reports an explicit constrained
+    reason rather than an empty result.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: summary
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      days:
+        type: int32
+        displayName: Window (days)
+        description: Number of trailing days to summarise. Clamped to 1-365.
+        default: 30
+      top:
+        type: int32
+        displayName: Top N executables
+        description: Maximum number of executables to return. Clamped to 1-500.
+        default: 25
+      by:
+        type: string
+        displayName: Sort by
+        description: >
+          Ranking metric: "run_time" (total_seconds, default) or
+          "run_count". Any other value is rejected with error|bad_param|by.
+        default: "run_time"
+
+  result:
+    # meta|window_days|<n>|coverage_since|<ts>|days_present|<n>|open_runs|<n>|
+    #   unmatched_stops|<n>|clock_anomalies|<n>|gap_count|<n>|
+    #   gap_lost_events|<n>|gap_last_ts|<ts>|lag_events|<n>|
+    #   feeder_enabled|<0/1>|last_fold_ts|<ts>
+    # usage|<exe_key>|<run_count>|<total_seconds>|<first_seen>|<last_seen>|
+    #   <distinct_users>|<superseded_runs>|<expired_runs>
+    columns:
+      - name: exe_key
+        type: string
+        description: 'Lowercased basename of the executable (P5-escaped: a literal "|" becomes "\|", CR/LF fold to a space, "\" folds to "/"). Never a full path, pid, or command line.'
+        example: chrome.exe
+        platforms: [windows, linux, darwin]
+      - name: run_count
+        type: int64
+        description: 'Number of runs recorded for this executable within the window. Values: non-negative integer.'
+        example: 12
+        platforms: [windows, linux, darwin]
+      - name: total_seconds
+        type: int64
+        description: 'Total wall-clock seconds this executable was observed running within the window. Values: non-negative integer.'
+        example: 43200
+        platforms: [windows, linux, darwin]
+      - name: first_seen
+        type: int64
+        description: 'Unix timestamp of the earliest run within TAR''s retained usage window (not every run ever recorded — rows older than TAR''s retention are already gone). Values: unix seconds.'
+        example: 1717200000
+        platforms: [windows, linux, darwin]
+      - name: last_seen
+        type: int64
+        description: 'Unix timestamp of the most recent run within TAR''s retained usage window. Values: unix seconds.'
+        example: 1717286400
+        platforms: [windows, linux, darwin]
+      - name: distinct_users
+        type: int64
+        description: 'COUNT(DISTINCT user) over the window — a count only; no user name ever leaves the agent''s SQLite database. Values: non-negative integer.'
+        example: 2
+        platforms: [windows, linux, darwin]
+      - name: superseded_runs
+        type: int64
+        description: 'Runs whose stop event was superseded by a newer start for the same pid before a clean stop was observed. Values: non-negative integer.'
+        example: 0
+        platforms: [windows, linux, darwin]
+      - name: expired_runs
+        type: int64
+        description: 'Runs closed by the fold''s own timeout rather than an observed stop event. Values: non-negative integer.'
+        example: 1
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Summarise application usage for the last ${days} days"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.last_used
+  displayName: App Last Used
+  version: 1.0.0
+  description: >
+    Per-executable last/first-seen within TAR's retained usage window
+    (31 days by default, not every run ever recorded) plus a trailing-30-day
+    run_count/total_seconds window, aggregated from TAR's usage_daily
+    table. Optional `exe` parameter narrows the result to one executable,
+    normalised with the same rule TAR uses to write exe_key (lowercased
+    basename, trimmed). Machine scope only — no pid, cmdline, or user name
+    is ever surfaced. Reports `constrained|usage_feeder_disabled` (or
+    `usage_feeder_errored`) instead of data when TAR's own usage fold is not
+    actually advancing (its process or usage collector is off), since this
+    action has no separate health row to carry that signal. The unfiltered
+    form is capped at 5000 executables and appends a trailing
+    `constrained|last_used_truncated|<cap>` row if the cap was reached.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: last_used
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      exe:
+        type: string
+        displayName: Executable
+        description: >
+          Optional executable name (or path — only the basename is used)
+          to narrow the result to. Omit to return every executable TAR
+          has recorded within its retained usage window.
+
+  result:
+    # last_used|<exe_key>|<last_seen>|<first_seen>|<run_count_30d>|<total_seconds_30d>
+    columns:
+      - name: exe_key
+        type: string
+        description: 'Lowercased basename of the executable (P5-escaped, same rule as summary''s exe_key column). Never a full path, pid, or command line.'
+        example: chrome.exe
+        platforms: [windows, linux, darwin]
+      - name: last_seen
+        type: int64
+        description: 'Unix timestamp of the most recent run within TAR''s retained usage window. Values: unix seconds.'
+        example: 1717286400
+        platforms: [windows, linux, darwin]
+      - name: first_seen
+        type: int64
+        description: 'Unix timestamp of the earliest run within TAR''s retained usage window. Values: unix seconds.'
+        example: 1717200000
+        platforms: [windows, linux, darwin]
+      - name: run_count_30d
+        type: int64
+        description: 'Number of runs recorded in the trailing 30 days. Values: non-negative integer.'
+        example: 8
+        platforms: [windows, linux, darwin]
+      - name: total_seconds_30d
+        type: int64
+        description: 'Total wall-clock seconds observed running in the trailing 30 days. Values: non-negative integer.'
+        example: 28800
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Report when ${exe} was last used"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.app_usage.foreground
+  displayName: App Foreground Time
+  version: 1.0.0
+  description: >
+    Reserved for a future foreground/focus-time and per-session
+    attribution capability. This source does not capture per-session
+    focus state on any platform today; every call reports
+    constrained|foreground_not_captured. Promoted here (rather than left
+    unimplemented) by the user-context-bridge roadmap, which will fill
+    this action in without a schema change once session-scope
+    attribution lands.
+  tags: [forensics, usage, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: app_usage
+    action: foreground
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # constrained|foreground_not_captured|<reason>
+    columns:
+      - name: status
+        type: string
+        description: 'Always "constrained" — this action never returns a success row. Values: constrained.'
+        example: constrained
+        platforms: [windows, linux, darwin]
+      - name: reason
+        type: string
+        description: 'Always "foreground_not_captured". Values: foreground_not_captured.'
+        example: foreground_not_captured
+        platforms: [windows, linux, darwin]
+      - name: detail
+        type: string
+        description: 'Free-text pointer to the roadmap item that will fill this action in. Values: human-readable text.'
+        example: "user-context-bridge roadmap (session-scope attribution)"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Report current foreground application"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [app_usage]
+
+status:
+  phase: active

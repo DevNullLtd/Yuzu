@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a44c8631e3c1
+== action=flush_dns
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=ping host=127.0.0.1
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+[rc] 1
+

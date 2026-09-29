@@ -1,0 +1,11 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash dcc02549b1eb
+== action=wake
+wake|error|Missing required parameter: mac
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=check host=127.0.0.1
+check|127.0.0.1|reachable|3
+mechanism|icmp
+[result_status] UNDECLARED / UNKNOWN / 
+

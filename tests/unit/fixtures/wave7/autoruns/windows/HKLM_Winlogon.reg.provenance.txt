@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg export "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" HKLM_Winlogon.reg /y
+date: 2026-09-06
+status: REAL CAPTURE
+note: includes Shell and Userinit values plus the full stock Winlogon subtree (77420 bytes)

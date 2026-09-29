@@ -1,6 +1,8 @@
 #include "default_certs.hpp"
 
 #include "key_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_session_advisory_lock.hpp"
 #include "x509_ca.hpp"
 
 #include <yuzu/secure_zero.hpp>
@@ -18,6 +20,7 @@
 #include <random>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -457,153 +460,43 @@ void warn_on_san_drift(const fs::path& representative_leaf,
                  joined);
 }
 
-} // namespace
+// Forward-declared: defined further down alongside the rest of the bootstrap
+// advisory-lock machinery it belongs with; referenced here first.
+[[nodiscard]] bool lock_connection_alive(PGconn* conn);
 
-std::string detect_hostname() {
-#ifdef _WIN32
-    if (const char* c = std::getenv("COMPUTERNAME"); c && c[0])
-        return std::string(c);
-    return "localhost";
-#else
-    char buf[256] = {};
-    if (::gethostname(buf, sizeof(buf) - 1) == 0 && buf[0])
-        return std::string(buf);
-    return "localhost";
-#endif
-}
-
-bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
-                          DefaultCertSet& out, const std::vector<std::string>& extra_sans,
-                          const std::string& cert_group) {
-    fill_paths(dir, out);
-    const fs::path marker = dir / "default-marker.json";
-
-    // ── Idempotent fast path ──────────────────────────────────────────────────
-    if (file_present(marker) && all_files_present(out)) {
-        const std::string marker_text = read_text_file(marker);
-        try {
-            const auto j = nlohmann::json::parse(marker_text);
-            if (j.value("version", 0) == kMarkerVersion) {
-                const std::string expected_fp = j.value("ca_fingerprint", "");
-                const std::string ca_pem = read_text_file(out.ca_cert);
-                auto fp = pki::fingerprint_sha256(ca_pem);
-                if (fp && *fp == expected_fp && !expected_fp.empty()) {
-                    // Beyond file-exists+size: confirm every leaf still chains to
-                    // this CA (catches a corrupt/substituted leaf) AND that the CA
-                    // is CURRENTLY valid. The validity check self-heals a set minted
-                    // under a skewed clock — e.g. clock ahead at first boot yields a
-                    // not-yet-valid CA; once the clock is corrected the next boot
-                    // regenerates rather than serving an unusable (or expired) cert.
-                    const bool leaves_ok =
-                        pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
-                        pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
-                        pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
-                    auto ca_info = pki::parse_certificate(ca_pem);
-                    const auto now = std::chrono::system_clock::now();
-                    const bool ca_valid_now =
-                        ca_info && ca_info->not_before <= now && now < ca_info->not_after;
-                    if (leaves_ok && ca_valid_now) {
-                        out.ca_fingerprint_sha256 = *fp;
-                        out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
-                        out.freshly_generated = false;
-                        spdlog::info("default_certs: existing default cert set is intact (CA {})",
-                                     out.ca_fingerprint_sha256);
-                        // Tell the operator if --cert-san now asks for names the
-                        // existing certs don't carry (we never auto-rotate).
-                        warn_on_san_drift(out.gateway_cert, extra_sans);
-                        // Re-assert the cert-sharing perms on the existing set so a
-                        // restart (or a --cert-group added after first boot) is
-                        // consistent — idempotent.
-                        apply_cert_group_share(dir, out, cert_group);
-                        return true;
-                    }
-                    spdlog::warn("default_certs: existing default certs unusable ({}) — "
-                                 "regenerating",
-                                 !leaves_ok ? "a leaf no longer chains to the CA"
-                                            : "CA not currently valid (clock skew?)");
-                } else {
-                    spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
-                }
-            }
-        } catch (const std::exception& e) {
-            spdlog::warn("default_certs: marker parse failed ({}) — regenerating", e.what());
-        }
+// Shared tail for ensure_default_certs: purge stale default-cert inventory, mint
+// the 3 default leaves under an ALREADY-ESTABLISHED root, and write the
+// completion marker LAST (its presence is the "set is complete" signal). Two
+// callers reach here, both having already proven exclusive ownership of
+// `ca_cert_pem`/`ca_key_pem` before calling: (1) the normal first-boot path,
+// having just won try_insert_root(); (2) the UP-2 same-instance resume path
+// (Gate 4 unhappy-path, 2026-08-21), having proven via a local key-file match
+// that THIS instance minted the root ca_store already holds. The purge below is
+// safe in both cases for the same reason: whoever calls this function is the
+// confirmed sole legitimate writer for "system:default-certs" going forward.
+// `lock_conn`: the SAME connection holding the bootstrap advisory lock (null
+// when there is no lock to verify — the no-ca_store local-only fallback).
+// Re-checked with a real round-trip immediately before the marker write —
+// see lock_connection_alive()'s doc comment for why (chaos-injector C5-1,
+// Gate 5, 2026-08-21): a dead lock-holding connection releases the session
+// lock silently, and nothing else on this path would ever notice.
+[[nodiscard]] bool complete_default_cert_set(const fs::path& dir, const std::string& hostname,
+                                             const std::vector<std::string>& extra_sans,
+                                             const std::string& cert_group, CaStore* ca_store,
+                                             FileKeyProvider& kp, const std::string& ca_cert_pem,
+                                             const std::string& ca_key_pem, const std::string& ca_fp,
+                                             const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                                             const fs::path& marker, DefaultCertSet& out,
+                                             PGconn* lock_conn = nullptr) {
+    if (ca_store) {
+        // Best-effort / non-fatal: a failed purge leaves stale rows, not a
+        // security or correctness defect (#1238 should-fix: don't silently
+        // ignore the rc).
+        if (!ca_store->delete_issued_by("system:default-certs"))
+            spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
+                         "(stale rows may remain) — continuing");
     }
 
-    // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
-    // We only reach here because the fast path found the on-disk default certs
-    // missing / corrupt / mismatched. If ca.db STILL remembers a CA root,
-    // generating a fresh one would set_root-REPLACE it and purge the issued
-    // inventory — orphaning every agent already enrolled under the old root (their
-    // leaves now chain to a dead CA). That is the dangerous quadrant the
-    // corrupt-only self-heal above does NOT cover: a wiped cert dir on a
-    // persistent ca.db volume, or a botched restore. Refuse with an actionable
-    // message; the operator restores the certs from backup (matching the ca.db
-    // root) or removes ca.db too for a deliberate clean re-root. We refuse on ANY
-    // existing root (not only a fingerprint mismatch): the regen path always mints
-    // a brand-new CA, so proceeding would re-root regardless.
-    if (ca_store && ca_store->is_open() && ca_store->has_root()) {
-        const auto root = ca_store->get_root();
-        const std::string on_disk = file_present(out.ca_cert)
-                                        ? ("on-disk CA " + pki::fingerprint_sha256(
-                                                               read_text_file(out.ca_cert))
-                                                               .value_or(std::string{"unreadable"}))
-                                        : std::string{"no on-disk CA cert"};
-        spdlog::error("default_certs: ca.db already holds a CA root ({}) but the on-disk default "
-                      "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
-                      "would re-root the fleet and orphan every enrolled agent. Restore "
-                      "default-*.{{pem,key}} from backup (matching the ca.db root), or remove ca.db "
-                      "for a deliberate clean re-root.",
-                      root ? root->fingerprint_sha256 : std::string{"?"}, dir.string(), on_disk);
-        return false;
-    }
-
-    // ── (Re)generate the whole set ────────────────────────────────────────────
-    spdlog::warn("default_certs: generating a fresh per-install CA + default leaves in {}",
-                 dir.string());
-
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) {
-        spdlog::error("default_certs: cannot create {}: {}", dir.string(), ec.message());
-        return false;
-    }
-    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
-    if (ec)
-        spdlog::error("default_certs: could not set 0700 on {}: {} (keys stay 0600 regardless)",
-                      dir.string(), ec.message());
-
-    // On regeneration, purge any prior default-cert inventory rows so ca.db
-    // reflects only the live set (no orphan leaves referencing a replaced root;
-    // set_root REPLACEs the single root row separately). After B-2 this path is
-    // only reached with an EMPTY ca.db (regen against a populated root is now
-    // refused), so this normally deletes nothing — but a failed purge would leave
-    // stale rows, so surface it (#1238 should-fix: don't silently ignore the rc).
-    if (ca_store && !ca_store->delete_issued_by("system:default-certs"))
-        spdlog::warn("default_certs: failed to purge prior default-cert inventory rows "
-                     "(stale rows may remain) — continuing");
-
-    auto ca_key_pem = pki::generate_private_key(pki::KeyAlgo::EcP384);
-    if (!ca_key_pem)
-        return false;
-    KeyZeroGuard ca_zero{*ca_key_pem}; // exception-safe wipe of the CA key
-
-    pki::CaParams ca_params;
-    ca_params.subject = {"Yuzu Install CA (" + hostname + ")", "Yuzu"};
-    ca_params.validity = pki::validity_years_from_now(10);
-    ca_params.path_len = 0;
-    auto ca_cert_pem = pki::self_sign_ca(*ca_key_pem, ca_params);
-    if (!ca_cert_pem)
-        return false;
-
-    auto ca_info = pki::parse_certificate(*ca_cert_pem);
-    auto ca_fp = pki::fingerprint_sha256(*ca_cert_pem);
-    if (!ca_info || !ca_fp)
-        return false;
-    // #1296: STABLE key-based CA identity stamped on every issued row so an
-    // "issued by this CA" query survives a subordinate re-key. Best-effort: a
-    // derivation miss leaves the field blank (the row stays serial-addressable).
-    const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
     // Leaves are sized to the CA's exact notAfter so they never outlive the
     // issuer (the x509_ca leaf-<=-CA invariant would otherwise reject them).
     // #1302: backdate notBefore by the clock-skew allowance — mirrors the CA root
@@ -612,7 +505,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     // server leaves as not-yet-valid and rejects the TLS handshake, and the retry
     // paths don't recover a "valid cert, skewed clock" until the skew elapses.
     const pki::Validity leaf_validity{
-        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info->not_after};
+        std::chrono::system_clock::now() - pki::kClockSkewBackdate, ca_info.not_after};
 
     pki::SubjectAltNames san;
     san.dns = {"localhost"};
@@ -651,8 +544,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
          pki::LeafUsage{.server_auth = true, .client_auth = true}},
     }};
 
-    FileKeyProvider kp(dir);
-    bool ok = write_public_file(out.ca_cert, *ca_cert_pem);
+    bool ok = write_public_file(out.ca_cert, ca_cert_pem);
 
     for (const auto& spec : leaves) {
         if (!ok)
@@ -662,7 +554,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         lp.san = san;
         lp.validity = leaf_validity;
         lp.usage = spec.usage;
-        auto kc = pki::issue_leaf(*ca_cert_pem, *ca_key_pem, pki::KeyAlgo::EcP256, lp);
+        auto kc = pki::issue_leaf(ca_cert_pem, ca_key_pem, pki::KeyAlgo::EcP256, lp);
         if (!kc) {
             ok = false;
             break;
@@ -679,32 +571,573 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             rec.subject = lp.subject.common_name;
             rec.san = join_san(san);
             rec.purpose = spec.purpose;
-            rec.not_after = to_epoch(ca_info->not_after);
+            rec.not_after = to_epoch(ca_info.not_after);
             rec.cert_pem = kc->cert_pem;
             rec.issued_by = "system:default-certs";
-            rec.issuer_fingerprint = *ca_fp;
+            rec.issuer_fingerprint = ca_fp;
             rec.issuer_key_id = ca_key_id;
-            if (!ca_store->record_issued(rec)) {
-                spdlog::error("default_certs: failed to record issued '{}' in ca.db — aborting "
-                              "(the inventory must be consistent for revocation / rotation)",
-                              spec.purpose);
+            if (auto rec_result = ca_store->record_issued(rec); !rec_result) {
+                spdlog::error("default_certs: failed to record issued '{}' in ca_store — aborting "
+                              "(the inventory must be consistent for revocation / rotation): {}",
+                              spec.purpose, rec_result.error());
                 ok = false;
             }
         }
     }
 
-    std::string ca_key_ref;
-    if (ok) {
-        auto ref = kp.store_key("default-ca", *ca_key_pem);
-        if (ref)
-            ca_key_ref = *ref;
-        else
-            ok = false;
-    }
     if (!ok) {
         spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
         return false;
     }
+
+    // Fencing check (chaos-injector C5-1, Gate 5, 2026-08-21): every write
+    // above is done, but if THIS lock-holding connection died partway through
+    // (pg_terminate_backend, an idle-session reap, a network blackhole to
+    // just this socket) Postgres already released the session advisory lock
+    // — silently, with no error from any of the calls above, since they each
+    // draw their OWN fresh per-call lease from the pool rather than reusing
+    // this connection. A sibling racer could already be mid-flight on its own
+    // concurrent attempt right now. Refuse to write the marker (the "this set
+    // is trustworthy" signal) if we can no longer prove we still hold the
+    // lock — the next boot (or the sibling that's likely already running)
+    // retries cleanly; writing the marker here would falsely vouch for a
+    // possibly-torn result.
+    if (lock_conn && !lock_connection_alive(lock_conn)) {
+        spdlog::error("default_certs: lock-holding connection died mid-critical-section — this "
+                      "attempt's result cannot be trusted, leaving no marker (will retry next "
+                      "boot)");
+        return false;
+    }
+
+    // Marker LAST — its presence is the "set is complete" signal.
+    nlohmann::json j;
+    j["version"] = kMarkerVersion;
+    j["generated_at"] = to_epoch(std::chrono::system_clock::now());
+    j["ca_fingerprint"] = ca_fp;
+    j["expires_at"] = to_epoch(ca_info.not_after);
+    j["hostname"] = hostname;
+    if (!write_public_file(marker, j.dump(2))) {
+        spdlog::error("default_certs: failed to write marker");
+        return false;
+    }
+
+    out.ca_fingerprint_sha256 = ca_fp;
+    out.ca_expires_at = ca_info.not_after;
+    out.freshly_generated = true;
+    // Now that the full set (incl. default-gateway.key) exists, apply the
+    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
+    apply_cert_group_share(dir, out, cert_group);
+    spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
+                 out.ca_fingerprint_sha256, to_epoch(ca_info.not_after));
+    return true;
+}
+
+// The idempotent fast path, extracted so it can ALSO be used as the bootstrap
+// lock's re-validation check (UP-2 Gate 8 fix, 2026-08-21): a caller that just
+// won the lock must re-check whether a concurrent sibling already finished
+// this exact work while it waited, rather than unconditionally purging and
+// re-minting over a sibling's just-completed, now-live set. Returns true
+// (and populates `out`) iff a complete, currently-valid set already exists on
+// disk; false means the caller should proceed to generate.
+[[nodiscard]] bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
+                                                 const std::string& hostname,
+                                                 const std::vector<std::string>& extra_sans,
+                                                 const std::string& cert_group, DefaultCertSet& out) {
+    if (!(file_present(marker) && all_files_present(out)))
+        return false;
+    const std::string marker_text = read_text_file(marker);
+    try {
+        const auto j = nlohmann::json::parse(marker_text);
+        if (j.value("version", 0) != kMarkerVersion)
+            return false;
+        const std::string expected_fp = j.value("ca_fingerprint", "");
+        const std::string ca_pem = read_text_file(out.ca_cert);
+        auto fp = pki::fingerprint_sha256(ca_pem);
+        if (!fp || *fp != expected_fp || expected_fp.empty()) {
+            spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
+            return false;
+        }
+        // Beyond file-exists+size: confirm every leaf still chains to this CA
+        // (catches a corrupt/substituted leaf) AND that the CA is CURRENTLY
+        // valid. The validity check self-heals a set minted under a skewed
+        // clock — e.g. clock ahead at first boot yields a not-yet-valid CA;
+        // once the clock is corrected the next boot regenerates rather than
+        // serving an unusable (or expired) cert.
+        const bool leaves_ok = pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
+                               pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
+                               pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
+        // Chain-verify alone does NOT catch a cert paired with the WRONG key
+        // for its own purpose — a corrupted-pairing class the chain check is
+        // blind to (chaos-injector C5-1, Gate 5, 2026-08-21): if the bootstrap
+        // advisory lock's holding connection ever died mid-critical-section
+        // (mitigated, not made impossible, by the fencing check in
+        // complete_default_cert_set()) a sibling racer could interleave
+        // writes and leave one purpose's cert from one racer paired with its
+        // key from the other — both individually valid, chaining fine, but
+        // mismatched. This is the ONLY thing standing between that corruption
+        // and it validating as intact forever, so it must self-heal on the
+        // very next boot rather than depend solely on prevention.
+        // Deliberately non-const (cpp-safety, Gate 8, 2026-08-21): a `const auto`
+        // here is a genuinely const-qualified automatic object, so wiping it via
+        // a `const_cast`-obtained reference in KeyZeroGuard would be UB under
+        // [dcl.type.cv]/4 — writing through a non-const reference to an object
+        // that is actually const, not the "const ref to a non-const object" case
+        // that would be fine. Matches this file's own established idiom
+        // (`KeyZeroGuard leaf_zero{kc->private_key_pem}` above, `ca_zero`
+        // elsewhere) — neither casts.
+        auto https_key = read_text_file(out.https_key);
+        auto server_key = read_text_file(out.server_key);
+        auto gateway_key = read_text_file(out.gateway_key);
+        KeyZeroGuard https_key_zero{https_key};
+        KeyZeroGuard server_key_zero{server_key};
+        KeyZeroGuard gateway_key_zero{gateway_key};
+        const bool keys_paired =
+            pki::cert_matches_key(read_text_file(out.https_cert), https_key) &&
+            pki::cert_matches_key(read_text_file(out.server_cert), server_key) &&
+            pki::cert_matches_key(read_text_file(out.gateway_cert), gateway_key);
+        auto ca_info = pki::parse_certificate(ca_pem);
+        const auto now = std::chrono::system_clock::now();
+        const bool ca_valid_now =
+            ca_info && ca_info->not_before <= now && now < ca_info->not_after;
+        if (!leaves_ok || !keys_paired || !ca_valid_now) {
+            spdlog::warn("default_certs: existing default certs unusable ({}) — regenerating",
+                         !leaves_ok  ? "a leaf no longer chains to the CA"
+                         : !keys_paired ? "a leaf cert/key pair no longer matches"
+                                        : "CA not currently valid (clock skew?)");
+            return false;
+        }
+        out.ca_fingerprint_sha256 = *fp;
+        out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
+        out.freshly_generated = false;
+        spdlog::info("default_certs: existing default cert set is intact (CA {}, dir {})",
+                     out.ca_fingerprint_sha256, dir.string());
+        // Tell the operator if --cert-san now asks for names the existing
+        // certs don't carry (we never auto-rotate).
+        warn_on_san_drift(out.gateway_cert, extra_sans);
+        // Re-assert the cert-sharing perms on the existing set so a restart
+        // (or a --cert-group added after first boot) is consistent — idempotent.
+        apply_cert_group_share(dir, out, cert_group);
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::warn("default_certs: marker parse failed ({}) — regenerating", e.what());
+        return false;
+    }
+}
+
+// UP-2 Gate 8 fix (2026-08-21, security-guardian + unhappy-path): both
+// complete_default_cert_set() callers — the normal winning-the-root-race path
+// AND the B-2 self-heal resume path below — must run under mutual exclusion.
+// The self-heal ownership proof (local key resolves + cryptographically pairs
+// with the stored root) proves this instance MINTED the root, but is a static
+// predicate every process sharing the same cert directory satisfies
+// IDENTICALLY — it is not a claim/CAS, so it cannot by itself prevent two
+// instances (e.g. two HA replicas restarting against one shared volume, or a
+// self-heal resumer racing the ORIGINAL instance which was merely slow, not
+// actually dead) from both reaching complete_default_cert_set() concurrently
+// and corrupting the on-disk set (mismatched cert/key pairs from
+// unsynchronized per-file renames; a purge deleting a sibling's
+// just-recorded rows). The normal winning path is already serialized by
+// try_insert_root()'s Postgres CAS — a losing fresh-CA attempt never reaches
+// complete_default_cert_set() at all — but is wrapped in the SAME lock here
+// too, both for the 3-instance interleaving above and so there is exactly one
+// mutual-exclusion mechanism to reason about, not two.
+//
+// Mirrors kek_op_lock.hpp's non-blocking try-lock + confirmed-acquired guard
+// pattern (the ONE reusable session-advisory-lock idiom in this codebase,
+// PgSessionAdvisoryLockGuard) rather than hand-rolling a new one — but RETRIES
+// (bounded) instead of KEK's immediate-Conflict-report, since this is a
+// one-shot boot-time operation where briefly waiting for a sibling to finish
+// is preferable to failing the boot outright.
+//
+// cpp-safety NOTE (Gate 8, 2026-08-21): complete_default_cert_set_locked()
+// holds its own pool::Lease for the ENTIRE critical section, while
+// complete_default_cert_set() (called from inside it) makes its OWN nested
+// try_acquire_for calls via CaStore's per-call leasing on the SAME pool
+// (delete_issued_by + up to 3x record_issued). A single racing instance needs
+// 2 simultaneous connections (its own outer lease + one nested call at a
+// time); an N-way race needs N outer leases (one per racer, held idle by
+// every non-lock-holder while it retries) + 1 more for whichever racer
+// currently holds the lock and is doing nested work. --postgres-pool-size
+// must stay comfortably above the realistic number of instances that could
+// share one --ca-dir + ca_store concurrently (2-3 for ordinary HA topologies
+// → pool size >= 4-5 with margin) — the default (16) is nowhere near this
+// floor. At --postgres-pool-size=1 specifically this is NOT merely "self-
+// contends under a race": the outer lease permanently holds the pool's only
+// connection, so EVERY nested call must time out — a deterministic failure
+// on every boot that needs default-cert generation, with zero racers
+// required (unhappy-path, Gate 8 narrow re-verify, 2026-08-21). It fails
+// CLOSED and LOUDLY either way (a nested acquire timeout surfaces as a normal
+// record_issued failure → "Refusing to start"; a delete_issued_by failure is
+// only logged — the purge is best-effort), never a
+// hang or silent corruption — so this is a documented constraint, not a
+// defect requiring a code fix.
+constexpr std::chrono::milliseconds kBootstrapLockAcquireTimeout{5000};
+constexpr std::chrono::milliseconds kBootstrapLockRetryInterval{100};
+
+// UP-3 (consistency-auditor, Gate 4, 2026-08-21; built on operator request in a
+// later round): a losing HA replica used to discard its own material and
+// return false unconditionally, needing a full process restart to pick up
+// the winner's certs from the shared cert directory. Poll for the winner's
+// complete set to land instead, bounded so a genuinely stuck/absent winner
+// still falls back to today's refuse-and-restart behaviour rather than
+// hanging boot indefinitely. The window is sized around
+// kBootstrapLockAcquireTimeout (the winner's own lock-acquire budget) plus
+// slack for actual cert generation + the 3 record_issued round-trips — NOT a
+// tight bound, since a boot that's going to succeed anyway losing a few extra
+// seconds to self-heal is a better trade than an avoidable restart.
+constexpr std::chrono::milliseconds kLoserSelfHealPollWindow{15000};
+constexpr std::chrono::milliseconds kLoserSelfHealPollInterval{250};
+
+const pg::PgAdvisoryLockKey& default_certs_bootstrap_lock_key() {
+    static const pg::PgAdvisoryLockKey key =
+        pg::PgAdvisoryLockKey::single("hashtextextended('yuzu:default_certs_bootstrap', 0)");
+    return key;
+}
+
+enum class BootstrapLockAttempt { kAcquired, kConflict, kError };
+
+[[nodiscard]] BootstrapLockAttempt try_lock_default_certs_bootstrap(PGconn* conn) {
+    const std::string sql = default_certs_bootstrap_lock_key().try_lock_sql();
+    pg::PgResult res{PQexec(conn, sql.c_str())};
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt failed: {}",
+                      PQerrorMessage(conn));
+        return BootstrapLockAttempt::kError;
+    }
+    // Guard the row read by construction, not by assumption (mirrors
+    // try_lock_kek_op's own defensive shape) — PQgetvalue returns nullptr
+    // out-of-range, so a future SQL edit would otherwise null-deref here.
+    if (PQntuples(res.get()) != 1 || PQgetisnull(res.get(), 0, 0)) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt returned an unexpected "
+                      "result shape");
+        return BootstrapLockAttempt::kError;
+    }
+    return (PQgetvalue(res.get(), 0, 0)[0] == 't') ? BootstrapLockAttempt::kAcquired
+                                                    : BootstrapLockAttempt::kConflict;
+}
+
+// Fencing-token gap (chaos-injector, Gate 5, 2026-08-21): holding the
+// bootstrap advisory lock is only as good as the SESSION it's held on still
+// being alive. Postgres releases a session advisory lock the moment that
+// session ends — if THIS connection dies mid-critical-section
+// (pg_terminate_backend, an idle_session_timeout, a network blackhole to
+// just this one socket) while the rest of the process keeps running on its
+// other, healthy per-call leases, nothing before this point would notice: a
+// sibling racer's retry loop acquires the now-free lock and starts its own
+// purge-and-regenerate concurrently with THIS attempt's still-in-flight
+// writes — reopening the exact corruption Finding A's lock exists to
+// prevent, via a broader trigger than "two processes racing at boot." A real
+// round-trip, not PQstatus alone (stale until the next I/O) and not
+// re-issuing pg_try_advisory_lock (re-entrant on the same connection — would
+// falsely reconfirm exclusivity while silently incrementing the hold count,
+// never proving liveness).
+[[nodiscard]] bool lock_connection_alive(PGconn* conn) {
+    if (!conn || PQstatus(conn) != CONNECTION_OK)
+        return false;
+    pg::PgResult res{PQexec(conn, "SELECT 1")};
+    return res.status() == PGRES_TUPLES_OK;
+}
+
+class DefaultCertsBootstrapLockGuard {
+public:
+    // Construct only after a `kAcquired` result — mirrors KekOpLockGuard.
+    // Declare AFTER the pool `Lease` in the same scope so it destructs
+    // (releases) BEFORE the lease returns the connection to the pool: a
+    // session advisory lock outlives the statement, so releasing it here is
+    // the only way to unlock at all.
+    //
+    // Deliberately NOT `noexcept` — same reason as KekOpLockGuard's identical
+    // constructor (`kek_op_lock.hpp`): `inner_`'s mem-initializer heap-allocates
+    // a fresh unlock-SQL string, so this can throw `bad_alloc`. Cpp-safety
+    // review (Gate 8, 2026-08-21) confirmed the resulting window — the lock is
+    // genuinely held at the DB before this constructor finishes, so a throw
+    // here leaks the session lock until the pooled connection is eventually
+    // discarded — already exists identically in the shipped `KekOpLockGuard`;
+    // this is a faithful mirror of that accepted precedent, not a new gap. If
+    // this is ever hardened, harden both consumers together.
+    explicit DefaultCertsBootstrapLockGuard(PGconn* conn)
+        : inner_(conn, default_certs_bootstrap_lock_key(), "default_certs bootstrap") {}
+    DefaultCertsBootstrapLockGuard(const DefaultCertsBootstrapLockGuard&) = delete;
+    DefaultCertsBootstrapLockGuard& operator=(const DefaultCertsBootstrapLockGuard&) = delete;
+    DefaultCertsBootstrapLockGuard(DefaultCertsBootstrapLockGuard&&) = delete;
+    DefaultCertsBootstrapLockGuard& operator=(DefaultCertsBootstrapLockGuard&&) = delete;
+
+private:
+    pg::PgSessionAdvisoryLockGuard inner_;
+};
+
+// Acquire the bootstrap lock (bounded retry on Conflict), re-validate inside
+// it (a sibling may have JUST finished), and only then purge + regenerate.
+// `pool` is the SAME pg::PgPool `ca_store` borrows (CaStore::pool()) — a
+// SEPARATE lease from ca_store's own per-call leasing, held for exactly the
+// duration of the critical section, matching KekOpLockGuard's precedent.
+[[nodiscard]] bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir,
+                                                    const fs::path& marker,
+                                                    const std::string& hostname,
+                                                    const std::vector<std::string>& extra_sans,
+                                                    const std::string& cert_group, CaStore* ca_store,
+                                                    FileKeyProvider& kp, const std::string& ca_cert_pem,
+                                                    const std::string& ca_key_pem, const std::string& ca_fp,
+                                                    const std::string& ca_key_id, const pki::CertDetails& ca_info,
+                                                    DefaultCertSet& out) {
+    auto lease = pool.try_acquire_for(kBootstrapLockAcquireTimeout);
+    if (!lease) {
+        spdlog::error("default_certs: could not acquire a database connection to take the "
+                      "bootstrap advisory lock — aborting this attempt (will retry next boot)");
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kBootstrapLockAcquireTimeout;
+    BootstrapLockAttempt attempt;
+    for (;;) {
+        attempt = try_lock_default_certs_bootstrap(lease.get());
+        if (attempt != BootstrapLockAttempt::kConflict)
+            break;
+        if (std::chrono::steady_clock::now() >= deadline)
+            break;
+        std::this_thread::sleep_for(kBootstrapLockRetryInterval);
+    }
+    if (attempt == BootstrapLockAttempt::kError) {
+        spdlog::error("default_certs: bootstrap advisory-lock attempt failed — aborting this "
+                      "attempt (will retry next boot)");
+        return false;
+    }
+    if (attempt == BootstrapLockAttempt::kConflict) {
+        spdlog::error("default_certs: another instance is completing default-cert bootstrap "
+                      "concurrently and did not finish within {}ms — aborting this attempt "
+                      "(will retry next boot)",
+                      static_cast<long long>(kBootstrapLockAcquireTimeout.count()));
+        return false;
+    }
+    DefaultCertsBootstrapLockGuard guard{lease.get()};
+    // Re-validate INSIDE the lock: a sibling may have completed this exact
+    // work while we waited for the lock (or before we even asked). Without
+    // this, an instance that legitimately lost a close race would still
+    // unconditionally purge + re-mint over its sibling's just-completed,
+    // now-live set.
+    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
+        spdlog::info("default_certs: a concurrent instance already completed the default-cert "
+                     "set while this one waited for the bootstrap lock — using it, not "
+                     "re-minting");
+        return true;
+    }
+    return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
+                                     ca_cert_pem, ca_key_pem, ca_fp, ca_key_id, ca_info, marker,
+                                     out, lease.get());
+}
+
+} // namespace
+
+std::string detect_hostname() {
+#ifdef _WIN32
+    if (const char* c = std::getenv("COMPUTERNAME"); c && c[0])
+        return std::string(c);
+    return "localhost";
+#else
+    char buf[256] = {};
+    if (::gethostname(buf, sizeof(buf) - 1) == 0 && buf[0])
+        return std::string(buf);
+    return "localhost";
+#endif
+}
+
+bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
+                          DefaultCertSet& out, const std::vector<std::string>& extra_sans,
+                          const std::string& cert_group) {
+    fill_paths(dir, out);
+    const fs::path marker = dir / "default-marker.json";
+
+    // ── Idempotent fast path ──────────────────────────────────────────────────
+    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out))
+        return true;
+
+    // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
+    // We only reach here because the fast path found the on-disk default certs
+    // missing / corrupt / mismatched. If ca_store STILL remembers a CA root,
+    // generating a fresh one would set_root-REPLACE it and purge the issued
+    // inventory — orphaning every agent already enrolled under the old root (their
+    // leaves now chain to a dead CA). That is the dangerous quadrant the
+    // corrupt-only self-heal above does NOT cover: a wiped cert dir against a
+    // still-populated ca_store, or a botched restore. Refuse with an actionable
+    // message; the operator restores the certs from backup (matching the ca_store
+    // root) or performs a deliberate clean re-root (docs/pki-architecture.md
+    // "Operator runbook" — clears ca_store.ca_root/ca_issued/ca_crl_versions
+    // directly, ca.db has no bearing on this since ADR-0053). We refuse on ANY
+    // existing root (not only a fingerprint mismatch): the regen path always mints
+    // a brand-new CA, so proceeding would re-root regardless.
+    if (ca_store && ca_store->is_open()) {
+        // ADR-0036/ADR-0053: get_root() directly, NOT has_root() — this is the ONE call site
+        // where a degraded read must NOT collapse to "no root". A DB blip misread as "no root"
+        // here would let a fresh CA generation proceed and silently re-root a fleet that already
+        // has one (the exact danger this guard exists to prevent).
+        auto root_or_err = ca_store->get_root();
+        if (!root_or_err) {
+            spdlog::error("default_certs: cannot determine whether ca_store already holds a CA "
+                          "root ({}) — refusing to regenerate. A fresh CA would re-root the fleet "
+                          "if one already exists and this read simply failed to see it; resolve "
+                          "the database error and retry.",
+                          root_or_err.error());
+            return false;
+        }
+        if (root_or_err->has_value()) {
+            const auto& root = **root_or_err;
+
+            // UP-2 self-heal (Gate 4 unhappy-path, 2026-08-21): reaches here any
+            // time the on-disk leaf set is unusable (missing, corrupt, no
+            // longer chains, or the CA isn't currently valid — see
+            // try_use_existing_complete_set() above) while ca_store already
+            // holds a root. This is NOT scoped to a first-boot crash window —
+            // enterprise-readiness (Gate 6, 2026-08-21) correctly named it
+            // broader: an ESTABLISHED, long-running install that later loses a
+            // leaf file (a bad partial restore, a lost volume file) hits this
+            // exact branch too. Before refusing outright, check whether THIS
+            // instance is provably the one that minted the root: for
+            // FileKeyProvider, key_ref IS the local file path (never shared
+            // state — see the "Store the CA private key LOCALLY" comment
+            // below), so if a key still resolves at that exact path AND its
+            // private half cryptographically pairs with the stored root cert,
+            // this instance has DIRECTORY ACCESS to the material that minted
+            // the root — a wiped persistent volume or a botched restore leaves
+            // no local key, or a mismatched one, and falls through to the
+            // refusal unchanged. Resume completing the SAME root (re-mints the
+            // server's own https/server/gateway leaves under it) rather than a
+            // heavyweight clean re-root — safe regardless of WHEN in the
+            // install's life this fires, because it never touches the root
+            // itself or any agent-issued leaf.
+            //
+            // CORRECTED (Gate 8, 2026-08-21): this is directory access, NOT
+            // instance identity — every process sharing this exact cert
+            // directory passes the check identically, which is exactly why
+            // complete_default_cert_set_locked() below serializes entry with a
+            // Postgres advisory lock rather than treating this check alone as
+            // sufficient mutual exclusion (unhappy-path Finding A named this
+            // comment's original "no other instance could be the true owner"
+            // phrasing specifically — that claim was false for a
+            // shared-cert-volume topology). Multi-replica HA over one shared
+            // ca_store is NOT an officially supported deployment shape (see
+            // this ADR's Decision section) — the lock exists because the code
+            // must stay safe if an operator does it anyway, and because a
+            // self-heal resumer can race the ORIGINAL instance on a SINGLE
+            // host too (merely slow, not actually dead), which needs no HA
+            // topology at all (enterprise-readiness, Gate 6, 2026-08-21 —
+            // corrected from an earlier round's "describes as supported"
+            // overclaim, which contradicted this same ADR's own Decision
+            // section).
+            FileKeyProvider self_heal_kp(dir);
+            if (self_heal_kp.has_key(root.key_ref)) {
+                auto key_pem = self_heal_kp.load_key(root.key_ref);
+                if (key_pem) {
+                    // Wrap the guard immediately on acquisition, matching every
+                    // other key-load in this file (ca_zero, leaf_zero) — Gate 8
+                    // security-guardian NICE (2026-08-21): constructing it only
+                    // after cert_matches_key succeeded left the present-but-WRONG
+                    // key case (a stale/mistaken local key from a botched
+                    // restore — real, not hypothetical) unwiped in freed heap.
+                    KeyZeroGuard heal_zero{*key_pem};
+                    if (pki::cert_matches_key(root.cert_pem, *key_pem)) {
+                        auto ca_info = pki::parse_certificate(root.cert_pem);
+                        if (!ca_info) {
+                            spdlog::error(
+                                "default_certs: self-heal aborted — the ca_store root cert this "
+                                "instance owns the key for does not parse; falling back to the "
+                                "manual-recovery refusal below");
+                        } else {
+                            spdlog::warn(
+                                "default_certs: re-minting the default leaf set under the SAME "
+                                "root (fingerprint {}) — the local CA key file still matches "
+                                "ca_store's stored root (directory access, arbitrated under the "
+                                "bootstrap lock, not a standalone ownership proof); the on-disk "
+                                "set was missing/corrupt (a first-boot crash before completing, "
+                                "or later damage to an established install — e.g. a lost leaf "
+                                "file).",
+                                root.fingerprint_sha256);
+                            const std::string ca_key_id =
+                                pki::issuer_key_id(root.cert_pem).value_or(std::string{});
+                            // Gate 8 BLOCKING fix (security-guardian + unhappy-path,
+                            // 2026-08-21): the ownership proof above is a static
+                            // predicate every process sharing this cert directory
+                            // satisfies identically — it does NOT by itself prevent
+                            // two such instances (e.g. two HA replicas restarting
+                            // against one shared volume) from both reaching here
+                            // concurrently. Route through the bootstrap advisory
+                            // lock, not complete_default_cert_set() directly.
+                            return complete_default_cert_set_locked(
+                                ca_store->pool(), dir, marker, hostname, extra_sans, cert_group,
+                                ca_store, self_heal_kp, root.cert_pem, *key_pem,
+                                root.fingerprint_sha256, ca_key_id, *ca_info, out);
+                        }
+                    }
+                }
+            }
+
+            const std::string on_disk =
+                file_present(out.ca_cert)
+                    ? ("on-disk CA " +
+                       pki::fingerprint_sha256(read_text_file(out.ca_cert)).value_or(std::string{"unreadable"}))
+                    : std::string{"no on-disk CA cert"};
+            spdlog::error(
+                "default_certs: ca_store already holds a CA root ({}) but the on-disk default "
+                "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
+                "would re-root the fleet and orphan every enrolled agent. Restore "
+                "default-*.{{pem,key}} from backup (matching the ca_store root), or perform a "
+                "deliberate clean re-root per docs/pki-architecture.md \"Operator runbook\".",
+                root.fingerprint_sha256, dir.string(), on_disk);
+            return false;
+        }
+    }
+
+    // ── (Re)generate the whole set ────────────────────────────────────────────
+    spdlog::warn("default_certs: generating a fresh per-install CA + default leaves in {}",
+                 dir.string());
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        spdlog::error("default_certs: cannot create {}: {}", dir.string(), ec.message());
+        return false;
+    }
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
+    if (ec)
+        spdlog::error("default_certs: could not set 0700 on {}: {} (keys stay 0600 regardless)",
+                      dir.string(), ec.message());
+
+    auto ca_key_pem = pki::generate_private_key(pki::KeyAlgo::EcP384);
+    if (!ca_key_pem)
+        return false;
+    KeyZeroGuard ca_zero{*ca_key_pem}; // exception-safe wipe of the CA key
+
+    pki::CaParams ca_params;
+    ca_params.subject = {"Yuzu Install CA (" + hostname + ")", "Yuzu"};
+    ca_params.validity = pki::validity_years_from_now(10);
+    ca_params.path_len = 0;
+    auto ca_cert_pem = pki::self_sign_ca(*ca_key_pem, ca_params);
+    if (!ca_cert_pem)
+        return false;
+
+    auto ca_info = pki::parse_certificate(*ca_cert_pem);
+    auto ca_fp = pki::fingerprint_sha256(*ca_cert_pem);
+    if (!ca_info || !ca_fp)
+        return false;
+    // #1296: STABLE key-based CA identity stamped on every issued row so an
+    // "issued by this CA" query survives a subordinate re-key. Best-effort: a
+    // derivation miss leaves the field blank (the row stays serial-addressable).
+    const std::string ca_key_id = pki::issuer_key_id(*ca_cert_pem).value_or(std::string{});
+
+    FileKeyProvider kp(dir);
+    // UP-3 (built on operator request, 2026-08-21): the CA private key is NOT
+    // written to disk here, before the cross-replica root race resolves — only
+    // its intended path is computed (path_for() is pure, no I/O). Multiple
+    // simultaneous candidates in a shared-cert-dir topology (the only place
+    // this race is reachable at all) would otherwise ALL speculatively write
+    // to the SAME well-known "default-ca" path, and whichever write lands
+    // LAST wins the file regardless of which candidate actually wins
+    // try_insert_root's CAS below — silently detaching the established root
+    // from its own real private key, permanently defeating every future
+    // self-heal attempt for that root (found empirically: a 6-way race on one
+    // shared TempDir hit this ~20% of the time before this fix). The actual
+    // key write is deferred to AFTER this candidate is confirmed the sole
+    // winner (below), by which point no other candidate can still be racing
+    // for the same "default-ca" name.
+    const std::string ca_key_ref = kp.path_for("default-ca").string();
 
     if (ca_store) {
         CaRoot root;
@@ -715,33 +1148,143 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         root.not_after = to_epoch(ca_info->not_after);
         root.fingerprint_sha256 = *ca_fp;
         root.mode = CaMode::Builtin;
-        if (!ca_store->set_root(root)) {
-            spdlog::error("default_certs: failed to record CA root in ca.db — aborting");
+        // ADR-0053 "Root-singleton first-boot race": try_insert_root(), NOT set_root() — a
+        // shared Postgres substrate makes it possible for two instances to independently
+        // generate root material and race to establish it (impossible under per-instance
+        // SQLite, where this call used to be an unconditional INSERT OR REPLACE). ON CONFLICT
+        // DO NOTHING means at most one caller's row is ever inserted; every caller reads back
+        // whichever root is now canonical.
+        //
+        // RESOLVED HERE, BEFORE any leaf generation, disk writes, inventory purge, or
+        // record_issued() call below (architect review, 2026-08-21 — moved from AFTER leaf
+        // generation, where it originally sat). The prior ordering let two racing instances
+        // BOTH pass this function's earlier B-2 empty-root check, then both proceed to purge
+        // ("system:default-certs" is a shared, unscoped WHERE clause) and record their own
+        // three leaf rows concurrently — the SECOND instance's purge could delete the FIRST
+        // instance's already-committed, now-live leaf rows regardless of which one went on to
+        // win the root race below, permanently orphaning the winner's certs from ca_store
+        // (unrevocable, absent from any future CRL). Resolving the race FIRST means only the
+        // confirmed winner ever reaches the purge/leaf/record_issued code past this point — a
+        // losing instance returns immediately, having touched no shared ca_store state at all.
+        auto established = ca_store->try_insert_root(root);
+        if (!established) {
+            spdlog::error("default_certs: failed to record CA root in ca_store — aborting: {}",
+                          established.error());
             return false; // before the marker — next boot regenerates
         }
+        if (established->fingerprint_sha256 != *ca_fp) {
+            // Lost the race — another instance already established a DIFFERENT root. This
+            // instance's freshly-generated key material is unusable (nobody else holds its
+            // private key): never write it, or proceed as though it were authoritative, rather
+            // than silently operating under, or clobbering, a root nobody else recognises.
+            // Nothing shared has been touched — no leaf was generated, no ca_issued row was
+            // written or purged.
+            //
+            // UP-3 self-heal (consistency-auditor, Gate 4; built on operator request): if
+            // instances share one --ca-dir volume (the only topology where losing this race is
+            // even possible), the winner is writing its OWN complete set to that SAME directory
+            // concurrently. Poll for it rather than failing this boot outright —
+            // try_use_existing_complete_set() only succeeds once the winner's marker (written
+            // LAST, after every cert/key file) is present AND every file individually
+            // chain-verifies and cert/key-pairs, so a partial/in-flight write is never adopted.
+            // This instance holds no claim on the shared resource (it already lost), so no lock
+            // is needed here — purely a passive reader.
+            spdlog::warn(
+                "default_certs: lost the first-boot CA-root race — ca_store already holds a "
+                "DIFFERENT root (fingerprint {}) established by another instance. This "
+                "instance's freshly generated CA (fingerprint {}) is discarded. Polling the "
+                "shared cert directory ({}) for up to {}s for the winner to finish writing its "
+                "own complete set before falling back to refusing boot.",
+                established->fingerprint_sha256, *ca_fp, dir.string(),
+                std::chrono::duration_cast<std::chrono::seconds>(kLoserSelfHealPollWindow).count());
+            const auto deadline = std::chrono::steady_clock::now() + kLoserSelfHealPollWindow;
+            do {
+                std::this_thread::sleep_for(kLoserSelfHealPollInterval);
+                if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group,
+                                                  out)) {
+                    // cpp-safety (Gate 8 domain re-review, 2026-08-21): don't assume the set this
+                    // just validated is necessarily THE root we lost the race to — cross-check
+                    // explicitly rather than relying on an unstated invariant, since this adoption
+                    // decision (and the log line below) both depend on it.
+                    if (out.ca_fingerprint_sha256 != established->fingerprint_sha256) {
+                        spdlog::warn(
+                            "default_certs: a complete cert set appeared on {} but its CA "
+                            "fingerprint ({}) does not match the root this instance lost the "
+                            "race to ({}) — not adopting; continuing to poll.",
+                            dir.string(), out.ca_fingerprint_sha256, established->fingerprint_sha256);
+                        continue;
+                    }
+                    spdlog::warn(
+                        "default_certs: self-healed onto the winning root (fingerprint {}) from "
+                        "disk without a restart.",
+                        established->fingerprint_sha256);
+                    return true;
+                }
+            } while (std::chrono::steady_clock::now() < deadline);
+            spdlog::error(
+                "default_certs: lost the first-boot CA-root race and the winner's complete cert "
+                "set never appeared on {} within {}s. This instance's freshly generated CA "
+                "(fingerprint {}) remains discarded. If instances are meant to share one cert "
+                "volume, restart this instance once the winner has finished; otherwise "
+                "investigate why two instances raced first-boot generation concurrently.",
+                dir.string(),
+                std::chrono::duration_cast<std::chrono::seconds>(kLoserSelfHealPollWindow).count(),
+                *ca_fp);
+            // cpp-safety (closure re-verify of d54311fce, 2026-08-21): a fingerprint
+            // mismatch above can leave `out` populated with a validated-but-wrong-root
+            // set (try_use_existing_complete_set() writes it before this function gets
+            // a chance to reject it) that then survives to this false return if the
+            // poll window subsequently times out. Reset so `out` is never left holding
+            // material for a root this instance did NOT adopt.
+            out = DefaultCertSet{};
+            return false;
+        }
+        // Won (or ca_store's root is uncontested single-instance) — the root race
+        // above already confirmed this instance is the sole legitimate writer for
+        // "system:default-certs" going forward; a losing instance never reaches
+        // this line. complete_default_cert_set() does the purge + leaf generation
+        // + marker write (shared with the UP-2 same-instance resume path above).
+        //
+        // UP-3: NOW safe to actually persist the CA key to the "default-ca" path
+        // computed above — no other candidate can still be racing for this exact
+        // name once try_insert_root's CAS has resolved in this candidate's
+        // favor. Residual (rare, already-covered by the existing manual-recovery
+        // runbook): if this specific write fails — a disk fault landing in the
+        // narrow window between winning the CAS and persisting the key — ca_store
+        // already holds this root with no local key resolving anywhere; the next
+        // boot hits the ordinary "on-disk certs missing/corrupt, no local key
+        // matches" refusal further up this function, the same recovery path any
+        // other cause of local key loss already documents (restore from backup,
+        // or a deliberate clean re-root).
+        if (!kp.store_key("default-ca", *ca_key_pem)) {
+            spdlog::error(
+                "default_certs: won the first-boot CA-root race (fingerprint {}) but failed to "
+                "persist the CA key locally at {} — ca_store now holds this root with no "
+                "resolvable local key. Restore default-ca.key from backup, or perform a "
+                "deliberate clean re-root per docs/pki-architecture.md \"Operator runbook\".",
+                *ca_fp, ca_key_ref);
+            return false;
+        }
+        // Still routed through the SAME bootstrap advisory lock as the self-heal
+        // path (Gate 8 fix, 2026-08-21): this instance winning try_insert_root's
+        // CAS only proves no OTHER instance is establishing a NEW root right
+        // now — it says nothing about a self-heal resumer on another process
+        // that believes (wrongly, if this instance is merely slow rather than
+        // dead) it owns the SAME already-established root concurrently.
+        return complete_default_cert_set_locked(ca_store->pool(), dir, marker, hostname,
+                                                extra_sans, cert_group, ca_store, kp, *ca_cert_pem,
+                                                *ca_key_pem, *ca_fp, ca_key_id, *ca_info, out);
     }
 
-    // Marker LAST — its presence is the "set is complete" signal.
-    nlohmann::json j;
-    j["version"] = kMarkerVersion;
-    j["generated_at"] = to_epoch(std::chrono::system_clock::now());
-    j["ca_fingerprint"] = *ca_fp;
-    j["expires_at"] = to_epoch(ca_info->not_after);
-    j["hostname"] = hostname;
-    if (!write_public_file(marker, j.dump(2))) {
-        spdlog::error("default_certs: failed to write marker");
+    // No ca_store (local-only / no-PG mode): no shared substrate means no
+    // cross-instance race to defer the key write past — persist it directly.
+    if (!kp.store_key("default-ca", *ca_key_pem)) {
+        spdlog::error("default_certs: generation failed; leaving no marker (will retry next boot)");
         return false;
     }
-
-    out.ca_fingerprint_sha256 = *ca_fp;
-    out.ca_expires_at = ca_info->not_after;
-    out.freshly_generated = true;
-    // Now that the full set (incl. default-gateway.key) exists, apply the
-    // cross-container sharing perms (no-op tight perms when --cert-group is unset).
-    apply_cert_group_share(dir, out, cert_group);
-    spdlog::warn("default_certs: generated default cert set — CA {} expires {}",
-                 out.ca_fingerprint_sha256, to_epoch(ca_info->not_after));
-    return true;
+    return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
+                                     *ca_cert_pem, *ca_key_pem, *ca_fp, ca_key_id, *ca_info,
+                                     marker, out);
 }
 
 } // namespace yuzu::server

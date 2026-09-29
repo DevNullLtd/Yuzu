@@ -23,6 +23,47 @@ namespace {
 
 YuzuPluginContext* g_ctx = nullptr;
 
+// ABI4 capability declarations (#2204). Every action reads the in-process
+// agent config store (yuzu_ctx_get_config) plus, for "certificates", a
+// std::filesystem::exists() stat of the configured cert paths — no
+// OS-specific code and no subprocess anywhere in this plugin, so every leg
+// is rung 1 uniformly across every OS.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "log_level",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.log_level)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.log_level)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.log_level)", nullptr},
+    },
+    {
+        /* .action      = */ "certificates",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists", nullptr},
+    },
+    {
+        /* .action      = */ "connection_info",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls.enabled/*)",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls.enabled/*)",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent config (agent.server_address/tls.enabled/*)",
+         nullptr},
+    },
+};
+
 } // namespace
 
 class DiagnosticsPlugin final : public yuzu::Plugin {
@@ -36,6 +77,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"log_level", "certificates", "connection_info", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

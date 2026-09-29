@@ -3,9 +3,9 @@
 ## Plugin: bitlocker | Actions: state
 ##
 ## Sources by platform:
-##   Windows: manage-bde -status (BitLocker)
-##   Linux:   lsblk + cryptsetup status (LUKS)
-##   macOS:   fdesetup status (FileVault)
+##   Windows: Win32_EncryptableVolume WMI, in-process (BitLocker)
+##   Linux:   libblkid + /sys/class/block/dm-* (LUKS)
+##   macOS:   fdesetup status + diskutil apfs list, bounded subprocess (FileVault)
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -15,13 +15,14 @@ metadata:
   displayName: Disk Encryption Status
   version: 1.0.0
   description: >
-    Query disk encryption status on the endpoint. On Windows, runs
-    manage-bde to report BitLocker status per volume including
-    conversion status, percentage encrypted, encryption method, and
-    protection state. On Linux, scans block devices for LUKS volumes
-    via lsblk and cryptsetup. On macOS, queries FileVault status via
-    fdesetup. Essential for compliance verification that endpoint
-    storage is encrypted at rest.
+    Query disk encryption status on the endpoint. On Windows, queries
+    Win32_EncryptableVolume in-process via WMI to report BitLocker
+    status per volume including conversion status, percentage
+    encrypted, encryption method, and protection state. On Linux,
+    enumerates LUKS volumes in-process via libblkid and reads
+    open/mapped state from /sys/class/block/dm-*. On macOS, queries
+    FileVault status via fdesetup and diskutil. Essential for
+    compliance verification that endpoint storage is encrypted at rest.
   tags: [security, encryption, bitlocker, luks, filevault, compliance]
 
 spec:
@@ -41,14 +42,43 @@ spec:
     columns:
       - name: volume
         type: string
+        description: >-
+          Per-OS volume identifier: drive letter on Windows, block-device basename on Linux, or the APFS volume's display label on macOS. Values: free text.
+        example: "C:"
+        platforms: [windows, linux, darwin]
       - name: conversion_status
         type: string
+        description: >
+          BitLocker's live conversion/encryption state for the volume,
+          decoded from Win32_EncryptableVolume::GetConversionStatus().
+          Populated only on Windows; Linux and macOS rows do not carry
+          this field.
+        values: [Fully Decrypted, Fully Encrypted, Encryption In Progress, Decryption In Progress, Encryption Paused, Decryption Paused, Unknown]
+        example: "Fully Decrypted"
+        platforms: [windows]
       - name: percentage_encrypted
         type: string
+        description: >-
+          Percentage of the volume currently encrypted, from BitLocker's EncryptionPercentage out-parameter. Populated only on Windows. Values: `<integer>%` or `unknown`.
+        example: "0%"
+        platforms: [windows]
       - name: encryption_method
         type: string
+        description: >
+          The disk-encryption cipher/mode BitLocker is using for the
+          volume, from GetEncryptionMethod(). Populated only on Windows.
+        values: [None, AES 128 with Diffuser, AES 256 with Diffuser, AES 128, AES 256, Hardware Encryption, XTS-AES 128, XTS-AES 256, Unknown]
+        example: "None"
+        platforms: [windows]
       - name: protection_status
         type: string
+        description: >
+          Whether BitLocker protection is currently on or off for the
+          volume, from Win32_EncryptableVolume::ProtectionStatus.
+          Populated only on Windows.
+        values: [Protection On, Protection Off, Protection Unknown]
+        example: "Protection Off"
+        platforms: [windows]
     aggregation:
       groupBy: [protection_status]
       operations: [count]

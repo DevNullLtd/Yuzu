@@ -187,7 +187,8 @@ extern const char* const kComplianceHtml =
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>

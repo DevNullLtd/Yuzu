@@ -1,0 +1,17 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash f4d514eecc28
+== action=quarantine
+[not captured] Destructive/Irreversible: not executed on a live host
+
+== action=unquarantine
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=status
+state|uncertain|note|pf state could not be read -- containment can be neither confirmed nor ruled out
+[result_status] UNAVAILABLE / PARTIAL / quarantine:macos_is_quarantined pf status unreadable
+[rc] 1
+
+== action=whitelist
+error|missing required parameter: action (add/remove)
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

@@ -1,0 +1,36 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash fc050dca8530
+== action=manufacturer
+manufacturer|Apple Inc.
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=model
+model|Mac16,10
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=bios
+bios_vendor|Apple
+bios_version|18000.161.10
+bios_date|N/A
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=processors
+cpu|0|Apple M4|10|10|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=memory
+dimm|total|32768|unknown|0
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=disks
+disk|0|APPLE SSD AP0512Z|465|SSD|NVMe
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=drivers
+driver|0|unknown||||
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=system
+serial|EXAMPLE0001
+system_uuid|00000000-0000-0000-0000-000000000001
+[result_status] UNDECLARED / UNKNOWN / 
+

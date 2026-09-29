@@ -1,0 +1,12 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 820bfb5e0176
+== action=client_version
+installed|false
+version|-
+service_status|not_found
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=site
+site_code|not_configured
+management_point|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+

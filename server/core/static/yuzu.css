@@ -448,6 +448,12 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .yar  { color: var(--mds-color-indicator-error-bright); font-weight: 600; }
 .ycc  { color: var(--mds-color-theme-indicator-warning); }
 
+/* #4187: a results cell whose value has a documented non-obvious meaning
+   (see result_parsing.hpp's cell_hint_for) gets a dotted underline so the
+   explanatory title= is discoverable, not just present for a stray hover. */
+.cell-hint { text-decoration: underline dotted; text-underline-offset: 2px;
+            cursor: help; }
+
 /* Row detail drawer */
 .result-row { cursor: pointer; }
 .result-row:hover { background: var(--mds-color-state-hover); }

@@ -1,0 +1,170 @@
+name: Fork dynamic review
+
+run-name: "Fork review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number statically approved by a collaborator
+        required: true
+        type: string
+      head_sha:
+        description: Exact 40-character PR head SHA approved for execution
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-dynamic-review-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Hosted Linux build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate immutable inputs
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # CWE-349 (#4471): this run executes UNREVIEWED fork code in the
+          # dispatch ref's GitHub Actions cache scope. Same quarantine
+          # contract as ci.yml's trusted_inputs step (its comment carries the
+          # full rationale): only a throwaway per-PR trusted-fork/pr-<N>[-<sha>]
+          # branch, never main/dev. Runbook: docs/ci-troubleshooting.md 1.2.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::fork-dynamic-review must be dispatched on refs/heads/trusted-fork/pr-${PR_NUMBER}[-<sha>] (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+
+      - name: Check out exact PR revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          persist-credentials: false
+
+      - name: Verify checked-out SHA before execution
+        env:
+          EXPECTED_SHA: ${{ inputs.head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install trusted host prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison ccache cmake flex libblkid-dev libtool ninja-build
+          python3 -m venv /tmp/yuzu-review-venv
+          # requirements-ci.txt is read from the FORK's own checked-out tree
+          # (already at HEAD above), so --require-hashes only proves each
+          # listed package matches ITS OWN declared hash on PyPI -- it does
+          # not prove the fork didn't edit which packages/hashes are listed.
+          # Not a gap for THIS job specifically: it holds no secrets, and
+          # `meson compile`/`meson test` of the same fork tree a few steps
+          # later is already arbitrary code execution by design.
+          /tmp/yuzu-review-venv/bin/pip install --require-hashes -r requirements-ci.txt
+          echo "/tmp/yuzu-review-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Set up isolated vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '4b77da7fed37817f124936239197833469f1b9a8'
+
+      - name: Configure without shared caches
+        env:
+          VCPKG_BINARY_SOURCES: clear
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          ./scripts/setup.sh \
+            --tests \
+            --native-file meson/native/linux-gcc13.ini
+
+      - name: Compile
+        run: meson compile -C build-linux
+
+      - name: Test
+        run: meson test -C build-linux --print-errorlogs
+
+  # #4471 (adversarial-review round, CDX-4471-01/kimi P1): this workflow
+  # executes UNREVIEWED fork code before a maintainer has approved the SHA,
+  # and the runbook dispatches the later trusted-fork-ci gate on the SAME
+  # quarantine ref -- same GitHub Actions cache scope. Without this job, a
+  # crafted cache entry written here (via the ambient runtime token; this job
+  # declares no actions/cache step, but that does not stop code running
+  # inside `meson compile`/`meson test` from calling the cache service
+  # directly -- the same mechanism #4471 exists to close) could be restored
+  # by the canary leg of the later trusted dispatch, before that job's own
+  # purge-quarantine-cache (trusted-fork-ci.yml) ever runs. Purging this
+  # workflow's own scope immediately, before a maintainer ever dispatches the
+  # gate, closes that ordering gap completely: the gate always sees an empty
+  # scope. Same shape as trusted-fork-ci.yml's purge job -- see its comment
+  # for the actions:write / no-checkout / always() reasoning, all identical
+  # here. (This job's own writes, if any, are removed by trusted-fork-ci.yml's
+  # purge after the gate runs, so re-approving a newer head on a reused
+  # branch is still safe either way.)
+  purge-quarantine-cache:
+    name: Purge quarantine cache scope
+    needs: [linux]
+    if: always()
+    runs-on: ubuntu-24.04
+    # 10 min, not 5: a scope near the 500-entry bound (5 pages x 100)
+    # under normal-to-slow gh-api latency could otherwise hit a bare
+    # GHA-level cancellation instead of the job's own designed
+    # "entries still present" failure message (governance Gate 4 UP-8).
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Delete every cache entry in this run's ref scope
+        env:
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Never purge outside a quarantine ref. A mis-scoped dispatch is
+          # already refused by the check right below; this keeps a future edit
+          # from turning the purge into a cold rebuild for every PR on dev/main.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::refusing to purge caches outside a trusted-fork/pr-<N> ref (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+          list_ids() {
+            gh api -X GET "repos/$REPOSITORY/actions/caches" -f ref="$GITHUB_REF" -F per_page=100 \
+              | jq -r --arg ref "$GITHUB_REF" '.actions_caches[] | select(.ref == $ref) | .id'
+          }
+          deleted=0
+          # Bounded re-list: one page per pass, so a scope holding more than a
+          # page drains over several passes instead of looping forever.
+          for _ in 1 2 3 4 5; do
+            ids=$(list_ids)
+            [[ -n "$ids" ]] || break
+            for id in $ids; do
+              # Report progress before failing -- under set -e a bare DELETE
+              # failure here would otherwise abort silently with no record of
+              # how many entries were already removed (docs/ci-troubleshooting.md
+              # 1.2 "purge job failed" covers the recovery: re-dispatch on the
+              # SAME branch, which is idempotent and finishes the job).
+              gh api -X DELETE "repos/$REPOSITORY/actions/caches/$id" >/dev/null || {
+                echo "::error::DELETE failed for cache id $id after removing $deleted entr$([ "$deleted" = 1 ] && echo y || echo ies) this run; re-dispatch on the same branch to retry (docs/ci-troubleshooting.md 1.2)."
+                exit 1
+              }
+              deleted=$((deleted + 1))
+            done
+          done
+          remaining=$(list_ids | wc -l | tr -d ' ')
+          [[ "$remaining" == "0" ]] || {
+            echo "::error::$remaining cache entries still present in $GITHUB_REF after purge; see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+          result="purged $deleted cache entries from scope $GITHUB_REF"
+          echo "$result"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "$result" >> "$GITHUB_STEP_SUMMARY"
+          fi

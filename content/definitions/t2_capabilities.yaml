@@ -90,96 +90,25 @@ spec:
     columns:
       - name: path
         type: string
+        description: "Absolute path of a matched file or directory."
+        example: "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)"
+        platforms: [windows, linux, darwin]
       - name: entry_type
         type: string
+        description: "Whether the matched entry is a file or a directory, as classified by match_type."
+        values: [file, directory]
+        example: "not observed in any capture (every platform's capture returned total_matches|0 with no result rows)"
+        platforms: [windows, linux, darwin]
       - name: total_matches
         type: int32
+        description: "Count of matching entries returned in this result, capped by max_results. Values: integer."
+        example: 0
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Search for ${match_type} matching '${pattern}' in ${root}"
 
   gather:
     ttlSeconds: 120
-
-  approval:
-    mode: auto
-
-  permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
-    authorRoles: [content-author]
-
-  compatibility:
-    minAgentVersion: 0.4.0
-    requiredPlugins: [filesystem]
-
-status:
-  phase: active
-
----
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: device.filesystem.get_version_info
-  displayName: Get PE Version Info
-  version: 0.4.0
-  description: >
-    Extract the PE (Portable Executable) version resource information from
-    a Windows executable or DLL. Returns the file version, product version,
-    company name, file description, internal name, original filename,
-    product name, and legal copyright. Windows only; returns an error on
-    Linux and macOS.
-  tags: [filesystem, windows, inventory, compliance, version]
-
-spec:
-  type: question
-  platforms: [windows]
-
-  execution:
-    plugin: filesystem
-    action: get_version_info
-    concurrency: per-device
-
-  parameters:
-    type: object
-    required: [path]
-    properties:
-      path:
-        type: string
-        displayName: File Path
-        description: >
-          The PE executable or DLL to inspect for version info.
-        validation:
-          maxLength: 4096
-      base_dir:
-        type: string
-        displayName: Base Directory
-        description: >
-          Optional. Restricts access to files within this directory.
-        validation:
-          maxLength: 4096
-
-  result:
-    columns:
-      - name: file_version
-        type: string
-      - name: product_version
-        type: string
-      - name: company_name
-        type: string
-      - name: file_description
-        type: string
-      - name: internal_name
-        type: string
-      - name: original_filename
-        type: string
-      - name: product_name
-        type: string
-      - name: legal_copyright
-        type: string
-
-  readablePayload: "Get PE version info for ${path}"
-
-  gather:
-    ttlSeconds: 300
 
   approval:
     mode: auto
@@ -275,10 +204,19 @@ spec:
     columns:
       - name: line_number
         type: int32
+        description: "1-based line number of a matching line. Values: integer."
+        example: 19
+        platforms: [windows, linux, darwin]
       - name: content
         type: string
+        description: "Full text of the matching line, with a trailing carriage return stripped. Values: free text."
+        example: "# localhost name resolution is handled within DNS itself."
+        platforms: [windows, linux, darwin]
       - name: total_matches
         type: int32
+        description: "Count of matching lines returned in this result, capped by max_matches. Values: integer."
+        example: 3
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Search '${pattern}' in ${path}"
 
@@ -390,12 +328,24 @@ spec:
     columns:
       - name: replacements_made
         type: int32
+        description: "Count of replacements performed (or that would be performed, when dry_run=true). Values: integer."
+        example: 2
+        platforms: [windows, linux, darwin]
       - name: file_size_before
         type: int64
+        description: "File size in bytes before the replace. Values: integer (bytes)."
+        example: 42
+        platforms: [windows, linux, darwin]
       - name: file_size_after
         type: int64
+        description: "File size in bytes after the replace. Values: integer (bytes)."
+        example: 18
+        platforms: [windows, linux, darwin]
       - name: dry_run
         type: bool
+        description: "Present and true only when dry_run=true was requested; the plugin omits this line entirely otherwise. Values: true (field absent when dry_run=false)."
+        example: "not observed in any capture (every capture ran with dry_run=false)"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Replace '${search}' with '${replacement}' in ${path}"
 
@@ -484,10 +434,20 @@ spec:
     columns:
       - name: status
         type: string
+        description: "Outcome of the write; the only value the plugin emits on success."
+        values: [ok]
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: bytes_written
         type: int64
+        description: "Number of bytes written to the file. Values: integer (bytes)."
+        example: 20
+        platforms: [windows, linux, darwin]
       - name: path
         type: string
+        description: "Canonicalized path that was written."
+        example: "C:\\Windows\\Temp\\yuzu_capture_bs7ucomo\\yuzu_capture_tmp.txt"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Write content to ${path} (create=${create}, overwrite=${overwrite})"
 
@@ -567,10 +527,20 @@ spec:
     columns:
       - name: status
         type: string
+        description: "Outcome of the append; the only value the plugin emits on success."
+        values: [ok]
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: bytes_appended
         type: int64
+        description: "Number of bytes appended, including an inserted newline separator when newline=true and the file did not already end with one. Values: integer (bytes)."
+        example: 21
+        platforms: [windows, linux, darwin]
       - name: total_size
         type: int64
+        description: "Total file size in bytes after the append. Values: integer (bytes)."
+        example: 40
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Append content to ${path}"
 
@@ -651,10 +621,19 @@ spec:
     columns:
       - name: lines_deleted
         type: int32
+        description: "Count of lines removed (end_line - start_line + 1, after end_line is clamped to the file's length). Values: integer."
+        example: 1
+        platforms: [windows, linux, darwin]
       - name: lines_before
         type: int32
+        description: "Declared here as lines_before, but the plugin's actual wire field is total_lines_before (filesystem_plugin.cpp:1998) — the file's total line count before the deletion. The emitted key does not match this column's declared name; see the filesystem plugin README Caveats. Values: integer."
+        example: 2
+        platforms: [windows, linux, darwin]
       - name: lines_after
         type: int32
+        description: "Declared here as lines_after, but the plugin's actual wire field is total_lines_after (filesystem_plugin.cpp:1999) — the file's total line count after the deletion. Same name mismatch as lines_before. Values: integer."
+        example: 1
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Delete lines ${start_line}-${end_line} from ${path}"
 
@@ -724,24 +703,54 @@ spec:
     columns:
       - name: target
         type: string
+        description: "The target URL tested for connectivity; repeated across its own DNS and TCP result rows. Values: free text (URL)."
+        example: "https://windowsupdate.microsoft.com"
+        platforms: [windows, linux, darwin]
       - name: dns_ok
         type: bool
+        description: "Whether DNS resolution of the target host succeeded."
+        example: true
+        platforms: [windows, linux, darwin]
       - name: dns_ms
         type: int32
+        description: "DNS resolution time in milliseconds. Values: integer (milliseconds)."
+        example: 3
+        platforms: [windows, linux, darwin]
       - name: ip
         type: string
+        description: "Resolved IP address when dns_ok is true; carries the DNS error text instead when dns_ok is false (windows_updates_plugin.cpp:990-992). Values: IP address string, or free-text DNS error on failure."
+        example: "128.85.102.70"
+        platforms: [windows, linux, darwin]
       - name: tcp_ok
         type: bool
+        description: "Whether the TCP connect to the target succeeded within timeout_seconds."
+        example: true
+        platforms: [windows, linux, darwin]
       - name: tcp_ms
         type: int32
+        description: "TCP connect time in milliseconds. Values: integer (milliseconds)."
+        example: 160
+        platforms: [windows, linux, darwin]
       - name: tcp_error
         type: string
+        description: "TCP connect error text, emitted as an additional row only when tcp_ok is false; the row is omitted entirely on a successful connect (windows_updates_plugin.cpp:1002). Values: free text."
+        example: "not observed in any capture (every capture's TCP connects succeeded)"
+        platforms: [windows, linux, darwin]
       - name: targets_tested
         type: int32
+        description: "Total number of targets tested in this run. Values: integer."
+        example: 3
+        platforms: [windows, linux, darwin]
       - name: targets_reachable
         type: int32
+        description: "Count of targets whose DNS and TCP checks both succeeded. Values: integer."
+        example: 3
+        platforms: [windows, linux, darwin]
       - name: targets_failed
         type: int32
+        description: "Count of targets that failed DNS resolution or TCP connect. Values: integer."
+        example: 0
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Test patch server connectivity (timeout=${timeout_seconds}s)"
 
@@ -768,13 +777,18 @@ kind: InstructionDefinition
 metadata:
   id: agent.content_dist.upload_file
   displayName: Upload File to Server
-  version: 1.1.0
+  version: 1.2.0
   description: >
-    Upload a local file from the agent endpoint to the Yuzu server via
-    multipart POST. Computes the SHA-256 hash of the file before upload and
-    sends it alongside the file data for server-side verification. If
-    server_url is not provided, derives it from the agent's configured
-    server web URL. Maximum file size is configurable (default 100 MB).
+    Upload a local file from the agent endpoint to the Yuzu server through
+    the one-time upload-grant + authenticated chunked-receive protocol
+    (PR1.6, CC-06): the operator mints a grant out of band (POST
+    /api/v1/upload-grants) and passes its one-time grant_id/grant_secret
+    here. The agent opens a session against that grant, streams the file in
+    bounded chunks honouring the server's declared chunk size, and commits
+    with a SHA-256 computed from the exact bytes acknowledged. There is no
+    server_url parameter — the destination is derived entirely from the
+    grant and the agent's own configured server transport
+    (agent.server_web_url), and the connection is always TLS.
   tags: [content, upload, transfer, deployment]
 
 spec:
@@ -788,7 +802,7 @@ spec:
 
   parameters:
     type: object
-    required: [path]
+    required: [path, grant_id, grant_secret]
     properties:
       path:
         type: string
@@ -797,19 +811,37 @@ spec:
           The local file path on the endpoint to upload.
         validation:
           maxLength: 4096
-      server_url:
+      grant_id:
         type: string
-        displayName: Server URL
+        displayName: Grant ID
         description: >
-          The Yuzu server base URL to upload to. If not provided, uses the
-          agent's configured server web URL (agent.server_web_url).
+          The one-time upload grant's id, minted operator-side via POST
+          /api/v1/upload-grants. Paired with grant_secret to authenticate
+          the session; both are revealed by the mint response exactly once.
         validation:
-          maxLength: 2048
+          maxLength: 64
+      grant_secret:
+        type: string
+        displayName: Grant Secret
+        description: >
+          The one-time upload grant's secret, minted alongside grant_id.
+          Never logged or echoed back by the server after the mint response.
+        validation:
+          maxLength: 128
+      base_dir:
+        type: string
+        displayName: Base Directory Restriction
+        description: >
+          If set, path must resolve (after symlink canonicalisation) inside
+          this directory, or the upload is refused before anything is read.
+        validation:
+          maxLength: 4096
       max_size_mb:
         type: int32
         displayName: Max Size (MB)
         description: >
-          Maximum allowed file size in megabytes. Default: 100.
+          Maximum allowed file size in megabytes, checked locally before
+          the session opens. Default: 100.
         default: 100
         validation:
           minimum: 1
@@ -819,12 +851,25 @@ spec:
     columns:
       - name: status
         type: string
+        description: "Outcome of the upload; the only value the plugin emits on success (content_dist_plugin.cpp:1171)."
+        values: [ok]
+        example: "not observed in any capture (every capture failed at parameter validation, before this line could be reached)"
+        platforms: [windows, linux, darwin]
       - name: sha256
         type: string
-      - name: bytes_uploaded
+        description: "Server-confirmed SHA-256 digest of the committed upload, computed from the exact bytes the server acknowledged. Values: hex digest."
+        example: "not observed in any capture (every capture failed at parameter validation, before this line could be reached)"
+        platforms: [windows, linux, darwin]
+      - name: size
         type: int64
-      - name: filename
+        description: "Server-reported size in bytes of the committed upload (commit_result.actual_size), which must match the local file size. Values: integer (bytes)."
+        example: "not observed in any capture (every capture failed at parameter validation, before this line could be reached)"
+        platforms: [windows, linux, darwin]
+      - name: upload_id
         type: string
+        description: "Server-assigned session id from the upload grant, used to address the /api/v1/uploads/{id}/... endpoints. Values: free text (opaque session id)."
+        example: "not observed in any capture (every capture failed at parameter validation, before this line could be reached)"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Upload ${path} to server"
 

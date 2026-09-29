@@ -170,6 +170,14 @@ Custom properties set via the Custom Properties API can be referenced in scope e
 
 Device tags are key-value pairs assigned to agents. Tags can be set by the agent itself (e.g. from hardware discovery), set server-side by an operator, or set via the API. The scope engine can query any tag using the `tag:<key>` syntax.
 
+> **Precedence when a tag has more than one source.** A `tag:<key>` atom resolves the
+> persistent tag store first; a connected agent's own live self-reported value answers
+> only when the store has no row at all for that key. `service` (used in the examples
+> below) is special-cased further — it never answers from a live agent self-report at
+> all, even as a fallback. See `docs/asset-tagging-guide.md`'s "Tag source precedence (write
+> time)" and "Tag source precedence (read time, scope-DSL, #3295)" blockquotes for the full
+> write-time and read-time rules, respectively.
+
 ### Syntax
 
 ```

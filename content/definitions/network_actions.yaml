@@ -5,7 +5,7 @@
 ## Sources by platform:
 ##   Windows: ipconfig /flushdns, ping -n
 ##   Linux:   resolvectl flush-caches / systemd-resolve --flush-caches, ping -c
-##   macOS:   dscacheutil -flushcache, ping -c
+##   macOS:   dscacheutil -flushcache AND killall -HUP mDNSResponder, ping -c
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -17,10 +17,15 @@ metadata:
   description: >
     Flushes the local DNS resolver cache on the endpoint. On Windows
     runs ipconfig /flushdns. On Linux attempts resolvectl flush-caches
-    then falls back to systemd-resolve --flush-caches. On macOS runs
-    dscacheutil -flushcache. Returns a status indicator and the
-    command output. This is a mutating action that clears cached DNS
-    records, forcing fresh resolution on subsequent lookups.
+    then falls back to systemd-resolve --flush-caches on any failure of
+    the first attempt (absent, or found but failing at runtime). On
+    macOS runs both dscacheutil -flushcache and killall -HUP
+    mDNSResponder — the SIGHUP is the step that actually resets the
+    resolver, so a flush without it is incomplete. On every platform the
+    status indicator reflects the real exit code(s) of the underlying
+    command(s) — ok only if all of them succeed — never a blind success.
+    This is a mutating action that clears cached DNS records, forcing
+    fresh resolution on subsequent lookups.
   tags: [network, dns, action, remediation]
 
 spec:
@@ -40,8 +45,16 @@ spec:
     columns:
       - name: status
         type: string
+        description: >-
+          Whether the flush succeeded ("ok") or failed ("error"); reflects the real exit code(s) of the underlying command(s), never a blind success. Values: ok, error.
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: output
         type: string
+        description: >-
+          Captured stdout+stderr of the underlying flush command(s), merged. On macOS this is a fixed "dscacheutil rc={} mDNSResponder rc={}" summary; on Windows and Linux it is the raw captured command output. Values: free text.
+        example: "dscacheutil rc={} mDNSResponder rc={}"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Flush DNS cache"
 
@@ -49,7 +62,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -116,6 +129,10 @@ spec:
     columns:
       - name: output
         type: string
+        description: >-
+          One raw line of the system ping tool's stdout, emitted per line of output. Not present when host/count validation fails — that path emits a single "error|<message>" line instead, outside this schema. Values: free text (raw ping-tool output).
+        example: "PING 127.0.0.1 (127.0.0.1): 56 data bytes"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Ping ${host} (${count} packets)"
 
@@ -123,7 +140,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]

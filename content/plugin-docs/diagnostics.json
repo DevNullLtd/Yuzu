@@ -1,0 +1,618 @@
+{
+  "actions": [
+    {
+      "action": "certificates",
+      "definition_ids": [
+        "device.diagnostics.certificates"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "connection_info",
+      "definition_ids": [
+        "device.diagnostics.connection_info"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.server_address/tls.enabled/*)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.server_address/tls.enabled/*)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.server_address/tls.enabled/*)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "log_level",
+      "definition_ids": [
+        "device.diagnostics.log_level"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.log_level)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.log_level)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process agent config (agent.log_level)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**All three captures are identical across every OS because none reflects a configured agent.** The capture driver loads the plugin via `PluginHandle::load` + `LocalDispatcher::run` without calling `init()` (per the capture methodology), so `g_ctx` stays `nullptr` for the whole run; `yuzu_ctx_get_config(nullptr, key)` returns `nullptr` unconditionally (`agents/core/src/agent.cpp:559-560`), and every field falls back to its hardcoded default. A real agent with a populated config store would show real values, not this placeholder set.",
+    "**No typed result status.** The plugin never calls `set_result_status`; every capture reads `UNDECLARED / UNKNOWN /` regardless of platform or outcome. There is no way to distinguish \"config genuinely unset\" from \"no host config was reachable\" from the status field alone.",
+    "**`certificates`' filesystem stat swallows its own error code.** `std::filesystem::exists(path_str, ec)` takes an `std::error_code` output parameter but the plugin never inspects it (`agents/plugins/diagnostics/src/diagnostics_plugin.cpp:144`), so a permission-denied stat and a genuinely-missing file both read as `exists=false`.",
+    "**`connection_info.session_id` carries the live agent session credential.** This is why the action is classified under the `PluginSecret` securable rather than `Inventory` (`server/core/src/capability_decls/plugin_action_catalogue_b.hpp:685-687`); do not relax its securable to match the other two actions.",
+    "**`log_level` is not validated against the spdlog enum.** The plugin returns whatever string sits at `agent.log_level` verbatim (or `\"info\"` if unset) — a misconfigured value would pass through unchanged rather than being rejected or normalized."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists the configured TLS certificate paths (CA cert, client cert, client key) and whether each file exists on the endpoint's filesystem. Useful for diagnosing mTLS connectivity issues.",
+      "display_name": "TLS Certificate Status",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.diagnostics.certificates",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns detailed gRPC connection diagnostics: server address, TLS status, session ID, gRPC channel state, reconnect count, round-trip latency in milliseconds, agent uptime in seconds, and the connected_since timestamp.",
+      "display_name": "Connection Diagnostics",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.diagnostics.connection_info",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reads the agent's current log level from the config context. Returns the spdlog level string (trace, debug, info, warn, error, critical, off). Defaults to \"info\" if not explicitly configured.",
+      "display_name": "Current Log Level",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "device.diagnostics.log_level",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Agent diagnostics — log level, certificates, connection info",
+  "how_it_works": "All three actions are pure reads against the agent's in-process config store (`yuzu_ctx_get_config`, wrapped by `PluginContext::get_config`); none of them makes an OS call, opens a socket, or spawns a process. `log_level` reads a single key, `agent.log_level`, defaulting to `\"info\"` when unset. `certificates` reads three configured paths (`tls.ca_cert`, `tls.client_cert`, `tls.client_key`) and stats each one with `std::filesystem::exists` — it reports path and existence only, never file contents. `connection_info` reads eight config keys covering server address, TLS-enabled flag, session ID, gRPC channel state, reconnect count, latency, and connection timestamps, and additionally computes `uptime_seconds` from `agent.start_time_epoch` at read time. Every config lookup that returns empty falls back to a fixed placeholder (`\"info\"`, `\"(not configured)\"`, `\"(none)\"`, `\"unknown\"`, `\"0\"`, `\"false\"`) rather than omitting the field.\n\nThe originating spec expected `diagnostics` to include a state-changing action; a full read of the shipped code found all three actions to be pure reports with no host, config, or filesystem write anywhere in the plugin, so every row is classified `ReadOnly`/`None` against the code as found, not the spec's expectation.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "c768172a2281",
+  "manifest_version": 1,
+  "name": "diagnostics",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Which certificate/key slot this row reports.",
+          "example": "ca_cert",
+          "name": "cert_type",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "ca_cert",
+            "client_cert",
+            "client_key"
+          ]
+        },
+        {
+          "description": "Filesystem path configured for this slot's config key, or the literal \"(not configured)\" when unset. Values: free text (path) or \"(not configured)\".",
+          "example": "(not configured)",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether std::filesystem::exists() found a file at path; always false when path is unconfigured.",
+          "example": "false",
+          "name": "exists",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "device.diagnostics.certificates"
+    },
+    {
+      "columns": [
+        {
+          "description": "gRPC server endpoint the agent is configured to connect to, or the literal \"(not configured)\" when unset. Values: free text (host:port) or \"(not configured)\".",
+          "example": "(not configured)",
+          "name": "server_address",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether mTLS is enabled for the agent's server connection, read from tls.enabled; false when unset.",
+          "example": "false",
+          "name": "tls_enabled",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "bool",
+          "values": null
+        },
+        {
+          "description": "Current gRPC session identifier (the live agent session credential), or the literal \"(none)\" when there is no active session. Values: free text or \"(none)\".",
+          "example": "(none)",
+          "name": "session_id",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Current gRPC channel connectivity state, read verbatim from agent.grpc_channel_state, or \"unknown\" when unset. Values: free text (e.g. READY, CONNECTING, TRANSIENT_FAILURE) or \"unknown\".",
+          "example": "unknown",
+          "name": "grpc_channel_state",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Number of times the agent has reconnected to the server since startup; 0 when unset. Values: integer >= 0.",
+          "example": "0",
+          "name": "reconnect_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Last measured round-trip latency to the server in milliseconds; 0 when unset. Values: integer >= 0.",
+          "example": "0",
+          "name": "latency_ms",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "Seconds since agent.start_time_epoch, computed at read time; 0 when start_time_epoch is unset or unparsable. Values: integer >= 0.",
+          "example": "0",
+          "name": "uptime_seconds",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Unix epoch timestamp (as a string) of when the current connection was established, or \"0\" when unset. Values: free text (epoch seconds) or \"0\".",
+          "example": "0",
+          "name": "connected_since",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.diagnostics.connection_info"
+    },
+    {
+      "columns": [
+        {
+          "description": "The agent's current spdlog log level, read verbatim from agent.log_level.",
+          "example": "info",
+          "name": "log_level",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "critical",
+            "off"
+          ]
+        }
+      ],
+      "definition_id": "device.diagnostics.log_level"
+    }
+  ],
+  "outputs_note": "One `key|value` row per field via `write_output()` — not a fixed-width pipe schema like most plugins, but a variable-length sequence of labelled rows per call (`agents/plugins/diagnostics/src/diagnostics_plugin.cpp:10-12`). `certificates` additionally prefixes each row with the literal discriminator `cert`. There is no empty-result placeholder row: every action always emits its full fixed set of rows, substituting a fallback string (`\"(not configured)\"`, `\"(none)\"`, `\"unknown\"`, `\"0\"`, `\"false\"`, `\"info\"`) for any config key that is unset — `-` is never used as a placeholder in this plugin.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — no OS call; the config store is read in-process.",
+      "if_refused": "n/a — an unset config key returns the plugin's fixed placeholder, not an error",
+      "measured": "2026-09-07, bare-metal, SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "None.",
+      "if_refused": "n/a — same placeholder fallback",
+      "measured": "2026-09-07, bare-metal, euid 501 (unprivileged — the capture ran outside the real daemon identity)",
+      "os": "macOS",
+      "runs_as": "agent daemon (root today per `docs/agent-privilege-model.md`)"
+    },
+    {
+      "grant": "None.",
+      "if_refused": "n/a — same placeholder fallback",
+      "measured": "2026-09-06, container, euid 0",
+      "os": "Linux",
+      "runs_as": "agent daemon (`yuzu` user, unprivileged, per `docs/agent-privilege-model.md`)"
+    }
+  ],
+  "readme": "agents/plugins/diagnostics/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "log_level",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "log_level|info"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "certificates",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "cert|ca_cert|(not configured)|false",
+            "cert|client_cert|(not configured)|false",
+            "cert|client_key|(not configured)|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "connection_info",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "server_address|(not configured)",
+            "tls_enabled|false",
+            "session_id|(none)",
+            "grpc_channel_state|unknown",
+            "reconnect_count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "c768172a2281",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "log_level",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "log_level|info"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "certificates",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "cert|ca_cert|(not configured)|false",
+            "cert|client_cert|(not configured)|false",
+            "cert|client_key|(not configured)|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "connection_info",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "server_address|(not configured)",
+            "tls_enabled|false",
+            "session_id|(none)",
+            "grpc_channel_state|unknown",
+            "reconnect_count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "c768172a2281",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "log_level",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "log_level|info"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "certificates",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "cert|ca_cert|(not configured)|false",
+            "cert|client_cert|(not configured)|false",
+            "cert|client_key|(not configured)|false"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "connection_info",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 8,
+          "rows": [
+            "server_address|(not configured)",
+            "tls_enabled|false",
+            "session_id|(none)",
+            "grpc_channel_state|unknown",
+            "reconnect_count|0"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "c768172a2281",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "log_level",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "certificates",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Security"
+    },
+    {
+      "action": "connection_info",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "PluginSecret"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/diagnostics.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/diagnostics/src/diagnostics_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "0.2.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:153`), readable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no server-side store or route reads `device.diagnostics.*` (grepped across `server/`); `server/core/src/agent_registry.cpp:922-925` only carries the action's one-line description for discovery/catalog display, not the result rows.",
+    "**Sensitivity.** `connection_info`'s `session_id` is the agent's live session credential — why that action sits behind the `PluginSecret` securable rather than `Inventory` — and `certificates`' `path` rows can reveal local filesystem layout; nothing here names a specific person or installed software.",
+    "**Siblings:** none in this plugin group — `agent_logging` is the closest neighbor (`get_key_files` reports TLS/key file paths under the same `Security` securable; `get_log`/`connection_info` both expose the live session credential under `PluginSecret`).",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.diagnostics.connection_info\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

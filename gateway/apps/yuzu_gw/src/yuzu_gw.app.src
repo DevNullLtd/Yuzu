@@ -15,6 +15,8 @@
         stdlib,
         sasl,
         inets,
+        crypto,
+        public_key,
         ctx,
         grpcbox,
         telemetry,

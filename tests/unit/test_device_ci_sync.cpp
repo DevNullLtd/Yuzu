@@ -5,8 +5,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "sync_canonical.hpp" // yuzu::agent::sha256_hex
 #include "sync_source_device_ci.hpp"
-#include "sync_source_installed_software.hpp" // yuzu::agent::sha256_hex
 
 #include <chrono>
 #include <string>

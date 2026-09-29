@@ -1,0 +1,26 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/auto/verify",
+    "capability_id": "get.fragments-auto-verify",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/verify/drill",
+    "capability_id": "get.fragments-auto-verify-drill",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/verify/run",
+    "capability_id": "get.fragments-auto-verify-run",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

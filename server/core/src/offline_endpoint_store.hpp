@@ -8,6 +8,32 @@
 /// every heartbeat ingest (direct + gateway, via HeartbeatIngestion), read by
 /// the viz topology handler. No secrets — plain columns, no SecretCodec.
 ///
+/// **HA WS-5 (ADR-2002 §7a, governance Gate 3 architect finding, 2026-09-22):
+/// this store's blast radius is WIDER than the paragraph above states.**
+/// `AgentRegistry::all_ids()`/`evaluate_scope()` (via `configure_presence`)
+/// merge this store's live rows into cross-replica scope-evaluation
+/// visibility — a degraded/misbehaving `OfflineEndpointStore` on a
+/// multi-replica deployment now affects live dispatch targeting, not only a
+/// stale-cube viz render.
+///
+/// **#4981 PR-1 (Finding B) widens `query_live_ids` to a type-distinguishable
+/// read.** Pre-#4981, a store outage was silently indistinguishable from
+/// "confirmed zero presence-only agents" (both returned an empty vector) —
+/// `AgentRegistry::evaluate_scope` could return a normal-looking,
+/// successful-but-incomplete match set during an outage. `query_live_ids` now
+/// returns `std::expected<std::vector<PresenceIdentity>, PresenceReadError>`:
+/// a genuine store/query failure (or a row count past `kQueryRowCap`) is
+/// `std::unexpected`, NEVER a silently-empty/truncated vector. `live_presence()`
+/// (`agent_registry.cpp`) propagates this to `evaluate_scope`'s
+/// `ScopeEvalError::Kind::PresenceDegraded`, which aborts fleet-wide scope
+/// evaluation rather than proceeding with a partial presence view — the same
+/// fail-closed posture `member_set_owned` already holds for result-set
+/// membership. `evaluate_scope_local` never calls into presence at all and so
+/// can never fail this way (see its own doc comment). `query_stale_within`
+/// (the viz-only read) is UNCHANGED — it stays fail-soft (empty on error),
+/// since a stale-cube viz render has no dispatch/enforce/target decision
+/// downstream of it.
+///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
 /// and schema-qualifies every runtime statement (`endpoint_state.endpoints`) —
@@ -16,9 +42,14 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -35,10 +66,51 @@ struct OfflineEndpoint {
     std::string os;
     std::int64_t last_heartbeat_ms{0}; ///< Server wall-clock epoch ms at last ingest.
     std::int64_t agent_ts{0};          ///< Agent-emitted snapshot epoch seconds (0 if none).
+    /// Round-3 v2 columns (Devices-page merge, item 1): last-known agent
+    /// version/arch, so an OFFLINE row still shows a version/arch on the
+    /// Hardware list instead of blanking the moment the agent drops off the
+    /// live registry. Empty when never observed (pre-migration rows, or a
+    /// heartbeat that raced session lookup — see upsert()'s blank-preserve
+    /// note below).
+    std::string agent_version;
+    std::string arch;
 };
+
+/// One agent's identity as known to a DIFFERENT replica, for cross-replica
+/// scope-evaluation visibility (HA WS-5, ADR-2002 §7a — see
+/// `AgentRegistry::evaluate_scope`/`all_ids()`, which merge this in for ids
+/// not in that replica's own local live registry, local always winning on
+/// conflict). Deliberately excludes `session_id` and plugin capability: a
+/// merge caller has no session concept of its own (that's WS-4's fenced
+/// `GatewayRouteStore`), and plugin-capability cross-replica visibility
+/// (`ids_missing_plugin`) is out of this slice's scope — see WS-5's plan doc.
+struct PresenceIdentity {
+    std::string agent_id;
+    std::string hostname;
+    std::string os;
+    std::string agent_version;
+    std::string arch;
+};
+
+/// `query_live_ids`'s typed failure surface (#4981 PR-1, Finding B).
+/// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
+/// existing `reason` label vocabulary (`store_unavailable`/`db_error`,
+/// offline_endpoint_store.cpp) exactly — do not introduce a third spelling.
+/// `Truncated` is new: the query result exceeded `kQueryRowCap` rows, so the
+/// caller cannot trust it as the COMPLETE live set (silently dropping rows
+/// past the cap would under-count presence, the same fail-open class a
+/// genuine DB error guards against).
+enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
 
 class OfflineEndpointStore {
 public:
+    /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
+    /// (gov sec-LOW / UP-5): the viz machines_max ceiling, so the store can
+    /// never allocate more than the page could ever serve even if the table
+    /// has grown large. Public so tests can size a truncation fixture against
+    /// the real value rather than a hardcoded duplicate.
+    static constexpr int kQueryRowCap = 100000;
+
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
     /// migration failed (the server fails closed before reaching here, so in
@@ -50,13 +122,37 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// HA WS-5 governance hardening (Gate 3 sre finding, 2026-09-22):
+    /// `remove_if_session` is fail-soft by design (see its own doc comment —
+    /// a read failure degrades to local-only visibility, never a wrong
+    /// dispatch). `query_live_ids` is NO LONGER fail-soft as of #4981 PR-1
+    /// (see this file's own header banner) — a read failure is now a typed
+    /// `std::unexpected`, never a silently-empty vector. Either way,
+    /// fail-soft/fail-closed must not mean fail-INVISIBLE now that this
+    /// store is load-bearing for cross-replica scope-evaluation correctness.
+    /// Set ONCE during single-threaded
+    /// startup, before serving threads read it without synchronisation —
+    /// same idiom as `AppPerfDailyStore::set_metrics` and its siblings. Null
+    /// (the default, e.g. unit tests / pre-WS-5 callers) disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     /// Upsert one agent's last-known identity + last-seen. Best-effort: returns
     /// false (logged at debug) on an empty lease or a query error so a slow or
     /// blipping database never fails the heartbeat path — the live in-memory
     /// stores remain the source of truth; this is durability on top. Single
     /// statement, autocommit, `INSERT ... ON CONFLICT ... RETURNING`.
+    ///
+    /// `agent_version`/`arch` (round-3 v2 columns): a BLANK value on the
+    /// incoming row NEVER overwrites an already-known non-blank value —
+    /// `hostname`/`os` are the ONE per-ingest source of truth (unconditional
+    /// EXCLUDED write, matching the pre-v2 columns), but a heartbeat that
+    /// raced the session lookup (registry lookup miss) supplies "" here, and
+    /// must not blank out a version/arch this store already learned from an
+    /// earlier heartbeat for the same agent.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
-                std::int64_t last_heartbeat_ms, std::int64_t agent_ts);
+                std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
+                std::string_view agent_version = {}, std::string_view arch = {},
+                std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
     /// first. The viz handler renders those NOT currently online as stale
@@ -65,9 +161,49 @@ public:
     /// page still renders the live fleet).
     [[nodiscard]] std::vector<OfflineEndpoint> query_stale_within(std::chrono::seconds window);
 
+    /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
+    /// DATABASE clock (`now()` in-SQL, never the replica's own
+    /// `system_clock` — the #3715 precedent), for cross-replica
+    /// scope-evaluation visibility.
+    ///
+    /// #4981 PR-1 (Finding B): type-distinguishable — `std::unexpected` on a
+    /// genuine read failure (`StoreUnavailable`: no connection in time;
+    /// `DbError`: the query itself failed) or on a result exceeding
+    /// `kQueryRowCap` (`Truncated` — queried at `LIMIT kQueryRowCap + 1`; a
+    /// `(kQueryRowCap + 1)`-row result means the true live set is larger than
+    /// what was fetched, so the extra row is discarded and the whole read is
+    /// reported as untrustworthy rather than silently serving a partial set).
+    /// The caller (`AgentRegistry::live_presence()`) MUST treat any of these
+    /// as "cannot answer" (`ScopeEvalError::Kind::PresenceDegraded` for
+    /// `evaluate_scope`), never silently substitute an empty vector — an
+    /// empty presence set during a genuine outage is indistinguishable from
+    /// "confirmed zero presence-only agents" and, under a NOT combinator
+    /// elsewhere in the scope expression, would otherwise invert to a
+    /// fleet-wide match built on a degraded read the caller never even
+    /// noticed. `query_stale_within` above is UNCHANGED (still fail-soft,
+    /// empty on error) — a stale-cube viz render has no
+    /// dispatch/enforce/target decision downstream of it, unlike this method.
+    [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
+    query_live_ids(std::chrono::seconds ttl);
+
+    /// Session-guarded delete (HA WS-5): removes the row ONLY when its
+    /// stored `session_id` matches — mirrors
+    /// `AgentRegistry::remove_agent_if_session`, so a stale/superseded
+    /// session's disconnect can never delete a NEWER session's presence
+    /// row. Called on graceful disconnect so a departed agent's row does
+    /// not linger for the full liveness window — needed to keep the
+    /// single-replica monolith's `evaluate_scope` outcome unchanged from
+    /// pre-WS-5 behavior (an agent gone from the local registry must also
+    /// be gone from presence, not just eventually-stale). Best-effort like
+    /// `upsert()`: a failure here just means the row lingers until TTL
+    /// expiry, which is always safe (over-inclusion never grants dispatch
+    /// authority).
+    bool remove_if_session(std::string_view agent_id, std::string_view session_id);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server

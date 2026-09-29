@@ -181,7 +181,8 @@ extern const char* const kSettingsHtml =
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
@@ -326,6 +327,53 @@ extern const char* const kSettingsHtml =
         <div id="api-token-section"
              hx-get="/fragments/settings/api-tokens"
              hx-trigger="load, refreshApiTokens from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Engine Principals ─────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Engine Principals</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Durable identities for autonomous use-case engine modules — owner, justification,
+          and classification outlive any one credential. Revoke is terminal; recovery mints
+          a successor principal (never un-revoked). A user cannot be deleted while owning an
+          active engine principal — transfer ownership first.
+        </p>
+        <!-- Deliberately OUTSIDE #engine-principals-section: that div's
+             innerHTML is fully replaced on every `refreshEnginePrincipals`
+             trigger (including the one a successful mint/rotate itself
+             fires right after populating this panel) — a reveal element
+             nested inside the refreshing section would be wiped the instant
+             it appeared. Populated by the body-level `submit` listener
+             below (CSP-safe, no `hx-on`). -->
+        <div id="engine-principal-reveal"></div>
+        <div id="engine-principals-section"
+             hx-get="/fragments/settings/engine-principals"
+             hx-trigger="load, refreshEnginePrincipals from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+)HTM"
+    R"HTM(
+    <!-- ── Access Reviews (SOC 2 CC6.2) ──────────────────── -->
+    <div class="section">
+      <div class="section-header">Access Reviews</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Periodic review evidence for every user/group/engine-principal's direct role grants.
+          This panel is a convenience view — the REST API (<code>/api/v1/access-reviews*</code>)
+          and MCP twins are the primary surface.
+        </p>
+        <div id="access-review-section"
+             hx-get="/fragments/settings/access-reviews"
+             hx-trigger="load, refreshAccessReview from:body"
              hx-swap="innerHTML">
           <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
@@ -603,7 +651,12 @@ extern const char* const kSettingsHtml =
     }
 
     /* ── Populate nav bar + context bar ─────────────────────── */
-    fetch('/api/me').then(function(r){return r.json()}).then(function(d){
+)HTM"
+    // Split here purely to keep each raw-string literal under MSVC's 16 KB
+    // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
+    // principals console section pushed this template over the limit). Local
+    // GCC/Clang have no such cap, so this only surfaces on the Windows leg.
+    R"HTM(    fetch('/api/me').then(function(r){return r.json()}).then(function(d){
       document.getElementById('nav-user').textContent = (d.display_name || d.username);
       var role = d.rbac_role || d.role;
       document.getElementById('role-badge').textContent = role;
@@ -626,6 +679,129 @@ extern const char* const kSettingsHtml =
           setTimeout(function() { btn.textContent = 'Copy to Clipboard'; }, 2000);
         }
       }
+      /* G5 (secret hygiene): manual dismiss for the engine-principal
+         mint/rotate secret reveal — wipes the DOM immediately rather than
+         waiting on the 60s auto-clear timer above. */
+      if (e.target.closest('[data-dismiss-reveal]')) {
+        var reveal = document.getElementById('engine-principal-reveal');
+        if (reveal) reveal.innerHTML = '';
+        if (window.__enginePrincipalRevealTimer) {
+          clearTimeout(window.__enginePrincipalRevealTimer);
+          window.__enginePrincipalRevealTimer = null;
+        }
+      }
+    });
+    /* Engine Principals — the REST surface (/api/v1/engine-principals/...)
+       is JSON-in/JSON-out, so these forms are deliberately PLAIN <form>
+       elements with NO hx-post (htmx's native form submission would send
+       application/x-www-form-urlencoded, and every one of these routes
+       400s on a non-JSON body — there is no bundled json-enc extension).
+       This body-level delegated `submit` listener does the same thing
+       instruction_ui.cpp's execute-instruction button already does for a
+       JSON REST endpoint: build the JSON body from the form fields, fetch()
+       it, and update the DOM from the response — CSP-safe (no `hx-on`,
+       no `new Function()`). One listener covers all five engine-principal
+       mutations (create/mint/rotate/transfer/revoke), dispatched on each
+       form's `data-engine-action` marker (settings_routes.cpp's
+       render_engine_principals_fragment). */
+    document.body.addEventListener('submit', function(e) {
+      var form = e.target.closest('form[data-engine-action]');
+      if (!form) return;
+      e.preventDefault();
+
+      var action = form.getAttribute('data-engine-action');
+      var principalId = form.getAttribute('data-principal-id') || '';
+      var submitBtn = form.querySelector('button[type=submit]');
+      var confirmMsg = submitBtn && submitBtn.getAttribute('data-confirm');
+      if (confirmMsg && !window.confirm(confirmMsg)) return;
+
+      var fd = new FormData(form);
+      var url, method, payload;
+      if (action === 'create') {
+        url = '/api/v1/engine-principals';
+        method = 'POST';
+        payload = {
+          slug: fd.get('slug') || '',
+          display_name: fd.get('display_name') || '',
+          owner_username: fd.get('owner_username') || '',
+          justification: fd.get('justification') || '',
+          classification: fd.get('classification') || ''
+        };
+      } else if (action === 'mint') {
+        url = '/api/v1/engine-principals/' + encodeURIComponent(principalId) + '/credentials';
+        method = 'POST';
+        payload = { ttl_days: parseInt(fd.get('ttl_days'), 10) || 90 };
+      } else if (action === 'rotate') {
+        url = '/api/v1/engine-principals/' + encodeURIComponent(principalId) +
+              '/credentials/rotate';
+        method = 'POST';
+        payload = { overlap_secs: parseInt(fd.get('overlap_secs'), 10) || 86400 };
+      } else if (action === 'transfer') {
+        url = '/api/v1/engine-principals/' + encodeURIComponent(principalId) + '/transfer-owner';
+        method = 'POST';
+        payload = { new_owner: fd.get('new_owner') || '' };
+      } else if (action === 'revoke') {
+        url = '/api/v1/engine-principals/' + encodeURIComponent(principalId);
+        method = 'DELETE';
+        var supersededBy = fd.get('superseded_by');
+        payload = supersededBy ? { superseded_by: supersededBy } : {};
+      } else {
+        return;
+      }
+
+      var feedback = document.getElementById('engine-principal-feedback');
+      if (feedback) feedback.textContent = '';
+      fetch(url, {
+        method: method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        /* G5 (secret hygiene): mint/rotate responses carry a raw one-time
+           secret; never let the browser's HTTP cache retain it. */
+        cache: 'no-store'
+      })
+      .then(function(r) { return r.json().then(function(d) { return { status: r.status, data: d }; }); })
+      .then(function(resp) {
+        if (resp.status >= 400) {
+          var msg = resp.data && resp.data.error
+            ? (resp.data.error.message || String(resp.data.error))
+            : 'Failed';
+          if (feedback) feedback.textContent = msg;
+          return;
+        }
+        // Success envelope shape is {"data": {...route-specific...},
+        // "meta": {...}} (rest_api_v1.cpp's ok_json helper) — the mint and
+        // rotate routes nest the raw one-time secret at data.data.token.
+        var secret = resp.data && resp.data.data ? resp.data.data.token : undefined;
+        if (secret) {
+          var reveal = document.getElementById('engine-principal-reveal');
+          if (reveal) {
+            reveal.innerHTML =
+              '<div class="token-reveal">' +
+              '  <div class="token-reveal-header">COPY THIS SECRET NOW — it will not be shown again</div>' +
+              '  <code></code><br>' +
+              '  <button class="btn btn-secondary" style="margin-top:0.5rem;font-size:0.7rem" data-copy-token>Copy to Clipboard</button>' +
+              '  <button class="btn btn-secondary" style="margin-top:0.5rem;margin-left:0.5rem;font-size:0.7rem" data-dismiss-reveal>Dismiss</button>' +
+              '</div>';
+            reveal.querySelector('code').textContent = secret;
+            /* G5 (secret hygiene): auto-clear the revealed secret from the
+               DOM after a bounded window — a tab left open, or shared over
+               screen-share, must not keep a raw credential visible
+               indefinitely. Cancel any timer from a still-pending PRIOR
+               reveal first so back-to-back mint/rotate calls can't leave a
+               stale timer wiping the newer secret early. */
+            if (window.__enginePrincipalRevealTimer)
+              clearTimeout(window.__enginePrincipalRevealTimer);
+            window.__enginePrincipalRevealTimer = setTimeout(function() {
+              reveal.innerHTML = '';
+              window.__enginePrincipalRevealTimer = null;
+            }, 60000);
+          }
+        }
+        htmx.trigger(document.body, 'refreshEnginePrincipals');
+      })
+      .catch(function(err) {
+        if (feedback) feedback.textContent = 'Error: ' + err.message;
+      });
     });
     /* Ctrl+K / Cmd+K — navigate to dashboard command palette */
     document.addEventListener('keydown', function(e) {

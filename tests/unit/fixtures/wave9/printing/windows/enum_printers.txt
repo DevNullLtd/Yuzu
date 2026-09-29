@@ -1,0 +1,10 @@
+identity: NT AUTHORITY\SYSTEM (WindowsIdentity.GetCurrent().Name)
+
+== EnumPrintersW(LOCAL|CONNECTIONS, level 2) ==
+returned=4
+  name=OneNote (Desktop) driver=Send to Microsoft OneNote 16 Driver port=nul: status=0x00000000 cJobs=0 attributes=0x00000240
+  name=Microsoft XPS Document Writer driver=Microsoft XPS Document Writer v4 port=PORTPROMPT: status=0x00000000 cJobs=0 attributes=0x00000240
+  name=Microsoft Print to PDF driver=Microsoft Print To PDF port=D:\yuzu-dev\wave9-probe\print\probe_output.pdf status=0x00000001 cJobs=2 attributes=0x00000240
+  name=Fax driver=Microsoft Shared Fax Driver port=SHRFAX: status=0x00000000 cJobs=0 attributes=0x00004040
+== GetDefaultPrinterW ==
+default=Microsoft Print to PDF

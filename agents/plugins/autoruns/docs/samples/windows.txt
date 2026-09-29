@@ -1,0 +1,440 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-08 · interactive user (elevated) · leg-hash d105f619923a
+== action=list
+autorun|win_run_hklm|1|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|SecurityHealth|%windir%\system32\SecurityHealthSystray.exe||unknown|system|-|not_checked|1784160697
+autorun|win_run_hklm|1|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|RtkAudUService|C:\WINDOWS\System32\DriverStore\FileRepository\realtekservice.inf_amd64_c607c18cb15933d8\RtkAudUService64.exe|-background|unknown|system|-|not_checked|1784160697
+source|win_run_hklm|supported|2|ok
+source|win_runonce_hklm|supported|0|ok
+source|win_runonceex_hklm|supported|0|ok
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Discord|C:\Users\jsmith\AppData\Local\Discord\Update.exe|--processStart Discord.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|com.poly.lens.client.app|C:\Users\jsmith\AppData\Local\Programs\oz-client\Poly|Lens.exe --openAsHidden|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|org.whispersystems.signal-desktop|C:\Users\jsmith\AppData\Local\Programs\signal-desktop\Signal.exe|--start-in-tray|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Adobe Acrobat Synchronizer|C:\Program Files\Adobe\Acrobat DC\Acrobat\AdobeCollabSync.exe||unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|NordVPN|C:\Program Files\NordVPN\NordVPN.exe|--auto-start|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Docker Desktop|C:\Program|Files\Docker\Docker\Docker Desktop.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|electron.app.NordPass|C:\Users\jsmith\AppData\Local\Programs\nordpass\NordPass.exe|"\"--hidden\""|unknown|user|jsmith|not_checked|1787048046
+source|win_run_hku|supported|7|ok
+source|win_runonce_hku|supported|0|ok
+autorun|win_startup_approved|1|HKLM\Run|SecurityHealth|||disabled|system|-|not_checked|1784117453
+autorun|win_startup_approved|1|HKLM\Run|Logitech Download Assistant|||disabled|system|-|not_checked|1784117453
+autorun|win_startup_approved|1|HKLM\Run|deviceTRUST Client User|||disabled|system|-|not_checked|1784117453
+autorun|win_startup_approved|1|HKLM\Run|RtkAudUService|||disabled|system|-|not_checked|1784117453
+autorun|win_startup_approved|1|HKLM\Run32|AnalyticsSrv|||disabled|system|-|not_checked|1775143805
+autorun|win_startup_approved|1|HKLM\Run32|ConnectionCenter|||disabled|system|-|not_checked|1775143805
+autorun|win_startup_approved|1|HKLM\Run32|Redirector|||disabled|system|-|not_checked|1775143805
+autorun|win_startup_approved|1|HKLM\Run32|InstallHelper|||disabled|system|-|not_checked|1775143805
+autorun|win_startup_approved|1|HKLM\StartupFolder|Tailscale.lnk|||disabled|system|-|not_checked|1784117450
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|NordVPN|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Discord|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|EADM|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|MicrosoftEdgeAutoLaunch_9907A6E846273BFEEA9614E5E48A76AD|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Adobe Acrobat Synchronizer|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|CCleaner Smart Cleaning|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Microsoft.Lists|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|OneDrive|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Grammarly|||enabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Docker Desktop|||unmodelled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|com.poly.lens.client.app|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|org.whispersystems.signal-desktop|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|electron.app.NordPass|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\StartupFolder|Send to OneNote.lnk|||disabled|user|jsmith|not_checked|1771279416
+source|win_startup_approved|supported|23|ok
+autorun|win_winlogon_shell|1|HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon|Shell|explorer.exe||unknown|system|-|not_checked|1788706554
+source|win_winlogon_shell|supported|1|ok
+autorun|win_winlogon_userinit|1|HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon|Userinit|C:\windows\system32\userinit.exe||unknown|system|-|not_checked|1788706554
+source|win_winlogon_userinit|supported|1|ok
+source|win_appinit_dlls|supported|0|ok
+source|win_ifeo_debugger|supported|0|ok
+autorun|win_startup_folder_common|1|C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp|desktop.ini|||enabled|system|-|not_checked|1711956244
+autorun|win_startup_folder_common|1|C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp|Tailscale.lnk|||enabled|system|-|not_checked|1786897769
+source|win_startup_folder_common|supported|2|ok
+autorun|win_startup_folder_user|1|C:\Users\jsmith\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup|desktop.ini|||enabled|user|jsmith|not_checked|1771434818
+autorun|win_startup_folder_user|1|C:\Users\jsmith\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup|Send to OneNote.lnk|||enabled|user|jsmith|not_checked|1727953839
+source|win_startup_folder_user|supported|2|ok
+autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskCachedFiles|MicrosoftEdgeUpdateTaskCachedFiles|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/c {0F5DEDC9-132F-202B-753E-C07734AAB5AE}|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskMachineCore|MicrosoftEdgeUpdateTaskMachineCore|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/c|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskMachineUA|MicrosoftEdgeUpdateTaskMachineUA|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/ua /installsource scheduler|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\NVIDIA App SelfUpdate_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}|NVIDIA App SelfUpdate_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}|"C:\Program Files\NVIDIA Corporation\NVIDIA App\CEF\NVIDIA App.exe"||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\pds-build|pds-build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/pds-build.sh|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\StartDockerDesktop|StartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Wave2WP0Build|Wave2WP0Build|C:\Users\jsmith\rig_do_build.cmd||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1786965064
+autorun|win_scheduled_tasks|1|\yuzu-ph-gate1-build|yuzu-ph-gate1-build|C:\Users\jsmith\rig-ph-build.cmd||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\yuzu-pr33d-rig-build|yuzu-pr33d-rig-build|C:\Program Files\Git\bin\bash.exe|"C:\Users\jsmith\yuzu-dev\rig_pr33d_compile.sh"|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuAgent|YuzuAgent|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-agent.ps1"|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuCodeReview|YuzuCodeReview|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-code-review.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2Build|YuzuD2Build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-d2.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2Capture|YuzuD2Capture|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-capture-d2.sh|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2CaptureOnly|YuzuD2CaptureOnly|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-capture-only.sh|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2Driver|YuzuD2Driver|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-driver.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuEunitDialyzer|YuzuEunitDialyzer|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-eunit-dialyzer.sh &gt; /c/Users/jsmith/yuzu-dev/eunit-dialyzer-run.log 2&gt;&amp;1"|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuExecConsole|YuzuExecConsole|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-console-logged.ps1"|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuGwEunit|YuzuGwEunit|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/gw-eunit.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuItem1Build|YuzuItem1Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcBuild|YuzuMsvcBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-build.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcPg|YuzuMsvcPg|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-pg.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcTest|YuzuMsvcTest|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-test.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41aBuild|YuzuPr41aBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41aFinal|YuzuPr41aFinal|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a-final.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41Build|YuzuPr41Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr42EventLogsBuild|YuzuPr42EventLogsBuild|C:\Users\jsmith\yuzu-dev\pr42-rig-run.cmd||enabled|system|S-1-5-18|not_checked|1787583870
+autorun|win_scheduled_tasks|1|\YuzuPr43aFinal|YuzuPr43aFinal|C:\Users\jsmith\yuzu-dev\pr43a-final-task.cmd||enabled|system|S-1-5-18|not_checked|1787587360
+autorun|win_scheduled_tasks|1|\YuzuPr43aFinalD|YuzuPr43aFinalD|D:\yuzu-dev\pr43a-final-d-task.cmd||enabled|system|S-1-5-18|not_checked|1787599696
+autorun|win_scheduled_tasks|1|\YuzuPr43aGate|YuzuPr43aGate|C:\Users\jsmith\yuzu-dev\pr43a-gate-task.cmd||enabled|system|S-1-5-18|not_checked|1787583546
+autorun|win_scheduled_tasks|1|\YuzuPr43aGate2|YuzuPr43aGate2|C:\Users\jsmith\yuzu-dev\pr43a-gate2-task.cmd||enabled|system|S-1-5-18|not_checked|1787585035
+autorun|win_scheduled_tasks|1|\YuzuPr43aSrv|YuzuPr43aSrv|C:\Users\jsmith\yuzu-dev\pr43a-srv-task.cmd||enabled|system|S-1-5-18|not_checked|1787586247
+autorun|win_scheduled_tasks|1|\YuzuPr43aVerified|YuzuPr43aVerified|D:\yuzu-dev\pr43a-scratch\verified-task.cmd||enabled|system|S-1-5-18|not_checked|1787610462
+autorun|win_scheduled_tasks|1|\YuzuPr43aVerified2|YuzuPr43aVerified2|D:\yuzu-dev\pr43a-scratch\verified2-task.cmd||enabled|system|S-1-5-18|not_checked|1787610616
+autorun|win_scheduled_tasks|1|\YuzuPr43aVerified3|YuzuPr43aVerified3|D:\yuzu-dev\pr43a-scratch\verified3-task.cmd||enabled|system|S-1-5-18|not_checked|1787610766
+autorun|win_scheduled_tasks|1|\YuzuPr43aVerified4|YuzuPr43aVerified4|D:\yuzu-dev\pr43a-scratch\verified4-task.cmd||enabled|system|S-1-5-18|not_checked|1787610910
+autorun|win_scheduled_tasks|1|\YuzuPr43aWipe2|YuzuPr43aWipe2|D:\yuzu-dev\pr43a-wipe2-task.cmd||enabled|system|S-1-5-18|not_checked|1787603577
+autorun|win_scheduled_tasks|1|\YuzuPr43aWipeFresh|YuzuPr43aWipeFresh|D:\yuzu-dev\pr43a-wipefresh-task.cmd||enabled|system|S-1-5-18|not_checked|1787603396
+autorun|win_scheduled_tasks|1|\YuzuPr43bFixD|YuzuPr43bFixD|D:\yuzu-dev\rig-fix-vcpkg.cmd||enabled|system|S-1-5-18|not_checked|1787588345
+autorun|win_scheduled_tasks|1|\YuzuPr43bFixEnvSh|YuzuPr43bFixEnvSh|D:\yuzu-dev\rig-fix-envsh.cmd||enabled|system|S-1-5-18|not_checked|1787603397
+autorun|win_scheduled_tasks|1|\YuzuPr43bGate|YuzuPr43bGate|C:\Users\jsmith\rig-gate-pr43b.cmd||enabled|system|S-1-5-18|not_checked|1787580370
+autorun|win_scheduled_tasks|1|\YuzuPr43bGateD|YuzuPr43bGateD|D:\yuzu-dev\rig-gate-pr43b-d.cmd||enabled|system|S-1-5-18|not_checked|1787588071
+autorun|win_scheduled_tasks|1|\YuzuPr43bGateD2|YuzuPr43bGateD2|D:\yuzu-dev\rig-gate-pr43b-d2.cmd||enabled|system|S-1-5-18|not_checked|1787603145
+autorun|win_scheduled_tasks|1|\YuzuPr43bGateD3|YuzuPr43bGateD3|D:\yuzu-dev\rig-gate-pr43b-d3.cmd||enabled|system|S-1-5-18|not_checked|1787610270
+autorun|win_scheduled_tasks|1|\YuzuPr43bGateD4|YuzuPr43bGateD4|D:\yuzu-dev\rig-gate-pr43b-d4.cmd||enabled|system|S-1-5-18|not_checked|1787653515
+autorun|win_scheduled_tasks|1|\YuzuPr43bProbe|YuzuPr43bProbe|C:\temp\pr43b\probe_sys.cmd||enabled|system|S-1-5-18|not_checked|1787585219
+autorun|win_scheduled_tasks|1|\YuzuPr43Build|YuzuPr43Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr43a.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPR60Build|YuzuPR60Build|C:\msys64\usr\bin\bash.exe|-lc /d/yuzu-src/pr60-build.sh|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788300059
+autorun|win_scheduled_tasks|1|\YuzuPR60Linux|YuzuPR60Linux|D:\yuzu-src\run-linux.cmd||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788302629
+autorun|win_scheduled_tasks|1|\YuzuServer|YuzuServer|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-server.ps1"|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuStartDockerDesktop|YuzuStartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuTestRun2771|YuzuTestRun2771|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-test-windows.sh &gt; /c/Users/jsmith/yuzu-dev/test-run-output.log 2&gt;&amp;1"|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem148.0.7730.0{5596812F-C0C8-4541-A3CC-43905C8D4B1B}|GoogleUpdaterTaskSystem148.0.7730.0{5596812F-C0C8-4541-A3CC-43905C8D4B1B}|"C:\Program Files (x86)\Google\GoogleUpdater\148.0.7730.0\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem150.0.7863.0{8719674F-17CC-4DDA-BD9C-DE3DDAF13178}|GoogleUpdaterTaskSystem150.0.7863.0{8719674F-17CC-4DDA-BD9C-DE3DDAF13178}|"C:\Program Files (x86)\Google\GoogleUpdater\150.0.7863.0\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem150.0.7863.3{28EF9628-D769-48ED-A959-8F579B31F2E6}|GoogleUpdaterTaskSystem150.0.7863.3{28EF9628-D769-48ED-A959-8F579B31F2E6}|"C:\Program Files (x86)\Google\GoogleUpdater\150.0.7863.3\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Actions Server|Office Actions Server|C:\Program Files\Microsoft Office\root\VFS\ProgramFilesCommonX64\Microsoft Shared\Office16\ActionsServer\ActionsServer.exe|availabilitycheck|disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Automatic Updates 2.0|Office Automatic Updates 2.0|C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe|/frequentupdate SCHEDULEDTASK displaylevel=False|disabled|system|S-1-5-18|not_checked|1501935198
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Background Push Maintenance|Office Background Push Maintenance|C:\Program Files\Microsoft Office\root\vfs\ProgramFilesCommonx64\Microsoft Shared\Office16\opushutil.exe|/pushregistration|disabled|system|-|not_checked|1727740800
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office ClickToRun Service Monitor|Office ClickToRun Service Monitor|C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe|/WatchService|disabled|system|S-1-5-18|not_checked|1129036877
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Feature Updates|Office Feature Updates|C:\Program Files\Microsoft Office\root\Office16\sdxhelper.exe||disabled|system|-|not_checked|1483228800
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Feature Updates Logon|Office Feature Updates Logon|C:\Program Files\Microsoft Office\root\Office16\sdxhelper.exe|/onlogon|disabled|system|-|not_checked|1483228800
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Performance Monitor|Office Performance Monitor|C:\Program Files\Microsoft Office\root\VFS\ProgramFilesCommonX64\Microsoft Shared\Office16\operfmon.exe||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Serviceability Manager|Office Serviceability Manager|C:\Program Files\Common Files\Microsoft Shared\ClickToRun\officesvcmgr.exe|/checkin|disabled|system|S-1-5-18|not_checked|1568659002
+autorun|win_scheduled_tasks|1|\Microsoft\Office\Office Startup Maintenance|Office Startup Maintenance|C:\Program Files\Microsoft Office\root\VFS\ProgramFilesCommonX64\Microsoft Shared\Office16\ActionsServer\ActionsServer.exe|wacheck|disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\.NET Framework\.NET Framework NGEN v4.0.30319|.NET Framework NGEN v4.0.30319|||enabled|system|S-1-5-18|not_checked|1285858417
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\.NET Framework\.NET Framework NGEN v4.0.30319 64|.NET Framework NGEN v4.0.30319 64|||enabled|system|S-1-5-18|not_checked|1285858417
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\.NET Framework\.NET Framework NGEN v4.0.30319 64 Critical|.NET Framework NGEN v4.0.30319 64 Critical|||disabled|system|S-1-5-18|not_checked|1285858417
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\.NET Framework\.NET Framework NGEN v4.0.30319 Critical|.NET Framework NGEN v4.0.30319 Critical|||disabled|system|S-1-5-18|not_checked|1285858417
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AccountHealth\RecoverabilityToastTask|RecoverabilityToastTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Active Directory Rights Management Services Client\AD RMS Rights Policy Template Management (Automated)|AD RMS Rights Policy Template Management (Automated)|||disabled|system|-|not_checked|1163168995
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Active Directory Rights Management Services Client\AD RMS Rights Policy Template Management (Manual)|AD RMS Rights Policy Template Management (Manual)|||enabled|system|-|not_checked|1163168995
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppID\EDP Policy Manager|EDP Policy Manager|||enabled|system|S-1-5-19|not_checked|1423479253
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppID\PolicyConverter|PolicyConverter|%windir%\system32\appidpolicyconverter.exe||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppID\VerifiedPublisherCertStoreCheck|VerifiedPublisherCertStoreCheck|%windir%\system32\appidcertstorecheck.exe||disabled|system|S-1-5-19|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Application Experience\MareBackup|MareBackup|%windir%\system32\compattelrunner.exe|-m:aeinv.dll -f:UpdateSoftwareInventoryW invsvc|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser Exp|Microsoft Compatibility Appraiser Exp|%windir%\system32\compattelrunner.exe|-m:appraiser.dll -f:DoScheduledTelemetryRun express|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Application Experience\PcaPatchDbTask|PcaPatchDbTask|%windir%\system32\rundll32.exe|%windir%\system32\PcaSvc.dll,PcaPatchSdbTask|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Application Experience\SdbinstMergeDbTask|SdbinstMergeDbTask|%windir%\system32\sdbinst.exe|-mm|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Application Experience\StartupAppTask|StartupAppTask|%windir%\system32\rundll32.exe|Startupscan.dll,SusRunTask|enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ApplicationData\appuriverifierdaily|appuriverifierdaily|%windir%\system32\AppHostRegistrationVerifier.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ApplicationData\appuriverifierinstall|appuriverifierinstall|%windir%\system32\AppHostRegistrationVerifier.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ApplicationData\CleanupTemporaryState|CleanupTemporaryState|%windir%\system32\rundll32.exe|Windows.Storage.ApplicationData.dll,CleanupTemporaryState|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ApplicationData\DsSvcCleanup|DsSvcCleanup|%windir%\system32\dstokenclean.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppListBackup\Backup|Backup|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppListBackup\BackupNonMaintenance|BackupNonMaintenance|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppxDeploymentClient\Pre-staged app cleanup|Pre-staged app cleanup|%windir%\system32\rundll32.exe|%windir%\system32\AppxDeploymentClient.dll,AppxPreStageCleanupRunTask|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\AppxDeploymentClient\UCPD velocity|UCPD velocity|%windir%\system32\UCPDMgr.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Autochk\Proxy|Proxy|%windir%\system32\rundll32.exe|/d acproxy.dll,PerformAutochkOperations|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\BitLocker\BitLocker Encrypt All Drives|BitLocker Encrypt All Drives|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\BitLocker\BitLocker MDM policy Refresh|BitLocker MDM policy Refresh|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Bluetooth\UninstallDeviceTask|UninstallDeviceTask|BthUdTask.exe|$(Arg0)|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\BrokerInfrastructure\BgTaskRegistrationMaintenanceTask|BgTaskRegistrationMaintenanceTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\capabilityaccessmanager\maintenancetasks|maintenancetasks|%windir%\system32\rundll32.exe|%windir%\system32\CapabilityAccessManager.dll,CapabilityAccessManagerDoStoreMaintenance|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\AikCertEnrollTask|AikCertEnrollTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\CryptoPolicyTask|CryptoPolicyTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\KeyPreGenTask|KeyPreGenTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\SystemTask|SystemTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\UserTask|UserTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CertificateServicesClient\UserTask-Roam|UserTask-Roam|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Chkdsk\ProactiveScan|ProactiveScan|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Chkdsk\SyspartRepair|SyspartRepair|%windir%\system32\bcdboot.exe|%windir% /sysrepair|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Clip\ClipESUConsumerProcessECUpdate|ClipESUConsumerProcessECUpdate|%SystemRoot%\system32\ClipESUConsumer.exe|-persistEligibilityStatus|enabled|system|S-1-5-18|not_checked|1758009600
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Clip\License Validation|License Validation|%SystemRoot%\system32\ClipUp.exe|-p -s -o|disabled|system|S-1-5-18|not_checked|1388534400
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Clip\LicenseImdsIntegration|LicenseImdsIntegration|%SystemRoot%\system32\fclip.exe||disabled|system|-|not_checked|1614556800
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CloudExperienceHost\CreateObjectTask|CreateObjectTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CloudRestore\Backup|Backup|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\CloudRestore\Restore|Restore|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ConsentUX\UnifiedConsent\UnifiedConsentSyncTask|UnifiedConsentSyncTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Containers\CmCleanup|CmCleanup|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Customer Experience Improvement Program\Consolidator|Consolidator|%SystemRoot%\System32\wsqmcons.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip|UsbCeip|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Data Integrity Scan\Data Integrity Check And Scan|Data Integrity Check And Scan|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Data Integrity Scan\Data Integrity Scan|Data Integrity Scan|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Data Integrity Scan\Data Integrity Scan for Crash Recovery|Data Integrity Scan for Crash Recovery|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Defrag\ScheduledDefrag|ScheduledDefrag|%windir%\system32\defrag.exe|-c -h -o -$|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Device Information\Device|Device|%windir%\system32\devicecensus.exe|SystemCxt|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Device Information\Device User|Device User|%windir%\system32\devicecensus.exe|UserCxt|enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Device Setup\Driver Recovery on Reboot|Driver Recovery on Reboot|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Device Setup\Metadata Refresh|Metadata Refresh|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\HandleCommand|HandleCommand|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\HandleWnsCommand|HandleWnsCommand|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\IntegrityCheck|IntegrityCheck|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\LocateCommandUserSession|LocateCommandUserSession|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDeviceAccountChange|RegisterDeviceAccountChange|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDeviceLocationRightsChange|RegisterDeviceLocationRightsChange|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDevicePeriodic24|RegisterDevicePeriodic24|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDevicePolicyChange|RegisterDevicePolicyChange|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDeviceProtectionStateChanged|RegisterDeviceProtectionStateChanged|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterDeviceSettingChange|RegisterDeviceSettingChange|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DeviceDirectoryClient\RegisterUserDevice|RegisterUserDevice|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Diagnosis\RecommendedTroubleshootingScanner|RecommendedTroubleshootingScanner|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Diagnosis\Scheduled|Scheduled|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Diagnosis\UnexpectedCodepath|UnexpectedCodepath|%windir%\system32\UCConfigTask.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DirectX\DirectXDatabaseUpdater|DirectXDatabaseUpdater|%windir%\system32\directxdatabaseupdater.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DirectX\DXGIAdapterCache|DXGIAdapterCache|%windir%\system32\dxgiadaptercache.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DiskCleanup\SilentCleanup|SilentCleanup|%windir%\system32\cleanmgr.exe|/autocleanstoragesense /d %systemdrive%|enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector|Microsoft-Windows-DiskDiagnosticDataCollector|%windir%\system32\rundll32.exe|dfdts.dll,DfdGetDefaultPolicyAndSMART|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticResolver|Microsoft-Windows-DiskDiagnosticResolver|%windir%\system32\DFDWiz.exe||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DiskFootprint\Diagnostics|Diagnostics|%windir%\system32\disksnapshot.exe|-z|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DiskFootprint\StorageSense|StorageSense|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\DUSM\dusmtask|dusmtask|%SystemRoot%\System32\dusmtask.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\EDP\EDP App Launch Task|EDP App Launch Task|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\EDP\EDP Auth Task|EDP Auth Task|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\EDP\EDP Inaccessible Credentials Task|EDP Inaccessible Credentials Task|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\EDP\StorageCardEncryption Task|StorageCardEncryption Task|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\EnterpriseMgmt\MDMMaintenenceTask|MDMMaintenenceTask|%windir%\system32\MDMAgent.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ExploitGuard\ExploitGuard MDM policy Refresh|ExploitGuard MDM policy Refresh|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Feedback\Siuf\DmClient|DmClient|%windir%\system32\dmclient.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload|DmClientOnScenarioDownload|%windir%\system32\dmclient.exe|utcwnf|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\File Classification Infrastructure\Property Definition Sync|Property Definition Sync|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\FileHistory\File History (maintenance mode)|File History (maintenance mode)|||enabled|system|S-1-5-19|not_checked|1281571200
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\BootstrapUsageDataReporting|BootstrapUsageDataReporting|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\GovernedFeatureUsageProcessing|GovernedFeatureUsageProcessing|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\ReconcileConfigs|ReconcileConfigs|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\ReconcileFeatures|ReconcileFeatures|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\SafeguardsReconciliation|SafeguardsReconciliation|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\UsageDataFlushing|UsageDataFlushing|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\UsageDataReceiver|UsageDataReceiver|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\FeatureConfig\UsageDataReporting|UsageDataReporting|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Flighting\OneSettings\RefreshCache|RefreshCache|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\HelloFace\FODCleanupTask|FODCleanupTask|%WinDir%\System32\WinBioPlugIns\FaceFodUninstaller.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Hotpatch\Monitoring|Monitoring|%systemroot%\system32\cmd.exe|/d /c %systemroot%\system32\hpatchmonTask.cmd|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\InputSettingsRestoreDataAvailable|InputSettingsRestoreDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\LocalUserSyncDataAvailable|LocalUserSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\MouseSyncDataAvailable|MouseSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\PenSyncDataAvailable|PenSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\RemoteMouseSyncDataAvailable|RemoteMouseSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\RemotePenSyncDataAvailable|RemotePenSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\RemoteTouchpadSyncDataAvailable|RemoteTouchpadSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\syncpensettings|syncpensettings|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\input\TouchpadSyncDataAvailable|TouchpadSyncDataAvailable|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\RestoreDevice|RestoreDevice|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\ScanForUpdates|ScanForUpdates|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\ScanForUpdatesAsUser|ScanForUpdatesAsUser|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\SmartRetry|SmartRetry|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\WakeUpAndContinueUpdates|WakeUpAndContinueUpdates|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\InstallService\WakeUpAndScanForUpdates|WakeUpAndScanForUpdates|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\International\Synchronize Language Settings|Synchronize Language Settings|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Kernel\La57Cleanup|La57Cleanup|%windir%\system32\la57setup.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\LanguageComponentsInstaller\Installation|Installation|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\LanguageComponentsInstaller\ReconcileLanguageResources|ReconcileLanguageResources|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\LanguageComponentsInstaller\Uninstallation|Uninstallation|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\License Manager\TempSignedLicenseExchange|TempSignedLicenseExchange|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Location\Notifications|Notifications|%windir%\System32\LocationNotificationWindows.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Location\WindowsActionDialog|WindowsActionDialog|%windir%\System32\WindowsActionDialog.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Maintenance\WinSAT|WinSAT|||enabled|system|-|not_checked|1203966900
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Autopilot\DetectHardwareChange|DetectHardwareChange|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Autopilot\RemediateHardwareChange|RemediateHardwareChange|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Provisioning\Cellular|Cellular|%windir%\system32\ProvTool.exe|/turn 7 /source CellStateChangeTask|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Provisioning\Logon|Logon|%windir%\system32\ProvTool.exe|/turn 5 /source LogonIdleTask|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Provisioning\MdmDiagnosticsCleanup|MdmDiagnosticsCleanup|%windir%\system32\MdmDiagnosticsTool.exe|/clean|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Provisioning\Retry|Retry|%windir%\system32\ProvTool.exe|/turn 5 /source ProvRetryTask|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Management\Provisioning\RunOnReboot|RunOnReboot|%windir%\system32\ProvTool.exe|/turn 5 /source ContinueSessionTask|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Maps\MapsToastTask|MapsToastTask|||enabled|system|-|not_checked|1415145600
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Maps\MapsUpdateTask|MapsUpdateTask|||disabled|system|S-1-5-20|not_checked|1415145600
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\MemoryDiagnostic\AutomaticOfflineMemoryDiagnostic|AutomaticOfflineMemoryDiagnostic|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\MemoryDiagnostic\ProcessMemoryDiagnosticEvents|ProcessMemoryDiagnosticEvents|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\MemoryDiagnostic\RunFullMemoryDiagnostic|RunFullMemoryDiagnostic|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Mobile Broadband Accounts\MNO Metadata Parser|MNO Metadata Parser|%SystemRoot%\System32\MbaeParserTask.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\MUI\LPRemove|LPRemove|%windir%\system32\lpremove.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Multimedia\SystemSoundsService|SystemSoundsService|||enabled|system|-|not_checked|1119534480
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Network Connectivity Status Indicator\NcsiIdentifyUserProxies|NcsiIdentifyUserProxies|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\NlaSvc\WiFiTask|WiFiTask|%SystemRoot%\System32\WiFiTask.exe|nla|enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Offline Files\Background Synchronization|Background Synchronization|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Offline Files\Logon Synchronization|Logon Synchronization|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PCRPF\PCR Prediction Framework Firmware Update Task|PCR Prediction Framework Firmware Update Task|%windir%\system32\rundll32.exe|%windir%\system32\pcrpf.dll,NotifyFirmwareUpdateStaged|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PerformanceTrace\ShowFeedbackToast|ShowFeedbackToast|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PerformanceTrace\WhesvcToast|WhesvcToast|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PI\Secure-Boot-Update|Secure-Boot-Update|||enabled|system|S-1-5-18|not_checked|1328632760
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PI\Sqm-Tasks|Sqm-Tasks|||enabled|system|S-1-5-18|not_checked|1311292800
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Plug and Play\Device Install Group Policy|Device Install Group Policy|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Plug and Play\Device Install Reboot Required|Device Install Reboot Required|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Plug and Play\Sysprep Generalize Drivers|Sysprep Generalize Drivers|%SystemRoot%\System32\drvinst.exe|6|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Pluton\Pluton-Ksp-Provisioning|Pluton-Ksp-Provisioning|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem|AnalyzeSystem|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Printing\EduPrintProv|EduPrintProv|%windir%\system32\eduprintprov.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Printing\PrinterCleanupTask|PrinterCleanupTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Printing\PrintJobCleanupTask|PrintJobCleanupTask|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PushToInstall\LoginCheck|LoginCheck|%windir%\system32\sc.exe|start pushtoinstall login|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\PushToInstall\Registration|Registration|%windir%\system32\sc.exe|start pushtoinstall registration|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Ras\MobilityManager|MobilityManager|||enabled|system|S-1-5-19|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\RecoveryEnvironment\VerifyWinRE|VerifyWinRE|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\ReFsDedupSvc\Initialization|Initialization|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Registry\RegIdleBackup|RegIdleBackup|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\RemoteAssistance\RemoteAssistanceTask|RemoteAssistanceTask|%windir%\system32\RAServer.exe|/offerraupdate|enabled|system|S-1-5-18|not_checked|1131470312
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Servicing\OOBEFodSetup|OOBEFodSetup|%windir%\system32\OOBEFodSetup.exe||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Servicing\StartComponentCleanup|StartComponentCleanup|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Setup\PITRTask|PITRTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Setup\SetupRecoveryDataTask|SetupRecoveryDataTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SharedPC\Account Cleanup|Account Cleanup|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\CreateObjectTask|CreateObjectTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\FamilySafetyMonitor|FamilySafetyMonitor|%windir%\System32\wpcmon.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\FamilySafetyRefreshTask|FamilySafetyRefreshTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\IndexerAutomaticMaintenance|IndexerAutomaticMaintenance|||enabled|system|S-1-5-19|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\ThemeAssetTask_SyncFODState|ThemeAssetTask_SyncFODState|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\ThemesSyncedImageDownload|ThemesSyncedImageDownload|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\UpdateUserPictureTask|UpdateUserPictureTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Shell\UpdateUserPictureTaskContained|UpdateUserPictureTaskContained|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SoftwareProtectionPlatform\SvcRestartTask|SvcRestartTask|||enabled|system|S-1-5-20|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SoftwareProtectionPlatform\SvcRestartTaskLogon|SvcRestartTaskLogon|||disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SoftwareProtectionPlatform\SvcRestartTaskNetwork|SvcRestartTaskNetwork|||disabled|system|S-1-5-20|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SpacePort\SpaceAgentTask|SpaceAgentTask|%windir%\system32\SpaceAgent.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SpacePort\SpaceManagerTask|SpaceManagerTask|%windir%\system32\spaceman.exe|/Work|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Speech\SpeechModelDownloadTask|SpeechModelDownloadTask|%windir%\system32\speech_onecore\common\SpeechModelDownload.exe||enabled|system|S-1-5-20|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\StateRepository\MaintenanceTasks|MaintenanceTasks|%windir%\system32\rundll32.exe|%windir%\system32\Windows.StateRepositoryClient.dll,StateRepositoryDoMaintenanceTasks|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Storage Tiers Management\Storage Tiers Management Initialization|Storage Tiers Management Initialization|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Storage Tiers Management\Storage Tiers Optimization|Storage Tiers Optimization|%windir%\system32\defrag.exe|-c -h -g -# -m 8 -i 13500|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Subscription\EnableLicenseAcquisition|EnableLicenseAcquisition|%SystemRoot%\system32\ClipRenew.exe|-e|enabled|system|S-1-5-18|not_checked|1451606400
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Subscription\LicenseAcquisition|LicenseAcquisition|%SystemRoot%\system32\ClipRenew.exe||disabled|system|-|not_checked|1451606400
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sustainability\PowerGridForecastTask|PowerGridForecastTask|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sustainability\SustainabilityTelemetry|SustainabilityTelemetry|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sysmain\HybridDriveCachePrepopulate|HybridDriveCachePrepopulate|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sysmain\HybridDriveCacheRebalance|HybridDriveCacheRebalance|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sysmain\ResPriStaticDbSync|ResPriStaticDbSync|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Sysmain\WsSwapAssessmentTask|WsSwapAssessmentTask|%windir%\system32\rundll32.exe|sysmain.dll,PfSvWsSwapAssessmentTask|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\SystemRestore\SR|SR|%windir%\system32\srtasks.exe|ExecuteScheduledSPPCreation|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Task Manager\Interactive|Interactive|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\TextServicesFramework\MsCtfMonitor|MsCtfMonitor|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Time Synchronization\ForceSynchronizeTime|ForceSynchronizeTime|||enabled|system|S-1-5-19|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Time Synchronization\SynchronizeTime|SynchronizeTime|%windir%\system32\sc.exe|start w32time task_started|enabled|system|S-1-5-19|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Time Zone\SynchronizeTimeZone|SynchronizeTimeZone|%windir%\system32\tzsync.exe||enabled|system|S-1-5-18|not_checked|1357835524
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\TPM\Tpm-HASCertRetr|Tpm-HASCertRetr|||enabled|system|S-1-5-18|not_checked|1424108960
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\TPM\Tpm-Maintenance|Tpm-Maintenance|||enabled|system|S-1-5-18|not_checked|1276192160
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\TPM\Tpm-PreAttestationHealthCheck|Tpm-PreAttestationHealthCheck|||enabled|system|S-1-5-18|not_checked|1701452960
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UNP\RunUpdateNotificationMgr|RunUpdateNotificationMgr|%windir%\System32\UNP\UpdateNotificationMgr.exe||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\MusUx_LogonUpdateResults|MusUx_LogonUpdateResults|%systemroot%\system32\MusNotification.exe|LogonUpdateResults|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Reboot_AC|Reboot_AC|%systemroot%\system32\MusNotification.exe|/RunOnAC ReadyToReboot|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Reboot_Battery|Reboot_Battery|%systemroot%\system32\MusNotification.exe|/RunOnBattery ReadyToReboot|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Report policies|Report policies|%systemroot%\system32\usoclient.exe|ReportPolicies|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Schedule Maintenance Work|Schedule Maintenance Work|%systemroot%\system32\usoclient.exe|StartMaintenanceWork|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Schedule Scan|Schedule Scan|%systemroot%\system32\usoclient.exe|StartScan|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task|Schedule Scan Static Task|%systemroot%\system32\usoclient.exe|StartScan|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Schedule Wake To Work|Schedule Wake To Work|%systemroot%\system32\usoclient.exe|StartWork|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Schedule Work|Schedule Work|%systemroot%\system32\usoclient.exe|StartWork|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\Start Oobe Expedite Work|Start Oobe Expedite Work|%systemroot%\system32\usoclient.exe|StartWork|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\StartOobeAppsScanAfterUpdate|StartOobeAppsScanAfterUpdate|%systemroot%\system32\usoclient.exe|StartOobeAppsScanAfterUpdate|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\StartOobeAppsScan_LicenseAccepted|StartOobeAppsScan_LicenseAccepted|%systemroot%\system32\usoclient.exe|StartOobeAppsScan|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\UIEOrchestrator|UIEOrchestrator|%systemroot%\system32\UIEOrchestratorStub.exe|/SendHeartbeat|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\USO_UxBroker|USO_UxBroker|%systemroot%\system32\MusNotification.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UpdateOrchestrator\UUS Failover Task|UUS Failover Task|%windir%\System32\MLEngineStub.exe|HandleUusFailoverEvaluationSignalFromWnf|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UPnP\UPnPHostConfig|UPnPHostConfig|sc.exe|config upnphost start= auto|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\UsageAndQualityInsights\UsageAndQualityInsights-MaintenanceTask|UsageAndQualityInsights-MaintenanceTask|%SystemRoot%\System32\Microsoft.Data.UsageAndQualityInsights.MaintenanceTask.exe||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\USB\Usb-Notifications|Usb-Notifications|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\User Profile Service\HiveUploadTask|HiveUploadTask|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WaaSMedic\PerformRemediation|PerformRemediation|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WCM\WiFiTask|WiFiTask|%SystemRoot%\System32\WiFiTask.exe||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WDI\ResolutionHost|ResolutionHost|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance|Windows Defender Cache Maintenance|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpCmdRun.exe|-IdleTask -TaskName WdCacheMaintenance|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Defender\Windows Defender Cleanup|Windows Defender Cleanup|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpCmdRun.exe|-IdleTask -TaskName WdCleanup|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan|Windows Defender Scheduled Scan|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpCmdRun.exe|Scan -ScheduleJob -ScanTrigger 55 -IdleScheduledJob|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Defender\Windows Defender Verification|Windows Defender Verification|C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.3-0\MpCmdRun.exe|-IdleTask -TaskName WdVerification|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Error Reporting\QueueReporting|QueueReporting|%windir%\system32\wermgr.exe|-upload|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Filtering Platform\BfeOnServiceStartTypeChange|BfeOnServiceStartTypeChange|%windir%\system32\rundll32.exe|bfe.dll,BfeOnServiceStartTypeChange|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Windows Media Sharing\UpdateLibrary|UpdateLibrary|"%ProgramFiles%\Windows Media Player\wmpnscfg.exe"||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\ClickToDo\ModelCachingIdle|ModelCachingIdle|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\ClickToDo\ModelCachingLimit|ModelCachingLimit|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\ClickToDo\ModelCachingUpdate|ModelCachingUpdate|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\Recall\InitialConfiguration|InitialConfiguration|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\Recall\PolicyConfiguration|PolicyConfiguration|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsAI\Settings\InitialConfiguration|InitialConfiguration|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsColorSystem\Calibration Loader|Calibration Loader|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsUpdate\Refresh Group Policy Cache|Refresh Group Policy Cache|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsUpdate\Scheduled Start|Scheduled Start|%systemroot%\System32\sc.exe|start wuauserv|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WindowsUpdate\RUXIM\PLUGScheduler|PLUGScheduler|"%ProgramFiles%\RUXIM\PLUGscheduler.exe"||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Wininet\CacheTask|CacheTask|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WlanSvc\CDSSync|CDSSync|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WlanSvc\MoProfileManagement|MoProfileManagement|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WOF\WIM-Hash-Management|WIM-Hash-Management|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WOF\WIM-Hash-Validation|WIM-Hash-Validation|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Work Folders\Work Folders Logon Synchronization|Work Folders Logon Synchronization|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Work Folders\Work Folders Maintenance Work|Work Folders Maintenance Work|||enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Workplace Join\Automatic-Device-Join|Automatic-Device-Join|%SystemRoot%\System32\dsregcmd.exe|$(Arg0) $(Arg1) $(Arg2)|disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Workplace Join\Device-Sync|Device-Sync|||disabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\Workplace Join\Recovery-Check|Recovery-Check|%SystemRoot%\System32\dsregcmd.exe|/checkrecovery|disabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WwanSvc\NotificationTask|NotificationTask|%SystemRoot%\System32\WiFiTask.exe|wwan|enabled|system|-|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\Windows\WwanSvc\OobeDiscovery|OobeDiscovery|||enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Microsoft\XblGameSave\XblGameSaveTask|XblGameSaveTask|%windir%\System32\XblGameSaveTask.exe|standby|enabled|system|S-1-5-18|not_checked|0
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update 308046B0AF4A39CB|Firefox Background Update 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update S-1-5-21-571721511-16201247-3531262703-1001 308046B0AF4A39CB|Firefox Background Update S-1-5-21-571721511-16201247-3531262703-1001 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Default Browser Agent 308046B0AF4A39CB|Firefox Default Browser Agent 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\default-browser-agent.exe|do-task "308046B0AF4A39CB"|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - S-1-5-21-571721511-16201247-3531262703-1001|CCleaner 7 - S-1-5-21-571721511-16201247-3531262703-1001|"C:\Program Files\Piriform\CCleaner 7\CCleaner.exe"|/bg|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788785931
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-571721511-16201247-3531262703-1001|CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-571721511-16201247-3531262703-1001|C:\Program Files\Piriform\CCleaner 7\CCleaner.exe|/bg /scheduledHC|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1769772820
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 BugReport|CCleaner 7 BugReport|"C:\Program Files\Piriform\CCleaner 7\CCleanerBugReport.exe"|--send "dumps│report" --product 234 --programpath "C:\Program Files\Piriform\CCleaner 7" --configpath "C:\Program Files\Piriform\CCleaner 7\data" --path "C:\Program Files\Piriform\CCleaner 7\log" --path "C:\Program Files\Piriform\CCleaner 7\data\dumps" --logpath "C:\Program Files\Piriform\CCleaner 7\log" --guid 6a788f14-2314-4d68-900e-2afeecc17f87 --silent|enabled|system|S-1-5-18|not_checked|1788785931
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 Update|CCleaner 7 Update|C:\Program Files\Common Files\Piriform\Icarus\piriform-ccl\icarus.exe|/update:piriform-ccl /silent|enabled|system|S-1-5-18|not_checked|1788785931
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingCreativeManagementTask|SoftLandingCreativeManagementTask|||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|||disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+source|win_scheduled_tasks|supported|326|ok
+autorun|win_wmi_subscriptions|1|root\subscription|SCM Event Log Filter||select * from MSFT_SCMEventLogEvent|unknown|system|-|not_checked|0
+source|win_wmi_subscriptions|supported|1|ok
+source|lnx_etc_crontab|unsupported|0|foreign_os
+source|lnx_cron_d|unsupported|0|foreign_os
+source|lnx_cron_periodic|unsupported|0|foreign_os
+source|lnx_user_crontabs|unsupported|0|foreign_os
+source|lnx_anacrontab|unsupported|0|foreign_os
+source|lnx_at_spool|unsupported|0|foreign_os
+source|lnx_systemd_timers_system|unsupported|0|foreign_os
+source|lnx_systemd_timers_user|unsupported|0|foreign_os
+source|lnx_xdg_autostart_system|unsupported|0|foreign_os
+source|lnx_xdg_autostart_user|unsupported|0|foreign_os
+source|lnx_rc_local|unsupported|0|foreign_os
+source|lnx_init_d|unsupported|0|foreign_os
+source|mac_launchdaemons|unsupported|0|foreign_os
+source|mac_launchagents|unsupported|0|foreign_os
+source|mac_system_launchdaemons|unsupported|0|foreign_os
+source|mac_system_launchagents|unsupported|0|foreign_os
+source|mac_user_launchagents|unsupported|0|foreign_os
+source|mac_login_items|unsupported|0|foreign_os
+source|mac_periodic|unsupported|0|foreign_os
+source|mac_emond|unsupported|0|foreign_os
+[result_status] UNDECLARED / UNKNOWN /
+
+== action=catalog
+catalog|1
+source|win_run_hklm|supported|-|declared
+source|win_runonce_hklm|supported|-|declared
+source|win_runonceex_hklm|supported|-|declared
+source|win_run_hku|supported|-|declared
+source|win_runonce_hku|supported|-|declared
+source|win_startup_approved|supported|-|declared
+source|win_winlogon_shell|supported|-|declared
+source|win_winlogon_userinit|supported|-|declared
+source|win_appinit_dlls|supported|-|declared
+source|win_ifeo_debugger|supported|-|declared
+source|win_startup_folder_common|supported|-|declared
+source|win_startup_folder_user|supported|-|declared
+source|win_scheduled_tasks|supported|-|declared
+source|win_wmi_subscriptions|supported|-|declared
+source|lnx_etc_crontab|unsupported|-|declared
+source|lnx_cron_d|unsupported|-|declared
+source|lnx_cron_periodic|unsupported|-|declared
+source|lnx_user_crontabs|unsupported|-|declared
+source|lnx_anacrontab|unsupported|-|declared
+source|lnx_at_spool|unsupported|-|declared
+source|lnx_systemd_timers_system|unsupported|-|declared
+source|lnx_systemd_timers_user|unsupported|-|declared
+source|lnx_xdg_autostart_system|unsupported|-|declared
+source|lnx_xdg_autostart_user|unsupported|-|declared
+source|lnx_rc_local|unsupported|-|declared
+source|lnx_init_d|unsupported|-|declared
+source|mac_launchdaemons|unsupported|-|declared
+source|mac_launchagents|unsupported|-|declared
+source|mac_system_launchdaemons|unsupported|-|declared
+source|mac_system_launchagents|unsupported|-|declared
+source|mac_user_launchagents|unsupported|-|declared
+source|mac_login_items|unsupported|-|declared
+source|mac_periodic|unsupported|-|declared
+source|mac_emond|unsupported|-|declared
+[result_status] UNDECLARED / UNKNOWN /

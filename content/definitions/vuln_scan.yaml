@@ -37,12 +37,28 @@ spec:
     columns:
       - name: severity
         type: string
+        description: Finding severity assigned by the check that produced this row.
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        example: CRITICAL
+        platforms: [windows, linux, darwin]
       - name: category
         type: string
+        description: Which half of the scan produced this row.
+        values: [cve, config, scan]
+        example: cve
+        platforms: [windows, linux, darwin]
       - name: title
         type: string
+        description: >-
+          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text.
+        example: "CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: >-
+          For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config row, the check's human-readable result text. Values: free text.
+        example: "Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [severity, category]
       operations: [count]
@@ -111,12 +127,27 @@ spec:
     columns:
       - name: severity
         type: string
+        description: Finding severity assigned by the CVE rule that matched.
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        example: HIGH
+        platforms: [windows, linux, darwin]
       - name: category
         type: string
+        description: Always "cve" for a match; "scan" on the single placeholder row emitted when nothing matches.
+        values: [cve, scan]
+        example: cve
+        platforms: [windows, linux, darwin]
       - name: title
         type: string
+        description: >-
+          "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the placeholder row. Values: free text.
+        example: "CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: "<installed product> <version> (fixed in <fixed_ver>). Values: free text."
+        example: "Python 3.9.6 (fixed in 3.11.4)"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [severity]
       operations: [count]
@@ -172,12 +203,26 @@ spec:
     columns:
       - name: severity
         type: string
+        description: Finding severity assigned by the compliance check that produced this row.
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        example: HIGH
+        platforms: [windows, linux, darwin]
       - name: category
         type: string
+        description: Always "config" for this action; "scan" only on the placeholder row emitted when there is nothing to report.
+        values: [config, scan]
+        example: config
+        platforms: [windows, linux, darwin]
       - name: title
         type: string
+        description: 'The name of the compliance check, e.g. the setting it inspects. Values: free text.'
+        example: "SMBv1 Protocol"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: "The check's human-readable result text, including why a failing check failed. Values: free text."
+        example: "Enabled - vulnerable to EternalBlue/WannaCry (MS17-010)"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [severity]
       operations: [count]
@@ -233,8 +278,18 @@ spec:
     columns:
       - name: severity
         type: string
+        description: >
+          The severity this row counts, or the literal "TOTAL" for the first row emitted by
+          every run.
+        values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        example: CRITICAL
+        platforms: [windows, linux, darwin]
       - name: count
         type: int32
+        description: >-
+          The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string "<n> findings (<n> issues)", not an integer. Values: integer, except a formatted string on the TOTAL row.
+        example: "17"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get vulnerability scan summary"
 
@@ -286,8 +341,15 @@ spec:
     columns:
       - name: name
         type: string
+        description: "Installed application or package name, as reported by the OS's own inventory source. Values: free text."
+        example: curl
+        platforms: [windows, linux, darwin]
       - name: version
         type: string
+        description: >-
+          Installed version string, or empty when the source reports none (e.g. a Windows uninstall entry with no DisplayVersion). Values: free text, or empty.
+        example: "8.14.1-2+deb13u4"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Collect software inventory for NVD matching"
 

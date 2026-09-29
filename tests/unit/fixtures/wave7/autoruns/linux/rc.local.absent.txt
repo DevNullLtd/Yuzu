@@ -1,0 +1,1 @@
+ABSENT: /etc/rc.local does not exist on ubuntu:24.04 (systemd-only init, no rc.local shipped by default)

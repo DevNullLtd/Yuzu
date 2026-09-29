@@ -283,7 +283,41 @@ CertStoreResult read_cert_from_store(const std::string& store_name, const std::s
 
 } // namespace yuzu::agent
 
-#else // !_WIN32 — Linux / macOS stub
+#elif defined(__APPLE__) // macOS — keychain identity is intentionally unsupported
+
+namespace yuzu::agent {
+
+// The macOS agent runs as a root LaunchDaemon (docs/agent-privilege-model.md)
+// with no attached user login session, and therefore no user login keychain
+// to read an operator-provisioned identity from. A prior revision of this
+// file implemented --cert-store on macOS via SecItemCopyMatching /
+// SecItemExport against the CURRENT USER's login keychain, resolved through
+// SecKeychainCopyDomainDefault(kSecPreferencesDomainUser, ...) — which is
+// backwards for this deployment: under launchd's root-daemon context that
+// call resolves root's own (nonexistent) login keychain, not an operator's,
+// so the lookup could only ever fail closed at startup. It also wiped
+// exported key material by writing through CFDataGetBytePtr's read-only
+// pointer via const_cast, which is undefined behavior on an immutable
+// CFDataRef and could crash while loading mTLS credentials.
+//
+// Both problems trace back to the same root cause — treating the daemon as
+// if it had a user session — so the fix is to stop pretending: the agent's
+// own startup identity must not depend on a login session a root daemon
+// never has. Report this path as honestly unsupported and point the
+// operator at the identity sources that DO work headless: --client-cert /
+// --client-key PEM files, or cert_auto_discovery (cert_discovery.cpp).
+CertStoreResult read_cert_from_store(const std::string& /*store_name*/,
+                                     const std::string& /*subject*/,
+                                     const std::string& /*thumbprint*/) {
+    return CertStoreResult{
+        .error = "OS certificate store (keychain) identity is not supported on the macOS "
+                 "agent — it runs as a root LaunchDaemon with no user login keychain; use "
+                 "--client-cert/--client-key PEM files instead."};
+}
+
+} // namespace yuzu::agent
+
+#else // Linux (and any other non-Windows, non-Apple target) — PEM files only
 
 namespace yuzu::agent {
 
@@ -297,4 +331,4 @@ CertStoreResult read_cert_from_store(const std::string& /*store_name*/,
 
 } // namespace yuzu::agent
 
-#endif
+#endif // _WIN32 / __APPLE__

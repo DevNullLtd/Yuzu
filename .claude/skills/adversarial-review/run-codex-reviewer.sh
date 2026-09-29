@@ -12,7 +12,7 @@
 # Usage:
 #   run-codex-reviewer.sh --phase 1 --review-dir DIR --target "PR #1220, head abc, diff X..Y" \
 #       [--repo .] [--anchors "- CLAUDE.md\n- docs/foo.md §3"] \
-#       [--self codex] [--peer claude] [--sandbox workspace-write] [--model NAME]
+#       [--self codex] [--peer claude] [--sandbox workspace-write] [--model NAME] [--static-only]
 #
 # Notes:
 #   * --sandbox workspace-write (default) lets Codex compile/run tests inside the repo
@@ -22,6 +22,15 @@
 #     the orchestrator checks for $REVIEW_DIR/$SELF.phaseN.md before proceeding.
 
 set -euo pipefail
+
+# LOAD-BEARING — do not remove. Bash >= 5.2 defaults `patsub_replacement` ON, which
+# makes an unescaped `&` in a ${var//pat/repl} replacement expand to the MATCH. Every
+# `&` in an injected value then becomes the literal token being replaced, silently
+# corrupting `&&` in anchors, C++ reference types (`bool& x`) and URL query strings
+# in the text under review. run-kimi-reviewer.sh carries the same guard (added in the
+# same change — neither driver had it before) — keep the two in sync; the regression
+# test drives BOTH drivers.
+shopt -u patsub_replacement 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/review-prompt.md"
@@ -35,6 +44,7 @@ SELF="codex"
 PEER="claude"
 SANDBOX="workspace-write"
 MODEL=""
+STATIC_ONLY="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,8 +57,9 @@ while [[ $# -gt 0 ]]; do
     --peer)        PEER="$2"; shift 2 ;;
     --sandbox)     SANDBOX="$2"; shift 2 ;;
     --model)       MODEL="$2"; shift 2 ;;
+    --static-only) STATIC_ONLY="true"; shift ;;
     --prompt-template) PROMPT_TEMPLATE="$2"; shift 2 ;;
-    -h|--help)     grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -77,6 +88,18 @@ render() {
 }
 
 PROMPT="$(render)"
+if [[ "$STATIC_ONLY" == "true" ]]; then
+  read -r -d '' STATIC_NOTE <<'EOF' || true
+
+---
+## STATIC SAFETY PASS
+This phase runs before any PR-controlled configure, build, test, generator, hook, or dependency
+command. Do not execute project code or invoke build-system commands. Inspect the diff, source, and
+anchors only; tag findings `static-read`. The orchestrator will record dynamic evidence separately
+after the trust gate.
+EOF
+  PROMPT="$PROMPT$STATIC_NOTE"
+fi
 SUMMARY_FILE="$REVIEW_DIR/$SELF.phase$PHASE.summary.md"
 
 echo ">> Codex reviewer: SELF=$SELF PEER=$PEER PHASE=$PHASE sandbox=$SANDBOX" >&2

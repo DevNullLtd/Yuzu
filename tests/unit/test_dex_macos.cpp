@@ -84,6 +84,45 @@ TEST_CASE("real crash .ips maps to process.crashed", "[dex_macos][crash]") {
     // platform + timestamp are stamped by the collector engine, NOT the parser.
     CHECK(obs->platform.empty());
     CHECK(obs->timestamp_unix == 0);
+    // yz_crash is a bare/unsigned CLI binary — neither header app_version nor
+    // body bundleInfo carries a version, so it falls into the shared unknown
+    // bucket rather than an empty-but-present quad.
+    CHECK(obs->version.empty());
+}
+
+TEST_CASE("crash .ips routes header app_version into canon_version",
+          "[dex_macos][crash][version]") {
+    const std::string ips = R"({"bug_type":"309","app_version":"3.2.1","name":"SomeApp"})"
+                            "\n"
+                            R"({"pid":1,"procName":"SomeApp"})";
+    const auto obs = macos::parse_ips_report(ips);
+    REQUIRE(obs.has_value());
+    CHECK(obs->obs_type == "process.crashed");
+    CHECK(obs->version == "3.2.1.0"); // canon_version pads to the 4-group quad
+}
+
+TEST_CASE("crash .ips falls back to body bundleInfo.CFBundleShortVersionString when header "
+          "app_version is absent",
+          "[dex_macos][crash][version]") {
+    const std::string ips = R"({"bug_type":"309","name":"SomeApp"})"
+                            "\n"
+                            R"({"pid":1,"procName":"SomeApp","bundleInfo":{"CFBundleShortVersionString":"1.0"}})";
+    const auto obs = macos::parse_ips_report(ips);
+    REQUIRE(obs.has_value());
+    CHECK(obs->obs_type == "process.crashed");
+    CHECK(obs->version == "1.0.0.0");
+}
+
+TEST_CASE("crash .ips prefers header app_version over body bundleInfo when both are present",
+          "[dex_macos][crash][version]") {
+    const std::string ips = R"({"bug_type":"309","app_version":"3.2.1","name":"SomeApp"})"
+                            "\n"
+                            R"({"pid":1,"procName":"SomeApp","bundleInfo":{"CFBundleShortVersionString":"9.9"}})";
+    const auto obs = macos::parse_ips_report(ips);
+    REQUIRE(obs.has_value());
+    // The header value must win; a regression inverting ips_app_version's
+    // preference (or letting bundleInfo unconditionally override) yields 9.9.0.0.
+    CHECK(obs->version == "3.2.1.0");
 }
 
 TEST_CASE("crash extractor leaks no path / user content", "[dex_macos][crash][privacy]") {
@@ -121,6 +160,29 @@ TEST_CASE("spin/hang .ips maps to process.hung", "[dex_macos][hang]") {
     CHECK(obs->subject == "SomeApp");
     CHECK(obs->kind == "hang");
     CHECK(obs->pid == 4242u);
+}
+
+TEST_CASE("hang .ips also routes version (both branches, not just crash)",
+          "[dex_macos][hang][version]") {
+    // Pins version routing on the HANG branch specifically — the crash and hang
+    // branches are edited independently, so a regression that drops the
+    // assignment from just the hang branch must fail here even though every
+    // crash-side version test still passes.
+    const std::string via_header = R"({"bug_type":"288","app_version":"2.0","name":"SomeApp"})"
+                                   "\n"
+                                   R"({"pid":4242,"procName":"SomeApp"})";
+    const auto o1 = macos::parse_ips_report(via_header);
+    REQUIRE(o1.has_value());
+    CHECK(o1->obs_type == "process.hung");
+    CHECK(o1->version == "2.0.0.0");
+
+    const std::string via_bundle = R"({"bug_type":"388","name":"OtherApp"})"
+                                   "\n"
+                                   R"({"pid":9,"procName":"OtherApp","bundleInfo":{"CFBundleShortVersionString":"5.1.2"}})";
+    const auto o2 = macos::parse_ips_report(via_bundle);
+    REQUIRE(o2.has_value());
+    CHECK(o2->obs_type == "process.hung");
+    CHECK(o2->version == "5.1.2.0");
 }
 
 TEST_CASE("panic .ips maps to os.bugcheck without shipping panicString",
@@ -255,6 +317,29 @@ TEST_CASE("non-launchd / unparseable oslog lines are dropped", "[dex_macos][oslo
         CHECK(macos::oslog_predicate().find(needle) != std::string::npos);
 }
 
+TEST_CASE("oslog_predicate requests Fault level alongside Error on both clauses",
+          "[dex_macos][oslog][predicate]") {
+    // logd only delivers what the predicate asks for — parse_oslog_event already
+    // accepts Fault (line 169), but a clause left bare-Error means Fault records
+    // from that clause never reach the parser. Count occurrences rather than a
+    // plain substring("fault") check: that would pass even if only ONE of the
+    // two error/fault clauses (process-group, com.apple.apfs) was converted,
+    // leaving the other clause bare-error.
+    const std::string pred = macos::oslog_predicate();
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0, pos = 0;
+        while ((pos = pred.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
+    };
+    const std::size_t error_count = count(R"(messageType == "error")");
+    const std::size_t fault_count = count(R"(messageType == "fault")");
+    CHECK(error_count >= 2);
+    CHECK(fault_count == error_count); // no bare error-without-fault clause remains
+}
+
 TEST_CASE("oslog non-finite runtime metric is clamped to 0 (no gauge poison)",
           "[dex_macos][oslog][robust]") {
     // std::stod("inf"/"nan") returns ±Inf/NaN WITHOUT throwing — governance B2.
@@ -345,6 +430,19 @@ TEST_CASE("error-level system-process events map to their heading signal",
 TEST_CASE("apfs subsystem error maps to fs.corruption", "[dex_macos][oslog]") {
     const std::string l =
         R"({"messageType":"Error","processImagePath":"\/kernel","subsystem":"com.apple.apfs",)"
+        R"("eventMessage":"apfs error"})";
+    const auto obs = macos::parse_oslog_event(l);
+    REQUIRE(obs.has_value());
+    CHECK(obs->obs_type == "fs.corruption");
+}
+
+TEST_CASE("apfs subsystem Fault-level event maps to fs.corruption", "[dex_macos][oslog][issue-1372]") {
+    // Issue #1372: fs.corruption was reachable only via Error-level records
+    // because the predicate never requested Fault; parse_oslog_event itself
+    // already accepted Fault, so this pins the previously-unreachable path
+    // end to end once the predicate change lands.
+    const std::string l =
+        R"({"messageType":"Fault","processImagePath":"\/kernel","subsystem":"com.apple.apfs",)"
         R"("eventMessage":"apfs error"})";
     const auto obs = macos::parse_oslog_event(l);
     REQUIRE(obs.has_value());

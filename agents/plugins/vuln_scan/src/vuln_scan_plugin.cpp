@@ -444,6 +444,58 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
     }
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order.
+//   - scan/summary run BOTH do_cve_scan_impl (get_installed_apps) and
+//     do_config_scan_impl (run_all_config_checks); cve_scan/inventory run
+//     only get_installed_apps; config_scan runs only run_all_config_checks.
+//   - Windows: get_installed_apps reads HKLM/HKCU Uninstall directly
+//     (RegOpenKeyExW/RegEnumKeyExW/RegQueryValueExW); the Windows config
+//     checks (config_checks.hpp #ifdef _WIN32 block) are registry reads too
+//     — every leg native, in-process, rung 1.
+//   - Linux: get_installed_apps shells out via popen to whichever package
+//     manager is present (dpkg-query/rpm/pacman/apk); run_linux_checks mixes
+//     native /proc + /etc/ssh/sshd_config reads with a popen firewall probe
+//     (iptables/nft/ufw) — the leg is genuinely wired throughout, but the
+//     firewall check's acquisition method is the worst (least-native) one
+//     actually exercised, so rung 3.
+//   - macOS: get_installed_apps shells out via popen (system_profiler,
+//     optionally brew); run_macos_checks is almost entirely popen
+//     (spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults) — rung 3.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "scan",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew+security-checks)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "cve_scan",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "config_scan",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(iptables/nft/ufw)+procfs", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(spctl/fdesetup/csrutil/socketfilterfw)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "summary",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew+security-checks)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "inventory",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler/brew)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+};
+
 } // namespace
 
 class VulnScanPlugin final : public yuzu::Plugin {
@@ -458,6 +510,14 @@ public:
         static const char* acts[] = {"scan",    "cve_scan",  "config_scan",
                                      "summary", "inventory", nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

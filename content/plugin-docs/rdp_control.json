@@ -1,0 +1,426 @@
+{
+  "actions": [
+    {
+      "action": "set_state",
+      "definition_ids": [
+        "windows.rdp.set_state"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Win32 registry + INetFwPolicy2 COM + SCM",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "status",
+      "definition_ids": [
+        "windows.rdp.status"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "Win32 registry + INetFwPolicy2 COM + SCM",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**No rollback on partial failure.** `set_state`'s three steps each report their own status; `overall|ok` only when all succeeded, and a partial failure leaves whichever gates were flipped in place with no automatic revert.",
+    "**Disable does not stop TermService.** Only the registry and firewall gates close on disable; the service is deliberately left running, which is why the capability catalogue classifies `set_state` as `Irreversible` rather than claiming a complete undo.",
+    "**`S_FALSE` from the firewall API is not success.** `INetFwPolicy2::EnableRuleGroup`/`IsRuleGroupEnabled` return `S_FALSE` (which passes `SUCCEEDED()`) when the built-in Remote Desktop rule group is absent (e.g. a hardened image); the plugin explicitly classifies that as `group_not_found`/an unreadable gate, never a confirmed enable, disable, or \"off\".",
+    "**`status` never reports \"off\" from an unreadable gate.** If any of the three gates cannot be read, the derived verdict is `unknown`, distinguishing \"confirmed closed\" from \"couldn't tell\" — the fail-safe direction for a remote-access posture check.",
+    "**No typed result status.** The plugin never calls a result-status setter; every sample on every OS shows `UNDECLARED / UNKNOWN`, so a caller must key off `overall`/`rdp` and the process exit code, not a typed status field."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enable or disable Remote Desktop (RDP) on a Windows endpoint. Enable sets HKLM fDenyTSConnections=0, enables the built-in Remote Desktop firewall rule group, and starts TermService. Disable sets fDenyTSConnections=1 and disables the firewall rule group (the service is left running; the registry and firewall gates block new connections). Per-step status is reported; overall=ok only when every step succeeded — callers must retry until confirmed, especially on disable. NOTE: disable blocks NEW connections only; it does not terminate an already-established RDP session.",
+      "display_name": "Enable/Disable Remote Desktop",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "windows.rdp.set_state",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Report the current Remote Desktop posture of a Windows endpoint: fDenyTSConnections registry value, Remote Desktop firewall rule group state, TermService state, and the derived rdp verdict. rdp=on only when all three gates are readable and open; rdp=unknown when any gate could not be read (e.g. a non-elevated agent); rdp=off when all gates are readable but at least one is closed. A non-zero command exit code also signals an unreadable gate — callers verifying a state change should check the exit code and the per-gate rows, not the rdp summary alone. SCOPE: the firewall check covers only the built-in Remote Desktop rule group; a custom inbound 3389 allow-rule is out of scope, so rdp=off means \"at least one MANAGED gate is closed\", not \"3389 is unreachable by every possible rule\".",
+      "display_name": "Remote Desktop Status",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.rdp.status",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Remote Desktop control — enable/disable RDP (registry + firewall + TermService)",
+  "how_it_works": "`set_state` runs three sequential steps under a per-process mutex (registry `fDenyTSConnections`, the built-in Remote Desktop firewall rule group via `INetFwPolicy2`, then TermService) and reports each step's outcome independently; `overall|ok` only when every attempted step succeeded, and there is no rollback on partial failure. Disable deliberately leaves TermService running — only the registry and firewall gates are closed. `status` independently re-reads all three gates and derives a `rdp` verdict that is `unknown` (never a false `off`) whenever any gate could not be read. On macOS and Linux neither action touches the OS: both return the honest `rdp_control|unsupported|...` sentinel; `set_state` still reports rc=1 there (a state-changing action that touched nothing must not read as success), while `status` keeps rc=0 (an unsupported read is not itself a failure). The plugin is deliberately not a rollback/undo mechanism, and it never stops a running TermService — that is the Guardian service-guard's job.",
+  "inputs": [
+    {
+      "constraints": {
+        "enum": [
+          "enable",
+          "disable"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.rdp.set_state",
+      "description": "enable allows Remote Desktop connections; disable blocks them (e.g. state: enable).\n",
+      "name": "state",
+      "required": true,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": false,
+    "mutating": true
+  },
+  "leg_hash": "e17062cd8474",
+  "manifest_version": 1,
+  "name": "rdp_control",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code. Values: ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED).",
+          "example": "not observed in any capture",
+          "name": "reg_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2. Values: ok, error:com_init, error:group_not_found, error:0x<hresult>.",
+          "example": "not observed in any capture",
+          "name": "firewall_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error. Values: running, untouched, error:<win32 code>.",
+          "example": "not observed in any capture",
+          "name": "service_status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Terminal verdict for the whole set_state call; ok only when every step above succeeded. Values: ok, error.",
+          "example": "not observed in any capture",
+          "name": "overall",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.rdp.set_state"
+    },
+    {
+      "columns": [
+        {
+          "description": "Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed. Values: 0, 1, error:<win32 code>.",
+          "example": "0",
+          "name": "deny_ts_connections",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the Remote Desktop firewall rule group is enabled, or why it could not be read. Values: enabled, disabled, group_not_found, error:com_init, error:0x<hresult>.",
+          "example": "enabled",
+          "name": "firewall_group",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Current SCM state name for TermService, or a Win32 error if the query failed. Values: running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>.",
+          "example": "not observed in any capture",
+          "name": "term_service",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise. Values: on, off, unknown.",
+          "example": "on",
+          "name": "rdp",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.rdp.status"
+    }
+  ],
+  "outputs_note": "Each action's result is a set of independent `key|value` lines — one per gate or step, in emission order — not a single delimited row; the bold lines below list the field order. There is no `-` placeholder convention here: a step or gate that could not be read reports its own `error:<code>` (or `error:com_init` / `error:group_not_found` for the firewall step) instead.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "unsupported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "**Administrators** group membership (LocalSystem already has it). The intended least-privilege `NT SERVICE\\YuzuAgent` account is **not** granted this by `scripts/install-agent-user.ps1`; must be added out of band (GPO Restricted Groups / Intune / `Add-LocalGroupMember`).",
+      "if_refused": "`set_state`: per-step `error:<code>` rows and `overall|error`; `status`: per-gate `error:<code>` rows and `rdp|unknown`",
+      "measured": "2026-09-07, bare metal, as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account with an elevated token (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `rdp_control|unsupported|...`, rc=1 (`set_state`) / rc=0 (`status`)",
+      "measured": "2026-09-07, bare metal, at euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "n/a — leg not implemented; the honest-sentinel path needs no privilege"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `rdp_control|unsupported|...`, rc=1 (`set_state`) / rc=0 (`status`)",
+      "measured": "2026-09-06, container, at euid 0",
+      "os": "Linux",
+      "runs_as": "n/a — leg not implemented; the honest-sentinel path needs no privilege"
+    }
+  ],
+  "readme": "agents/plugins/rdp_control/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "set_state",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rdp_control|unsupported|Windows Remote Desktop is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rdp_control|unsupported|Windows Remote Desktop is not available on this platform"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "e17062cd8474",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "set_state",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "e17062cd8474",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "set_state",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|invalid state (use enable or disable)"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "status",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 4,
+          "rows": [
+            "deny_ts_connections|0",
+            "firewall_group|enabled",
+            "term_service|running",
+            "rdp|on"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "e17062cd8474",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "set_state",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "High",
+      "securable": "Security"
+    },
+    {
+      "action": "status",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/rdp_control.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/rdp_control/src/rdp_control_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": []
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin is registered only in the agent's instruction catalogue and the capability catalogue — nothing else in `server/` references `rdp_control` or the `windows.rdp.*` ids.",
+    "**Sensitivity.** Rows carry only boolean/enum posture state (`reg_status`/`firewall_status`/`service_status`/`overall`, `deny_ts_connections`/`firewall_group`/`term_service`/`rdp`) — nothing that identifies a specific device, person, or installed software beyond the device id.",
+    "**Siblings:** none report combined RDP posture. `registry.get_value`/`registry.set_value` can reach the same `fDenyTSConnections` value in isolation, and `firewall.state`/`firewall.rules` read Windows Firewall generally, but neither combines the registry + firewall-group + service triad this plugin reports together.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.rdp.status\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

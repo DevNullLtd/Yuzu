@@ -1,0 +1,276 @@
+{
+  "actions": [
+    {
+      "action": "echo",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "ping",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "in-process",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**No definition YAML — unreachable via MCP/REST.** No file under `content/definitions/` sets `plugin: example`; the capability rows exist (`server/core/src/capability_decls/plugin_action_catalogue_b.hpp:703,714`) but nothing wires `ping`/`echo` to a `definition_id`, so the two actions can only be exercised by loading the plugin directly.",
+    "**`echo` always shows the default in the samples.** All three captures show `echo: (no message)` because the capture driver calls `execute()` with no `message` parameter — the samples don't exercise the parameter-passing path they exist to demonstrate.",
+    "**No result status is ever set.** `execute()` never calls a result-status API; every sample reports `UNDECLARED / UNKNOWN /`.",
+    "**No tests.** No file under `tests/` references this plugin.",
+    "**Reference/template purpose only.** The file header states its purpose is to be a \"starting point for writing real plugins\" (`example_plugin.cpp:1-6`) — it deliberately does no OS interaction, matching its role as an ABI smoke/reference implementation rather than a functional collector."
+  ],
+  "definitions": [],
+  "description": "Reference example plugin — responds to 'ping'",
+  "how_it_works": "`execute()` dispatches on the action name with no OS syscalls, subprocess, or file/network I/O (`example_plugin.cpp:63-77`). `ping` writes the literal string `pong` and returns 0 — no parameters, no host state read (`example_plugin.cpp:64-67`). `echo` reads one parameter, `message`, defaulting to `(no message)` when omitted, and writes it back prefixed with `echo: ` (`example_plugin.cpp:69-73`). Any other action name writes `unknown action: <name>` and returns 1 (`example_plugin.cpp:75-76`). `init()` and `shutdown()` are both no-ops — there is no state to set up or tear down (`example_plugin.cpp:56-61`). The plugin deliberately reads or changes no host state; its file header states its purpose is to be a starting point for writing real plugins (`example_plugin.cpp:1-6`), and its capability comment notes every leg is rung 1 \"in-process\" with no OS interaction at all (`example_plugin.cpp:15-17`). No file under `content/definitions/` declares `plugin: example`, so today the plugin cannot be dispatched through a definition id — only a direct plugin load (capture, tooling) reaches it.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": false,
+    "mutating": false
+  },
+  "leg_hash": "23dda8161132",
+  "manifest_version": 1,
+  "name": "example",
+  "outputs": [],
+  "outputs_note": "Each action writes exactly one line of plain text via `ctx.write_output()` (`example_plugin.cpp:65,71,75`) — there is no pipe-delimited row schema, discriminator field, or empty-row placeholder convention as used by the collector-style plugins. A call on a known action name always produces one output line and returns 0; an unrecognized action name writes `unknown action: <action>` and returns 1 (`example_plugin.cpp:75-76`).",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — no OS call is made (`example_plugin.cpp:63-77`)",
+      "if_refused": "n/a — no external resource is read; both actions return rc 0 for a known action name",
+      "measured": "2026-09-07, bare-metal, Windows NT 10.0.26200.0 x64 (`docs/samples/windows.txt:1`)",
+      "os": "Windows",
+      "runs_as": "no `docs/agent-privilege-model.md` row; sample captured as `SYSTEM`"
+    },
+    {
+      "grant": "None",
+      "if_refused": "n/a",
+      "measured": "2026-09-07, bare-metal, macOS 26.6.2 arm64 (`docs/samples/macos.txt:1`)",
+      "os": "macOS",
+      "runs_as": "no privilege-model row; sample captured at euid 501 (jsmith), unprivileged"
+    },
+    {
+      "grant": "None",
+      "if_refused": "n/a",
+      "measured": "2026-09-06, container, Debian GNU/Linux 13 aarch64 (`docs/samples/linux.txt:1`)",
+      "os": "Linux",
+      "runs_as": "no privilege-model row; sample captured at euid 0, container"
+    }
+  ],
+  "readme": "agents/plugins/example/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "pong"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "echo",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "echo: (no message)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "23dda8161132",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "pong"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "echo",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "echo: (no message)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "23dda8161132",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "ping",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "pong"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "echo",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "echo: (no message)"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "23dda8161132",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "ping",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    },
+    {
+      "action": "echo",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [],
+    "plugin": [
+      "agents/plugins/example/src/example_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**MCP / REST.** No definition YAML exists for `example` (no file under `content/definitions/` sets `plugin: example`), so there is no `definition_id` to discover via `discover_instructions`/`get_definition` or run via `execute_instruction` today — `ping` and `echo` are unreachable from the MCP/REST surface until a definition is authored. The only paths that load this plugin today are the plugin-capture driver (`PluginHandle::load` + `LocalDispatcher::run`, used for the samples below) and direct test/tooling loads of the shared library.",
+    "**Not consumed by** daily-sync, the TAR warehouse, DEX, or metrics — nothing schedules this plugin; it runs only when explicitly loaded.",
+    "**Sensitivity.** Both actions carry no host state — `ping`'s row is a fixed literal and `echo`'s row is only the operator-supplied `message` parameter echoed back; nothing about the device, an account, or installed software is read or reported.",
+    "**Siblings:** none — a standalone ABI/host reference plugin, not part of an inventory family (`example_plugin.cpp:1-6`)."
+  ]
+}

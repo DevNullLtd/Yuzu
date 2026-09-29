@@ -289,6 +289,10 @@ public:
         return histograms_[name].labels_with_buckets({}, std::move(buckets));
     }
 
+    /// DESTROYS every series in the family — which INVALIDATES any `Gauge&`/`Gauge*` a
+    /// caller cached from it (see `McpStreamState`, which caches two for the life of a
+    /// stream to keep allocation off a locked path). Only call this on families whose
+    /// gauges nobody holds a reference to.
     void clear_gauge_family(const std::string& name) {
         std::lock_guard lock(mu_);
         if (auto it = gauges_.find(name); it != gauges_.end()) {

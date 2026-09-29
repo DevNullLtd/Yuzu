@@ -503,8 +503,9 @@ function normIp(addr) {
 // Return true for any bind address that cannot accept connections from
 // another instance: 127.0.0.0/8, ::1, and the v4-mapped-in-v6 form. The
 // agent emits LISTEN rows for every kernel-visible listener (this matches
-// what the `sockwho` plugin would surface for the host); the renderer's
-// job is to keep only the ones that participate in inter-host topology.
+// what netstat's `attribution` action would surface for the host); the
+// renderer's job is to keep only the ones that participate in inter-host
+// topology.
 function isLoopbackBind(addr) {
   if (!addr) return false;
   let s = String(addr);

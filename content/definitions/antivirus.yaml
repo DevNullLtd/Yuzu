@@ -1,11 +1,14 @@
 ## Antivirus Product Detection Definitions
 ## Detects installed antivirus products and queries Windows Defender status.
-## Plugin: antivirus | Actions: products, status
+## Plugin: antivirus | Actions: products, status, av_exclusions
 ##
 ## Sources by platform:
-##   Windows: WMI SecurityCenter2 (products), Get-MpComputerStatus (Defender)
+##   Windows: WMI SecurityCenter2 (products), Get-MpComputerStatus (Defender),
+##            registry (av_exclusions — Defender exclusion lists)
 ##   Linux:   Process detection for ClamAV, CrowdStrike Falcon, Sophos
-##   macOS:   XProtect (always present), CrowdStrike/Sophos process detection
+##   macOS:   products: XProtect.bundle version probe + endpoint-security
+##            system extensions (systemextensionsctl), process fallback;
+##            status: XProtect definition version/freshness + Remediator/MRT
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,14 +16,23 @@ kind: InstructionDefinition
 metadata:
   id: security.antivirus.products
   displayName: List Antivirus Products
-  version: 1.0.0
+  version: 1.2.0
   description: >
     Enumerate installed antivirus products on the endpoint. On Windows,
-    queries WMI SecurityCenter2 for registered AV products and their
-    productState. On Linux, checks for running ClamAV (clamd),
-    CrowdStrike Falcon (falcon-sensor), and Sophos processes or
-    installation directories. On macOS, reports XProtect (always active)
-    and checks for CrowdStrike/Sophos processes.
+    queries WMI SecurityCenter2 for registered AV products and decodes
+    each productState into a protection state (enabled, snoozed, or
+    disabled) plus a definitions-freshness field (current or stale) —
+    the Windows-only third column below; older agents passed the raw
+    productState code through as the state. On Linux, checks for
+    running ClamAV (clamd), CrowdStrike Falcon (falcon-sensor), and
+    Sophos processes or installation directories. On macOS, probes the
+    XProtect definition bundle (an xprotect_version row rides alongside;
+    state reads unknown when the bundle is unreadable, never assumed
+    active) and enumerates endpoint-security system extensions for
+    third-party EDR/AV (an edr row carries bundle id and version), with
+    process detection as a fallback. Older agents report XProtect as
+    unconditionally active and detect third parties by process only, so
+    a mixed fleet shows both shapes until fully upgraded.
   tags: [security, antivirus, compliance, inventory]
 
 spec:
@@ -40,8 +52,26 @@ spec:
     columns:
       - name: name
         type: string
+        description: 'OS-supplied display name of the detected antivirus product or extension. Values: free text.'
+        example: "Windows Defender"
+        platforms: [windows, linux, darwin]
       - name: state
-        type: string
+        type: string # Windows: enabled | snoozed | disabled (decoded
+                      # productState). Linux/macOS: presence/liveness tokens
+                      # (running, installed, active, unknown), as before.
+        description: Protection/liveness state of the product — decoded productState on Windows, presence/liveness token elsewhere.
+        values: [enabled, snoozed, disabled, running, installed, active, unknown]
+        example: "snoozed"
+        platforms: [windows, linux, darwin]
+      - name: definitions
+        type: string # Windows-only: current | stale (productState low
+                      # byte). Linux/macOS rows carry only name+state — a
+                      # 3-field `av|<name>|<state>` line — so this column is
+                      # absent (not blank) off Windows.
+        description: Definitions-freshness state decoded from productState's low byte. Windows only; absent (not blank) on Linux/macOS 3-field rows.
+        values: [current, stale, unknown]
+        example: "current"
+        platforms: [windows]
     aggregation:
       groupBy: [name]
       operations: [count]
@@ -71,12 +101,16 @@ kind: InstructionDefinition
 metadata:
   id: security.antivirus.defender_status
   displayName: Windows Defender Status
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Query the detailed status of Windows Defender on a Windows endpoint.
     Reports real-time protection state, antivirus signature version,
     last signature update time, and last quick scan completion time.
-    Returns "not_available" on non-Windows platforms.
+    This definition targets Windows only; macOS reports XProtect data via
+    security.antivirus.xprotect_status instead. The plugin's underlying
+    "status" action also has a real Linux leg (ClamAV liveness plus
+    CrowdStrike/Sophos presence), but no content definition targets Linux
+    for it today.
   tags: [security, antivirus, defender, compliance, windows]
 
 spec:
@@ -96,12 +130,25 @@ spec:
     columns:
       - name: realtime_protection
         type: string
+        description: Whether Windows Defender real-time protection is on. Row is omitted entirely when the WMI property is absent — never fabricated.
+        values: [enabled, disabled]
+        example: "enabled"
+        platforms: [windows]
       - name: definition_version
         type: string
+        description: 'Antivirus signature version string as reported by MSFT_MpComputerStatus. Values: free text.'
+        example: "1.459.88.0"
+        platforms: [windows]
       - name: last_update
         type: string
+        description: 'Signature last-updated timestamp, WMI CIM datetime format (not ISO-8601). Values: free text.'
+        example: "20260906211522.000000+000"
+        platforms: [windows]
       - name: last_quick_scan
         type: string
+        description: 'Last quick-scan completion timestamp, WMI CIM datetime format (not ISO-8601). Values: free text.'
+        example: "20260906150800.885000+000"
+        platforms: [windows]
 
   visualization:
     # The Defender plugin emits one row per status field as
@@ -117,6 +164,159 @@ spec:
     valueLabel: Devices
 
   readablePayload: "Query Windows Defender status"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [antivirus]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.antivirus.xprotect_status
+  displayName: XProtect Status
+  version: 1.0.0
+  description: >
+    Query the built-in macOS malware-protection status. Reports the
+    XProtect definition version (from the XProtect.bundle), the
+    definition freshness (bundle modification time), and the XProtect
+    Remediator and MRT engine versions. Emits status "unknown" when the
+    definition bundle is unreadable — never an assumed-healthy value. No
+    real-time-protection row is reported: macOS exposes no queryable
+    equivalent, and antivirus plugin versions older than 0.2.0 answer
+    "not_available".
+  tags: [security, antivirus, xprotect, compliance, macos]
+
+spec:
+  type: question
+  platforms: [darwin]
+
+  execution:
+    plugin: antivirus
+    action: status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: definition_version
+        type: string
+        description: 'XProtect definition bundle version token (CFBundleShortVersionString). Values: free text.'
+        example: "5358"
+        platforms: [darwin]
+      - name: last_update
+        type: string # ISO-8601 (bundle mtime, local time); the Windows defender_status
+                      # last_update is a locale-dependent PowerShell render —
+                      # do not treat the two as interchangeably formatted
+        description: 'XProtect bundle Info.plist modification time, ISO-8601 local time. Not the same format as the Windows defender_status last_update. Values: free text.'
+        example: "2026-08-28T08:11:38"
+        platforms: [darwin]
+      - name: remediator_version
+        type: string
+        description: 'XProtect Remediator (XProtect.app) version token, omitted if unreadable. Values: free text.'
+        example: "157"
+        platforms: [darwin]
+      - name: mrt_version
+        type: string
+        description: 'Malware Removal Tool (MRT.app) version token, omitted if unreadable. Values: free text.'
+        example: "1.93"
+        platforms: [darwin]
+
+  readablePayload: "Query macOS XProtect status"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    # Gates the agent daemon version, NOT the antivirus plugin's own version
+    # (0.2.0, AntivirusPlugin::version()) — no minPluginVersion mechanism
+    # exists today. An agent running plugin <0.2.0 degrades to
+    # status|not_available rather than being gated out here.
+    minAgentVersion: 0.1.0
+    requiredPlugins: [antivirus]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.antivirus.av_exclusions
+  displayName: Windows Defender Exclusions
+  version: 1.0.0
+  description: >
+    List Windows Defender's configured exclusions (paths, processes, and
+    file extensions) on a Windows endpoint. Reads both the operator-editable
+    local hive and the GPO/MDM-managed policy hive, merged with provenance
+    so an operator can tell which plane an exclusion came from. This list
+    is itself a map of where AV coverage has gaps on an endpoint, which is
+    more sensitive than presence/status alone. A row's key is always
+    "exclusion"; the value carries kind (path/process/extension), source
+    (local/policy/both), and the excluded value itself, pipe-delimited. A
+    "partial" row means the enumeration could not be confirmed complete
+    (a registry read was truncated or transiently failed) — the exclusions
+    returned are real, but there may be more that weren't collected.
+    Windows-only; other platforms report "unsupported".
+  tags: [security, antivirus, defender, exclusions, compliance, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: antivirus
+    action: av_exclusions
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: kind
+        type: string
+        description: Which Defender exclusion list the value belongs to.
+        values: [path, process, extension]
+        example: "path"
+        platforms: [windows]
+      - name: source
+        type: string
+        description: Which registry hive the exclusion came from; "both" means it is present in both.
+        values: [local, policy, both]
+        example: "local"
+        platforms: [windows]
+      - name: value
+        type: string
+        description: The excluded path, process, or extension, sanitized. Vendor/operator-controlled free text.
+        example: "D:\\yuzu-dev"
+        platforms: [windows]
+
+  readablePayload: "List Windows Defender exclusions"
 
   gather:
     ttlSeconds: 120

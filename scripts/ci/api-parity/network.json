@@ -1,0 +1,21 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/network/devices",
+    "capability_id": "get.fragments-network-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/network/devices"
+    },
+    "mcp_twin": "list_network_devices",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/network/overview",
+    "capability_id": "get.fragments-network-overview",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

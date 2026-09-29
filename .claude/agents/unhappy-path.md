@@ -275,6 +275,21 @@ During full governance, this agent:
 
 ---
 
+## State-machine mutation × state (added after #2284)
+
+When the change touches a **state machine** — rotation, lifecycle,
+deployment, enrollment; anything with ordered transitions or
+paired/linked rows — don't stop at the happy transitions. Enumerate
+every mutating op × every state a linked row can be in and walk the
+cross-product for a wedge, an orphaned partner, or an unsafe terminal
+(zero rows / no live credential). Trace the OUT-OF-BAND paths — a single
+manual revoke or delete performed mid-transition, a lost-response retry,
+a background sweep firing against a hand-mutated row — not just the
+in-band flow. #2284's paired-credential rotation could be driven to zero
+active credentials by a manual successor-revoke the sweep then finished
+off. See the security-guardian's "Design-contract & state-machine
+tracing" check.
+
 ## Summary Directive
 
 This agent exists to answer:

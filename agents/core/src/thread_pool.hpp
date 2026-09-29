@@ -35,6 +35,32 @@ public:
         num_threads = std::max<std::size_t>(num_threads, 4);
         num_threads = std::min<std::size_t>(num_threads, 32);
         workers_.reserve(num_threads);
+        // EXCEPTION-SAFE CONSTRUCTION (governance Gate-4 UP-3). std::thread's ctor throws
+        // std::system_error under EAGAIN (thread/pid exhaustion — a pids-capped container,
+        // RLIMIT_NPROC). Without this guard the throw propagated out of ThreadPool's ctor,
+        // which destroys the partially-filled `workers_` vector — and ~std::thread on a
+        // JOINABLE thread calls std::terminate(). So the agent aborted, rather than
+        // reporting a clean startup failure, on exactly the overloaded host where it most
+        // needs to survive. (SparkEngine, which spawns its threads earlier, degrades
+        // gracefully instead — so the OPTIONAL subsystem survived while the MANDATORY one
+        // killed the process. Rung 1 also reorders construction so the pool claims its
+        // threads first; this makes the failure itself survivable either way.)
+        try {
+            spawn_workers(num_threads);
+            // INSIDE the try, deliberately. spdlog rethrows non-std exceptions, and a throw
+            // out here would destroy a FULLY-POPULATED workers_ vector of joinable threads
+            // -> std::terminate: the very failure this try/catch exists to remove, one line
+            // lower down (governance Gate-3 cpp-expert).
+            spdlog::info("Thread pool started: {} workers, max queue {}", workers_.size(),
+                         max_queue_size);
+        } catch (...) {
+            quiesce_and_join(); // signal + join whatever DID start, so ~vector is safe
+            throw;              // the caller still learns the pool could not be built
+        }
+    }
+
+private:
+    void spawn_workers(std::size_t num_threads) {
         for (std::size_t i = 0; i < num_threads; ++i) {
             workers_.emplace_back([this] {
                 while (true) {
@@ -71,9 +97,30 @@ public:
                 }
             });
         }
-        spdlog::info("Thread pool started: {} workers, max queue {}", num_threads, max_queue_size);
     }
 
+    /// Signal every started worker to exit and join it. Safe to call on a partially
+    /// constructed pool (the ctor's failure path) and from the destructor.
+    void quiesce_and_join() noexcept {
+        {
+            std::lock_guard lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) {
+                try {
+                    w.join();
+                } catch (...) {
+                    // A join that throws here would terminate() us anyway (noexcept);
+                    // swallowing keeps the partially-built teardown best-effort.
+                }
+            }
+        }
+        workers_.clear();
+    }
+
+public:
     // Returns false if the queue is full (backpressure).
     bool submit(std::function<void()> task) {
         {
@@ -88,17 +135,9 @@ public:
         return true;
     }
 
-    ~ThreadPool() {
-        {
-            std::lock_guard lock(mu_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& w : workers_) {
-            if (w.joinable())
-                w.join();
-        }
-    }
+    // Shares the ctor's failure path: signal, join, clear. A throwing join would
+    // terminate() out of a destructor anyway, so quiesce_and_join() swallows it.
+    ~ThreadPool() { quiesce_and_join(); }
 
     // Non-copyable, non-movable
     ThreadPool(const ThreadPool&) = delete;

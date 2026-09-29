@@ -8,17 +8,31 @@
 #include "baseline_store.hpp"
 #include "http_route_sink.hpp"
 #include "guardian_form_render.hpp"
-#include "guardian_push_builder.hpp"  // guardian_enforced_on_platform / platform_display_name / os_target_matches
+#include "guardian_model.hpp" // #4037 — shared per-guard census builder
+                              // (guardian_rule_agent_status_rows), so this
+                              // fragment computes the SAME census as the REST
+                              // /rules/{rule_id}/status and MCP
+                              // get_guardian_rule_status twins
+#include "guardian_push_builder.hpp"  // guardian_guard_supported_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
+                                     // header and body always agree
 #include "secure_random.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <exception>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -218,18 +232,23 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
     return out;
 }
 
-// Distinct colour for the "not yet implemented" class (macOS/Linux agents whose
-// agent-side guards are no-ops). Deliberately NOT green/grey so it can never read as
-// compliant or as a stale-offline "unknown" — used by the fleet census, the
-// By-Guard/By-Baseline "N not impl" tags, and the per-device drill-down.
+// Distinct colour for the "not yet implemented" class (an (agent, rule) pair whose
+// GUARD TYPE the agent-side Guardian can't arm on that agent's platform — see
+// guardian::guardian_guard_supported_on_platform for the per-type matrix; it is NOT a
+// blanket macOS/Linux exclusion, e.g. Service arms on Linux today). Deliberately NOT
+// green/grey so it can never read as compliant or as a stale-offline "unknown" — used
+// by the fleet census, the By-Guard/By-Baseline "N not impl" tags, and the per-device
+// drill-down.
 constexpr const char* kNotImplColor = "#a78bfa";  // violet
 
 // agent_id -> raw platform token ("windows"|"linux"|"darwin"|...) for currently-
 // connected agents, parsed from the registry JSON (registry_.to_json()). Used both to
 // fold liveness (a status row whose agent_id is absent is "unknown" — offline, can't
-// verify) and to flag agents on platforms the agent-side Guardian does not arm yet
-// (macOS/Linux), so they are reported "not yet implemented" rather than silently
-// looking compliant/unknown. Callers derive the online-id set from its keys.
+// verify) and, together with a rule's guard type, to flag pairs the agent-side
+// Guardian does not arm yet (guardian::guardian_guard_supported_on_platform — NOT a
+// blanket per-platform rule; see the #4252 matrix), so they are reported "not yet
+// implemented" rather than silently looking compliant/unknown. Callers derive the
+// online-id set from its keys.
 std::unordered_map<std::string, std::string> parse_online_agent_os(const std::string& agents_json) {
     std::unordered_map<std::string, std::string> m;
     auto j = nlohmann::json::parse(agents_json, nullptr, false);
@@ -250,9 +269,14 @@ std::unordered_map<std::string, std::string> parse_online_agent_os(const std::st
 struct StateRollup {
     int64_t ok = 0, drift = 0, err = 0, unk = 0;
     // (agent, rule) pairs the rule targets on a platform the agent-side Guardian
-    // does not arm yet (macOS/Linux). Tracked separately so it is never folded into
-    // compliant or into the offline "unknown" bucket — an unenforceable platform
-    // must never read as protected.
+    // does not arm THIS GUARD TYPE on (e.g. Registry/File on macOS+Linux; Service
+    // on macOS only — guardian::guardian_guard_supported_on_platform is the single
+    // source of the matrix). Tracked separately so it is never folded into
+    // compliant or into the offline "unknown" bucket — an unenforceable pair
+    // must never read as protected. Only counted when the pair has NO real
+    // status row (see has_real_status below) — #4252: a pair the agent-side
+    // Guardian DOES now arm (Linux Service) must not be counted here just
+    // because it is also absent from some OTHER, stricter bucket.
     int64_t notimpl = 0;
     int64_t total() const { return ok + drift + err + unk + notimpl; }
 };
@@ -271,7 +295,243 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
     return m;
 }
 
+// ── #4252 shared machinery: guard-type-aware "not implemented" + double-count
+//    exclusion, used by all 3 synthetic-notimpl fold sites in this file ──────
+
+// Composite key for one (agent, rule) pair. A real struct + hash functor, NOT a
+// delimiter-joined string — and its correctness never leans on either field's
+// charset, which is why it stays correct even though only one of the two now
+// carries a guarantee: agent_id is client-supplied at Register (length-checked
+// only, agent_service_impl.cpp), still charset-unrestricted; rule_id created
+// via REST/MCP now IS charset-restricted (is_valid_rule_id, #4665), but a
+// rule_id predating that check, or one reaching this struct via any other,
+// non-charset-checked path, is not guaranteed charset-safe either — a
+// delimiter would still be ambiguous for either field. Governance Gate 2/3/6
+// independently confirmed a crafted "\x1f"-containing agent_id or rule_id
+// collided the prior delimited-string key
+// (`agentA\x1fextra` + `ruleX` == `agentA` + `extra\x1fruleX`), silently
+// dropping a real status row from every fold. A struct key has no delimiter to
+// collide on, for any byte content, by construction — this is the fix, not a
+// stricter escape. Owned std::string fields (not string_view): status_pair_index
+// is consumed by the baseline fold AFTER the scope where its backing status rows
+// were fetched closes (see render_baseline_page_fragment), so a view-based key
+// would dangle there. Precedent: stream_budget.hpp's Key/KeyHash.
+struct PairStatusKey {
+    std::string agent_id;
+    std::string rule_id;
+
+    bool operator==(const PairStatusKey& o) const noexcept {
+        return agent_id == o.agent_id && rule_id == o.rule_id;
+    }
+};
+struct PairStatusKeyHash {
+    std::size_t operator()(const PairStatusKey& k) const noexcept {
+        return std::hash<std::string>{}(k.agent_id) ^
+               (std::hash<std::string>{}(k.rule_id) * 0x9e3779b97f4a7c15ULL);
+    }
+};
+
+// (agent_id, rule_id) pairs that already own a REAL status row — built once
+// per fragment render from the SAME status vector `rollup_by_rule()` (or, for
+// the single-rule guard page, `guardian_rule_agent_status_rows()`) already
+// consumes, never a second store query.
+std::unordered_set<PairStatusKey, PairStatusKeyHash>
+status_pair_index(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows) {
+    std::unordered_set<PairStatusKey, PairStatusKeyHash> s;
+    s.reserve(rows.size());
+    for (const auto& r : rows) s.insert(PairStatusKey{r.agent_id, r.rule_id});
+    return s;
+}
+
+// True iff `pairs` (built by a caller via status_pair_index, or the single-
+// rule equivalent) already contains a real status row for (agent_id,
+// rule_id). THE one exclusion predicate shared by every synthetic "not
+// implemented" fold in this file: a pair that already reports real state
+// must NEVER also get a synthetic notimpl increment — that additive
+// double-count (present pre-#4252 for Linux Service, once Service became
+// guard-type-aware-supported on Linux) is exactly the bug this predicate
+// closes. Not folding this into guardian_guard_supported_on_platform itself:
+// that function answers a pure "can this platform arm this guard type"
+// question with no store/status dependency, and stays unit-testable as such.
+bool has_real_status(const std::unordered_set<PairStatusKey, PairStatusKeyHash>& pairs,
+                     std::string_view agent_id, std::string_view rule_id) {
+    return pairs.contains(PairStatusKey{std::string(agent_id), std::string(rule_id)});
+}
+
+// Extract a rule's spark.type token from its canonical spec_json — the input
+// to guardian::guardian_guard_supported_on_platform's guard-type-aware check.
+// Parse once per rule (outside the per-agent loop at each call site), mirroring
+// how build_agent_push / render_guard_page_fragment already parse spec_json
+// per-render. Malformed/absent spec_json, a non-object "spark" block, or a
+// non-string "type" all yield an empty token, never throw — an empty token
+// reads as "unknown type" to guardian_guard_supported_on_platform, which falls
+// back to the pre-#4252 Windows-only rule, so a bad row can never regress
+// Registry/File support.
+std::string spark_type_of(const std::string& spec_json) {
+    if (spec_json.empty())
+        return {};
+    auto j = nlohmann::json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object() || !j.contains("spark") || !j["spark"].is_object())
+        return {};
+    const auto& spark = j["spark"];
+    return spark.contains("type") && spark["type"].is_string() ? spark["type"].get<std::string>()
+                                                               : std::string{};
+}
+
+// ── Detectability (#4252): server support-matrix stale vs. agent-observed
+//    reality ────────────────────────────────────────────────────────────────
+// Fires when a call site below would have counted an (agent, rule) pair as
+// "not implemented" per guardian_guard_supported_on_platform's hardcoded
+// matrix, but has_real_status says the agent already reports REAL status for
+// that exact pair — i.e. the matrix disagrees with what the agent has
+// actually observed. This is the double-count #4252 fixes; firing it here
+// pins the fix and gives a live signal if the matrix ever drifts stale again
+// (e.g. a future guard type ships agent-side support before this file's
+// matrix is updated to match). Render-time only — it fires when an operator
+// loads a Guardian fragment, NOT a continuous background monitor; naming and
+// docs below say so explicitly, per the plan's detectability note. Mirrors
+// app_perf_daily_store.cpp's note_read_degrade() shape (atomic relaxed
+// counter + modulo-sampled log + a real bounded-label Prometheus counter,
+// docs/observability-conventions.md's pre-seed rule) — deliberately NOT the
+// engine_principal_store.cpp/LogCapture pattern an earlier draft of this fix
+// cited, which does not exist anywhere in this tree.
+// #4252 consolidated round: kMatrixStaleSparkTypes used to be its own separate
+// std::array here — a THIRD independent enumeration of Guardian spark types
+// alongside the schema catalog and the platform matrix, with no cross-check
+// binding them (governance Gate 4 consistency-auditor finding). Now an alias
+// for guardian::kKnownGuardSparkTypes (guardian_push_builder.hpp) — no third
+// copy. That header's own comment states precisely what IS and is NOT bound
+// by the schema-registry cross-check test: this array, not
+// guardian_guard_supported_on_platform's literal if-chain.
+constexpr auto& kMatrixStaleSparkTypes = guardian::kKnownGuardSparkTypes;
+constexpr const char* kMatrixStaleSparkTypeUnknown = "unknown";
+constexpr std::uint64_t kMatrixStaleLogSample = 50;
+
+std::atomic<std::uint64_t> g_matrix_stale_count{0};
+
+void note_platform_matrix_stale(yuzu::MetricsRegistry* metrics, std::string_view agent_id,
+                                std::string_view rule_id, std::string_view spark_type) {
+    // The metric label is the CLOSED set advertised in docs/user-manual/metrics.md — never
+    // the raw authored token. spark.type is operator-authored free text with no membership
+    // check on the create/update path (guardian_rule_spec.cpp's derive_rule_spec validates
+    // only non-emptiness), so passing it through verbatim would let a privileged operator
+    // mint an unbounded, never-evicted Prometheus series per distinct typo/garbage value —
+    // exactly what docs/observability-conventions.md's closed/bounded/pre-seeded-label rule
+    // exists to prevent (precedent: dispatch_confined_arms.hpp's kQuarantineGateOutcomes
+    // drives both the pre-seed and the emit side from one closed constant). The raw token
+    // still reaches the sampled log line below for forensics.
+    const bool known = std::ranges::find(kMatrixStaleSparkTypes, spark_type) !=
+                       kMatrixStaleSparkTypes.end();
+    const std::string label = known ? std::string(spark_type) : std::string(kMatrixStaleSparkTypeUnknown);
+    if (metrics)
+        metrics
+            ->counter("yuzu_server_guardian_platform_matrix_stale_total", {{"spark_type", label}})
+            .increment();
+    const std::uint64_t n = g_matrix_stale_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n % kMatrixStaleLogSample == 1)
+        // #4665 governance-external-review finding (fjarvis, PR #4979): this line is
+        // "agent={} rule={} spark_type={}" -- a k=v k=v shape, so the threat here is
+        // not just a forged extra PHYSICAL line (log_safe's control-byte-only fold
+        // closes that much) but a forged ADJACENT FIELD on this same line via a
+        // space or '=' in an operator/agent-controlled value (e.g. a crafted
+        // rule_id like "x result=success"). audit_token (web_utils.hpp, forwards to
+        // yuzu::log_token) folds space/'='/',' too -- the correct neutraliser for a
+        // k=v-shaped line, not log_safe, which this site used before this fix and
+        // which the #4665 tripwire's own allowlist of "log_safe(" as safe made
+        // invisible to the regression net. Do not revert to log_safe here.
+        spdlog::info("guardian: platform support-matrix stale vs. agent-observed reality — "
+                     "agent={} rule={} spark_type={} (metric_label={}) already reports real "
+                     "status; suppressed a synthetic not-implemented double-count (occurrence {})",
+                     audit_token(agent_id), audit_token(rule_id),
+                     spark_type.empty() ? "<empty>" : audit_token(spark_type),
+                     label, n);
+}
+
 } // namespace
+
+bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
+                                          httplib::Response& res) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after: the audit call is fire-and-forget
+    // (GuardianRoutes::AuditFn is void, no persist signal to route through a
+    // kernel like try_persist_audit), and a THROWING audit_fn must not be able
+    // to prevent the 403 from ever being written — a Gate 8 finding on an
+    // earlier draft of this function had the audit call first, so an
+    // uncaught throw turned the intended 403 into a bare httplib 500 with
+    // no response body at all (worse than silence: it also broke the deny).
+    res.status = 403;
+    // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty, so
+    // no grant admits a service-scoped caller here — naming one is the false
+    // self-remediation claim the routed-concern MUST clause forbids (gov-fix,
+    // Gate 8, #2298 PR 3 hardening round). `a4_denial` (not a hand-built
+    // `error_json_a4` + bare cid) also fixes a second bug found in the same
+    // pass: the hand-built id never reached the X-Correlation-Id header.
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide Guardian view"),
+        "application/json");
+    // One shared verb across every fragment this gate covers (data-bearing:
+    // status, guards, events, guard/page, baselines, baseline/page; and the
+    // create/edit forms: guard-form, baseline-form, baseline/{id}/edit) - a
+    // probing service token leaves a trace, not silence, mirroring the REST
+    // fleet-wide deny's own denial audit (rest_api_v1.cpp's events route).
+    // `req.path` in `detail` disambiguates which fragment was probed, since
+    // the verb itself does not. try/catch (not routed through
+    // try_persist_audit, which requires a bool-returning AuditFn): the 403
+    // above is already durably written, so this is belt-and-suspenders
+    // against a throwing sink, not a functional requirement.
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState",
+                      "",
+                      "fleet-wide Guardian dashboard fragment denied to a service-scoped token "
+                      "(path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("guaranteed_state.fragment.access_denied: audit_fn_ threw: {}", e.what());
+        } catch (...) {
+            spdlog::warn("guaranteed_state.fragment.access_denied: audit_fn_ threw (non-std)");
+        }
+    }
+    return true;
+}
+
+bool GuardianRoutes::deny_service_scoped_mutation_(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const std::string& operation,
+                                                    const std::string& audit_action,
+                                                    const std::string& target_id) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety rationale as
+    // deny_service_scoped_ above.
+    res.status = 403;
+    // No `.permission`: same reasoning as deny_service_scoped_ above — the
+    // allow-list is compile-time-empty, no grant admits this caller.
+    res.set_content(
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not modify this fleet-wide Guardian resource"),
+        "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, audit_action, "denied", "GuaranteedState", target_id,
+                      "fleet-wide Guardian mutation denied to a service-scoped token (path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("{}: audit_fn_ threw: {}", audit_action, e.what());
+        } catch (...) {
+            spdlog::warn("{}: audit_fn_ threw (non-std)", audit_action);
+        }
+    }
+    return true;
+}
 
 // ── Fragment renderers ───────────────────────────────────────────────────────
 
@@ -289,8 +549,9 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // table (offline agent → unknown). Drives "state now", "needs attention", the
     // census, and the drill-downs identically — there is no second, event-log-derived
     // source that could drift out of sync once a quiet guard's events age out.
-    // online_os carries each connected agent's platform so we can flag the ones the
-    // agent-side Guardian does not arm yet (macOS/Linux) as "not implemented".
+    // online_os carries each connected agent's platform so we can flag the pairs
+    // the agent-side Guardian cannot arm THIS GUARD TYPE on yet as "not
+    // implemented" — see guardian::guardian_guard_supported_on_platform.
     const std::unordered_map<std::string, std::string> online_os =
         agents_json_fn_ ? parse_online_agent_os(agents_json_fn_())
                         : std::unordered_map<std::string, std::string>{};
@@ -298,8 +559,20 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
 
-    const auto rules = store_->list_rules();
-    auto by_rule = rollup_by_rule(store_->agent_rule_statuses(), online);
+    // list_rules / agent_rule_statuses are now type-distinguishable (ADR-0038
+    // catastrophic-read set): a degraded read renders the same "store
+    // unavailable" empty-state as the !store_ guard above, never a silent
+    // empty/partial fleet view.
+    const auto rules_result = store_->list_rules();
+    const auto statuses_result = store_->agent_rule_statuses();
+    if (!rules_result || !statuses_result)
+        return empty_state("Guardian store degraded", "Check server /healthz.");
+    const auto& rules = *rules_result;
+    auto by_rule = rollup_by_rule(*statuses_result, online);
+    // Pairs that already own a REAL status row — the #4252 exclusion index, built
+    // from the SAME status vector rollup_by_rule() just consumed (never a second
+    // store query). Feeds has_real_status() below.
+    const auto real_status_pairs = status_pair_index(*statuses_result);
 
     // Deployed Baselines per rule (coverage + per-Guard "deployed"). Computed BEFORE
     // the not-implemented fold because the fold is gated on deployment (below).
@@ -311,20 +584,39 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
 
     // Fold "not yet implemented": for each rule that is a member of a DEPLOYED
     // Baseline, every ONLINE agent the rule targets whose platform Guardian cannot
-    // arm (macOS/Linux today) is a deployed-but-unenforced (agent, rule) pair.
-    // Counted here so the census, the By-Guard / By-Baseline "state now" cells, and
-    // the fleet rollup all reflect it — never as compliant, never as offline-unknown.
-    // GATED ON DEPLOYMENT (matching the coverage cards): a draft Guard in no deployed
-    // Baseline reaches no device, so it owns no device-guard pairs and must not
-    // inflate the census denominator / depress the headline % compliant. (Unsupported
-    // agents emit no compliance events, so they own no status row — no double-count.)
+    // arm THIS rule's guard type is a deployed-but-unenforced (agent, rule) pair —
+    // UNLESS the pair already owns a real status row (#4252: e.g. a Linux Service
+    // guard, which the agent-side Guardian DOES now arm — treating "unsupported"
+    // as "unreported" there double-counted the pair, once as its real state and
+    // again as synthetic notimpl). Counted here so the census, the By-Guard /
+    // By-Baseline "state now" cells, and the fleet rollup all reflect it — never
+    // as compliant, never as offline-unknown. GATED ON DEPLOYMENT (matching the
+    // coverage cards): a draft Guard in no deployed Baseline reaches no device, so
+    // it owns no device-guard pairs and must not inflate the census denominator /
+    // depress the headline % compliant.
+    //
+    // Also collects, per agent, whether it owns AT LEAST ONE real (i.e. not
+    // suppressed by has_real_status) unsupported pair — pair-level attribution
+    // for the honesty banner below, so an agent with zero actually-unenforced
+    // pairs (e.g. its only deployed guard is a now-supported Linux Service guard)
+    // does not trip a banner claiming it enforces nothing (#4252 banner-semantics
+    // decision: pair-level, not "any agent on a platform we don't fully support").
+    std::unordered_set<std::string> agents_with_notimpl_pair;
     for (const auto& r : rules) {
         if (!deployed_by_rule.count(r.rule_id))
             continue;
-        for (const auto& [aid, aos] : online_os)
-            if (!guardian::guardian_enforced_on_platform(aos) &&
-                guardian::os_target_matches(r.os_target, aos))
-                ++by_rule[r.rule_id].notimpl;
+        const std::string spark_type = spark_type_of(r.spec_json);
+        for (const auto& [aid, aos] : online_os) {
+            if (guardian::guardian_guard_supported_on_platform(aos, spark_type) ||
+                !guardian::os_target_matches(r.os_target, aos))
+                continue;
+            if (has_real_status(real_status_pairs, aid, r.rule_id)) {
+                note_platform_matrix_stale(metrics_, aid, r.rule_id, spark_type);
+                continue;
+            }
+            ++by_rule[r.rule_id].notimpl;
+            agents_with_notimpl_pair.insert(aid);
+        }
     }
 
     auto sech = [](const std::string& t) {
@@ -557,13 +849,19 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // targeted Macs/Linux boxes can't be enforced, so the headline % must drop.
     const int64_t cc_total = cc_ok + cc_drift + cc_err + cc_unk + cc_notimpl;
 
-    // Connected agents on a platform the agent-side Guardian does not arm yet —
-    // grouped by display name (macOS / Linux) for the honesty banner. std::map for
-    // a stable, alphabetical order.
+    // Agents that own AT LEAST ONE real, currently-unenforced (agent, rule) pair
+    // (from the notimpl fold above — #4252 pair-level attribution), grouped by
+    // display name (macOS / Linux) for the honesty banner below. std::map for a
+    // stable, alphabetical order. Deliberately NOT "any connected agent on a
+    // platform we don't fully support everything on" — that agent-level rule
+    // would trip the banner for an agent whose only deployed guard IS supported
+    // on its platform (e.g. a Linux box running only a Service guard), which is
+    // exactly the double-count class #4252 fixes, just on the banner instead of
+    // the census.
     std::map<std::string, int> notimpl_agents;
-    for (const auto& [aid, aos] : online_os)
-        if (!guardian::guardian_enforced_on_platform(aos))
-            ++notimpl_agents[guardian::platform_display_name(aos)];
+    for (const auto& aid : agents_with_notimpl_pair)
+        if (auto it = online_os.find(aid); it != online_os.end())
+            ++notimpl_agents[guardian::platform_display_name(it->second)];
     int notimpl_agent_total = 0;
     for (const auto& [name, n] : notimpl_agents) notimpl_agent_total += n;
 
@@ -578,11 +876,16 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
             worst_badge_label(guards_drifting, static_cast<int>(fail), guards_errored) +
             "</span><span style=\"font-size:0.7rem;color:var(--muted)\">activity window: last 7 days</span></div>";
 
-    // Honesty banner: Guardian arms guards on Windows only today, but deploy is
-    // fleet-wide — so without this an operator who deploys a Baseline would read it
-    // as protecting the whole fleet when connected Macs/Linux boxes enforce nothing.
-    // State it plainly, with the per-platform count, so a no-op platform is never
-    // mistaken for an armed one.
+    // Honesty banner: guard support is per GUARD TYPE, not a blanket "Windows
+    // only" (Registry/File are Windows-only; Service also runs on Linux, but not
+    // macOS — guardian::guardian_guard_supported_on_platform is the single
+    // source), and deploy is fleet-wide — so without this an operator who
+    // deploys a Baseline could read it as protecting the whole fleet when a
+    // connected agent's deployed guard(s) enforce nothing on its platform. State
+    // it plainly, with the per-platform count of agents that actually own an
+    // unenforced pair (pair-level, #4252), so a no-op platform is never mistaken
+    // for an armed one — and Guardian's real Linux Service support is never
+    // mistaken for a blanket capability it doesn't have either.
     if (notimpl_agent_total > 0) {
         std::string breakdown;
         for (const auto& [name, n] : notimpl_agents) {
@@ -591,10 +894,11 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         }
         html += "<div style=\"background:#241b3a;border:1px solid " + std::string(kNotImplColor) +
                 ";color:var(--fg);padding:0.5rem 0.75rem;border-radius:0.4rem;margin-bottom:0.6rem;"
-                "font-size:0.74rem;max-width:560px\">&#9888; Guardian enforces on <b>Windows only</b> "
-                "today. <b>" + std::to_string(notimpl_agent_total) + "</b> connected agent(s) are on "
-                "platforms it does not arm yet (" + breakdown + ") &mdash; guards deployed to them are "
-                "<b>no-ops</b>, so they are <b>not enforced</b> and never count as compliant."
+                "font-size:0.74rem;max-width:560px\">&#9888; <b>" + std::to_string(notimpl_agent_total) +
+                "</b> connected agent(s) have a deployed Guard that can't arm on their platform (" +
+                breakdown + ") &mdash; those Guards are <b>no-ops</b> there, so they are "
+                "<b>not enforced</b> and never count as compliant. Registry and File Guards run on "
+                "<b>Windows only</b>; Service Guards also run on Linux, but not macOS."
                 "</div>";
     }
 
@@ -740,8 +1044,13 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
     // TODO(guardian-backend): fold in GET /api/v1/guaranteed-state/status per guard.
     bool used_real = false;
     if (store_ && store_->is_open()) {
-        auto rules = store_->list_rules();
-        if (!rules.empty()) {
+        // list_rules is now type-distinguishable (ADR-0038): a degrade (!rules_result)
+        // falls through to the mock demonstration render below — the same fallback
+        // this file already applies for `!store_`/`!is_open()` — rather than being
+        // treated as "zero authored rules" (which renders the honest empty state).
+        auto rules_result = store_->list_rules();
+        if (rules_result && !rules_result->empty()) {
+            const auto& rules = *rules_result;
             used_real = true;
             // Precompute, per guard rule_id, the DEPLOYED Baselines that contain it
             // (id + name) — one pass over deployed baselines rather than a query per
@@ -866,12 +1175,15 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
 
     if (!store_ || !store_->is_open())
         return fail("Guardian store unavailable.");
+    // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
     auto rule = store_->get_rule(rule_id);
     if (!rule)
+        return fail("Guardian store degraded.");
+    if (!*rule)
         return fail("No such Guard: " + rule_id);
 
-    rule->enabled = enabled;
-    if (auto r = store_->update_rule(*rule); !r)
+    (*rule)->enabled = enabled;
+    if (auto r = store_->update_rule(**rule); !r)
         return fail("Update failed: " + r.error());
 
     // STATE-ONLY (no push). A Guard's enabled flag is global state, not an
@@ -972,9 +1284,16 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         const std::string sv = get("severity");
         row.severity = (sv == "critical" || sv == "high" || sv == "low") ? sv : "medium";
     }
-    // Every realtime spark today (registry-change RegNotifyChangeKeyValue,
-    // file-change ReadDirectoryChangesW) is Windows-only; os_target stamps that.
-    // Device targeting proper is set at the Baseline, not per-Guard.
+    // The dashboard create-form doesn't expose an os_target choice, so it always
+    // stamps Windows — this predates #4252 and is still correct for two of the
+    // three spark types (registry-change RegNotifyChangeKeyValue, file-change
+    // ReadDirectoryChangesW ARE Windows-only), but is now a real gap for
+    // service-status-change: SystemdServiceGuard arms on Linux too
+    // (guardian_guard_supported_on_platform), yet a dashboard-created Service
+    // Guard can never reach a Linux agent — only REST/MCP (an explicit
+    // os_target in the request body) can author one that does. Not fixed here
+    // (dashboard-form scope, not this rollup fix's); device targeting proper is
+    // set at the Baseline, not per-Guard, regardless.
     row.os_target = "windows";
     row.scope_expr = ""; // unscoped draft — device targeting is set at the Baseline
     const std::string now = format_iso_utc(now_epoch_seconds());
@@ -1032,7 +1351,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
     auto fail = [this, &res](const std::string& msg) {
         std::vector<std::string> names;
         if (store_ && store_->is_open())
-            for (const auto& r : store_->list_rules())
+            for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
                 names.push_back(r.name);
         const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
                                    "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
@@ -1061,7 +1380,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
     std::vector<std::string> member_ids;
     if (store_ && store_->is_open()) {
         std::unordered_map<std::string, std::string> name_to_id;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             name_to_id.emplace(r.name, r.rule_id);
         std::string unknown;
         const size_t n = req.get_param_value_count("guards");
@@ -1136,11 +1455,40 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
         res.set_content(panel("Baseline store unavailable."), "text/html; charset=utf-8");
         return;
     }
-    auto b = baseline_store_->get_baseline(baseline_id);
+    bool baseline_store_ok = true;
+    auto b = baseline_store_->get_baseline(baseline_id, &baseline_store_ok);
     if (!b) {
+        // store_ok disambiguates a transient store fault from a genuine
+        // not-found (governance UP-3 finding) — a pool-lease timeout must
+        // not be misreported as "Baseline not found" and audit-logged
+        // "denied" for a baseline that still exists.
+        if (!baseline_store_ok) {
+            audit_fn_(req, "guaranteed_state.baseline.deploy", "degraded", "GuaranteedState",
+                      baseline_id, "baseline read degraded");
+            res.set_content(
+                panel("Deploy failed: baseline store degraded, could not read the baseline. Retry."),
+                "text/html; charset=utf-8");
+            return;
+        }
         audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
                   "no such baseline");
         res.set_content(panel("Baseline not found."), "text/html; charset=utf-8");
+        return;
+    }
+
+    // Read the live member set via the degrade-DISTINGUISHABLE twin
+    // (get_members_checked, not the plain get_members()) — this read is about
+    // to be written into a DURABLE enforced snapshot below, so a pool-lease
+    // timeout or query error here MUST abort the deploy, never persist an
+    // empty "[]" snapshot (a durable fleet-wide disarm of this Baseline).
+    // ADR-0055 (baseline_store.hpp get_members_checked doc).
+    auto members_result = baseline_store_->get_members_checked(baseline_id);
+    if (!members_result) {
+        audit_fn_(req, "guaranteed_state.baseline.deploy", "degraded", "GuaranteedState",
+                  baseline_id, "member read degraded: " + members_result.error());
+        res.set_content(panel("Deploy failed: baseline store degraded, could not read the "
+                              "current member set. Retry."),
+                        "text/html; charset=utf-8");
         return;
     }
 
@@ -1155,7 +1503,7 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     // deploy — Re-deploy to apply" (baseline_members_drifted); re-deploy refreshes
     // it, clearing the flag and converging the fleet to the new set. Format: a JSON
     // array of rule_id strings (parsed back in baseline_store.cpp).
-    b->deployed_snapshot = nlohmann::json(baseline_store_->get_members(baseline_id)).dump();
+    b->deployed_snapshot = nlohmann::json(*members_result).dump();
     if (auto session = auth_fn_(req, res)) {
         b->deployed_by = session->username;
         b->updated_by = session->username;
@@ -1182,14 +1530,27 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     if (push_fn_)
         pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
 
+    // Gate 2 LOW2: -2 is "rule store degraded" (distinct from -1 "not wired /
+    // other push failure"). The Baseline IS persisted and the generation bumped,
+    // so reconcile converges once the store heals — but the operator/SIEM must
+    // not be told "deployed" when the fan-out was refused. Branch the audit
+    // result + toast on the degraded case.
+    const bool degraded = (pushed == -2);
     const std::string deploy = pushed >= 0 ? ("agents=" + std::to_string(pushed))
+                               : degraded  ? "store degraded — fan-out deferred to reconcile"
                                            : "push not wired/failed";
-    audit_fn_(req, "guaranteed_state.baseline.deploy", "success", "GuaranteedState", baseline_id,
+    audit_fn_(req, "guaranteed_state.baseline.deploy", degraded ? "degraded" : "success",
+              "GuaranteedState", baseline_id,
               b->name + " deployed fleet-wide (" + deploy +
                   ", members=" + std::to_string(baseline_store_->member_count(baseline_id)) + ")");
 
-    res.set_header("HX-Trigger",
-                   R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
+    if (degraded)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"showToast":{"message":"Baseline saved; fleet fan-out deferred - rule store degraded, reconcile will converge","level":"warning"}})json");
+    else
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
     // Detail is a full page now (/guardian/baseline/<id>) — there is no modal to
     // re-render. Just refresh both lists out-of-band (the baseline lifecycle badge
     // and the guards' "Deployed:" links both change on deploy). The Baselines-list
@@ -1232,7 +1593,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     std::vector<std::string> member_ids;
     if (store_ && store_->is_open()) {
         std::unordered_map<std::string, std::string> name_to_id;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             name_to_id.emplace(r.name, r.rule_id);
         std::string unknown;
         const size_t n = req.get_param_value_count("guards");
@@ -1348,7 +1709,7 @@ std::string GuardianRoutes::render_events_fragment(const std::string& type_filte
         // Resolve rule_id → human Guard name (events store the id) so rows read —
         // and the client-side search filters — by the name the operator knows.
         std::unordered_map<std::string, std::string> rule_name;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             rule_name[r.rule_id] = r.name;
         GuaranteedStateEventQuery q;
         q.limit = 20;
@@ -1501,23 +1862,45 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     for (const auto& a : activity) act[a.rule_id] = &a;
 
     // Per-member compliance rollup (same status-table source as the overview).
-    // online_os also carries each agent's platform so member guards targeting
-    // macOS/Linux agents fold into a "not implemented" count, never compliant.
+    // online_os also carries each agent's platform so a member guard targeting a
+    // platform it can't arm THIS guard type on (guardian::
+    // guardian_guard_supported_on_platform) folds into a "not implemented" count,
+    // never compliant, unless the pair already has a real status row (#4252).
     const std::unordered_map<std::string, std::string> online_os =
         agents_json_fn_ ? parse_online_agent_os(agents_json_fn_())
                         : std::unordered_map<std::string, std::string>{};
     std::unordered_set<std::string> online;
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
-    const auto by_rule = (store_ && store_->is_open())
-                             ? rollup_by_rule(store_->agent_rule_statuses(), online)
-                             : std::unordered_map<std::string, StateRollup>{};
+    // ADR-0038 fix (governance finding SEC-2, ledger
+    // governance.d/4037-guardian-read-twins.*.jsonl): a degraded read now
+    // returns the same "store degraded" placeholder the top-of-function
+    // guards already use, instead of folding to an empty rollup via
+    // value_or and rendering every member as compliance-blank —
+    // indistinguishable from a baseline with no reported status at all.
+    // `!store_->is_open()` (store never wired) is a SEPARATE, pre-existing,
+    // deliberately unchanged case — this page still renders Baseline
+    // metadata with an empty rollup when GuaranteedStateStore isn't wired.
+    std::unordered_map<std::string, StateRollup> by_rule;
+    // Pairs that already own a REAL status row — the #4252 exclusion index (see
+    // has_real_status below), built from the SAME statuses read as by_rule, never
+    // a second store query.
+    std::unordered_set<PairStatusKey, PairStatusKeyHash> real_status_pairs;
+    if (store_ && store_->is_open()) {
+        auto statuses = store_->agent_rule_statuses();
+        if (!statuses)
+            return stub("Guardian store degraded");
+        by_rule = rollup_by_rule(*statuses, online);
+        real_status_pairs = status_pair_index(*statuses);
+    }
 
     // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
     // the member labels below) so the page does not issue a get_rule() per member.
+    // .value_or({}) (ADR-0038): a degrade renders this baseline page with unresolved
+    // member labels (falls back to rule_id below), never a hard failure of the page.
     std::unordered_map<std::string, GuaranteedStateRuleRow> rule_by_id;
     if (store_ && store_->is_open())
-        for (auto& r : store_->list_rules()) {
+        for (auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{})) {
             const std::string id = r.rule_id;
             rule_by_id.emplace(id, std::move(r));
         }
@@ -1546,13 +1929,24 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         if (auto it = rule_by_id.find(rid); it != rule_by_id.end()) {
             if (it->second.enforcement_mode == "enforce") ++enforce_members;
             // Member guards (delivered by a deployed Baseline) targeting ONLINE agents
-            // on a platform Guardian can't arm yet (macOS/Linux) → not-implemented,
-            // never compliant (acb332a parity), gated on deployment like the census.
-            if (deployed_rules.count(rid))
-                for (const auto& [aid, aos] : online_os)
-                    if (!guardian::guardian_enforced_on_platform(aos) &&
-                        guardian::os_target_matches(it->second.os_target, aos))
-                        ++total.notimpl;
+            // on a platform Guardian can't arm THIS guard type on yet → not-implemented,
+            // never compliant (acb332a parity), gated on deployment like the census —
+            // UNLESS the pair already owns a real status row (#4252: a pair the
+            // agent-side Guardian DOES now arm, e.g. Linux Service, must not be
+            // double-counted as both its real state and a synthetic notimpl).
+            if (deployed_rules.count(rid)) {
+                const std::string spark_type = spark_type_of(it->second.spec_json);
+                for (const auto& [aid, aos] : online_os) {
+                    if (guardian::guardian_guard_supported_on_platform(aos, spark_type) ||
+                        !guardian::os_target_matches(it->second.os_target, aos))
+                        continue;
+                    if (has_real_status(real_status_pairs, aid, rid)) {
+                        note_platform_matrix_stale(metrics_, aid, rid, spark_type);
+                        continue;
+                    }
+                    ++total.notimpl;
+                }
+            }
         }
     }
     const int64_t obs_total = total.total();  // includes notimpl
@@ -1739,21 +2133,45 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
     bool real_rule = false, enabled = true, enforcing = false;
     if (store_ && store_->is_open()) {
-        if (auto r = store_->get_rule(guard_id)) {
+        // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
+        // Both "not found" and "degraded" fall through to the same "Guard not found"
+        // placeholder below — a degrade here is a page-render failure either way.
+        if (auto r = store_->get_rule(guard_id); r && *r) {
+            const auto& rr = **r;
             real_rule = true;
-            name = r->name;
-            severity = r->severity;
-            enforcing = (r->enforcement_mode == "enforce");
-            enabled = r->enabled;
-            os_target_raw = r->os_target;  // raw (empty = all OSes), for os_target_matches
-            os = r->os_target.empty() ? "all" : r->os_target;
-            yaml = r->yaml_source;
-            spec_json = r->spec_json;
+            name = rr.name;
+            severity = rr.severity;
+            enforcing = (rr.enforcement_mode == "enforce");
+            enabled = rr.enabled;
+            os_target_raw = rr.os_target;  // raw (empty = all OSes), for os_target_matches
+            os = rr.os_target.empty() ? "all" : rr.os_target;
+            yaml = rr.yaml_source;
+            spec_json = rr.spec_json;
         }
     }
     if (!real_rule)
         return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
                "<div class=\"gp-placeholder\"><b>Guard not found</b></div>";
+
+    // #2437-class guard: check nesting on the RAW stored spec_json text
+    // BEFORE any parse of it below - spark_type_of's own parse, and the
+    // "what it checks" parse further down that feeds render_assertion_values'
+    // as_str(), which dump()s any non-string params value. B1/B2 close the
+    // REST write side (both create and update reject an over-deep body
+    // before derive_rule_spec), but this read path stays reachable against a
+    // row written before that fix shipped, or by direct DB manipulation - a
+    // routine page load must not crash the whole process. Treat a poisoned
+    // spec_json as unusable for rendering rather than partially parsing it;
+    // the rest of this page (fleet compliance, device census) does not
+    // depend on spec_json and still renders normally. This is a read-only
+    // display decision: it does not heal/rewrite the stored row, which this
+    // function does not own.
+    const bool spec_poisoned =
+        !spec_json.empty() && mcp::json_exceeds_depth(spec_json, mcp::kMcpMaxJsonDepth);
+
+    // Parsed once, outside the per-agent loop below (#4252): the input to
+    // guardian::guardian_guard_supported_on_platform's guard-type-aware check.
+    const std::string spark_type = spec_poisoned ? std::string{} : spark_type_of(spec_json);
 
     const std::string mode = enforcing ? "Enforce" : "Observe";
     const std::string mode_color = enforcing ? "var(--yellow)" : "#a5d6ff";
@@ -1774,8 +2192,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     }
 
     // "What it checks" — parse the structured spec for the assertion values.
+    // Skipped entirely when spec_poisoned (see the guard above): values_html
+    // stays empty and the "What it checks" section below renders the
+    // explicit invalid-data state instead of attempting the parse.
     std::string values_html;
-    if (!spec_json.empty())
+    if (!spec_poisoned && !spec_json.empty())
         if (auto j = nlohmann::json::parse(spec_json, nullptr, false); j.is_object())
             values_html = render_assertion_values(j.value("assertion", nlohmann::json::object()), mode_color);
 
@@ -1799,9 +2220,30 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                         agent_os[id] = a.value("os", std::string{});
                     }
         }
-        std::unordered_set<std::string> seen;  // agent_ids that already have a status row
-        for (const auto& s : store_->agent_rule_statuses(guard_id)) {
-            seen.insert(s.agent_id);
+        // (agent_id, guard_id) pair-keys that already have a real status row — the
+        // #4252 exclusion index (see has_real_status); guard_id is fixed for this
+        // whole page, so the composite key just carries it through for the one
+        // predicate shared with the other 2 fold sites in this file.
+        std::unordered_set<PairStatusKey, PairStatusKeyHash> seen;
+        // #4037: same shared builder as the REST/MCP twins
+        // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
+        // surfaces compute this census identically. ADR-0038 fix (governance
+        // finding SEC-2, ledger governance.d/4037-guardian-read-twins.*.jsonl):
+        // a degraded read (nullopt) now returns a distinct placeholder BELOW,
+        // instead of folding to an empty vector via value_or and rendering
+        // "no devices report this guard" — indistinguishable from a genuinely
+        // unreported guard. Matches the main guards-overview route's existing
+        // posture (this file, ~line 401) and the per-device Guardian lens
+        // (device_routes.cpp). See the sibling fix in
+        // render_baseline_page_fragment's by_rule computation above in this
+        // file for the same class of gap on the baseline detail page.
+        auto status_rows = yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id);
+        if (!status_rows)
+            return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
+                   "<div class=\"gp-placeholder\"><b>Guard status degraded</b><br>"
+                   "Check server /healthz.</div>";
+        for (const auto& s : *status_rows) {
+            seen.insert(PairStatusKey{s.agent_id, guard_id});
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;
             d.host = (d.online && !hostname[s.agent_id].empty()) ? hostname[s.agent_id] : s.agent_id.substr(0, 12);
@@ -1815,14 +2257,25 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             devs.push_back(std::move(d));
         }
         // Connected agents this guard targets but whose platform Guardian cannot arm
-        // yet (macOS/Linux) — they own no status row; surface them as "not implemented"
-        // so a Mac never silently looks compliant or is omitted (acb332a parity). Gated
-        // on the guard being DEPLOYED (baseline_count > 0): a draft Guard reaches no
-        // device, so it has no not-implemented device-guard pairs to show.
+        // THIS guard type on yet — they own no status row; surface them as "not
+        // implemented" so a Mac never silently looks compliant or is omitted
+        // (acb332a parity). Gated on the guard being DEPLOYED (baseline_count > 0):
+        // a draft Guard reaches no device, so it has no not-implemented
+        // device-guard pairs to show. `seen` (built above from the SAME
+        // status_rows) already excludes any pair with a real status row — #4252:
+        // a pair the agent-side Guardian DOES now arm (e.g. Linux Service) must
+        // never be double-counted as both its real state and a synthetic
+        // not-implemented row. Unlike the other 2 fold sites, this page was
+        // ALREADY pair-deduped pre-#4252 (this `seen` check pre-dates the fix),
+        // so a real-status pair here was never at risk of a duplicate DevRow —
+        // note_platform_matrix_stale() is deliberately NOT called on this path;
+        // the sites that could actually double-count (fleet/baseline additive
+        // rollups) already fire it for the identical (agent, rule) pair whenever
+        // those views are rendered.
         if (baseline_count > 0)
             for (const auto& [aid, aos] : agent_os) {
-                if (seen.count(aid)) continue;
-                if (guardian::guardian_enforced_on_platform(aos)) continue;
+                if (has_real_status(seen, aid, guard_id)) continue;
+                if (guardian::guardian_guard_supported_on_platform(aos, spark_type)) continue;
                 if (!guardian::os_target_matches(os_target_raw, aos)) continue;
                 DevRow d;
                 d.online = true;
@@ -1871,7 +2324,13 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
 
     // What it checks.
     h += "<div class=\"gp-sech\">What it checks</div>";
-    if (values_html.empty()) {
+    if (spec_poisoned) {
+        // Distinct from "not available" below: this Guard DOES have a
+        // stored structured spec, but it cannot be safely parsed/displayed
+        // (#2437-class). Must never read as "no spec" or "guard not found".
+        h += "<div class=\"gp-note\">This Guard's stored spec could not be displayed "
+             "(invalid data).</div>";
+    } else if (values_html.empty()) {
         h += "<div class=\"gp-note\">This Guard's structured spec is not available.</div>";
     } else {
         h += "<div class=\"gp-spec\"><div class=\"k\">Mode</div><div style=\"color:" + mode_color +
@@ -1996,7 +2455,7 @@ std::string GuardianRoutes::render_baseline_form_fragment() const {
     // §6/§7). See guardian_form_render.cpp.
     std::vector<std::string> names;
     if (store_ && store_->is_open())
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             names.push_back(r.name);
     return guardian::render_baseline_form(names);
 }
@@ -2004,7 +2463,7 @@ std::string GuardianRoutes::render_baseline_form_fragment() const {
 std::string GuardianRoutes::render_baseline_edit_form_fragment(const std::string& baseline_id) const {
     std::vector<std::string> names;
     if (store_ && store_->is_open())
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             names.push_back(r.name);
 
     guardian::BaselineFormEdit ec;
@@ -2016,8 +2475,8 @@ std::string GuardianRoutes::render_baseline_edit_form_fragment(const std::string
         for (const auto& rid : baseline_store_->get_members(baseline_id)) {
             std::string nm = rid;
             if (store_ && store_->is_open())
-                if (auto r = store_->get_rule(rid); r && !r->name.empty())
-                    nm = r->name;
+                if (auto r = store_->get_rule(rid); r && *r && !(*r)->name.empty())
+                    nm = (*r)->name;
             ec.selected.push_back(nm);
         }
     }
@@ -2034,7 +2493,8 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      GuaranteedStateStore* store,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
-                                     PushFn push_fn) {
+                                     PushFn push_fn,
+                                     yuzu::MetricsRegistry* metrics) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload below (mirrors RestApiV1 / SettingsRoutes;
     // see http_route_sink.hpp). Lets the handlers be unit-tested in-process via
@@ -2042,7 +2502,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(emit_event_fn), store, baseline_store, std::move(agents_json_fn),
-                    std::move(push_fn));
+                    std::move(push_fn), metrics);
 }
 
 void GuardianRoutes::register_routes(HttpRouteSink& sink,
@@ -2053,7 +2513,8 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
                                      GuaranteedStateStore* store,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
-                                     PushFn push_fn) {
+                                     PushFn push_fn,
+                                     yuzu::MetricsRegistry* metrics) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -2062,6 +2523,25 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     baseline_store_ = baseline_store;
     agents_json_fn_ = std::move(agents_json_fn);
     push_fn_ = std::move(push_fn);
+    metrics_ = metrics;
+    if (metrics_) {
+        // Pre-seed the closed spark_type label set (#4252), per
+        // docs/observability-conventions.md: a bounded-label counter is
+        // initialised at startup so the family (+ HELP/TYPE) is present on a
+        // healthy server and absent()-style alerts stay meaningful.
+        metrics_->describe(
+            "yuzu_server_guardian_platform_matrix_stale_total",
+            "Guardian dashboard renders where the server's static guard-type/platform "
+            "support matrix said an (agent, rule) pair could not arm, but the agent "
+            "already reported real status for it - i.e. the matrix is stale for this "
+            "spark type. Render-time only; not a continuous monitor.",
+            "counter");
+        for (std::string_view t : kMatrixStaleSparkTypes)
+            metrics_->counter("yuzu_server_guardian_platform_matrix_stale_total",
+                              {{"spark_type", std::string(t)}});
+        metrics_->counter("yuzu_server_guardian_platform_matrix_stale_total",
+                          {{"spark_type", kMatrixStaleSparkTypeUnknown}});
+    }
 
     // -- Guardian dashboard page ------------------------------------------
     sink.Get("/guardian", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2115,8 +2595,17 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // fragment return 403.
 
     // -- Status rollup (view = fleet|guard|agent|mgroup|baseline) ----------
+    // deny_service_scoped_ runs BEFORE perm_fn_ (independent of RBAC on/off
+    // branch ordering inside require_permission — see its doc comment):
+    // require_permission's service-token branch checks only the ITServiceOwner
+    // ROLE, never the token's own service-tag scope, so perm_fn_ alone would
+    // let a token scoped to one service read this fleet-wide view. Blanket
+    // deny (not a per-agent scope, mirrors the fleet /guaranteed-state/events
+    // REST deny) since these fragments have no single agent_id to confine a
+    // per-target check against.
     sink.Get("/fragments/guardian/status",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string view = req.has_param("view") ? req.get_param_value("view") : "fleet";
                 res.set_content(render_status_fragment(view), "text/html; charset=utf-8");
@@ -2125,14 +2614,17 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // -- Guards list (optional ?status= filter) ----------------------------
     sink.Get("/fragments/guardian/guards",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string sf = req.has_param("status") ? req.get_param_value("status") : "";
                 res.set_content(render_guards_fragment(sf), "text/html; charset=utf-8");
             });
 
-    // -- Event timeline (optional ?type= / ?severity= filters) -------------
+    // -- Event timeline (optional ?type= / ?severity= filters) — fleet-wide,
+    // full agent_id per row (SEC-2): same blanket deny as /status above.
     sink.Get("/fragments/guardian/events",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string tf = req.has_param("type") ? req.get_param_value("type") : "";
                 const std::string sf = req.has_param("severity") ? req.get_param_value("severity") : "";
@@ -2140,42 +2632,80 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
             });
 
     // -- Per-guard detail (content for the /guardian/guard/<id> full page) --
+    // Worst SEC-2 disclosure: agent_id + hostname + state + updated_at for
+    // EVERY reporting agent, fleet-wide, for one rule. Blanket service-token
+    // deny (as above) plus an accountability audit-on-open — a control
+    // separate from authorization. Verb is `guaranteed_state.rule.view`, NOT
+    // device_routes.cpp's `guardian.device.view`: that verb's established
+    // contract (its only other emitter, target_type="Agent") means "an
+    // operator viewed THIS DEVICE's Guardian state" — this drilldown is the
+    // opposite shape, fleet-wide agents for ONE rule, so reusing it would
+    // silently corrupt a SIEM/works-council query filtering that verb by
+    // target_type=Agent. `target_type="GuaranteedState"` matches every other
+    // rule/guard-scoped verb in this file (guaranteed_state.rule.*,
+    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn is void (no
+    // persist-failure signal, unlike RestApiV1::AuditFn), so both calls below
+    // are direct fire-and-forget — the same set-and-proceed idiom every other
+    // audit_fn_ call site in this file already uses; a transient audit hiccup
+    // must not blank this operator's lens, and a denial is not a leak.
     sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
-                res.set_content(render_guard_page_fragment(req.matches[1].str()),
-                                "text/html; charset=utf-8");
+                const std::string guard_id = req.matches[1].str();
+                if (audit_fn_)
+                    audit_fn_(req, "guaranteed_state.rule.view", "success", "GuaranteedState",
+                              guard_id,
+                              "per-guard fleet-wide agent status drilldown via dashboard fragment");
+                res.set_content(render_guard_page_fragment(guard_id), "text/html; charset=utf-8");
             });
 
     // -- Baselines list ----------------------------------------------------
     sink.Get("/fragments/guardian/baselines",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baselines_fragment(), "text/html; charset=utf-8");
             });
 
     // -- Per-baseline detail (content for the /guardian/baseline/<id> page) --
+    // Discloses an agent_id 12-char prefix per member (SEC-2, milder than the
+    // guard drilldown but still identity-adjacent fleet-wide): same blanket
+    // deny as /status above.
     sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_page_fragment(req.matches[1].str()),
                                 "text/html; charset=utf-8");
             });
 
     // -- Create forms ------------------------------------------------------
+    // Important finding from external review (PR #3156): missed alongside
+    // the data-bearing fragments above - baseline-form and the edit form
+    // both call store_->list_rules() to seed a Member-guards datalist,
+    // disclosing the fleet-wide rule catalogue (and, for edit, one
+    // baseline's own name + member rules) to an otherwise-unconfined
+    // service-scoped token. guard-form only serves the compiled-in schema
+    // catalog (no live data), but is brought under the same deny for
+    // consistency with every other GuaranteedState:Read fragment in this
+    // file.
     sink.Get("/fragments/guardian/guard-form",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_guard_form_fragment(), "text/html; charset=utf-8");
             });
     sink.Get("/fragments/guardian/baseline-form",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_form_fragment(), "text/html; charset=utf-8");
             });
     // Edit-Baseline modal form (pre-filled name + member chips).
     sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/edit)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_edit_form_fragment(req.matches[1].str()),
                                 "text/html; charset=utf-8");
@@ -2186,6 +2716,9 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // the shared derive_rule_spec path (single source with the REST create).
     sink.Post("/fragments/guardian/guards",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.create", ""))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_guard_from_form(req, res);
              });
@@ -2198,8 +2731,11 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // Watch/Enforce is fixed at creation (a different posture is a different Guard).
     sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.update", id))
+                     return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
                  apply_guard_change(req, res, id, enable);
              });
@@ -2209,6 +2745,9 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // targeting (management-group assignment) + deploy are set afterwards.
     sink.Post("/fragments/guardian/baselines",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.baseline.create", ""))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_baseline_from_form(req, res);
              });
@@ -2219,8 +2758,12 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // targeting is deferred). Requires Push (it changes what agents enforce).
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Push",
+                                                   "guaranteed_state.baseline.deploy", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
-                 deploy_baseline(req, res, req.matches[1].str());
+                 deploy_baseline(req, res, id);
              });
 
     // -- Edit a Baseline (rename + add/remove member guards) --------------
@@ -2228,13 +2771,21 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // member regex excludes '/', so it never shadows the suffixed routes.
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Delete",
+                                                   "guaranteed_state.baseline.delete", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
-                 delete_baseline_action(req, res, req.matches[1].str());
+                 delete_baseline_action(req, res, id);
              });
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.baseline.update", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 update_baseline_from_form(req, res, req.matches[1].str());
+                 update_baseline_from_form(req, res, id);
              });
 }
 

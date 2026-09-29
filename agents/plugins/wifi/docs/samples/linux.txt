@@ -1,0 +1,9 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 08531a51b9d2
+== action=list_networks
+wifi|error|No wireless tools available (nmcli/iw)|0|0|none
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+
+== action=connected
+connected|unknown|Wi-Fi connection state could not be determined (NetworkManager unreachable; nmcli and iwconfig both failed)|0|none|none
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+

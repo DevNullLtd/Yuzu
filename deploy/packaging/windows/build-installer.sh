@@ -72,7 +72,6 @@ mkdir -p "$SCRIPT_DIR/output"
 
 # Convert paths to Windows format for ISCC
 WIN_BUILD_DIR=$(cygpath -w "$BUILD_DIR" 2>/dev/null || echo "$BUILD_DIR")
-WIN_CONTENT_DIR=$(cygpath -w "$REPO_ROOT/content" 2>/dev/null || echo "$REPO_ROOT/content")
 
 # ── Build agent installer ──
 if [[ "$TARGET" == "agent" || "$TARGET" == "all" ]]; then
@@ -117,7 +116,6 @@ if [[ "$TARGET" == "server" || "$TARGET" == "all" ]]; then
     MSYS_NO_PATHCONV=1 "$ISCC" \
         "/DAppVersion=$VERSION" \
         "/DBuildDir=$WIN_BUILD_DIR" \
-        "/DContentDir=$WIN_CONTENT_DIR" \
         "$WIN_ISS"
 
     echo "Built: $SCRIPT_DIR/output/YuzuServerSetup-$VERSION.exe"

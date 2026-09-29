@@ -1,0 +1,168 @@
+## Windows Optional Features Definitions
+## Reports Windows optional OS feature state (enabled/disabled/pending) via
+## the DISM API. Windows-only: DISM has no Linux/macOS equivalent.
+## Plugin: windows_optional_features | Actions: list, info
+##
+## Source: DismOpenSession(DISM_ONLINE_IMAGE) + DismGetFeatures/
+## DismGetFeatureInfo, resolved at runtime from DismApi.dll (System32) --
+## no ADK dependency, no dism.exe, no WMI, no COM. See
+## agents/plugins/windows_optional_features/README.md.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.features.list
+  displayName: List Optional Features
+  version: 1.0.0
+  description: >
+    Enumerates Windows optional OS features (DismGetFeatures) and reports
+    each one's state — enabled, disabled, pending_enable, pending_disable,
+    superseded, partially_installed, or unknown — plus whether a restart is
+    required to complete a pending change. An optional `state` filter
+    narrows to one bucket (enabled = installed only; disabled = not
+    present/removed/staged; pending = install/uninstall pending).
+    Windows-only: DISM has no Linux/macOS equivalent.
+  tags: [windows, dism, features, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: windows_optional_features
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      state:
+        type: string
+        description: >
+          Optional filter narrowing the result to one state bucket.
+        validation:
+          enum: [enabled, disabled, pending]
+
+  result:
+    # feature|<name>|<state>|<restart_required 0/1>
+    columns:
+      - name: name
+        type: string
+        description: 'DISM feature name (FeatureName), e.g. NetFx3.'
+        example: NetFx3
+        platforms: [windows]
+      - name: state
+        type: string
+        description: 'Feature state. Values: enabled, disabled, pending_enable, pending_disable, superseded, partially_installed, unknown.'
+        example: enabled
+        platforms: [windows]
+      - name: restart_required
+        type: boolean
+        description: 'Whether a restart is needed to complete a pending enable/disable. Values: 1 (pending state), 0 (not pending) — a digit, never true/false.'
+        example: "0"
+        platforms: [windows]
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "List Windows optional features"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [windows_optional_features]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.features.info
+  displayName: Optional Feature Detail
+  version: 1.0.0
+  description: >
+    Detail for one Windows optional OS feature (DismGetFeatureInfo): its
+    display name, description, state, and restart requirement. `feature`
+    is bounded and character-restricted (`^[A-Za-z0-9._-]{1,256}$`) before
+    it ever reaches DISM — an invalid value is refused with no DISM call.
+    Windows-only: DISM has no Linux/macOS equivalent.
+  tags: [windows, dism, features, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: windows_optional_features
+    action: info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [feature]
+    properties:
+      feature:
+        type: string
+        description: >
+          The DISM feature name (FeatureName), e.g. NetFx3. The plugin
+          additionally refuses any value containing a ".." substring
+          (path-traversal guard) even though every individual character in
+          such a value would otherwise match the pattern below.
+        validation:
+          pattern: "^[A-Za-z0-9._-]{1,256}$"
+
+  result:
+    # feature_info|<name>|<display_name>|<state>|<restart_type>|<description>
+    columns:
+      - name: name
+        type: string
+        description: 'DISM feature name (FeatureName), e.g. NetFx3.'
+        example: NetFx3
+        platforms: [windows]
+      - name: display_name
+        type: string
+        description: 'Operator-visible feature display name (DismFeatureInfo.DisplayName).'
+        example: .NET Framework 3.5 (includes .NET 2.0 and 3.0)
+        platforms: [windows]
+      - name: state
+        type: string
+        description: 'Feature state. Values: enabled, disabled, pending_enable, pending_disable, superseded, partially_installed, unknown.'
+        example: enabled
+        platforms: [windows]
+      - name: restart_type
+        type: string
+        description: 'Restart requirement for a pending change (DismFeatureInfo.RestartRequired). Values: no, possible, required, unknown.'
+        example: possible
+        platforms: [windows]
+      - name: description
+        type: string
+        description: 'Feature description (DismFeatureInfo.Description).'
+        example: .NET Framework 3.5 (includes .NET 2.0 and 3.0)
+        platforms: [windows]
+
+  readablePayload: "Report detail for Windows optional feature {{feature}}"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [windows_optional_features]
+
+status:
+  phase: active

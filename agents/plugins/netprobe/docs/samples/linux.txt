@@ -1,0 +1,13 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash e635d1fd4823
+== action=icmp targets=127.0.0.1
+rtt|127.0.0.1|icmp|5|5|0.0|0.1|0.2|0.0|0.0|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=tcp targets=127.0.0.1 port=22
+rtt|127.0.0.1|tcp:22|5|0|0.0|0.0|0.0|0.0|100.0|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns targets=localhost
+dns|localhost|0.4|ok|2
+[result_status] UNDECLARED / UNKNOWN / 
+

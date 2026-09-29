@@ -115,9 +115,15 @@ struct ModuleEvent {
 /// loaded image under `C:\Users\<name>`, `C:\Documents and Settings\<name>`,
 /// `/home/<name>`, or `/Users/<name>` would otherwise persist a username.
 /// Replaces the segment immediately after a case-insensitive `Users` /
-/// `Documents and Settings` / `home` path segment with `<redacted>`, preserving
-/// the original separators (handles `\`, `/`, and the `\Device\HarddiskVolumeN\…`
-/// NT form). Non-profile paths (System32, /usr/lib, …) pass through unchanged.
+/// `Documents and Settings` / `home` / `media` / `Volumes` path segment with
+/// `<redacted>`, preserving the original separators (handles `\`, `/`, and the
+/// `\Device\HarddiskVolumeN\…` NT form). The `media`/`Volumes` triggers also
+/// cover `/media/<user>/...` and `/run/media/<user>/...` (single-segment
+/// match on `media` catches both, `run` needing no special case) and
+/// `/Volumes/<name>/...` on macOS — the removable-media mount points this
+/// helper's other caller, the removable-media exec-from-removable path, needs
+/// covered (tar_cursor.hpp rule 4b). Non-profile, non-mount paths (System32,
+/// /usr/lib, …) pass through unchanged.
 /// Known gaps (documented, deferred): 8.3 short names and redirected/roaming
 /// profile roots are not recognised — cross-reference `$Process_Live` for those.
 /// Pure + cross-platform: every module collector (ETW/ES/auditd) calls it at
@@ -141,7 +147,8 @@ inline std::string redact_module_dir(const std::string& dir) {
         std::string seg = dir.substr(spans[k].first, spans[k].second - spans[k].first);
         for (auto& c : seg)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (seg == "users" || seg == "home" || seg == "documents and settings") {
+        if (seg == "users" || seg == "home" || seg == "documents and settings" ||
+            seg == "media" || seg == "volumes") {
             // Replace the NEXT segment (the username) with the redaction marker;
             // everything else — including separators — is kept verbatim.
             return dir.substr(0, spans[k + 1].first) + "<redacted>" +

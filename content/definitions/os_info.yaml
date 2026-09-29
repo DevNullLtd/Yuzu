@@ -11,10 +11,12 @@ metadata:
   version: 1.0.0
   description: >
     Returns the full OS product name (e.g. "Windows 11 Pro",
-    "Ubuntu 24.04.1 LTS", "macOS 15.2"). On Windows, reads the registry
+    "Ubuntu 24.04.1 LTS", "macOS 26.6.2"). On Windows, reads the registry
     ProductName and corrects the Windows 10/11 naming for builds >= 22000.
-    On Linux, reads PRETTY_NAME from /etc/os-release. On macOS, uses
-    sw_vers.
+    On Linux, reads PRETTY_NAME from /etc/os-release. On macOS, reads
+    ProductName and ProductVersion from SystemVersion.plist, falling back
+    to the kern.osproductversion sysctl and then a literal if the plist
+    is unreadable -- no subprocess is spawned.
   tags: [os, inventory]
 
 spec:
@@ -34,6 +36,10 @@ spec:
     columns:
       - name: os_name
         type: string
+        description: >-
+          The OS product name as read by the platform-specific leg (registry ProductName on Windows, corrected for the Windows 11 naming quirk; PRETTY_NAME from /etc/os-release on Linux; ProductName + ProductVersion from SystemVersion.plist on macOS). Values: free text.
+        example: "Windows 11 Pro"
+        platforms: [windows, linux, darwin]
 
   visualization:
     # The os_info plugin emits rows of the form `os_name|<value>` — the
@@ -76,7 +82,9 @@ metadata:
     Returns the OS version string. On Windows, reports Major.Minor.Build
     from RtlGetVersion (avoids manifest-dependent version lies). On Linux
     and macOS, reports the kernel release from uname. On macOS, also
-    returns the user-facing product version from sw_vers.
+    returns the user-facing product version (os_product_version) read
+    from SystemVersion.plist's ProductVersion key, falling back to the
+    kern.osproductversion sysctl -- no subprocess is spawned.
   tags: [os, inventory]
 
 spec:
@@ -96,8 +104,16 @@ spec:
     columns:
       - name: os_version
         type: string
+        description: >-
+          The kernel/version string: Major.Minor.Build from RtlGetVersion on Windows; the uname(2) kernel release on Linux and macOS. Values: free text.
+        example: "10.0.26200"
+        platforms: [windows, linux, darwin]
       - name: os_product_version
         type: string
+        description: >-
+          macOS-only: the user-facing product version read from SystemVersion.plist's ProductVersion key (sysctl kern.osproductversion fallback); not emitted on Windows or Linux. Values: free text.
+        example: "26.6.2"
+        platforms: [darwin]
 
   readablePayload: "Get OS version string"
 
@@ -129,7 +145,8 @@ metadata:
     Returns the OS build identifier. On Windows, reports
     CurrentBuildNumber.UBR from the registry (e.g. "22631.4890"). On
     Linux, extracts the kernel build version from /proc/version. On
-    macOS, returns the build version from sw_vers -buildVersion.
+    macOS, reads ProductBuildVersion from SystemVersion.plist, falling
+    back to the kern.osversion sysctl -- no subprocess is spawned.
   tags: [os, inventory, compliance]
 
 spec:
@@ -149,6 +166,10 @@ spec:
     columns:
       - name: os_build
         type: string
+        description: >-
+          The OS build identifier: registry CurrentBuildNumber.UBR on Windows; the third whitespace field of /proc/version on Linux; SystemVersion.plist's ProductBuildVersion (sysctl kern.osversion fallback) on macOS. Values: free text.
+        example: "26200.9278"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get OS build identifier"
 
@@ -199,6 +220,10 @@ spec:
     columns:
       - name: os_arch
         type: string
+        description: >-
+          CPU architecture. Linux and macOS report the raw uname(2) machine string unnormalized (e.g. "aarch64", "arm64" -- not the same token); Windows maps GetNativeSystemInfo to a fixed set: x86_64, aarch64, x86, arm, or unknown. Values: free text (Linux/macOS); "x86_64", "aarch64", "x86", "arm", "unknown" (Windows).
+        example: "x86_64"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get CPU architecture"
 
@@ -249,8 +274,16 @@ spec:
     columns:
       - name: uptime_seconds
         type: int64
+        description: >-
+          Seconds since boot. Emitted as the literal string "unknown" instead of an integer if the platform read fails (/proc/uptime unreadable on Linux, the KERN_BOOTTIME sysctl failing on macOS) -- never observed in this capture set. Values: integer, or the literal "unknown".
+        example: "69193"
+        platforms: [windows, linux, darwin]
       - name: uptime_display
         type: string
+        description: >-
+          Human-readable uptime formatted "<days>d <hours>h <minutes>m"; "unknown" if the platform read failed. Values: free text ("<n>d <n>h <n>m"), or the literal "unknown".
+        example: "0d 19h 13m"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get system uptime"
 

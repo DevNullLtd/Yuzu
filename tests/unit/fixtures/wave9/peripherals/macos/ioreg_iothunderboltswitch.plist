@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>DROM</key>
+		<data>
+		l7CU9KmyXKwFXS0S6QFCAAEADwABAAiBgAKAAAAACIKQAYAAAAADgyAChAWF
+		CQEABYYJAQAChwWICQEADQFBcHBsZSBJbmMuAAYCaU9TAAA=
+		</data>
+		<key>Depth</key>
+		<integer>0</integer>
+		<key>Device ID</key>
+		<integer>8200</integer>
+		<key>Device Model ID</key>
+		<integer>15</integer>
+		<key>Device Model Name</key>
+		<string>iOS</string>
+		<key>Device Model Revision</key>
+		<integer>1</integer>
+		<key>Device Vendor ID</key>
+		<integer>1</integer>
+		<key>Device Vendor Name</key>
+		<string>Apple Inc.</string>
+		<key>EEPROM Revision</key>
+		<integer>0</integer>
+		<key>IOObjectClass</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOObjectRetainCount</key>
+		<integer>27</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>0</integer>
+			<key>CurrentPowerState</key>
+			<integer>0</integer>
+			<key>DesiredPowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>2</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>4294969505</integer>
+		<key>IORegistryEntryName</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>33523833</integer>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>Max Port Number</key>
+		<integer>8</integer>
+		<key>ROM Version</key>
+		<integer>0</integer>
+		<key>Revision ID</key>
+		<integer>0</integer>
+		<key>Route String</key>
+		<integer>0</integer>
+		<key>Router ID</key>
+		<integer>0</integer>
+		<key>Thunderbolt Version</key>
+		<integer>32</integer>
+		<key>UID</key>
+		<integer>408803588609184944</integer>
+		<key>Upstream Port Number</key>
+		<integer>7</integer>
+		<key>Vendor ID</key>
+		<integer>1452</integer>
+	</dict>
+	<dict>
+		<key>DROM</key>
+		<data>
+		hLGU9KmyXKwFBn502wFCAAEADwABAAiBgQKBAAAACIKRAYEAAAADgyAChAWF
+		CQEABYYJAQAChwWICQEADQFBcHBsZSBJbmMuAAYCaU9TAAA=
+		</data>
+		<key>Depth</key>
+		<integer>0</integer>
+		<key>Device ID</key>
+		<integer>8200</integer>
+		<key>Device Model ID</key>
+		<integer>15</integer>
+		<key>Device Model Name</key>
+		<string>iOS</string>
+		<key>Device Model Revision</key>
+		<integer>1</integer>
+		<key>Device Vendor ID</key>
+		<integer>1</integer>
+		<key>Device Vendor Name</key>
+		<string>Apple Inc.</string>
+		<key>EEPROM Revision</key>
+		<integer>0</integer>
+		<key>IOObjectClass</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOObjectRetainCount</key>
+		<integer>27</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>0</integer>
+			<key>CurrentPowerState</key>
+			<integer>0</integer>
+			<key>DesiredPowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>2</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>4294969511</integer>
+		<key>IORegistryEntryName</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>33565541</integer>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>Max Port Number</key>
+		<integer>8</integer>
+		<key>ROM Version</key>
+		<integer>0</integer>
+		<key>Revision ID</key>
+		<integer>0</integer>
+		<key>Route String</key>
+		<integer>0</integer>
+		<key>Router ID</key>
+		<integer>1</integer>
+		<key>Thunderbolt Version</key>
+		<integer>32</integer>
+		<key>UID</key>
+		<integer>408803588609184945</integer>
+		<key>Upstream Port Number</key>
+		<integer>7</integer>
+		<key>Vendor ID</key>
+		<integer>1452</integer>
+	</dict>
+	<dict>
+		<key>DROM</key>
+		<data>
+		orOU9KmyXKwFsNi4vwFCAAEADwABAAiBgwKDAAAACIKTAYMAAAADgyAChAWF
+		CQEABYYJAQAChwWICQEADQFBcHBsZSBJbmMuAAYCaU9TAAA=
+		</data>
+		<key>Depth</key>
+		<integer>0</integer>
+		<key>Device ID</key>
+		<integer>8200</integer>
+		<key>Device Model ID</key>
+		<integer>15</integer>
+		<key>Device Model Name</key>
+		<string>iOS</string>
+		<key>Device Model Revision</key>
+		<integer>1</integer>
+		<key>Device Vendor ID</key>
+		<integer>1</integer>
+		<key>Device Vendor Name</key>
+		<string>Apple Inc.</string>
+		<key>EEPROM Revision</key>
+		<integer>0</integer>
+		<key>IOObjectClass</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOObjectRetainCount</key>
+		<integer>25</integer>
+		<key>IOPowerManagement</key>
+		<dict>
+			<key>CapabilityFlags</key>
+			<integer>0</integer>
+			<key>CurrentPowerState</key>
+			<integer>0</integer>
+			<key>DesiredPowerState</key>
+			<integer>2</integer>
+			<key>DriverPowerState</key>
+			<integer>2</integer>
+			<key>MaxPowerState</key>
+			<integer>2</integer>
+		</dict>
+		<key>IORegistryEntryID</key>
+		<integer>4294969606</integer>
+		<key>IORegistryEntryName</key>
+		<string>IOThunderboltSwitchType5</string>
+		<key>IOServiceBusyState</key>
+		<integer>0</integer>
+		<key>IOServiceBusyTime</key>
+		<integer>12959416</integer>
+		<key>IOServiceState</key>
+		<integer>30</integer>
+		<key>Max Port Number</key>
+		<integer>7</integer>
+		<key>ROM Version</key>
+		<integer>0</integer>
+		<key>Revision ID</key>
+		<integer>0</integer>
+		<key>Route String</key>
+		<integer>0</integer>
+		<key>Router ID</key>
+		<integer>3</integer>
+		<key>Thunderbolt Version</key>
+		<integer>32</integer>
+		<key>UID</key>
+		<integer>408803588609184947</integer>
+		<key>Upstream Port Number</key>
+		<integer>7</integer>
+		<key>Vendor ID</key>
+		<integer>1452</integer>
+	</dict>
+</array>
+</plist>

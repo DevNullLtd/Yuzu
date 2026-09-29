@@ -1,0 +1,420 @@
+{
+  "actions": [
+    {
+      "action": "get_key_files",
+      "definition_ids": [
+        "device.agent_logging.get_key_files"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/proc/self/exe symlink + std::filesystem metadata",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "_NSGetExecutablePath + realpath(3) + std::filesystem metadata",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "GetModuleFileNameA + std::filesystem metadata",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_log",
+      "definition_ids": [
+        "device.agent_logging.get_log"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "agent config lookup + std::ifstream tail read",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "agent config lookup + std::ifstream tail read",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "agent config lookup + std::ifstream tail read",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`get_log` can expose the agent's live session credential.** The tailed log is the same file the agent writes `\"Registered with server (session={}, ...)\"` to (`agents/core/src/agent.cpp:1928`); `get_log` is classified under securable `PluginSecret` rather than plain `Inventory` for exactly this reason.",
+    "**The declared result schema doesn't name a `status` field.** `get_log`'s empty path (`status|empty`, rc=0) and error path (`status|error`, rc=1) both emit a `status` key that the definition's three columns (`log_file`, `line_count`, `line`) never declare.",
+    "**No capture has ever resolved a log file.** All three samples (Windows, macOS, Linux) returned `status|empty` — `log_file` and `line` have never been observed populated in a real run.",
+    "**`get_key_files` reports the calling process's own executable, not necessarily `yuzu-agent`'s.** `GetModuleFileNameA`/`/proc/self/exe`/`_NSGetExecutablePath` all resolve to whichever process is running the plugin; each sample here was captured through the `plugin-capture` harness, so its first `file|` row names the harness binary, not the production agent.",
+    "**No typed result status is ever set.** Every sample shows `UNDECLARED / UNKNOWN /` regardless of outcome — a caller must parse the `status|` output line itself to tell \"no log configured\" from \"action failed\"."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Lists important agent files — the agent executable, log files, config files, data stores, plugins, and TLS certificates — with their absolute paths, sizes in bytes, and last-modified timestamps (as Unix epoch seconds). Useful for remote diagnostics and inventory of agent deployment state.",
+      "display_name": "Agent Key Files",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "device.agent_logging.get_key_files",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Returns the last N lines of the agent's log file. The log file path is discovered from agent config (agent.log_file or agent.data_dir), falling back to platform default paths (/var/log/yuzu or /opt/yuzu on Linux, /Library/Application Support/Yuzu or /var/log/yuzu on macOS, ProgramData/Yuzu on Windows). Returns status|empty with zero lines when no log file resolves on this host. The number of lines is configurable (default 50, max 500).",
+      "display_name": "Agent Log Tail",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 30
+      },
+      "id": "device.agent_logging.get_log",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Remote agent log access — retrieve log tail, list key agent files",
+  "how_it_works": "`get_log` resolves the agent log path through a three-tier fallback — explicit `agent.log_file` config, then `agent.data_dir`/`yuzu-agent.log`, then platform default paths — and tails it line-by-line into a bounded deque, clamped to 500 lines. A log path that resolves to nothing is not an error: the action returns rc=0 with `status|empty` and `line_count|0`, while an out-of-range `lines` parameter returns rc=1 with `status|error`. Every `fs::exists` check in the path search deliberately uses the non-throwing `error_code` overload — the throwing form raised `filesystem_error` on `EACCES` and crashed the whole agent process on a macOS host with a restricted log directory.\n\n`get_key_files` walks a fixed list of locations — the agent's own executable path (via an OS-specific self-lookup), its log file, up to three config file names and two data-store file names under `agent.data_dir`, every regular file in `agent.plugin_dir`, and three TLS certificate/key config keys — emitting one `file|<path>|<size>|<mtime>` row per file actually found. A missing file, an unreadable size, or an unreadable mtime is skipped or zeroed rather than failing the whole action.\n\nNeither action shells out or spawns a subprocess; both are native, in-process filesystem/config reads on every OS. This plugin is deliberately not a live log tail or a file-content reader: `get_log` re-reads the whole file on every call rather than streaming, and `get_key_files` reports paths, sizes and mtimes only — never file contents, including for the TLS private key it enumerates.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": 50,
+      "definition_id": "device.agent_logging.get_log",
+      "description": "Number of trailing log lines to return, 1-500 (e.g. 100). Defaults to 50; values above 500 are clamped, values below 1 are rejected with a status|error result.\n",
+      "name": "lines",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "6e239e35ca05",
+  "manifest_version": 1,
+  "name": "agent_logging",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Absolute path of a discovered agent file (executable, log file, config file, data store, plugin file, or TLS certificate/key). Values: absolute path.",
+          "example": "/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture",
+          "name": "path",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "File size in bytes; 0 if the size read failed. Values: non-negative integer (bytes).",
+          "example": "142208",
+          "name": "size",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Last-write time as Unix epoch seconds; 0 if the mtime read failed. Values: non-negative integer (unix epoch seconds).",
+          "example": "1788774907",
+          "name": "modified",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        }
+      ],
+      "definition_id": "device.agent_logging.get_key_files"
+    },
+    {
+      "columns": [
+        {
+          "description": "Absolute path to the log file that was read; the field is omitted from the output entirely when no log file resolves on this host. Values: absolute path, or field absent.",
+          "example": "field omitted in every captured sample — no capture has resolved a log file (see status|empty)",
+          "name": "log_file",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Count of line entries returned; 0 when no log file resolves. Values: non-negative integer.",
+          "example": "0",
+          "name": "line_count",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int32",
+          "values": null
+        },
+        {
+          "description": "One raw line from the tailed log file, unescaped and in file order; omitted entirely when no log file resolves. Values: free text, or field absent.",
+          "example": "field omitted in every captured sample — no capture has resolved a log file",
+          "name": "line",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "device.agent_logging.get_log"
+    }
+  ],
+  "outputs_note": "Output is a stream of pipe-delimited `key|value` lines via `write_output()`, not typed row-per-record output. `get_log` emits `log_file`, `line_count`, then one `line` entry per tailed line — except when no log file resolves, where it emits only `status|empty` and `line_count|0`, or when `lines` is invalid, where it emits only `status|error` and returns non-zero; neither `status` value is a declared result column. `get_key_files` emits one `file|<path>|<size>|<mtime>` row per file found; a missing file is skipped outright rather than emitted as a placeholder row, so an empty result set here means literally nothing was found, not a signal of failure.\n\n\n\n**Empty-result convention.** `get_log`'s empty case is reported entirely through `status|empty` + `line_count|0`, never a placeholder `log_file`/`line` row. `get_key_files` simply emits zero `file|` rows when nothing is found — there is no placeholder row for this action.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "None — both actions are plain Win32 calls (`GetModuleFileNameA`, `std::filesystem`) with no elevated handle opened",
+      "if_refused": "the file is silently omitted from the row set — `emit_file_info` returns early on a failed `fs::exists`",
+      "measured": "2026-09-07, bare-metal, SYSTEM (windows.txt sample stamp)",
+      "os": "Windows",
+      "runs_as": "agent service account, registered as LocalSystem in practice today (docs/agent-privilege-model.md:12, #1442)"
+    },
+    {
+      "grant": "None — ordinary filesystem/config reads under the daemon's own permissions",
+      "if_refused": "same silent omission",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith) (macos.txt sample stamp — unprivileged, not the production root daemon)",
+      "os": "macOS",
+      "runs_as": "agent daemon, root today (LaunchDaemon plist carries no `UserName` key) (docs/agent-privilege-model.md:14)"
+    },
+    {
+      "grant": "None declared",
+      "if_refused": "same silent omission",
+      "measured": "2026-09-06, container, euid 0 (linux.txt sample stamp — root, not the designed `yuzu` account)",
+      "os": "Linux",
+      "runs_as": "agent daemon, designed to run unprivileged as `yuzu` (docs/agent-privilege-model.md:12)"
+    }
+  ],
+  "readme": "agents/plugins/agent_logging/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "get_log",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|empty|agent log file not configured on this host",
+            "line_count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_key_files",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "file|/src/builddir/tools/plugin-capture/plugin-capture|75168|1788720500"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "6e239e35ca05",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "get_log",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|empty|agent log file not configured on this host",
+            "line_count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_key_files",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "file|/private/tmp/claude-501/-Users-jsmith-yuzu-dev/00000000-0000-0000-0000-000000000000/scratchpad/d2/plugin_capture|142208|1788774907"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6e239e35ca05",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "get_log",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "status|empty|agent log file not configured on this host",
+            "line_count|0"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_key_files",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "file|D:\\yuzu-dev\\Yuzu-worktrees\\docs-plugin-readme-sweep\\build-windows\\tools\\plugin-capture-tmp\\plugin_capture.exe|64512|1788774930"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6e239e35ca05",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "get_log",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "PluginSecret"
+    },
+    {
+      "action": "get_key_files",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Security"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/agent_logging.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/agent_logging/src/agent_logging_plugin.cpp"
+    ],
+    "privilege_row": false,
+    "tests": []
+  },
+  "version": "0.1.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's response channel into the ResponseStore (default 90-day retention via `reap_expired()`), queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. The plugin executes only when an operator or workflow dispatches `device.agent_logging.get_log` or `device.agent_logging.get_key_files`; outside `agent_registry.cpp`'s static action-description catalogue (a name/description list, not a data sink), no other server code references this plugin.",
+    "**Sensitivity.** `get_log`'s `line` field is a verbatim tail of the agent's log, which includes the line `\"Registered with server (session=..., ...)\"` — the agent's live session credential — plus whatever other free text the agent logged, including file paths that may embed a username; `get_key_files`'s `path` rows can likewise embed a username or hostname in the file path. Neither action names installed third-party software.",
+    "**Siblings:** none — no other plugin's definition references `agent_logging`.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.agent_logging.get_log\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

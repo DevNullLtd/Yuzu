@@ -1,5 +1,8 @@
 #include "offload_routes.hpp"
 
+#include "offload_target_model.hpp" // adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders (Rule 1)
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -10,40 +13,19 @@ namespace yuzu::server {
 
 namespace {
 
-constexpr std::string_view kErrUnavailable =
-    R"({"error":{"code":503,"message":"offload store unavailable"},"meta":{"api_version":"v1"}})";
-constexpr std::string_view kErrInvalidJson =
-    R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})";
-constexpr std::string_view kErrNotFound =
-    R"({"error":{"code":404,"message":"offload target not found"},"meta":{"api_version":"v1"}})";
-
-nlohmann::json target_to_json(const OffloadTarget& t) {
-    return nlohmann::json{
-        {"id", t.id},
-        {"name", t.name},
-        {"url", t.url},
-        {"auth_type", offload_auth_type_to_string(t.auth_type)},
-        {"event_types", t.event_types},
-        {"batch_size", t.batch_size},
-        {"enabled", t.enabled},
-        {"created_at", t.created_at},
-        // auth_credential intentionally omitted from API responses
-    };
-}
-
 void send_unavailable(httplib::Response& res) {
     res.status = 503;
-    res.set_content(std::string(kErrUnavailable), "application/json");
+    res.set_content(detail::a4_error(res, "offload store unavailable"), "application/json");
 }
 
 void send_bad_json(httplib::Response& res) {
     res.status = 400;
-    res.set_content(std::string(kErrInvalidJson), "application/json");
+    res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
 }
 
 void send_not_found(httplib::Response& res) {
     res.status = 404;
-    res.set_content(std::string(kErrNotFound), "application/json");
+    res.set_content(detail::a4_error(res, "offload target not found"), "application/json");
 }
 
 /// Parse a numeric path segment to int64. The route regex `(\d+)` makes
@@ -72,10 +54,18 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                      send_unavailable(res);
                      return;
                  }
+                 // AUTHORITATIVE read (ADR-0012 §1): nullopt means the read
+                 // degraded (lease timeout/query failure), never "no
+                 // targets configured" — surface it as 503, not an empty
+                 // 200 list.
                  auto targets = offload_store->list();
+                 if (!targets) {
+                     send_unavailable(res);
+                     return;
+                 }
                  nlohmann::json arr = nlohmann::json::array();
-                 for (const auto& t : targets)
-                     arr.push_back(target_to_json(t));
+                 for (const auto& t : *targets)
+                     arr.push_back(offload_target_json(t));
                  res.set_content(nlohmann::json({{"offload_targets", arr}}).dump(),
                                  "application/json");
              });
@@ -97,33 +87,74 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       send_bad_json(res);
                       return;
                   }
-                  auto name = body.value("name", std::string{});
-                  auto url = body.value("url", std::string{});
+                  std::string name, url, auth_type_str, auth_credential, event_types;
+                  int batch_size = 1;
+                  bool enabled = true;
+                  try {
+                      name = body.value("name", std::string{});
+                      url = body.value("url", std::string{});
+                      auth_type_str = body.value("auth_type", std::string{"none"});
+                      auth_credential = body.value("auth_credential", std::string{});
+                      event_types = body.value("event_types", std::string{"*"});
+                      batch_size = body.value("batch_size", 1);
+                      enabled = body.value("enabled", true);
+                  } catch (const nlohmann::json::exception&) {
+                      // A present-but-wrong-typed field (e.g. batch_size as a
+                      // string) throws type_error out of body.value() — that's
+                      // still a caller mistake, not a server fault (#3097).
+                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                               "invalid_field_type");
+                      send_bad_json(res);
+                      return;
+                  }
                   if (name.empty() || url.empty()) {
                       res.status = 400;
-                      res.set_content(
-                          R"({"error":{"code":400,"message":"name and url are required"},"meta":{"api_version":"v1"}})",
-                          "application/json");
+                      res.set_content(detail::a4_error(res, "name and url are required"),
+                                      "application/json");
                       return;
                   }
-                  auto auth_type_str = body.value("auth_type", std::string{"none"});
                   auto auth_type = offload_auth_type_from_string(auth_type_str);
-                  auto auth_credential = body.value("auth_credential", std::string{});
-                  auto event_types = body.value("event_types", std::string{"*"});
-                  auto batch_size = body.value("batch_size", 1);
-                  auto enabled = body.value("enabled", true);
-
-                  auto id = offload_store->create_target(name, url, auth_type, auth_credential,
-                                                        event_types, batch_size, enabled);
-                  if (id < 0) {
+                  if (offload_auth_type_to_string(auth_type) != auth_type_str) {
+                      // offload_auth_type_from_string() folds any unrecognized
+                      // string to None for defensive DB-read tolerance; at the
+                      // REST boundary that would silently turn a typo like
+                      // "bearre" into an unauthenticated target instead of
+                      // rejecting it — round-trip through to_string() to catch
+                      // exactly that case without touching the shared helper.
                       audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                               "validation_failed");
+                               "invalid_auth_type");
                       res.status = 400;
-                      res.set_content(
-                          R"json({"error":{"code":400,"message":"target rejected: invalid url, name, batch_size, or duplicate name"},"meta":{"api_version":"v1"}})json",
-                          "application/json");
+                      res.set_content(detail::a4_error(res, "unrecognized auth_type"),
+                                      "application/json");
                       return;
                   }
+
+                  auto result = offload_store->create_target(name, url, auth_type, auth_credential,
+                                                             event_types, batch_size, enabled);
+                  if (!result.has_value()) {
+                      // #3097 classification: invalid_input is the caller's
+                      // mistake (400); store_unavailable/db_error are
+                      // store/infra degradation (503) — distinct in the
+                      // audit record even where the HTTP status collapses.
+                      if (result.error() == OffloadWriteError::invalid_input) {
+                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                                   "validation_failed");
+                          res.status = 400;
+                          res.set_content(
+                              detail::a4_error(res, "target rejected: invalid url, name, "
+                                                     "batch_size, or duplicate name"),
+                              "application/json");
+                      } else {
+                          const char* detail = result.error() == OffloadWriteError::store_unavailable
+                                                  ? "store_unavailable"
+                                                  : "db_error";
+                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                                   detail);
+                          send_unavailable(res);
+                      }
+                      return;
+                  }
+                  const int64_t id = *result;
                   audit_fn(req, "offload_target.create", "success", "offload_target",
                            std::to_string(id), name);
                   res.status = 201;
@@ -146,12 +177,18 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                      send_not_found(res);
                      return;
                  }
-                 auto t = offload_store->get(*id_opt);
+                 bool store_ok = true;
+                 auto t = offload_store->get(*id_opt, &store_ok);
                  if (!t) {
-                     send_not_found(res);
+                     // Distinguish genuine not-found (404) from a degraded
+                     // read (503) — #3097 classification.
+                     if (store_ok)
+                         send_not_found(res);
+                     else
+                         send_unavailable(res);
                      return;
                  }
-                 res.set_content(target_to_json(*t).dump(), "application/json");
+                 res.set_content(offload_target_json(*t).dump(), "application/json");
              });
 
     // DELETE /api/v1/offload-targets/:id — delete
@@ -182,7 +219,21 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                         detail =
                             "name=" + target_snapshot->name + " url=" + target_snapshot->url;
                     }
-                    if (offload_store->delete_target(*id_opt)) {
+                    auto result = offload_store->delete_target(*id_opt);
+                    if (!result.has_value()) {
+                        // Same #3097 classification as create's 503 branch
+                        // above — distinct in the audit record even though
+                        // the HTTP status collapses to 503 for both.
+                        const char* write_err_detail =
+                            result.error() == OffloadWriteError::store_unavailable
+                                ? "store_unavailable"
+                                : "db_error";
+                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                                 std::to_string(*id_opt), write_err_detail);
+                        send_unavailable(res);
+                        return;
+                    }
+                    if (*result) {
                         audit_fn(req, "offload_target.delete", "success", "offload_target",
                                  std::to_string(*id_opt), detail);
                         res.set_content(R"({"status":"deleted"})", "application/json");
@@ -210,9 +261,14 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                  // Match sibling GET /:id semantics (HP-2): a missing target
                  // returns 404 rather than `{"deliveries":[]}` + 200, so an
                  // operator polling for a deleted target sees the explicit
-                 // 404 instead of confusing empty-success.
-                 if (!offload_store->get(*id_opt)) {
-                     send_not_found(res);
+                 // 404 instead of confusing empty-success. #3097: a
+                 // degraded existence check is 503, not 404.
+                 bool store_ok = true;
+                 if (!offload_store->get(*id_opt, &store_ok)) {
+                     if (store_ok)
+                         send_not_found(res);
+                     else
+                         send_unavailable(res);
                      return;
                  }
                  // Cap limit to a sane maximum so an operator can't request a
@@ -227,16 +283,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                  limit = std::clamp(limit, 1, 1000);
                  auto deliveries = offload_store->get_deliveries(*id_opt, limit);
                  nlohmann::json arr = nlohmann::json::array();
-                 for (const auto& d : deliveries) {
-                     arr.push_back({{"id", d.id},
-                                    {"target_id", d.target_id},
-                                    {"event_type", d.event_type},
-                                    {"event_count", d.event_count},
-                                    {"payload", d.payload},
-                                    {"status_code", d.status_code},
-                                    {"delivered_at", d.delivered_at},
-                                    {"error", d.error}});
-                 }
+                 for (const auto& d : deliveries)
+                     arr.push_back(offload_delivery_json(d));
                  res.set_content(nlohmann::json({{"deliveries", arr}}).dump(),
                                  "application/json");
              });

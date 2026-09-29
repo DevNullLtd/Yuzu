@@ -1,23 +1,54 @@
 #pragma once
 
 /// @file ca_store.hpp
-/// SQLite-backed inventory + lifecycle store for Yuzu's internal CA (`ca.db`).
+/// Migrated Postgres store (ADR-0006/0009/0053, schema `ca_store`) for Yuzu's internal CA
+/// inventory + lifecycle (`ca_root`, `ca_issued`, `ca_crl_versions`).
 ///
-/// Holds METADATA ONLY: the root certificate, the issued-cert inventory, and
-/// the CRL version history. The root PRIVATE KEY is NOT stored here — it lives
-/// behind a `KeyProvider` (a 0600 file in Milestone 1) and only its opaque
-/// `key_ref` is persisted in `ca_root`. This keeps the crown-jewel key out of
-/// the database blast radius and lets a future HSM swap leave `ca.db` untouched.
+/// Holds METADATA ONLY: the root certificate, the issued-cert inventory, and the CRL version
+/// history. The root PRIVATE KEY is NEVER stored here — it lives behind a `KeyProvider` (a 0600
+/// file in Milestone 1) and only its opaque `key_ref` is persisted in `ca_root`. This keeps the
+/// crown-jewel key out of the database blast radius and lets a future HSM swap leave this store
+/// untouched. `key_ref` is the ONLY thing this migration resolves the Wave 3 "secret-gated"
+/// listing over — there is no envelope-encrypted column here, so `SecretCodec` is not involved
+/// (ADR-0053).
 ///
-/// Threading: a single connection guarded by one std::mutex. The CA store is
-/// low-traffic (issuance at enrollment, revocation by an operator), so coarse
-/// serialisation is the right trade — and it sidesteps the FULLMUTEX
-/// `sqlite3_changes()` data race (#1033) entirely. The one place a change-count
-/// matters (revoke) uses `RETURNING`, never `sqlite3_changes()`.
+/// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and runtime. The database
+/// is the source of truth for the revoked-certificate set — a silently-empty/-false read on
+/// `is_revoked`/`list_revoked` would silently accept a certificate that should have been
+/// rejected, or publish a CRL that omits a real revocation. Every reader/mutator whose false/empty
+/// result could feed that class of decision returns `std::expected<..., std::string>` (ADR-0036
+/// type-distinguishability), prefixed `kCaDbErrorPrefix` on a genuine DB/lease failure — EXCEPT
+/// `is_revoked()`, which stays a plain `bool` and is documented below to degrade to `true` (fail
+/// CLOSED: treat "couldn't tell" as "revoked") rather than exposing a three-state channel on the
+/// mTLS-accept hot path.
+///
+/// Substrate contract (ADR-0008): the store holds a `pg::PgPool&` (not a `sqlite3*`), runs its
+/// schema migration at construction on a pinned lease, and schema-qualifies every runtime
+/// statement (`ca_store.ca_root` / `ca_store.ca_issued` / `ca_store.ca_crl_versions`) — pooled
+/// connections carry no per-store search_path. Mutate-and-return uses `RETURNING`, never
+/// `sqlite3_changes()`.
+///
+/// **First-boot CA-root race (ADR-0053 "Root-singleton first-boot race").** Under per-instance
+/// SQLite this race never existed — each server instance held its own local `ca.db`. A shared
+/// Postgres substrate makes it possible for two instances to independently generate root material
+/// and race to establish it. `try_insert_root()` is the dedicated, race-safe entry point for
+/// FIRST-BOOT generation (`default_certs.cpp`): `ON CONFLICT (id) DO NOTHING` means at most one
+/// caller's row is ever inserted, and every caller — winner or loser — reads back the SAME row
+/// that is now canonical. `set_root()` keeps its pre-migration unconditional-REPLACE contract for
+/// the two callers that legitimately intend a replace: PR6 subordinate-CA import (an explicit,
+/// single-writer, operator-triggered re-root) and test seeding. Never call `set_root()` from
+/// first-boot generation — see `try_insert_root()`'s doc comment for why.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0053 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the mandatory three-table fingerprinted backfill it
+/// implemented never had real legacy data to protect. `server.cpp` now runs
+/// `legacy_sqlite_probe::warn_if_legacy_rows` over `ca_root`/`ca_issued`/`ca_crl_versions`
+/// instead — silent unless real rows are found, never blocks boot.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -25,12 +56,29 @@
 #include <string_view>
 #include <vector>
 
-struct sqlite3;
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
-/// Trust-source mode of the issuing CA. Builtin = self-signed install root
-/// (M1). Subordinate = intermediate signed by an enterprise root (PR6).
+/// Machine-checkable prefix on every `CaStore` `unexpected()` that represents a genuine DB/lease
+/// failure rather than a business-rule answer (mirrors `LicenseStore`'s `kLicenseDbErrorPrefix` —
+/// deliberately a separate constant per-store, not shared; see the playbook / ADR-0048).
+inline constexpr const char* kCaDbErrorPrefix = "db_error: ";
+
+/// Machine-checkable prefix on `record_issued`'s `unexpected()` when the failure is specifically
+/// a `serial_hex` unique-violation (PG SQLSTATE 23505) rather than a genuine DB/lease failure —
+/// see `record_issued`'s doc comment and the `.cpp` file header for #1276. Distinct from
+/// `kCaDbErrorPrefix` because this ONE case is retryable-with-a-fresh-serial, not an outage —
+/// infrastructure for a FUTURE caller to act on; `sign_agent_csr` (the sole production caller
+/// today) does not yet inspect this prefix and retry, it logs and returns nullopt on any
+/// `record_issued` failure regardless of classification (governance Gate 3 cpp-expert,
+/// 2026-08-21 — this comment previously read as though the retry were already wired).
+inline constexpr const char* kCaDuplicateSerialPrefix = "duplicate_serial: ";
+
+/// Trust-source mode of the issuing CA. Builtin = self-signed install root (M1). Subordinate =
+/// intermediate signed by an enterprise root (PR6).
 enum class CaMode {
     Builtin,
     Subordinate,
@@ -112,6 +160,9 @@ struct CrlVersionRecord {
     /// STABLE key-based identity of the signing CA (#1296, see IssuedCertRecord).
     /// Invariant across a subordinate re-key; empty on pre-v5 rows.
     std::string issuer_key_id;
+    /// Number of revoked certs this CRL was built from (migration v3). `nullopt` on rows
+    /// published before v3 and on test-seeded rows that don't set it.
+    std::optional<int64_t> revoked_count;
 };
 
 /// Canonicalise a certificate serial to the engine's stored form — uppercase
@@ -120,99 +171,298 @@ struct CrlVersionRecord {
 /// colon-decorated, which would otherwise silently miss revoke()/is_revoked()
 /// (a revoked cert that keeps validating). Returns nullopt on an empty or
 /// non-hex input so callers fail closed (mirrors x509_ca::build_crl's bad-serial
-/// precedent). Pure string transform — ca.db deliberately links no crypto.
+/// precedent). Pure string transform — this store deliberately links no crypto.
 [[nodiscard]] std::optional<std::string> normalize_serial_hex(std::string_view serial);
 
 class CaStore {
 public:
-    explicit CaStore(const std::filesystem::path& db_path);
+    /// Borrows the shared pool and runs the `ca_store` schema migration on a pinned lease.
+    /// `is_open()` is false if the lease was empty or the migration failed.
+    explicit CaStore(pg::PgPool& pool);
     ~CaStore();
+
     CaStore(const CaStore&) = delete;
     CaStore& operator=(const CaStore&) = delete;
 
-    [[nodiscard]] bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// The shared pool this store borrows. Exposed so a caller that already
+    /// holds a `CaStore*` can take an INDEPENDENT lease for its own purpose —
+    /// e.g. `default_certs.cpp`'s bootstrap advisory lock (ADR-0053 UP-2 Gate 8
+    /// fix, 2026-08-21), which needs a connection to hold a session advisory
+    /// lock across a multi-call critical section, separate from this store's
+    /// own per-call leasing.
+    [[nodiscard]] pg::PgPool& pool() const noexcept { return pool_; }
 
     // ── Root ──────────────────────────────────────────────────────────────────
+
+    /// The current root (id=1), if any. `nullopt` = a successful read finding none (a genuine,
+    /// successful answer — e.g. operator-supplied certs, or before first-boot generation has
+    /// run). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure — ADR-0036:
+    /// a caller deciding whether to (re)generate/re-root MUST treat that as fail-closed (refuse),
+    /// never fold it into the "no root" case. See `has_root()` for the narrower convenience that
+    /// is safe to use ONLY where a degraded answer collapsing to "no root" is an acceptable,
+    /// non-security-relevant default (documented per call site in the `.cpp` of callers).
+    [[nodiscard]] std::expected<std::optional<CaRoot>, std::string> get_root();
+
+    /// Convenience wrapper over `get_root()` for callers where a degraded read collapsing to
+    /// "false" is an acceptable, conservative default (a background CRL-freshness sweep skipping
+    /// a tick; the `/readyz` `ca_root` signal, where "can't prove a root exists" SHOULD read as
+    /// unhealthy anyway). **Never use this to gate a decision to (re)generate or replace the root**
+    /// — `default_certs.cpp`'s B-2 re-root guard calls `get_root()` directly for exactly this
+    /// reason: a DB blip collapsing to "no root" there would let a fresh CA generation proceed and
+    /// silently re-root a fleet that already has one.
     [[nodiscard]] bool has_root();
-    [[nodiscard]] std::optional<CaRoot> get_root();
-    /// Persist the single root row (id = 1). Replaces any existing root — used
-    /// once at first-boot generation and again on subordinate-CA import (PR6).
-    [[nodiscard]] bool set_root(const CaRoot& root);
+
+    /// Unconditionally REPLACES the root row (id=1) — the pre-migration `INSERT OR REPLACE`
+    /// contract, kept verbatim for the two callers that legitimately intend an unconditional
+    /// replace: PR6 subordinate-CA import (`ServerImpl::import_subordinate_chain`, an explicit,
+    /// single-writer, operator-triggered re-root of an ALREADY-established root) and test seeding.
+    /// **Never call this from first-boot root generation** — two instances racing this call over a
+    /// shared Postgres would have the later writer silently clobber the earlier one's root
+    /// (orphaning every agent enrolled under it in the instant between). Use `try_insert_root()`
+    /// there. `unexpected("empty cert/key_ref")` on an invalid root; `unexpected(msg)` (prefixed
+    /// `kCaDbErrorPrefix`) is a genuine write failure.
+    [[nodiscard]] std::expected<void, std::string> set_root(const CaRoot& root);
+
+    /// Race-safe first-boot root establishment (ADR-0053). `ON CONFLICT (id) DO NOTHING` — at
+    /// most one caller's row is ever inserted. Returns the root now on file: the caller's own
+    /// `root` echoed back if it won the race, or the ALREADY-ESTABLISHED root (some other writer's)
+    /// if it lost. **The caller MUST compare the returned fingerprint against what it generated to
+    /// learn which happened — never locally infer "I won" from anything but this return value.**
+    /// A losing caller's own already-generated key material is NOT retroactively usable (nobody
+    /// else holds its private key) — the caller's job on a loss is to discard its attempt and
+    /// refuse to proceed as authoritative, not to keep operating under material nobody else
+    /// recognises. `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine DB failure — the
+    /// caller must NOT treat that as "I won" or "lost", only as "undetermined, retry/abort".
+    [[nodiscard]] std::expected<CaRoot, std::string> try_insert_root(const CaRoot& root);
 
     // ── Issued inventory ────────────────────────────────────────────────────────
-    [[nodiscard]] bool record_issued(const IssuedCertRecord& rec);
-    [[nodiscard]] std::optional<IssuedCertRecord> get_issued(const std::string& serial_hex);
-    [[nodiscard]] std::vector<IssuedCertRecord> list_issued(int limit = 200, int offset = 0);
-    /// "Certificates issued by THIS CA", keyed on the STABLE pki::issuer_key_id
-    /// (#1296) — NOT issuer_fingerprint, which a subordinate re-key would split into
-    /// two values over one key and silently orphan the older population. An empty
-    /// `issuer_key_id` returns nothing (the unpopulated-row sentinel is not a CA
-    /// identity). Newest-first, same pagination contract as list_issued.
-    [[nodiscard]] std::vector<IssuedCertRecord>
+
+    /// Records a newly issued certificate. `unexpected("duplicate_serial: ...")` on a serial
+    /// collision (PG unique-violation SQLSTATE 23505 on `ca_issued.serial_hex`) — the caller
+    /// (server.cpp) treats ANY failure here as fail-closed (does not hand out an unrecorded cert),
+    /// but a duplicate-serial collision is specifically retryable (mint a fresh serial and retry
+    /// issuance) rather than a genuine outage; see the `.cpp` file header for #1276. Any other
+    /// `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine write failure.
+    [[nodiscard]] std::expected<void, std::string> record_issued(const IssuedCertRecord& rec);
+
+    /// `nullopt` = a successful read finding no such serial (or a non-hex serial — there is no
+    /// such cert). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure.
+    [[nodiscard]] std::expected<std::optional<IssuedCertRecord>, std::string>
+    get_issued(const std::string& serial_hex);
+
+    /// Newest-issued-first, `limit` clamped to [1, 10000] (bounded materialisation, matches the
+    /// ladder's UP-5 precedent). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read
+    /// failure; an empty inventory still returns success with an empty vector.
+    [[nodiscard]] std::expected<std::vector<IssuedCertRecord>, std::string>
+    list_issued(int limit = 200, int offset = 0);
+
+    /// "Certificates issued by THIS CA", keyed on the STABLE pki::issuer_key_id (#1296) — NOT
+    /// issuer_fingerprint, which a subordinate re-key would split into two values over one key and
+    /// silently orphan the older population. An empty `issuer_key_id` returns an empty vector (the
+    /// unpopulated-row sentinel is not a CA identity — see IssuedCertRecord::issuer_key_id).
+    [[nodiscard]] std::expected<std::vector<IssuedCertRecord>, std::string>
     list_issued_by_key_id(const std::string& issuer_key_id, int limit = 200, int offset = 0);
-    /// Revoke a cert. Returns true iff a row transitioned Active → Revoked; an
-    /// already-revoked or unknown serial returns false (idempotent).
-    [[nodiscard]] bool revoke(const std::string& serial_hex, const std::string& reason);
+
+    /// Revoke a cert. `Ok(true)` = a row transitioned Active → Revoked. `Ok(false)` = a genuine,
+    /// successful business answer — the serial is unknown or already revoked (idempotent
+    /// reject-without-state-change; callers audit this as `result=denied`, per
+    /// `docs/pki-architecture.md`). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine
+    /// write failure — callers MUST NOT fold this into the `Ok(false)` case: doing so would
+    /// falsely audit a database outage as "serial not found" (a false compliance record).
+    [[nodiscard]] std::expected<bool, std::string> revoke(const std::string& serial_hex,
+                                                           const std::string& reason);
+
+    /// True iff the presented serial is one of ours and currently revoked. **Deliberately stays a
+    /// plain `bool`, not `std::expected`** — this is the mTLS-accept security gate
+    /// (`is_peer_cert_revoked`), and the fail-closed contract IS the type: every degradation mode
+    /// (a non-hex serial, a lease timeout, a query error) returns `true` ("treat as revoked,
+    /// refuse") rather than exposing a third state a caller could accidentally fold into "not
+    /// revoked" (mirrors `ApiTokenStore::validate_token`'s hot-path-degrades-to-the-safe-answer
+    /// precedent). **Operational note:** during a sustained Postgres outage this means EVERY
+    /// heartbeat/Subscribe/Register-reauth is rejected fleet-wide, not just genuinely-revoked
+    /// agents — an operator must be able to tell "mass rejection because the DB is down" from
+    /// "mass rejection because of a real revocation sweep" from logs/metrics alone, since the
+    /// return value itself cannot distinguish them; see the `.cpp` for the distinct log line this
+    /// degradation emits.
     [[nodiscard]] bool is_revoked(const std::string& serial_hex);
-    [[nodiscard]] std::vector<IssuedCertRecord> list_revoked();
-    /// Delete all issued-cert rows with the given issued_by — used to purge stale
-    /// default-cert inventory on regeneration so ca.db reflects only the live set.
-    bool delete_issued_by(const std::string& issued_by);
+
+    /// The full currently-revoked set — feeds CRL construction directly. `unexpected(msg)`
+    /// (prefixed `kCaDbErrorPrefix`) is a genuine read failure; **callers MUST treat this as an
+    /// abort-the-publish signal, never as "empty = nobody is revoked"** — publishing a CRL built
+    /// from a silently-empty read would un-revoke every real revocation in every cache that trusts
+    /// it (ADR-0036; ADR-0053 "CRL version continuity").
+    [[nodiscard]] std::expected<std::vector<IssuedCertRecord>, std::string> list_revoked();
+
+    /// Serials-only revoked set — same WHERE clause as `list_revoked()` but no `cert_pem`
+    /// (unbounded blob, grows forever — nothing prunes `ca_issued`) and no `ORDER BY` (CRL
+    /// construction needs a stable, complete row set; the revocation-SWEEP caller below only
+    /// needs set membership). Gate 8 fix (unhappy-path, 2026-08-21): the ~15s revocation-sweep
+    /// tick used to share `list_revoked()` with CRL publishing, and that heavier query failing
+    /// under load/lock contention while the cheaper point-lookup `is_revoked()` kept succeeding
+    /// was a real, nameable corridor where the sweep silently stopped tearing down live streams
+    /// for already-revoked agents while new connections were still correctly gated — a security
+    /// control quietly not holding, not merely an availability blip. Same abort-never-empty
+    /// contract as `list_revoked()`: `unexpected(msg)` is a genuine read failure, never "nobody
+    /// is revoked".
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string> list_revoked_serials();
+
+    /// Delete the NON-revoked issued-cert rows with the given issued_by — used to purge stale
+    /// default-cert inventory on regeneration. Revoked rows are always kept: deleting one would
+    /// make `is_revoked()` accept that cert again and drop it from every later CRL, and the
+    /// revoked set must stay append-only for `has_unpublished_revocations()`. Best-effort /
+    /// non-fatal by design (the caller logs and continues on failure); stays a plain `bool`.
+    [[nodiscard]] bool delete_issued_by(const std::string& issued_by);
 
     // ── CRL versions ────────────────────────────────────────────────────────────
-    /// Next CRL sequence number = MAX(version)+1. NOT durable across the
-    /// allocate→record gap on its own: callers MUST serialise allocate+record
-    /// externally (the server holds `crl_publish_mu_` for exactly this) so two
-    /// publishers can't compute the same number and have `record_crl` collide.
-    /// In an HA / multi-instance / DB-restore scenario this single-DB counter can
-    /// still collide across instances — durable cross-instance CRL numbering is a
-    /// tracked follow-up (#1240 UP-4). record_crl() rejects a duplicate version
-    /// (no silent clobber), so a collision fails loudly rather than corrupting.
-    [[nodiscard]] uint64_t next_crl_number();
-    [[nodiscard]] bool record_crl(const CrlVersionRecord& rec);
+
+    /// Next CRL sequence number = MAX(version)+1, as a plain READ (tests / diagnostics). NOT an
+    /// allocator: another publisher on any replica can take the number first. Production
+    /// publishing goes through `publish_next_crl`, which allocates under the table lock.
+    /// `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure — never
+    /// substitute a default number (ADR-0053 "CRL version continuity").
+    [[nodiscard]] std::expected<std::uint64_t, std::string> next_crl_number();
+
+    /// TEST SEEDING ONLY: persist a CRL version with a caller-chosen number. Plain autocommit
+    /// INSERT with none of publish_next_crl's transaction-scoped timeouts (it queues behind the
+    /// CRL table lock bounded only by the pool's own lock_timeout). Never a production
+    /// publish path — composing this with `next_crl_number()` reads the revoked set outside the
+    /// lock and breaks the superset guarantee `publish_next_crl` gives (PKI routed concern).
+    /// Refuses version < 1, empty DER, and a duplicate version (never a silent clobber).
+    [[nodiscard]] bool record_crl_for_test(const CrlVersionRecord& rec);
+
+    /// True when the latest CRL was not built from the current revoked set — no CRL yet, a
+    /// pre-v3 row, or a revocation (e.g. one whose own publish failed) that no committed CRL
+    /// covers. Compares counts in one statement, never timestamps from different replicas'
+    /// clocks. `unexpected(msg)` is a genuine read failure.
+    [[nodiscard]] std::expected<bool, std::string> has_unpublished_revocations();
+
+    /// The most recently published CRL, if any. Both "genuinely none published yet" and "a
+    /// genuine read failure" already degrade safely to the SAME caller behaviour (the public
+    /// `GET /api/v1/ca/crl` route serves 503 either way rather than ever synthesizing/serving a
+    /// wrong CRL) — verified against every call site before choosing to keep this a plain
+    /// `std::optional` rather than `std::expected` (ADR-0053).
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();
 
-    /// Builds the signed CRL DER for an allocated `crl_number` over the supplied
-    /// `revoked` inventory. Returns empty to abort (e.g. a bad serial — fail
-    /// closed). Runs under crl_publish_mu_ only (NOT the connection lock), so it
-    /// may load the CA key + sign without blocking issuance, and may even call
-    /// back into CaStore's mu_-guarded methods — though it needn't, as `revoked`
-    /// is supplied. It MUST NOT call publish_next_crl itself (crl_publish_mu_ is a
-    /// plain, non-recursive mutex).
-    using CrlBuilder =
-        std::function<std::vector<uint8_t>(uint64_t crl_number,
-                                           const std::vector<IssuedCertRecord>& revoked)>;
+    /// What a `CrlBuilder` returns: the signed DER plus the validity window it signed.
+    struct BuiltCrl {
+        std::vector<uint8_t> der;
+        int64_t this_update{0};
+        int64_t next_update{0};
+    };
 
-    /// Allocate the next CRL number, build the DER for THAT number, and persist
-    /// it — serialised by crl_publish_mu_ so two concurrent publishers can never
-    /// claim the same number (RFC 5280 §5.2.3 monotonicity) or clobber a
-    /// generation. The crlNumber must be embedded in the signed DER, so the
-    /// allocation and build are fused via `build` (not a bare `INSERT … SELECT
-    /// MAX+1 … RETURNING`); `build` gets the allocated number + the current
-    /// revoked set. The connection lock is taken only for the brief DB steps, NOT
-    /// across signing. Returns the persisted record, or nullopt on any failure
-    /// (nothing inserted; the number is not consumed).
-    [[nodiscard]] std::optional<CrlVersionRecord>
-    publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
-                     const std::string& issuer_fingerprint = {},
-                     const std::string& issuer_key_id = {});
+    /// Builds and signs the CRL for an allocated `crl_number` over the supplied `revoked`
+    /// inventory. Runs INSIDE `publish_next_crl`'s transaction while the CRL table lock is held,
+    /// so it must be pure CPU work — load the CA key BEFORE calling `publish_next_crl`, never in
+    /// here. Returning `nullopt` or empty DER aborts the publish (e.g. a bad serial — fail closed)
+    /// and consumes no number. It must not call back into this store.
+    using CrlBuilder = std::function<std::optional<BuiltCrl>(
+        uint64_t crl_number, const std::vector<IssuedCertRecord>& revoked)>;
+
+    /// Why a publish did not commit. `RootChanged` is the only retryable outcome: the caller's
+    /// expected issuer fingerprint no longer matches `ca_root` (a subordinate import landed
+    /// between the caller's root read and the lock), so it must re-read the root, reload the
+    /// key and try again.
+    enum class PublishError { Failed, Busy, RootChanged };
+
+    /// #4830: finer-grained cause underneath a `PublishError` — a bounded, metrics/audit-facing
+    /// label, not a substitute for `kind`'s retry/skip control flow. The first 7 values are set
+    /// inside `publish_next_crl`, at the site the corresponding `std::unexpected(...)` is
+    /// returned; the last 4 belong to `CrlPublisher` (`server/core/src/crl_publisher.hpp`) for
+    /// failures that never reach this store at all. Closed set — extend `kPublishFailReasonLabels`
+    /// below in the same change as any new value, and keep the two declarations in lock-step
+    /// order (indexed by `static_cast<size_t>(reason)`).
+    enum class PublishFailReason {
+        NoConnection,          ///< no pool connection within local_wait, or the txn-scoped
+                               ///< bounds (set_config) themselves could not be applied
+        LockTimeout,           ///< `LOCK TABLE ... SHARE ROW EXCLUSIVE MODE` timed out
+        RootReadFailed,        ///< the under-lock root re-read query failed, OR (kind ==
+                               ///< RootChanged) it succeeded but disagreed with the caller's
+                               ///< expected fingerprint
+        NumberReadFailed,      ///< `MAX(version)+1` read failed
+        DegradedRevokedRead,   ///< the revoked-set read (`query_revoked_on`) failed
+        BuildFailed,           ///< the `CrlBuilder` returned nullopt or an empty DER
+        InsertOrCommitFailed,  ///< the INSERT failed, or the txn body returned true but COMMIT
+                               ///< did not durably confirm (a lost COMMIT acknowledgement)
+        KeyLoad,               ///< CrlPublisher: the CA key failed to load
+        RootChangedTwice,      ///< CrlPublisher: the root changed on both attempts — giving up
+        Busy,                  ///< the process-local `publish_mu_` was held past `local_wait`
+        Exception,             ///< CrlPublisher: the build/signing step threw
+        kCount,                ///< sentinel only — NOT a real reason; must stay last. Ties
+                               ///< `kPublishFailReasonLabels`'s size to this enum's cardinality
+                               ///< at compile time (governance #4828-#4832 follow-up) so a future
+                               ///< 12th value that forgets to extend the label array fails the
+                               ///< build instead of an unchecked out-of-bounds `operator[]` read
+                               ///< at first occurrence.
+    };
+
+    /// Compact labels for `PublishFailReason`, in enum-declaration order. Drives both a metrics
+    /// pre-seed loop and every increment site (`server.cpp`/`crl_publisher.cpp`) so a label
+    /// string can never drift between the two — index with `static_cast<size_t>(reason)`.
+    static constexpr std::array<std::string_view, 11> kPublishFailReasonLabels{
+        "no_connection",         "lock_timeout",       "root_read_failed",
+        "number_read_failed",    "degraded_revoked_read", "build_failed",
+        "insert_or_commit_failed", "key_load",         "root_changed_twice",
+        "busy",                  "exception",
+    };
+    static_assert(kPublishFailReasonLabels.size() ==
+                      static_cast<std::size_t>(PublishFailReason::kCount),
+                  "kPublishFailReasonLabels must have exactly one entry per PublishFailReason "
+                  "value (excluding the kCount sentinel) — extend both in the same change");
+
+    /// `publish_next_crl`'s error type: `kind` drives retry/skip control flow (unchanged since HA
+    /// WS-6 6.1 — callers must keep branching on it, not on `reason`); `reason` is the finer
+    /// #4830 cause. A 2-arg constructor (rather than relying on aggregate init) makes an
+    /// incomplete `PublishFailure{kind}` a genuine compile error — aggregate init would otherwise
+    /// silently value-initialize `reason` to `PublishFailReason::NoConnection` (enum value 0) on
+    /// any future call site that forgets to supply it, mislabeling a real failure's Prometheus
+    /// cause and audit detail.
+    struct PublishFailure {
+        PublishError kind;
+        PublishFailReason reason;
+
+        constexpr PublishFailure(PublishError k, PublishFailReason r) : kind(k), reason(r) {}
+    };
+
+    /// Upper bound on waiting for the CRL table lock, applied per transaction with
+    /// `set_config('lock_timeout', …, true)` so it holds even when the DSN's `options=` /
+    /// PGOPTIONS stops the pool from setting its own. `statement_timeout` is set the same way.
+    static constexpr std::chrono::milliseconds kCrlLockTimeout{5000};
+    static constexpr std::chrono::milliseconds kCrlLeaseTimeout{2500}; // == the store's write-lease bound
+    static constexpr std::chrono::milliseconds kCrlStatementTimeout{30000};
+
+    /// The ONE production CRL publish path (HA WS-6 slice 6.1, closes #4126). Extend it; never
+    /// compose `next_crl_number()` + `record_crl_for_test()` into a second one.
+    ///
+    /// One transaction: take `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE MODE`,
+    /// check `ca_root`'s fingerprint still equals `issuer_fingerprint` (when non-empty), read
+    /// MAX+1, read the revoked set, build, INSERT, COMMIT. The lock serialises every publisher on
+    /// every replica sharing the database — including writers that don't opt in, which an
+    /// advisory lock would not stop — so crlNumbers are strictly increasing with no duplicates
+    /// or gaps, and each new CRL contains every revocation the previous one did. A process-local
+    /// timed mutex is taken first, so one process parks at most one pool connection on the
+    /// lock. Not epoch-fenced: operator revocation publishes through here synchronously
+    /// (two-dispatch-planes rule).
+    ///
+    /// Errors: `Busy` (another publish in this process still held the local mutex after
+    /// `local_wait` — a holder can legitimately take longer, so this is an honest failure the
+    /// freshness pass heals, not a stuck publisher),
+    /// `RootChanged` (see above), `Failed` (lock timeout, read failure, build abort, insert
+    /// failure, lost COMMIT ack). Nothing is reported as published unless the txn committed.
+    /// `local_wait` bounds the wait for another publish in this process; pass zero from a
+    /// background pass, which should skip rather than queue behind an operator publish.
+    [[nodiscard]] std::expected<CrlVersionRecord, PublishFailure>
+    publish_next_crl(const CrlBuilder& build, const std::string& issuer_fingerprint = {},
+                     const std::string& issuer_key_id = {},
+                     std::chrono::milliseconds local_wait = kCrlLeaseTimeout + kCrlLockTimeout);
 
 private:
-    /// Set once in the constructor (and only nulled there, on a migration
-    /// failure, before the object is handed out). Never mutated afterwards, so
-    /// is_open()'s unlocked read of db_ is race-free.
-    sqlite3* db_{nullptr};
-    std::mutex mu_; ///< Connection lock — guards every sqlite call on db_.
-    /// Serialises CRL *publishes* against each other — a distinct, coarser lock
-    /// than mu_ — so two concurrent publish_next_crl callers cannot allocate the
-    /// same crlNumber WITHOUT holding the connection lock across the signing
-    /// callback (which loads the CA key + signs). Acquire crl_publish_mu_ only at
-    /// the top of publish_next_crl, never while holding mu_, to keep lock order
-    /// consistent. (Cross-process publishers — not the M1 single-server model —
-    /// are still caught by record_crl's plain INSERT refusing a duplicate.)
-    std::mutex crl_publish_mu_;
-
-    void run_migrations();
+    pg::PgPool& pool_;
+    bool open_{false};
+    /// Taken (bounded) before `publish_next_crl` acquires a lease, so concurrent publishers in
+    /// one process queue here instead of each parking a shared-pool connection on the table lock.
+    std::timed_mutex publish_mu_;
 };
 
 } // namespace yuzu::server

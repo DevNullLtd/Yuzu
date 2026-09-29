@@ -6,13 +6,21 @@ document holds the hard invariants every successor PR in the ladder must check.
 
 ## PR 2 — `command_id → execution_id` mapping
 
-`responses.execution_id` is populated at write time by an in-memory
-`cmd_execution_ids_` map inside `AgentServiceImpl` (under `cmd_times_mu_`).
-The mapping is registered at dispatch time INSIDE `cmd_dispatch` BEFORE any
-RPC is sent — closes the FAST-agent race where a sub-millisecond loopback
-agent could reply before a post-dispatch registration. The `CommandDispatchFn`
-typedef carries `execution_id` as its sixth parameter; pass empty to opt out
-(out-of-band dispatch / no-tracker callers).
+`responses.execution_id` is populated at write time by resolving the
+`command_id` against `ExecutionTracker`'s PG-backed `command_execution` table
+(HA WS-1(1b), ADR-2002 section 5 — migrated off the former in-process
+`AgentServiceImpl::cmd_execution_ids_` map, which was replica-local and could
+not resolve a response landing on a different server instance than the one
+that dispatched it). `ExecutionTracker::record_command_execution` /
+`::lookup_execution_id` are the store's write/read entry points;
+`AgentServiceImpl::record_execution_id` / `::resolve_execution_id` are the
+corresponding `AgentServiceImpl`-side wrappers, with `resolve_execution_id`
+the single chokepoint every response-receipt read goes through. The mapping is registered at dispatch
+time INSIDE `cmd_dispatch` BEFORE any RPC is sent — closes the FAST-agent race
+where a sub-millisecond loopback agent could reply before a post-dispatch
+registration. The `CommandDispatchFn` typedef carries `execution_id` as its
+sixth parameter; pass empty to opt out (out-of-band dispatch / no-tracker
+callers).
 
 ### Known coverage gap (every PR in this ladder must check this)
 
@@ -38,11 +46,17 @@ no error or warning.
 
 A single `command_id` is dispatched to N agents; each agent sends its own
 response with the same `command_id`. Terminal-status branches in
-`agent_service_impl.cpp` do NOT erase `cmd_execution_ids_` — erasing on the
-first agent's terminal would leave agents 2..N stamping empty
-`execution_id`. Map entries persist for process lifetime; a periodic
-sweeper is filed as PR 2.x. The accepted bounded leak matches the existing
-`cmd_send_times_` / `cmd_first_seen_` shape under the same `cmd_times_mu_`.
+`agent_service_impl.cpp` do NOT delete the `command_execution` row — deleting
+on the first agent's terminal would leave agents 2..N stamping empty
+`execution_id`. The row ages out via
+`ExecutionTracker::reap_command_execution_mappings` instead (HA WS-1(1b)) — a
+clock-guarded retention sweep on a ~60m cadence
+(`yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` /
+`_store_degrade_total`), not an unbounded in-process leak. The dispatch-time
+write (`record_command_execution`, single attempt, no retry — deliberately
+bounded to `kWriteTimeout` since it sits on the synchronous pre-RPC dispatch
+path) has its own counter on failure, `yuzu_exec_correlation_write_degrade_total`,
+distinct from the reap counters above.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
@@ -52,11 +66,18 @@ and the `__timing__|...` sentinel early-return. The
 `test_workflow_routes.cpp:814` sibling case covers the response-store
 level only.
 
-### Server restart caveat
+### Server restart / cross-replica behaviour
 
-The mapping is in-memory; restart loses it. In-flight commands at restart
-time produce responses tagged `execution_id=''` that use the legacy
-fallback in the drawer.
+The mapping is PG-backed (HA WS-1(1b)), so it survives a server restart and
+resolves identically regardless of which server replica's `AgentServiceImpl`
+receives the response — the property the migration off the in-process map
+exists to deliver (WS-9 scenario: `test_execution_tracker.cpp`'s
+"a command_execution mapping written on one instance resolves on a SEPARATE
+instance"). A mapping still does not survive its own retention window (see
+the fan-out section above) or a degraded/unreachable Postgres — either
+produces a response tagged `execution_id=''` that uses the legacy
+timestamp-window fallback in the drawer, the same degrade path an unmapped
+out-of-band dispatch already takes.
 
 ### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`, `deployment-`)
 
@@ -130,24 +151,41 @@ partial-index predicate. Every query against this index must include
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
-**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
-SQL.** The MCP `query_responses` collect path runs a per-agent
-`check_scoped_permission` filter on the returned rows (#1550), *after* the store
-has applied `ORDER BY timestamp DESC LIMIT`. **NOTE (#1634): this filter is INERT
-under the current global `Response:Read` gate** — a holder of global `Response:Read`
-(the only principal that passes the gate) admits every agent, so no rows are
-dropped, while a management-group-confined operator is 403'd at the gate before the
-filter runs. So it does **not** today provide cross-operator isolation: a normal
-caller sees all agents' rows. Its only active effect is failing **closed** on a
-corrupt/load-failed `rbac.db`. When the #1634 admit-then-filter gate makes scoping
-effective, this after-LIMIT placement means an execution that fans out wider than
-the row cap and spans both in- and out-of-scope agents can have the cap consumed by
-out-of-scope rows, truncating the in-scope caller's view (or a row present in one
-poll vanishes from the next as the window shifts) — at that point the isolation
-holds (never another operator's rows) but completeness does not. The handler flags
-truncation with `result_truncated_by_cap:true`; the durable fix (scope-aware keyset
-pagination + pushing the predicate into the WHERE clause) is part of the #1634
-follow-up. The same applies to every other operator-facing reader of this store.
+**Management-group scope is now applied BEFORE the LIMIT, in the SQL (#1634,
+ADR-0017 INV-3).** The MCP `query_responses` collect path — and the legacy REST
+`/api/responses/{id}/export` and catch-all list — resolve the caller's visible-agent
+set (`ResponseStore::distinct_agent_ids`/`distinct_agent_ids_by_execution`) and push
+it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)`
+**before** `ORDER BY ... LIMIT`, via a new optional scope parameter (mirroring
+`aggregate()`'s existing `AggregateScope`). This closes a real defect the first
+#1634 migration pass shipped: filtering *after* `LIMIT` meant an execution that
+fans out wider than the row cap and spans both in- and out-of-scope agents could
+have the cap consumed entirely by out-of-scope rows, handing a confined caller a
+short or empty page despite visible rows existing further back — found by an
+adversarial review (Kimi + Codex) citing this exact INV-3 text. `result_truncated_by_cap:true`
+now signals that the CALLER'S OWN scoped query hit the cap, not a raw-then-filtered
+cap hit that could fire entirely inside another operator's rows. The gate itself
+(`require_fleet_read`/`fleet_read_fn_`) replaced the old flat `Response:Read` check
+these readers sat behind, so a management-group-confined operator is admitted and
+narrowed rather than 403'd outright. **NOT true of every reader (correction, PR review
+2026-09-01):** the executions-drawer detail fragment (`workflow_routes.cpp`, `limit=500`)
+and the dashboard's `/fragments/results` (`dashboard_routes.cpp`, `limit=10000`) both
+predate #1634 and still call `query_by_execution`/`query` with no scope argument,
+post-fetch-filtering the raw (capped) result instead — the same INV-3 shape this
+paragraph describes as closed elsewhere. Isolation still holds (under-display only,
+never over-disclosure: a confined caller can see fewer in-scope rows than exist past
+the cap, never an out-of-scope row), so this is not a security regression, but it is
+not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
+tracked separately as #3805.
+
+**#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`execution_routes.cpp` as
+of #2542 PR-7, extracted from `server.cpp` onto the `HttpRouteSink` seam) — the one
+execution-reading surface with NO confinement of any kind, not even a post-fetch filter — is now
+on `require_fleet_read`, and its LIST route uses the SQL-pushdown pattern this paragraph describes
+(a correlated `EXISTS` over `agent_exec_status`, since `executions` carries no per-row `agent_id`
+column). Full design: `docs/auth-architecture.md`'s "Fourth migration (#3789)" /
+`docs/adr/0017-management-group-confinement-list-reads.md`'s "Executions (legacy pre-v1 routes)"
+bullet.
 
 ## PR 3 — SSE live updates
 
@@ -203,6 +241,49 @@ successor PR that restructures `gc_terminal_channels` or adds a new path
 that erases from `channels_` while holding a channel mutex must preserve
 this ordering. Lock hierarchy is `map_mu_` → `ch->mu`, never reversed.
 
+### Terminal-visit primitive (#2409)
+
+`ExecutionEventBus::unsubscribe_and_visit_terminal(execution_id, sub_id, f)`
+runs a caller-supplied claim callback `f` under a **single hold of one
+channel's mutex**, then erases the listener **iff `f` claimed**. It is the
+MCP progress bridge's fix for a race where the sweep could unsubscribe a
+parked streamed record and then synthesize a spurious `-32014`
+terminal-unavailable frame over an execution that had actually completed —
+because a terminal published into the unsubscribe→re-check window was never
+latched. Three invariants a successor PR must not break:
+
+- **The verdict keys on `Channel::first_terminal_id`, not an event-type
+  scan.** `refresh_counts` publishes a terminal-flagged `execution-progress`
+  *before* `execution-completed` (two publishes, `ch->mu` released between),
+  so the *first* terminal-flagged event is a progress event; a scan for
+  `event_type == "execution-completed"` misclassifies. A marker that has
+  aged out of the ring is `kTerminalKnownLost` → the caller's safe
+  success-shaped fallback ("fetch by execution_id"); it deliberately does
+  **not** recover a later buffered `execution-completed`, which could be a
+  spurious `mark_cancelled` terminal (#2409 UP-1).
+
+- **The claimed teardown owns THREE resources.** A claimed record must
+  settle its `records_` entry, its streamed admission charge, **and** its
+  bus subscription. Erasing the map entry while the subscription survives
+  strands the listener permanently: the listener holds a `shared_ptr` to
+  the record, so the erase frees nothing, `shutdown()` can no longer reach
+  it, and channel GC never reaps the channel because it requires
+  `listeners.empty()`. `torn_down` (set once, never cleared) excludes the
+  record from every *ordinary* sweep claim - but an incomplete teardown
+  IS retried, from a later sweep tick, up to `Config::teardown_retry_max`
+  times via the record's own `teardown_retry_claimable` flag (#2513);
+  `shutdown()` remains the reclaimer of last resort, for a record whose
+  retry budget is exhausted or that shutdown races before a retry pass
+  gets to it. A step that cannot complete must leave the record reachable
+  by a later retry (or, failing that, `shutdown()`) and say so, rather
+  than erase around a live listener (#2487).
+- **`f` runs under `ch->mu` and must never call back into the bus** (a bus
+  call taking `map_mu_` would invert the `map_mu_` → `ch->mu` order above)
+  and must be erase-only-on-claim: every *defer* keeps the listener, so a
+  deferred terminal channel is never listener-less and never GC-eligible
+  out from under the record. The full contract lives on the method in
+  `execution_event_bus.hpp`.
+
 ### Client-side bootstrap is data-attribute-driven
 
 The list-row markup carries `data-execution-id` and
@@ -240,14 +321,27 @@ agentic route wraps every event in
 subscribed to one channel can still discriminate events without out-of-
 band context.
 
-**Two consumers, one bus, one set of publisher invariants** — the
+**Three consumers, one bus, one set of publisher invariants** - the
 publisher list above (`update_agent_status` / `refresh_counts` /
 `mark_cancelled` → `agent-transition` / `execution-progress` /
-`execution-completed`) is the single taxonomy both routes emit. A new
-event type must be added on the bus side first; both routes pick it up
-transparently. **Do not add a route-specific event type to either
-sibling** — that would split the taxonomy and break the A3 invariant
-that a single deterministic step name appears on every channel.
+`execution-completed`) is the single taxonomy every consumer reads. The
+three live consumers are (1) the dashboard SSE route
+(`execution.live_subscribe`), (2) the agentic route
+(`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
+progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
+projection only*: it maps the same bus events onto an MCP session as
+`notifications/progress` + a final JSON-RPC response, adds **no bus event
+type** and renames no step. Which wire carries those frames is a per-request
+client choice and changes nothing here — the session's `GET` stream (PR 3a)
+or the `tools/call` POST response held open as SSE (PR 3b) — because both
+read the same subscription off the same bus. The bridge subscribes via
+`ExecutionEventBus::subscribe_and_replay` (atomic install-then-replay,
+closing the `replay_since`+`subscribe` race the two older siblings still
+carry - tracked for migration in #2410). A new event type must be added
+on the bus side first; every consumer picks it up transparently. **Do not
+add a consumer-specific event type** - that would split the taxonomy and
+break the A3 invariant that a single deterministic step name appears on
+every channel.
 
 The agentic route's audit verb is `api.v1.events.subscribe` (separate
 from `execution.live_subscribe` so SIEM filters can distinguish browser
@@ -284,3 +378,122 @@ than letting them go silent.
   already lives with; it is documented here for agentic-client authors
   who write reconnect logic against the executions ladder rather than
   the dashboard's bootstrap path.
+- **Cross-replica live delivery (HA WS-2a-2).** Each server replica runs
+  a ~2s poll (`ExecutionTracker::poll_event_outbox_once`) that drains the
+  durable `event_outbox` for events which originated on OTHER replicas
+  and re-publishes them onto the local in-memory bus, so a subscriber
+  sees live progress driven from any replica. The poll cursors on a
+  Postgres commit-settle horizon (`w_xid < pg_snapshot_xmin(...)`) — its
+  live forward delivery is gapless, at-least-once, and skips this
+  replica's own already-published rows. Its horizon is initialized at
+  ExecutionTracker CONSTRUCTION (before SSE admission), so events that
+  commit during the boot→first-poll window are delivered, not ceded. A
+  long-running transaction anywhere on the substrate pins the horizon and
+  DELAYS (never drops) cross-replica delivery until it commits.
+  Single-replica deployments are a no-op here (nothing foreign to deliver).
+- **The live bus `id` is the per-channel counter, not the durable id
+  (HA WS-2a-2 Option A).** The durable global `event_outbox.event_id`
+  (a fleet-wide Postgres IDENTITY) is kept in the outbox — it drives the
+  poll's settle-horizon cursor and the later durable failover replay — but
+  it is deliberately NOT used as the live SSE `id`. Assigning it at INSERT
+  and publishing post-commit would let two concurrent same-execution
+  transitions invert id-vs-publish order and strand a committed event from
+  a cursor-based (`ev.id > since_id`) subscriber on a SINGLE replica. So
+  the bus id stays the per-channel counter assigned in publish order under
+  the channel mutex (buffer order == id order, reconnect-safe), and the
+  cross-replica poll re-publishes foreign events through the same path
+  (they too get a monotonic local counter id).
+- **Reconnect across replicas is NOT yet loss-free (WS-2a-2 slice
+  boundary).** Single-replica reconnect is safe (ring order == id order).
+  But a subscriber that fails over to a DIFFERENT replica holds a
+  `Last-Event-ID` that is that replica's LOCAL counter — meaningless on
+  the new one. Loss-free cross-replica reconnect needs the durable outbox
+  replay, served by `execution_id ORDER BY event_id`, with the durable
+  `event_id` becoming the cross-replica cursor (and delivered in id order
+  to avoid the commit-inversion skip). That is the WS-2a-2 follow-up slice
+  and a precondition for enabling a second replica (ADR-2002 "no committed
+  event lost across failover"). Until it ships, cross-replica failover
+  reconnect is not covered.
+
+## Catastrophic invariants (routed-concern detail)
+
+These are the clauses `.claude/routed-concerns.md` routes here (#1634, PR #3793 review).
+
+**(a) Admission grants VISIBILITY, never a redaction bypass.** Dispatcher/owner admission on a
+management-group-confined execution read grants visibility only — it never bypasses the confined-
+projection redaction (`scope_expression`, `parameter_values`, counts) applied to every OTHER confined
+caller. A new admission path — dispatcher ownership, a future service-token carve-out — that skips
+this redaction reopens the exact class of leak found in PR #3793's review, where the dashboard
+`/fragments/executions/{id}/detail` sidebar rendered `scope_expression`/`parameter_values`
+unconditionally with no `gate.scope` check at all.
+
+**(b) Every bus consumer sanitizes.** Every `ExecutionEventBus` consumer reachable by a confinable
+principal — REST `/api/v1/events`, the dashboard `/sse/executions/{id}`, and any future consumer —
+MUST route every event through `execution_event_scope.hpp`'s
+`classify_execution_event_for_scope` / `sanitize_execution_event_for_scope`. A consumer that reads
+the bus directly without this call leaks agent-transition and progress events to an out-of-scope
+subscriber.
+
+Both call sites are pinned by source-tripwire tests
+(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
+**A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
+## HA WS-2a — durable event outbox (ADR-2002 §5)
+
+The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`
+gains a durable, append-only `event_outbox` table (migration v4) that shadows
+every event `ExecutionEventBus` fans out in-memory. The bus stays the *local*
+fan-out; the outbox is the durable, cross-replica feed. **2a-1 lands the outbox
+and its atomic write only — there is no consumer yet** (the in-memory bus still
+serves live SSE exactly as before). A later slice (2a-2) drives a
+LISTEN/NOTIFY-plus-cursor-poll loop from it.
+
+- **Atomic-write invariant (§5 invariant 1).** Each event is appended
+  (`append_event_outbox`, `execution_tracker.cpp`) on the **caller's live
+  transaction connection**, inside the same `with_txn_for` as the state
+  mutation that produced it — the `agent_exec_status` upsert
+  (`upsert_agent_status_once`), the aggregate recompute / terminal transition
+  (`refresh_counts_once`), and the cancel (`mark_cancelled`). A failed append
+  returns false, which rolls the whole transaction back, so the store can never
+  hold state without its event or an event without its state. The append takes
+  no lease of its own (nesting a pool acquire inside an open `with_txn` would
+  deadlock). It is decoupled from `event_bus_`: the durable append happens
+  regardless of whether a local SSE bus is attached; only the post-commit
+  in-memory fan-out is bus-gated.
+- **Durable monotonic ids.** `event_id` is a global `BIGINT` IDENTITY,
+  replacing the per-process ring-buffer counter. `created_at` is authored from
+  Postgres `now()` in-SQL so the retention cutoff and the row share one DB clock
+  domain.
+- **ID-ORDERING CONTRACT for future consumers.** An IDENTITY id is assigned at
+  INSERT but the row is visible only at COMMIT, so a transaction holding a lower
+  id can commit *after* one holding a higher id, and rolled-back appends/state
+  writes leave permanent id gaps. A cross-execution forward poll (2a-2) **MUST
+  NOT** use a bare `event_id > cursor ORDER BY event_id`, or it silently skips a
+  slower-committing lower id forever. **A trailing `created_at` time-lookback is
+  NOT a sufficient fix** and must not be specified as one: `created_at` is
+  authored from `now()`, which in Postgres is TRANSACTION-START time, so it does
+  not linearize COMMIT order — a late-starting transaction can commit a higher id
+  before an early-starting transaction commits a lower one, and no finite time
+  window closes that straddle. The two sound approaches (algorithm left to the
+  2a-2 design) are: **(a)** an id-gap-pending advance — never step past a missing
+  id until it is proven committed OR proven rolled back (aborted-txn gaps are
+  permanent); or **(b)** a txid/snapshot-horizon cursor — poll only rows whose
+  inserting xid is below the database's all-committed xmin horizon
+  (`pg_snapshot_xmin(pg_current_snapshot())`). The per-execution `Last-Event-ID`
+  reconnect replay (`execution_id = $1 AND event_id > $since`) is safe with a
+  bare id cursor — those rows are long-committed by reconnect time; the hazard is
+  the live-edge forward poll. The authoritative statement of this contract lives
+  at `append_event_outbox`.
+- **No FK, deliberately.** `event_outbox` carries no foreign key to
+  `executions(id)` and no UNIQUE/CHECK beyond the PK — `execution_id`
+  legitimately holds non-`executions` ids (`polchk-`/`preflight-`/…), and a
+  constraint would turn a benign append into an unrecoverable, differential
+  failure of the paired state write.
+- **Retention.** `reap_event_outbox` is a clock-guarded sweep (24h window,
+  `reap_meta` key `event_outbox_reap_anchor`) mirroring
+  `reap_command_execution_mappings`: advisory-lock single-writer, one in-SQL DB
+  `now()` read, sanitised persisted anchor, forward/backward-anomaly decline,
+  unconditional cap, and the same would-wipe + fact-set-dedup carve-outs.
+  Missing anchor **PROCEEDs** (an outbox row is a regenerable live-update frame,
+  not compliance evidence; the reap never touches authoritative state). Metrics:
+  `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
+  `yuzu_exec_outbox_store_degrade_total`.

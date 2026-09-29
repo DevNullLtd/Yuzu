@@ -1,0 +1,4 @@
+ESTABLISH E1 Service end-to-end (idle) Add-accepted -> first Fired n=199 min= 58529 p50=64182 p90=64767 p99=65285 max=65452 us
+E1 Service end-to-end (idle): 200 services attempted, 0 timed out waiting for a Fired event (excluded from the series above)
+ESTABLISH E2 Service end-to-end UNDER SCM LOAD Add-accepted -> first Fired n= 199 min=55865 p50=63535 p90=64020 p99=64402 max=64453 us
+E2 Service end-to-end UNDER SCM LOAD: 200 services attempted, 0 timed out waiting for a Fired event (excluded from the series above)

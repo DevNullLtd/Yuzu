@@ -27,7 +27,7 @@ Each job starts on a fresh disk. The cache lives in GitHub's blob storage and is
 ```yaml
 - name: Restore <thing>
   id: cache-<thing>
-  uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+  uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
   with:
     path: <path>
     key: <primary-key-with-strong-uniqueness>
@@ -39,15 +39,72 @@ Each job starts on a fresh disk. The cache lives in GitHub's blob storage and is
 - name: Save <thing>
   # `if: always()` is the documented replacement for the deprecated
   # `save-always: true` input — runs even on Build/Test failure, which
-  # is the only behaviour `save-always` was meant to deliver. The
+  # is the only behaviour `save-always` was meant to deliver. NOTE: this
+  # is right for an ADDITIVE cache only — see "Additive vs
+  # coherent-artifact caches" below before copying it onto a tree. The
   # `cache-hit != 'true'` gate skips the upload when the primary key
   # already matched on restore (no new content to save, no point
   # paying the upload cost).
   if: always() && steps.cache-<thing>.outputs.cache-hit != 'true'
-  uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+  uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
   with:
     path: <path>
     key: ${{ steps.cache-<thing>.outputs.cache-primary-key }}
+```
+
+**Additive vs coherent-artifact caches — `always()` is not always right:**
+
+The `if: always()` above is correct for an **additive** cache, where every object saved is
+independently valid and a partial save is merely a smaller cache. `ccache` is the type case.
+
+It is **wrong** for a **coherent-artifact** cache — `vcpkg_installed`, or any installed-prefix
+tree — where the entry only means anything as a complete set. A run cancelled or failed
+part-way saves a half-populated tree, and because the key inputs (manifest + baseline) still
+claim it is complete, the next run restores it as an exact hit, rebuilds everything anyway, and
+then **skips its own save** because `cache-hit == 'true'` — so the good tree is discarded and
+the poison persists. GHA cache keys are immutable, so nothing can overwrite it; only
+out-of-band deletion recovers. This is not hypothetical: it cost the canary ~65 min per run
+until #3229.
+
+Note the split is about CONTENT VALIDITY, not about key occupancy. The
+`cache-hit != 'true'` skip means ANY entry — additive or not — locks its key for
+as long as it lives, so a thin entry saved by a cancelled run suppresses later
+saves in both cases. For an additive cache that costs a colder cache; for a
+coherent artifact it hands out a tree that reads as complete. Only the second is
+a correctness problem, which is why only the second is gated here — but do not
+read "additive" as "immune".
+
+Two consequences follow, and they are different questions:
+
+**Correctness** — only coherent artifacts need it. Gate the save on the **producing
+step's** outcome, not the job's.
+
+**Key occupancy** — both classes need thought. A thin entry written under an exact
+key is hit by every later run with the same inputs, which then skips its own save,
+and the key is immutable. For an additive cache that costs a permanently colder
+cache rather than a wrong answer, so the gate is looser: save when the producing
+step RAN (pass *or* fail — a failed build's objects are still worth keeping), skip
+only when it was cancelled or never started. `ci.yml`'s canary ccache save is the
+worked example.
+
+**Key inputs must be stable.** `hashFiles` globs the whole workspace and does not
+honour `.gitignore`, so a bare `**/*.cpp`-style glob also hashes anything an
+earlier restore step materialised — dependency trees included. The key then differs
+between a cold and a warm run and the namespace splits. Scope the glob to the
+source roots you actually compile (#3270).
+
+For coherent artifacts, additionally gate on the **producing step's** outcome, not the job's:
+
+```yaml
+- name: Install deps
+  id: install-deps
+  run: ...
+
+- name: Save <tree>
+  # always() is still required — see the invariant above; without it the
+  # implicit success() would also skip the save when only a LATER step
+  # (e.g. Build) failed, even though the tree is complete and worth keeping.
+  if: always() && steps.install-deps.outcome == 'success' && steps.cache-<thing>.outputs.cache-hit != 'true'
 ```
 
 **Key construction (D3 of the CI overhaul plan):**
@@ -73,7 +130,7 @@ restore-keys: |
 
 GHA cache scope is **branch-isolated** with PR runs scoped to `refs/pull/<N>/merge`. A PR job can read caches from (a) its own ref, (b) the repo's default branch, (c) the PR's base branch. **Sibling-PR caches are unreadable.** If a job only ever runs on `pull_request`, its cache never lands on `refs/heads/main` and every PR cold-starts.
 
-Fix: also trigger the job on `push` to `main` when the relevant inputs change. The canary job in `ci.yml` does this via `detect-ci-changes` firing on both `pull_request` and `push` to `refs/heads/main`. Mirror that pattern for any new cache that needs cross-PR warmth.
+Fix: also trigger the job on `push` to the branch PRs actually base on. The canary job in `ci.yml` does this via `detect-ci-changes` firing on `pull_request` plus `push` to `refs/heads/main` **and `refs/heads/dev`**. Warming only the default branch is not enough here and silently stopped working: this repo integrates on `dev`, `main` moves only at release time, and with no `main` push for five weeks the warm scope was simply empty — every PR then saved its own private ~843 MB copy of a byte-identical tree, six of them live at once against a 10 GB repo cap (#3233). Pick the branch by scope rule (c), not by convention, and check it is actually pushed to.
 
 ---
 
@@ -122,7 +179,7 @@ When in doubt, read these as worked examples (all up-to-date as of v0.12.0-rc0):
 | File | Pattern shown |
 |---|---|
 | `.github/workflows/ci.yml` macOS legs (lines 564–675) | GHA-hosted split restore + paired save |
-| `.github/workflows/ci.yml` canary (lines 730–820) | GHA-hosted split restore + paired save + push-to-main warming |
+| `.github/workflows/ci.yml` canary (job `canary:`; line numbers drift, grep the job name) | GHA-hosted split restore + paired save + push-to-main/dev warming |
 | `.github/workflows/release.yml` (lines 703–751) | Restore-only (release builds consume cache, never produce — see comment block) |
 | `.github/workflows/codeql.yml` | Self-hosted `VCPKG_DEFAULT_BINARY_CACHE → runner.tool_cache` |
 | `scripts/ci/vcpkg-triplet-sentinel.sh` | Sentinel invalidation logic, including the orphaned-registry self-heal |
@@ -135,6 +192,6 @@ Three questions to answer before you add `actions/cache/restore`:
 
 1. **What's the cache key?** Must be uniquely determined by the inputs that change the cache content. Source-file hash for ccache; manifest + triplet + baseline for vcpkg; pip-tools requirements file hash for `~/.cache/pip`. If the key collapses two materially-different states into one entry, the cache is poisoned.
 2. **Where does it save?** GHA-hosted → blob storage with branch-scope rules. Self-hosted → local `runner.tool_cache`. Pick one based on the runner kind, never both.
-3. **Will it ever warm via push-to-main?** If only `pull_request` writes the cache, every PR cold-starts. Either accept that or add a push-to-main trigger that produces the cache (see canary in ci.yml).
+3. **Will it ever warm via a push to main or dev?** If only `pull_request` writes the cache, every PR cold-starts. Either accept that or add a push trigger on the branch PRs base on that produces the cache (see canary in ci.yml).
 
 If any of those three feels wrong, the cache step is wrong. Re-read this skill before pushing.

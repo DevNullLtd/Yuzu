@@ -351,6 +351,21 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
 #endif // platform
 
+// ABI4 capability declarations (#2204). Every leg is a native, in-process
+// enumeration + hash — no subprocess anywhere in this plugin.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "procfetch_fetch",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + OpenSSL EVP SHA-1", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "CreateToolhelp32Snapshot + BCrypt SHA-1", nullptr},
+    },
+};
+
 } // namespace
 
 class ProcfetchPlugin final : public yuzu::Plugin {
@@ -364,6 +379,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"procfetch_fetch", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

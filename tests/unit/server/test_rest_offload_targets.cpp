@@ -23,6 +23,7 @@
 
 #include "offload_routes.hpp"
 #include "offload_target_store.hpp"
+#include "test_offload_target_store_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -32,13 +33,12 @@
 
 #include "../test_helpers.hpp"
 
-#include <filesystem>
-#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::test::OffloadTargetStorePg;
 
 namespace {
 
@@ -48,14 +48,12 @@ struct AuditRecord {
 
 /// REST harness for OffloadRoutes.
 ///
-/// **Member declaration order is load-bearing.** `db_file` must precede
-/// `store` so the store's destructor runs first (closing the SQLite
-/// handle) and `db_file`'s RAII removes the path afterwards. The
-/// previous draft used a manual `~Harness` destructor with `fs::remove`
-/// calls — that path leaked the db file when `OffloadTargetStore`'s
-/// constructor or `REQUIRE(store->is_open())` aborted the test (qe-B1
-/// in `feedback_governance_run.md`). `TempDbFile` from `test_helpers.hpp`
-/// is the mandatory pattern.
+/// **`store` is PG-backed (ADR-0059)** — `OffloadTargetStorePg` (see
+/// test_offload_target_store_pg_helper.hpp) owns the ephemeral database +
+/// FileKeyProvider + SecretCodec + PgPool + OffloadTargetStore chain and
+/// SKIPs the whole TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset. Declared
+/// as `std::optional` (not constructed) for the `with_store=false` harness
+/// mode below, matching the SQLite-era `store` unique_ptr's optionality.
 ///
 /// **`auth_fn` is captured but ignored** by the production
 /// `OffloadRoutes::register_routes` overload — same shape as sibling
@@ -65,16 +63,15 @@ struct AuditRecord {
 /// behaviour through this harness.
 struct OffloadHarness {
     yuzu::server::test::TestRouteSink sink;
-    yuzu::test::TempDbFile db_file{std::string_view{"rest-offload-"}};
-    std::unique_ptr<OffloadTargetStore> store;
+    std::optional<OffloadTargetStorePg> store;
     bool perm_grant{true};
     std::vector<AuditRecord> audit_log;
     OffloadRoutes routes;
 
     explicit OffloadHarness(bool with_store = true) {
         if (with_store) {
-            store = std::make_unique<OffloadTargetStore>(db_file.path);
-            REQUIRE(store->is_open());
+            store.emplace();
+            REQUIRE(store->get()->is_open());
         }
 
         auto auth_fn = [](const httplib::Request&, httplib::Response&)
@@ -100,13 +97,13 @@ struct OffloadHarness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                               with_store ? store.get() : nullptr);
+                               store ? store->get() : nullptr);
     }
 };
 
 } // namespace
 
-TEST_CASE("REST offload-targets: list empty", "[rest][offload]") {
+TEST_CASE("REST offload-targets: list empty", "[rest][offload][pg]") {
     OffloadHarness h;
     auto res = h.sink.Get("/api/v1/offload-targets");
     REQUIRE(res);
@@ -118,7 +115,7 @@ TEST_CASE("REST offload-targets: list empty", "[rest][offload]") {
     CHECK(j["offload_targets"].empty());
 }
 
-TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload]") {
+TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "siem-primary"},
                            {"url", "https://siem.example.com/ingest"},
@@ -141,7 +138,7 @@ TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload]") 
     CHECK(h.audit_log[0].detail == "siem-primary");
 }
 
-TEST_CASE("REST offload-targets: list redacts auth_credential", "[rest][offload][security]") {
+TEST_CASE("REST offload-targets: list redacts auth_credential", "[rest][offload][pg][security]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "secret-bearer"},
                            {"url", "https://x.example.com/h"},
@@ -179,7 +176,7 @@ TEST_CASE("REST offload-targets: list redacts auth_credential", "[rest][offload]
 }
 
 TEST_CASE("REST offload-targets: rejects CRLF in auth_credential",
-          "[rest][offload][security]") {
+          "[rest][offload][pg][security]") {
     OffloadHarness h;
     // Bearer-type credential with embedded CRLF — would inject extra
     // HTTP headers on the outbound POST. Must be rejected at create.
@@ -196,7 +193,7 @@ TEST_CASE("REST offload-targets: rejects CRLF in auth_credential",
 }
 
 TEST_CASE("REST offload-targets: GET /:id 404 on int64 overflow",
-          "[rest][offload]") {
+          "[rest][offload][pg]") {
     OffloadHarness h;
     // 21-digit integer overflows int64; std::stoll throws out_of_range
     // pre-fix. Post-fix the route returns 404 cleanly.
@@ -206,7 +203,7 @@ TEST_CASE("REST offload-targets: GET /:id 404 on int64 overflow",
 }
 
 TEST_CASE("REST offload-targets: GET /:id/deliveries clamps limit",
-          "[rest][offload]") {
+          "[rest][offload][pg]") {
     OffloadHarness h;
     auto post = h.sink.Post("/api/v1/offload-targets",
                             R"({"name":"limit-test","url":"https://x.example.com/h"})");
@@ -224,7 +221,7 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries clamps limit",
     CHECK(j["deliveries"].empty());
 }
 
-TEST_CASE("REST offload-targets: GET /:id 200 then 404", "[rest][offload]") {
+TEST_CASE("REST offload-targets: GET /:id 200 then 404", "[rest][offload][pg]") {
     OffloadHarness h;
     auto post = h.sink.Post("/api/v1/offload-targets",
                             R"({"name":"one","url":"https://x.example.com/h"})");
@@ -243,7 +240,7 @@ TEST_CASE("REST offload-targets: GET /:id 200 then 404", "[rest][offload]") {
     CHECK(missing->status == 404);
 }
 
-TEST_CASE("REST offload-targets: DELETE removes and audits", "[rest][offload]") {
+TEST_CASE("REST offload-targets: DELETE removes and audits", "[rest][offload][pg]") {
     OffloadHarness h;
     auto post = h.sink.Post("/api/v1/offload-targets",
                             R"({"name":"doomed","url":"https://x.example.com/h"})");
@@ -266,14 +263,14 @@ TEST_CASE("REST offload-targets: DELETE removes and audits", "[rest][offload]") 
     CHECK(del2->status == 404);
 }
 
-TEST_CASE("REST offload-targets: POST 400 on missing fields", "[rest][offload]") {
+TEST_CASE("REST offload-targets: POST 400 on missing fields", "[rest][offload][pg]") {
     OffloadHarness h;
     auto res = h.sink.Post("/api/v1/offload-targets", R"({"url":"https://x.example.com/h"})");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
 
-TEST_CASE("REST offload-targets: POST 400 on invalid JSON", "[rest][offload]") {
+TEST_CASE("REST offload-targets: POST 400 on invalid JSON", "[rest][offload][pg]") {
     OffloadHarness h;
     auto res = h.sink.Post("/api/v1/offload-targets", "{not-json");
     REQUIRE(res);
@@ -281,7 +278,7 @@ TEST_CASE("REST offload-targets: POST 400 on invalid JSON", "[rest][offload]") {
 }
 
 TEST_CASE("REST offload-targets: POST 400 on bad URL scheme",
-          "[rest][offload][security]") {
+          "[rest][offload][pg][security]") {
     OffloadHarness h;
     auto res = h.sink.Post("/api/v1/offload-targets",
                            R"({"name":"bad","url":"ftp://evil/h"})");
@@ -292,7 +289,29 @@ TEST_CASE("REST offload-targets: POST 400 on bad URL scheme",
     CHECK(h.audit_log[0].result == "denied");
 }
 
-TEST_CASE("REST offload-targets: 403 when perm_fn denies", "[rest][offload][rbac]") {
+TEST_CASE("REST offload-targets: POST 400 (not 500) on type-mismatched field",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    // batch_size as a string throws nlohmann::json::type_error out of
+    // body.value() — must be a caller-mistake 400, never an unhandled 500.
+    auto res = h.sink.Post(
+        "/api/v1/offload-targets",
+        R"({"name":"x","url":"https://x.example.com/h","batch_size":"not-an-int"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST offload-targets: POST 400 on unrecognized auth_type",
+          "[rest][offload][pg]") {
+    OffloadHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/offload-targets",
+        R"({"name":"x","url":"https://x.example.com/h","auth_type":"bearre"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST offload-targets: 403 when perm_fn denies", "[rest][offload][pg][rbac]") {
     OffloadHarness h;
     h.perm_grant = false;
 
@@ -315,7 +334,7 @@ TEST_CASE("REST offload-targets: 503 when store is null", "[rest][offload]") {
 }
 
 TEST_CASE("REST offload-targets: GET /:id/deliveries empty list",
-          "[rest][offload]") {
+          "[rest][offload][pg]") {
     OffloadHarness h;
     auto post = h.sink.Post("/api/v1/offload-targets",
                             R"({"name":"d","url":"https://x.example.com/h"})");
@@ -332,7 +351,7 @@ TEST_CASE("REST offload-targets: GET /:id/deliveries empty list",
 }
 
 TEST_CASE("REST offload-targets: GET /:id/deliveries 404 on missing target",
-          "[rest][offload]") {
+          "[rest][offload][pg]") {
     OffloadHarness h;
     // No target created — /deliveries on a non-existent id must 404
     // rather than 200 + empty array (HP-2 from Gate 4 happy-path).

@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg export "HKU\<SID from hku_sid.txt>\Software\Microsoft\Windows\CurrentVersion\Run" HKU_SID_Run.reg /y
+date: 2026-09-06
+status: REAL CAPTURE

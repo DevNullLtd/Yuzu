@@ -69,9 +69,11 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::agent {
@@ -89,7 +91,72 @@ struct SparkEngineStats {
     /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
+    /// Mechanism unwatch() calls that THREW during the ARM-RACE teardown (#2270).
+    /// SCOPE IS IN THE NAME ON PURPOSE: this covers teardown_arm_race ONLY. disarm()
+    /// has its own counter below. unregister_consumer() is NOT a peer of these two —
+    /// its unwatch() still propagates UNCONTAINED, and the consequence is worse than
+    /// an uncounted orphaned watch: escaping a void function there permanently
+    /// strands the consumer's dispatch thread (#2814). A zero across both counters
+    /// below does NOT mean "no orphaned watches fleet-wide", and does not speak to
+    /// #2814 at all. Every other counter in this struct is scope-complete; these two
+    /// are not, and an alert built on either must say so.
+    /// Non-zero means an OS watch outlived its armed_ entry. Reclamation is
+    /// mechanism-dependent, not simply OS-dependent: a File watch (Windows-only
+    /// mechanism) is never reclaimed short of a process restart; a Service watch
+    /// (Linux or Windows) is reclaimed the next time stop() runs; a Registry watch
+    /// (Windows-only mechanism) cannot fail this way at all — its unwatch()
+    /// allocates nothing (see teardown_arm_race for the per-mechanism detail).
+    /// macOS is out of scope for all of the above: every mechanism factory returns
+    /// nullptr there (`spark_mechanism.hpp`), so `mech` is always null and this
+    /// counter is structurally unreachable on that platform.
+    /// Monotonic. Surfaced as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`;
+    /// the fleet rollup, metrics.md row and alert rule are deferred to the
+    /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
+    ///
+    /// #2833 — WHEN THAT TAG IS UNREACHABLE, which is exactly when it would matter most.
+    /// Increments that happen during SHUTDOWN never reach the wire: the agent's heartbeat
+    /// composer emits NOTHING once stop_requested_ is set (agent.cpp:2582 / :3311). The
+    /// two shutdown paths' spark-stop and heartbeat-join calls (:1086 / :3345 vs :3125 /
+    /// :3774) run on different threads and aren't ordered relative to each other, but
+    /// that isn't load-bearing here — the engine's own gate says the same thing
+    /// independently: emit_spark_heartbeat_tags() takes the ABSENT posture on !running, and stop() has
+    /// already cleared running_. So a shutdown-window increment is JOURNAL-ONLY: its sole
+    /// egress is the spdlog::error at the increment site.
+    ///
+    /// OPERATOR CONSEQUENCE: a zero reading for this tag during a shutdown is NOT evidence
+    /// that nothing was orphaned. Accepted, not fixed — adding an egress here would be
+    /// inert, because the gate that suppresses it is the agent's and is deliberate
+    /// (STOPPED is not FAILED: a cleanly-stopping agent must not page on-call). Pinned by
+    /// "#2833 — a shutdown-window unwatch failure is counted but has NO heartbeat egress"
+    /// in test_spark_mechanism.cpp.
+    std::uint64_t arm_race_unwatch_failures_total{0};
+    /// Mechanism unwatch() calls that THREW during an ordinary disarm() teardown (#2270).
+    /// The counterpart of the counter above, scoped the same way on purpose: that one
+    /// covers teardown_arm_race, this one covers disarm(). Neither covers
+    /// unregister_consumer() (#2814, worse in kind — see above), so a zero across
+    /// BOTH is still not "no orphaned watches fleet-wide". Same per-mechanism
+    /// reclamation bound as its counterpart — and the same #2833 shutdown-window
+    /// unreachability, stated in full at that counter: an increment during shutdown is
+    /// journal-only, so a zero reading then is not evidence nothing was orphaned.
+    std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
+    /// stop() calls whose BOUNDED wait for the in-flight mechanism-teardown lease
+    /// expired, so stop() proceeded to tear the mechanisms down with a caller still
+    /// inside the post-mu_ window (#2815). Monotonic.
+    ///
+    /// JOURNAL-ONLY BY CONSTRUCTION, and deliberately absent from
+    /// emit_spark_heartbeat_tags(): this counter can only ever increment INSIDE stop(),
+    /// which runs after running_ = false, and the heartbeat gate at agent.cpp:2582 emits
+    /// nothing once shutdown has been requested. A heartbeat tag for it would be
+    /// unreachable on every path that can set it — the same shape as the two
+    /// unwatch-failure counters' shutdown-window increments (#2833). Its egress is the
+    /// spdlog::warn at the expiry site, plus this field for tests.
+    ///
+    /// Non-zero does NOT mean a use-after-free happened: ~SparkEngine's wait is
+    /// UNBOUNDED and is what actually closes that. It means the late unwatch may have
+    /// reached an already-stopped mechanism (benign — every real mechanism fails a
+    /// post-stop unwatch closed) and that some caller outstayed the budget.
+    std::uint64_t teardown_join_timeouts_total{0};
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
     std::uint64_t queued_dropped_total{0}; ///< bounded-queue overflow + shutdown drops
@@ -102,11 +169,21 @@ struct SparkEngineStats {
     std::uint64_t inline_over_100us_total{0}; ///< tail counter (p-high proxy)
     std::uint64_t inline_over_10ms_total{0};  ///< scheduler-quantum-class outliers
     // Summed across every registered mechanism's stats() (#1979); see
-    // SparkMechanismStats for per-field meaning.
+    // SparkMechanismStats for per-field meaning. The per-mechanism-type breakdown
+    // (which sum() folds away) is available via stats_by_type() (#2011 rung 1).
     std::uint64_t mech_retiring{0};
+    std::uint64_t mech_retiring_cap{0}; ///< summed teardown-backpressure ceiling — the
+                                        ///< context that makes mech_retiring readable
+                                        ///< (a bare retiring count has no scale)
     std::uint64_t mech_watch_rejected_total{0};
     std::uint64_t mech_quarantined_total{0};
     std::uint64_t mech_slow_op_total{0};
+    /// #2818: Lost notifications actually DELIVERED (i.e. the drop_key_locked call site
+    /// found >=1 live subscriber to notify before erasing the key). Distinct from
+    /// watch_faults_total/armed_faulted, which already cover the Faulted/Recovered edge
+    /// at the key level — this counts the previously-invisible hard-kill case
+    /// specifically. Monotonic.
+    std::uint64_t subscription_lost_total{0};
 };
 
 class YUZU_EXPORT SparkEngine {
@@ -180,22 +257,81 @@ public:
 
     /// Remove one subscription; the watcher itself disarms when its last
     /// subscription goes. Unknown ids are ignored (idempotent).
+    /// NOT noexcept, and the surviving sources are exactly what
+    /// GuardianSparkRuntime::detach_rule_locked needs to know: the two lock_guard
+    /// acquisitions can raise std::system_error. Everything else on the path is
+    /// contained as of #2270 — the allocations, the log, and the mechanism unwatch.
+    /// (`mech_ops_mu_by_type_.at()` cannot throw: it is populated in lockstep with
+    /// mechanisms_ and frozen after start().)
     void disarm(SubscriptionId id);
 
     /// Start the mechanism threads. Interval/poll deadlines are (re)based on
-    /// the start instant; startup sparks fire immediately. Single-shot.
+    /// the start instant; startup sparks fire immediately. Single-shot. On a
+    /// failure (#2050), an internal rollback guard tears the partial startup
+    /// back down and the original exception propagates — the engine is left
+    /// TERMINALLY stopped (mirrors stop()'s own sticky-stop invariant), never
+    /// restartable, not restored to a pre-start state.
     void start();
 
     /// Stop watchers (wheel + mechanisms), then consumer dispatch threads.
     /// PROMPT FOR WELL-BEHAVED HANDLERS ONLY: a queued handler that blocks past
     /// kConsumerJoinBudgetMs is DETACHED + counted rather than joined, so a hung
     /// handler can never hang agent shutdown (governance UP-1 / #1311 class).
-    /// Undelivered queued events are dropped + counted. Idempotent.
-    void stop();
+    /// Undelivered queued events are dropped + counted.
+    ///
+    /// IDEMPOTENT **AND** CONCURRENCY-SAFE: serialised against start(),
+    /// register_mechanism() and any other stop() by `lifecycle_mu_`, which is held
+    /// for the WHOLE operation. A second caller therefore BLOCKS until the first
+    /// has fully torn down — it does not early-return past an in-flight teardown.
+    /// That completion barrier is load-bearing: ~SparkEngine calls stop(), and
+    /// Agent::stop() is reachable concurrently from the Windows SCM control thread
+    /// (service_win.cpp handler_ex). Without it, the destructor could outrun an
+    /// in-flight stop() and run ~std::thread on a still-joinable wheel thread
+    /// (std::terminate) while the other thread was mid-`m->stop()` on mechanisms_
+    /// being destroyed (use-after-free) — governance Gate-3 B3 / Gate-4 UP-1.
+    ///
+    /// noexcept: ~SparkEngine calls this, and NOTHING may terminate the agent for
+    /// an observe-only subsystem. The body swallows teardown exceptions.
+    void stop() noexcept;
 
     [[nodiscard]] bool is_running() const noexcept;
 
     [[nodiscard]] SparkEngineStats stats() const;
+
+    /// #2818: cheap, lock-only (mu_), no I/O — safe to call from any context, including
+    /// a periodic backstop sweep (GuardianSparkRuntime::revalidate_subscriptions). See
+    /// SubscriptionHealth's own doc comment for why this needs no incarnation counter.
+    [[nodiscard]] SubscriptionHealth subscription_health(SubscriptionId id) const;
+
+    /// Pull query for the establishment signal (rung 9c PR-6 item 1) — see
+    /// spark.hpp's SubscriptionEstablishment doc comment for the field
+    /// semantics. nullopt for an unknown/dead subscription id, mirroring
+    /// subscription_health()'s Dead case (same sub_keys_/armed_ lookup).
+    /// Cheap, lock-only (mu_), no I/O.
+    ///
+    /// `coverage` is overlaid to None while the type's mechanism reports itself
+    /// inert - either reason, boot-inert OR runtime-degraded (whatever it last
+    /// reported); `established_at` is never touched. The result is a conservative
+    /// snapshot, not a coherent one: inert is an atomic read beside the mu_-guarded
+    /// cache, so it can disagree with a newer report.
+    ///
+    /// R4: after stop(), this returns the LAST-KNOWN values (stop() never
+    /// erases armed_ — the same precedent subscription_health() already sets,
+    /// and emit_spark_heartbeat_tags()'s ABSENT posture on !running takes the
+    /// same "consumer gates on liveness" shape). A caller that cares whether
+    /// the engine is still live checks is_running() itself; this query does
+    /// not do it for them.
+    [[nodiscard]] std::optional<SubscriptionEstablishment>
+    subscription_establishment(SubscriptionId id) const;
+
+    /// Per-mechanism-type snapshot of the mechanism-owned counters (#2011 rung 1).
+    /// Keyed by the registered SparkType — the KEY that stats() sums away — so the
+    /// agent can export a per-type (file / registry / service) heartbeat breakdown
+    /// instead of a single blended sum. Only registered (event-driven, platform-
+    /// supported) mechanisms appear, so the key set doubles as the agent's spark
+    /// capability. Same point-in-time skew caveat as SparkMechanismStats (each field
+    /// is an independent atomic; not a coherent cross-field snapshot).
+    [[nodiscard]] std::map<SparkType, SparkMechanismStats> stats_by_type() const;
 
     /// Test seam: substitute the platform disk reader. Set BEFORE start().
     void set_disk_reader_for_test(DiskReaderFn reader);
@@ -220,12 +356,84 @@ public:
     /// ghost-subscription race window (#1994) instead of a timing-dependent
     /// stress loop. Same set-then-use contract as the other race-hook seams.
     void set_arm_race_hook_for_test(std::function<void()> hook);
-    /// Test seam: if set, invoked once inside disarm() and
-    /// unregister_consumer(), after mu_ is released and before the
-    /// staleness-rechecked mechanism unwatch() call — lets a test
-    /// deterministically force a concurrent equal-spec re-arm into the M2
-    /// late-unwatch race window (#1994). Same set-then-use contract.
+    /// Test seam (#2270): if set, invoked once inside arm() AFTER the consumer
+    /// pre-check releases consumers_mu_ and BEFORE arm_impl() runs — no locks
+    /// held. This is the only deterministic reach into the FIRST half of the M1
+    /// window: set_arm_race_hook_for_test fires after the insert, so a hook that
+    /// unregisters from there has unregister_consumer() perform the teardown
+    /// itself and arm_impl's own teardown degenerates to a no-op. Unregistering
+    /// from HERE leaves nothing for the scan to find, so the teardown's real-work
+    /// branch (including the OS unwatch) runs. Same set-then-use contract.
+    void set_arm_precheck_race_hook_for_test(std::function<void()> hook);
+    /// Test seam: if set, invoked inside disarm(), unregister_consumer() AND
+    /// teardown_arm_race() (#2270 added the third site, and the M2 case in
+    /// test_spark_mechanism.cpp depends on it) — after mu_ is released and before the
+    /// staleness-rechecked mechanism unwatch() call. Lets a test deterministically
+    /// force a concurrent equal-spec re-arm into the M2 late-unwatch race window
+    /// (#1994). Same set-then-use contract. No locks are held when it fires.
     void set_disarm_race_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2270): if set, invoked at each labelled allocation point inside
+    /// arm_impl() AND inside start()'s pre-start replay (kArmFaultPhaseWatchErrorBuild
+    /// fires from both — named, not numbered, so a future renumber cannot strand this —
+    /// watch_guarded is shared by the two arm paths, and a replay case depends on it).
+    /// A test throws from the phase it wants to simulate an allocation failure at,
+    /// which is the only way to exercise the strong-guarantee path deterministically —
+    /// a real std::bad_alloc cannot be aimed at one statement. Same set-then-use
+    /// contract as the other seams.
+    void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Test seam (rung 9c PR-6 item 1, E13): if set, invoked exactly once inside
+    /// start(), after every mechanism's start() has returned (and the
+    /// establishment sink has been installed on each) but BEFORE the pre-start
+    /// replay loop runs. No locks held. Lets a test land a disarm+re-arm of a
+    /// pre-start subscription INSIDE this exact window, deterministically
+    /// reproducing the race the replay's incarnation gate (not a bare
+    /// armed_.contains() check) exists to close — the replay must skip a key
+    /// whose incarnation has moved on, not merely a key that is still present.
+    /// Same set-then-use contract as the other test seams: set before start().
+    void set_on_start_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2050): if set, invoked at each labelled phase inside start()'s
+    /// in-mu_ startup sequence (Replay collection, mechanism-pointer collection,
+    /// wheel-thread spawn). None of these three sites is reachable through a
+    /// mechanism fake — they run before/around the per-mechanism loop — so this is
+    /// the only way to deterministically exercise start()'s rollback guard for them.
+    /// CONTRACT: fires with the non-recursive mu_ HELD (all three phases run inside
+    /// start()'s `{ lock_guard lk(mu_); ... }` block) — throw or observe only;
+    /// re-entering the engine self-deadlocks. Same set-then-use contract as the
+    /// other test seams: set before start().
+    void set_start_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Reached immediately before the Replay-collection loop iterates armed_.
+    static constexpr int kStartFaultPhaseReplayCollection = 1;
+    /// Reached immediately before the mechanism-pointer collection loop.
+    static constexpr int kStartFaultPhaseMechCollection = 2;
+    /// Reached immediately before wheel_thread_ is constructed.
+    static constexpr int kStartFaultPhaseWheelSpawn = 3;
+    /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
+    /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
+    /// entry (the in-lock layer).
+    /// CONTRACT: fires with the non-recursive mu_ HELD. Throw or observe only —
+    /// re-entering the engine from this phase self-deadlocks.
+    static constexpr int kArmFaultPhaseBeforeSubKeys = 1;
+    /// Reached inside watch_guarded()'s catch arms, before the watch error is
+    /// completed from its pre-sized buffer. Pins CONTAINMENT, not rollback: a throw
+    /// here must not escape watch_guarded (it would escape arm_impl past a committed
+    /// subscription — the #2270 ghost — and escape the void start() on the replay
+    /// path). DEFENCE IN DEPTH, not a live-path guard: completion is BoundedMsg::finish,
+    /// which is noexcept by construction, so no production statement at this point can
+    /// throw today. The seam pins that property portably, on the platforms where the
+    /// Linux-only allocation counter in the tests cannot run.
+    /// CONTRACT: fires with this spark type's mech_ops_mu_by_type_ entry HELD. Throw or
+    /// observe only — re-entering the engine self-deadlocks on that non-recursive mutex.
+    ///
+    /// ORDINAL 3, NOT 2, DELIBERATELY. Ordinal 2 was `kArmFaultPhaseAfterCommit` until
+    /// 6c1d6942 deleted it with the post-commit rollback. Round 4 first reintroduced 2
+    /// under this new meaning, which meant a pre-round-4 test or ledger row citing
+    /// "phase 2" resolved to something else entirely — and ledger rows in both #2270
+    /// fragments do cite it (CA8-1 owns the count; a count quoted here would decay with
+    /// every appended row, which governance.d/README.md forbids). Renumbered to 3 so
+    /// retired ordinals stay retired
+    /// (Gate 8 — CA8-1, doc8-2). Retired so far: 2. Add the next phase as 4, and
+    /// document its lock contract as both live phases do.
+    static constexpr int kArmFaultPhaseWatchErrorBuild = 3;
 
 private:
     struct Subscriber {
@@ -254,7 +462,54 @@ private:
         /// firing. Cleared when the mechanism reports recovery.
         bool faulted{false};
         std::vector<Subscriber> subs;
+        /// Identity token (rung 9c PR-6 item 1), minted from the SAME shared
+        /// next_id_ counter as ConsumerId/SubscriptionId, ONLY on a fresh key
+        /// (never on a dedup arm, which shares the existing key's token). Lets
+        /// a mechanism's asynchronous establishment report be checked against
+        /// "is this still the CURRENT watch for this key" before it is trusted
+        /// (H1) — see report_established().
+        SparkIncarnation incarnation{kNoSparkIncarnation};
+        /// When this key's CURRENT incarnation was minted (H14: even a
+        /// pre-start arm gets this at arm time, not at start()).
+        std::chrono::steady_clock::time_point armed_at{};
+        /// First time a mechanism reported Notification coverage for the
+        /// CURRENT incarnation — first-wins, never re-stamped by a later
+        /// recovery (spark.hpp's SubscriptionEstablishment doc comment).
+        std::optional<std::chrono::steady_clock::time_point> established_at;
+        /// The mechanism's most recently reported tri-state coverage for this
+        /// key — unlike established_at, this DOES track the current state
+        /// (can drop back to None or Poll and this field follows it).
+        SparkCoverage coverage{SparkCoverage::None};
     };
+
+    // #2270 tripwires. arm_impl's publishing tail runs AFTER its first shared-state
+    // commit, so it must not throw: it move-assigns an Armed into the map entry and
+    // moves a Subscriber into already-reserved vector capacity. Both are nothrow
+    // today (every member bottoms out in std::string / std::vector / std::function /
+    // trivial types). Adding a throwing-move member to either struct would silently
+    // reopen the ghost-entry hole this ordering closes, so it fails to COMPILE here
+    // instead — the same tripwire idiom as kMaxProcessIoWorkers in
+    // guardian_io_executor.hpp.
+    static_assert(std::is_nothrow_move_constructible_v<Subscriber>,
+                  "arm_impl publishes a Subscriber into reserved capacity after its "
+                  "first commit; a throwing move would leave a ghost armed_ entry (#2270)");
+    static_assert(std::is_nothrow_move_assignable_v<Armed>,
+                  "arm_impl move-assigns Armed into the committed map entry; a throwing "
+                  "move would leave a ghost armed_ entry (#2270)");
+    // Move-ASSIGNMENT, which the two asserts above do NOT cover: teardown_arm_race runs
+    // std::erase_if(subs, ...) in the post-commit window, where nothing may throw, and
+    // erase_if move-assigns Subscribers. is_nothrow_move_assignable_v<Armed> does not
+    // reach it transitively — vector's move-assign is nothrow for std::allocator
+    // regardless of T. NOT standard-guaranteed: [func.wrap.func.con] declares
+    // std::function's move-assignment with no exception specification, and P0771R1
+    // strengthened only the move CONSTRUCTOR. All three implementations strengthen it
+    // anyway, MEASURED in governance round 4: libstdc++ 15 = true, and MSVC
+    // (cl.exe /std:c++latest on the DGRHP rig) = true; libc++ declares it _NOEXCEPT.
+    // If a future platform disagrees this fails to COMPILE, loudly and immediately,
+    // which is the tripwire working — far better than a silent throw past the commit.
+    static_assert(std::is_nothrow_move_assignable_v<Subscriber>,
+                  "teardown_arm_race erase_if move-assigns Subscribers after the commit; "
+                  "a throwing move-assign would strand a live subscription (#2270)");
 
     /// Delivery counters touched by consumer dispatch threads. Heap-owned via a
     /// shared_ptr the threads capture, so a DETACHED consumer thread (a handler
@@ -284,6 +539,34 @@ private:
     };
 
     std::expected<SubscriptionId, std::string> arm_impl(SparkSpec spec, Subscriber sub);
+    /// Drop one spark key and every subscription fanned out from it. Caller holds
+    /// mu_ and owns any OS-watch teardown. Used by arm_impl's failed-WATCH teardown
+    /// — see the definition for why a failed watch drops the whole key rather than
+    /// one sub. The consumer-race path does NOT use it: losing that race invalidates
+    /// one subscription, not the key, so it goes through teardown_arm_race().
+    /// (The post-commit rollback this doc used to name was deleted in 6c1d6942.)
+    /// Allocates nothing — map/node erases and string compares only.
+    void drop_key_locked(const std::string& key);
+    /// Undo ONE subscription after arm_impl loses the M1 consumer race. This
+    /// declaration states the interface contract; the DEFINITION owns implementation
+    /// claims — allocation posture, and the exact count/enumeration of differences
+    /// from disarm() — so this comment does not restate either. Both drifted out of
+    /// sync when restated here before, each caught by fjarvis's adversarial review
+    /// of the PR then open: a completeness claim with no number attached ("differ
+    /// only in that this one takes key/type from the caller"), found reviewing PR
+    /// #2863; and an "allocating nothing" claim, made false by the log calls this
+    /// function contains, found reviewing PR #2868. Do not reintroduce either at
+    /// THIS declaration — see the definition for both. The caller owns `key`/`type`/
+    /// `event_driven`, so nothing has to be copied or recomputed for THOSE
+    /// specifically. A specialization of disarm() — lockstep siblings, NOT exact
+    /// duplicates. It is NOT redundant with disarm():
+    /// routing arm_impl's M1 teardown through disarm() would remove ONE subscription
+    /// via a whole-key-capable path and reintroduce a lookup on values the caller
+    /// already holds. Keep the two in lockstep.
+    /// NOT noexcept: mutex acquisition can raise std::system_error (the residual
+    /// stated in arm_impl); turning that into std::terminate would be worse.
+    void teardown_arm_race(SubscriptionId id, const std::string& key, SparkType type,
+                           bool event_driven);
     /// Validate + normalise (cadence flooring). Returns the effective cadence
     /// (0 for the event-driven and startup types, which have no wheel cadence).
     std::expected<std::uint64_t, std::string> validate_and_floor(const SparkSpec& spec) const;
@@ -304,6 +587,38 @@ private:
     /// edge into Armed::faulted + the fault counter under mu_. Never blocks
     /// firing — health only. Called with the engine lock released.
     void report_fault(const std::string& key, bool faulted, std::string_view reason);
+    /// Establishment-signal entry point (rung 9c PR-6 item 1): a mechanism
+    /// reports a coverage transition for `key`. mu_ ONLY — allocation-free, no
+    /// deliver() (this is a pull-query field, not a delivered event). Identity
+    /// check first (drops a report whose incarnation no longer names the
+    /// key's CURRENT watch — H1), then an UNCONDITIONAL coverage assignment
+    /// (the cache always reflects the mechanism's last-reported value), then
+    /// first-wins established_at stamping (set only once per incarnation, only
+    /// on a Notification transition). Called with the engine lock released,
+    /// like report_fault().
+    void report_established(const std::string& key, SparkIncarnation incarnation,
+                            std::chrono::steady_clock::time_point at, SparkCoverage coverage);
+    /// #2050: stop()'s teardown body, factored out so start()'s own rollback guard can
+    /// drive the identical teardown on a startup failure. REQUIRES lifecycle_mu_
+    /// ALREADY HELD by the caller — stop() holds it via its own `life` lock_guard;
+    /// start()'s rollback guard runs while start()'s `life` lock_guard is still live
+    /// (the guard is declared after `life` and destructs before it unwinds — see
+    /// start()'s definition for why that ordering is deadlock-load-bearing, not
+    /// cosmetic). Never call this without lifecycle_mu_ held, and never re-enter it on
+    /// the same thread — lifecycle_mu_ is non-recursive.
+    ///
+    /// MAY THROW, exactly as stop()'s body always could (joins, map ops, spdlog can
+    /// all raise). Each of the two callers contains that itself: stop()'s own outer
+    /// `noexcept try { } catch (...) { }` (unchanged by this refactor), and the
+    /// rollback guard's own inline try/catch (a destructor must never let an
+    /// exception escape mid-unwind).
+    ///
+    /// Mechanism teardown is per-iteration-isolated: one mechanism's stop() throwing
+    /// does not skip the rest, and `teardown_complete_` is set ONLY when every phase
+    /// — including every mechanism this pass — completed without throwing, so a
+    /// partial pass is retried (idempotently) by the next caller instead of being
+    /// latched away as done.
+    void teardown_locked();
     void wheel_loop();
     void deliver(const SparkEvent& ev, const std::vector<Subscriber>& subs);
     /// Signal one consumer to stop (set stopping + notify). Non-blocking.
@@ -322,52 +637,96 @@ private:
     static void consumer_loop(std::shared_ptr<Consumer> consumer,
                               std::shared_ptr<DeliveryCounters> counters);
 
+    /// LIFECYCLE lock — serialises register_mechanism() / start() / stop() against
+    /// each other, held for the WHOLE of each. Distinct from `mu_` (which guards
+    /// per-operation state and is taken by the wheel and the hot arm/disarm paths):
+    /// a lifecycle op must not hold `mu_` while joining threads, but it MUST exclude
+    /// its siblings end-to-end.
+    ///
+    /// Two invariants ride on it:
+    ///   1. stop()'s teardown_complete_ early-out is a genuine COMPLETION barrier —
+    ///      the loser waits here for the winner to finish, so ~SparkEngine can never
+    ///      outrun an in-flight stop() (Gate-3 B3).
+    ///   2. stop() may iterate `mechanisms_` without `mu_` — no register_mechanism()
+    ///      can be concurrently mutating the map, even during the boot window where
+    ///      Agent::stop() is reachable from the Windows SCM control thread while the
+    ///      main thread is still registering (Gate-4 UP-1).
+    ///
+    /// LOCK ORDER: lifecycle_mu_ → mu_. Never the reverse. The wheel and the
+    /// arm/disarm paths take only mu_, so they cannot deadlock against a lifecycle op.
+    std::mutex lifecycle_mu_;
+
     // armed sparks + subscription index + wheel state, all under mu_.
     mutable std::mutex mu_;
-    /// Serializes every mechanism watch()/unwatch() call engine-wide (#1994
-    /// M2). Without this, a disarm()'s pending unwatch(key) and a concurrent
-    /// re-arm's watch(key) for an equal spec can interleave out of order —
-    /// the late unwatch tears down the fresh watch while armed_ still shows
-    /// the key armed. Each call site re-checks armed_'s current state for the
-    /// key WHILE HOLDING this lock, immediately before issuing the mechanism
-    /// call, so the mechanism call always reflects the freshest armed_ state.
-    /// Lock order: mech_ops_mu_ → mu_, NEVER reversed; mechanism worker
-    /// threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with their
-    /// own internal lock released and never touch mech_ops_mu_, so there is no
-    /// cycle. REQUIRES (Stage-2 trap, enforced by convention): a mechanism must
-    /// deliver emit()/fault() ASYNCHRONOUSLY — off the watch()/unwatch() call
-    /// stack, from its own thread. A mechanism that fired emit() synchronously
-    /// from inside watch(), reaching an inline consumer that re-arms, would
-    /// re-enter arm_impl → mech_ops_mu_ and self-deadlock this non-recursive
-    /// lock. All shipped mechanisms emit from worker threads, so this holds
-    /// today; a future mechanism author must preserve it (cpp-safety Gate 3).
-    /// Coarsened to per-engine (not per-key): arm/disarm are rare
-    /// control-plane operations, so a mechanism call briefly blocking another
-    /// unrelated key's arm/disarm is an acceptable trade for not needing
-    /// per-key generation tokens. KNOWN COUPLING (accepted, tracked): because
-    /// this is ONE engine-wide lock rather than per-mechanism, a slow
-    /// watch() on one mechanism blocks a concurrent unwatch() on a DIFFERENT
-    /// mechanism (e.g. File blocking Registry) that was fully independent
-    /// before. The "acceptable" defence rests on a BOUNDED worst-case watch(),
-    /// but that bound is WEAK and FILE-ONLY: spark_file's arm_ancestor deadline
-    /// (#1980) checks the 500ms budget BETWEEN probes, and fs::is_directory is
-    /// uninterruptible — so a single hung probe on a dead UNC/network path
-    /// holds this lock for the full OS network timeout (tens of seconds), not
-    /// ~500ms; the deadline bounds the NUMBER of slow probes to ~one, not the
-    /// wall-clock of any one probe (unhappy-path UP-1). Registry (TP_WAIT) and
-    /// Service (SCM query) watch latencies are entirely UNCHARACTERISED — a hung
-    /// SCM RPC in Service::watch() would stall this engine-wide lock with no
-    /// bound at all (architect Gate 3). Truly bounding this needs the
-    /// walk-off-mu_ (probe on a separate thread) restructure — the deferred
-    /// follow-up below.
-    /// Only same-mechanism watch/unwatch were serialised previously (by each
-    /// mechanism's own internal lock); this adds cross-mechanism serialisation
-    /// that Stage 2's simultaneous File+Registry+Service guards will exercise.
-    /// Correctness needs only same-KEY ordering; per-mechanism-type granularity
-    /// drops the cross-mechanism coupling for modest extra bookkeeping — this
-    /// is a HARD GATE before Stage 2 wires the SECOND live mechanism under
-    /// load, not an open-ended backlog item.
-    mutable std::mutex mech_ops_mu_;
+    /// Serializes every mechanism watch()/unwatch() call PER MECHANISM TYPE
+    /// (#1994 M2; per-type granularity #2011). Without this, a disarm()'s
+    /// pending unwatch(key) and a concurrent re-arm's watch(key) for an equal
+    /// spec can interleave out of order — the late unwatch tears down the fresh
+    /// watch while armed_ still shows the key armed. Each call site re-checks
+    /// armed_'s current state for the key WHILE HOLDING this lock, immediately
+    /// before issuing the mechanism call, so the mechanism call always reflects
+    /// the freshest armed_ state. Correctness needs only same-KEY ordering, and
+    /// a key encodes its SparkType (spark_key) — so a lock per mechanism type is
+    /// sufficient: two keys that could collide always share a type.
+    /// Lock order: mech_ops_mu_by_type_[type] → mu_, NEVER reversed; mechanism
+    /// worker threads (wheel/IOCP/TP_WAIT callbacks) call emit()/fault() with
+    /// their own internal lock released and never touch these locks, so there is
+    /// no cycle. REQUIRES (Stage-2 trap, enforced by convention): a mechanism
+    /// must deliver emit()/fault() ASYNCHRONOUSLY — off the watch()/unwatch()
+    /// call stack, from its own thread. A mechanism that fired emit()
+    /// synchronously from inside watch(), reaching an inline consumer that
+    /// re-arms, would re-enter arm_impl → the same type's lock and self-deadlock
+    /// this non-recursive lock. All shipped mechanisms emit from worker threads,
+    /// so this holds today; a future mechanism author must preserve it
+    /// (cpp-safety Gate 3). Coarsened to per-TYPE (not per-key): arm/disarm are
+    /// rare control-plane operations, so a mechanism call briefly blocking
+    /// another same-type key's arm/disarm is an acceptable trade for not needing
+    /// per-key generation tokens.
+    /// RESOLVED cross-mechanism coupling (#2011): a slow watch() on one
+    /// mechanism no longer blocks a concurrent arm/disarm on a DIFFERENT
+    /// mechanism (e.g. File no longer blocks Registry/Service) — the HARD GATE
+    /// closed before Stage 2 wires the second live mechanism under load.
+    /// SAME-TYPE stall (#2012/#3840, the walk-off-mu_ restructure), per
+    /// mechanism: a slow watch() stalls its OWN type's arm/disarm queue for as
+    /// long as the mechanism lets it. REGISTRY is bounded since PR-B1
+    /// (spark_registry.cpp): watch() reserves under the mechanism's own lock,
+    /// runs the probe on a detached F3-counted worker, waits at most
+    /// kRegCallerWaitBudget (50 ms - PR-B's chosen initial policy value, not a
+    /// measured bound; the measured inputs in docs/spark-rebuild-baselines/
+    /// stage2-watch-establish-latency.md sit at 82 us / 1264 us p99) and
+    /// otherwise publishes the probe to its sweeper; unwatch() hands the
+    /// blocking callback drain to a detached worker and returns in
+    /// microseconds - which also closes the #4181 same-type reentrant deadlock
+    /// (this lock held across that drain while the drained callback's Inline
+    /// consumer needed it). Cost: a consumed Target-mode Registry notification is now TWO
+    /// emit submissions (the immediate fire, then a synthetic fire when the
+    /// asynchronous re-arm commits) - a queued consumer's per-consumer,
+    /// drop-oldest queue (deliver()) can therefore be pushed by a noisy key's
+    /// synthetic fire into evicting a quiet key's only fire, a detection-
+    /// latency/fairness cost, and nothing here dedups on the wire (Guardian's
+    /// decide_emit re-emits Drift past debounce_ms regardless). LANDED for FILE
+    /// (PR-B2, #2012): watch()'s discovery/ancestor-walk probe now runs on a
+    /// detached F3-counted worker, bounded on the control path by
+    /// kFileCallerWaitBudget, with the same reservation-before-publication
+    /// shape as Registry above - a hung probe on a dead UNC path no longer
+    /// holds File's lock for the OS network timeout. LANDED for SERVICE, Windows
+    /// half only (PR-B3, #2012/#3840): its queue-push watch()/unwatch() were
+    /// already O(1); OpenServiceW establishment now runs on a bounded,
+    /// F3-counted probe lane instead of head-of-line on its worker. The Linux
+    /// sd-bus mechanism has no head-of-line OS call in watch()/unwatch() at
+    /// all (a queue push only), so PR-B3 did not need a Linux half.
+    /// Populated in register_mechanism() under mu_, in lockstep with
+    /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
+    /// std::mutex& obtained via .at(type) is safe to hold across the blocking
+    /// mechanism call for the same structural-stability reason a raw mechanism
+    /// pointer is (see mechanisms_ below). The map is moreover FROZEN after
+    /// start(): register_mechanism() is rejected once running_ (all under mu_),
+    /// while every .at() read site runs only when running_ — so the lock-free
+    /// .at() tree-walks are strictly disjoint in time from the sole mutator
+    /// across the start() mu_ barrier, never a concurrent read/write race (that
+    /// frozen-after-start fact, not node-stability alone, is what makes the
+    /// unsynchronized .at() reads sound).
+    mutable std::map<SparkType, std::mutex> mech_ops_mu_by_type_;
     std::condition_variable wheel_cv_;
     std::map<std::string, Armed> armed_; ///< by spark_key
     std::map<SubscriptionId, std::string> sub_keys_;
@@ -380,6 +739,13 @@ private:
     /// value without relying on a same-thread mu_-then-consumers_mu_ publish
     /// argument that a future refactor could silently break.
     std::atomic<bool> stopped_{false};
+    /// Set ONLY once stop()'s teardown has actually run to completion. Distinct from
+    /// stopped_, which latches "accept no new work" BEFORE the teardown (whose joins,
+    /// map ops and logging can all throw). stop()'s early-out tests THIS, so a teardown
+    /// that threw part-way is retried by the next caller — normally ~SparkEngine —
+    /// instead of being latched away as "already stopped" and leaving a joinable wheel
+    /// thread for the destructor to terminate on (Gate-8 security-guardian).
+    bool teardown_complete_{false}; ///< guarded by mu_
     std::thread wheel_thread_;
     std::uint64_t next_id_{1}; ///< shared consumer/subscription id counter
 
@@ -399,7 +765,11 @@ private:
     std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
     std::function<void()> register_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
+    std::function<void()> arm_precheck_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
+    std::function<void()> on_start_hook_for_test_;      ///< test seam (E13); null = no-op (set-then-use)
+    std::function<void(int)> start_fault_hook_for_test_; ///< test seam (#2050); null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The
@@ -408,6 +778,69 @@ private:
     std::shared_ptr<DeliveryCounters> delivery_{std::make_shared<DeliveryCounters>()};
     std::atomic<std::uint64_t> consumer_threads_detached_{0};
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
+    std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
+    std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
+    std::atomic<std::uint64_t> teardown_join_timeouts_{0};    ///< monotonic; stop()'s lease wait expired (#2815)
+    std::atomic<std::uint64_t> subscription_lost_{0}; ///< monotonic; #2818 Lost notifications delivered
+
+    /// #2815 TEARDOWN LEASE. Callers currently inside one of the FOUR windows that
+    /// resolve a raw `ISparkMechanism*` (and this engine's mech_ops_mu_by_type_ entry)
+    /// under mu_, RELEASE mu_, and then call into the mechanism: disarm(),
+    /// teardown_arm_race(), unregister_consumer(), and the live arm path in arm_impl().
+    /// Armed as the last statement of the SAME mu_ block that resolves the mechanism,
+    /// released when the enclosing function returns (an RAII lease in spark_engine.cpp).
+    ///
+    /// stop() waits on it BOUNDED before stopping the mechanisms; ~SparkEngine waits on
+    /// it UNBOUNDED before any member is destroyed. The unbounded one is the actual
+    /// safety mechanism: without it, ~SparkEngine frees mech_ops_mu_by_type_ out from
+    /// under a caller parked in that window (use-after-free). The bounded one is an
+    /// API-contract nicety, and stop() must never become a place shutdown can hang.
+    ///
+    /// NO NEW CALLER CAN ARM A LEASE BEHIND stop() on three of the four doors: disarm(),
+    /// teardown_arm_race() and arm_impl() gate their own entry on running_/stopped_
+    /// under mu_ BEFORE they resolve a mechanism, so once stop()'s early locked block
+    /// has flipped both flags a later caller resolves nothing and arms nothing. (Door 3
+    /// is the exception to THIS claim only — its unwatch()-gating is uniform across all
+    /// four doors; see below.)
+    /// unregister_consumer() (door 3) gates ENTRY differently — on whether `id` is
+    /// still present in consumers_, which stop() doesn't empty until its OWN later
+    /// step 3 (the consumers.swap) — so a call landing in that window still arms a
+    /// lease (governance Gate 8 cpp-expert finding, correcting an earlier draft of
+    /// this paragraph that overstated door 3's residual risk: it does NOT still call
+    /// unwatch() on a mechanism stop() may be concurrently tearing down). The actual
+    /// unwatch() call is gated by the SAME running_ check as the other three doors —
+    /// it sits on the to_unwatch collection inside this window, not on the lease —
+    /// so once stop() flips running_ false, a racing unregister_consumer() collects
+    /// nothing and its post-mu_ unwatch loop runs zero times. What's genuinely
+    /// different about door 3 is narrower: the lease itself is armed
+    /// UNCONDITIONALLY (see unregister_consumer()'s own comment), because this
+    /// function's tail — quiesce_consumer() — touches consumer_join_budget_ms_/
+    /// consumer_threads_detached_ regardless of whether any mechanism call happened.
+    /// So a post-flip caller can still arm a lease with an empty unwatch loop
+    /// (harmless, slightly conservative over-counting), never a live unwatch()
+    /// racing a concurrently-stopping mechanism. What's not true is that the ENTRY
+    /// GATE on the LEASE is uniform across all four doors — it is uniform on the
+    /// mechanism-unwatch path.
+    ///
+    /// A PLAIN ATOMIC, POLLED — a simplicity choice, not a forced one (governance
+    /// Gate 3 cpp-expert review: worth recording precisely, since the original
+    /// wording here overclaimed that a condition_variable was ruled out entirely).
+    /// The lease is released from an RAII DESTRUCTOR on the door caller's thread. A
+    /// destructor that itself LOCKED a mutex would std::terminate on the
+    /// std::system_error std::mutex::lock is permitted to raise, in a subsystem whose
+    /// whole design premise is that an observe-only component may never take the
+    /// agent down (see stop()'s noexcept rationale) — that part is a real, load-
+    /// bearing constraint. But `condition_variable::notify_all()` itself takes no
+    /// lock and is noexcept, so a hybrid (atomic fetch_sub, then a lock-free
+    /// notify_all, with this same poll retained only as a much-longer-interval
+    /// lost-wakeup backstop) was a real option that was not implemented, not one
+    /// that couldn't be. fetch_sub cannot throw, so the count is always correct
+    /// either way; the waiters absorb the cost as a 1 ms sleep-poll, which is paid
+    /// only at shutdown and only while a caller is genuinely in flight — judged not
+    /// worth the added complexity for a dormant subsystem's teardown path. Ordering:
+    /// the releasing fetch_sub and the waiters' acquiring load give the waiter
+    /// happens-before over everything the door caller did.
+    std::atomic<std::uint64_t> inflight_teardowns_{0};
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};

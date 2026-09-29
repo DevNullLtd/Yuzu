@@ -53,6 +53,12 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
+    # "Sizing"): a held-open SSE response's worst-case drain is the 120s
+    # response cap + 2x~3s pump ticks + the 30s socket write timeout
+    # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
+    # it mid-drain; 210s matches the systemd unit's existing margin.
+    stop_grace_period: 210s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
   postgres:

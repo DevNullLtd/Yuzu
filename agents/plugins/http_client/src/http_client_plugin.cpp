@@ -399,6 +399,33 @@ std::string http_head(std::string_view url, int& status_code) {
     return headers_str;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Every action goes through cpp-httplib's native, in-process socket client
+// (getaddrinfo + socket()/connect(), no shell, no subprocess) on every
+// platform — rung 1 throughout. SHA-256 hashing (download) is likewise
+// native, via BCrypt on Windows and OpenSSL EVP elsewhere.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "download",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+    },
+    {
+        /* .action      = */ "get",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+    },
+    {
+        /* .action      = */ "head",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "cpp-httplib (native sockets)", nullptr},
+    },
+};
+
 } // namespace
 
 class HttpClientPlugin final : public yuzu::Plugin {
@@ -412,6 +439,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"download", "get", "head", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

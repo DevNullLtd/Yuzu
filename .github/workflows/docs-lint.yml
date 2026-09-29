@@ -5,8 +5,12 @@ name: Docs Lint
 # workflow must run on EVERY pull request to main/dev. A `paths:` filter here
 # was the bug: a PR that didn't touch CHANGELOG.md never reported the required
 # check and got wedged forever on a status that never arrived (the
-# path-filtered-required-check trap). The job is fast and dependency-light — no
-# build, no vcpkg, no caches — so running it unconditionally is cheap.
+# path-filtered-required-check trap). The changelog jobs are fast and
+# dependency-light — no build, no vcpkg, no caches — so running them
+# unconditionally is cheap. `prometheus-rules` below is the one exception: it
+# reaches TWO registries — a digest-pinned Prometheus image from Docker Hub and
+# a hash-pinned PyYAML from PyPI — which is why it is a separate job, so an
+# outage at either reds only that check.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -30,12 +34,171 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
+
+      # Issue-lifecycle hygiene (ADR-3001 A1) lives under this REQUIRED job on
+      # purpose: the meson `docs` suite also runs it, but only inside the heavy
+      # platform jobs, which docs-only PRs skip (#1978 gate) — and docs-only
+      # PRs are exactly the class that can push CLAUDE.md over its cap or break
+      # the never-close list. This job runs on every PR, so the invariant
+      # actually binds.
+      - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
+        run: python3 tests/test_issue_docs.py
+
+      # ADR-0032 sequencing-interlock merge-gate (WS-0). No engine-path code may
+      # merge until the unconditional set (a)-(d)+(h) lands. Governance runs from
+      # the author's working tree, so a stale branch can silently run the old
+      # pipeline and miss the routed-concern row; this test runs on the merge ref
+      # on every PR, so the gate actually binds. Data: tests/split_interlock_ledger.json.
+      - name: Split interlock merge-gate tripwire (ADR-0032)
+        run: python3 tests/test_split_interlock_tripwire.py
+
+      # Locks the tripwire's ledger against silent neutering: pins gate_set,
+      # search/exclude paths, the engine-path marker key set, and "every gate cell
+      # has a substrate marker" against frozen test constants, and re-checks the
+      # tripwire fires. A PR that edits the ledger to open the gate must also edit
+      # these constants — a loud, reviewable change, not one silent JSON value.
+      - name: Split interlock tripwire self-test
+        run: python3 tests/test_split_interlock_tripwire_selftest.py
+
+      # #1611: keeps the compiled-in TSan suppression in
+      # tests/unit/test_runner_main.cpp honest — fails if any first-party code
+      # starts calling libpq's conn-less PQescapeString/PQescapeBytea (the only
+      # readers of the two globals that suppression silences). Also registered
+      # in tests/meson.build for local `meson test --suite docs` parity.
+      - name: No conn-less libpq escape references (#1611)
+        run: python3 tests/test_no_connless_pq_escape.py
+
+      # PR #4985 / ADR-0012 s3: the RBAC last-Administrator guard's cross-schema SQL
+      # lives only in RbacAdminAuthorityOwner (never rbac_store.cpp), and its shared SQL
+      # fragment kAuthenticatableAdminGrantsFrom has exactly one definition. Also
+      # registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
+        run: python3 tests/test_rbac_query_owner_seam.py
+
+      # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
+      # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
+      # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered
+      # in tests/meson.build for local `meson test --suite docs` parity.
+      - name: Spark evidence format lockstep (#4665)
+        run: python3 tests/test_spark_evidence_format_lockstep.py
+
+      # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
+      # subsystem that fails the moment a NEW spdlog:: call prints a rule-id/Spark-key-
+      # shaped argument unwrapped. Also registered in tests/meson.build for local
+      # `meson test --suite docs` parity.
+      - name: Guardian/Spark log-injection tripwire (#4665)
+        run: python3 tests/test_guardian_spark_log_injection_tripwire.py
+
+      # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
+      # item 1): a family's presentation/handler TUs must not reach a store
+      # directly. check-seam-closure.py walks each declared family TU's
+      # transitive #include closure and fails on any store-layer header found
+      # in it (see the script's module docstring for the "sound proxy, two
+      # acknowledged escapes" scope statement). Pure lexical source-tree
+      # analysis, no build deps — belongs beside the other preflight gates in
+      # this job, same as the sibling check-api-parity.py gate (ci.yml).
+      - name: Seam-closure gate (ADR-0031 WS-A4 item 1)
+        run: python3 scripts/ci/check-seam-closure.py
+
+      # Locks check-seam-closure.py's FAMILIES/FORBIDDEN_HEADER_PATTERNS
+      # constants against silent neutering, and positive-fire-probes the gate
+      # (including the angle-bracket internal-header escape) so a clean run
+      # above is evidence the gate actually discriminates, not that it always
+      # passes. Mirrors the split interlock self-test's shape immediately above.
+      - name: Seam-closure gate self-test
+        run: python3 tests/test_seam_closure_selftest.py
+
+      # check-seam-closure.py's LINK-level twin, scripts/ci/check_core_
+      # presentation_link.py (ADR-0031 WS-A4 PR-1 F1 fix), needs COMPILED
+      # objects to run `nm` over, so the gate itself runs as a meson test()
+      # in suite:server (tests/meson.build's `dex link no presentation
+      # symbols`) instead of here. Its SELF-test, unlike the gate, compiles
+      # its own tiny throwaway fixtures and needs no project build — same
+      # "pure lexical / no build deps" posture as check-seam-closure.py's own
+      # gate above — so it belongs in this build-free job, pinning the
+      # checker's FAMILIES constant and positive-fire/negative-control
+      # probing the link-symbol logic exactly like the include-closure
+      # self-test above does for its own gate.
+      - name: Core/presentation link gate self-test (ADR-0031 WS-A4 PR-1 F1 fix)
+        # qa-4 (WS-A4 PR-1 Gate 7 fix round): docs-lint's runner image is
+        # guaranteed a C++ compiler + `nm` (ubuntu-24.04) — require the
+        # selftest to FAIL loudly, not silently SkipTest-and-pass, if that
+        # ever stops being true.
+        env:
+          YUZU_REQUIRE_TOOLCHAIN: "1"
+        run: python3 tests/test_core_presentation_link_selftest.py
+
+      # Governance-ledger linter self-test. NOTE: the linter itself
+      # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
+      # gate over governance.d/ — calibration showed most historical
+      # fragments predate its strict self-consistency rules, so it is an
+      # ADVISORY author-side pre-push check (the /governance skill runs it on
+      # the current run's fragment). Only this self-test runs in CI, to keep the
+      # tool's own discrimination logic from silently rotting — deterministic,
+      # synthetic input, touches no real ledger. Stdlib only.
+      - name: Governance-ledger linter self-test
+        run: python3 tests/test_governance_ledger_check_selftest.py
+
+      # RBAC doc/seed parity (#480): docs/user-manual/rbac.md's four tables
+      # (system roles, securable types, operations, the authorization-topology
+      # floor) are hand-maintained copies of arrays in rbac_store.cpp and
+      # authz_topology_floor.hpp. Nothing checked the copies still matched, and
+      # by the time PR #4776 audited them the doc was 15 securable types, one
+      # role and five floor entries behind — each drift arriving through a
+      # reviewed PR. Set-equality, so a failure names the entry rather than the
+      # count. Stdlib only, parses source text, needs no build.
+      - name: RBAC doc/seed parity
+        run: python3 tests/test_rbac_doc_counts.py
+
+  # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
+  # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
+  # unless the PR body states `docs-unchanged: <section> — <reason>`. The
+  # override is read from the PR body written to a file with printf — never
+  # interpolated into a shell line — so body text cannot become shell.
+  # Byte-diff of the generated fences and the README-existence ratchet live in
+  # the meson `docs` suite (tests/test_plugin_readmes.py); this job is only the
+  # part that needs the PR's own diff and body.
+  plugin-readme-touch-rule:
+    name: Plugin README touch rule
+    # pull_request only: the override lives in the PR body, which a push event
+    # has no access to — on push (a merge to dev/main) the rule would re-run
+    # against BEFORE_SHA with an empty body and turn a legitimately overridden
+    # PR into a red mainline run. Merged content was already gated at PR time.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enforce README touch rule
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) BASE="$BASE_SHA" ;;
+            *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
+          esac
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
+            exit 0
+          fi
+          # A two-tree diff needs only the base commit itself, not the whole
+          # history (the changelog-fragments job above does the same).
+          git fetch --depth=1 origin "$BASE"
+          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
+          scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
   # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
   # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's
@@ -50,7 +213,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -64,3 +227,108 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
+
+  # Prometheus alert rules are code that runs in production and never compiles,
+  # so nothing caught a rule that parses perfectly and can still never fire for
+  # the case it was written for — which is exactly how YuzuAuditRetentionNotRunning
+  # shipped unable to fire for a crash-looping server (#2553). `check rules` is
+  # the parse gate; `test rules` is the behaviour gate, and it is the one that
+  # would have caught it.
+  #
+  # ITS OWN JOB, deliberately. This step pulls a container — the only Docker Hub
+  # dependency in THIS workflow (other workflows have their own: pre-release.yml
+  # runs distro images) — so a registry outage or an anonymous-pull rate limit
+  # fails THIS check, under a name that says what actually broke, instead of
+  # failing a required check called "CHANGELOG order" on a PR that never touched
+  # an alert rule. (A workflow-level `paths:` filter would be the wrong fix: a
+  # required check that is skipped rather than run never reports — the
+  # path-filtered-required-check trap this file's own top-of-workflow header
+  # documents.) Whether this job becomes a required check is a branch-protection
+  # decision, not something this file can assert.
+  #
+  # IT CALLS THE SCRIPT rather than inlining the invocation, so the pinned image
+  # has exactly one home (`tests/prometheus/run_promtool_tests.py`) and CI runs
+  # provably the same code as a local run — the pattern
+  # `scripts/ci/verify-healthcheck-invariants.sh` and `scripts/ci/ensure-postgres.sh`
+  # already use. The same script is registered in `tests/meson.build`, where it
+  # deliberately does NOT pull: without the opt-in below it needs a native
+  # promtool and otherwise skips, because flake-retry runs `meson test`
+  # unfiltered on three required build legs and an earlier version of this wiring
+  # put Docker Hub on all three (#2553).
+  #
+  # Runs on every PR rather than only rule changes: the rules and the code that
+  # feeds them drift apart from either side, and the whole run is a few seconds
+  # plus an image pull.
+  prometheus-rules:
+    name: Prometheus alert rules
+    runs-on: ubuntu-24.04
+    # 30 -> 45 for #2340 PR-4: marker-extraction added a SECOND full gate()
+    # to step 1 (the shipped RULES/TESTS pair, then the extracted
+    # yuzu-guardian-journal group - CH-2 + CH-5-PROM), each up to 4x120s
+    # (check + test + the canary's own test + check) = 480s worst case. The
+    # budget fits the WORST-CASE SUM of both steps' own documented ceilings,
+    # not their typical runtime - the same methodology
+    # run_promtool_tests.py's pull_with_retry() uses for its own ladder
+    # ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE IT"). Step 1's
+    # own comment now states ~1185s worst case (pull ladder + daemon probe,
+    # ~225s, plus TWO full gates at 480s each) - an earlier version of that
+    # comment stated ~465-495s, counting only one gate's check+test and
+    # omitting its own canary's two calls; corrected in the same change that
+    # added the second gate. Step 2: its own pull_with_retry ladder (~195s,
+    # same shared function) plus 6 sequential measure() calls at 30s+90s each
+    # = ~720s, totalling ~915s. Sum: ~2100s (35 min). 40 minutes would leave
+    # only ~300s over that sum - thinner than the ~600s the chosen value
+    # keeps, and closer to the ~150s margin the rung B 10->20 derivation
+    # deliberately kept than is comfortable - so 45 minutes (2700s), a ~1.29x
+    # margin matching the prior 1800/1410 ratio. Sizing to the TYPICAL
+    # combined runtime measured locally is what the original 10->15 bump did,
+    # and is exactly the gap that let step 2 ship with a per-call ceiling the
+    # job budget could not actually survive. A THIRD sweep scenario grows
+    # step 2 by another ~360s, or a THIRD gate on step 1 adds another ~480s:
+    # re-derive this number in that PR, don't inherit it (see the warning
+    # next to `SCENARIO_ALERTS` in `blind_band_sweep.py`, and
+    # run_promtool_tests.py's own pull_with_retry() comment).
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The harness FAIL-CLOSES without PyYAML on the gate path (it cannot count
+      # assertions, so it cannot prove the run was not vacuous). Install it
+      # explicitly rather than relying on the runner image happening to ship it:
+      # an image update that dropped it would red this job for a reason nobody
+      # would guess from the message.
+      #
+      # Hash-pinned via requirements-ci.txt, matching every other pip site in
+      # this repo (ci.yml:522, :929). A bare `pip install pyyaml` would take
+      # whatever PyPI serves at that moment into a job whose whole purpose is to
+      # be trustworthy evidence. `--break-system-packages` because ubuntu-24.04
+      # is PEP 668 externally-managed; the hosted image tolerates the bare form
+      # today, but self-hosted does not, and this survives that move.
+      - name: Install PyYAML
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Validate and unit-test alert rules (promtool)
+        env:
+          # Makes the pinned image mandatory for this job: the script's opt-in
+          # takes precedence over any promtool that happens to be on PATH.
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/run_promtool_tests.py
+
+      # #2854 rung B: the coverage-manifest gate. Distinct from the step above -
+      # `run_promtool_tests.py` proves the shipped rules parse and behave per
+      # `tests/prometheus/yuzu-alerts.test.yml`'s hand-written cases;
+      # `blind_band_sweep.py --check` proves the audit-retention alert family's
+      # measured COVERAGE across a swept range of restart cadences has not
+      # silently widened relative to the committed
+      # `tests/prometheus/blind_band_manifest.json`. Same opt-in, same pinned
+      # image (imported from the script above, not a second copy), same
+      # ubuntu-24.04 runner already carrying the PyYAML install above it.
+      - name: Audit-retention alert coverage manifest (promtool)
+        env:
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/blind_band_sweep.py --check

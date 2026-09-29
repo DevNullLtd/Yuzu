@@ -11,13 +11,19 @@
 If you discover a security vulnerability in Yuzu, please report it responsibly:
 
 1. **Do not** open a public GitHub issue for security vulnerabilities
-2. Use [GitHub's private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new) to submit a report
+2. Use [GitHub's private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new) to submit a report
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
    - Affected components (agent, server, SDK, plugins)
    - Potential impact
    - Suggested fix (if any)
+
+Public GitHub issues carrying the `security` label are for **hardening, defense-in-depth, and
+reliability work only** — an exploitable vulnerability always goes through private reporting
+above, never a public issue (`docs/agents/issue-standard.md`, section 6). Tracker automation
+never closes a `security`-labelled issue; a human verifies the fix against the current `dev`
+branch first.
 
 ## Response
 

@@ -1,0 +1,60 @@
+name: Pin-displacement claim gate
+
+# Drift gate for the "what causes a replay-ring pin displacement" claim, which is stated
+# independently on every surface listed in the script's STATING_SURFACES array, each of
+# which must name BOTH residual counters, plus changelog.d fragments under a weaker
+# both-or-neither rule -- a release note may name no counters at all, but naming one while
+# omitting the other is the drift shape. The membership is NOT enumerated here: this comment
+# went stale once already when the array grew.
+#
+# An adversarial review (kimi + codex, independently, each with a reproducing fixture)
+# BLOCKED the first version of this gate because that header claimed the runbook and
+# changelog were protected while the cause-set check covered only four files. A gate that
+# overstates its own coverage is the very defect class it exists to catch, and CLAUDE.md
+# makes a false-green offered as closure evidence a policy floor. --selftest proves each
+# shape reddens before the real check runs.
+#
+# WHY A GATE AND NOT A CONVENTION. #2740 falsified the claim "a full pin-slot set means
+# admission accounting has drifted", and correcting it across its surfaces defeated a
+# convention: the claim exists as an independent paraphrase everywhere it appears, so each
+# review pass fixed a different subset, and the pass that designated a single normative home
+# still shipped two stale copies under reviewers looking for exactly that.
+#
+# The history is NOT restated here -- see scripts/ci/check-pin-displacement-claim-set.sh's
+# header, which owns it, and the run ledger it cites.
+#
+# WHAT IT CHECKS. Not the prose -- the lexical approach walls at exactly that boundary and
+# is parked for that reason. It checks the CAUSE SET: which counters each surface names as
+# explaining a displacement. That set is enumerable, it is what on-call acts on, and every
+# defect this exists to catch was a disagreement about its membership. See the script's own
+# header for the invariant and its derivation.
+#
+# Deliberately its OWN workflow, like plugin-spawn-gate.yml: it greps source text and needs
+# no build -- no meson, vcpkg or compiler setup -- so it neither belongs in ci.yml's
+# build-dependent fast path nor needs a paths: filter, because there is nothing expensive
+# to skip.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  claim-set:
+    name: "Pin-displacement cause set"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Self-test the detector (fixtures) before trusting it on real source
+        run: bash scripts/ci/check-pin-displacement-claim-set.sh --selftest
+
+      - name: Check the cause set agrees across every surface
+        run: bash scripts/ci/check-pin-displacement-claim-set.sh

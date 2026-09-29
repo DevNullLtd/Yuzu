@@ -34,14 +34,23 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // /viz/fleet instead of vanishing. Best-effort and OFF the gRPC hot-path
     // lock — a slow/blipping database never blocks the heartbeat (the in-memory
     // stores stay authoritative). Does not touch the executions-ladder
-    // invariants (cmd_execution_ids_ / polchk-): those live on the
-    // CommandResponse path, not here.
+    // invariants (the command_id -> execution_id correlation / polchk-):
+    // those live on the CommandResponse path, not here.
     if (offline_store_) {
         std::string hostname;
         std::string os;
+        std::string agent_version;
+        std::string arch;
+        std::string session_id;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
+            agent_version = sess->agent_version;
+            arch = sess->arch;
+            // HA WS-5: threaded through so a later graceful disconnect can
+            // session-guard its presence-row delete (remove_if_session) —
+            // see agent_service_impl.cpp / gateway_service_impl.cpp.
+            session_id = sess->session_id;
         }
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
@@ -52,7 +61,12 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // SHOULD-1). Staleness is driven entirely by the server-side
         // last_heartbeat_ms. Wire a real agent ts here when one exists, or drop
         // the column — tracked as a follow-up.
-        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0);
+        //
+        // agent_version/arch: a session-lookup miss above leaves both blank,
+        // which upsert() treats as "preserve the last-known value" (round-3 v2
+        // columns) rather than blanking a value this store already learned.
+        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0, agent_version,
+                               arch, session_id);
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied
@@ -70,6 +84,31 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             // rejected, not silently read as 123 (cpp-expert / #1209).
             if (ec == std::errc() && ptr == v.data() + v.size())
                 guardian_reconcile_fn_(agent_id_str, gen);
+        }
+    }
+
+    // #3425: quarantine reconnect reconciler. Unconditional — reconnect
+    // itself is the signal, no tag to gate on (unlike the guardian hook
+    // above). Defensive: never let a reconcile hook take down the rest of
+    // ingestion.
+    //
+    // Held for the ENTIRE call, not just the fn copy (governance Gate 3,
+    // cpp-safety, 2026-08-24) — the shared lock IS the liveness proof
+    // `set_quarantine_reconcile_fn(nullptr)`'s exclusive lock waits on; a
+    // copy-then-call-outside-the-lock idiom would let set(nullptr) return
+    // while a copied fn is still running, which reopens the same
+    // use-after-free window this lock exists to close. Concurrent ingest()
+    // calls from other heartbeats are unaffected (shared/shared never
+    // blocks).
+    {
+        std::shared_lock lock(quarantine_reconcile_mu_);
+        if (quarantine_reconcile_fn_) {
+            try {
+                quarantine_reconcile_fn_(agent_id_str);
+            } catch (const std::exception& e) {
+                spdlog::warn("[{}] Heartbeat quarantine reconcile threw for agent={}: {}", via_str,
+                            agent_id_str, e.what());
+            }
         }
     }
 

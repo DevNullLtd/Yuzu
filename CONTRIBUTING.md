@@ -43,15 +43,25 @@ maintainer at nathan.dornbrook@gmail.com.
 > directly. **CMake is not an alternative build system** here — it is pulled in
 > only as a Meson dependency-resolution method, never invoked to build. Without
 > Meson + Ninja you cannot build, test, or run any of the tooling, so install
-> them first (Meson 1.11.1; a recent Ninja) before following the steps below.
+> them first (Meson 1.12.0, the pin in `requirements-ci.txt`; a recent Ninja)
+> before following the steps below.
 
-1. **Prerequisites**: Meson 1.11.1, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
+1. **Prerequisites**: Meson 1.12.0 (`requirements-ci.txt`), Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
-   git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu
+   git clone https://github.com/DevNullLtd/Yuzu.git && cd Yuzu
    ./scripts/setup.sh
    meson compile -C build-linux
    ```
+
+## Agent and instruction files
+
+`CLAUDE.md` and `AGENTS.md` are contents pages, not knowledge bases: they load into every agent
+session, so anything added to them is paid on every session whether or not the work touches that
+subject. Before adding to either — or to the routed-concern tables under `.claude/` — read
+**`docs/instruction-file-standard.md`**. It gives the placement ladder (a hook, a header comment at
+the site, a `docs/` file plus a routed-concern row, a routed-concern row alone, and only then an
+instruction file) and the budget CI enforces.
 
 ## Architecture
 
@@ -67,7 +77,8 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the target feature se
 - `fix/<short-description>` for bug fixes
 - `fix/<finding-id>-<short-description>` for RC sprint findings (e.g., `fix/C1-gateway-tls`)
 
-Branch from `main`. Keep branches focused on a single change.
+Branch from `dev` — all work merges into `dev`; `main` is release-only. Keep branches focused
+on a single change.
 
 ## Erlang Gateway
 
@@ -86,12 +97,35 @@ The MCP server is embedded in the C++ server at `POST /mcp/v1/`. Changes to MCP 
 
 All code changes follow mandatory governance gates defined in `CLAUDE.md`. In summary: change summary, security + docs deep-dive, domain-triggered review, correctness & resilience analysis (happy-path + unhappy-path + consistency-auditor in parallel), chaos analysis (chaos-injector), all findings addressed before merge. See the Agent Team section in CLAUDE.md for the full workflow and gate definitions.
 
+## Filing Issues
+
+Issue filing, labelling, and closing follow the repo standard:
+[`docs/agents/issue-standard.md`](docs/agents/issue-standard.md). The short version:
+
+- **Search for duplicates before filing** — comment new evidence on an existing issue rather
+  than filing a twin.
+- One actionable outcome per issue, with Context / Evidence / Acceptance criteria / Origin
+  sections in the body. (Reporting via the web templates? A description and reproduction steps
+  are enough — triage fills in the rest; the full format binds the `gh`/agent path.)
+- Every issue carries exactly one type label; every non-`roadmap` issue also carries one triage
+  state (`roadmap` = parked scope: no triage state, no priority). Priority (`P0`/`P1`/`P2`)
+  is a triage decision: set it if you have the context (agents and maintainers do);
+  leave it off a drive-by report and triage will add it.
+- **Never file an exploitable security vulnerability as a public issue.** Use
+  [GitHub private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new)
+  (see [SECURITY.md](SECURITY.md)). Public `security`-labelled issues are for hardening and
+  defense-in-depth work only.
+- A PR that resolves an issue says `Closes #N` in its body; partial work says `Relates to #N`
+  and never uses a closing keyword.
+
 ## Pull Request Process
 
 1. Ensure CI passes (builds on Linux, Windows, macOS, ARM64)
 2. Run `clang-tidy` locally against changed files (the repo `.clang-tidy` config is picked up automatically)
 3. Write a clear PR title and description using the PR template
-4. Keep PRs small where possible; large features should be broken into incremental PRs
+4. Declare linked issues in the PR body: `Closes #N` for every issue the PR fully resolves;
+   `Relates to #N` for partial work
+5. Keep PRs small where possible; large features should be broken into incremental PRs
 
 ## Changelog
 
@@ -152,6 +186,17 @@ meson test -C build-linux --print-errorlogs
 ```
 
 Tests use [Catch2](https://github.com/catchorg/Catch2) and live in `tests/unit/`.
+
+Tests that touch PostgreSQL are tagged `[pg]` and follow the recipe in step 7
+of [`docs/postgres-store-playbook.md`](docs/postgres-store-playbook.md) —
+fixtures, pre-migrated templates (`PgTestTemplate` + `YUZU_REQUIRE_PG_DB_TPL`
+for store-behaviour tests), and the local one-liner
+`docker run -d -e POSTGRES_USER=yuzu -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu -p 5433:5432 postgres:18`
+followed by `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
+Skip-vs-fail contract: with `YUZU_TEST_POSTGRES_DSN` **unset**, `[pg]` tests
+skip cleanly (no local database needed for non-Postgres work); **set but
+broken**, they FAIL — deliberate, since CI guarantees a database, so an
+unreachable DSN is breakage to surface, never to skip past.
 
 ## Build System
 

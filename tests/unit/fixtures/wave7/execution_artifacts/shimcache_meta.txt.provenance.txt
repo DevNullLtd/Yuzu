@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: same capture as shimcache.bin; length and first 64 bytes hex-dumped inline in PowerShell
+date: 2026-09-06
+status: REAL CAPTURE

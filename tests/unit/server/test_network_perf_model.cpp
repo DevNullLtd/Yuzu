@@ -15,6 +15,7 @@
 #include "network_perf_rules.hpp"
 #include "network_routes.hpp"
 #include "rest_api_v1.hpp"
+#include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -70,6 +71,18 @@ NetPerfDevice degraded(const std::string& id, std::optional<double> cpu, bool ap
     d.cpu_pct = cpu;
     d.app_unstable = app;
     return d;
+}
+
+/// Test-only wrapper preserving the pre-ADR-0031-WS-A4 call shape: resolve
+/// the device list + available_keys/cohort_key from a raw NetPerfSnapshot,
+/// then call the seam-split renderer (rows + available_keys + cohort_key are
+/// now separate, already-resolved inputs — see network_routes.hpp).
+std::string render_devices(const NetPerfSnapshot& snap, NetPerfMetric metric, bool not_reporting,
+                           NetCoocFilter cooc, const std::optional<std::string>& cohort_filter,
+                           int limit) {
+    const auto rows = net_perf_device_list(snap, metric, not_reporting, cooc, cohort_filter, limit);
+    return render_network_devices_fragment(rows, snap.available_keys, snap.cohort_key, metric,
+                                           not_reporting, cooc, cohort_filter, limit);
 }
 
 } // namespace
@@ -235,7 +248,7 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
     snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + device pressure
     snap.devices.push_back(degraded("deg-app", 10.0, true));  // degraded + app instability
 
-    const auto html = render_network_overview_fragment(snap);
+    const auto html = render_network_overview_fragment(net_perf_fleet_now(snap));
     CHECK(html.find("Network quality") != std::string::npos);
     // IA: Network is a DEX sub-view — the overview renders the shared DEX sub-nav
     // (a sibling DEX tab link is present) with the Network tab marked active,
@@ -260,7 +273,7 @@ TEST_CASE("overview render: cards, co-occurrence, honesty", "[network][ui]") {
 TEST_CASE("overview render: empty population is honest", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("silent", std::nullopt, std::nullopt, std::nullopt));
-    const auto html = render_network_overview_fragment(snap);
+    const auto html = render_network_overview_fragment(net_perf_fleet_now(snap));
     CHECK(html.find("No network telemetry yet") != std::string::npos);
 }
 
@@ -270,7 +283,7 @@ TEST_CASE("devices render: worst-first + co-occurrence flags inline", "[network]
     snap.devices.push_back(dev("lnx-high", 600.0, std::nullopt, std::nullopt));
     snap.devices.push_back(degraded("deg-dev", 95.0, false));
 
-    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+    const auto html = render_devices(snap, NetPerfMetric::kRtt, false,
                                                       NetCoocFilter::kNone, std::nullopt, 50);
     CHECK(html.find("lnx-high") != std::string::npos);
     CHECK(html.find("Worst devices by RTT") != std::string::npos);
@@ -291,17 +304,25 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         res.status = 403;
         return false;
     };
-    NetworkRoutes::PerfFn perf = [](const std::string&) {
-        NetPerfSnapshot snap;
-        snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + pressure
-        snap.devices.push_back(degraded("deg-app", 10.0, true));  // degraded + app
-        return snap;
+    std::vector<std::string> auditLog;
+    auto okAudit = [&](const httplib::Request&, const std::string& action,
+                       const std::string& result, const std::string&, const std::string&,
+                       const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
     };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false)); // degraded + pressure
+            snap.devices.push_back(degraded("deg-app", 10.0, true));  // degraded + app
+            return snap;
+        });
 
     SECTION("permitted: overview + devices render through the provider") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, perf);
+        routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 200);
@@ -318,7 +339,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("denied without GuaranteedState:Read") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, noPerm, perf);
+        routes.register_routes(sink, okAuth, noPerm, okAudit, perf);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 403);
@@ -327,7 +348,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("no provider wired → honest unavailable placeholder") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm);
+        routes.register_routes(sink, okAuth, okPerm, okAudit);
         auto ov = sink.Get("/fragments/network/overview");
         REQUIRE(ov);
         CHECK(ov->status == 200);
@@ -337,7 +358,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     SECTION("page shell loads the overview fragment") {
         yuzu::server::test::TestRouteSink sink;
         NetworkRoutes routes;
-        routes.register_routes(sink, okAuth, okPerm, perf);
+        routes.register_routes(sink, okAuth, okPerm, okAudit, perf);
         auto page = sink.Get("/network");
         REQUIRE(page);
         CHECK(page->status == 200);
@@ -352,10 +373,99 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
     }
 }
 
+// ── SEC-3 sibling-gap coverage: /fragments/network/devices previously had NO
+// service-token confinement and NO audit capability at all — this fragment
+// names every reporting agent's identity fleet-wide. Gate 8 governance review
+// found this as a 4th instance of the same vulnerability class already fixed
+// on GET /api/v1/network/devices and 5 other surfaces on this branch. ────────
+
+TEST_CASE("network devices fragment: service-scoped token denied, denial audited",
+          "[network][routes][rbac][security]") {
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> auditLog;
+    auto recordingAudit = [&](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string&, const std::string&,
+                              const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
+    };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false));
+            return snap;
+        });
+
+    NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, recordingAudit, perf);
+
+    // The overview fragment (aggregate, no agent_id) is UNAFFECTED — only the
+    // devices drill (identity-linked) gets the new deny.
+    auto ov = sink.Get("/fragments/network/overview");
+    REQUIRE(ov);
+    CHECK(ov->status == 200);
+
+    auto drill = sink.Get("/fragments/network/devices");
+    REQUIRE(drill);
+    CHECK(drill->status == 403);
+    CHECK(drill->body.find("deg-dev") == std::string::npos); // no identity leaked
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(drill->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(drill->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    REQUIRE(auditLog.size() == 1);
+    CHECK(auditLog[0] == "network.device.view:denied");
+}
+
+TEST_CASE("network devices fragment: ordinary session reaches the route, audited success",
+          "[network][routes][security]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> auditLog;
+    auto recordingAudit = [&](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string&, const std::string&,
+                              const std::string&) {
+        auditLog.push_back(action + ":" + result);
+        return true;
+    };
+    NetworkRoutes::NetworkApiPtr perf =
+        std::make_shared<yuzu::server::test::FnNetworkApi>([](const std::string&) {
+            NetPerfSnapshot snap;
+            snap.devices.push_back(degraded("deg-dev", 95.0, false));
+            return snap;
+        });
+
+    NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, recordingAudit, perf);
+
+    auto drill = sink.Get("/fragments/network/devices");
+    REQUIRE(drill);
+    CHECK(drill->status == 200);
+    CHECK(drill->body.find("deg-dev") != std::string::npos);
+    REQUIRE(auditLog.size() == 1);
+    CHECK(auditLog[0] == "network.device.view:success");
+}
+
 TEST_CASE("devices render: hostile agent_id is HTML-escaped", "[network][ui]") {
     NetPerfSnapshot snap;
     snap.devices.push_back(dev("<b>x</b>&\"", 600.0, std::nullopt, std::nullopt));
-    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+    const auto html = render_devices(snap, NetPerfMetric::kRtt, false,
                                                       NetCoocFilter::kNone, std::nullopt, 50);
     CHECK(html.find("<b>x</b>") == std::string::npos); // raw markup never emitted
     CHECK(html.find("&lt;b&gt;") != std::string::npos); // escaped form present
@@ -367,7 +477,7 @@ TEST_CASE("devices render: cohort picker + drillable cohort cell (available_keys
     snap.available_keys = {"site", "region"}; // non-empty → the picker branch renders
     snap.cohort_key = "site";                 // the active key
     snap.devices.push_back(dev("d1", 40.0, std::nullopt, std::nullopt, false, "linux", "site-b"));
-    const auto html = render_network_devices_fragment(snap, NetPerfMetric::kRtt, false,
+    const auto html = render_devices(snap, NetPerfMetric::kRtt, false,
                                                       NetCoocFilter::kNone, std::nullopt, 50);
     // Picker present (htmx core attrs only — no hx-on), active key selected, both keys offered.
     CHECK(html.find("<select name=\"key\"") != std::string::npos);
@@ -382,7 +492,7 @@ TEST_CASE("devices render: cohort picker + drillable cohort cell (available_keys
         s2.available_keys = {"region"}; // "site" is NOT among them
         s2.cohort_key = "site";
         s2.devices.push_back(dev("d2", 40.0, std::nullopt, std::nullopt));
-        const auto h2 = render_network_devices_fragment(s2, NetPerfMetric::kRtt, false,
+        const auto h2 = render_devices(s2, NetPerfMetric::kRtt, false,
                                                         NetCoocFilter::kNone, std::nullopt, 50);
         CHECK(h2.find("no devices tagged") != std::string::npos); // honest fallback option shown
     }
@@ -390,7 +500,7 @@ TEST_CASE("devices render: cohort picker + drillable cohort cell (available_keys
     SECTION("no cohort key chosen → cohort cell is the muted '—', not a drill") {
         NetPerfSnapshot s3;
         s3.devices.push_back(dev("d3", 40.0, std::nullopt, std::nullopt)); // cohort_key empty
-        const auto h3 = render_network_devices_fragment(s3, NetPerfMetric::kRtt, false,
+        const auto h3 = render_devices(s3, NetPerfMetric::kRtt, false,
                                                         NetCoocFilter::kNone, std::nullopt, 50);
         CHECK(h3.find("cohort_value=") == std::string::npos); // no drill without a key
     }
@@ -435,10 +545,16 @@ struct RestNetHarness {
                            const std::string&, const std::string&, const std::string&) -> bool {
             return true;
         };
+        // Wrap the plain NetPerfSnapshot(cohort_key) function this file's tests
+        // already build in the NetworkApi seam (ADR-0031 WS-A4) — an unset
+        // `perf` stays null (the "no provider wired" 503 branch).
+        std::shared_ptr<const yuzu::server::NetworkApi> network_api;
+        if (perf)
+            network_api = std::make_shared<yuzu::server::test::FnNetworkApi>(std::move(perf));
         api.register_routes(sink, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr,
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {},
                             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {},
-                            nullptr, nullptr, {}, {}, {}, {}, std::move(perf));
+                            nullptr, nullptr, {}, {}, {}, {}, std::move(network_api));
     }
 };
 

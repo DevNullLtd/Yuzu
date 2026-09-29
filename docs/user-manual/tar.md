@@ -6,7 +6,7 @@ The TAR plugin continuously captures system state snapshots and records changes 
 
 ## What TAR captures
 
-TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**; **software**, **ARP**, **DNS**, and **mapped drives** are opt-in (off by default) — software/ARP/DNS are Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS), while **mapdrive** (network-share mappings in both directions, §3.8) also runs on Linux. Further opt-in and planned sources — per-app performance, module loads, per-connection network quality (`netqual`), and connectivity-transition history (`netconn` — network/Wi-Fi connect/disconnect + internet-capability changes, including a retrospective backfill of OS-retained history from before TAR was enabled; ADR-0020) — are covered under Configuration and the OS compatibility matrix below.
+TAR monitors these categories of system activity. Processes, network connections, services, user sessions, and device performance are **always-on**. **power** and **removable media** (Wave 6) are the first sources whose configuration ships *enabled* — every source below them is opt-in, and that divergence is deliberate. **Both ship collecting in this release**: **power** (Windows/Linux live subscription; macOS retrospective replay bounded by `power_lookback_seconds`) — an empty `$Power_Live` means no transitions occurred, not that collection has not started; **removable media** (Windows retrospective event-log replay bounded by `removable_lookback_seconds`; Linux/macOS live-only) — an empty `$Removable_Live` means no removable-media activity occurred, not that collection has not started. **usage** (Wave 7) also ships enabled by default alongside them: it derives per-executable run history directly from the always-on `process` source (no separate collector of its own), starting from the first tick after enablement or upgrade — see the `usage_enabled` row below for the access-limitations note. **software**, **ARP**, **DNS**, and **mapped drives** are opt-in (off by default) — software/DNS are Windows-only today (software is machine scope only — ADR-0015 covers ARP/DNS), while **ARP** also runs on Linux (`/proc/net/arp`) and macOS (constrained — a sysctl route-table dump, `entry_type` always reported `unknown`), and **mapdrive** (network-share mappings in both directions, §3.8) also runs on Linux and macOS (constrained on macOS — outbound-live only via `getfsstat`; the username column is always blank, but a credentialed SMB mount source is stored verbatim in `remote_path`; no inbound, no history). Further opt-in and planned sources — per-app performance, module loads, per-connection network quality (`netqual`), and connectivity-transition history (`netconn` — network/Wi-Fi connect/disconnect + internet-capability changes, including a retrospective backfill of OS-retained history from before TAR was enabled; ADR-0020) — are covered under Configuration and the OS compatibility matrix below.
 
 | Category | Collection interval | Events detected |
 |----------|-------------------|-----------------|
@@ -16,10 +16,10 @@ TAR monitors these categories of system activity. Processes, network connections
 | **User sessions** | 300 seconds (slow) | User login, user logout |
 | **Software** | 3600 seconds (software) | Application installed, removed, upgraded |
 | **Performance** | 30 seconds (perf) | Device CPU/memory/disk/network sample (a scalar reading, not a diff) |
-| **ARP** *(opt-in, Windows)* | 60 seconds (fast) | ARP / neighbour binding appeared, removed |
+| **ARP** *(opt-in, Windows/Linux/macOS)* | 60 seconds (fast) | ARP / neighbour binding appeared, removed |
 | **DNS cache** *(opt-in, Windows)* | 60 seconds (fast) | DNS resolver-cache entry appeared, removed |
 
-Every source except **Performance** takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
+Every source except **Performance** and the cursor-model sources (**power**, **removable**, which track a durable log position instead) takes a snapshot of the current state each cycle, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.
 
 The **Software** source diffs the installed-software inventory to record install / uninstall / upgrade events over time — the historical "what was installed or removed on this box, and when" that the point-in-time `installed_apps` inventory cannot answer. On Windows it captures **machine-wide** installs only (the HKLM Uninstall keys, 64-bit and 32-bit) — **machine scope only, no user identity / no PII**. It runs on its own slower trigger (hourly by default — installs are infrequent) and is **off by default** (opt-in): enable it per host with `software_enabled=true` (see `software_enabled` below). The cautious default reflects the posture for a new capture source; the inventory it gathers is asset-management and vulnerability-relevance data with no user identity, like Services and User sessions. It records names, versions, and publisher only — no command lines, no usage data.
 
@@ -112,9 +112,14 @@ Use the `configure` action to adjust TAR behavior.
 | `netconn_enabled` | `true` / `false` | **`false`** | Toggle the connectivity-transition source (`netconn` → `$NetConn_Live`, ADR-0020). **Off by default** (opt-in). Windows reads the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig event logs, so the FIRST read backfills history from **before TAR was enabled** (or installed) — network connect/disconnect, internet-capability changes, Wi-Fi connect/fail/disconnect with reason codes. Only closed enum tokens and numeric reason codes are stored: **no SSID, BSSID, profile name, interface GUID, or MAC is ever extracted**. Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in. |
 | `netconn_lookback_seconds` | integer seconds | **`604800`** (7 days) | How far **before enablement** the `netconn` backfill reads OS-retained connectivity history (ADR-0020 privacy note). Because the *timing* of network/Wi-Fi connect/disconnect events is a presence/working-hours proxy — behavioral data even with SSIDs stripped — enabling `netconn` retroactively ingests a window that predates any monitoring disclosure. Set to **`0`** to disable the retrospective read entirely (the source then records only forward connectivity from the moment it is enabled), for jurisdictions or works-council agreements where pre-notice collection is not permitted. Clamped to `[0, 90 days]`. Applies to the first read after enablement (and after a late enable); once caught up the source reads only forward. |
 | `module_enabled` | `true` / `false` | **`false`** | Toggle the image-load / module-stream capture source (`module` source → `$Module_*`). **Off by default** — module-load capture is high-volume usage-class telemetry (every DLL/dylib/`.so` load and driver/kext/kmod load per process, with a code-signing verdict) under the works-council posture. Loaded-image **directories are captured** (the search-order-hijack signal is the path) but the user-profile segment of a path is scrubbed at the edge (`C:\Users\<redacted>\…`); no command line is ever captured. **No data is recorded until a collector for the host's OS ships** — the `$Module_*` tables are queryable but return zero rows until then (M2 Windows ETW, M4/M5 macOS Endpoint Security, M6 Linux auditd; see [`tar-module-loads.md`](../tar-module-loads.md)). Set to `true` to opt in. |
-| `arp_enabled` | `true` / `false` | **`false`** | Toggle the ARP / neighbour-table capture source (`arp` source → `$ARP_Live`/`$ARP_Hourly`) on this host (ADR-0015). **Off by default** (opt-in). Captures IP↔MAC bindings per interface for Layer-2 adjacency / ARP-spoofing forensics. **Windows only today** (`GetIpNetTable2`); Linux/macOS are planned (schema registered, queryable-empty). Set to `true` to opt in; collected at `fast_interval`. |
+| `arp_enabled` | `true` / `false` | **`false`** | Toggle the ARP / neighbour-table capture source (`arp` source → `$ARP_Live`/`$ARP_Hourly`) on this host (ADR-0015). **Off by default** (opt-in). Captures IP↔MAC bindings per interface for Layer-2 adjacency / ARP-spoofing forensics. Windows (`GetIpNetTable2`, full interface/IP/MAC/entry_type) and Linux (`/proc/net/arp`, same detail) are fully supported; macOS is constrained (`sysctl NET_RT_FLAGS` route-table dump — `entry_type` always reported `unknown`, no interface field). Set to `true` to opt in; collected at `fast_interval`. |
+| `power_enabled` | `true` / `false` | **`true`** | Toggle the power capture source (`power` → `$Power_Live`): AC attach/detach and sleep/wake transitions. **On by default** — with `removable`, the first *works-council-class* TAR source to ship enabled. (`process`, `tcp`, `service`, `user` and `perf` have always been on as machine-scope operational telemetry; every source added since 1.5 under the opt-in posture defaults off, and these two are the first of that class to diverge.) The *timing* of sleep/wake and AC events is a presence/working-hours proxy, so the same works-council posture as `netconn` applies: set `power_lookback_seconds=0` for forward-only collection where a retrospective read is not lawful. |
+| `power_lookback_seconds` | `0` or up to 7776000 (90 days) | 604800 | How far back the first macOS read replays OS-retained power history (Windows/Linux ignore this key — they are live subscriptions with no history API). **`0` = forward-only** — the control to use where retrospective collection is not lawful; a value that cannot be read is treated as `0`, never as the default. |
+| `removable_enabled` | `true` / `false` | **`true`** | Toggle the removable-media capture source (`removable` → `$Removable_Live`): USB/removable attach and detach with device identity, plus executed-from-removable evidence. **On by default** — see `power_enabled` above for what "first" does and does not mean here. Records vendor/product/serial and executed-binary paths, which is identity/usage-class data under the works-council posture. |
+| `removable_lookback_seconds` | `0` or up to 7776000 (90 days) | 604800 | How far back the first Windows read backfills OS-retained removable history (Linux/macOS ignore this key — they are live-only, no history API). **`0` = forward-only** — a value that cannot be read is treated as `0`, never as the default. |
+| `usage_enabled` | `true` / `false` | **`true`** | Toggle the derived app-usage fold (`usage` source → `$Usage_Live`/`$Usage_Daily`): pairs `process_live` started/stopped events into per-executable runs (`run_usage_fold`, no collector of its own — see `tar-implementer.md` §8). **On by default** — joining `power`/`removable` as a works-council-class source that ships enabled (see the note above for what "first" does and does not mean here). What a device runs and when is a presence/working-hours proxy even though `usage` carries no user column of its own (open runs record a `user` field, folded into a `distinct_users` count on write). Coverage begins once the source reaches its `Active` lifecycle state after enablement or upgrade — strictly forward-only, never a retrospective fold over history that accrued before that point. Set to `false` to opt out; disabling freezes retention rather than accelerating it (like every other TAR source, #539), and existing `usage_daily`/`usage_daily_user`/`usage_live` rows stay queryable until they age out on their own schedules (31-day `usage_daily`/`usage_daily_user`; the fold's own 20000-run open-run cap on `usage_live`). **Access posture (enforced): `usage_live`/`usage_daily`/`usage_daily_user` are queryable ONLY through the Forensics-gated `app_usage` reads**, never through the generic `tar.sql` action — `tar.sql` (`Infrastructure:Read`) denies all three tables (direct name, `$Usage_*` placeholder, alias, or JOIN/subquery), matching the posture this section already documents for `tar_events`. `usage_enabled` and the `tar.status` usage counters are unaffected by this — they report on the fold regardless of how (or whether) the data is subsequently read (issue #4260). |
 | `dns_enabled` | `true` / `false` | **`false`** | Toggle the DNS resolver-cache capture source (`dns` source → `$DNS_Live`/`$DNS_Hourly`) on this host (ADR-0015). **Off by default** — the DNS cache reveals which domains a host resolved (**usage-class telemetry under the works-council posture; enabling is audited**). **Device-level state only — no per-process attribution** (the cache carries no PID). **Windows only today** (`DnsGetCacheDataTable`, cache-only — never issues a wire query); Linux/macOS planned. Set to `true` to opt in; collected at `fast_interval`. |
-| `mapdrive_enabled` | `true` / `false` | **`false`** | Toggle the mapped-drive capture source (`mapdrive` source → `$MapDrive_Live`/`$MapDrive_Hourly`) on this host (capability-map §3.8). **Off by default** — rows expose usernames and remote share paths (**identity/usage-class telemetry under the works-council posture; enabling is audited**). Records network-share mappings in **both** directions (`direction` column): **outbound** (drives this host maps to remote shares) and **inbound** (remote hosts mapping this host's shares — the lateral-movement signal). Windows + Linux (macOS planned); inbound needs local-admin/Server-Operator on Windows and Samba on Linux, degrading to empty otherwise. Collected at `slow_interval`. **A one-time historical backfill** seeds *previously* mapped drives (from the registry / fstab / event logs) as `origin='historical'` rows — it runs at agent init, so it materializes on the **first agent restart after you enable this**. Set to `true` to opt in. |
+| `mapdrive_enabled` | `true` / `false` | **`false`** | Toggle the mapped-drive capture source (`mapdrive` source → `$MapDrive_Live`/`$MapDrive_Hourly`) on this host (capability-map §3.8). **Off by default** — rows expose usernames and remote share paths (**identity/usage-class telemetry under the works-council posture; enabling is audited**). Records network-share mappings in **both** directions (`direction` column): **outbound** (drives this host maps to remote shares) and **inbound** (remote hosts mapping this host's shares — the lateral-movement signal). Windows + Linux fully; macOS is constrained — outbound live only via `getfsstat` (the username column is always blank, but a credentialed SMB mount source is stored verbatim in `remote_path`; no inbound, no history: honestly out of reach for an unprivileged agent). Inbound needs local-admin/Server-Operator on Windows and Samba on Linux, degrading to empty otherwise. Collected at `slow_interval`. **A one-time historical backfill** seeds *previously* mapped drives (from the registry / fstab / event logs) as `origin='historical'` rows — it runs at agent init, so it materializes on the **first agent restart after you enable this**. Set to `true` to opt in. |
 | `perf_interval_seconds` | ≥ 1 | 30 | Seconds between performance samples (device **and** per-app, when each is enabled — they share the tick). `0` disables registration of the perf trigger entirely. **Read at agent startup (trigger registration), not via `tar.configure`** — change it through the agent's KV config / install profile; a running agent picks it up on restart. (To stop perf collection at runtime without a restart, use `perf_enabled=false`.) |
 | `network_capture_method` | `polling` (always accepted) plus the methods accepted on the **running host's OS** — e.g. `iphlpapi` on Windows, `procfs` on Linux, `proc_pidfdinfo` on macOS (run `compatibility` for the live list) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. Methods from a *different* OS are rejected. The `status` action reports `network_capture_method_effective` alongside the configured value so the configured-vs-active discrepancy is always explicit. |
 | `process_stabilization_exclusions` | JSON array (≤256 × ≤256 chars) | `[]` | Process-name **substrings** (case-insensitive; leading/trailing `*` stripped; `?` and `[abc]` are literals; effective substring must be ≥3 chars) to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
@@ -150,19 +155,21 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 
 | Source | Windows | Linux | macOS |
 |--------|---------|-------|-------|
-| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`endpoint_security`) — Endpoint Security `NOTIFY_EXEC`/`NOTIFY_EXIT` stream: **gap-free** start/stop, full image path, accurate ppid, owning user from the audit token. **Names only — no command line** (parity with the Windows ETW posture). Requires a build against the **full Xcode SDK** (the Command Line Tools SDK omits the framework), the `com.apple.developer.endpoint-security.client` entitlement, and root. Falls back to the `KERN_PROC_ALL` sysctl poll when the stream is unavailable (CLT-SDK build, missing entitlement, or non-root) — **the poll is also names-only** (it blanks the `proc_pidpath` image it would otherwise place in `cmdline`), so macOS process rows carry no command line on either path. **Boot gap** (as on Windows): processes alive before the agent's session opens get no `started` row — macOS has no AutoLogger-equivalent backfill. **Not active in current shipped builds** — the Apple entitlement + notarized release pipeline are pending (#1455), so macOS agents poll until then; check `process_capture_method` in `tar.status` to see the live path. |
-| **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
+| **process** | supported (`etw`) — `Microsoft-Windows-Kernel-Process` real-time session: **gap-free** start/stop (catches short-lived processes the poll misses), exact timestamps + exit code. **Names only — no command line** (the start event carries none; aligns with the privacy posture). Owning user resolved from the SID at start (empty for processes that exit faster than ETW's ~1s buffer flush — the same limit the poll has). Falls back to the `toolhelp32` poll if the ETW session cannot start. **Boot gap:** processes that start *and* exit before the agent's live session opens are backfilled from a boot **AutoLogger** (a circular, FlushTimer-enabled Kernel-Process `.etl` configured by the InnoSetup installer and `install-agent-user.ps1`, started by the kernel early each boot); the agent reads it directly at startup for events before the live session began (no session stop / no elevation — read access only), de-duplicated per boot. Takes effect from the next boot after install. Boot-window events are **names-only with no user** (the start event carries no user SID — precise attribution would need the Security-Auditing 4688 provider); if the AutoLogger isn't configured, that narrow window is simply not captured. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`endpoint_security`) — Endpoint Security `NOTIFY_EXEC`/`NOTIFY_EXIT` stream: **gap-free** start/stop, full image path, accurate ppid, owning user from the audit token. **Names only — no command line** (parity with the Windows ETW posture). Requires a build with the ES SDK present (shipped in both the Command Line Tools and full Xcode SDKs — "needs full Xcode" is a myth; a build-probe defect currently prevents the real client from compiling on any SDK, tracked separately), the `com.apple.developer.endpoint-security.client` entitlement, and root. Falls back to the `KERN_PROC_ALL` sysctl poll when the stream is unavailable (ES SDK not detected at build time, missing entitlement, or non-root) — **the poll is also names-only** (it blanks the `proc_pidpath` image it would otherwise place in `cmdline`), so macOS process rows carry no command line on either path. **Boot gap** (as on Windows): processes alive before the agent's session opens get no `started` row — macOS has no AutoLogger-equivalent backfill. **Not active in current shipped builds** — the Apple entitlement + notarized release pipeline are pending (#1455), so macOS agents poll until then; check `process_capture_method` in `tar.status` to see the live path. |
+| **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo` + `nstat`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc` remains the fallback/seed poll (same TOCTOU caveat: short-lived sockets that close before the per-fd query may produce empty rows). Connection **lifecycle is event-driven** via the same `nstat` kernel-control client that serves netqual: `SRC_ADDED`/`SRC_REMOVED` messages fire on open/close. **Not Endpoint Security** — ES has no TCP/socket event notifications, only process exec/exit. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
 | **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
 | **perf** | supported (`ntcounters`) — `GetSystemTimes`, `GlobalMemoryStatusEx`/`GetPerformanceInfo`, `IOCTL_DISK_PERFORMANCE`, `GetIfTable2`. No PDH, no WMI, no shell-out. Some virtual disks do not answer `IOCTL_DISK_PERFORMANCE` — disk columns read 0 there. | supported (`procfs`) — `/proc/stat`, `/proc/meminfo` (`MemAvailable`), `/proc/diskstats` (whole disks only, fixed 512-byte ABI sectors), `/proc/net/dev` (loopback excluded). No shell-out. `commit_pct` reads 0 under `vm.overcommit_memory=1` (CommitLimit is advisory there); a host with no recognised whole-disk device (some containers) reads 0 in the disk columns — same per-domain degrade as a Windows virtual disk. **Containerized agents report host-wide readings** (`/proc/stat`, `/proc/meminfo` and the CPU count are not cgroup-scoped), so a cgroup-throttled workload can look idle in device perf — run the agent on the host for container fleets. | planned (`host_statistics`) — `host_processor_info` / `host_statistics64` + IOKit. Records nothing until wired. |
 | **procperf** | supported (`ntsysinfo`), **opt-in (off by default)** — one `NtQuerySystemInformation(SystemProcessInformation)` snapshot per tick: image name, CPU times, working set for every process. No PDH, no WMI, no per-process handles. Records image **names only — never command lines**; redaction patterns apply to the name (as bare case-insensitive substrings — a pattern meant for a command-line argument can match an image name, so over-matching drops a process from the warehouse entirely). | supported (`procfs`), **opt-in (off by default)** — one `/proc/<pid>/stat` read per process per tick: comm, utime+stime, rss, starttime; no ptrace, no per-process handles. Kernel threads (e.g. `kworker/*`) are included, matching Windows recording the `System` process — they are kernel scheduling infrastructure, not user-app usage, and rss 0 keeps them out of the working-set top-N; one appears in the CPU top-N only when genuinely hot. Names are the kernel's **15-character comm** (at most 15 characters before escaping — `\` and newline are stored kernel-escaped) — the same value the process source records, so procperf rows join `$Process_Live` by name. **Redaction here is best-effort against the 15-byte comm, not a guarantee:** a pattern only redacts reliably when its sensitive substring is a **≤15-byte, prefix-aligned** slice of the comm — the kernel truncates the name to 15 bytes, so a token that falls past byte 15 (`averylongprefix_leak` → comm `averylongprefix`) is physically gone and cannot be matched, and a Windows-style core like `outlook.exe` does not match the extension-less comm `outlook`. As a partial mitigation a pattern core longer than 15 bytes is also matched by its 15-byte prefix, which only ever *adds* redaction (and can over-suppress an unrelated same-prefix app — e.g. `SensitiveApp` also hides `SensitiveAppliance`). Write Linux patterns as ≤15-byte prefix-aligned comm fragments, and treat comm redaction as reducing — not eliminating — per-app exposure; the durable fix (matching a fuller name source than the 15-byte comm) is a tracked follow-up. `version` is always `""` (on-disk version capture is a follow-up). | planned (`libproc`) — `proc_pid_rusage`/`proc_taskinfo`. Records nothing until wired. |
 | **module** | planned (`etw`), **opt-in (off by default)** — `Microsoft-Windows-Kernel-Process` image-load events with the code-signing verdict resolved at drain. **Schema registered + queryable now (M1); records nothing until the collector ships (M2).** | planned (`auditd`) — kernel-module loads via `init_module`/`finit_module` (M6). Records nothing until wired. | planned (`endpoint_security`) — `NOTIFY_KEXTLOAD`/`KEXTUNLOAD` + dylibs (M4/M5). Records nothing until wired. |
+| **power** | supported (`powerbroadcast`) — suspend/resume + AC transitions via `PowerRegisterSuspendResumeNotification`/`PowerSettingRegisterNotification`; a live subscription, so no history before the agent starts (or before it was last unarmed — a disabled window or restart is reported as an explicit `capture_gap`, never silently backfilled). | supported (`logind`) — systemd-logind `PrepareForSleep` over sd-bus plus power-supply sysfs; live-only, gated on the optional libsystemd dependency (unarmed without it — reported, not silent). | supported (`pmset_log`) — `pmset -g log` retrospective replay, the only leg with real history, bounded by `power_lookback_seconds` (default 7 days; `0` = forward-only). **On by default.** |
+| **removable** | supported (`wevtapi`) — OS event log, so this leg has real retained history bounded by `removable_lookback_seconds`. | supported (`udev_netlink`) — udev netlink subscription; live-only, no history. | supported (`diskarbitration`) — DiskArbitration attach/detach callbacks plus a `getfsstat` baseline; live-only, no history API. **On by default.** |
 | **software** | supported (`registry`), **opt-in (off by default)** — diffs the registry Uninstall keys on the `tar.software` tick: HKLM 64-bit + WOW6432Node 32-bit (**machine scope only, no user identity / no PII**). `SystemComponent` entries (canonically a `REG_DWORD` set to a non-zero value) are excluded — system components and OS patches are not reported as installed software; names, versions, and publisher only. First run seeds the baseline silently. | planned (`dpkg_rpm`) — dpkg/rpm/pacman diff. Records nothing until wired. | planned (`pkgutil`) — `system_profiler` + pkgutil diff. Records nothing until wired. |
-| **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | planned (`procfs`) — `/proc/net/arp`. Records nothing until wired. | planned (`route_sysctl`) — `sysctl NET_RT_FLAGS`; `entry_type` will be `unknown` (constrained). Records nothing until wired. |
+| **arp** | supported (`iphlpapi`), **opt-in (off by default)** — `GetIpNetTable2(AF_UNSPEC)`: ARP + IPv6 neighbour cache; full interface/IP/MAC/entry_type (ADR-0015). | supported (`procfs`), **opt-in (off by default)** — `/proc/net/arp`: IP/MAC/interface, `entry_type` (static/dynamic/incomplete/other) mapped from the Flags column. Capped at 2048 live entries. | constrained (`route_sysctl`), **opt-in (off by default)** — reuses the shared `NET_RT_FLAGS`/`RTF_LLINFO` routing-socket dump; MAC available, `entry_type` always `unknown` (this source distinguishes neither static/permanent nor dynamic/stale/probe entries), no interface field. Capped at 2048 live entries. |
 | **dns** | supported (`dnsapi`), **opt-in (off by default)** — `DnsGetCacheDataTable` + cache-only `DnsQuery_W`: name/record_type/data/TTL (ADR-0015). Device-level resolver-cache state; **no per-process attribution**. | planned (`systemd-resolved`) — resolve1 D-Bus / `/etc/hosts` fallback (constrained). Records nothing until wired. | planned (`dscacheutil`) — subprocess; TTL unavailable (`ttl_remaining_s = -1`, constrained). Records nothing until wired. |
-| **netqual** *(opt-in)* | constrained (`estats`) — TCP ESTATS (`GetPerTcpConnectionEStats`) per ESTABLISHED connection (ADR-0020). **Requires an elevated agent**: enabling per-connection stats is admin-only, so a non-elevated agent records nothing and `tar.status` reports `netqual_capture_method=none`. RTT is **ms-resolution** (sub-ms LAN RTTs read 0); `retrans`/`segs_out` count **since stats-enable**, not connection start; `lost`/`ca_state` are delta-derived approximations of the Linux gauges. The per-boot `$NetQual_Boot` baseline (since-boot OS counters) is captured non-elevated. | supported (`inetdiag`) — netlink `SOCK_DIAG`/`INET_DIAG` `TCP_INFO`, joined to the owning process by 4-tuple. | planned (`nstat`) — per-socket `tcp_connection_info`. Records nothing until wired. |
+| **netqual** *(opt-in)* | constrained (`estats`) — TCP ESTATS (`GetPerTcpConnectionEStats`) per ESTABLISHED connection (ADR-0020). **Requires an elevated agent**: enabling per-connection stats is admin-only, so a non-elevated agent records nothing and `tar.status` reports `netqual_capture_method=none`. RTT is **ms-resolution** (sub-ms LAN RTTs read 0); `retrans`/`segs_out` count **since stats-enable**, not connection start; `lost`/`ca_state` are delta-derived approximations of the Linux gauges. The per-boot `$NetQual_Boot` baseline (since-boot OS counters) is captured non-elevated. | supported (`inetdiag`) — netlink `SOCK_DIAG`/`INET_DIAG` `TCP_INFO`, joined to the owning process by 4-tuple. | constrained (`nstat`) — per-socket `tcp_connection_info` read from the private `com.apple.network.statistics` kernel control (no framework, no entitlement). **Requires root for system-wide flow visibility**: an unprivileged agent sees only its own process's flows, so it records nothing and `tar.status` reports `netqual_capture_method=none` (mirrors the Windows admin-only posture). RTT is **already microsecond-resolution** (no `*1000` conversion needed, unlike Windows ms). `lost` is a **per-tick delta**, like Windows — nstat exposes cumulative `rxretransmit`/`txretransmit`, not an instantaneous loss gauge. `retrans`/`segs_out` are cumulative-since-flow-open context. The struct layout is private/version-unstable; a runtime self-check falls back to `capture_method=none` on mismatch rather than emit wrong values (`docs/darwin-compat.md`). Behavior pending validation on real hardware. |
 | **netconn** *(opt-in)* | supported (`wevtapi`) — `EvtQuery` over the OS-retained NetworkProfile / NCSI / WLAN-AutoConfig operational channels (ADR-0020): network connect/disconnect, internet-capability changes, Wi-Fi connect/fail/disconnect + reason codes. The first read **backfills history from before TAR (or the agent) existed** — reach is bounded by `netconn_lookback_seconds` (default 7 days; 0 disables retrospective reads). **Only closed enum tokens + numeric reason codes are stored — no SSID, BSSID, profile name, interface GUID, or MAC.** A missing channel (Server SKU without WLAN) or an ACL-denied channel is skipped (warned once). | planned (`journald`) — NetworkManager/systemd-networkd transitions. Records nothing until wired. | planned (`oslog`) — configd/Wi-Fi subsystem transitions. Records nothing until wired. |
-| **mapdrive** | supported (`wnet`/`netapi32`/`registry`), **opt-in (off by default)** — both directions (§3.8). Outbound live `WNetEnumResourceW`; outbound history registry `Network`/MRU/`MountPoints2` across offline profiles. Inbound live `NetSessionEnum` (needs local-admin/Server-Operator, degrades to empty); inbound history Security log 4624 network logons. | constrained (`procfs`) — outbound live `/proc/mounts` (no username) + history `/etc/fstab` (ts=0); inbound `smbstatus` + `/var/log/samba` connect logs, both requiring Samba (empty otherwise). | planned (`getfsstat`) — outbound via `getfsstat`/`mount`, inbound via `smbutil`. Records nothing until wired. |
+| **mapdrive** | supported (`wnet`/`netapi32`/`registry`), **opt-in (off by default)** — both directions (§3.8). Outbound live `WNetEnumResourceW`; outbound history registry `Network`/MRU/`MountPoints2` across offline profiles — reads each logged-out profile's registry hive, mounting it offline via the same ladder `registry.get_user_value` uses (#2771), capped at 512 profiles like every other consumer of that ladder (a host with more loses outbound history for the profiles past the cap, logged once, not per profile). This is part of the **one-time historical backfill** (§3.8, `mapdrive_enabled` row below) — it runs once, at init, gated by a durable `mapdrive_backfill_done` key, not on a recurring cadence; enabling mapdrive means one pass over every logged-out profile's `NTUSER.DAT` on the first agent (re)start after enabling, not an ongoing background job. Inbound live `NetSessionEnum` (needs local-admin/Server-Operator, degrades to empty); inbound history Security log 4624 network logons. | constrained (`procfs`) — outbound live `/proc/mounts` (no username) + history `/etc/fstab` (ts=0); inbound `smbstatus` + `/var/log/samba` connect logs, both requiring Samba (empty otherwise). | constrained (`getfsstat`) — outbound live only: `getfsstat(2)` mount table filtered to `{nfs, smbfs, cifs, afpfs, webdav}`; the username **column** is always blank (getfsstat exposes no separate credential field), but a credentialed SMB mount source (e.g. `//alice@host/share`) is stored verbatim in `remote_path`, so the account name can still be recovered from there even though the username column is empty — unlike Linux, whose `/proc/mounts` device string never carries a username. No inbound (no `smbutil` integration) and no history (`getfsstat` exposes only the current mount table). |
 
 Status values:
 
@@ -215,6 +222,8 @@ POST /api/v1/instructions/execute
 The `status` action returns database health information:
 
 ```
+storage_state|ok
+db_health|ok|0
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -252,11 +261,58 @@ config|dns_enabled|false
 config|dns_paused_at|0
 config|dns_live_rows|0
 config|dns_oldest_ts|0
+retention_guard_declines_total|0
+retention_guard_failures_total|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
 config|software_last_run_ts|1711050000
+config|perf_capture_method|procfs
+config|procperf_procs_seen|412
+config|process_last_status|events_recorded
+config|process_consecutive_failures|0
+config|process_last_status_at|1711050400
+config|tcp_last_status|events_recorded
+config|tcp_consecutive_failures|0
+config|tcp_last_status_at|1711050400
 ```
+
+(The sample is abbreviated: `<source>_last_status`, `<source>_consecutive_failures`
+and `<source>_last_status_at` appear once per capture source, in registry order.)
+
+**Database health (`db_health`).** `db_health|ok|<epoch>` reports the epoch of
+the last tar.db quarantine ever recorded on the device (`0` = never);
+`db_health|quarantined|<epoch>` is reported only by the agent process whose
+startup quarantined a corrupt database (see "Corrupt-database quarantine" below).
+The fact is persisted in `tar_config` (`db_health_last_quarantine_epoch` /
+`db_health_last_quarantine_file`, basename only), so it survives restarts.
+
+**Per-source health.** `<source>_last_status` is the terminal outcome token of
+the source's most recent collection (`never_ran` until it has run in this agent
+process), `<source>_consecutive_failures` counts back-to-back failures, and
+`<source>_last_status_at` is the epoch of that outcome (`0` if never). The failure
+tokens are `capture_incomplete`, `counters_unavailable`, `cursor_lost`,
+`state_unreadable`, `insert_failed` and `state_save_failed`; every other token
+(including `source_disabled`, `unsupported_platform` and baseline resets) resets
+the streak. The ledger is **process memory only**: an agent restart resets every
+source to `never_ran` / `0`, which is not a recovery. When one source hits a fatal
+early return in a tick, the sources after it do not run that tick, so read
+`<source>_last_status_at` to spot a source that is frozen by an upstream failure
+rather than healthy. `perf_capture_method` is the registry capture method for the
+running OS (`procfs` on Linux, `ntcounters` on Windows, `none` where there is no
+perf collector), and `procperf_procs_seen` is the process count in the last valid
+per-process counter snapshot.
+
+**Write failures.** Snapshot-diff sources (`process`, `tcp`, `service`, `user`,
+`software`, `arp`, `dns`, `mapdrive`) commit a tick's events and their baseline in
+one transaction, so a failed save can never leave events durable against a stale
+baseline. When a tick that had events fails, the collector emits
+`error|<source> insert failed`; when only a baseline-only save fails (no events
+in the diff, the process fallback seed) it emits
+`error|<source> state_save_failed`; the software cold-start seed reports on the
+software collector's own line, `tar|collect_software|0|state_save_failed`. Either way nothing was persisted and the
+next tick re-derives the same delta. `arp`, `dns` and `mapdrive` are non-fatal:
+they emit no `error|` line and record the token in the ledger instead.
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
@@ -271,10 +327,13 @@ but the agent can't collect" is distinguishable from "off", and a non-elevated
 agent never briefly advertises `estats` before flipping to `none`. The
 default-ON sources — `process`, `tcp`, `service`, `user`, and `perf` — report
 `<source>_enabled|true`. `module_live_rows` stays `0` until a collector for the
-host's OS ships; likewise `arp`/`dns` are **Windows-only today** (planned on
-Linux/macOS), so on a Linux or macOS agent `arp_enabled|true` / `dns_enabled|true`
-still report `*_live_rows|0` — run the `compatibility` action to distinguish a
-supported-but-empty source from a planned-but-unimplemented one.
+host's OS ships; likewise `dns` is **Windows-only today** (planned on
+Linux/macOS), so on a Linux or macOS agent `dns_enabled|true` still reports
+`dns_live_rows|0`. `arp` is wired on every OS (Linux via `/proc/net/arp`; macOS
+constrained via the `NET_RT_FLAGS` sysctl route dump — `entry_type` always
+`unknown` there), so `arp_enabled|true` reports real rows there — run the
+`compatibility` action to distinguish a supported-but-empty source from a
+planned-but-unimplemented one.
 `software_last_run_ts` is the wall-clock of the last `collect_software` tick (`0`
 if it has not run yet); it is the heartbeat that distinguishes "healthy but no
 software changed" (where `software_live_rows` stays low) from "the hourly trigger
@@ -291,15 +350,89 @@ config|process_enabled|errored
 ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
 
+`retention_guard_declines_total` counts retention passes this agent declined
+(see [The retention clock guard](#the-retention-clock-guard) for the four
+triggers and which of them are benign), and
+`retention_guard_failures_total` counts tables that
+could not be retained at all -- whether the probes could not be read or the
+delete itself failed (see "The retention clock guard" below). Both
+are always emitted. **Read them together**: a zero declines total only means the
+clock is behaving if the failures total is also zero -- a table whose probes fail
+every pass has silently stopped being retained, and would otherwise report as
+healthy. When either is non-zero, one extra line per affected warehouse table
+names the table and its own count:
+
+```
+retention_guard|process_hourly|3
+retention_guard|tcp_hourly|3
+retention_guard_failed|module_hourly|2
+retention_guard_failed|__clock_state__|1
+retention_guard_declines_total|6
+retention_guard_failures_total|2
+```
+
+Only tables with a non-zero count appear, so a healthy agent emits just the two
+totals. `__clock_state__` is not a table: it reports that the agent could not
+persist its own clock reading, which leaves the guard without a comparison point
+after the next restart. `__implausible_now__` is also not a table: it reports
+that the clock reading **handed to a pass** (not the stored comparison point)
+was too far ahead to trust, so the whole pass declined before touching any
+table -- see "The retention clock guard" below. The per-table counters are in-memory and reset when the agent restarts
+(the clock reading they compare against is persisted, so restarting does not
+blind the guard). Scrape this across the fleet to find endpoints whose clocks
+need attention -- the agent has no `/metrics` endpoint, so this action is the
+fleet-readable signal. The retention-guard counters are **not yet fleet-aggregated**: there is no shipped
+instruction or heartbeat tag that rolls these up server-side; surfacing them via
+the agent heartbeat is a tracked follow-up. (tar.db corruption, by contrast, is fleet-visible: see "Corrupt-database quarantine" below.)
+
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
 ### Corrupt-database quarantine
 
-When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. This is an **agent-local log line** (`spdlog`, error level), **not** a Yuzu server audit event — do not look for it under `GET /api/v1/audit`; surface it via the agent's log file or remote log shipping. Consequences an operator should know:
+When an agent's `tar.db` fails its `PRAGMA integrity_check` at startup, the agent quarantines the corrupt file rather than trusting it: the database and its `-wal`/`-shm` sidecars are renamed aside to `tar.db.corrupt-<epoch>` (etc.) in the same directory, a fresh empty database is initialised in its place, and the agent logs `tar.db.corruption_detected`. `tar.db.corruption_detected` is an agent-local log line (`spdlog`, error level); the quarantine itself reaches the server as a `tar.db.corruption_quarantined` audit row via the heartbeat — see "Fleet visibility" below. Consequences an operator should know:
 
 - **All TAR history on that device is reset** — the new database is empty; prior events live only in the `.corrupt-<epoch>` sidecar.
 - **Per-source enable/disable state is reset to defaults** — a source previously paused for forensic preservation is collecting again. After the agent recovers, re-issue any required `configure` toggles, and `status` may briefly show `errored` for a source whose value could not be read.
 - **The quarantined file is not auto-deleted.** Recover data from `tar.db.corrupt-<epoch>` before the new database's retention overwrites the device's storage budget — e.g. `sqlite3 tar.db.corrupt-<epoch> ".recover" | sqlite3 recovered.db`, or open it read-only with any SQLite tool — then remove the sidecar manually once recovered. Repeated corruption produces multiple timestamped quarantine files; none are pruned automatically, so an agent with a recurring storage fault can accumulate them — watch the data dir's footprint.
+
+**Fleet visibility.** A quarantine is reported off-device: the tar plugin
+publishes `heartbeat.db_corruption_total` (cumulative per agent, monotonic in the
+common case) and `heartbeat.db_quarantine_last` (`<epoch>:<file>`) in its plugin
+storage, which the
+agent forwards on every heartbeat as `yuzu.plugin.tar.db_corruption_total` /
+`yuzu.plugin.tar.db_quarantine_last`. The server exposes
+`yuzu_fleet_tar_db_corruption_agents` (see the metrics reference) and writes a
+`tar.db.corruption_quarantined` audit row per (agent, quarantine identity),
+deduplicated against the audit store and bounded to one row per agent per 10
+minutes per server process (intermediate quarantines inside that window collapse
+to the newest identity; another HA node can add a second row for the same
+identity) — see the audit-log reference. A plugin that failed to
+initialise (including TAR when the corrupt file cannot be moved aside) is reported
+in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
+which distinguishes "failed to load" from "not installed". The plugin keeps its
+count in a private storage record; if that record is present but unreadable the
+plugin logs `TAR: db_health.ledger unreadable; not overwriting` and stops updating
+the two heartbeat keys rather than resetting the count — `status` still reports
+`db_health`, and the agent log carries the warning on every collect_slow tick. If
+instead the record write itself fails persistently (as opposed to a read of it),
+there is currently no fleet-visible signal beyond that same local warning — a
+device stuck this way is silently excluded from `yuzu_fleet_tar_db_corruption_agents`
+until the fault clears; tracked as a follow-up. The count is not monotonic in one
+further edge case: a *transient* fault on the read that decides whether a prior
+record exists (rather than the read above) is indistinguishable in-plugin from
+"no prior record," so a faulted read followed by a successful write on a later
+tick restarts the count at 1 for that device rather than resuming it — the fleet
+gauge counts affected agents, not events, so this narrows to a small undercount
+rather than a lost signal; tracked as #5037.
+
+Two things worth knowing about the timing of this signal. **A mass event** (many
+devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still
+updates the fleet gauge in real time, but individual audit rows serialize behind
+one another server-wide, so the audit trail can lag well behind the gauge during a
+burst — don't read row latency as gauge inaccuracy. **A device already quarantined
+before this fleet-visibility mechanism shipped** has no durable epoch/basename
+recorded yet, so it produces no fleet signal until its *next* corruption event —
+there is no backfill of pre-existing quarantines.
 
 If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked file, permissions), the agent fails closed — it refuses to load TAR rather than silently trusting the corrupt database — and logs the reason. Other agent plugins continue running; only TAR is unavailable on that device until the underlying fault is cleared and the agent restarted.
 
@@ -375,6 +508,8 @@ POST /api/v1/instructions/execute
 }
 ```
 
+**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged and the source's `<source>_last_status` reads `capture_incomplete` with `<source>_consecutive_failures` counting the streak in `tar.status`.
+
 ## Performance impact
 
 TAR is designed for minimal performance overhead:
@@ -384,7 +519,145 @@ TAR is designed for minimal performance overhead:
 - **Performance sampling**: a handful of kernel-counter reads every 30s; one row written per sample. The `$Perf_Live` 7-day window holds ~20,000 rows (~1-2 MB) per endpoint at the default cadence.
 - **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window)
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
-- **Automatic purge**: old events are removed hourly based on the retention setting
+- **Automatic purge**: old events are removed on the rollup tick (every 900 s).
+  Each tier's window comes from the schema registry's per-granularity default,
+  **not** from the `retention_days` configure key -- that key is stored and
+  reported by `status` but is not what the warehouse tiers prune against.
+
+### The retention clock guard
+
+Time-based retention deletes rows older than `now - <tier retention>`, where
+`now` is read from the **endpoint's own clock** -- the clock in a fleet most
+likely to be wrong. A dead CMOS battery, a long suspend, a cloned VM, or a boot
+before NTP converges all produce a reading that marks every row in a warehouse
+table expired at once, and an unguarded delete then takes the whole forensic
+window with it.
+
+A retention pass first refuses to act at all if the clock reading **handed to
+it** is implausible (too far ahead to be trusted into arithmetic) -- the whole
+pass declines before anything is persisted or any table is examined, and
+retention resumes once a sane reading arrives.
+
+Per table, the pass then either declines (deletes nothing from that table,
+counts the decline) or proceeds, based on the same **fact set** each time --
+the combination of which of these four conditions hold for this table on
+this pass:
+
+  1. it would delete **every** datable row of that table;
+  2. more than **a fixed 30 days** elapsed since the previous pass;
+  3. the stored reading is **ahead** of the current clock;
+  4. there is **no stored reading at all** -- the first pass after an agent
+     upgrade or a restore.
+
+  A table declines whenever this pass's fact set **differs from what was last
+  reported** for it. An **identical repeat** is a suppressed, capped drain, so
+  a warehouse that is legitimately all-expired still ages out -- at the cost
+  of one rollup tick (900 s) per distinct anomaly, not one per pass. A
+  **different** anomaly arriving while one is still being worked off (e.g. the
+  table starts wiping while a corrupt-reading decline is still active) reports
+  again rather than deleting silently. Trigger 4 is the one exception: it is
+  never recorded, so a table that keeps failing to persist its own comparison
+  point declines **every** pass rather than being suppressed after the first --
+  a missing comparison point is not an anomaly whose fact set can safely repeat
+  unreported.
+
+  **What to do:** for 4, nothing. The reading is a single `tar_config` key
+  shared by every source and table, so it is expected once per agent -- but note
+  EVERY enabled time-based table declines in that one pass, so the total jumps
+  by the table count, not by 1. It recurs only if the agent cannot WRITE that
+  key at all (read-only or full disk), which is the safe direction and is what
+  `retention_guard_failures_total` is for. For 2 and 3, check the endpoint's
+  clock and its uptime; see
+  [the runbook](../ops-runbooks/audit-store-clock-guard.md) for the audit twin
+  of this triage.
+
+  The 30 days is **absolute, not derived from the tier's retention window**: how
+  far the clock moved has nothing to do with how long that tier keeps rows, and
+  scaling it to the window put the threshold at a year on the monthly tier,
+  where it could never fire. Elapsed time cannot tell a jump from a dark laptop,
+  so the threshold sits past the point where an outage is itself remarkable -- a
+  laptop off over a long weekend reports nothing; one off for a month declines
+  one tick. The reading is persisted in `tar_config`, so trigger 2 still fires
+  on the first pass after an agent restart, including one that *booted* with a
+  wrong RTC.
+- **Every accepted pass deletes at most 5,000 rows per table**, oldest first
+  (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
+  A wipe the guard chose to allow ages out at a paced rate rather than in one
+  statement.
+- Rows timestamped implausibly far in the future -- more than a day ahead, i.e.
+  written while the clock was already skewed forward -- are excluded from the
+  "would this delete everything?" question. Without that, one such row would
+  disarm the guard permanently.
+
+**Row-count retention is deliberately unguarded, but it is capped.** The tiers
+that trim to a fixed row ceiling do so with no clock involved, so no clock
+reading can make them delete more than they always would -- hence no guard and
+no decline. They ARE capped at the same 5,000 rows per table per pass, for a
+different reason: the whole retention batch runs under one held database lock,
+and an uncapped prune over a large excess would stall every collector on the
+endpoint. A big backlog now drains over a few rollup ticks instead.
+
+**A paused or errored source is skipped before the guard is consulted**, so it
+neither deletes nor records a decline -- an operator who paused a source for
+forensics never sees a clock-anomaly signal from it.
+
+**What this does and does not promise.** The cap is the half that always
+applies: it bounds every delete unconditionally. The detectors are best-effort,
+and the outcome test in particular is defeated by any row written after the
+clock moved -- which `do_rollup` reliably produces, since `run_aggregation` runs
+first and mints rows into the very tables retention then reads. That is why the
+elapsed-time check is persisted. Taken together the guard converts an
+instantaneous wipe of the device's forensic window into a paced one plus a
+counter; it does not guarantee every clock anomaly is detected, and a
+persistently wrong clock will still drain the window over several ticks.
+
+The operator surface is `retention_guard_declines_total` and
+`retention_guard_failures_total` (plus the per-table `retention_guard|<table>|<n>`
+and `retention_guard_failed|<table>|<n>` lines) in the `status` action, described
+above. A non-zero declines total has four possible causes, listed in
+[The retention clock guard](#the-retention-clock-guard). One of them is benign
+and expected after an agent upgrade; the rest mean the endpoint's clock moved,
+it was dark longer than the threshold, or the stored reading was ahead of the
+clock. Elapsed time cannot separate those, so check the host's time
+synchronisation *and* its uptime history. A non-zero failures total means retention has stopped for that table
+for a reason that is not the clock: either its probes could not be read, or its
+delete failed. What happens to the REST of the pass depends on the error. One
+that aborts the transaction itself (a disk-full, an I/O error) rolls the whole
+pass back, and every table queued in it is reported -- including row-count
+tables, which are otherwise outside the guard. An error that leaves the
+transaction intact -- one table with a corrupt index, say -- fails only that
+table, and the healthy tables in the same pass still have their deletions
+committed. That distinction exists because stopping on every error meant one
+permanently-broken table halted retention for the whole endpoint, for ever.
+
+If that rollback ITSELF fails and the database is left inside the transaction,
+the agent **closes the TAR database**. Every later write on a connection stuck in
+an uncommittable transaction would be reported durable and then lost at restart,
+so it fails all of them closed instead. `tar status` then returns non-zero and
+emits an `error|` line followed by `storage_state|offline`, and nothing else --
+every `config|` line is withheld. Collection and retention are both stopped on
+that endpoint until the agent restarts. **Historical data normally stays
+readable**: the close affects only the read-write connection, so `tar sql` can
+still query what was already collected. The error line says which of those two
+cases you are in -- the read-only connection is itself optional at open time, and
+on the rare endpoint where it never opened, `tar sql` cannot read the history
+either, so the line says that instead of promising a read path that is not there.
+This needs a disk-level fault to reach, but read `storage_state` before trusting
+any other line in that output.
+
+In the dashboard, the capture-sources frame surfaces that error line verbatim
+rather than a generic failure, so the reason and the recovery advice reach the
+operator on the frame they opened to ask why the device's data is missing.
+
+**Known dead band.** Because the threshold is a fixed 30 days, a forward clock
+error smaller than that trips neither detector on a table whose own window is
+shorter:
+the step check is below its floor, and the outcome test is separately defeated
+by the rollup minting fresh rows before retention runs. In that band the table
+drains at the capped rate with no decline and no counter. The cap still bounds
+the damage; the detection does not fire. This is the deliberate cost of not
+reporting every switched-off laptop as a clock anomaly. Retention resumes automatically, paced, once the
+condition clears.
 
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
 > upgrade to this release, every Windows agent continues **device** performance
@@ -420,8 +693,15 @@ TAR is designed for minimal performance overhead:
 > **`arp_enabled` / `dns_enabled` are new this release (ADR-0015) and also ship
 > off by default.** Expect both to read `false` in `tar.status` on upgrade; the
 > new `$ARP_*` / `$DNS_*` warehouse tables are created automatically and stay
-> empty until you opt in (Windows-only collectors today; Linux/macOS planned).
-> No data collection changes on upgrade from ARP/DNS. **GUI note:** after enabling a source
+> empty until you opt in. **ARP now collects on Windows, Linux, and macOS as of
+> this release** (previously Windows-only) — if you already set
+> `arp_enabled=true` fleet-wide (e.g. while only Windows agents could collect),
+> upgrading Linux/macOS agents starts them collecting neighbour IP/MAC records
+> (plus interface on Linux; macOS has no interface field) at the next
+> `fast_interval` tick, with no separate notice. Set
+> `arp_enabled=false` before upgrading any endpoint where that new collection
+> is not yet approved, then re-enable once it is. DNS remains Windows-only, so
+> there is no DNS collection change on upgrade. **GUI note:** after enabling a source
 > (Capture-sources frame or `configure`), the first rows appear at the next
 > `fast_interval` tick (default 60 s) — an empty panel immediately after enabling
 > is expected, not a fault.
@@ -518,6 +798,8 @@ Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent
 | **TCP** | `$TCP_Live` (5000 rows) | `$TCP_Hourly` (24h) | `$TCP_Daily` (31d) | `$TCP_Monthly` (12mo) |
 | **Service** | `$Service_Live` (5000 rows) | `$Service_Hourly` (24h) | -- | -- |
 | **User** | `$User_Live` (5000 rows) | -- | `$User_Daily` (31d) | -- |
+| **Power** | `$Power_Live` (20000 rows) | -- | -- | -- |
+| **Removable** | `$Removable_Live` (20000 rows) | -- | -- | -- |
 | **Perf** | `$Perf_Live` (7d, time-based) | `$Perf_Hourly` (31d) | -- | -- |
 | **ProcPerf** | `$ProcPerf_Live` (7d, time-based) | `$ProcPerf_Hourly` (31d, per app) | -- | -- |
 | **Module** | `$Module_Live` (100000 rows) | `$Module_Hourly` (24h) | `$Module_Daily` (31d) | `$Module_Monthly` (12mo) |
@@ -550,6 +832,8 @@ The `$Software_*` tables are populated on **Windows** when the source is enabled
 **User tables:** `ts`, `user`, `domain`, `logon_type`, `action` (login/logout). Daily tier adds `login_count`.
 
 **Perf tables:** `ts`, `cpu_pct`, `mem_used_pct`, `commit_pct`, `disk_read_bps`, `disk_write_bps`, `disk_read_lat_us`, `disk_write_lat_us`, `net_rx_bps`, `net_tx_bps` (all numeric; rates are bytes/sec, latencies are µs per I/O). `$Perf_Hourly` carries per-hour `samples`, `cpu_avg`/`cpu_max`, `mem_avg`/`mem_max`, `commit_avg`, and avg/max throughput and latency columns. Collection is trigger-driven (`tar.collect_perf`, every `perf_interval_seconds`), so the audit trail for perf is the `configure` action that enables/paces it, not a per-sample dispatch record.
+
+**`collect_perf` status tokens.** `sample_recorded`, `baseline` (first tick after start), `source_disabled`, `unsupported_platform` (no perf collector for this OS: macOS today) and `counters_unavailable` (the OS has a perf collector but the counter read failed; the same token is used for `procperf`).
 
 **ProcPerf tables:** `ts`, `name` (image name only — **never a command line**), `instances`, `cpu_pct`, `ws_bytes`. Each tick records the **top 10 applications by CPU plus the top 10 by working set** (union, ≤ 20 rows), aggregated across same-name processes (`instances` = how many). `cpu_pct` is the app's share of *total machine capacity* — one saturated core on an 8-core box reads 12.5, matching `$Perf_Live` and Task Manager. `$ProcPerf_Hourly` aggregates per `(hour, name)`: `samples`, `instances_max`, `cpu_avg`/`cpu_max`, `ws_avg_bytes`/`ws_max_bytes`. Apps matching a redaction pattern are never recorded. Example — yesterday's CPU-hungriest apps on a device:
 

@@ -1,0 +1,11 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash ece0243d8d74
+== action=list
+error|platform not supported
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=product_codes
+error|platform not supported
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

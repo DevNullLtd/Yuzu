@@ -1,0 +1,11 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash dcc02549b1eb
+== action=wake
+wake|error|Missing required parameter: mac
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=check host=127.0.0.1
+check|127.0.0.1|reachable|3
+mechanism|icmp
+[result_status] UNDECLARED / UNKNOWN / 
+

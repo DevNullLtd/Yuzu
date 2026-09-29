@@ -92,3 +92,36 @@ TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_per
         CHECK(row[8] == "400");                                // MAX(ws_max_bytes)
     }
 }
+
+TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processes",
+          "[tar][app_perf][procperf]") {
+    // Kernel threads (Linux PF_KTHREAD) and the Windows System process (pid 4)
+    // are recorded unfiltered into procperf_hourly (the live TAR tier keeps
+    // them — tar_proc_perf.hpp's "Kernel-thread marker" note); this rollup
+    // query is the ONE place that excludes them from the daily app-perf
+    // history sent to the server.
+    auto t = make_db();
+    const std::int64_t day_start = 1735689600;
+    const std::int64_t window_start = day_start;
+    const std::int64_t today_start = day_start + 86400;
+
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO procperf_hourly "
+        "(hour_ts, name, version, is_kthread, samples, instances_max, cpu_avg, cpu_max, "
+        " ws_avg_bytes, ws_max_bytes) VALUES "
+        "(" +
+        std::to_string(day_start) +
+        ", 'kworker/0:1', '', 1, 10, 1, 5.0, 8.0, 0, 0)," // kernel thread — excluded
+        "(" +
+        std::to_string(day_start) +
+        ", 'normal.exe', '1.0.0.0', 0, 10, 2, 12.5, 20.0, 1024, 2048)")); // normal — included
+
+    const std::string sql = build_app_perf_query(window_start, today_start);
+    auto validated = yuzu::tar::validate_and_translate_sql(sql);
+    REQUIRE(validated.has_value());
+    CHECK(validated->find("is_kthread") != std::string::npos);
+    auto res = t.db.execute_user_query(*validated);
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1); // the kernel-thread row never reaches the output
+    CHECK(res->rows[0][0] == "normal.exe");
+}

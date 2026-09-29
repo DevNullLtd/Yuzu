@@ -66,6 +66,10 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc_name` |
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code` |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Pending registration-replay entries, labeled by `node` |
+| `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick, labeled by `node` (HA WS-4 `#4555`) |
+| `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick, labeled by `node` (`#4555`) |
+| `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`) |
+| `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap refused a never-before-seen address (`#4555` review round 2) |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and queue-length histograms, circuit-breaker and cluster counters) is registered in `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`.
 

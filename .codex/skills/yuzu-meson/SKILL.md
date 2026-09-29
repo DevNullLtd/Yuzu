@@ -15,7 +15,7 @@ description: Maintain Yuzu's Meson build graph, source lists, dependency wiring,
 
 - Add every new `.cpp` file to the correct target.
 - Remove or rename files in the same edit as the code move.
-- Keep `build_agent`, `build_server`, `build_tests`, and `build_examples` gating intact.
+- Keep `build_agent`, `build_server`, `build_tests` gating intact. `build_examples` gates ONLY the four decorative demo plugins (`example`, `chargen`, `procfetch`, `netprobe`) — a new real plugin's `subdir()` call goes unconditionally under `if build_agent`, never inside the `build_examples` block.
 - Preserve `include_type: 'system'` on third-party dependencies.
 - Use existing `host_machine.system()` patterns for conditional sources and flags.
 

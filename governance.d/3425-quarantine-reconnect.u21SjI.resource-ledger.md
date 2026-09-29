@@ -1,0 +1,43 @@
+# Resource Ledger — `3425-quarantine-reconnect.u21SjI`
+
+Every owning boundary the C++ in `4c0bfe1e3..HEAD` (fix/3425-quarantine-reconnect)
+acquires. Required by the Gate 1 contract on any C++ diff; recorded
+here rather than only in the run narrative so a later reader can check it
+against the code. Written retroactively during the Gate 3 fix round after
+cpp-safety's Gate 3 pass reported no ledger artifact existed for this change
+(policy-floor finding B) — see `governance.d/3425-quarantine-reconnect.*.jsonl`
+for the disposition on that finding.
+
+This diff acquires exactly one new OS thread, one new mutex-class owner, five
+new non-owning borrowed pointers (a `Deps` struct, matching the pre-existing
+`PolicyEvaluator`/`PreflightRunner` shape), and reuses the store's pre-existing
+Postgres-pool-lease pattern for two new write APIs. Nothing in it acquires a
+raw fd/HANDLE/SOCKET/`FILE*`, an OpenSSL/BCrypt object, an allocated C string,
+or a mapped library.
+
+| Resource | Owner | Acquired | Released | Transfer | Failure cleanup |
+|---|---|---|---|---|---|
+| `quarantine_reconcile_thread_` (`std::thread`) | `ServerImpl` member | spawned during server bring-up wiring (`server.cpp:16706`), always (no store-presence gate — the thread body itself no-ops per-tick if `quarantine_reconciler_` is unset) | `.join()` in `stop()` (`server.cpp:7375-7376`), **before** `heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)` and `quarantine_reconciler_.reset()` (`:7592-7598`), which in turn precede `response_store_.reset()`/`quarantine_store_.reset()`/`audit_store_.reset()` | none | Joined unconditionally if joinable; the tick body is wrapped in a per-tick `try`/`catch` (`server.cpp:16713-16721`), matching the pre-existing snapshot-refresher precedent this thread's shape was copied from — an exception escaping a `std::thread` entry is `std::terminate` |
+| `HeartbeatIngestion::quarantine_reconcile_mu_` (`std::shared_mutex`, **new in the Gate 3 fix round**) | `HeartbeatIngestion` member | `std::shared_lock` for the full duration of the hook call in `ingest()` (`heartbeat_ingestion.cpp:90-99`); `std::unique_lock` in `set_quarantine_reconcile_fn` (`heartbeat_ingestion.hpp:117`) | scope exit (RAII, both lock types) | none | RAII. This is the fix for cpp-safety's Gate 3 BLOCKING finding A: without it, `set_quarantine_reconcile_fn(nullptr)` (called from `stop()`, after only a *bounded* gRPC drain — not a quiescence guarantee, same precedent as the `execution_tracker_`/`nvd_sync_`/`web_thread_` teardown comments in `server.cpp`) could return while a heartbeat-handler thread was still inside the callback, letting `quarantine_reconciler_.reset()` run concurrently with a live call into it (reassignment-races-`operator()` plus a dangling post-reset capture). The `shared_lock` is held for the *whole* call, not just to copy the `std::function`, because only that makes `unique_lock`'s return a genuine drain-barrier. Verified by a deterministic (latch-based, not TSan-dependent) regression test, `test_heartbeat_ingestion.cpp` `"set_quarantine_reconcile_fn(nullptr) blocks until an in-flight ingest() call completes"` — mutation-tested by temporarily removing the lock and confirming the test fails, then restoring |
+| `HeartbeatIngestion::guardian_reconcile_fn_` (`std::function`, pre-existing) | `HeartbeatIngestion` member | unsynchronized, unchanged by this diff | unsynchronized | none | **Not fixed here** — same-shape hazard as `quarantine_reconcile_fn_` had, but out of scope per this repo's scope-to-authored-lines convention (this diff did not introduce it). Recorded as a follow-up candidate, not silently left off this ledger |
+| `QuarantineContainmentReconciler::mu_` (`std::mutex`) | `QuarantineContainmentReconciler` member | `std::lock_guard`, multiple short-lived scopes per `tick()`/`reconcile_one()` call (claim-then-act, GC sweep, state transitions) | scope exit | none | RAII. The class's own header contract ("store reads/dispatch calls never run WHILE the lock is held") was verified by a Gate 3 cpp-safety pass tracing every `lock_guard` scope in the file — holds for all of them, including the two new `audit_unstamped` call sites added this round (both placed outside any lock, mirroring the pre-existing `audit_confirmed`/`audit_reapply` placement) |
+| `QuarantineContainmentReconciler::Deps` — 5 borrowed raw pointers (`quarantine_store`, `response_store`, `registry`, `metrics`, `audit_store`) | **non-owning** — `ServerImpl` owns all five; the reconciler borrows them for its lifetime | set at construction (`server.cpp:16681+`) | never explicitly released by the reconciler — lifetime is a teardown-ORDER proof, not a reference count: `quarantine_reconciler_.reset()` (`server.cpp:7598`) runs before any of the five owning members reset (`response_store_` `:7730`, `quarantine_store_` `:7724`, `audit_store_` `:7799`; `registry_`/`metrics_` are whole-object-lifetime members) | none | Declaration order also makes this safe under implicit (non-`stop()`) destruction — `quarantine_reconciler_` is declared last among the five at `server.cpp:20088` |
+| `QuarantineContainmentReconciler::Deps::dispatch_fn`/`now_fn` (`std::function`) | `QuarantineContainmentReconciler` member (owned copy, not borrowed) | set at construction; `dispatch_fn` = the shared `command_dispatch_fn` (`server.cpp:16500-16513`), which captures `this` (`ServerImpl*`) by value | destroyed with the reconciler | none | `this` is guaranteed to outlive the reconciler (same object, torn down first, see the row above) — no dangling-capture risk. `now_fn` is empty in production (falls back to `default_now_epoch()`, no captures) |
+| PG pool leases (`pool_.try_acquire_for`, `kReadTimeout=2s`/`kWriteTimeout=4s`) | local, per call, in `QuarantineStore::get_status`/`mark_endpoint_applied`/`mark_endpoint_confirmed` | `try_acquire_for` at the top of each store call | RAII lease guard, scope exit | none | Pre-existing pattern (matches `release_device`'s precedent); the two new write APIs (`mark_endpoint_applied`/`mark_endpoint_confirmed`, this PR) reuse it unchanged. Bounded by construction — never held across a dispatch call (the lease is released before `redispatch_stored_containment` invokes `dispatch_fn`) |
+| `std::thread ingest_thread` / `std::thread set_thread` + `std::latch fn_started`/`fn_may_return` (test-only) | `test_heartbeat_ingestion.cpp`'s new regression test | test body | explicit `.join()` on both threads, unconditional, no early return between spawn and join | none | Test-local; not a production resource. Latches are single-use, single-count, no reset path needed for this test's shape |
+| `QuarantineContainmentReconciler::Deps::should_stop` (`std::function<bool()>`, **new in the Gate 5/6 fix round**) | `QuarantineContainmentReconciler` member (owned copy, not borrowed) | set at construction (`server.cpp:16693`); production value is `[this] { return stop_requested_.load(std::memory_order_acquire); }`, capturing `ServerImpl*` by value | destroyed with the reconciler | none | Same shape and same safety argument as the `dispatch_fn`/`now_fn` row above: `this` is guaranteed to outlive the reconciler, since the reconciler's sole call path to this callback (`tick()`, via `notify_agent_heartbeat`'s sibling `should_stop()` check) is only reachable from `quarantine_reconcile_thread_`, which is `.join()`'d (`server.cpp:7375-7376`) strictly before `quarantine_reconciler_.reset()` (`:7598`) — no invocation can occur after the reconciler is destroyed, and `ServerImpl` is guaranteed alive for the whole of its own `stop()` call. Default-unset (empty `std::function`) on every `Deps` construction that predates this field (all existing tests) — checked via `if (d_.should_stop && d_.should_stop())`, never an unchecked call on an empty function |
+
+**Adjudications recorded:** none required — no manual (non-RAII) resource
+cleanup was added anywhere in this diff; the one genuine lifetime defect found
+in review (cpp-safety Gate 3 finding A, the unsynchronized
+`quarantine_reconcile_fn_`) was fixed with a proper RAII lock, not waived.
+
+**Sanitizer coverage.** No TSan leg exists in-tree for
+`quarantine_reconcile_mu_` or `QuarantineContainmentReconciler::mu_`. The new
+teardown-race regression test is deterministic (latch-ordered, not
+timing-dependent) rather than TSan-dependent by design — cpp-safety's Gate 3
+report recommended a TSan-run version of the same shape as a follow-up
+(spin a thread calling `notify_agent_heartbeat` in a loop against a
+concurrent teardown sequence); not added in this round, tracked as a
+follow-up candidate alongside the pre-existing `guardian_reconcile_fn_` gap
+above.

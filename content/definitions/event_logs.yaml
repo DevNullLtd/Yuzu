@@ -3,8 +3,9 @@
 ## Plugin: event_logs | Actions: errors, query
 ##
 ## Sources by platform:
-##   Windows: Get-WinEvent PowerShell cmdlet
-##   Linux:   journalctl (systemd journal)
+##   Windows: wevtapi EvtQuery/EvtRender (in-process Event Log API)
+##   Linux:   sd_journal (in-process), falling back to a bounded journalctl
+##            invocation where libsystemd is unavailable
 ##   macOS:   log show (unified logging)
 
 ---
@@ -17,11 +18,17 @@ metadata:
   description: >
     Retrieve recent error-level events from a system event log. On
     Windows, queries the specified log (default "System") for Level 2
-    (Error) events within the time window via Get-WinEvent. On Linux,
-    uses journalctl -p err. On macOS, uses log show with error predicate.
-    Returns up to 100 events with timestamp, event ID, source, and
-    truncated message (max 200 chars). Input sanitization prevents
-    command injection.
+    (Error) events within the time window via the in-process Event Log
+    API (wevtapi). On Linux, reads the journal in-process at priority
+    err or worse, falling back to a bounded journalctl invocation where
+    libsystemd is unavailable. On macOS, uses log show with an error
+    predicate. Returns up to 100 events with timestamp and truncated
+    message (max 200 chars); event ID and provider/source are populated
+    on Windows only, and Linux/macOS instead resolve a unit or process
+    name that does not appear in this schema. A read that fails, is
+    denied, or is cut short by its bound reports a typed status rather
+    than an empty result, except on macOS, which signals degradation
+    only through the row content and return code.
   tags: [diagnostics, event-logs, monitoring, compliance]
 
 spec:
@@ -40,8 +47,10 @@ spec:
         type: string
         displayName: Log Name
         description: >
-          The event log to query. On Windows: System, Application,
-          Security, etc. Ignored on Linux/macOS. Default: "System".
+          The event log to query, e.g. "System" or "Application". Windows
+          only — the value is accepted but has no effect on Linux/macOS,
+          which always read the system journal / unified log. Default:
+          "System".
         default: "System"
         validation:
           maxLength: 128
@@ -49,8 +58,8 @@ spec:
         type: int32
         displayName: Hours Back
         description: >
-          Number of hours to look back for error events. Range: 1-720
-          (30 days). Default: 24.
+          Number of hours to look back for error events, e.g. 24 or 168.
+          Range: 1-720 (30 days). Default: 24.
         default: 24
         validation:
           minimum: 1
@@ -60,12 +69,25 @@ spec:
     columns:
       - name: timestamp
         type: string
+        description: 'Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.'
+        example: "2026-09-06T14:55:55.0521384Z"
+        platforms: [windows, linux, darwin]
       - name: event_id
         type: string
+        description: 'Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.'
+        example: "6008"
+        platforms: [windows]
       - name: source
         type: string
+        description: >-
+          Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.
+        example: "EventLog"
+        platforms: [windows]
       - name: message
         type: string
+        description: 'Event message text, truncated to 200 bytes at a UTF-8 character boundary. Values: free text.'
+        example: "16:11:31 ‎05/‎09/‎2026 105614"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [source]
       operations: [count]
@@ -98,11 +120,16 @@ metadata:
   version: 1.0.0
   description: >
     Search event log entries by keyword filter within a specified log.
-    On Windows, uses Get-WinEvent with a Where-Object message filter.
-    On Linux, uses journalctl --grep. On macOS, uses log show with an
+    On Windows, reads events via the in-process Event Log API (wevtapi)
+    and matches the keyword against the event's data and provider name.
+    On Linux, matches a case-insensitive substring against the journal
+    message. On macOS, uses log show with an
     eventMessage contains predicate (last 24h). Returns matching events
-    with timestamp, level, event ID, source, and message. Input is
-    sanitized to prevent command injection.
+    with timestamp and message; level, event ID, and provider/source are
+    populated on Windows only, and Linux/macOS instead resolve a unit or
+    process name that does not appear in this schema. Input is matched
+    in-process; no operator-supplied value is passed to an external
+    command.
   tags: [diagnostics, event-logs, search, monitoring]
 
 spec:
@@ -122,8 +149,10 @@ spec:
         type: string
         displayName: Log Name
         description: >
-          The event log to search. On Windows: System, Application,
-          Security, etc.
+          The event log to search, e.g. "System" or "Application". On
+          Windows this selects the channel; on Linux/macOS the value is
+          accepted but does not select a log (both always read the
+          journal / unified log).
         validation:
           minLength: 1
           maxLength: 128
@@ -131,9 +160,10 @@ spec:
         type: string
         displayName: Search Filter
         description: >
-          Keyword to search for in event messages. Case-insensitive
-          substring match. Only alphanumeric characters, spaces, dots,
-          hyphens, underscores, and slashes are allowed.
+          Keyword to search for in event messages, e.g. "error" or
+          "disk-warning". Case-insensitive substring match. Only
+          alphanumeric characters, spaces, dots, hyphens, underscores,
+          and slashes are allowed.
         validation:
           minLength: 1
           maxLength: 256
@@ -141,7 +171,10 @@ spec:
         type: int32
         displayName: Max Results
         description: >
-          Maximum number of events to return. Range: 1-500. Default: 50.
+          Maximum number of recent events EXAMINED for a match on
+          Windows (the filter is applied within that window); the maximum
+          number of matches returned on Linux and macOS. Range: 1-500.
+          Default: 50.
         default: 50
         validation:
           minimum: 1
@@ -151,14 +184,32 @@ spec:
     columns:
       - name: timestamp
         type: string
+        description: 'Event timestamp. Full-precision UTC ISO-8601 on Windows; local short-iso time on Linux; the `log show --style compact` column timestamp on macOS. Values: free text.'
+        example: "2026-09-06 10:55:53.560"
+        platforms: [windows, linux, darwin]
       - name: level
         type: string
+        description: >-
+          Windows event level display name derived from the numeric `<Level>`. Not populated on Linux or macOS. Values: Critical, Error, Warning, Information, Verbose, or Level<n> for an unmapped numeric level.
+        example: "not observed in any capture (the Windows query run matched no rows)"
+        platforms: [windows]
       - name: event_id
         type: string
+        description: 'Windows numeric Event ID. Not populated on Linux or macOS. Values: integer.'
+        example: "6008 (from the errors sample; the query run matched no rows)"
+        platforms: [windows]
       - name: source
         type: string
+        description: >-
+          Windows event provider name. Not populated on Linux or macOS — those legs report a journal unit or process name in this row position instead, which is a different field outside this schema. Values: free text.
+        example: "Kernel-General"
+        platforms: [windows]
       - name: message
         type: string
+        description: >-
+          Matched event message text, truncated to 200 bytes at a UTF-8 character boundary. The `filter` keyword is matched against this field (and the provider name, on Windows). Values: free text.
+        example: "2026-09-06 10:55:53.560 Df WeatherWidget[977:d9fa44] [com.apple.weather:WidgetRefresh] About to compute error refresh policy. (5 min to next refresh)."
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy: [level, source]
       operations: [count]

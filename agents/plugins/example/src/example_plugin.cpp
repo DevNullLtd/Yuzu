@@ -10,6 +10,28 @@
 #include <format>
 #include <string_view>
 
+namespace {
+
+// ABI4 capability declarations (#2204). Reference plugin: both actions are
+// trivial in-process responders with no OS interaction at all, so every leg
+// is rung 1 ("in-process") on every OS uniformly.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "ping",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+    },
+    {
+        /* .action      = */ "echo",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "in-process", nullptr},
+    },
+};
+
+} // namespace
+
 class ExamplePlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "example"; }
@@ -21,6 +43,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"ping", "echo", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {

@@ -32,6 +32,7 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -122,6 +123,33 @@ public:
     };
     [[nodiscard]] static std::string_view to_string(InitError::Kind kind);
 
+    /// Typed lifecycle-operation error (#2530 A1) — replaces the old bare
+    /// `std::expected<T, std::string>` on rotate/rewrap/oldest/retire, same
+    /// shape precedent as `InitError` above. SQLSTATE is extracted and
+    /// classified INSIDE the codec (secret_codec.cpp) — the raw SQLSTATE
+    /// string itself never leaves the codec, only the `Kind` discriminant.
+    /// `internal_message` may carry raw `PQerrorMessage` text: server-side
+    /// logging ONLY, never forwarded to an HTTP/MCP response (kek_routes.hpp
+    /// rule B).
+    struct LifecycleError {
+        enum class Kind {
+            query_canceled, ///< SQLSTATE 57014 — the query was canceled OR
+                             ///< exceeded statement_timeout (NOT uniquely a
+                             ///< timeout; also results from pg_cancel_backend).
+                             ///< Operator-facing wording must say "canceled or
+                             ///< exceeded its statement timeout", never just
+                             ///< "timed out".
+            database,       ///< any other Postgres query/transaction failure
+            provider,       ///< KeyProvider generate/check-value/delete failure
+            precondition,   ///< a lifecycle precondition was unmet (init() not
+                             ///< run, kek_version space exhausted, target
+                             ///< version is active/unregistered)
+            crypto,         ///< re-wrap crypto failure (DEK unwrap/wrap)
+        };
+        Kind kind{Kind::database};
+        std::string internal_message;
+    };
+
     /// The identity tuple AAD binds to. Encrypted values are non-relocatable
     /// across any of these coordinates. Secret-bearing tables must use stable
     /// PKs; identity-changing migrations decrypt-and-re-encrypt, never copy
@@ -185,8 +213,15 @@ public:
     [[nodiscard]] std::uint32_t active_kek_version() const;
 
     /// Register a secret-bearing column. Returns false (and registers
-    /// nothing) if any identifier fails the SQL-identifier rule.
+    /// nothing) if any identifier fails the SQL-identifier rule, OR if a
+    /// column with the same (store, table, column) is already registered
+    /// (#2530 A3) — a duplicate would multiply the rewrap_all scan and
+    /// distort the registered-column trip-wire.
     [[nodiscard]] bool register_secret_column(SecretColumn col);
+
+    /// Snapshot of every registered secret column, in registration order
+    /// (#2530 A2). Taken under `mu_`.
+    [[nodiscard]] std::vector<SecretColumn> registered_columns() const;
 
     // ── Per-value operations ────────────────────────────────────────────────
 
@@ -221,8 +256,11 @@ public:
     /// NOTE: if an error is returned AFTER the new version registered (a
     /// rewrap_all failure), active_version_ has already advanced — new
     /// encrypts use the new KEK; call rewrap_all() to finish, never
-    /// rotate_kek again.
-    [[nodiscard]] std::expected<std::uint32_t, std::string> rotate_kek(PGconn* conn);
+    /// rotate_kek again. The returned error's `Kind` is PRESERVED from the
+    /// wrapped rewrap_all() failure (#2530 A1) — never flattened to
+    /// `database`, so a canceled/timed-out rewrap is still reported as
+    /// `query_canceled` to callers classifying the failure.
+    [[nodiscard]] std::expected<std::uint32_t, LifecycleError> rotate_kek(PGconn* conn);
 
     /// Re-wrap every registered row not already on the active version.
     /// Compare-and-swap per row (`WHERE <col> = <bytes read>`): a plain
@@ -230,13 +268,13 @@ public:
     /// to the old value under the new KEK. CAS losers are skipped (the
     /// concurrent writer encrypted under the active version anyway) and
     /// counted in the return. Returns rows re-wrapped.
-    [[nodiscard]] std::expected<std::size_t, std::string> rewrap_all(PGconn* conn);
+    [[nodiscard]] std::expected<std::size_t, LifecycleError> rewrap_all(PGconn* conn);
 
     /// Smallest kek_version any stored blob still references (header scan of
     /// every registered column — scan-trivial at our volumes, ADR §3), or
     /// nullopt when no secret rows exist. The operator's rotation-complete /
     /// safe-retirement signal.
-    [[nodiscard]] std::expected<std::optional<std::uint32_t>, std::string>
+    [[nodiscard]] std::expected<std::optional<std::uint32_t>, LifecycleError>
     oldest_kek_version_in_use(PGconn* conn);
 
     /// Retire an old KEK version: refused while it is the active version or
@@ -246,7 +284,40 @@ public:
     /// deletes the key from provider storage. The backup-honoring condition
     /// (ADR §3 (b)) is the operator's call via the runbook — it cannot be
     /// checked here.
-    [[nodiscard]] std::expected<void, std::string> retire_kek(PGconn* conn, std::uint32_t version);
+    [[nodiscard]] std::expected<void, LifecycleError> retire_kek(PGconn* conn,
+                                                                  std::uint32_t version);
+
+    // ── #2530 rotate runaway control — durable reads feeding the guard ─────
+
+    /// Count of non-retired `kek_meta` rows (#2530 A4) — the backstop-ceiling
+    /// input. `SELECT COUNT(*) FROM secrets.kek_meta WHERE retired_at IS
+    /// NULL`. The parsed count is validated and range-checked before return
+    /// (it lands in a `std::uint32_t` status field downstream) — a
+    /// malformed/absent result is `Kind::database`, never a silent 0.
+    [[nodiscard]] std::expected<std::size_t, LifecycleError> live_kek_version_count(
+        PGconn* conn) const;
+
+    /// The durable rotation clock (#2530 A5): age of the newest `kek_meta`
+    /// row and whether it is future-dated, both read from a SINGLE statement
+    /// so both timestamps come from the same Postgres server clock — an
+    /// app-host clock is never compared against the DB clock, which is what
+    /// makes the anomaly check sound.
+    struct RotateClock {
+        std::chrono::seconds since_newest{0}; ///< age of the newest kek_meta row
+        bool clock_anomaly{false}; ///< newest row is FUTURE-dated vs now()
+        bool any_rows{false};      ///< false = no kek_meta rows yet
+        /// #2530 G7-B6: magnitude of the future-dating in seconds, meaningful
+        /// only when `clock_anomaly` is true (0 otherwise). A forward clock
+        /// skew is NOT self-clearing the way a backward skew is — a
+        /// future-dated `kek_meta.created_at` stays `> now()` until real time
+        /// catches up to it, blocking every rotation for the whole skew
+        /// duration with no configuration escape (see server-admin.md). This
+        /// field is what lets an operator tell "2 seconds of NTP jitter" from
+        /// "this row is dated next year" — those demand completely different
+        /// responses, and without this the seam could not distinguish them.
+        std::uint64_t future_skew_secs{0};
+    };
+    [[nodiscard]] std::expected<RotateClock, LifecycleError> rotate_clock(PGconn* conn) const;
 
     // ── Observability seams ─────────────────────────────────────────────────
 

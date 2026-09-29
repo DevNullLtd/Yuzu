@@ -1,0 +1,4 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Get-ChildItem on HKLM IFEO path, checked each subkey for a Debugger value via Get-ItemProperty
+date: 2026-09-06
+status: REAL CAPTURE

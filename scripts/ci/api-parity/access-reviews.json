@@ -1,0 +1,18 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/settings/access-reviews",
+    "capability_id": "get.fragments-settings-access-reviews",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/access-reviews/campaign",
+    "capability_id": "get.fragments-settings-access-reviews-campaign",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

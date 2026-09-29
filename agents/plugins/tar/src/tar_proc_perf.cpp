@@ -24,6 +24,13 @@ std::uint64_t delta(std::uint64_t prev, std::uint64_t cur) {
     return cur >= prev ? cur - prev : 0;
 }
 
+// PF_KTHREAD ("I am a kernel thread"), <linux/sched.h> — hardcoded rather
+// than including the kernel header (userspace has no business pulling that
+// in; the bit is stable ABI). Checked against the raw kernel `flags` word
+// (proc(5) field 9), never the attacker/process-settable `comm` name — see
+// tar_proc_perf.hpp's "Kernel-thread marker" banner note.
+constexpr std::uint64_t kPfKthreadFlag = 0x00200000;
+
 // Saturating add/multiply — a hostile /proc mount can put 2^64-scale integers
 // in a stat field; the products below would wrap (defined, but garbage). We
 // saturate to UINT64_MAX so a forged value yields a pinned reading rather than
@@ -179,6 +186,7 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
         std::uint32_t rep_pid{0};
         std::int64_t rep_create_time{0};
         std::uint64_t rep_ws{0};
+        bool is_kthread{false}; // OR'd across instances — see ProcPerfSample::is_kthread
     };
     std::unordered_map<std::string, Agg> by_name;
     for (const auto& p : cur.procs) {
@@ -194,6 +202,7 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
         auto& a = by_name[p.name];
         ++a.instances;
         a.ws += p.ws_bytes;
+        a.is_kthread = a.is_kthread || p.is_kthread;
         if (auto it = prev_cpu.find(proc_key(p)); it != prev_cpu.end())
             a.cpu_delta += delta(it->second, p.cpu_100ns);
         if (a.rep_pid == 0 || p.ws_bytes > a.rep_ws) {
@@ -217,6 +226,7 @@ std::vector<ProcPerfSample> derive_proc_samples(const ProcSnapshot& prev,
         s.ws_bytes = static_cast<std::int64_t>(a.ws);
         s.rep_pid = a.rep_pid;
         s.rep_create_time_100ns = a.rep_create_time;
+        s.is_kthread = a.is_kthread;
         all.push_back(std::move(s));
     }
 
@@ -260,8 +270,9 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
         return std::nullopt;
 
     // Tokens after the ')' are stat fields 3+, so 0-indexed: field N → N−3.
-    //   utime=11  stime=12  starttime=19  rss=21   (proc(5), fields 14/15/22/24)
-    constexpr std::size_t kUtime = 11, kStime = 12, kStartTime = 19, kRss = 21;
+    //   flags=6  utime=11  stime=12  starttime=19  rss=21
+    //   (proc(5), fields 9/14/15/22/24)
+    constexpr std::size_t kFlags = 6, kUtime = 11, kStime = 12, kStartTime = 19, kRss = 21;
     constexpr std::size_t kNeed = kRss + 1;
     const auto is_field_ws = [](char c) {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -290,11 +301,12 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
         const auto [p, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
         return (ec == std::errc{} && p == t.data() + t.size()) ? std::optional{v} : std::nullopt;
     };
+    const auto flags = parse_num(tok[kFlags], std::uint64_t{});
     const auto utime = parse_num(tok[kUtime], std::uint64_t{});
     const auto stime = parse_num(tok[kStime], std::uint64_t{});
     const auto starttime = parse_num(tok[kStartTime], std::uint64_t{});
     const auto rss = parse_num(tok[kRss], std::int64_t{});
-    if (!utime || !stime || !starttime || !rss)
+    if (!flags || !utime || !stime || !starttime || !rss)
         return std::nullopt;
 
     ProcCounter p;
@@ -304,6 +316,10 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
     // process_live name join, and scrubs ill-formed UTF-8. derive_proc_samples
     // matches operator redaction patterns in this SAME sanitized space.
     p.name = sanitize_comm(stat_content.substr(open + 1, close - open - 1));
+    // Flag-derived, not name-derived — see tar_proc_perf.hpp's "Kernel-thread
+    // marker" note on why a name pattern is trivially spoofable in either
+    // direction (prctl(PR_SET_NAME)) and this bit is not.
+    p.is_kthread = (*flags & kPfKthreadFlag) != 0;
     // Ticks → 100 ns: ×1e7/clk_tck, multiply first (a real kernel needs ~570
     // CPU-years of jiffies to overflow; a forged /proc value is caught by the
     // saturating multiply). Keeps derive_proc_samples' capacity denominator
@@ -529,6 +545,11 @@ ProcSnapshot read_proc_counters() {
                 p.name = sanitize_comm(ucs_to_utf8(e->ImageName));
             if (p.name.empty() && pid == 4)
                 p.name = "System"; // the kernel: real working set, no image name
+            if (pid == 4)
+                // Windows' kernel-process analog — see tar_proc_perf.hpp's
+                // "Kernel-thread marker" note. Set independent of the name
+                // branch above (pid is the authoritative identity either way).
+                p.is_kthread = true;
             snap.procs.push_back(std::move(p));
         }
         if (e->NextEntryOffset == 0)

@@ -42,6 +42,10 @@ spec:
     columns:
       - name: output
         type: string
+        description: >-
+          One streamed line: an RFC 864 line (72 rotating printable ASCII characters, offset one position from the previous line), or the literal "chargen session ended" on the final line once the session stops. Values: free text — RFC 864 line, or the literal chargen session ended.
+        example: ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefg'
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Start chargen (rate={{rate_ms}}ms)"
 
@@ -49,7 +53,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -91,6 +95,10 @@ spec:
     columns:
       - name: output
         type: string
+        description: >-
+          Confirmation message sent once every running chargen session has been signalled to stop. Values: free text — the literal chargen stopped.
+        example: "chargen stopped"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Stop chargen"
 

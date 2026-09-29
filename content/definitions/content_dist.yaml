@@ -24,18 +24,43 @@ spec:
       url:
         type: string
         displayName: URL
+        description: >
+          Source URL, e.g. https://cdn.example.com/pkg-1.2.3.msi. Must start
+          with http:// or https://; downloaded directly over a socket the
+          agent opens itself, never via a shell command.
       filename:
         type: string
         displayName: Filename
+        description: >
+          Destination filename inside the agent's staging directory, e.g.
+          pkg-1.2.3.msi. Alphanumeric, dots, hyphens, and underscores only
+          (no path separators or ".."); any other character is refused.
       sha256:
         type: string
         displayName: Expected SHA256
+        description: >
+          Lowercase hex SHA-256 the downloaded file must hash to, e.g.
+          "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3...". A mismatch deletes
+          the downloaded file and fails the action; the verified hash is what
+          execute_staged later re-checks from agent KV, not this parameter.
   result:
     columns:
       - name: status
         type: string
+        description: >
+          Literal "ok" on a verified download. content_dist never writes
+          "status|error" — a failure instead replaces this whole line with a
+          single unstructured "error|<message>" line, so a failed stage never
+          populates this column at all.
+        values: [ok]
+        example: ok
+        platforms: [windows, linux, darwin]
       - name: staged_path
         type: string
+        description: >-
+          Absolute filesystem path of the downloaded, hash-verified file under the agent's staging directory (content_dist_plugin.cpp's staging_dir(): <agent.data_dir>/staged, or a temp-dir fallback). Only present on success — no captured sample shows a populated value. Values: absolute path.
+        example: "-"
+        platforms: [windows, linux, darwin]
   approval:
     mode: role-gated
   permissions:
@@ -71,17 +96,42 @@ spec:
       filename:
         type: string
         displayName: Filename
+        description: >
+          Name of a previously staged file, e.g. pkg-1.2.3.msi. Must already
+          have a verified hash on record from a prior stage action (agent KV
+          key staged_hash:<filename>) — the hash is re-verified against that
+          record, not against this parameter, before anything runs.
       args:
         type: string
         displayName: Arguments
+        description: >
+          Optional whitespace-separated argv tail, e.g. "/quiet /norestart".
+          Never shell-parsed (no quoting/escaping); rejected outright if it
+          contains a shell metacharacter such as ; | & ` $ ( ) { } < >.
   result:
     columns:
       - name: status
         type: string
+        description: >
+          "ok" when the staged file exited 0, "error" for any nonzero exit,
+          spawn failure, or a deadline/cancel kill. On an early rejection
+          (not staged, no trusted hash, hash mismatch, unsafe args) this
+          column is never emitted at all — only an "error|<message>" line is.
+        values: [ok, error]
+        example: ok
+        platforms: [windows, linux, darwin]
       - name: exit_code
         type: int32
+        description: >-
+          The staged process's exit code, or -1 for a spawn failure or a deadline/cancel kill (subprocess_runner's sentinel, never a real process exit status in that case). Values: process exit code, or -1.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: output
         type: string
+        description: >-
+          Combined stdout+stderr, capped at 16 MiB, with a "[output truncated at 16 MiB]" and/or "[terminated: deadline exceeded]"/"[terminated: cancelled]" annotation appended when applicable. Omitted entirely (no output| line at all) when the captured text is empty. Values: free text, truncated/terminated annotations, or omitted.
+        example: "-"
+        platforms: [windows, linux, darwin]
   approval:
     mode: role-gated
   permissions:
@@ -117,10 +167,21 @@ spec:
     columns:
       - name: file
         type: string
+        description: >-
+          Filename of one staged file (relative, no path). One row per file in the staging directory; a "count|<n>" summary line follows the last row and is not itself a declared column. An empty directory emits zero rows and count|0, never an error. Values: free text.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: size
         type: int64
+        description: 'File size in bytes, from std::filesystem::file_size. Values: non-negative integer.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: sha256
         type: string
+        description: >-
+          Lowercase hex SHA-256 of the file's current on-disk contents, recomputed on every list_staged call (not cached from stage time). Values: 64 lowercase hex characters.
+        example: "-"
+        platforms: [windows, linux, darwin]
   approval:
     mode: auto
   permissions:
@@ -140,9 +201,13 @@ metadata:
   displayName: Cleanup Staged Files
   version: 1.0.0
   description: >
-    Remove one or all files from the agent's staging directory. If a filename
-    is specified, only that file is removed. If no filename is given, all
-    staged files are removed.
+    Remove staged files older than an age cutoff (default 24 hours) from the
+    agent's staging directory, evicting each removed file's KV-recorded hash
+    alongside it. NOTE: content_dist_plugin.cpp's do_cleanup reads only an
+    "hours" value (undeclared below) to pick the cutoff — it never reads the
+    filename parameter this definition declares, so a per-file targeted
+    removal is not implemented today; see the plugin README's Caveats
+    section.
   tags: [content, staging, cleanup]
 spec:
   type: action
@@ -157,13 +222,29 @@ spec:
       filename:
         type: string
         displayName: Filename
-        description: Specific file to remove. Omit to clear all staged files.
+        description: >
+          Declared but NOT read by the current implementation
+          (content_dist_plugin.cpp's do_cleanup only reads "hours") — setting
+          this parameter has no effect on which files are removed. Left in
+          place for API compatibility; see the plugin README's Caveats
+          section.
   result:
     columns:
       - name: status
         type: string
+        description: >
+          Declared but never emitted — do_cleanup writes only a
+          "removed|<n>" line, no "status|" line at all, on every run
+          (including a hours-parse failure, which is silently ignored rather
+          than reported).
+        example: "-"
+        platforms: []
       - name: files_removed
         type: int32
+        description: >-
+          Declared column name does not match the wire field: the actual emitted line is "removed|<n>", not "files_removed|<n>" — the count of files whose last-write time was older than the cutoff. Values: non-negative integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
   approval:
     mode: role-gated
   permissions:

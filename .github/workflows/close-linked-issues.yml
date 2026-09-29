@@ -1,0 +1,204 @@
+name: Close Linked Issues
+
+# ADR-3001 pillar 2 (as amended by A1 §3): make `Closes #N` actually work on a
+# repo whose integration branch (`dev`) is not the default branch. On every
+# push to dev, resolve the PRs that push merged, parse their BODIES with the
+# single grammar implementation (scripts/tracker/closing_refs.py), and close
+# the claimed issues as `completed` with a self-identifying evidence comment.
+#
+# Trigger is `push:`, NOT `pull_request [closed]`, deliberately: a
+# pull_request run for a fork/Dependabot PR gets a read-only GITHUB_TOKEN
+# (permissions: can only reduce, never elevate), so the close job would 403
+# and the alert job that reports failures would 403 in the same breath.
+# `push:` to dev is a trusted event with a full token regardless of where the
+# merged PR came from, and the PR body reaches the parser via an API fetch --
+# no attacker-controlled event payload ever crosses a YAML interpolation.
+#
+# NO `paths:` filter, ever: the control-plane guard in zizmor.yml fails any PR
+# that adds one (a filtered close workflow silently stops closing).
+#
+# Never-close rules (issue-standard.md §5.1) are enforced in the driver, which
+# FAILS CLOSED if scripts/tracker/do-not-close.txt is missing. MERGE ORDER IS
+# A HARD REQUIREMENT: land #2168 (which introduces that file) FIRST. Merging
+# this workflow early is safe but LOUD, not silent -- the workflow runs on the
+# very push that merges it, exits 3 on the missing list, and opens an
+# automation-broken issue on every subsequent push until the list lands; the
+# skipped ranges are then recovered by re-running the failed runs.
+#
+# Liveness is three mechanisms (A1 §11), not this file's alert job alone:
+# the `if: failure()` alert (execution failures, below), the per-push leak
+# scan step (completeness), and the frozen parser fixture corpus in tests/.
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: close-linked-issues-${{ github.ref }}
+  # Never cancel a close run mid-batch: a cancelled half-applied batch is
+  # exactly the state the idempotency markers exist to avoid creating twice.
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: Close linked issues on dev merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # issues:write -- this job's entire purpose: close/comment/label the
+      # issues that merged PRs claim.
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Close issues claimed by the PRs this push merged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python3 scripts/tracker/close_linked_issues.py --push "$BEFORE" "$AFTER" --execute
+
+      # Completeness backstop (A1 §11): claimed-but-open issues with no marker
+      # and no never-close protection mean an earlier run failed silently --
+      # fail this run so the alert job fires. Applies the identical cap rule
+      # as the close path, so the two can never contradict each other.
+      - name: Leak scan (last 50 merged PRs)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          python3 scripts/tracker/close_linked_issues.py --leak-scan
+
+  # ── Alert on failure ────────────────────────────────────────────────────
+  # The nightly-broken pattern from nightly.yml: open or update an
+  # `automation-broken` issue. This signals EXECUTION failures only -- it
+  # cannot fire on a run that never happens, which is why the leak scan and
+  # the fixture corpus exist (A1 §11). Body is a non-sensitive summary only:
+  # workflow name + run URL, never logs or step output.
+  alert:
+    name: "Open automation-broken on failure"
+    needs: [close]
+    # cancelled() too: with cancel-in-progress:false GitHub still evicts a
+    # QUEUED run when a third push arrives -- an evicted range must alert
+    # (the nightly TSan implicit-success() trap, #1038, same class).
+    if: failure() || cancelled()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # issues:write -- opens/updates the automation-broken alert issue.
+      issues: write
+    steps:
+      - name: Open or update automation-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'automation-broken';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            // before/after are platform-controlled SHAs (same safety class as
+            // run_id) -- they identify the affected range, which is exactly
+            // what a re-run or --undo-push needs.
+            const body = [
+              `The close-linked-issues automation failed on a push to \`dev\`.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              `**Range:** \`${{ github.event.before }}\`..\`${{ github.event.after }}\``,
+              ``,
+              `Until this is fixed, merged PRs' \`Closes #N\` declarations are NOT`,
+              `being applied -- close the affected issues by hand or re-run the`,
+              `workflow after fixing. (auto-posted by`,
+              `.github/workflows/close-linked-issues.yml -- close after a green run.)`,
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 5,
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+              core.notice(`Commented on existing automation-broken issue #${existing.data[0].number}`);
+            } else {
+              // Tolerate the label not existing yet (A1 §7: an early merge
+              // cannot fail the alert): create bare, then label best-effort.
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Tracker automation broken: close-linked-issues failed',
+                body,
+              });
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: created.data.number,
+                  labels: [label, 'P1'],
+                });
+              } catch (e) {
+                core.notice(`Could not label #${created.data.number}: ${e.message}`);
+              }
+              core.notice(`Opened automation-broken issue #${created.data.number}`);
+            }
+
+  # Symmetric close-on-green (the nightly.yml pattern): a green close run
+  # clears any open automation-broken issue so the alert self-heals.
+  close-on-green:
+    name: "Close automation-broken on green"
+    needs: [close]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # issues:write -- closes the automation-broken issue after a green run.
+      issues: write
+    steps:
+      - name: Close any open automation-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'automation-broken';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+            if (open.data.length === 0) {
+              core.notice('No open automation-broken issues to close.');
+              return;
+            }
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `close-linked-issues ran green: ${runUrl} -- closing. (auto-posted)`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed automation-broken issue #${issue.number}`);
+            }

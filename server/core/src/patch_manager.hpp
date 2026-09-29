@@ -1,17 +1,49 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file patch_manager.hpp
+/// Postgres-backed OS-patch inventory + deployment-orchestration store
+/// (ADR-0006/0009/0062). Schema `patch_manager`, three tables
+/// (`patch_inventory`, `patch_deployments`, `patch_deployment_targets` —
+/// the last FK-cascaded on `patch_deployments`).
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE/fail-hard construction — a
+/// reachable database whose schema can't migrate/open is a fatal startup
+/// error (`startup_failed_`), a posture UPGRADE from the SQLite era (where
+/// construction was unconditional/best-effort and `is_open()` was never
+/// even checked by any caller). Runtime reads/writes keep their
+/// pre-migration plain-container/`std::expected<std::string,std::string>`
+/// shapes — this store has exactly one external consumer surface
+/// (`DiscoveryRoutes`' `/api/patches/*`, no MCP), and its call sites are
+/// unaffected by this migration by design.
+///
+/// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment —
+/// no production fleet has ever run a pre-Postgres build of any Yuzu
+/// store). The legacy `patches.db` is never read for data; construction
+/// logs a one-time "fresh start, no legacy backfill" line, and the caller
+/// (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()` over
+/// the legacy file so an environment where "no production fleet" turns out
+/// to be locally wrong gets a loud signal instead of silent loss.
+///
+/// `execute_deployment()` (+ its `PatchDispatchFn`/`AgentOsLookupFn`
+/// callback types) is REMOVED in this migration — it had zero production
+/// callers on `dev` (nothing wires a dispatch/os-lookup callback to it),
+/// see ADR-0062 "Deleted: execute_deployment" for the rationale and the
+/// tracking issue for its tested-but-unwired reboot-orchestration
+/// behaviour.
 
-#include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
-#include <functional>
-#include <map>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <vector>
+
+namespace yuzu::server::pg {
+class PgPool;
+} // namespace yuzu::server::pg
+
+namespace yuzu {
+class MetricsRegistry;
+} // namespace yuzu
 
 namespace yuzu::server {
 
@@ -73,18 +105,6 @@ struct PatchQuery {
     int limit{100};
 };
 
-// ── Dispatch callback types ─────────────────────────────────────────────────
-// The patch manager invokes these callbacks to dispatch instructions to agents.
-// Returns a JSON result string on success, or an error string on failure.
-
-using PatchDispatchFn = std::function<std::expected<std::string, std::string>(
-    const std::string& instruction_id,
-    const std::string& agent_id,
-    const std::string& parameters_json)>;
-
-// Returns the OS string ("windows", "linux", "darwin") for an agent.
-using AgentOsLookupFn = std::function<std::string(const std::string& agent_id)>;
-
 /// Request struct for creating a patch deployment.
 struct DeploymentRequest {
     std::string kb_id;                      // KB identifier (e.g., "KB5034441")
@@ -99,17 +119,26 @@ struct DeploymentRequest {
 
 class PatchManager {
 public:
-    explicit PatchManager(const std::filesystem::path& db_path);
-    ~PatchManager();
+    explicit PatchManager(pg::PgPool& pool);
 
     PatchManager(const PatchManager&) = delete;
     PatchManager& operator=(const PatchManager&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Wire a metrics sink for write-outcome counters
+    /// (`yuzu_server_patch_manager_writes_total{op,result}` — `op` one of
+    /// `record_patches`/`deploy_patch`/`cancel_deployment`, `result` one of
+    /// `success`/`failed`; pre-seeded at boot so a rate can be computed
+    /// from the first request, not just from the first failure). Set-
+    /// before-traffic contract, same as every other metrics-emitting store.
+    void set_metrics(yuzu::MetricsRegistry* metrics) noexcept { metrics_ = metrics; }
 
     // ── Patch inventory ─────────────────────────────────────────────────
 
     /// Record patches reported by an agent (called when scan results come in).
+    /// One transaction for the whole batch (translated 1:1 from the
+    /// SQLite-era explicit BEGIN/COMMIT around this same loop).
     void record_patches(const std::string& agent_id,
                         const std::vector<PatchInfo>& patches);
 
@@ -124,8 +153,12 @@ public:
 
     // ── Deployment ──────────────────────────────────────────────────────
 
-    /// Create a new patch deployment targeting specific agents.
-    /// The deployment orchestrates: scan -> download -> install -> verify -> reboot.
+    /// Create a new patch deployment targeting specific agents. The
+    /// deployment row + its per-target rows are inserted in ONE
+    /// transaction — new atomicity added by this migration; the SQLite era
+    /// inserted the deployment row and target rows unprotected (see
+    /// ADR-0062 for why, and for the caller-supplied-duplicate-agent-id
+    /// de-dup this atomicity required).
     std::expected<std::string, std::string>
     deploy_patch(const DeploymentRequest& req);
 
@@ -137,14 +170,6 @@ public:
                  const std::string& created_by,
                  int reboot_delay_seconds = 300,
                  int64_t reboot_at = 0);
-
-    /// Execute the deployment workflow using the provided dispatch callback.
-    /// This runs through the steps: check -> install -> verify -> reboot for each target.
-    /// If os_lookup is provided, the reboot command is adapted for the agent's OS.
-    std::expected<void, std::string>
-    execute_deployment(const std::string& deployment_id,
-                       PatchDispatchFn dispatch_fn,
-                       AgentOsLookupFn os_lookup = {});
 
     /// Get deployment details including per-target status.
     std::optional<PatchDeployment> get_deployment(const std::string& id) const;
@@ -162,15 +187,12 @@ public:
                               const std::string& error = {});
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::shared_mutex mtx_;
+    pg::PgPool& pool_;
+    bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
-    void create_tables();
     std::string generate_id() const;
 
-    // Internal helpers
-    void update_deployment_status(const std::string& id, const std::string& status);
-    void recalculate_deployment_progress(const std::string& id);
     std::vector<PatchInfo> query_patches(const PatchQuery& query,
                                           const std::string& status_filter) const;
 };

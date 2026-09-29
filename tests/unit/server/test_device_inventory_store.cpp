@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,16 @@ using yuzu::server::pg::PgPool;
 namespace agentpb = yuzu::agent::v1;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
+// store-behaviour test clones an already-migrated database instead of
+// re-running the migrations.
+yuzu::test::PgTestTemplate device_ci_tpl{"device_ci", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    DeviceInventoryStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("device_ci template: store failed to migrate");
+}};
+
 // THE cross-side pins (ADR-0016 §4): the agent computes the SAME hash for the SAME
 // record (tests/unit/test_device_ci_sync.cpp — identical constants). A one-byte
 // drift in either canonicalisation fails one assertion.
@@ -156,7 +167,7 @@ TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device
 }
 
 TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeviceInventoryStore store{pool};
@@ -249,7 +260,7 @@ TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]")
                 found = true;
         CHECK(found);
 
-        store.delete_agent("agent-d");
+        CHECK(store.delete_agent("agent-d")); // committed → true
         auto gone = store.get_device_ci("agent-d");
         REQUIRE(gone.has_value());  // read succeeded
         CHECK(!gone->has_value());  // absent
@@ -263,7 +274,7 @@ TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]")
 }
 
 TEST_CASE("ingest_device_ci_report end-to-end (all wire shapes)", "[pg][device_ci][ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     DeviceInventoryStore store{pool};

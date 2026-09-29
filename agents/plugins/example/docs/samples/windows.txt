@@ -1,0 +1,9 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 23dda8161132
+== action=ping
+pong
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=echo
+echo: (no message)
+[result_status] UNDECLARED / UNKNOWN / 
+

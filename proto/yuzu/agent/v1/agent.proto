@@ -185,6 +185,29 @@ message CommandRequest {
   // nonetheless copies `payload` now so it cannot become a strip point if reused.)
   // See docs/guardian-mvp-contract.md G2/G12.
   bytes payload = 8;
+
+  // Dispatch classification tag for this command, computed and frozen by
+  // command_capability_parsers.hpp (server/core/src/command_capability_parsers.hpp):
+  // encode_dispatch_tag/decode_dispatch_tag produce and parse EXACTLY
+  //   v1|<class>|<mutability>|<plan_hash_hex>
+  // with class in {ro, mut, dest} and mutability in {none, rev, irrev}. One
+  // opaque string, not three fields, so a future dispatch class costs no
+  // proto churn — this grammar is frozen; do not encode/decode it anywhere
+  // else with a different format.
+  // GATEWAY: this field IS mirrored into the gateway's vendored agent.proto
+  // (gateway/priv/proto/agent.proto AND
+  // gateway/priv/proto/yuzu/agent/v1/agent.proto, agent_pb.erl regenerated)
+  // and the gateway forwards the decoded CommandRequest straight through
+  // gpb. gpb 4.21.7 has no preserve_unknown_fields — it DROPS any field
+  // absent from its own copy of the message, so a missing mirror silently
+  // strips the tag and the server-side dispatch chokepoint sees an
+  // agent-side default-empty string instead of the real classification.
+  // CC-03: the server refuses to route a tagged CommandRequest through a
+  // gateway whose most recent StreamStatusNotification.wire_capabilities
+  // (proto/yuzu/gateway/v1/gateway.proto) does not advertise the literal
+  // "command_dispatch_tag_v1" — that capability is this gateway's proof it
+  // carries this field end-to-end.
+  string dispatch_tag = 9;
 }
 
 message CommandResponse {
@@ -214,6 +237,23 @@ message CommandResponse {
   string plugin  = 7;
   string action  = 8;
   bytes  payload = 9;
+
+  // CC-07 plugin→host typed result-status seam (ABI4, sdk/include/yuzu/plugin.h).
+  // Populated from the agent-side YuzuResultStatus the plugin reports via
+  // yuzu_ctx_set_result_status() during execute(); PLUGIN_RESULT_UNDECLARED
+  // (the zero value) means the plugin never called it — either an ABI<4
+  // plugin (int-only execute()) or an ABI4 plugin that didn't report a typed
+  // status for this call. This is the plugin→host CC-07 status ONLY; it is
+  // NOT the subprocess-runner termination-reason enum (a separate, later,
+  // out-of-scope-for-this-PR concept) and carries no mapping to it.
+  enum PluginResultStatus {
+    PLUGIN_RESULT_UNDECLARED        = 0;
+    PLUGIN_RESULT_OK                = 1;
+    PLUGIN_RESULT_UNAVAILABLE       = 2;
+    PLUGIN_RESULT_PERMISSION_DENIED = 3;
+    PLUGIN_RESULT_CONSTRAINED       = 4;
+  }
+  PluginResultStatus plugin_result_status = 10;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
@@ -270,6 +310,24 @@ message CheckForUpdateResponse {
   bool   mandatory        = 4;  // If true, agent must update immediately
   bool   eligible         = 5;  // Rollout eligibility for this agent
   int64  file_size        = 6;  // Binary size in bytes
+
+  // Detached PEM CMS signature over the binary's bytes (#416/#3807).
+  //
+  // The SHA-256 above is an INTEGRITY check only: the server supplies it over
+  // the same channel that serves the binary, so anything able to substitute the
+  // binary can substitute the hash beside it. This field carries authenticity
+  // instead — it is produced by whoever built and signed the package, and the
+  // agent verifies it against a trust bundle placed on disk at install time,
+  // out of band of this channel. The server never signs and is not trusted to.
+  //
+  // Empty when the operator has not signed the package. A new agent with
+  // --update-require-signature refuses such a package; without that flag it
+  // warns and proceeds, which is the transitional mode. An OLD agent ignores
+  // this field entirely (proto3 preserves unknown fields rather than failing on
+  // them), which is why the signature is carried here rather than by changing
+  // DownloadUpdateChunk's framing — that would have broken every agent already
+  // in the field.
+  bytes  update_signature = 7;
 }
 
 message DownloadUpdateRequest {

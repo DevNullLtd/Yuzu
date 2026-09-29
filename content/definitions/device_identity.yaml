@@ -31,6 +31,9 @@ spec:
     columns:
       - name: device_name
         type: string
+        description: "The device's hostname as reported by the OS. Values: free text."
+        example: "DESKTOP-04DNSIG"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get device hostname"
 
@@ -61,8 +64,11 @@ metadata:
   description: >
     Returns the DNS or Active Directory domain name and whether the
     device is domain-joined. On Windows, uses NetGetJoinInformation. On
-    Linux, reads /etc/resolv.conf and checks realm/sssd for AD join
-    status. On macOS, uses dsconfigad -show with hostname -f fallback.
+    Linux, reads /etc/resolv.conf for the DNS domain and checks AD-join
+    status via sssd's D-Bus InfoPipe, falling back to `realm list` and
+    then /etc/sssd/sssd.conf. On macOS, runs `dsconfigad -show`, falling
+    back to a native gethostname()+getaddrinfo(AI_CANONNAME) lookup if
+    the device is not AD-bound.
   tags: [identity, inventory, directory]
 
 spec:
@@ -82,8 +88,14 @@ spec:
     columns:
       - name: domain
         type: string
+        description: 'The DNS or Active Directory domain name the device reports, or "N/A" if none was found. Values: free text (or the literal "N/A").'
+        example: "WORKGROUP"
+        platforms: [windows, linux, darwin]
       - name: joined
         type: bool
+        description: Whether the device is currently joined to a domain or realm.
+        example: "false"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get domain membership"
 
@@ -136,6 +148,9 @@ spec:
     columns:
       - name: ou
         type: string
+        description: 'The Active Directory organizational unit distinguished-name path, or "N/A" if the device is not domain-joined or the OU could not be read. Values: free text (AD DN fragment) or the literal "N/A".'
+        example: "N/A"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get Active Directory organizational unit"
 

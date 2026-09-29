@@ -36,7 +36,10 @@ class TempPipe {
 public:
     explicit TempPipe(std::string_view content)
         : path_(yuzu::test::unique_temp_path("dex-journal-pipe-")) {
-        f_ = std::fopen(path_.string().c_str(), "w+b");
+        // "x" = C11 exclusive create: fails if path_ already exists, closing the
+        // symlink-preplant/TOCTOU window a plain "w" leaves open on a
+        // shared-identity CI box (CodeQL cpp/world-writable-file-creation #5084).
+        f_ = std::fopen(path_.string().c_str(), "w+bx");
         if (f_ && !content.empty()) {
             std::fwrite(content.data(), 1, content.size(), f_);
             std::rewind(f_);

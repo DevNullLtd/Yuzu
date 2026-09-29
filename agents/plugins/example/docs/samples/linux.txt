@@ -1,0 +1,9 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 23dda8161132
+== action=ping
+pong
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=echo
+echo: (no message)
+[result_status] UNDECLARED / UNKNOWN / 
+

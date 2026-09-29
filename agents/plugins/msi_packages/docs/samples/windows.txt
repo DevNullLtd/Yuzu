@@ -1,0 +1,281 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash ece0243d8d74
+== action=list
+msi|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|-
+msi|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|-
+msi|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput|3.3.221.0|-
+msi|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)|8.94.0.0|-
+msi|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|-
+msi|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|-
+msi|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64|10.1.26100.7705|-
+msi|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64|10.1.26100.7705|-
+msi|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247|14.51.36247|-
+msi|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64|10.1.26100.7705|-
+msi|{1D8E6291-B0D5-35EC-8441-6616F567A0F7}|Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219|10.0.40219|-
+msi|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components|10.1.26100.7705|-
+msi|{ad8a2fa1-06e7-4b0d-927d-6e54b3d31028}|Microsoft Visual C++ 2005 Redistributable (x64)|8.0.61000|-
+msi|{8122DAB1-ED4D-3676-BB0A-CA368196543E}|Microsoft Visual C++ 2013 x86 Minimum Runtime - 12.0.40664|12.0.40664|-
+msi|{AA86DFC1-17A2-6133-1D55-92818B9D3082}|SDK ARM64 Redistributables|10.1.26100.7705|-
+msi|{F0C3E5D1-1ADE-321E-8167-68EF0DE699A5}|Microsoft Visual C++ 2010  x86 Redistributable - 10.0.40219|10.0.40219|-
+msi|{B817BAD1-CC9F-940C-FFD8-7543D89B8EB7}|Windows App Certification Kit x64 (OnecoreUAP)|10.1.26100.7705|-
+msi|{F9DDDEF1-BCF0-275F-DE29-9332F1149B79}|Windows SDK Signing Tools|10.1.26100.7705|-
+msi|{9EE92E02-FA29-DF43-7E45-A256139DEBE4}|Windows SDK Desktop Libs x86|10.1.26100.7705|-
+msi|{6C7D0172-7367-4F0C-95DB-6021765B58EA}|vs_filehandler_x86|17.14.36024|-
+msi|{E43BDB72-464A-290B-A51D-537CBBE1CAC8}|Windows App Certification Kit SupportedApiList x86|10.1.26100.7705|-
+msi|{BC104582-4691-4D4C-8922-C215D941A2EB}|Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211|14.44.35211|-
+msi|{13D2A7A2-1B42-4C03-8F0F-697991259AEE}|Windows SDK AddOn|10.1.0.0|-
+msi|{CCEEC7A2-2179-C5D0-60E2-2651993A8AD5}|Windows SDK Desktop Headers x64|10.1.26100.7705|-
+msi|{368E4D03-5983-1C2C-B42E-1C0C51A935A5}|Universal CRT Redistributable|10.1.26100.7705|-
+msi|{91306123-946D-452F-3206-A8AB9F8293D6}|WinRT Intellisense PPI - en-us|10.1.26100.7705|-
+msi|{F4F63553-2774-41A6-C784-7FAC7DF4CAF3}|Windows Desktop Extension SDK Contracts|10.1.26100.7705|-
+msi|{EB8B0E53-980A-E861-DC85-05240EFA888D}|WinRT Intellisense IoT - en-us|10.1.26100.7705|-
+msi|{F5796163-6EC6-488A-B2DE-E1E94477F6AD}|VS Script Debugging Common|17.0.157.0|-
+msi|{D75B3C63-F3BB-5EC1-45A7-15C00BBB9D3F}|Application Verifier x64 External Package (DesktopEditions)|10.1.26100.7705|-
+msi|{1F507473-1077-3AB8-2E11-C839AE4E27B8}|Windows Team Extension SDK|10.1.26100.7705|-
+msi|{9A2FEE83-D2FB-A48E-52E0-15801042220F}|Windows Team Extension SDK Contracts|10.1.26100.7705|-
+msi|{06671634-35F4-43F1-1B57-68B7CE54E5B3}|MSI Development Tools|10.1.26100.7705|-
+msi|{53CF6934-A98D-3D84-9146-FC4EDF3D5641}|Microsoft Visual C++ 2013 x64 Minimum Runtime - 12.0.40664|12.0.40664|-
+msi|{EA88E7B4-C204-CC0C-FC10-D13FC9C30800}|WinRT Intellisense Desktop - Other Languages|10.1.26100.7705|-
+msi|{96B30005-C36E-07FF-DF27-EEB8199694CD}|Windows SDK Redistributables|10.1.26100.7705|-
+msi|{A39D4115-3A27-4245-AE92-3214B8B21932}|Microsoft Windows Desktop Runtime - 6.0.11 (x64)|48.47.50419|-
+msi|{4C150435-9153-456C-C0BE-497D89513B18}|Windows SDK for Windows Store Apps Tools|10.1.26100.7705|-
+msi|{C7F2EF85-ACD3-0480-6BC2-0C3B45A8F1C1}|Universal CRT Tools x64|10.1.26100.7705|-
+msi|{2CAA22A5-36FE-21B0-5A67-3BE172FEFF12}|Windows SDK for Windows Store Apps Libs|10.1.26100.7705|-
+msi|{5C8B4DA5-62C6-8D4A-F21A-AD4D66FCA8D9}|WinRT Intellisense UAP - en-us|10.1.26100.7705|-
+msi|{243EC516-9B7D-4F3D-BD71-D2FD44EF63D6}|Microsoft Windows Desktop Runtime - 8.0.28 (x86)|64.112.53617|-
+msi|{B4B3AA16-E828-4577-A9F2-629E1A95FE4A}|vs_vswebprotocolselectormsi|17.14.36323|-
+msi|{A2FDDC26-4232-4287-8839-2F53A01E1E97}|vs_minshellinteropmsi|17.14.36015|-
+msi|{B637A6A6-5591-4503-AFD8-776164EB837A}|Windows Subsystem for Linux|2.6.3.0|-
+msi|{26BD6DC6-3F0F-4C17-A78C-5D06459F39C0}|Windows SDK Modern Non-Versioned Developer Tools|10.1.26100.7705|-
+msi|{97DEC5D6-2BE9-45BB-BFC5-274B851B486B}|NordVPN network TAP|1.0.1|C:\Program Files (x86)\NordVPN network TAP\
+msi|{F251EBD6-9B8C-3876-A422-B4F677BF3766}|Windows SDK Modern Versioned Developer Tools|10.1.26100.7705|-
+msi|{71498EE6-F94E-4061-9DD5-55925CA8A74F}|vs_communitysharedmsi|17.14.36025|-
+msi|{43506B27-889E-2F0F-F8BE-4AEBE7CC9249}|Kits Configuration Installer|10.1.26100.7705|-
+msi|{8FCD1D57-2245-3417-9DDD-8F1CCF99976D}|Microsoft Edge|152.0.4191.66|-
+msi|{B5534577-4F61-73AC-FFCB-91B0B0674DA4}|Windows SDK for Windows Store Apps Headers|10.1.26100.7705|-
+msi|{37B8F9C7-03FB-3253-8781-2517C99D7C00}|Microsoft Visual C++ 2012 x64 Additional Runtime - 11.0.61030|11.0.61030|-
+msi|{FB7C4DC7-7641-04B7-6639-589757B86783}|Windows SDK DirectX x64 Remote|10.1.26100.7705|-
+msi|{4D8C14D7-C036-33F2-EFA7-C5CC5F73932B}|Windows SDK for Windows Store Managed Apps Libs|10.1.26100.7705|-
+msi|{CFEF5BD7-A03F-DEF3-1707-A31C813F6D14}|WinAppDeploy|10.1.26100.7705|-
+msi|{CB91C4E7-9C14-6ABD-566B-DF4593456102}|Windows SDK for Windows Store Apps Headers OnecoreUap|10.1.26100.7705|-
+msi|{D331F4E7-BC3B-47BE-BB56-5F33895F9347}|vs_FileTracker_Singleton|17.14.36015|-
+msi|{C7FC6DE7-5C06-4311-837A-E0D774618D17}|vcpp_crt.redist.clickonce|14.44.35211|-
+msi|{6798C408-2636-448C-8AC6-F4E341102D27}|Windows PC Health Check|3.6.2204.08001|-
+msi|{2C37C218-88FF-9E58-0151-1AF693535792}|Windows SDK Desktop Libs arm64|10.1.26100.7705|-
+msi|{4BF7CE18-E151-449F-9190-6CDBED0BB4A2}|Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.51.36247|14.51.36247|-
+msi|{BD0E4F38-D3F6-452D-A32E-B14D721839AC}|NordVPN network TUN|1.0.1|C:\Program Files\NordVPN network TUN\
+msi|{C3DD1448-513A-4DB8-978D-6991562EA63D}|Microsoft .NET Runtime - 6.0.11 (x64)|48.47.50420|-
+msi|{EC049978-2176-47C6-B99B-2C64AD6F6828}|vs_minshellmsires|17.14.36015|-
+msi|{226CEF88-E174-49A6-865C-874A7B7F86F3}|Logi Plugin Service|6.4.0.3079|-
+msi|{9D9075A8-069B-452D-9D4A-66A89D01C1A7}|Microsoft .NET Host - 8.0.28 (x86)|64.112.53549|-
+msi|{537F07C8-0EC6-41A5-BB91-750FA3CAA110}|vs_minshellinteropsharedmsi|17.14.36015|-
+msi|{F6E69DD8-7652-4CC6-8A4F-485A16012B5B}|vs_minshellsharedmsi|17.14.36024|-
+msi|{7C1561F8-C963-0AC7-21BD-EA4DD9633C50}|Windows SDK Desktop Tools arm64|10.1.26100.7705|-
+msi|{22EE1419-B47E-44B8-A635-868746946079}|vs_filehandler_amd64|17.14.36024|-
+msi|{582BA719-E6F1-4651-A873-049E6A0DDDAF}|Microsoft Visual C++ 2022 X86 Additional Runtime - 14.51.36247|14.51.36247|-
+msi|{A92DAB39-4E2C-4304-9AB6-BC44E68B55E2}|Google Update Helper|1.3.101.0|-
+msi|{FE85AA49-3522-4663-9F52-9CD9E9837189}|Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211|14.44.35211|-
+msi|{A224D569-B07A-8178-A1E4-75DC397C06B2}|Windows SDK|10.1.26100.7705|-
+msi|{601DDF69-FCF4-F568-946A-C17046C946E4}|Application Verifier x64 External Package (OnecoreUAP)|10.1.26100.7705|-
+msi|{9AC08E99-230B-47e8-9721-4577B7F124EA}|-|-|-
+msi|{6E4984A9-4321-4D96-861F-D03578E68C8B}|Microsoft .NET Runtime - 6.0.20 (x86)|48.83.63169|-
+msi|{FEC52FA9-A866-C884-4AAA-0B15BE793610}|Universal CRT Tools x86|10.1.26100.7705|-
+msi|{A27B17B9-90C8-4B07-83C6-1303FC186B6B}|PlayStation? Accessories|2.0.0.13|C:\Program Files\Sony\PlayStationAccessories\
+msi|{EB362CC9-F0B3-EDBC-82E8-91F6BBF36F6E}|Windows SDK Desktop Tools x64|10.1.26100.7705|-
+msi|{E93670D9-924A-7B6F-5F55-AE8E3043BCB0}|SDK ARM64 Additions|10.1.26100.7705|-
+msi|{B92B890A-04F2-4880-BA20-20D4364FB263}|Microsoft .NET Host - 6.0.11 (x64)|48.47.50420|-
+msi|{A056CA2A-2AB1-EB1B-1B2E-D49E0C6C8E17}|Windows IoT Extension SDK|10.1.26100.7705|-
+msi|{3EEF5F2A-A2A3-89FC-D7DF-CFE8DEFE4A8F}|WinRT Intellisense Mobile - en-us|10.1.26100.7705|-
+msi|{E901323A-7A02-50A8-F4E0-95C4AD8A098F}|Windows Mobile Extension SDK|10.1.26100.7705|-
+msi|{3120663A-4F7D-252C-2829-1B9DBEDFEEED}|WinRT Intellisense IoT - Other Languages|10.1.26100.7705|-
+msi|{9CCBB04A-DB05-4005-B694-CA184112C65E}|Microsoft .NET Runtime - 8.0.28 (x64)|64.112.53549|-
+msi|{22B1775A-6F83-4BC4-9330-0F10CE026003}|GitHub CLI|2.89.0|-
+msi|{D0772A8A-6AB2-E6E1-8BEF-29F59AB99893}|Windows SDK Desktop Headers x86|10.1.26100.7705|-
+msi|{D07657AA-968C-4629-BD6C-1B52AF825EA7}|Microsoft Visual Studio Setup Configuration|3.12.2140.44225|-
+msi|{010792BA-551A-3AC0-A7EF-0FAB4156C382}|Microsoft Visual C++ 2013 x64 Additional Runtime - 12.0.40664|12.0.40664|-
+msi|{2817364B-A3DE-472C-BF19-F19B6997061F}|vs_communitymsires|17.14.36015|-
+msi|{CEE6617B-1BF5-4E83-BD00-51E24542AEF1}|Microsoft .NET Host - 8.0.28 (x64)|64.112.53549|-
+msi|{0460C87B-7F4C-3170-FAC9-B7A6AE5CE4E9}|Universal CRT Redistributable|10.0.26624|-
+msi|{5E63E49B-C88C-46C5-855C-A7B07C11CDC8}|Microsoft .NET Host FX Resolver - 6.0.11 (x64)|48.47.50420|-
+msi|{FB4D4A9B-9E8F-42CB-B08F-AE153FFA31AC}|Windows SDK Facade Windows WinMD Versioned|10.1.26100.7705|-
+msi|{B1769FAB-7263-469A-8201-0EB91861643A}|Microsoft .NET Host FX Resolver - 8.0.28 (x86)|64.112.53549|-
+msi|{FC641ACB-FE5E-4F88-B392-9421BDCA1143}|Microsoft Windows Desktop Runtime - 6.0.20 (x86)|48.83.63194|-
+msi|{82F89EDB-1DF1-402B-BED6-01C736967B6F}|Microsoft .NET Host - 6.0.20 (x86)|48.83.63169|-
+msi|{0343A2EB-5CCA-79B9-18A4-ABD484A97924}|Universal CRT Extension SDK|10.1.26100.7705|-
+msi|{B0E7F6FB-C0C6-51D9-9E80-CB1FEAB4CB19}|Tailscale|1.102.2|-
+msi|{B175520C-86A2-35A7-8619-86DC379688B9}|Microsoft Visual C++ 2012 x86 Additional Runtime - 11.0.61030|11.0.61030|-
+msi|{710f4c1c-cc18-4c49-8cbf-51240c89a1a2}|Microsoft Visual C++ 2005 Redistributable|8.0.61001|-
+msi|{CF2BEA3C-26EA-32F8-AA9B-331F7E34BA97}|Microsoft Visual C++ 2012 x64 Minimum Runtime - 11.0.61030|11.0.61030|-
+msi|{12C6754C-2086-9BFC-1292-FA0BE54009E6}|Windows SDK Desktop Libs x64|10.1.26100.7705|-
+msi|{099E916C-D17E-7E1A-0046-3AD1D042102F}|WinRT Intellisense UAP - Other Languages|10.1.26100.7705|-
+msi|{2397436C-7461-4B1F-84C2-1B78CAF38CBF}|Microsoft Windows Desktop Runtime - 8.0.28 (x64)|64.112.53617|-
+msi|{7D4D186C-70F0-6990-1792-DAA557B1E010}|Universal CRT Headers Libraries and Sources|10.1.26100.7705|-
+msi|{C762588C-06DE-496A-8ADF-EBDBD49E37B5}|DiagnosticsHub_CollectionService|17.14.36412|-
+msi|{CEC6FB8C-1F94-F7F8-C9F7-EF55CC2A519F}|Windows SDK for Windows Store Apps|10.1.26100.7705|-
+msi|{3873679C-FA03-4101-97E9-107D67C568B8}|vs_communityx64msi|17.14.36025|-
+msi|{575077AC-CCC1-9943-6F3C-EDB6149964E7}|Windows SDK ARM64 Desktop Tools|10.1.26100.7705|-
+msi|{279EE1CC-31F4-3BAF-9921-89B84C5B57B8}|Google Chrome|149.0.7827.201|-
+msi|{F738E2CC-E003-B601-F38B-4521ED842C98}|Windows SDK for Windows Store Apps DirectX x86 Remote|10.1.26100.7705|-
+msi|{D401961D-3A20-3AC7-943B-6139D5BD490A}|Microsoft Visual C++ 2013 x86 Additional Runtime - 12.0.40664|12.0.40664|-
+msi|{6A115A5D-0429-4524-87F1-2E7FB10EE520}|CMake|4.3.3|C:\Program Files\CMake\
+msi|{572C25BD-AB18-B702-9ED7-6F0CC6821847}|WinRT Intellisense Desktop - en-us|10.1.26100.7705|-
+msi|{BD95A8CD-1D9F-35AD-981A-3E7925026EBB}|Microsoft Visual C++ 2012 x86 Minimum Runtime - 11.0.61030|11.0.61030|-
+msi|{9BA10CCD-7064-7FAB-B48B-C7B2CCFC60FB}|WinRT Intellisense PPI - Other Languages|10.1.26100.7705|-
+msi|{6AAEB5DD-FFFE-4CA1-9FE2-38A44B6B4477}|vs_minshellmsi|17.14.36301|-
+msi|{AF0CF0ED-D9DA-DFDA-52DD-B3B0FE269640}|Windows SDK for Windows Store Apps Metadata|10.1.26100.7705|-
+msi|{1851460E-0E63-4117-B5BA-25A2F045801B}|vs_CoreEditorFonts|17.7.40001|-
+msi|{5120ED0E-8B54-B212-15E6-EE404FE83E37}|Windows SDK EULA|10.1.26100.7705|-
+msi|{C6FD611E-7EFE-488C-A0E0-974C09EF6473}|Microsoft Update Health Tools|5.72.0.0|-
+msi|{DB72537E-BD30-364B-6A72-09CE78DB8321}|Windows SDK Desktop Tools x86|10.1.26100.7705|-
+msi|{EF01A7AE-30DA-45B6-9049-8E4651EFEFE7}|Microsoft .NET Runtime - 8.0.28 (x86)|64.112.53549|-
+msi|{29297AFE-9D24-4DFE-ACAF-D90090D905CF}|vs_githubprotocolhandlermsi|17.14.36015|-
+msi|{E2627D3F-C9CA-42D9-9BE9-A2E645A56FEF}|Microsoft .NET Host FX Resolver - 8.0.28 (x64)|64.112.53549|-
+msi|{11C0EB4F-A1BA-2068-49A5-F7C242708BA2}|Windows SDK DirectX x86 Remote|10.1.26100.7705|-
+msi|{9FA1715F-2809-3C7D-B9BB-17574DA0AED9}|Windows Mobile Extension SDK Contracts|10.1.26100.7705|-
+msi|{EFF12E8F-5027-FE5D-6ABF-5F837F3B70F8}|Windows SDK OnecoreUap Headers x86|10.1.26100.7705|-
+msi|{7E52FE9F-4D3E-9277-0E37-0014C83D4F5E}|Universal General MIDI DLS Extension SDK|10.1.26100.7705|-
+msi|{85F3FF9F-CFBA-AD2F-85E2-90571032D412}|Windows SDK OnecoreUap Headers arm64|10.1.26100.7705|-
+msi|{6FA797CF-6B76-4B6D-87EE-768F92008720}|Microsoft Visual C++ 2022 X64 Additional Runtime - 14.51.36247|14.51.36247|-
+msi|{E8BE09DF-D93B-AE40-FD63-05E5ABEFB6D9}|Windows SDK for Windows Store Apps Contracts|10.1.26100.7705|-
+msi|{561137EF-2ECE-48F0-A6D6-6260AC7112A5}|Microsoft .NET Host FX Resolver - 6.0.20 (x86)|48.83.63169|-
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=product_codes
+product_code|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component
+product_code|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider
+product_code|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput
+product_code|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)
+product_code|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK
+product_code|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts
+product_code|{0A1B70B0-DD98-1BCC-6958-D5AD8BBAF2B2}|Windows SDK Desktop Headers arm64
+product_code|{B7BC83B0-1A94-0290-4309-820859276E72}|Windows App Certification Kit x64
+product_code|{931A2CF0-2404-45EA-82F5-345735AE6A90}|Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.51.36247
+product_code|{80F76A51-EAF7-DA8E-C732-B26C591BCC23}|Windows SDK OnecoreUap Headers x64
+product_code|{1D8E6291-B0D5-35EC-8441-6616F567A0F7}|Microsoft Visual C++ 2010  x64 Redistributable - 10.0.40219
+product_code|{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}|Windows App Certification Kit Native Components
+product_code|{ad8a2fa1-06e7-4b0d-927d-6e54b3d31028}|Microsoft Visual C++ 2005 Redistributable (x64)
+product_code|{8122DAB1-ED4D-3676-BB0A-CA368196543E}|Microsoft Visual C++ 2013 x86 Minimum Runtime - 12.0.40664
+product_code|{AA86DFC1-17A2-6133-1D55-92818B9D3082}|SDK ARM64 Redistributables
+product_code|{F0C3E5D1-1ADE-321E-8167-68EF0DE699A5}|Microsoft Visual C++ 2010  x86 Redistributable - 10.0.40219
+product_code|{B817BAD1-CC9F-940C-FFD8-7543D89B8EB7}|Windows App Certification Kit x64 (OnecoreUAP)
+product_code|{F9DDDEF1-BCF0-275F-DE29-9332F1149B79}|Windows SDK Signing Tools
+product_code|{9EE92E02-FA29-DF43-7E45-A256139DEBE4}|Windows SDK Desktop Libs x86
+product_code|{6C7D0172-7367-4F0C-95DB-6021765B58EA}|vs_filehandler_x86
+product_code|{E43BDB72-464A-290B-A51D-537CBBE1CAC8}|Windows App Certification Kit SupportedApiList x86
+product_code|{BC104582-4691-4D4C-8922-C215D941A2EB}|Microsoft Visual C++ 2022 X86 Debug Runtime - 14.44.35211
+product_code|{13D2A7A2-1B42-4C03-8F0F-697991259AEE}|Windows SDK AddOn
+product_code|{CCEEC7A2-2179-C5D0-60E2-2651993A8AD5}|Windows SDK Desktop Headers x64
+product_code|{368E4D03-5983-1C2C-B42E-1C0C51A935A5}|Universal CRT Redistributable
+product_code|{91306123-946D-452F-3206-A8AB9F8293D6}|WinRT Intellisense PPI - en-us
+product_code|{F4F63553-2774-41A6-C784-7FAC7DF4CAF3}|Windows Desktop Extension SDK Contracts
+product_code|{EB8B0E53-980A-E861-DC85-05240EFA888D}|WinRT Intellisense IoT - en-us
+product_code|{F5796163-6EC6-488A-B2DE-E1E94477F6AD}|VS Script Debugging Common
+product_code|{D75B3C63-F3BB-5EC1-45A7-15C00BBB9D3F}|Application Verifier x64 External Package (DesktopEditions)
+product_code|{1F507473-1077-3AB8-2E11-C839AE4E27B8}|Windows Team Extension SDK
+product_code|{9A2FEE83-D2FB-A48E-52E0-15801042220F}|Windows Team Extension SDK Contracts
+product_code|{06671634-35F4-43F1-1B57-68B7CE54E5B3}|MSI Development Tools
+product_code|{53CF6934-A98D-3D84-9146-FC4EDF3D5641}|Microsoft Visual C++ 2013 x64 Minimum Runtime - 12.0.40664
+product_code|{EA88E7B4-C204-CC0C-FC10-D13FC9C30800}|WinRT Intellisense Desktop - Other Languages
+product_code|{96B30005-C36E-07FF-DF27-EEB8199694CD}|Windows SDK Redistributables
+product_code|{A39D4115-3A27-4245-AE92-3214B8B21932}|Microsoft Windows Desktop Runtime - 6.0.11 (x64)
+product_code|{4C150435-9153-456C-C0BE-497D89513B18}|Windows SDK for Windows Store Apps Tools
+product_code|{C7F2EF85-ACD3-0480-6BC2-0C3B45A8F1C1}|Universal CRT Tools x64
+product_code|{2CAA22A5-36FE-21B0-5A67-3BE172FEFF12}|Windows SDK for Windows Store Apps Libs
+product_code|{5C8B4DA5-62C6-8D4A-F21A-AD4D66FCA8D9}|WinRT Intellisense UAP - en-us
+product_code|{243EC516-9B7D-4F3D-BD71-D2FD44EF63D6}|Microsoft Windows Desktop Runtime - 8.0.28 (x86)
+product_code|{B4B3AA16-E828-4577-A9F2-629E1A95FE4A}|vs_vswebprotocolselectormsi
+product_code|{A2FDDC26-4232-4287-8839-2F53A01E1E97}|vs_minshellinteropmsi
+product_code|{B637A6A6-5591-4503-AFD8-776164EB837A}|Windows Subsystem for Linux
+product_code|{26BD6DC6-3F0F-4C17-A78C-5D06459F39C0}|Windows SDK Modern Non-Versioned Developer Tools
+product_code|{97DEC5D6-2BE9-45BB-BFC5-274B851B486B}|NordVPN network TAP
+product_code|{F251EBD6-9B8C-3876-A422-B4F677BF3766}|Windows SDK Modern Versioned Developer Tools
+product_code|{71498EE6-F94E-4061-9DD5-55925CA8A74F}|vs_communitysharedmsi
+product_code|{43506B27-889E-2F0F-F8BE-4AEBE7CC9249}|Kits Configuration Installer
+product_code|{8FCD1D57-2245-3417-9DDD-8F1CCF99976D}|Microsoft Edge
+product_code|{B5534577-4F61-73AC-FFCB-91B0B0674DA4}|Windows SDK for Windows Store Apps Headers
+product_code|{37B8F9C7-03FB-3253-8781-2517C99D7C00}|Microsoft Visual C++ 2012 x64 Additional Runtime - 11.0.61030
+product_code|{FB7C4DC7-7641-04B7-6639-589757B86783}|Windows SDK DirectX x64 Remote
+product_code|{4D8C14D7-C036-33F2-EFA7-C5CC5F73932B}|Windows SDK for Windows Store Managed Apps Libs
+product_code|{CFEF5BD7-A03F-DEF3-1707-A31C813F6D14}|WinAppDeploy
+product_code|{CB91C4E7-9C14-6ABD-566B-DF4593456102}|Windows SDK for Windows Store Apps Headers OnecoreUap
+product_code|{D331F4E7-BC3B-47BE-BB56-5F33895F9347}|vs_FileTracker_Singleton
+product_code|{C7FC6DE7-5C06-4311-837A-E0D774618D17}|vcpp_crt.redist.clickonce
+product_code|{6798C408-2636-448C-8AC6-F4E341102D27}|Windows PC Health Check
+product_code|{2C37C218-88FF-9E58-0151-1AF693535792}|Windows SDK Desktop Libs arm64
+product_code|{4BF7CE18-E151-449F-9190-6CDBED0BB4A2}|Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.51.36247
+product_code|{BD0E4F38-D3F6-452D-A32E-B14D721839AC}|NordVPN network TUN
+product_code|{C3DD1448-513A-4DB8-978D-6991562EA63D}|Microsoft .NET Runtime - 6.0.11 (x64)
+product_code|{EC049978-2176-47C6-B99B-2C64AD6F6828}|vs_minshellmsires
+product_code|{226CEF88-E174-49A6-865C-874A7B7F86F3}|Logi Plugin Service
+product_code|{9D9075A8-069B-452D-9D4A-66A89D01C1A7}|Microsoft .NET Host - 8.0.28 (x86)
+product_code|{537F07C8-0EC6-41A5-BB91-750FA3CAA110}|vs_minshellinteropsharedmsi
+product_code|{F6E69DD8-7652-4CC6-8A4F-485A16012B5B}|vs_minshellsharedmsi
+product_code|{7C1561F8-C963-0AC7-21BD-EA4DD9633C50}|Windows SDK Desktop Tools arm64
+product_code|{22EE1419-B47E-44B8-A635-868746946079}|vs_filehandler_amd64
+product_code|{582BA719-E6F1-4651-A873-049E6A0DDDAF}|Microsoft Visual C++ 2022 X86 Additional Runtime - 14.51.36247
+product_code|{A92DAB39-4E2C-4304-9AB6-BC44E68B55E2}|Google Update Helper
+product_code|{FE85AA49-3522-4663-9F52-9CD9E9837189}|Microsoft Visual C++ 2022 X64 Debug Runtime - 14.44.35211
+product_code|{A224D569-B07A-8178-A1E4-75DC397C06B2}|Windows SDK
+product_code|{601DDF69-FCF4-F568-946A-C17046C946E4}|Application Verifier x64 External Package (OnecoreUAP)
+product_code|{9AC08E99-230B-47e8-9721-4577B7F124EA}|-
+product_code|{6E4984A9-4321-4D96-861F-D03578E68C8B}|Microsoft .NET Runtime - 6.0.20 (x86)
+product_code|{FEC52FA9-A866-C884-4AAA-0B15BE793610}|Universal CRT Tools x86
+product_code|{A27B17B9-90C8-4B07-83C6-1303FC186B6B}|PlayStation? Accessories
+product_code|{EB362CC9-F0B3-EDBC-82E8-91F6BBF36F6E}|Windows SDK Desktop Tools x64
+product_code|{E93670D9-924A-7B6F-5F55-AE8E3043BCB0}|SDK ARM64 Additions
+product_code|{B92B890A-04F2-4880-BA20-20D4364FB263}|Microsoft .NET Host - 6.0.11 (x64)
+product_code|{A056CA2A-2AB1-EB1B-1B2E-D49E0C6C8E17}|Windows IoT Extension SDK
+product_code|{3EEF5F2A-A2A3-89FC-D7DF-CFE8DEFE4A8F}|WinRT Intellisense Mobile - en-us
+product_code|{E901323A-7A02-50A8-F4E0-95C4AD8A098F}|Windows Mobile Extension SDK
+product_code|{3120663A-4F7D-252C-2829-1B9DBEDFEEED}|WinRT Intellisense IoT - Other Languages
+product_code|{9CCBB04A-DB05-4005-B694-CA184112C65E}|Microsoft .NET Runtime - 8.0.28 (x64)
+product_code|{22B1775A-6F83-4BC4-9330-0F10CE026003}|GitHub CLI
+product_code|{D0772A8A-6AB2-E6E1-8BEF-29F59AB99893}|Windows SDK Desktop Headers x86
+product_code|{D07657AA-968C-4629-BD6C-1B52AF825EA7}|Microsoft Visual Studio Setup Configuration
+product_code|{010792BA-551A-3AC0-A7EF-0FAB4156C382}|Microsoft Visual C++ 2013 x64 Additional Runtime - 12.0.40664
+product_code|{2817364B-A3DE-472C-BF19-F19B6997061F}|vs_communitymsires
+product_code|{CEE6617B-1BF5-4E83-BD00-51E24542AEF1}|Microsoft .NET Host - 8.0.28 (x64)
+product_code|{0460C87B-7F4C-3170-FAC9-B7A6AE5CE4E9}|Universal CRT Redistributable
+product_code|{5E63E49B-C88C-46C5-855C-A7B07C11CDC8}|Microsoft .NET Host FX Resolver - 6.0.11 (x64)
+product_code|{FB4D4A9B-9E8F-42CB-B08F-AE153FFA31AC}|Windows SDK Facade Windows WinMD Versioned
+product_code|{B1769FAB-7263-469A-8201-0EB91861643A}|Microsoft .NET Host FX Resolver - 8.0.28 (x86)
+product_code|{FC641ACB-FE5E-4F88-B392-9421BDCA1143}|Microsoft Windows Desktop Runtime - 6.0.20 (x86)
+product_code|{82F89EDB-1DF1-402B-BED6-01C736967B6F}|Microsoft .NET Host - 6.0.20 (x86)
+product_code|{0343A2EB-5CCA-79B9-18A4-ABD484A97924}|Universal CRT Extension SDK
+product_code|{B0E7F6FB-C0C6-51D9-9E80-CB1FEAB4CB19}|Tailscale
+product_code|{B175520C-86A2-35A7-8619-86DC379688B9}|Microsoft Visual C++ 2012 x86 Additional Runtime - 11.0.61030
+product_code|{710f4c1c-cc18-4c49-8cbf-51240c89a1a2}|Microsoft Visual C++ 2005 Redistributable
+product_code|{CF2BEA3C-26EA-32F8-AA9B-331F7E34BA97}|Microsoft Visual C++ 2012 x64 Minimum Runtime - 11.0.61030
+product_code|{12C6754C-2086-9BFC-1292-FA0BE54009E6}|Windows SDK Desktop Libs x64
+product_code|{099E916C-D17E-7E1A-0046-3AD1D042102F}|WinRT Intellisense UAP - Other Languages
+product_code|{2397436C-7461-4B1F-84C2-1B78CAF38CBF}|Microsoft Windows Desktop Runtime - 8.0.28 (x64)
+product_code|{7D4D186C-70F0-6990-1792-DAA557B1E010}|Universal CRT Headers Libraries and Sources
+product_code|{C762588C-06DE-496A-8ADF-EBDBD49E37B5}|DiagnosticsHub_CollectionService
+product_code|{CEC6FB8C-1F94-F7F8-C9F7-EF55CC2A519F}|Windows SDK for Windows Store Apps
+product_code|{3873679C-FA03-4101-97E9-107D67C568B8}|vs_communityx64msi
+product_code|{575077AC-CCC1-9943-6F3C-EDB6149964E7}|Windows SDK ARM64 Desktop Tools
+product_code|{279EE1CC-31F4-3BAF-9921-89B84C5B57B8}|Google Chrome
+product_code|{F738E2CC-E003-B601-F38B-4521ED842C98}|Windows SDK for Windows Store Apps DirectX x86 Remote
+product_code|{D401961D-3A20-3AC7-943B-6139D5BD490A}|Microsoft Visual C++ 2013 x86 Additional Runtime - 12.0.40664
+product_code|{6A115A5D-0429-4524-87F1-2E7FB10EE520}|CMake
+product_code|{572C25BD-AB18-B702-9ED7-6F0CC6821847}|WinRT Intellisense Desktop - en-us
+product_code|{BD95A8CD-1D9F-35AD-981A-3E7925026EBB}|Microsoft Visual C++ 2012 x86 Minimum Runtime - 11.0.61030
+product_code|{9BA10CCD-7064-7FAB-B48B-C7B2CCFC60FB}|WinRT Intellisense PPI - Other Languages
+product_code|{6AAEB5DD-FFFE-4CA1-9FE2-38A44B6B4477}|vs_minshellmsi
+product_code|{AF0CF0ED-D9DA-DFDA-52DD-B3B0FE269640}|Windows SDK for Windows Store Apps Metadata
+product_code|{1851460E-0E63-4117-B5BA-25A2F045801B}|vs_CoreEditorFonts
+product_code|{5120ED0E-8B54-B212-15E6-EE404FE83E37}|Windows SDK EULA
+product_code|{C6FD611E-7EFE-488C-A0E0-974C09EF6473}|Microsoft Update Health Tools
+product_code|{DB72537E-BD30-364B-6A72-09CE78DB8321}|Windows SDK Desktop Tools x86
+product_code|{EF01A7AE-30DA-45B6-9049-8E4651EFEFE7}|Microsoft .NET Runtime - 8.0.28 (x86)
+product_code|{29297AFE-9D24-4DFE-ACAF-D90090D905CF}|vs_githubprotocolhandlermsi
+product_code|{E2627D3F-C9CA-42D9-9BE9-A2E645A56FEF}|Microsoft .NET Host FX Resolver - 8.0.28 (x64)
+product_code|{11C0EB4F-A1BA-2068-49A5-F7C242708BA2}|Windows SDK DirectX x86 Remote
+product_code|{9FA1715F-2809-3C7D-B9BB-17574DA0AED9}|Windows Mobile Extension SDK Contracts
+product_code|{EFF12E8F-5027-FE5D-6ABF-5F837F3B70F8}|Windows SDK OnecoreUap Headers x86
+product_code|{7E52FE9F-4D3E-9277-0E37-0014C83D4F5E}|Universal General MIDI DLS Extension SDK
+product_code|{85F3FF9F-CFBA-AD2F-85E2-90571032D412}|Windows SDK OnecoreUap Headers arm64
+product_code|{6FA797CF-6B76-4B6D-87EE-768F92008720}|Microsoft Visual C++ 2022 X64 Additional Runtime - 14.51.36247
+product_code|{E8BE09DF-D93B-AE40-FD63-05E5ABEFB6D9}|Windows SDK for Windows Store Apps Contracts
+product_code|{561137EF-2ECE-48F0-A6D6-6260AC7112A5}|Microsoft .NET Host FX Resolver - 6.0.20 (x86)
+[result_status] UNDECLARED / UNKNOWN / 
+

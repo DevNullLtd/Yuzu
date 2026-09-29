@@ -1,0 +1,35 @@
+{
+  "note": "Reflects TODAY'S rules file, measured with the inverted must-be-firing assertion: a listed cadence is one where the scenario's alert did NOT stay continuously firing. Empty lists are the #2854 rung D redesign's shipped state - the stamp-based grace closed both the historical 164-195 minute blind band and the ~90-minute-up intermittent auto-resolve gap the inversion measured (each documented in this file's git history). A cadence appearing here again is a regression to re-reason, not a number to commit.",
+  "promtool_image": "prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893",
+  "grid": {
+    "settle_minutes": 200,
+    "low": 30,
+    "high": 240,
+    "step": 5
+  },
+  "intervals_s": [
+    30,
+    60,
+    300
+  ],
+  "uncovered": {
+    "anchored": {
+      "alert": "YuzuAuditRetentionNotRunning",
+      "alert_present": true,
+      "by_interval": {
+        "30": [],
+        "60": [],
+        "300": []
+      }
+    },
+    "fresh": {
+      "alert": "YuzuAuditRetentionNeverRan",
+      "alert_present": true,
+      "by_interval": {
+        "30": [],
+        "60": [],
+        "300": []
+      }
+    }
+  }
+}

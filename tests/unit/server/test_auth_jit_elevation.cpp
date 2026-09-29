@@ -17,10 +17,13 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -31,7 +34,9 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -39,30 +44,68 @@ namespace fs = std::filesystem;
 using namespace yuzu::server;
 using yuzu::server::auth::Role;
 
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — the harness below clones this
+// pre-migrated template instead of opening a SQLite path. Self-contained
+// (mirrors yuzu::test::AuthDbPg, already embedded in the harness): SKIPs the
+// enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (via auth_db's own
+// ctor, constructed first), FAILs when set but broken.
+yuzu::test::PgTestTemplate jit_elevation_audit_tpl{"jitaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("jitaudit template: store failed to migrate");
+}};
+} // namespace
+
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
 TEST_CASE("effective_role: a session is admin only while elevated", "[jit][auth]") {
+    // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), is_elevated adjudicates
+    // against the local monotonic `steady_elevated_until` derived by
+    // AuthManager::derive_session_deadlines — which is where the future-issued
+    // rejection, the kMaxElevationWindow authored-width ceiling, and the H2
+    // backward-`now` clamp now live. Set up each scenario through it (from ms +
+    // an authority `now`), rather than hand-stamping the wall fields.
+    using auth::AuthManager;
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const std::int64_t life = now + 8LL * 3600 * 1000; // 8h session
+    const std::int64_t kMaxMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(auth::kMaxElevationWindow).count();
+
     auth::Session s;
     s.username = "alice";
     s.role = Role::user;
 
     // Not elevated → base role.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, /*elev_until*/ 0, /*issued*/ 0, now);
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
-    // Elevated into the future → effective admin.
-    s.elevated_until = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    // Elevated 60s into the future → effective admin.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + 60'000, now, now);
     CHECK(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::admin);
 
-    // An elapsed window → reverts to base (monotonic, no wall-clock).
-    s.elevated_until = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    // Epoch anchor (issued=0) → authored width ~= elevated_until (enormous) > kMax
+    // → REJECTED (a corrupted/anchor-less grant confers zero admin).
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + 60'000, /*issued*/ 0, now);
+    CHECK_FALSE(auth::is_elevated(s));
+
+    // Window wider than kMaxElevationWindow → REJECTED (forward-corruption bound).
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + kMaxMs + 3600'000, now, now);
+    CHECK_FALSE(auth::is_elevated(s));
+
+    // An elapsed window → not elevated.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now - 1000, now - 61'000, now);
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
     // A base-admin is admin regardless of elevation.
     s.role = Role::admin;
-    s.elevated_until = {};
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, 0, 0, now);
     CHECK(auth::effective_role(s) == Role::admin);
 }
 
@@ -98,16 +141,16 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
     CHECK(auth::effective_role(*s) == Role::admin);
 
     // Manual revoke reverts to base and reports it WAS elevated.
-    CHECK(mgr->revoke_elevation(*token));
+    CHECK(mgr->revoke_elevation(*token).value_or(false));
     auto s2 = mgr->validate_session(*token);
     REQUIRE(s2.has_value());
     CHECK_FALSE(auth::is_elevated(*s2));
     CHECK(auth::effective_role(*s2) == Role::user);
     // Revoking an un-elevated session is a no-op (returns false).
-    CHECK_FALSE(mgr->revoke_elevation(*token));
+    CHECK_FALSE(mgr->revoke_elevation(*token).value_or(false));
     // Unknown token → nullopt / false.
     CHECK_FALSE(mgr->elevate_session("deadbeef", std::chrono::seconds(60)).has_value());
-    CHECK_FALSE(mgr->revoke_elevation("deadbeef"));
+    CHECK_FALSE(mgr->revoke_elevation("deadbeef").value_or(false));
 }
 
 // ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
@@ -130,12 +173,12 @@ TEST_CASE("AuthManager::elevate_session clamps the window to the session's own "
     CHECK(*until <= session_before->expires_at);
     // And meaningfully clamped, not merely coincidentally equal — the naive
     // (unclamped) now+48h would be far beyond the session's ~8h expiry.
-    CHECK(*until < std::chrono::steady_clock::now() + std::chrono::hours(47));
+    CHECK(*until < std::chrono::system_clock::now() + std::chrono::hours(47));
 
     // A short, well-inside-the-session-lifetime window is NOT clamped.
     auto token2 = mgr->authenticate("carol", "secret123456");
     REQUIRE(token2.has_value());
-    auto before2 = std::chrono::steady_clock::now();
+    auto before2 = std::chrono::system_clock::now();
     auto until2 = mgr->elevate_session(*token2, std::chrono::seconds(60));
     REQUIRE(until2.has_value());
     CHECK(*until2 >= before2 + std::chrono::seconds(58));
@@ -187,7 +230,7 @@ TEST_CASE("AuthManager::reap_expired_elevation is a no-op after a manual revoke"
     // Manual step-down clears elevated_until to the same sentinel a passive
     // reap would — so a manually-revoked window must never ALSO report an
     // "expired" event (it already has its own role.elevation.revoked row).
-    CHECK(mgr->revoke_elevation(*token));
+    CHECK(mgr->revoke_elevation(*token).value_or(false));
     CHECK_FALSE(mgr->reap_expired_elevation(*token).has_value());
 
     // Not-yet-elevated / never-elevated is likewise a no-op.
@@ -253,32 +296,29 @@ TEST_CASE("AuthManager::reap_expired_elevation is exactly-once under concurrent 
 
 // ── AuthDB eligibility column ────────────────────────────────────────────────
 
-TEST_CASE("AuthDB::set/is_elevation_eligible round-trips, fail-closed", "[jit][authdb]") {
-    auto dir = yuzu::test::TempDir{};
-    fs::create_directories(dir.path);
-    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(db.initialize().has_value());
+TEST_CASE("AuthDB::set/is_elevation_eligible round-trips, fail-closed", "[pg][jit][authdb]") {
+    yuzu::test::AuthDbPg db;
     auto salt = auth::AuthManager::random_bytes(16);
     auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
     REQUIRE(
-        db.upsert_user("alice", auth::AuthManager::pbkdf2_sha256("pw", salt, 1000), salt_hex,
-                       Role::user)
+        db->upsert_user("alice", auth::AuthManager::pbkdf2_sha256("pw", salt, 1000), salt_hex,
+                        Role::user)
             .has_value());
 
     // Default is not-eligible.
-    CHECK(db.is_elevation_eligible("alice").value() == false);
+    CHECK(db->is_elevation_eligible("alice").value() == false);
     // Grant, then read back.
-    REQUIRE(db.set_elevation_eligible("alice", true).has_value());
-    CHECK(db.is_elevation_eligible("alice").value() == true);
+    REQUIRE(db->set_elevation_eligible("alice", true).has_value());
+    CHECK(db->is_elevation_eligible("alice").value() == true);
     // Revoke.
-    REQUIRE(db.set_elevation_eligible("alice", false).has_value());
-    CHECK(db.is_elevation_eligible("alice").value() == false);
+    REQUIRE(db->set_elevation_eligible("alice", false).has_value());
+    CHECK(db->is_elevation_eligible("alice").value() == false);
     // Unknown user: set → UserNotFound; read → fail-closed false.
-    CHECK_FALSE(db.set_elevation_eligible("nobody", true).has_value());
-    CHECK(db.is_elevation_eligible("nobody").value() == false);
+    CHECK_FALSE(db->set_elevation_eligible("nobody", true).has_value());
+    CHECK(db->is_elevation_eligible("nobody").value() == false);
     // Malformed username rejected on both.
-    CHECK_FALSE(db.set_elevation_eligible("alice:admin", true).has_value());
-    CHECK_FALSE(db.is_elevation_eligible("alice:admin").has_value());
+    CHECK_FALSE(db->set_elevation_eligible("alice:admin", true).has_value());
+    CHECK_FALSE(db->is_elevation_eligible("alice:admin").has_value());
 }
 
 // ── REST surface ─────────────────────────────────────────────────────────────
@@ -296,61 +336,68 @@ struct JitHarness {
     yuzu::test::TempDir tmp;
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    AuthDB auth_db;
-    std::unique_ptr<ApiTokenStore> api_tokens;
+    yuzu::test::AuthDbPg auth_db;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool in the normal case, mirroring auth_db's own
+    // self-contained skip/fail posture above (auth_db constructs first, so an
+    // unset DSN never reaches this member at all). When `audit_store_broken`,
+    // `audit_pool` instead points at an unroutable host — see the ctor doc
+    // below.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
-    std::unique_ptr<AnalyticsEventStore> analytics_store;
+    // AnalyticsEventStore ported to Postgres (ADR-0049) — own ephemeral
+    // clone, matching audit_store's pattern above.
+    yuzu::test::AnalyticsEventStorePg analytics_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     std::unique_ptr<AuthRoutes> auth_routes;
     yuzu::server::test::TestRouteSink sink;
 
-    // The comma-operator creates the temp dir (TempDir only computes the path)
-    // before AuthDB opens its files under it. `audit_store_broken` (governance
-    // hardening round, UP-3 guard) points the AuditStore at an unopenable
-    // path — SQLITE_CANTOPEN leaves it wired-but-closed (db_==nullptr), so
-    // AuditStore::log() fail-returns false without throwing, matching the
-    // idiom at test_rest_audit_sample.cpp:51. Made HERMETIC (L5, adversarial
-    // review): rather than a hardcoded path outside the sandbox (a
-    // writable-root CI could create `/nonexistent-yuzu-test-dir/` and void
-    // the negative assertion), the unopenable directory is a subdirectory of
-    // the harness's own TempDir with its write bit stripped (mirrors the
-    // owner_read/owner_write idiom in test_cert_reloader.cpp) — SQLite can
-    // list it but can't create a file inside it.
-    explicit JitHarness(bool audit_store_broken = false)
-        : auth_db((fs::create_directories(tmp.path), tmp.path), 0) {
+    // `audit_store_broken` (governance hardening round, UP-3 guard) points
+    // the AuditStore at an unroutable pool — the connection can never
+    // succeed, so AuditStore::is_open() reads false and log() fail-returns
+    // false without throwing, matching the idiom at
+    // test_rest_audit_sample.cpp:51. This path does NOT depend on
+    // YUZU_TEST_POSTGRES_DSN being set — it needs no live Postgres at all
+    // (mirrors test_audit_store.cpp's "bad-path constructor" fixture).
+    explicit JitHarness(bool audit_store_broken = false) {
+        fs::create_directories(tmp.path);
         cfg.auth_config_path = tmp.path / "auth.cfg";
         cfg.https_enabled = false;
         cfg.jit_max_elevation_secs = 3600;
-        REQUIRE(auth_db.initialize().has_value());
         auth_mgr.load_config(cfg.auth_config_path);
         seed("admin", "adminpassword1", Role::admin);
         seed("alice", "alicepassword1", Role::user);
         seed("bob", "bobpassword1234", Role::user);
         seed("carol", "carolpassword1", Role::user);
-        auth_mgr.set_auth_db(&auth_db);
+        auth_mgr.set_auth_db(auth_db.get());
         enroll_mfa("admin");
         enroll_mfa("alice");
         enroll_mfa("carol");
         // bob is deliberately left WITHOUT MFA (mandatory-MFA gate test).
-        REQUIRE(auth_db.set_elevation_eligible("alice", true).has_value());
-        REQUIRE(auth_db.set_elevation_eligible("bob", true).has_value());
-        REQUIRE(auth_db.set_elevation_eligible("carol", true).has_value());
+        REQUIRE(auth_db->set_elevation_eligible("alice", true).has_value());
+        REQUIRE(auth_db->set_elevation_eligible("bob", true).has_value());
+        REQUIRE(auth_db->set_elevation_eligible("carol", true).has_value());
 
-        api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
-        std::filesystem::path audit_path = tmp.path / "audit.db";
         if (audit_store_broken) {
-            std::filesystem::path unopenable_dir = tmp.path / "no-write";
-            fs::create_directories(unopenable_dir);
-            fs::permissions(unopenable_dir, fs::perms::owner_read | fs::perms::owner_exec,
-                            fs::perm_options::replace);
-            audit_path = unopenable_dir / "audit-broken.db";
+            audit_pool.emplace(yuzu::server::pg::PgPool::Options{
+                .conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1});
+        } else {
+            audit_db.emplace(jit_elevation_audit_tpl);
+            INFO("[JitHarness] audit db status (blank == ok): " << audit_db->error());
+            REQUIRE(audit_db->available());
+            audit_pool.emplace(
+                yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
         }
-        audit_store = std::make_unique<AuditStore>(audit_path);
-        analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
-                                                   api_tokens.get(), audit_store.get(), nullptr,
+                                                   /*api_token_store=*/nullptr, audit_store.get(), nullptr,
                                                    nullptr, analytics_store.get(), oidc_mu,
                                                    oidc_provider);
         auth_routes->register_routes(sink);
@@ -360,19 +407,19 @@ struct JitHarness {
         REQUIRE(auth_mgr.upsert_user(u, pw, r));
         auto salt = auth::AuthManager::random_bytes(16);
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
-        REQUIRE(auth_db.upsert_user(u, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
-                                    r)
+        REQUIRE(auth_db->upsert_user(u, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
+                                     r)
                     .has_value());
     }
 
     void enroll_mfa(const std::string& u) {
-        auto init = auth_db.mfa_init_enrollment(u, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(u, "Yuzu");
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db.mfa_verify_enrollment(u, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(u, code).has_value());
     }
 
     // A cookie session for `u`. fresh_mfa=true stamps mfa_verified_at=now so the
@@ -392,23 +439,27 @@ struct JitHarness {
     //   proof=stale   -> mfa_verified_at older than the elevation step-up window
     enum class OidcProof { absent, fresh, stale };
     std::string oidc_session_for(const std::string& u, OidcProof proof) {
-        std::chrono::steady_clock::time_point mfa_at{};
+        std::chrono::system_clock::time_point mfa_at{};
         if (proof == OidcProof::fresh) {
-            mfa_at = std::chrono::steady_clock::now();
+            mfa_at = std::chrono::system_clock::now();
         } else if (proof == OidcProof::stale) {
-            mfa_at = std::chrono::steady_clock::now() - std::chrono::seconds(400);
+            mfa_at = std::chrono::system_clock::now() - std::chrono::seconds(400);
         }
         return auth_mgr.create_oidc_session(u, u + "@example.com", "sub-" + u,
                                             "https://idp.example", {}, "", mfa_at);
     }
 
-    // detail string of the most-recent matching audit row ("" if none).
+    // detail string of the most-recent matching audit row ("" if none, or if
+    // the store degrades — the broken-store harness relies on this staying
+    // empty rather than throwing).
     std::string audit_detail(const std::string& action, const std::string& principal) {
         AuditQuery q;
         q.action = action;
         q.principal = principal;
         auto rows = audit_store->query(q);
-        return rows.empty() ? std::string{} : rows.front().detail;
+        if (!rows.has_value() || rows->empty())
+            return {};
+        return rows->front().detail;
     }
 
     // A cookie-authenticated POST.
@@ -422,7 +473,8 @@ struct JitHarness {
         q.action = action;
         if (!principal.empty())
             q.principal = principal;
-        return static_cast<int>(audit_store->query(q).size());
+        auto rows = audit_store->query(q);
+        return rows.has_value() ? static_cast<int>(rows->size()) : 0;
     }
 
     // principal_role recorded on the most-recent matching audit row ("" if none).
@@ -431,12 +483,14 @@ struct JitHarness {
         q.action = action;
         q.principal = principal;
         auto rows = audit_store->query(q);
-        return rows.empty() ? std::string{} : rows.front().principal_role;
+        if (!rows.has_value() || rows->empty())
+            return {};
+        return rows->front().principal_role;
     }
 };
 } // namespace
 
-TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
 
@@ -467,8 +521,9 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
         q.action = "role.elevation.granted";
         q.principal = "alice";
         auto rows = h.audit_store->query(q);
-        REQUIRE_FALSE(rows.empty());
-        CHECK(rows.front().detail.find("expires_at=") != std::string::npos);
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail.find("expires_at=") != std::string::npos);
     }
 
     // The session is now effectively admin.
@@ -487,7 +542,7 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
 // is already expired), passes post-fix (ceil'd remaining).
 TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
           "truncated to 0",
-          "[jit][routes]") {
+          "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice"); // normal, full-lifetime session
 
@@ -503,8 +558,9 @@ TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
     q.action = "role.elevation.granted";
     q.principal = "alice";
     auto rows = h.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
-    const std::string& detail = rows.front().detail;
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+    const std::string& detail = rows->front().detail;
     auto pos = detail.find("duration_secs=");
     REQUIRE(pos != std::string::npos);
     pos += std::string("duration_secs=").size();
@@ -526,7 +582,7 @@ TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
 // no other test forces a clamp at the REST layer.
 TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
           "duration_secs in sync with the response expires_in",
-          "[jit][routes]") {
+          "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
 
@@ -550,8 +606,9 @@ TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
     q.action = "role.elevation.granted";
     q.principal = "alice";
     auto rows = h.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
-    const std::string& detail = rows.front().detail;
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+    const std::string& detail = rows->front().detail;
     auto pos = detail.find("duration_secs=");
     REQUIRE(pos != std::string::npos);
     pos += std::string("duration_secs=").size();
@@ -564,7 +621,7 @@ TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
     CHECK(audit_duration == expires_in);
 }
 
-TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][routes]") {
+TEST_CASE("an elevated operator can perform an admin-gated action", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // Before elevation: the admin-gated eligibility endpoint is forbidden.
@@ -579,10 +636,10 @@ TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][route
                         R"({"eligible":false})");
     REQUIRE(after);
     CHECK(after->status == 200);
-    CHECK(h.auth_db.is_elevation_eligible("bob").value() == false);
+    CHECK(h.auth_db->is_elevation_eligible("bob").value() == false);
 }
 
-TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[jit][routes]") {
+TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice"); // base role: user
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -595,7 +652,7 @@ TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[
     CHECK(h.audit_role("role.elevation.granted", "alice") == "admin");
 }
 
-TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[pg][jit][routes]") {
     JitHarness h;
     // bob is eligible but has NO second factor enrolled — elevation is the
     // privilege-crossing boundary, so it is refused regardless of mfa_enforcement
@@ -626,7 +683,7 @@ TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit]
 // asserting a successful OIDC-amr grant were removed here and belong with #1852.
 TEST_CASE("POST /api/v1/elevate: an OIDC session cannot elevate — denied at the "
           "eligibility gate (#1837/#1857 severance; restoration tracked in #1852)",
-          "[jit][routes][oidc]") {
+          "[pg][jit][routes][oidc]") {
     JitHarness h;
     // bob has a local users row (eligible), but his OIDC session's principal is
     // the namespaced oidc:<iss>#<sub>, NOT "bob" — it can never match bob's (or
@@ -653,7 +710,7 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session cannot elevate — denied at th
 
 TEST_CASE("POST /api/v1/elevate: a federated-only OIDC identity (no local users row) "
           "is likewise denied (#1837/#1857 severance)",
-          "[jit][routes][oidc]") {
+          "[pg][jit][routes][oidc]") {
     JitHarness h;
     // "dave" was never seeded into auth.db — a genuinely federated-only
     // identity. Same outcome as an OIDC session whose sub coincides with a
@@ -674,7 +731,7 @@ TEST_CASE("POST /api/v1/elevate: a federated-only OIDC identity (no local users 
 // admin's local session with a fresh local step-up proof — the OIDC branch
 // must never engage for auth_source=="local".
 TEST_CASE("POST /api/v1/elevate: a local session is unaffected by the OIDC-amr path",
-          "[jit][routes][oidc]") {
+          "[pg][jit][routes][oidc]") {
     JitHarness h;
     auto token = h.session_for("alice"); // local session, alice IS enrolled
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
@@ -686,7 +743,7 @@ TEST_CASE("POST /api/v1/elevate: a local session is unaffected by the OIDC-amr p
 
 TEST_CASE("POST /api/v1/elevate: audit detail places mfa= before justification= "
           "(anti-forgery, consistency S-3)",
-          "[jit][routes]") {
+          "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // A crafted justification embeds a forged "mfa=oidc_amr" token. Free-text
@@ -706,7 +763,7 @@ TEST_CASE("POST /api/v1/elevate: audit detail places mfa= before justification= 
     CHECK(detail.substr(mfa_pos, std::string("mfa=local_totp").size()) == "mfa=local_totp");
 }
 
-TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", "[pg][jit][routes]") {
     JitHarness h;
     // alice IS enrolled but the session has no fresh proof (mfa_verified_at at the
     // epoch sentinel) → the step-up gate challenges; elevation is NOT granted.
@@ -718,9 +775,9 @@ TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", 
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[pg][jit][routes]") {
     JitHarness h;
-    REQUIRE(h.auth_db.set_elevation_eligible("alice", false).has_value()); // revoke eligibility
+    REQUIRE(h.auth_db->set_elevation_eligible("alice", false).has_value()); // revoke eligibility
     auto token = h.session_for("alice");
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
     REQUIRE(res);
@@ -729,7 +786,7 @@ TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[jit][route
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"   "})"); // whitespace only
@@ -738,7 +795,7 @@ TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[jit][routes]") {
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // A present-but-wrong-type field must be a clean client error (review UP-2).
@@ -762,7 +819,7 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit
     CHECK(huge_expires_in == h.cfg.jit_max_elevation_secs);
 }
 
-TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     auto res = h.post("/api/v1/elevate", token,
@@ -775,7 +832,7 @@ TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]
     CHECK(expires_in == h.cfg.jit_max_elevation_secs);
 }
 
-TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -788,7 +845,7 @@ TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") 
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("revoking eligibility terminates an active elevation", "[jit][routes]") {
+TEST_CASE("revoking eligibility terminates an active elevation", "[pg][jit][routes]") {
     JitHarness h;
     // alice elevates, then an admin revokes her eligibility — her in-flight
     // elevation must drop immediately (review UP-1), not linger for the window.
@@ -803,7 +860,7 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[jit][routes]"
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
 }
 
-TEST_CASE("an operator cannot set their own elevation eligibility", "[jit][routes]") {
+TEST_CASE("an operator cannot set their own elevation eligibility", "[pg][jit][routes]") {
     JitHarness h;
     // Self-grant is blocked (review UP-6) so a temporary admin window cannot
     // manufacture a durable self-elevation right.
@@ -813,7 +870,7 @@ TEST_CASE("an operator cannot set their own elevation eligibility", "[jit][route
     CHECK(res->status == 403);
 }
 
-TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "[pg][jit][routes]") {
     JitHarness h;
     // No Cookie header → not an interactive session → 401 (API/MCP tokens, which
     // resolve without a cookie, can never elevate).
@@ -826,7 +883,7 @@ TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "
 
 TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
          "request after a passive lapse",
-         "[jit][routes]") {
+         "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // Force a lapsed elevation directly via AuthManager (bypassing the REST
@@ -855,7 +912,7 @@ TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
 }
 
 TEST_CASE("a manually revoked elevation does not ALSO emit role.elevation.expired",
-         "[jit][routes]") {
+         "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -872,7 +929,7 @@ TEST_CASE("a manually revoked elevation does not ALSO emit role.elevation.expire
 
 TEST_CASE("a reap that fires within a request leaves THAT request's session "
          "resolving as base role (UP-9)",
-         "[jit][routes]") {
+         "[pg][jit][routes]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
@@ -896,7 +953,7 @@ TEST_CASE("a reap that fires within a request leaves THAT request's session "
 
 TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store "
          "(best-effort, UP-3)",
-         "[jit][routes]") {
+         "[pg][jit][routes]") {
     JitHarness h(/*audit_store_broken=*/true);
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());

@@ -16,7 +16,25 @@ metadata:
     and to monitor disk usage. Also reports both the configured
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
-    misrepresents the active capture mechanism.
+    misrepresents the active capture mechanism. On the healthy path the FIRST
+    line is storage_state|ok. Offline means a wedged rollback closed the TAR
+    database, so collection and retention are both stopped until the agent
+    restarts and every other field is withheld -- the reply is then just an
+    error| line followed by storage_state|offline, and the action exits
+    non-zero. The order is REVERSED on that path: error| comes FIRST, because
+    server and dashboard consumers key off the output starting with error|, so
+    do not assume storage_state is always the first line. Historical data
+    NORMALLY stays queryable via tar sql, but only when the read-only query
+    connection is itself available; the error| line states which case applies,
+    so do not infer tar sql access from storage_state|offline alone.
+    Reports the retention clock
+    guard counters (#2361): retention_guard_declines_total and
+    retention_guard_failures_total are always present, with per-table
+    retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for
+    any table with a non-zero count. Read the two totals TOGETHER - a zero
+    declines total only means the endpoint's clock is behaving if the failures
+    total is also zero. Scrape this across the fleet to find hosts whose clocks
+    need attention; the agent has no /metrics endpoint.
   tags: [tar, timeline, monitoring, diagnostics]
 
 spec:
@@ -36,14 +54,29 @@ spec:
     columns:
       - name: record_count
         type: int64
+        description: 'Total number of TAR event rows currently stored across all warehouse tables. Values: non-negative integer.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: oldest_timestamp
         type: int64
+        description: 'Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty. Values: epoch seconds, or 0.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: newest_timestamp
         type: int64
+        description: 'Unix epoch seconds of the newest event row, or 0 when the warehouse is empty. Values: epoch seconds, or 0.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: db_size_bytes
         type: int64
+        description: 'Size in bytes of tar.db on disk. Values: non-negative integer.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: retention_days
         type: int32
+        description: 'Currently configured retention window in days (see configure.retention_days). Values: 1-365.'
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get TAR database status"
 
@@ -134,14 +167,30 @@ spec:
     columns:
       - name: timestamp
         type: int64
+        description: Unix epoch seconds the event was recorded.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: event_type
         type: string
+        description: 'Which capture source the row came from. Values: process, network, service, user, software, arp, dns, mapdrive.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: event_action
         type: string
+        description: 'The lifecycle verb for this event (e.g. started/stopped, appeared/removed, opened/closed); the vocabulary is source-specific. Values: free text, source-dependent verb.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: snapshot_id
         type: int64
+        description: 'Internal id of the collection cycle that produced this row, used to correlate rows from the same tick. Values: integer.'
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: detail_json
         type: clob
+        description: >-
+          JSON object with type-specific fields (see metadata.description for the per-type shape); empty string on the default (no type filter) union branches, which project only ts/event_type/action/snapshot_id. Values: JSON object, or empty string.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Query TAR events from ${from} to ${to} type=${type}"
 
@@ -193,8 +242,16 @@ spec:
     columns:
       - name: status
         type: string
+        description: >-
+          Outcome token for the forced snapshot. The actual response line is `tar|snapshot|complete` when every enabled source collected cleanly, or `tar|snapshot|partial|<comma-joined source names>` when one or more sources threw an incomplete-capture error and retained their previous baseline instead of collecting. Values: complete, partial.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: events_recorded
         type: int32
+        description: >-
+          Declared as a count of events the forced snapshot recorded; the current wire format (tar|snapshot|complete or |partial|<sources>) does not carry a numeric count, so this column is not populated — see Caveats and known gaps. Values: not emitted by the current wire format.
+        example: "-"
+        platforms: []
 
   readablePayload: "Force immediate TAR snapshot"
 
@@ -262,6 +319,12 @@ spec:
     columns:
       - name: json_output
         type: clob
+        description: >
+          A JSON array of event objects; each carries id, timestamp,
+          event_type, event_action, snapshot_id and a nested detail object
+          with type-specific fields.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Export TAR events as JSON"
 
@@ -512,8 +575,10 @@ spec:
         description: >
           Enable or disable the ARP / neighbour-table capture source (ADR-0015).
           Opt-in: "false" by default. See process_enabled for semantics.
-          Windows-only collector today (Linux/macOS planned). Requires agent
-          v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+          Native on every OS today: GetIpNetTable2 on Windows, /proc/net/arp
+          on Linux, and a route_sysctl dump on macOS (constrained there --
+          entry_type always reports "unknown"). Requires agent v0.12.0+;
+          older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       dns_enabled:
@@ -546,6 +611,121 @@ spec:
           opt-in posture; disabling leaves existing rows queryable).
           Requires agent v0.12.0+; older agents silently ignore. Valid:
           "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      power_enabled:
+        type: string
+        displayName: Power Transition Capture Enabled
+        description: >
+          Enable or disable the sleep/wake/AC-power transition source (power →
+          $Power_Live, cursor-model seam). **ON by default ("true")** — the
+          first works-council-class source to ship enabled. Note this is NOT
+          the product's first default-on source: process, tcp, service, user
+          and perf have always been on as machine-scope operational telemetry.
+          Of the eight sources added since 1.5 under the works-council opt-in
+          posture (procperf, netqual, module, software, arp, dns, netconn,
+          mapdrive) every one defaults OFF, and power is the first of THAT
+          class to diverge.
+          The divergence is deliberate, but it does NOT mean the data is
+          low-sensitivity: the SOC 2 data inventory classifies $Power_Live as
+          usage-class / behavioral-adjacent, because the TIMING of sleep/wake
+          and AC events is a presence and working-hours proxy. Treat it as
+          co-determination-relevant and use power_lookback_seconds=0 where a
+          retrospective read is not lawful.
+          The source WILL use a durable log-position cursor (not a snapshot
+          diff), so a restart will resume from where it left off rather than
+          re-scanning; a lost/invalid cursor or a wrapped OS event log will
+          re-baseline forward and record a capture_gap rather than replaying
+          from the beginning.
+          Set to "false" to opt out. Requires agent v0.12.0+; older agents
+          silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      power_lookback_seconds:
+        type: string
+        displayName: Power History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the power source's first read may reach
+          into OS-retained sleep/wake/AC-power history (same shape as
+          netconn_lookback_seconds, ADR-0020). Set to "0" to disable the
+          pre-enablement read entirely (forward-only from the moment it is
+          enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7
+          days). Applies to the first read after enablement (and after a late
+          enable); once caught up the source reads only forward. Effective on
+          macOS only — Windows and Linux have no power-history API, so their
+          first read is always forward-only regardless of this value. Requires
+          agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
+      removable_enabled:
+        type: string
+        displayName: Removable Media Capture Enabled
+        description: >
+          Enable or disable the removable-media attach/detach source
+          (removable → $Removable_Live, cursor-model seam), including
+          exec_from_removable correlation (a process observed running from a
+          removable volume). **ON by default ("true")** — the first
+          works-council-class source to ship enabled, alongside power. This is
+          NOT the product's first default-on source: process, tcp, service,
+          user and perf have always been on as machine-scope operational
+          telemetry. Of the eight sources added since 1.5 under the
+          works-council opt-in posture every one defaults OFF, and removable is
+          one of the first two of THAT class to diverge.
+          The divergence is deliberate and it does NOT mean the data is
+          low-sensitivity — this is the MORE sensitive of the two. The SOC 2
+          data inventory classifies $Removable_Live as usage/identity-class:
+          it records device vendor, product and SERIAL, plus the executed
+          binary path and pid of any process running from a removable volume.
+          Treat it as co-determination-relevant and set
+          removable_lookback_seconds=0 where a retrospective read of OS-retained
+          removable history is not lawful.
+          The source WILL use the same durable log-position cursor model as
+          power (see power_enabled) — a lost/invalid cursor will re-baseline
+          forward and record a capture_gap rather than replaying history.
+          Queried via tar.sql only ($Removable_Live); the legacy tar.query /
+          tar.export actions do not surface removable. Set to "false"
+          to opt out. Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      removable_lookback_seconds:
+        type: string
+        displayName: Removable Media History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the removable source's first read may
+          reach into OS-retained device-attach history (same shape as
+          netconn_lookback_seconds / power_lookback_seconds above). Set to "0"
+          to disable the pre-enablement read entirely (forward-only from the
+          moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default
+          604800 (7 days). Applies to the first read after enablement (and
+          after a late enable); once caught up the source reads only forward.
+          Requires agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
+      usage_enabled:
+        type: string
+        displayName: Application Usage Capture Enabled
+        description: >
+          Enable or disable the `usage` derived fold (usage → $Usage_Live /
+          $Usage_Daily), a checked_transaction-based pairing of the process
+          source's started/stopped events into per-executable run/duration
+          aggregates plus a per-day distinct-user count. **ON by default
+          ("true")** — joining power/removable as a works-council-class
+          source shipping enabled; process, tcp, service, user and perf are
+          already default-on as machine-scope operational telemetry.
+          The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as
+          usage-class / behavioral-adjacent: $Usage_Live persists the owning
+          pid and user for each open run, and the per-day username
+          membership (queryable via tar.sql) reveals which applications run
+          on a device, when, and by whom. Treat as co-determination-relevant,
+          same basis as power/removable.
+          Forward-only, no retrospective backfill: disabling and later
+          re-enabling always re-baselines from the moment of re-enable, never
+          a retrospective fold over whatever process history accrued during
+          the disabled window — this is a lifecycle-state-machine property,
+          not a best-effort marker check. Set to "false" to opt out.
+          Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"
       network_capture_method:
@@ -587,8 +767,16 @@ spec:
     columns:
       - name: key
         type: string
+        description: >-
+          Name of one configuration setting that was changed by this call (e.g. retention_days, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs.
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: >-
+          The new value that was persisted for that key, as a string (post-clamp / post-validation where the parameter defines one). Values: free text, mirrors the parameter's own type/values.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Configure TAR settings"
 
@@ -596,7 +784,7 @@ spec:
     ttlSeconds: 60
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -640,6 +828,10 @@ spec:
     columns:
       - name: events_recorded
         type: int32
+        description: >-
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable. Values: non-negative integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Run TAR fast collection (processes + network)"
 
@@ -692,6 +884,10 @@ spec:
     columns:
       - name: events_recorded
         type: int32
+        description: >-
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `tar|collect_slow|<events_recorded>|<token>` (same token vocabulary as collect_fast). Values: non-negative integer.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Run TAR slow collection (services + users)"
 
@@ -753,7 +949,10 @@ spec:
     columns:
       - name: output
         type: clob
-        description: "header|... or row|source|os|status|capture_method|notes lines"
+        description: >-
+          One `header|source|os|status|capture_method|notes` line, then one `row|<source>|<os>|<status>|<capture_method>|<notes>` line per registered capture source x OS combination (every OS, not only the host's own). Values: header|... or row|... lines; status is supported, constrained, planned, or unsupported.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show TAR OS compatibility matrix"
 
@@ -812,7 +1011,10 @@ spec:
     columns:
       - name: json_output
         type: clob
-        description: "Single fleet_snapshot.v1 JSON document"
+        description: >-
+          A single fleet_snapshot.v1 JSON document: hostname, timestamp, local IPs, up to 4096 processes and 4096 TCP connections (each list truncated with a truncated_processes / truncated_connections flag), and source_paused.* markers when process or tcp capture is paused. Values: JSON object (fleet_snapshot.v1).
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Collect fleet topology snapshot"
 

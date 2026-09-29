@@ -7,6 +7,11 @@ name: Cache prune
 # port — acceptable, since stale-by-mtime ports are by definition not in
 # the active build's working set.
 #
+# Also sweeps leaked yuzu_test_* databases off the persistent self-hosted
+# Postgres instances (#1367, scripts/ci/sweep-test-databases.sh) — the
+# out-of-band counterpart to the suite-start sweeper from PR #2091, so
+# leaks reclaim even on a box that stops running [pg] legs.
+#
 # Does NOT touch:
 #   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache) — its own LRU at
 #     CCACHE_MAXSIZE=30G already handles eviction without our help.
@@ -34,7 +39,7 @@ jobs:
   prune-linux:
     name: "Prune Linux runner cache"
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 10
+    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
     steps:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
@@ -71,10 +76,69 @@ jobs:
           after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           echo "buildx chisel cache: before=${before} after=${after}"
 
+      - name: Sweep leaked healthcheck-gate containers and images (#751)
+        run: |
+          set -eu
+          # scripts/ci/verify-healthcheck-invariants.sh starts a `yuzu-hc-probe-*`
+          # listener container, and its workflows `docker load` a
+          # `yuzu-hc-verify/<role>:<sha>` image. Both are cleaned up in-job, but a
+          # SIGKILL (cancellation grace period expiring, job timeout, daemon
+          # crash) can outrun that cleanup, and Big Tam has no blanket
+          # `docker system prune`, so nothing else would ever reclaim them.
+          #
+          # AGE-FILTERED on purpose. The gate itself must never sweep by name at
+          # startup: Big Tam runs four runners against ONE dockerd and the verify
+          # matrix is five wide, so a name-scoped sweep would `docker rm -f` a
+          # sibling job's LIVE listener mid-probe and fail it with a confident but
+          # false "the tool is missing". `until=24h` cannot do that — the verify
+          # job's timeout is 120 min, so nothing 24h old is still in use.
+          docker ps -aq --filter 'name=^yuzu-hc-probe-' --filter 'until=24h' \
+            | xargs -r docker rm -f || true
+          docker image ls --filter 'reference=yuzu-hc-verify/*' --filter 'until=24h' -q \
+            | xargs -r docker image rm -f || true
+          echo "healthcheck-gate leftovers older than 24h swept"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # clean: false is load-bearing on the self-hosted agents: they share
+          # one per-repo workspace with ci.yml's build jobs (which also set it),
+          # and the default git clean -ffdx would wipe the warm build-*/ and
+          # vcpkg_installed/ trees this workflow's own header promises not to
+          # touch.
+          clean: false
+
+      - name: Sweep leaked yuzu_test_* databases (#1367)
+        run: bash scripts/ci/sweep-test-databases.sh
+
+  prune-macos:
+    name: "Prune macOS runner cache"
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
+    timeout-minutes: 15  # parity with the sibling prune jobs
+    steps:
+      - name: Prune vcpkg binary cache zips older than 30 days
+        run: |
+          set -eu
+          # RUNNER_TOOL_CACHE on the BigMags Mac Minis; the macos job in ci.yml
+          # keys its vcpkg binary cache under ${runner.tool_cache}/yuzu-vcpkg-binary-cache-macos.
+          base="${RUNNER_TOOL_CACHE:-}"
+          if [[ -z "$base" || ! -d "$base" ]]; then
+            echo "::warning::RUNNER_TOOL_CACHE not found at '$base' — skipping"
+            exit 0
+          fi
+          echo "Pruning vcpkg binary-cache zips older than 30 days under: $base"
+          # `-type f` because the cache subdirs are kept; only the zip
+          # contents age out. -mtime +30 = strictly older than 30 days.
+          # Print before delete so the workflow log shows what went.
+          before_total=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f 2>/dev/null | wc -l || echo 0)
+          deleted=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
+          after_total=$(find "$base/yuzu-vcpkg-binary-cache-macos" -type f 2>/dev/null | wc -l || echo 0)
+          echo "before=${before_total} deleted=${deleted} after=${after_total}"
+
   prune-windows:
     name: "Prune Windows runner cache"
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
-    timeout-minutes: 10
+    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
     defaults:
       run:
         # MSYS2 bash for the same `find -mtime` semantics. Same shell
@@ -84,6 +148,12 @@ jobs:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
           set -eu
+          # System32 precedes /usr/bin on these runners' PATH (the same fact
+          # that forces the `source`-not-`bash` idiom below), so a bare `find`
+          # is Windows find.exe — its errors were swallowed by 2>/dev/null and
+          # this step pruned nothing while printing before=0 deleted=0.
+          # Prepend /usr/bin so coreutils win.
+          export PATH="/usr/bin:$PATH"
           # RUNNER_TOOL_CACHE on Windows is typically C:\actions-runner\_work\_tool
           # which msys2 bash sees as /c/actions-runner/_work/_tool. Use the
           # native env var directly; bash treats forward+back slashes equivalently
@@ -98,3 +168,21 @@ jobs:
           deleted=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
           after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
           echo "before=${before_total} deleted=${deleted} after=${after_total}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # clean: false is load-bearing on the self-hosted agents: they share
+          # one per-repo workspace with ci.yml's build jobs (which also set it),
+          # and the default git clean -ffdx would wipe the warm build-*/ and
+          # vcpkg_installed/ trees this workflow's own header promises not to
+          # touch.
+          clean: false
+
+      - name: Sweep leaked yuzu_test_* databases (#1367)
+        # `source`, not `bash`: same idiom as ci.yml's ensure-postgres step —
+        # the bare `bash` resolves to the System32 WSL stub under LOCAL
+        # SYSTEM, while this step already runs inside MSYS2 bash (job
+        # default shell). The script ends in an explicit exit, so sourcing
+        # is safe.
+        run: source scripts/ci/sweep-test-databases.sh

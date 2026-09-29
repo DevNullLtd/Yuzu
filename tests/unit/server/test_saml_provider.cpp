@@ -120,6 +120,12 @@ struct SamlTestFixture {
     ///        make_attribute_statement) embedded in the UNSIGNED injected
     ///        assertion — qa-S3, proves group extraction never leaks a value
     ///        from the unverified node.
+    /// @param name_id_format    ADR-2001 PR4a — the NameID Format attribute
+    ///        value. Defaults to the SAML 1.1 emailAddress format (a
+    ///        STABLE/linkable format, matching the codebase's original
+    ///        hardcoded behaviour). Pass an empty string to omit the
+    ///        Format attribute entirely (models an IdP that never sends
+    ///        one — the "missing Format" case).
     std::string make_response(
         const std::string& request_id,
         const std::string& name_id        = "user@example.com",
@@ -131,7 +137,9 @@ struct SamlTestFixture {
         bool use_sha1_algorithms           = false,
         bool use_sha1_digest_only          = false,
         const std::string& attribute_statement_xml = {},
-        const std::string& evil_attribute_statement_xml = {}) const
+        const std::string& evil_attribute_statement_xml = {},
+        const std::string& name_id_format =
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress") const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -195,7 +203,8 @@ struct SamlTestFixture {
               "</ds:Signature>"
               "<saml:Subject>"
                 "<saml:NameID"
-                  " Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">"
+                  + (name_id_format.empty() ? std::string{} : " Format=\"" + name_id_format + "\"")
+                  + ">"
                   + name_id +
                 "</saml:NameID>"
                 "<saml:SubjectConfirmation"
@@ -960,6 +969,179 @@ static std::string extract_request_id_from_url(const std::string& url) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers: AuthnRequest signature reconstruction/verification (HTTP-Redirect
+// binding detached query-string signature — SAML 2.0 core §3.4.4.1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string url_decode_simple(const std::string& encoded) {
+    std::string out;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        if (encoded[i] == '%' && i + 2 < encoded.size()) {
+            char hex[3] = {encoded[i + 1], encoded[i + 2], 0};
+            out += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+        } else if (encoded[i] == '+') {
+            out += ' ';
+        } else {
+            out += encoded[i];
+        }
+    }
+    return out;
+}
+
+static std::vector<unsigned char> std_b64_decode(const std::string& b64) {
+    static constexpr unsigned char kT[256] = {
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64, 64,64,64,62,64,64,64,63,
+        52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+        64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+        // 128-255: 64
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,
+    };
+    std::vector<unsigned char> out;
+    unsigned int val = 0;
+    int bits = -8;
+    for (unsigned char c : b64) {
+        if (kT[c] == 64) continue;
+        val = (val << 6) | kT[c];
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<unsigned char>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+/// Returns the substring of `url` after '?' and before "&Signature=" — the
+/// exact octet-string the production code signs. Empty when the URL carries
+/// no "&Signature=" marker.
+static std::string extract_signed_base(const std::string& url) {
+    const auto q_pos = url.find('?');
+    if (q_pos == std::string::npos) return {};
+    const auto sig_marker = url.find("&Signature=", q_pos);
+    if (sig_marker == std::string::npos) return {};
+    return url.substr(q_pos + 1, sig_marker - (q_pos + 1));
+}
+
+/// Returns the raw (URL- and base64-decoded) signature bytes from the
+/// "&Signature=" parameter of `url`. Empty when absent.
+static std::vector<unsigned char> extract_signature_bytes(const std::string& url) {
+    static const std::string kMarker = "&Signature=";
+    const auto pos = url.find(kMarker);
+    if (pos == std::string::npos) return {};
+    const auto encoded = url.substr(pos + kMarker.size());
+    return std_b64_decode(url_decode_simple(encoded));
+}
+
+/// Verify a detached RSA-SHA256 signature (EXPLICIT PKCS#1 v1.5 padding) over
+/// `base` using the public component of `priv_key_pem`. Mirrors the exact
+/// padding contract of the production rsa_sha256_sign — using a private-key
+/// PEM here is fine, OpenSSL verify only consumes the public numbers it
+/// carries.
+static bool verify_rsa_sha256(const std::string& priv_key_pem, const std::string& base,
+                               const std::vector<unsigned char>& sig) {
+    BIO* bio = BIO_new_mem_buf(priv_key_pem.data(), static_cast<int>(priv_key_pem.size()));
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_MD_CTX* c; ~CtxGuard() { EVP_MD_CTX_free(c); } } cg{ctx};
+
+    EVP_PKEY_CTX* pctx = nullptr;
+    REQUIRE(EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), nullptr, pkey) == 1);
+    REQUIRE(pctx != nullptr);
+    REQUIRE(EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) > 0);
+    REQUIRE(EVP_DigestVerifyUpdate(ctx, base.data(), base.size()) == 1);
+    return EVP_DigestVerifyFinal(ctx, sig.data(), sig.size()) == 1;
+}
+
+/// Generate a fresh EC (P-256) private key PEM — used to prove a non-RSA
+/// signing key is rejected.
+static std::string generate_ec_key_pem() {
+    EVP_PKEY* pkey = EVP_EC_gen("P-256");
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid RSA-2048 key, PEM-encoded AES-256-CBC passphrase-encrypted. The
+/// provider must reject it WITHOUT prompting for the passphrase (UP-1).
+static std::string generate_encrypted_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(2048);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    std::string pass = "test-passphrase";
+    REQUIRE(PEM_write_bio_PrivateKey(
+                bio, pkey, EVP_aes_256_cbc(),
+                reinterpret_cast<unsigned char*>(pass.data()),
+                static_cast<int>(pass.size()), nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid but WEAK (1024-bit) unencrypted RSA key — below the 2048-bit floor.
+static std::string generate_small_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(1024);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid RSA-PSS key (EVP_PKEY_RSA_PSS base id) — must be rejected by the
+/// RSA-only gate, never signed with PKCS#1 v1.5.
+static std::string generate_rsa_pss_key_pem() {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA_PSS, nullptr);
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
+    REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
+    REQUIRE(EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) == 1);
+    EVP_PKEY* pkey = nullptr;
+    REQUIRE(EVP_PKEY_keygen(ctx, &pkey) == 1);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TEST CASES
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1021,6 +1203,166 @@ TEST_CASE("SAML: build_authn_request generates valid redirect URL", "[saml]") {
     CHECK(request_id[0] == '_');
 }
 
+TEST_CASE("SAML: build_authn_request is unsigned when no SP signing key is configured "
+          "(backward-compat)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    REQUIRE(cfg.sp_signing_key_pem.empty());
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request("myrelay");
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    // Matches the existing unsigned shape exactly: "?SAMLRequest=...&RelayState=...".
+    CHECK(url.starts_with(f.idp_sso_url + "?SAMLRequest="));
+    CHECK(url.find("&RelayState=") != std::string::npos);
+    CHECK(url.find("SigAlg=") == std::string::npos);
+    CHECK(url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: build_authn_request signs the redirect URL when an SP signing key is "
+          "configured",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = f.priv_key_pem; // RSA-2048 — exactly our supported type
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request("myrelay");
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    CHECK(url.find("&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256") !=
+          std::string::npos);
+    CHECK(url.find("&Signature=") != std::string::npos);
+
+    const auto base = extract_signed_base(url);
+    REQUIRE_FALSE(base.empty());
+    CHECK(base.starts_with("SAMLRequest="));
+    CHECK(base.find("&RelayState=") != std::string::npos);
+    CHECK(base.find("myrelay") != std::string::npos); // "myrelay" is alnum-only, url_encode is a no-op
+    CHECK(base.find("&SigAlg=") != std::string::npos);
+    CHECK(base.find("&Signature=") == std::string::npos); // extract_signed_base stops there
+
+    const auto sig = extract_signature_bytes(url);
+    REQUIRE_FALSE(sig.empty());
+    CHECK(verify_rsa_sha256(f.priv_key_pem, base, sig));
+
+    // MUTATION-CHECK: tampering a single byte of the signed base must fail
+    // verification — proves the test isn't accidentally verifying against
+    // an empty/always-true signature.
+    std::string tampered = base;
+    tampered[0] = (tampered[0] == 'S') ? 'X' : 'S';
+    CHECK_FALSE(verify_rsa_sha256(f.priv_key_pem, tampered, sig));
+}
+
+TEST_CASE("SAML: signed AuthnRequest with empty RelayState omits RelayState from the signed "
+          "base entirely",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = f.priv_key_pem;
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request(""); // no relay state
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    const auto base = extract_signed_base(url);
+    REQUIRE_FALSE(base.empty());
+    // Never "RelayState=" — omitted entirely, not present-but-empty.
+    CHECK(base.find("RelayState=") == std::string::npos);
+    CHECK(base.starts_with("SAMLRequest="));
+    CHECK(base.find("&SigAlg=") != std::string::npos);
+
+    const auto sig = extract_signature_bytes(url);
+    REQUIRE_FALSE(sig.empty());
+    CHECK(verify_rsa_sha256(f.priv_key_pem, base, sig));
+}
+
+TEST_CASE("SAML: a non-RSA (EC) SP signing key is rejected — signing stays disabled", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_ec_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK(p.signing_init_error().find("RSA") != std::string::npos);
+
+    // The provider itself may still be otherwise enabled (IdP verification is
+    // independent of SP signing) — but the redirect URL must never carry a
+    // signature produced from a rejected key. Assert the URL is present
+    // UNCONDITIONALLY: a future regression that made is_enabled() false on a
+    // broken signing key would otherwise make this check silently vacuous.
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: a malformed SP signing key PEM is rejected", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = "not a key";
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+}
+
+TEST_CASE("SAML: a weak (1024-bit) SP signing key is rejected — below the 2048-bit floor",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_small_rsa_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: an RSA-PSS SP signing key is rejected by the RSA-only gate", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_rsa_pss_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: an encrypted (passphrase-protected) SP signing key is rejected "
+          "without prompting",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_encrypted_rsa_key_pem();
+    // If the ctor ever fell back to OpenSSL's default password callback this
+    // would prompt on /dev/tty and hang the test; the no-op callback makes it
+    // fail closed deterministically instead. (UP-1)
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
 TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {
     const auto& f  = fixture();
     auto cfg       = f.make_config();
@@ -1037,6 +1379,97 @@ TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {
 
     REQUIRE(result.has_value());
     CHECK(result->name_id == "user@example.com");
+}
+
+// ── ADR-2001 PR4a — NameID Format extraction (SamlAssertion::name_id_format) ──
+//
+// Pure extraction coverage: the verifier never rejects on Format — the
+// stable-vs-transient decision is entirely the login-site linking
+// orchestration's (saml_scim_link.hpp, test_saml_scim_link.cpp). These tests
+// pin that the verifier faithfully surfaces whatever Format the verified
+// assertion carried (or an empty string when it carried none).
+
+TEST_CASE("SAML: default NameID Format (SAML 1.1 emailAddress) is extracted verbatim",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // fixture's make_response default Format is the SAML 1.1 emailAddress
+    // format — matches the codebase's original hardcoded behaviour.
+    const auto response_b64 = f.make_response(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
+}
+
+TEST_CASE("SAML: NameID Format persistent is extracted verbatim", "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, {}, {},
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent");
+}
+
+TEST_CASE("SAML: NameID Format transient is extracted verbatim (still accepted by the "
+          "verifier — the reject-for-linking decision lives at the login-site orchestration)",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, {}, {},
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:2.0:nameid-format:transient");
+}
+
+TEST_CASE("SAML: a NameID with no Format attribute extracts an empty name_id_format — the "
+          "login still succeeds",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Empty name_id_format arg → make_response omits the Format attribute
+    // entirely, modelling an IdP that never sends one.
+    const auto response_b64 = f.make_response(request_id, "user@example.com", 3600, {}, {}, false,
+                                              nullptr, false, false, {}, {}, /*name_id_format=*/"");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "user@example.com");
+    CHECK(result->name_id_format.empty());
 }
 
 TEST_CASE("SAML: tampered assertion body after signing is rejected", "[saml]") {
@@ -1215,7 +1648,7 @@ TEST_CASE("SAML: empty group_attribute parses no groups (thin-slice-compatible d
     CHECK(result->groups.empty());
 }
 
-TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
+TEST_CASE("SAML: group values are capped at kMaxGroupValues entries (DoS guard)", "[saml]") {
     const auto& f  = fixture();
     auto cfg       = f.make_config();
     cfg.group_attribute = "groups";
@@ -1226,8 +1659,15 @@ TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
     const auto& cookie_secret = authn_result.cookie_secret;
     REQUIRE_FALSE(request_id.empty());
 
+    // This calls SamlProvider::validate_response DIRECTLY (no HTTP layer —
+    // unlike test_saml_routes.cpp's TestRouteSink-mediated tests, there is
+    // no httplib CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=8192 wire
+    // cap to fit under here), so this is the right place to exercise the
+    // full DoS-cap boundary at kMaxGroupValues=200 (aligned with
+    // RbacStore::kMaxIdpGroupsPerLogin — SAML fine-grained RBAC).
+    const auto cap = yuzu::server::saml::kMaxGroupValues;
     std::vector<std::string> many_values;
-    for (int i = 0; i < 100; ++i) many_values.push_back("group" + std::to_string(i));
+    for (std::size_t i = 0; i < cap + 50; ++i) many_values.push_back("group" + std::to_string(i));
     const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", many_values);
     const auto response_b64 = f.make_response(
         request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
@@ -1235,9 +1675,9 @@ TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
     const auto result = p.validate_response(response_b64, cookie_secret);
 
     REQUIRE(result.has_value());
-    CHECK(result->groups.size() == 64);
+    CHECK(result->groups.size() == cap);
     CHECK(result->groups.front() == "group0");
-    CHECK(result->groups.back() == "group63");
+    CHECK(result->groups.back() == "group" + std::to_string(cap - 1));
 }
 
 TEST_CASE("SAML: empty <AttributeValue/> is skipped, not pushed (UP-8)", "[saml]") {
@@ -1359,6 +1799,175 @@ TEST_CASE("SAML: XSW — second injected Assertion is still rejected when attrib
 
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("XSW") != std::string::npos);
+}
+
+// ── AttributeStatement: display-name / email session-enrichment ─────────────
+
+TEST_CASE("SAML: name/email attributes parse into assertion.display_name/email", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute  = "http://schemas.microsoft.com/identity/claims/displayname";
+    cfg.email_attribute = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // One signed AttributeStatement carrying both attributes (extract walks all
+    // statements, so concatenated per-attribute statements are equivalent).
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement(cfg.name_attribute, {"Ada Lovelace"}) +
+        SamlTestFixture::make_attribute_statement(cfg.email_attribute, {"ada@example.com"});
+    const auto response_b64 = f.make_response(request_id, "ada-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "ada-nameid");
+    CHECK(result->display_name == "Ada Lovelace");
+    CHECK(result->email == "ada@example.com");
+}
+
+TEST_CASE("SAML: unset name/email attribute config yields empty display_name/email "
+          "(backward-compatible)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config(); // name_attribute / email_attribute unset (default)
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // The assertion DOES carry attributes; with the flags unset they must be
+    // ignored (the session then falls back to the raw NameID, exactly as before).
+    const auto attr_stmt = SamlTestFixture::make_attribute_statement(
+        "http://schemas.microsoft.com/identity/claims/displayname", {"Ada Lovelace"});
+    const auto response_b64 = f.make_response(request_id, "ada-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->display_name.empty());
+    CHECK(result->email.empty());
+}
+
+TEST_CASE("SAML: name attribute takes the FIRST non-empty value; empty values skipped", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute = "displayName";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // First value empty, second the real name, third a decoy — first non-empty wins.
+    const auto attr_stmt =
+        SamlTestFixture::make_attribute_statement("displayName", {"", "Grace Hopper", "decoy"});
+    const auto response_b64 = f.make_response(request_id, "grace-nameid", 3600, {}, {}, false,
+                                              nullptr, false, false, attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    REQUIRE(result.has_value());
+    CHECK(result->display_name == "Grace Hopper");
+}
+
+TEST_CASE("SAML: XSW — name/email from an unsigned injected Assertion never leak into "
+          "display_name/email (qa-S3 parity)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute  = "displayName";
+    cfg.email_attribute = "email";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // The legit SIGNED assertion carries NO enrichment attributes. The evil
+    // UNSIGNED injected assertion carries a display name and email. Same
+    // guarantee as the group qa-S3 test: extraction is scoped to the
+    // XSW-verified node, so an injected value must never reach display_name/
+    // email — and today's exactly-one-Assertion rule rejects the doc outright.
+    const auto evil_attr_stmt =
+        SamlTestFixture::make_attribute_statement("displayName", {"Attacker"}) +
+        SamlTestFixture::make_attribute_statement("email", {"attacker@evil.example"});
+    const auto response_b64 =
+        f.make_response(request_id, "victim-nameid", 3600, {}, {}, /*inject_extra_assertion=*/true,
+                        nullptr, false, false, /*attribute_statement_xml=*/{}, evil_attr_stmt);
+
+    const auto result = p.validate_response(response_b64, cookie_secret);
+    if (result.has_value()) {
+        CHECK(result->display_name != "Attacker");
+        CHECK(result->email != "attacker@evil.example");
+        CHECK(result->display_name.empty());
+        CHECK(result->email.empty());
+    } else {
+        CHECK(result.error().find("XSW") != std::string::npos);
+    }
+}
+
+TEST_CASE("SAML: a display-name attribute value is sanitised — control chars stripped, length "
+          "clamped (#2396-adjacent Gate 4 UP-1/2/3)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.name_attribute = "displayName";
+    SamlProvider p{cfg};
+
+    const auto authn_result   = p.build_authn_request("relay");
+    const auto request_id     = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    SECTION("internal newline is stripped (no log-record forgery)") {
+        // A value carrying a newline + a fake log tail — the newline MUST NOT
+        // survive into display_name (it would forge a second spdlog line).
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement(
+            "displayName", {"Alice&#10;SAML session created for 'admin' (role=Administrator)"});
+        const auto response_b64 = f.make_response(request_id, "alice-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.find('\n') == std::string::npos);
+        CHECK(result->display_name.find('\r') == std::string::npos);
+        // The visible text survives (concatenated), only the control char is gone.
+        CHECK(result->display_name.find("Alice") != std::string::npos);
+    }
+
+    SECTION("an over-long ASCII value is clamped") {
+        const std::string huge(5000, 'x');
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement("displayName", {huge});
+        const auto response_b64 = f.make_response(request_id, "big-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.size() <= 256);
+        CHECK(result->display_name.size() > 0); // not emptied
+    }
+
+    SECTION("clamp lands on a UTF-8 codepoint boundary, never mid-sequence (adv-review K4)") {
+        // 100 × '€' (U+20AC = E2 82 AC, 3 bytes) = 300 bytes. A naive resize(256)
+        // would split the 86th char mid-sequence (byte 256 is a continuation
+        // byte); the back-up loop must retreat to byte 255 → 85 whole chars.
+        std::string euros;
+        for (int i = 0; i < 100; ++i) euros += "\xe2\x82\xac";
+        const auto attr_stmt = SamlTestFixture::make_attribute_statement("displayName", {euros});
+        const auto response_b64 = f.make_response(request_id, "euro-nameid", 3600, {}, {}, false,
+                                                  nullptr, false, false, attr_stmt);
+        const auto result = p.validate_response(response_b64, cookie_secret);
+        REQUIRE(result.has_value());
+        CHECK(result->display_name.size() <= 256);
+        CHECK(result->display_name.size() % 3 == 0);   // only whole 3-byte codepoints survive
+        CHECK(result->display_name.size() == 255);     // 85 × 3, not a mid-sequence 256
+    }
 }
 
 TEST_CASE("SAML: expired assertion (NotOnOrAfter in past) is rejected", "[saml]") {

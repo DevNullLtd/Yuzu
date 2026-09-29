@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,15 @@ using yuzu::server::build_comparison;
 using yuzu::server::pg::PgPool;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): mirrors the
+// tests' store set (the reader carries no migration of its own).
+yuzu::test::PgTestTemplate apperf_cohort_tpl{"apperf_cohort", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AppPerfDailyStore b1{pool};
+    AppPerfCohortReader reader{pool};
+    if (!b1.is_open())
+        throw std::runtime_error("apperf_cohort template: store failed to migrate");
+}};
 std::int64_t today_utc() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -56,7 +66,7 @@ bool has(const std::vector<AppPerfCohortRow>& v, const std::string& agent, const
 } // namespace
 
 TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions", "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_cohort_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore b1{pool};
@@ -123,7 +133,7 @@ TEST_CASE("AppPerfCohortReader returns ONLY members × app × the two versions",
 
 TEST_CASE("AppPerfCohortReader windows in SQL — most-recent N days per (agent,version)",
           "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_cohort_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore b1{pool};
@@ -155,7 +165,7 @@ TEST_CASE("AppPerfCohortReader windows in SQL — most-recent N days per (agent,
 
 TEST_CASE("AppPerfCohortReader: the SQL window is PER-(agent,version) — staggered upgrade still pairs",
           "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_cohort_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore b1{pool};

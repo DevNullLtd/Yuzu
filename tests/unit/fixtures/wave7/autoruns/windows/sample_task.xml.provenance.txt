@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: Export-ScheduledTask -TaskName "PolicyConverter" -TaskPath "\Microsoft\Windows\AppID\" (task named in task_name.txt)
+date: 2026-09-06
+status: REAL CAPTURE
+note: existing stock Microsoft scheduled task, not created for this capture

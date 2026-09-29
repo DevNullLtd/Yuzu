@@ -1,0 +1,8 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5789eff1c673
+== action=chargen_start
+[not captured] Mutating/Reversible: not executed on a live host
+
+== action=chargen_stop
+chargen stopped
+[result_status] UNDECLARED / UNKNOWN / 
+

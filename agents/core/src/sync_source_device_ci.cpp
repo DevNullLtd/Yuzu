@@ -1,7 +1,7 @@
 #include "sync_source_device_ci.hpp"
 
 #include "local_dispatcher.hpp"
-#include "sync_source_installed_software.hpp" // reuse yuzu::agent::sha256_hex
+#include "sync_canonical.hpp" // sanitize_utf8_strict / clamp_field / sha256_hex
 
 #include <spdlog/spdlog.h>
 
@@ -26,87 +26,12 @@ constexpr std::size_t kMaxFieldLen = 1024;
 constexpr std::size_t kMaxBlobBytes = 64u * 1024;
 
 // ── UTF-8 scrub + field clamp ───────────────────────────────────────────────
-//
-// VERBATIM copy of sync_source_installed_software.cpp's sanitize_utf8_strict +
-// clamp_field. The bytes MUST be identical here, in sync_source_installed_software,
-// AND in the server's device_ci_ingestion.cpp (parse), or the agent- and
-// server-recomputed canonical hashes diverge → permanent need_full. Scrub BEFORE
-// clamp (U+FFFD is 3 bytes, so scrubbing can grow a field; clamping first would
-// apply a different budget on each side). Replaces every byte not part of a valid
-// PostgreSQL-UTF8 sequence (no overlong, no surrogates, nothing > U+10FFFF) with
-// U+FFFD — an invalid byte reaching PG is SQLSTATE 22021, which rolls back the
-// full-replace txn and makes the agent resend the identical poison forever.
-std::string sanitize_utf8_strict(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    const std::size_t n = s.size();
-    const auto cont = [&](std::size_t j) -> bool {
-        return j < n && (static_cast<unsigned char>(s[j]) & 0xC0) == 0x80;
-    };
-    std::size_t i = 0;
-    while (i < n) {
-        const unsigned char c = static_cast<unsigned char>(s[i]);
-        const unsigned char c1 = i + 1 < n ? static_cast<unsigned char>(s[i + 1]) : 0;
-        std::size_t len = 0;
-        bool ok = false;
-        if (c < 0x80) {
-            ok = true;
-            len = 1;
-        } else if (c >= 0xC2 && c <= 0xDF) {
-            ok = cont(i + 1);
-            len = 2;
-        } else if (c == 0xE0) {
-            ok = c1 >= 0xA0 && c1 <= 0xBF && cont(i + 2); // reject overlong 80..9F
-            len = 3;
-        } else if (c >= 0xE1 && c <= 0xEC) {
-            ok = cont(i + 1) && cont(i + 2);
-            len = 3;
-        } else if (c == 0xED) {
-            ok = c1 >= 0x80 && c1 <= 0x9F && cont(i + 2); // reject surrogates A0..BF
-            len = 3;
-        } else if (c >= 0xEE && c <= 0xEF) {
-            ok = cont(i + 1) && cont(i + 2);
-            len = 3;
-        } else if (c == 0xF0) {
-            ok = c1 >= 0x90 && c1 <= 0xBF && cont(i + 2) && cont(i + 3); // reject overlong 80..8F
-            len = 4;
-        } else if (c >= 0xF1 && c <= 0xF3) {
-            ok = cont(i + 1) && cont(i + 2) && cont(i + 3);
-            len = 4;
-        } else if (c == 0xF4) {
-            ok = c1 >= 0x80 && c1 <= 0x8F && cont(i + 2) && cont(i + 3); // reject > U+10FFFF
-            len = 4;
-        }
-        if (ok) {
-            out.append(s.data() + i, len);
-            i += len;
-        } else {
-            out.append("\xEF\xBF\xBD", 3); // U+FFFD, advance one byte
-            i += 1;
-        }
-    }
-    return out;
-}
-
-std::string clamp_field(std::string_view raw) {
-    std::string f = sanitize_utf8_strict(raw);
-    if (f.size() > kMaxFieldLen) {
-        std::size_t end = kMaxFieldLen;
-        while (end > 0 && (static_cast<unsigned char>(f[end]) & 0xC0) == 0x80)
-            --end;
-        f.resize(end);
-    }
-    // Strip the canonical framing separators (and NUL) so a value can never corrupt
-    // the wire blob's structure (0x1F field / 0x1E record separators).
-    std::string out;
-    out.reserve(f.size());
-    for (char c : f) {
-        if (c == '\x1f' || c == '\x1e' || c == '\0')
-            continue;
-        out.push_back(c);
-    }
-    return out;
-}
+// sanitize_utf8_strict / clamp_field live in sync_canonical.{hpp,cpp} — one
+// agent-side implementation shared by every daily-sync source. The server's
+// copy in device_ci_ingestion.cpp (parse) must stay byte-for-byte identical,
+// or the agent- and server-recomputed canonical hashes diverge → permanent
+// need_full. This source's field cap is kMaxFieldLen above
+// (comment-coordinated with the server seam).
 
 // ── plugin-output parsing ───────────────────────────────────────────────────
 // Each plugin action writes pipe-delimited lines: `key|f1|f2|...`.
@@ -189,7 +114,7 @@ std::string device_ci_canonical_blob(const CiRecord& rec) {
     for (const auto& f : fields) {
         if (!first)
             canon += '\x1f';
-        canon += clamp_field(f);
+        canon += clamp_field(f, kMaxFieldLen);
         first = false;
     }
     canon += '\x1e';

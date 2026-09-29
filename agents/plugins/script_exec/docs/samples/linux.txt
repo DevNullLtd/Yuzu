@@ -1,0 +1,19 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash a6cac34c1781
+== action=exec command=echo args=yuzu-capture
+stdout|yuzu-capture
+exit_code|0
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=powershell script="Write-Output yuzu-capture"
+error|powershell action is Windows-only
+status|error
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=bash script="echo yuzu-capture"
+stdout|yuzu-capture
+exit_code|0
+status|ok
+[result_status] UNDECLARED / UNKNOWN / 
+

@@ -1,0 +1,24 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/viz/fleet/topology",
+    "capability_id": "get.fragments-viz-fleet-topology",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/viz/fleet/topology"
+    },
+    "mcp_twin": "get_fleet_topology",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/viz/host/{param}/topology",
+    "capability_id": "get.fragments-viz-host-param-topology",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/viz/host/{param}/topology"
+    },
+    "mcp_twin": "get_host_topology",
+    "status": "twinned"
+  }
+]

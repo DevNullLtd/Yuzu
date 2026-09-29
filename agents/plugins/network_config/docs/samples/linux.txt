@@ -1,0 +1,33 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3b5c27bfec23
+== action=adapters
+adapter|tunl0|-|0|down
+adapter|gre0|-|0|down
+adapter|gretap0|00:00:00:00:00:00|0|down
+adapter|erspan0|00:00:00:00:00:00|0|down
+adapter|ip_vti0|-|0|down
+adapter|ip6_vti0|-|0|down
+adapter|sit0|-|0|down
+adapter|ip6tnl0|-|0|down
+adapter|ip6gre0|-|0|down
+adapter|eth0|8e:8c:e7:4b:5d:b5|10000|up
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=ip_addresses
+ip|eth0|172.17.0.4|16|172.17.0.1
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_servers
+dns|system|192.168.65.7|IPv4
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=proxy
+proxy_type|none
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=dns_cache
+dns_cache|not_available|no systemd-resolved
+[result_status] UNAVAILABLE / PARTIAL / network_config:no_resolver_cache_tool
+
+== action=arp
+[result_status] UNDECLARED / UNKNOWN / 
+

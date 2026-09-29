@@ -1,0 +1,184 @@
+## Autoruns Definitions
+## Enumerates persistence sources ("what starts automatically") across
+## Windows, Linux and macOS.
+## Plugin: autoruns | Actions: list, catalog
+##
+## Sources by platform:
+##   Windows: Reg*W over HKLM Run/RunOnce/RunOnceEx/StartupApproved/Winlogon/
+##            AppInit_DLLs/IFEO, and every loaded/mountable HKU hive; the
+##            Startup folders (common + per-user); ITaskService COM for
+##            Scheduled Tasks; a bounded WMI root\subscription query for
+##            permanent event subscriptions.
+##   Linux:   file reads of /etc/crontab, /etc/cron.d, /etc/cron.{hourly,
+##            daily,weekly,monthly}, per-user crontabs, /etc/anacrontab,
+##            /var/spool/at, systemd system/user timer units,
+##            /etc/xdg/autostart + ~/.config/autostart, /etc/rc.local, and an
+##            /etc/init.d listing (script names only — not wired-in state).
+##   macOS:   CFPropertyListCreateWithData over launchd plists in
+##            /Library/LaunchDaemons, /Library/LaunchAgents,
+##            /System/Library/LaunchDaemons, /System/Library/LaunchAgents and
+##            ~/Library/LaunchAgents; file reads of /etc/periodic and
+##            /etc/emond.d/rules; Login Items is CONSTRAINED (private BTM
+##            database, no public API).
+##
+## `catalog` performs no OS call: it reflects the plugin's own static source
+## catalog (`kAutorunSourceCatalogVersion`) and which support level THIS
+## build declares for each source.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.autoruns.list
+  displayName: Autoruns
+  version: 1.0.0
+  description: >
+    Enumerates the plugin's versioned catalog of persistence sources across
+    the endpoint's operating system, from Run keys and Scheduled Tasks on
+    Windows to cron/systemd timers on Linux to launchd jobs on macOS. Every
+    source in the catalog reports a status row even when it produced no
+    entries, could not be read, is constrained by a documented gap (e.g.
+    macOS Login Items has no public read API; some `win_*_hku` sources
+    depend on a per-profile hive being reachable), or is not supported on
+    this OS, so a consumer never reads silence and infers "nothing
+    checked" — every one of those outcomes says so explicitly rather than
+    being omitted. `sources=` filters to a comma-separated list of source
+    ids (e.g. `win_run_hklm,win_scheduled_tasks`).
+  tags: [security, persistence, autoruns, startup]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: autoruns
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sources:
+        type: string
+        description: Comma-separated source ids to filter to. Empty means every source.
+
+  result:
+    # Two row shapes on one stream, discriminated by field 0:
+    #   source|<id>|<supported|constrained|unsupported>|<row_count>|<reason>
+    #   autorun|<source_id>|<catalog_version>|<location>|<entry>|<target>|
+    #          <args>|<enabled>|<scope>|<user>|<signed>|<mtime>
+    # A literal '|' inside any text field is folded to U+2502 (│) rather than
+    # backslash-escaped, so every row is a fixed field count under a plain
+    # split('|').
+    #
+    # field_1..field_11 cover the wider `autorun|` shape (11 data fields:
+    # source_id, catalog_version, location, entry, target, args, enabled,
+    # scope, user, signed, mtime); a `source|` row only populates
+    # field_1..field_4 (id/support/row_count/reason) and leaves the rest
+    # empty.
+    columns:
+      - name: row_kind
+        type: string
+      - name: field_1
+        type: string
+      - name: field_2
+        type: string
+      - name: field_3
+        type: string
+      - name: field_4
+        type: string
+      - name: field_5
+        type: string
+      - name: field_6
+        type: string
+      - name: field_7
+        type: string
+      - name: field_8
+        type: string
+      - name: field_9
+        type: string
+      - name: field_10
+        type: string
+      - name: field_11
+        type: string
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [autoruns]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.autoruns.catalog
+  displayName: Autoruns Source Catalog
+  version: 1.0.0
+  description: >
+    Reports the full autoruns source catalog and which support level this
+    agent build declares for each source, with no OS call — a pure
+    reflection of the plugin's own static catalog. Use this to confirm what
+    an agent version is capable of enumerating before relying on
+    `crossplatform.autoruns.list`'s coverage.
+  tags: [security, persistence, autoruns, capability]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: autoruns
+    action: catalog
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # catalog|<version> (one line) then one line per source:
+    # source|<id>|<supported|constrained|unsupported>|-|declared
+    columns:
+      - name: row_kind
+        type: string
+      - name: source_id
+        type: string
+      - name: support
+        type: string
+      - name: row_count
+        type: string
+      - name: reason
+        type: string
+    aggregation:
+      groupBy:
+        - support
+      operations:
+        - count
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [autoruns]
+
+status:
+  phase: active

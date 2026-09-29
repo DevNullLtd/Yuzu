@@ -1,0 +1,80 @@
+REAL CAPTURE (reduced + redacted)
+=================================
+Subject: Microsoft Edge (Chromium) profile file "Local State" (browser root). The same rig session also captured Default/Preferences, Default/Secure Preferences and one
+installed extension's manifest.json; those three files are the inputs of the per-profile `extensions` action, which follows as its own PR and commits them (with their own
+reduction/redaction record) then. They are NOT in this directory and nothing in this tree reads them.
+These fixtures are a REDUCED (subtrees dropped) and REDACTED (values replaced) copy of a real capture. The full raw copies are not published and are not in the ~/.claude mirror.
+CORRECTION (Architect arbitration, ws-10.2b P2b-2 R1, 2026-09-21): the raw copies were pulled to the Mac BEFORE redaction and sat in raw/ INSIDE the run-dir copy of this
+directory (mode 700/600, Mac only) - this breached the workstream boundary "no unredacted Edge data leaves the rig". raw/ is now chmod 000 pending Alex's authorised
+deletion (`rm -P -r <RUN>/captures/edge/raw`); nothing in any workstream reads it, and the rig-side originals were never modified. Future rig sessions redact ON the rig
+and transfer an explicit allowlist of sanitised files only (run-context X24).
+
+Host ............. the-rig (Windows 11 Pro, version 10.0.26200, build 26200.9457, 25H2)
+Identity .......... the account the ssh session runs as (an ordinary named local user; the name and profile-folder name are withheld from this public file).
+                     Read-only access to that user's own Edge profile. NOTE: the session token is ELEVATED (whoami /groups: Mandatory Label\High Mandatory Level;
+                     WindowsPrincipal.IsInRole(Administrator) = True) - not a non-elevated interactive token. Edge was NOT running (0 msedge processes) during the copy.
+Edge version ...... installed binary  C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe  ProductVersion 153.0.4234.48;
+                     'Last Version' file in the User Data dir: 150.0.4078.65 (the version that last ran this profile);
+                     Local State browser.browser_build_version: 149.0.4022.98.
+                     File LastWriteTime on the rig: Local State 2026-07-15 13:10:17 +01:00. The profile predates the currently installed Edge build, so the captured
+                     file describes an older Edge, not 153.0.4234.48.
+Capture date ...... 2026-09-21, local time +01:00 (BST): recon 19:11, Edge copy 19:13:55, files pulled 19:17, redaction built on the Mac afterwards.
+
+COMMANDS (rig side, run as the account above; script edge_copy.ps1, output in rig log edge_copy.log)
+  $ud = Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data'
+  Test-Path / Get-Item -LiteralPath <file>          (existence, Length, LastWriteTime; errors would be logged verbatim - none occurred)
+  [IO.File]::Open(<src>, Open, Read, ReadWrite|Delete)  ->  CopyTo([IO.File]::Create(D:\w10-edge-capture\raw\<same relative name>))   (share-read copy; nothing written on C:)
+  Get-FileHash -Algorithm SHA256 <copy>
+  Get-Content 'Last Version'                           (one-line version string, logged not copied)
+Lock/share errors: none (Edge not running). Files copied in the session: 4 (one published here); nothing in the profile was modified or deleted.
+Pull to the Mac:  scp -r the-rig:/D:/w10-edge-capture/raw <RUN>/captures/edge/   (umask 077; dir chmod 700, files chmod 600). sha256 recomputed on the Mac = the rig-side values below.
+Mac side:  jq (facts below), then  python3 redact_edge.py <raw> <out> <user> <host>  and  python3 scan_edge.py <out> <user> <host>  (scripts kept in the session evidence, rig-scripts/).
+
+RAW FILES (not published) - relative name, bytes, sha256 (the whole session's capture; only Local State is published in this directory)
+  Local State                                                                                             45645  9519a603e6a0e6252c746c8a078e014eb29525b56349d88f58bea1c25dd7558a
+  Default/Preferences                                                                                    761593  edf3a6a319afaadb25bcefc5ba53dc577e737b72dc39ef31559f7b1a1ea59f4e
+  Default/Secure Preferences                                                                              61216  1626ea8575ec3f22f2e64a21237ac507742d6296d92993998fb10dadcc16f225
+  Default/Extensions/ghbmnnjooekpmoecnnnilnnbdlolhkhi/1.102.1_0/manifest.json                              2526  1d444f0d789be1b384c8681bcd814d4eb0c3a30b131d1c3ddf4901aa0981a4c5
+
+JQ FACTS ON THE RAW FILE (key names and counts only)
+---------------------------------------------------
+## top-level key list
+$ jq -c 'keys' "Local State"
+["abusive_adblocker_etag","accessibility","app_defaults","apps_count_check_time","autofill","background_tracing","breadcrumbs","browser","cloud_config_service_v2","continuous_migration","data_use_measurement","default_browser","default_search_provider","desktop_mode","desktop_session_duration_tracker","domain_actions_config","dual_engine","edge","edge_activation","edge_autolaunch","edge_ci","edge_cloud_messaging","edge_copilot","edge_copilot_mode_enabled_state","edge_llm","edge_mouse_gesture","edge_operation_config","edge_standalone_sidebar","edge_web_content_filtering","edgel_llm","fre","hardware_acceleration_mode_previous","host_package_checked_on_browser_version","identity_combined_status","ie_react","invalidation","last_pin_migration_on_edge_version","last_pin_migration_on_os_version","last_pinned_sites_migration_type","last_pinned_sites_migration_version","legacy","local","management","metrics","microsoft","migration","network_primary_browser","network_time","new_device_fre","ntp","nurturing","optimization_guide","os_crypt","password_manager","performance_intervention","policy","private_key_encrypted_data","profile","profiles","sentinel_creation_time","session_id_generator_last_value","shortcut_migration_failed","shutdown","signin","site_pinning","smart_switch","smartscreen","startup_boost","subresource_filter","tab_stats","telemetry_client","ukm","uninstall_metrics","updateclientdata","updateclientlastupdatecheckerror","updateclientlastupdatecheckerrorcategory","updateclientlastupdatecheckerrorextracode1","user_experience_metrics","variations_compressed_seed","variations_config_ids","variations_country","variations_crash_streak","variations_failed_to_fetch_seed_streak","variations_google_groups","variations_last_fetch_time","variations_last_runtime_fetch_time","variations_permanent_consistency_country","variations_runtime_compressed_seed","variations_runtime_config_ids","variations_safe_compressed_seed","variations_safe_seed_date","variations_safe_seed_fetch_time","variations_safe_seed_locale","variations_safe_seed_milestone","variations_safe_seed_permanent_consistency_country","variations_safe_seed_session_consistency_country","variations_safe_seed_signature","variations_seed_client_version_at_store","variations_seed_date","variations_seed_etag","variations_seed_milestone","variations_seed_runtime_etag","variations_seed_runtime_serial_number","variations_seed_serial_number","variations_seed_signature","variations_sticky_studies","was","web_widget","whnew","windows_welcome"]
+
+REDUCTION AND REDACTION (key names only; no value is printed in this file except fixed placeholders)
+-----------------------------------------------------------------------------------------------------
+Method: structure-preserving JSON edits with redact_edge.py (python3 json, key order preserved), then re-serialized with 2-space indent, ensure_ascii off, trailing newline
+(so byte layout differs from Edge's compact one-line output; every kept number/string/bool is unchanged unless listed below). verify_redaction.py compared every leaf
+of the output file with the raw file at the same path: only the placeholders listed below differ (Local State 41 identical + 12 placeholders + 1 leaf under the dotted key
+'signin.with_credential_provider' checked by hand, false = false).
+
+Local State
+  KEPT : top-level 'profile' (info_cache.Default, last_active_profiles, last_used, metrics.next_bucket_index, profile_counts_reported, profiles_order) and 'browser' version scalars
+         (browser_build_version, browser_version_of_last_seen_whats_new, build_version_for_update_tracker, last_seen_whats_new_page_version).
+  DROPPED: 108 of 110 top-level keys - every key except profile and browser, in particular: os_crypt (encrypted key blob), private_key_encrypted_data, variations_* (all),
+         user_experience_metrics, optimization_guide, signin, sync-related and edge_* telemetry keys (the full raw key list is the jq output above).
+         Within 'browser': last_browser_update_time and last_redirect_origin dropped (not version-ish scalars).
+  REDACTED (string value -> "REDACTED") in profile.info_cache.Default, 12 values: edge_account_cid, edge_account_environment_string, edge_account_first_name, edge_account_last_name,
+         edge_account_oid, edge_account_tenant_id, gaia_id, gaia_name, shortcut_name, user_name  (the keys the brief names), plus two beyond the brief's list,
+         gaia_picture_file_name and last_downloaded_gaia_picture_url_with_size (a picture URL), redacted conservatively.
+  LEFT EMPTY (6 keys whose value is already the empty string, so there was nothing to redact and emptiness is preserved): edge_muid, edge_previously_signin_user_name,
+         enterprise_label, gaia_given_name, hosted_domain, managed_user_id.
+  KEPT AS IS: booleans and integers (e.g. edge_account_type, edge_account_environment, edge_sync_enabled, is_consented_primary_account, sign_in_source); avatar_icon (a chrome://theme
+         resource name containing no user name); display 'name' ('Profile 1' - a generic name, no personal name, so no 'Person 1' replacement was needed).
+  Note: the profile record shows a signed-in Edge account (booleans/ints above); every identifying string about it is redacted.
+
+RESIDUAL SCANS (scan_edge.py at capture time over the whole published bundle; the lines below are the subset for the file in this directory. raw/ excluded.)
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+Counts for Local State: account/profile-folder name 0; host name 0; at-sign (e-mail shaped) 0; SID prefix 0; gaia 6; token 0; password 0; secret 0; cookie 0; base64-looking 20+ run 0.
+Every remaining hit (file:line: text) and its justification:
+  HIT [gaia] Local State:32: "gaia_given_name": "",
+  HIT [gaia] Local State:33: "gaia_id": "REDACTED",
+  HIT [gaia] Local State:34: "gaia_name": "REDACTED",
+  HIT [gaia] Local State:35: "gaia_picture_file_name": "REDACTED",
+  HIT [gaia] Local State:41: "last_downloaded_gaia_picture_url_with_size": "REDACTED",
+  HIT [gaia] Local State:48: "use_gaia_picture": true,
+  JUSTIFICATION: the 6 hits of the Google-account word are KEY NAMES under profile.info_cache.Default; their string values are "REDACTED" or empty, use_gaia_picture is a boolean.
+
+SELF-SCAN OF THIS FILE (provenance.txt): personal-identifier patterns (account name, host name, at-sign, SID prefix) 0 hits; the word patterns are skipped for this file because
+it necessarily names them. Base64-looking runs of 20+ characters: the 4 sha256 digests above and long key names in the jq key list. No secret or personal value.

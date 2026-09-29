@@ -125,8 +125,11 @@ agent_plugins(Info) ->
 %% NOTE: this normaliser is NOT on the command-forward path — the gateway
 %% forwards the decoded CommandRequest straight through gpb, which preserves
 %% every field. It is kept faithful (it copies `payload`, the Guardian push
-%% bytes) purely so it can never become a silent strip point if a future
-%% refactor routes commands through it (M8 / #1209).
+%% bytes, and `dispatch_tag`, the p1/p8 dispatch-classification token) purely
+%% so it can never become a silent strip point if a future refactor routes
+%% commands through it (M8 / #1209). dispatch_tag gets the identical
+%% treatment as payload — same reasoning, same field-9-follows-field-8
+%% shape — see proto/yuzu/agent/v1/agent.proto CommandRequest.dispatch_tag.
 -spec encode_command_request(map()) -> map().
 encode_command_request(Cmd) ->
     #{command_id => command_id(Cmd),
@@ -136,10 +139,19 @@ encode_command_request(Cmd) ->
                              maps:get(<<"parameters">>, Cmd, #{})),
       payload    => maps:get(payload, Cmd,
                              maps:get(<<"payload">>, Cmd, <<>>)),
+      dispatch_tag => maps:get(dispatch_tag, Cmd,
+                               maps:get(<<"dispatch_tag">>, Cmd, <<>>)),
       expires_at => maps:get(expires_at, Cmd,
                              maps:get(<<"expires_at">>, Cmd, undefined))}.
 
 %% @doc Ensure a CommandResponse map has all required fields.
+%%
+%% NOTE: kept faithful to all ten CommandResponse fields, mirroring
+%% encode_command_request/1 above. Fields 7-9 (`plugin`/`action`/`payload`)
+%% carry the Guardian side-channel (see agent.proto CommandResponse doc) and
+%% field 10 (`plugin_result_status`) is the CC-07 plugin->host typed
+%% result-status seam (ABI4). gpb drops any field a whitelist rebuild omits,
+%% so this must never silently narrow back to a partial field set.
 -spec encode_command_response(map()) -> map().
 encode_command_response(Resp) ->
     #{command_id => command_id(Resp),
@@ -151,7 +163,14 @@ encode_command_response(Resp) ->
       error      => maps:get(error, Resp,
                              maps:get(<<"error">>, Resp, undefined)),
       sent_at    => maps:get(sent_at, Resp,
-                             maps:get(<<"sent_at">>, Resp, now_timestamp()))}.
+                             maps:get(<<"sent_at">>, Resp, now_timestamp())),
+      plugin     => command_plugin(Resp),
+      action     => command_action(Resp),
+      payload    => maps:get(payload, Resp,
+                             maps:get(<<"payload">>, Resp, <<>>)),
+      plugin_result_status => maps:get(plugin_result_status, Resp,
+                                       maps:get(<<"plugin_result_status">>, Resp,
+                                                undefined))}.
 
 %% @doc Build a SendCommandResponse message.
 -spec encode_send_command_response(binary(), map()) -> map().

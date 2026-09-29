@@ -104,9 +104,7 @@ std::string cell(const std::optional<double>& v, Unit u) {
 
 } // namespace
 
-std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
-    const auto now = net_perf_fleet_now(snap);
-
+std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
     std::string h;
     h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
     // The DEX sub-nav with "network" active (Network sits under DEX). This is a
@@ -155,7 +153,9 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
          "throughput (<span style=\"font-family:var(--mono)\">GetIfTable2</span>) + an interval "
          "retransmit rate (<span style=\"font-family:var(--mono)\">GetTcpStatisticsEx</span> &mdash; "
          "system-wide, so it includes loopback and is not yet loss-validated) but <b>not RTT yet</b> "
-         "(per-connection RTT needs ESTATS, a later slice). <b>macOS emits nothing yet.</b> "
+         "(per-connection RTT needs ESTATS, a later slice). <b>macOS</b> reports device "
+         "throughput only (<span style=\"font-family:var(--mono)\">NET_RT_IFLIST2</span>; "
+         "retransmit + RTT deferred &mdash; the global TCP counters are unmaintained on modern macOS). "
          "<b>Retransmission</b> is an interval rate &mdash; &Delta;retransmits / &Delta;segments "
          "smoothed over the last few heartbeats (the lifetime ratio is diluted to noise; the interval "
          "delta cleanly recovers the real rate). <b>RTT</b> (Linux only today) is coarse &mdash; a "
@@ -185,12 +185,17 @@ std::string render_network_overview_fragment(const NetPerfSnapshot& snap) {
     return h;
 }
 
-std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerfMetric metric,
+std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>& rows,
+                                            const std::vector<std::string>& available_keys,
+                                            const std::string& cohort_key, NetPerfMetric metric,
                                             bool not_reporting, NetCoocFilter cooc,
                                             const std::optional<std::string>& cohort_filter,
-                                            int limit) {
-    const auto rows = net_perf_device_list(snap, metric, not_reporting, cooc, cohort_filter, limit);
-
+                                            [[maybe_unused]] int limit) {
+    // `limit` is no longer consulted here — `rows` arrives already capped by
+    // the caller's NetworkApi::device_list(NetDeviceQuery{.limit=limit}) call
+    // (ADR-0031 WS-A4: the limit-application step moved to the API seam).
+    // Kept as a parameter so the signature stays self-documenting at call
+    // sites and symmetric with the pre-seam version.
     // The metric token preserved across the cohort picker / cohort-value drill so
     // switching cohort keeps the column (shared with net_perf_metric_from_token).
     const char* metric_token = net_perf_metric_token(metric);
@@ -230,24 +235,24 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
     // TagStore; htmx submits the select's own name=value on change, re-rendering
     // this fragment with ?key=<chosen> (metric preserved). Only the key param is
     // exposed here; the cohort_value filter is reached by drilling a Cohort cell.
-    if (!snap.available_keys.empty()) {
+    if (!available_keys.empty()) {
         h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
              "hx-get=\"/fragments/network/devices?metric=" +
              std::string(metric_token) +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
              "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
              "border-radius:.35rem;padding:.15rem .4rem;\">";
-        h += "<option value=\"\"" + std::string(snap.cohort_key.empty() ? " selected" : "") +
+        h += "<option value=\"\"" + std::string(cohort_key.empty() ? " selected" : "") +
              ">(none)</option>";
         bool key_listed = false;
-        for (const auto& k : snap.available_keys) {
-            const bool on = (k == snap.cohort_key);
+        for (const auto& k : available_keys) {
+            const bool on = (k == cohort_key);
             key_listed = key_listed || on;
             h += "<option value=\"" + esc(k) + "\"" + (on ? " selected" : "") + ">" + esc(k) +
                  "</option>";
         }
-        if (!key_listed && !snap.cohort_key.empty()) // requested key has no tagged devices — honest
-            h += "<option value=\"" + esc(snap.cohort_key) + "\" selected>" + esc(snap.cohort_key) +
+        if (!key_listed && !cohort_key.empty()) // requested key has no tagged devices — honest
+            h += "<option value=\"" + esc(cohort_key) + "\" selected>" + esc(cohort_key) +
                  " (no devices tagged)</option>";
         h += "</select></div>";
     }
@@ -272,10 +277,10 @@ std::string render_network_devices_fragment(const NetPerfSnapshot& snap, NetPerf
         // Cohort cell: "—" until a key is chosen (the dimension is undefined),
         // then the resolved value as a drill that filters to that cohort_value.
         std::string cohort_cell;
-        if (snap.cohort_key.empty()) {
+        if (cohort_key.empty()) {
             cohort_cell = "<span class=\"gp-mute\">&mdash;</span>";
         } else {
-            const std::string qs = "key=" + url_encode(snap.cohort_key) +
+            const std::string qs = "key=" + url_encode(cohort_key) +
                                    "&amp;cohort_value=" + url_encode(r.cohort) +
                                    "&amp;metric=" + metric_token;
             cohort_cell = drill("/fragments/network/devices?" + qs,

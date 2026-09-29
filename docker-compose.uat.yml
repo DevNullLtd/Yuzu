@@ -38,7 +38,15 @@ configs:
               {circuit_breaker_reset_timeout_ms, 10000},
               {circuit_breaker_max_reset_timeout_ms, 300000},
               {backpressure_threshold, 1000},
-              {hash_ring_vnodes, 256}
+              {hash_ring_vnodes, 256},
+              %% #1422 escape hatch - UAT ONLY: the mgmt listener below is
+              %% plaintext on 0.0.0.0; a gateway image carrying the #1422
+              %% mgmt-posture guard refuses to boot without this (the
+              %% release-pinned image above ignores the key until a release
+              %% ships the guard). Safe only while :50063 stays unpublished
+              %% on this compose network. Standing exception, revisit when
+              %% the rig TLS flip lands (#1422 follow-up).
+              {allow_insecure_mgmt, true}
           ]},
           {grpcbox, [
               {client, #{channels => [
@@ -180,7 +188,7 @@ configs:
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-server
     restart: unless-stopped
     ports:
@@ -251,10 +259,16 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
+    # "Sizing"): a held-open SSE response's worst-case drain is the 120s
+    # response cap + 2x~3s pump ticks + the 30s socket write timeout
+    # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
+    # it mid-drain; 210s matches the systemd unit's existing margin.
+    stop_grace_period: 210s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
   postgres:
-    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:
@@ -285,12 +299,15 @@ services:
 
   # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-gateway
     restart: unless-stopped
     ports:
       - "50061:50051"   # Agent-facing gRPC (mapped to host 50061 to avoid conflict)
-      - "50063:50063"   # Management/command forwarding
+      # :50063 (management/command fan-out) is deliberately NOT published: this
+      # rig's mgmt plane is plaintext+unauthenticated (allow_insecure_mgmt), so
+      # it must stay reachable only from the compose network (the server dials
+      # gateway:50063). #1422.
       - "8081:8081"     # Health/readiness
       - "9568:9568"     # Prometheus metrics
     environment:

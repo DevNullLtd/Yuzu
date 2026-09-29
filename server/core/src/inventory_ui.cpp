@@ -15,8 +15,12 @@
 
 #include "web_utils.hpp"
 
+#include <cctype>
 #include <charconv>
+#include <cstdint>
+#include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -24,6 +28,17 @@ namespace yuzu::server {
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+
+// Lowercase, for a data-gpname search key — gpSearch (guardian_page_ui.cpp)
+// lowercases the QUERY but not the stored attribute, so the attribute must
+// already be lowercase for a case-insensitive match (same contract as
+// device_ui.cpp's own lc(), used for the identical reason on the Live
+// process list).
+std::string lc(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
 
 // Percent-encode a query-string value (RFC 3986 unreserved kept literal).
 std::string url_encode(const std::string& s) {
@@ -40,6 +55,30 @@ std::string url_encode(const std::string& s) {
             out.push_back(kHex[c & 0x0f]);
         }
     }
+    return out;
+}
+
+// A CSS-id-safe token derived from a software title, for the "devices ›"
+// expansion's element id / hx-target selector AND its internal gpSearch
+// group (round-3 item 8) — every non [A-Za-z0-9_-] byte becomes '_', with a
+// short content hash appended so two titles differing only in punctuation
+// ("C++ Redistributable" vs "C   Redistributable") can't collide into the
+// same expansion id. `hx-target="#..."` is a literal CSS id selector (passed
+// to querySelector), so this must never contain a raw '%'/space/etc. the way
+// url_encode's percent-escaping would.
+std::string id_safe(const std::string& name) {
+    std::string out = "n";
+    for (unsigned char c : name)
+        out.push_back((std::isalnum(c) || c == '-' || c == '_') ? static_cast<char>(c) : '_');
+    std::uint64_t h = 1469598103934665603ull; // FNV-1a offset basis
+    for (unsigned char c : name) {
+        h ^= c;
+        h *= 1099511628211ull; // FNV-1a prime
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    out += "-";
+    out += buf;
     return out;
 }
 
@@ -247,20 +286,36 @@ std::string inv_style() {
   .inv-grey{color:var(--slate,#6f86a6)}
   .ci-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.3rem .9rem;font-size:.74rem;margin-bottom:.7rem}
   .ci-grid .ci-lab{color:var(--muted,#8fa3bd);font-size:.62rem;text-transform:uppercase;letter-spacing:.03em}
+  /* Round-3 item 8: the catalogue row's "devices ›" inline expansion. An empty
+     cell collapses to nothing (no dead whitespace before anything is loaded);
+     the expansion's own close link empties the cell via a plain inline
+     onclick (no hx-on — CSP has no unsafe-eval). */
+  tr.inv-exp>td{padding:0;border-bottom:1px solid var(--border,#2d4068)}
+  tr.inv-exp>td:empty{padding:0;border-bottom:0}
+  .inv-exp-body{padding:.6rem .8rem;background:rgba(0,188,235,.03)}
+  .inv-devbtn{cursor:pointer;color:var(--accent,#00bceb)}
+  .inv-close{float:right;cursor:pointer;color:var(--muted,#8fa3bd);font-size:.7rem}
 </style>)css";
 }
 
-// The Software/Devices/Find tab bar. Each tab hx-gets its fragment into the shared
-// shell content container (#guardian-detail) — htmx core attrs only (CSP-safe).
+// The Software tab bar (nav-split: Devices moved to the /hardware CI list).
+// Round-3 item 9: the separate "Find software" tab is RETIRED from this bar —
+// its function (which devices run a title) now lives inline as each catalogue
+// row's "devices ›" expansion (render_inventory_software_devices_fragment
+// below), so there is nothing left for Find to do that Software doesn't
+// already do, searchably, in one place. The /fragments/inventory/find(+
+// /results) routes stay registered (deep links, existing tests) — only this
+// tab bar's link to them is removed; see docs/user-manual/inventory.md for the
+// retirement follow-up (tracked: drop the routes once no deep link depends on
+// them). The old /fragments/inventory/devices + /fragments/inventory/device
+// routes are the same story (Devices moved to /hardware).
 std::string inv_subnav(const std::string& active) {
     auto tab = [&](const char* id, const char* href, const char* label) {
         return std::string("<a class=\"") + (active == id ? "on" : "") + "\" hx-get=\"" + href +
                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
     };
     return std::string("<div class=\"inv-subnav\">") +
-           tab("software", "/fragments/inventory/software", "Software") +
-           tab("devices", "/fragments/inventory/devices", "Devices") +
-           tab("find", "/fragments/inventory/find", "Find software") + "</div>";
+           tab("software", "/fragments/inventory/software", "Software") + "</div>";
 }
 
 std::string degrade_banner(const std::string& what) {
@@ -280,9 +335,86 @@ std::string scope_caveat() {
 
 std::string page_head() {
     return inv_style() +
-           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Inventory</h1>"
-           "<div class=\"inv-sub\">Software &amp; device inventory, synced <b>daily</b> from every "
-           "endpoint (ADR-0016 daily-sync).</div>";
+           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Software</h1>"
+           "<div class=\"inv-sub\">Installed-software catalogue, synced <b>daily</b> from every "
+           "endpoint (ADR-0016 daily-sync). Looking for a device? See "
+           "<a href=\"/hardware\">Hardware</a>.</div>";
+}
+
+// Round-3 item 8: the SOFTWARE catalogue's swappable results region — search
+// results table + per-row "installs per version"/"devices" drills. Factored
+// out of render_inventory_software_fragment so a results_only=1 request (the
+// search box's own hx-get) can return ONLY this region, mirroring
+// hardware_ui.cpp's render_hardware_results_region fix for the identical class
+// of bug (a re-render that includes the triggering <input> destroys it
+// mid-keystroke). `name_filter` is echoed back into the "capped" banner only —
+// the box itself lives OUTSIDE this region (see render_inventory_software_fragment)
+// so it is never part of the swap.
+std::string render_inventory_software_results_region(
+    const std::optional<std::vector<SoftwareCatalogRow>>& catalogue, const std::string& name_filter,
+    bool capped, bool building) {
+    std::string h = "<div id=\"sw-results\">";
+    h += "<div class=\"inv-banner\">Installed-software list rolled up across the fleet "
+         "(precomputed; refreshes hourly). <b>Installs</b> = devices carrying the title. Click a "
+         "title for its <b>installs per version</b>, or <b>devices</b> for which hosts run it "
+         "(searchable within the expansion).</div>";
+
+    if (!catalogue) {
+        h += degrade_banner("Software catalogue");
+        h += "</div>";
+        return h;
+    }
+    if (building) {
+        // Rollup never computed yet (refreshed_at==0) — distinct from a genuinely
+        // empty fleet OR a search with no matches. The thread refreshes shortly
+        // after startup; a search box wouldn't turn up real results either way
+        // until it does, so this takes priority over the empty/no-match message.
+        h += "<div class=\"inv-empty\">Catalogue is building — the rollup refreshes hourly and "
+             "populates shortly after startup. Reload in a moment.</div></div>";
+        return h;
+    }
+    if (catalogue->empty()) {
+        h += name_filter.empty()
+                 ? "<div class=\"inv-empty\">No installed-software inventory has been reported "
+                   "yet. Agents sync once per ~24h (spread across the fleet); a freshly enrolled "
+                   "agent populates within minutes.</div></div>"
+                 : "<div class=\"inv-empty\">No title or publisher matches &ldquo;" +
+                       esc(name_filter) + "&rdquo;.</div></div>";
+        return h;
+    }
+    if (capped)
+        h += "<div class=\"inv-banner\">Showing the most-installed matches (list capped) &mdash; "
+             "narrow the search for an exact title not shown.</div>";
+
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Software</th><th>Publisher</th>"
+         "<th class=\"inv-num\">Installs</th><th class=\"inv-num\">Versions</th>"
+         "<th></th></tr></thead><tbody>";
+    for (const auto& r : catalogue.value()) {
+        const std::string enc = url_encode(r.name);
+        // Round-3 item 8/9: "devices ›" is a second, independent hx-get action
+        // nested inside the row's own hx-get (which drills into installs-per-
+        // version) — event.stopPropagation() (plain inline onclick, no hx-on;
+        // CSP has no unsafe-eval) keeps the two from double-firing on one
+        // click. `id_safe(r.name)` is the SAME derivation
+        // render_inventory_software_devices_fragment uses for its internal
+        // gpSearch group, so a css-id-safe hx-target here lines up with that
+        // fragment's own row grouping with no id passed over the wire.
+        const std::string grp = "sw-exp-" + id_safe(r.name);
+        h += "<tr class=\"click\" data-gpf=\"invsw\" data-gpname=\"" + esc(lc(r.name)) +
+             "\" hx-get=\"/fragments/inventory/software/versions?name=" + enc +
+             "\" hx-target=\"#inv-drill\" hx-swap=\"innerHTML\">"
+             "<td class=\"inv-name\">" +
+             esc(r.name) + "</td><td class=\"inv-pub\">" + esc(r.publisher) +
+             "</td><td class=\"inv-num\">" + std::to_string(r.device_count) +
+             "</td><td class=\"inv-num\">" + std::to_string(r.version_count) +
+             "</td><td class=\"inv-mono\">installs per version &rsaquo; &middot; "
+             "<span class=\"inv-devbtn\" onclick=\"event.stopPropagation()\" "
+             "hx-get=\"/fragments/inventory/software/devices?name=" + enc +
+             "\" hx-target=\"#" + grp + "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr>";
+        h += "<tr class=\"inv-exp\"><td colspan=\"5\"><div id=\"" + grp + "\"></div></td></tr>";
+    }
+    h += "</tbody></table><div id=\"inv-drill\"></div></div>";
+    return h;
 }
 
 } // namespace
@@ -290,14 +422,25 @@ std::string page_head() {
 std::string render_inventory_software_fragment(
     const std::optional<std::vector<SoftwareCatalogRow>>& catalogue,
     const std::optional<CatalogRollupMeta>& meta, const std::string& name_filter,
-    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs) {
+    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs,
+    bool results_only) {
+    // "Building" (rollup never computed yet) vs. a genuinely empty/no-match
+    // result: computed up front from `meta` alone (no I/O) so BOTH the
+    // results_only early-return and the full-page path share one derivation.
+    const bool building = meta && meta->refreshed_at == 0;
+
+    // results_only=1: return ONLY the #sw-results region (the search box's own
+    // hx-get) — see render_inventory_software_results_region's doc comment for
+    // why this must never also re-render the box itself.
+    if (results_only)
+        return render_inventory_software_results_region(catalogue, name_filter, capped, building);
+
     std::string h = page_head();
     h += inv_subnav("software");
 
     // KPIs come from the precomputed rollup meta (the page never runs a COUNT): distinct
     // titles + devices reporting + the stale count (a separate cheap probe) + the "as of"
     // freshness of the rollup itself.
-    const bool building = meta && meta->refreshed_at == 0;
     const std::string titles = meta ? std::to_string(meta->total_titles) : std::string("&mdash;");
     const std::string devices = meta ? std::to_string(meta->total_devices) : std::string("&mdash;");
     const std::string stale = stale_count ? std::to_string(*stale_count) : std::string("&mdash;");
@@ -331,51 +474,22 @@ std::string render_inventory_software_fragment(
          as_of_disp + "</div><div class=\"s2\">rollup refreshes hourly</div></div></div>";
 
     h += scope_caveat();
-    h += "<div class=\"inv-ctrls\"><input class=\"inv-search\" placeholder=\"Filter titles…\" "
-         "value=\"" +
+    // Round-3 item 8: a REAL server round-trip (title OR publisher, matches the
+    // store-level OR added to SoftwareCatalogQuery), not the old client-side-only
+    // gpSearch — a search for a publisher name ("adobe") only works if the server
+    // re-queries. `id="sw-q"` lives OUTSIDE #sw-results and hx-targets it with
+    // `outerHTML`, mirroring hardware_ui.cpp's fix for the search-box-freeze bug:
+    // `keyup changed delay:400ms` (not an event filter, which the no-unsafe-eval
+    // CSP silently drops) plus a swap region that excludes the input itself, so a
+    // re-render never destroys the box mid-keystroke.
+    h += "<input id=\"sw-q\" type=\"search\" class=\"inv-search\" name=\"q\" "
+         "placeholder=\"Filter by title or publisher…\" value=\"" +
          esc(name_filter) +
-         "\" oninput=\"gpSearch(this)\" data-gpf=\"invsw\"></div>"
-         "<div class=\"inv-banner\">Installed-software list rolled up across the fleet "
-         "(precomputed; refreshes hourly). <b>Installs</b> = devices carrying the title. Click a "
-         "title for its <b>installs per version</b>.</div>";
-
-    if (!catalogue) {
-        h += degrade_banner("Software catalogue");
-        h += "</div>";
-        return h;
-    }
-    if (building) {
-        // Rollup never computed yet (refreshed_at==0) — distinct from a genuinely empty
-        // fleet. The thread refreshes shortly after startup.
-        h += "<div class=\"inv-empty\">Catalogue is building — the rollup refreshes hourly and "
-             "populates shortly after startup. Reload in a moment.</div></div>";
-        return h;
-    }
-    if (catalogue->empty()) {
-        h += "<div class=\"inv-empty\">No installed-software inventory has been reported yet. "
-             "Agents sync once per ~24h (spread across the fleet); a freshly enrolled agent "
-             "populates within minutes.</div></div>";
-        return h;
-    }
-    if (capped)
-        h += "<div class=\"inv-banner\">Showing the most-installed titles (list capped). Use "
-             "<b>Find software</b> for an exact title not shown.</div>";
-
-    h += "<table class=\"inv-tbl\"><thead><tr><th>Software</th><th>Publisher</th>"
-         "<th class=\"inv-num\">Installs</th><th class=\"inv-num\">Versions</th>"
-         "<th></th></tr></thead><tbody>";
-    for (const auto& r : catalogue.value()) {
-        const std::string enc = url_encode(r.name);
-        h += "<tr class=\"click\" data-gpf=\"invsw\" data-gpname=\"" + esc(r.name) +
-             "\" hx-get=\"/fragments/inventory/software/versions?name=" + enc +
-             "\" hx-target=\"#inv-drill\" hx-swap=\"innerHTML\">"
-             "<td class=\"inv-name\">" +
-             esc(r.name) + "</td><td class=\"inv-pub\">" + esc(r.publisher) +
-             "</td><td class=\"inv-num\">" + std::to_string(r.device_count) +
-             "</td><td class=\"inv-num\">" + std::to_string(r.version_count) +
-             "</td><td class=\"inv-mono\">installs per version &rsaquo;</td></tr>";
-    }
-    h += "</tbody></table><div id=\"inv-drill\"></div></div>";
+         "\" hx-get=\"/fragments/inventory/software?results_only=1\" hx-target=\"#sw-results\" "
+         "hx-swap=\"outerHTML\" hx-trigger=\"keyup changed delay:400ms, search\" "
+         "hx-sync=\"this:replace\">";
+    h += render_inventory_software_results_region(catalogue, name_filter, capped, building);
+    h += "</div>";
     return h;
 }
 
@@ -594,6 +708,70 @@ std::string render_inventory_find_results_fragment(
              (r.entry.install_date.empty() ? "&mdash;" : esc(r.entry.install_date)) + "</td></tr>";
     }
     h += "</tbody></table>";
+    return h;
+}
+
+std::string render_inventory_software_devices_fragment(
+    const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
+    std::size_t devices_omitted, const std::unordered_map<std::string, std::string>& hostnames) {
+    if (name.empty())
+        return "";
+    const std::string grp = "swdev-" + id_safe(name);
+    std::string h = "<div class=\"inv-exp-body\">";
+    h += "<a class=\"inv-close\" onclick=\"this.closest('.inv-exp-body').innerHTML=''\">close</a>";
+    h += "<div class=\"inv-sub\" style=\"margin:0 0 .4rem\">Devices running <b>" + esc(name) +
+         "</b>";
+    if (!rows) {
+        h += "</div>";
+        h += degrade_banner("Device list");
+        h += "</div>";
+        return h;
+    }
+    h += " &mdash; " + std::to_string(rows->size()) + " row(s)";
+    if (hit_cap)
+        h += " <span class=\"inv-pill old\">truncated at cap</span>";
+    if (devices_omitted > 0)
+        h += " <span class=\"inv-pill\">" + std::to_string(devices_omitted) +
+             " device(s) outside your scope</span>";
+    h += "</div>";
+    if (rows->empty()) {
+        h += "<div class=\"inv-empty\">No devices run \"" + esc(name) + "\"";
+        if (hit_cap)
+            h += " in this page (result was capped &mdash; narrow the query)";
+        h += ".</div></div>";
+        return h;
+    }
+    // Client-side filter — a popular title can have hundreds of installs. Group
+    // id is derived from `name` (id_safe), matching the hx-target the catalogue
+    // row used to open this expansion, so two expansions open at once never
+    // cross-filter each other's rows.
+    h += "<input class=\"inv-search\" style=\"min-width:200px;margin-bottom:.4rem\" "
+         "placeholder=\"Filter these devices…\" oninput=\"gpSearch(this)\" data-gpf=\"" +
+         grp + "\">";
+    h += "<table class=\"inv-tbl\"><thead><tr><th>Device</th><th>Version</th><th>Publisher</th>"
+         "<th>Install date</th><th>Signature</th><th>Ecosystem</th><th>Arch</th>"
+         "</tr></thead><tbody>";
+    for (const auto& r : rows.value()) {
+        auto hn = hostnames.find(r.agent_id);
+        const std::string device_disp =
+            (hn != hostnames.end() && !hn->second.empty()) ? hn->second : r.agent_id;
+        const std::string searchable = lc(device_disp + " " + r.entry.version + " " + r.entry.publisher);
+        h += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(searchable) + "\">"
+             "<td class=\"inv-name\"><a href=\"/hardware/ci?id=" + url_encode(r.agent_id) +
+             "\">" + esc(device_disp) + "</a></td><td class=\"inv-mono\">" +
+             (r.entry.version.empty() ? "&mdash;" : esc(r.entry.version)) +
+             "</td><td class=\"inv-pub\">" +
+             (r.entry.publisher.empty() ? "&mdash;" : esc(r.entry.publisher)) +
+             "</td><td class=\"inv-pub\">" +
+             (r.entry.install_date.empty() ? "&mdash;" : esc(r.entry.install_date)) +
+             "</td><td class=\"inv-mono\">" +
+             (r.entry.signature_status.empty() ? "&mdash;" : esc(r.entry.signature_status)) +
+             "</td><td class=\"inv-mono\">" +
+             (r.entry.ecosystem.empty() ? "&mdash;" : esc(r.entry.ecosystem)) +
+             "</td><td class=\"inv-mono\">" +
+             (r.entry.arch.empty() ? "&mdash;" : esc(r.entry.arch)) + "</td></tr>";
+    }
+    h += "</tbody></table></div>";
     return h;
 }
 

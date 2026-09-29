@@ -91,6 +91,11 @@ struct DefaultCertSet {
 /// group-readable so sibling containers running as different uids can read the CA +
 /// their leaf material — dir 0750 + group, default-gateway.key 0640 + group. Empty
 /// (default) keeps the tight single-host posture (dir 0700, keys 0600). POSIX-only.
+///
+/// `out`'s contents are UNSPECIFIED when this function returns false — the sole
+/// caller (bootstrap_default_certs()) never reads it again and refuses to start,
+/// but do not add a new caller that reads `out` without first checking the
+/// return value.
 [[nodiscard]] bool ensure_default_certs(const std::filesystem::path& dir,
                                         const std::string& hostname, CaStore* ca_store,
                                         DefaultCertSet& out,

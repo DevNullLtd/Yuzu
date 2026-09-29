@@ -6,19 +6,39 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
+#include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "insecure_tls_gate.hpp"
+#include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
+#include "key_provider.hpp"
+#include "pg/multi_host_dsn.hpp" // HA WS-8: multi-host DSN must use target_session_attrs=read-write
+#include "pg/pg_pool.hpp"
+#include "pg/secret_codec.hpp"
+#include "rbac_store.hpp" // fresh-start Administrator bootstrap (RbacStore::provision_first_admin)
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
+#include "sso_boot_guard.hpp" // sso_only_boot_guard_ok / *_config_complete (CC6.3)
 
 #include <CLI/CLI.hpp>
+
+#include "server_ota_options.hpp"
+#include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
+#include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
+#include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
+
+#ifndef _WIN32
+#include <yuzu/shutdown_watcher.hpp> // POSIX self-pipe + watcher thread (#3007, mirrors the agent)
+#endif
+#include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <mutex>
 
 #ifdef _WIN32
 // clang-format off
@@ -34,26 +54,131 @@
 #endif
 #include <sqlite3.h>
 
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
 static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
+// Read FROM A SIGNAL HANDLER. Only a lock-free atomic is legal there ([support.signal]) —
+// a non-lock-free one takes an internal spinlock, and a handler interrupting a thread that
+// holds it deadlocks the process. Mirrors agents/core/src/main.cpp's g_agent.
+static_assert(std::atomic<yuzu::server::Server*>::is_always_lock_free);
+
+#ifdef _WIN32
+/// WINDOWS ONLY. Serialises the console handler's `g_server->stop()` against main()'s
+/// unpublish-and-destroy, so the Server cannot be destroyed while a stop() is still running
+/// on it. Taken ONLY inside the `#ifdef _WIN32` branch of on_signal, where the CRT has
+/// already handed us an ordinary thread, so locking is legal — never on the POSIX path,
+/// where the self-pipe below gets this same barrier for free from ~ShutdownWatcher's
+/// join(). Mirrors agents/core/src/main.cpp's g_agent_mu (#1822 / Gate-8 round 8 UP8-1).
+/// There is no Windows SCM service path for the server today (unlike the agent's
+/// service_win.cpp), so the console handler is the only Windows caller of stop().
+static std::mutex g_server_mu;
+#endif
+
+/// Signals seen. The SECOND one escalates — see on_signal. Deliberately not under
+/// `#ifndef _WIN32`: escalation must exist on both platforms and must run BEFORE any lock
+/// (agents/core/src/main.cpp, Gate-8 round 9) — a wedged stop() parks the watcher thread
+/// (POSIX) or holds g_server_mu across s->stop() (Windows) indefinitely, so a second
+/// signal must be able to act regardless of which side is stuck.
+static std::atomic<int> g_signal_count{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+#ifndef _WIN32
+/// Write end of the shutdown self-pipe. The handler's ONLY job is to poke this.
+static std::atomic<int> g_shutdown_wfd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+#endif
+
+/// LAST-RESORT HANDLER — used before the shutdown watcher exists (the boot window ahead
+/// of Server::create(), which is not the trivial construction the agent's make_agent() is:
+/// TLS cert bootstrap, the gateway mTLS client, and the full gRPC BuildAndStart() can run
+/// for a real interval), if the watcher failed to construct or died, and after run()
+/// returns (see the "handlers must not outlive what serves them" comment below). It does
+/// not try to be graceful — there is nothing to run a graceful teardown, or nothing left
+/// worth waiting on — it only guarantees the process stays KILLABLE, including as PID 1 in
+/// a container, where the kernel discards a default-disposition signal entirely.
+/// Async-signal-safe: no locks, no stdio, no spdlog (which allocates and RETHROWS non-std
+/// exceptions — a throw here has no enclosing handler and std::terminate()s WITHOUT
+/// unwinding). Body is a deliberate 2-line duplicate of agents/core/src/hard_exit.hpp's
+/// hard_exit(), not a reuse — that header lives under agents/core/src, outside the server's
+/// include graph (server/core/meson.build only exposes include/ + ../../common/include),
+/// and pulling it in for a two-line function isn't worth the cross-binary header dependency.
+/// If a THIRD call site ever needs this, hoist it to common/include/yuzu/ alongside
+/// shutdown_watcher.hpp instead of adding a fourth copy. See that header anyway for why
+/// TerminateProcess, not ::_exit(), on Windows (no DllMain, no loader lock) and ::_exit(),
+/// not std::exit(), on POSIX (async-signal-safe, cannot block) — the rationale, not the code.
+static void on_signal_hard_exit(int sig) noexcept {
+    (void)sig;
+#ifdef _WIN32
+    ::TerminateProcess(::GetCurrentProcess(), 1);
+#else
+    ::_exit(1);
+#endif
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// SIGNAL HANDLING — the handler must do NOTHING but poke a pipe (#3007). Ported from
+// agents/core/src/main.cpp, which already fixed this exact defect for the agent daemon.
+// This used to call `s->stop()` directly, under a comment claiming "only async-signal-safe
+// calls allowed here" — ServerImpl::stop() is nothing of the sort: it takes mutexes across
+// ~60 stores, joins ~8 background threads, calls grpc::Server::Shutdown(), and logs
+// through spdlog — undefined behaviour inside a signal handler per signal-safety(7).
+// Reproduced empirically: SIGABRT "dying due to potential deadlock" from abseil's
+// DebugOnlyDeadlockCheck during grpc::Server::ShutdownInternal() while the main thread was
+// blocked in Wait(); the detector is compiled out under NDEBUG, so a release build is
+// expected to hit the identical interleaving as a silent, probabilistic hang instead — that
+// specific claim is inference from the mechanism (#3007), not separately observed on a
+// release binary.
+//
+// See agents/core/src/main.cpp's on_signal for the full trap list this dodges — the
+// mechanism (common/include/yuzu/shutdown_watcher.hpp) is now shared verbatim between the
+// two binaries. Windows keeps the direct call: the CRT dispatches console/CTRL signals on
+// a freshly created thread, so it is already an ordinary thread context, and there is no
+// SCM control path for the server to share it with (unlike the agent's service_win.cpp).
+// ─────────────────────────────────────────────────────────────────────────────────
 static void on_signal(int sig) {
-    // Only async-signal-safe calls allowed here.
-    // write() to stderr instead of spdlog (which allocates and locks).
+    // A process-directed signal lands on an ARBITRARY unmasked thread. Every write()
+    // below can set errno (the O_NONBLOCK write end is *expected* to return EAGAIN), so
+    // clobbering it here would silently rewrite an unrelated thread's error.
+    const int saved_errno = errno;
     const char msg[] = "Received signal, shutting down...\n";
+    (void)sig;
+
+    // Second signal => escalate, both platforms, BEFORE any lock. See
+    // agents/core/src/main.cpp's on_signal for the full rationale (Gate-8 round 9).
+    if (g_signal_count.fetch_add(1, std::memory_order_acq_rel) >= 1) {
+        on_signal_hard_exit(sig);
+    }
+
 #ifdef _WIN32
     _write(2, msg, sizeof(msg) - 1);
+    // Hold g_server_mu ACROSS s->stop(), not merely across the load — main() takes the
+    // same mutex to unpublish, so it blocks until an in-flight stop() has returned
+    // before destroying the Server. See agents/core/src/main.cpp's on_signal, Gate-8
+    // round 8 UP8-1.
+    {
+        std::lock_guard<std::mutex> lock(g_server_mu);
+        if (auto* s = g_server.load(std::memory_order_acquire))
+            s->stop();
+    }
 #else
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    // The pipe byte goes first — it cannot block (the write end is O_NONBLOCK). The
+    // stderr log is best-effort and comes after: see shutdown_watcher.hpp.
+    const int wfd = g_shutdown_wfd.load(std::memory_order_acquire);
+    if (wfd >= 0) {
+        const char byte = yuzu::ShutdownWatcher::kSignal;
+        ssize_t n = ::write(wfd, &byte, 1); // async-signal-safe, and CANNOT block
+        (void)n; // EAGAIN on a full pipe just means a shutdown is already pending.
+    }
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1); // best-effort; may block, harmlessly
 #endif
-    (void)sig;
-    if (auto* s = g_server.load(std::memory_order_acquire))
-        s->stop();
+    errno = saved_errno;
 }
 
 // Resolve the real OS account running this process for break-glass audit
@@ -118,6 +243,32 @@ static bool break_glass_user_valid(yuzu::server::AuthDB& db, const std::string& 
     return true;
 }
 
+// Open the Postgres audit store for a one-shot break-glass CLI path, and bring
+// it to a state where writing an evidence row is SAFE.
+//
+// No legacy-backfill gate (retired: ADR-0009 hard-cutover Update, 2026-09-04) —
+// AuditStore is born-on-PG with no migration path held open, same as every
+// other retired store. Returns nullptr, having logged and printed, when the
+// store is unusable; `refuse_action` names the mutation being refused.
+static std::unique_ptr<yuzu::server::AuditStore>
+open_one_shot_audit(yuzu::server::pg::PgPool& pool, int retention_days, std::string_view flag,
+                    std::string_view refuse_action, std::string_view extra_remediation = {}) {
+    // Retention comes from config, NOT the constructor default: a site running
+    // --audit-retention-days=90 would otherwise get break-glass evidence rows on
+    // a 365-day horizon — the highest-stakes rows outliving the policy that
+    // governs the rest of the trail (adversarial review, Kimi L1).
+    auto audit = std::make_unique<yuzu::server::AuditStore>(pool, retention_days);
+    if (!audit->is_open()) {
+        spdlog::error("{}: Postgres audit store (schema audit_store) is not writable; refusing to "
+                      "{} without an audit record. Check --postgres-dsn reachability and retry.{}",
+                      flag, refuse_action, extra_remediation);
+        std::cerr << "error: audit store unavailable; refusing to " << refuse_action
+                  << " without an audit record\n";
+        return nullptr;
+    }
+    return audit;
+}
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // Suppress all CRT/abort pop-up dialogs — route to stderr instead.
@@ -137,6 +288,18 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 #endif
+
+    // #4722: gRPC's ConfigVars snapshots GRPC_SSL_CIPHER_SUITES on first use;
+    // pin it before any gRPC symbol can run (unconditional overwrite — see
+    // tls_policy.hpp). ORDERING IS THE CONTRACT: no automated test observes
+    // this line (the test executable pins from its own static initialiser);
+    // moving it below the first gRPC call silently restores gRPC's default
+    // TLS 1.2 cipher list.
+    if (!yuzu::tls::pin_grpc_cipher_env()) {
+        std::cerr << "Failed to pin " << yuzu::tls::kGrpcCipherSuitesEnvVar
+                  << " in the process environment; refusing to start\n";
+        return EXIT_FAILURE;
+    }
 
     CLI::App app{"Yuzu Server", "yuzu-server"};
     app.set_version_flag("--version",
@@ -168,6 +331,14 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
+                   "On shutdown, keep serving for at least this many seconds after /readyz "
+                   "starts answering 503, so a load balancer stops routing here before the "
+                   "listener closes (default 0; 0-60). Set it to at least the load balancer's "
+                   "health-check interval x unhealthy threshold, plus one interval.")
+        ->default_val(0)
+        ->check(CLI::Range(0, yuzu::server::shutdown_drain::kMaxShutdownDrainSeconds))
+        ->envname("YUZU_SHUTDOWN_DRAIN_SECONDS");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
@@ -180,6 +351,18 @@ int main(int argc, char* argv[]) {
     app.add_option("--web-port", cfg.web_port, "Web UI port")
         ->default_val(8080)
         ->envname("YUZU_WEB_PORT");
+    app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
+                   "External origin the dashboard is served on, for the CSRF same-site check "
+                   "(repeatable; a single value may be comma-separated). Set this when a reverse "
+                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
+                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
+                   "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
+        // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
+        // NOT here — do NOT add CLI11 `->delimiter(',')`, or a comma-separated value
+        // would be split twice (CLI11 tokens × the parser's own comma loop) and mangle
+        // entries. Same rule, and same reason, as --cert-san (#1271).
+        ->envname("YUZU_CSRF_TRUSTED_ORIGIN");
     app.add_flag("--no-tls", "Disable TLS (insecure, for development only)")
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")->envname("YUZU_CERT");
@@ -215,16 +398,16 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_CERT_GROUP");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
-    bool deprecated_allow_one_way_tls_flag = false;
+    bool deprecated_tls_flag_used = false;
     app.add_flag("--insecure-skip-client-verify",
                  "Allow TLS without --ca-cert (disables mTLS client verification). "
                  "Requires YUZU_ALLOW_INSECURE_TLS=1.")
-        ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+        ->each([&cfg](const std::string&) { cfg.insecure_skip_client_verify = true; });
     app.add_flag("--allow-one-way-tls", "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
                                         "still accepted for backward compatibility.")
-        ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
-            cfg.allow_one_way_tls = true;
-            deprecated_allow_one_way_tls_flag = true;
+        ->each([&cfg, &deprecated_tls_flag_used](const std::string&) {
+            cfg.insecure_skip_client_verify = true;
+            deprecated_tls_flag_used = true;
         });
     app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
                    "PEM management server certificate override");
@@ -240,6 +423,21 @@ int main(int argc, char* argv[]) {
     app.add_option("--gateway-command-addr", cfg.gateway_command_address,
                    "Gateway ManagementService address for command forwarding (host:port)")
         ->envname("YUZU_GATEWAY_COMMAND_ADDR");
+    // HA WS-4 4.3: raw entries, parsed+validated into cfg.gateway_cluster_addresses
+    // after CLI11_PARSE below (parse_gateway_cluster_addrs needs to reject a
+    // malformed entry with a CLI exit, not a lenient warning — see that
+    // function's doc comment, gateway_mgmt_stub_pool.hpp).
+    std::vector<std::string> gateway_cluster_addr_entries;
+    app.add_option("--gateway-cluster-addr", gateway_cluster_addr_entries,
+                   "Per-cluster gateway ManagementService address(es) for cross-cluster command "
+                   "fan-out, cluster_id=host:port (e.g. us-east=10.0.1.5:50063). Repeatable or "
+                   "comma-separated. Unset (default) = single-cluster mode: "
+                   "--gateway-command-addr alone is used for every cluster_id. Per-cluster "
+                   "routing only -- trust-zone isolation between clusters is not yet provided "
+                   "(#4669); do not rely on this to keep one cluster's gateway from being able "
+                   "to answer for an agent on another cluster.")
+        ->delimiter(',')
+        ->envname("YUZU_GATEWAY_CLUSTER_ADDR");
     app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
                    "Multi-egress NAT/proxy CIDR(s) (e.g. 203.0.113.0/24,2001:db8::/32). A direct "
                    "agent whose Register and Subscribe source IPs both fall in one range is "
@@ -275,6 +473,27 @@ int main(int argc, char* argv[]) {
                    "Max login attempts/second per IP (default: 10)")
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
+    app.add_option("--principal-max-concurrency", cfg.principal_max_concurrency,
+                   "Max in-flight requests per engine principal (default: 16)")
+        ->default_val(16)
+        // A 0/negative value self-bricks every engine principal (every
+        // request 429s forever) with no clear signal why; reject at boot
+        // with CLI11's message instead of silently shipping a dead cap.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_PRINCIPAL_MAX_CONCURRENCY");
+    app.add_option("--principal-rate-limit", cfg.principal_rate_limit,
+                   "Max requests/second per engine principal (default: 20)")
+        ->default_val(20.0)
+        // Same footgun as --principal-max-concurrency above: 0/negative
+        // would zero every engine principal's token bucket.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_PRINCIPAL_RATE_LIMIT");
+
+    // Agent OTA pull bounds (#913 per-peer limit, #911 deadlines) and the
+    // server-wide gRPC bounds. Registered from server_ota_options.hpp so the flag
+    // names, defaults, env spellings and validators are pinned by a test —
+    // see test_server_ota_options.cpp.
+    register_ota_options(app, cfg);
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
@@ -302,8 +521,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--auth-mode", cfg.auth_mode,
                    "Local-password login policy (default: standard). \"standard\" = "
                    "password login enabled. \"sso-only\" = local-password login is "
-                   "disabled fleet-wide (only OIDC SSO mints a session); the server "
-                   "refuses to start without OIDC configured. A single --break-glass-user "
+                   "disabled fleet-wide (only SSO mints a session); the server refuses to "
+                   "start unless an SSO provider is configured — OIDC (--oidc-issuer + "
+                   "--oidc-client-id), or on Linux/macOS with HTTPS a complete SAML SP "
+                   "config. A single --break-glass-user "
                    "is exempt while armed (see --break-glass-arm).")
         ->default_val("standard")
         ->check(CLI::IsMember({"standard", "sso-only"}))
@@ -336,6 +557,10 @@ int main(int argc, char* argv[]) {
                   "Bearer credential IdPs present on every /scim/v2/* request. "
                   "Required when --scim-enable is set; stored as a sha256 hash only.")
         ->envname("YUZU_SCIM_TOKEN");
+    app.add_option("--scim-admin-group", cfg.scim_admin_group,
+                  "SCIM Group displayName that maps to admin role; empty disables "
+                  "SCIM-group-to-admin mapping")
+        ->envname("YUZU_SCIM_ADMIN_GROUP");
 
     // Account lockout — SOC 2 CC6.3. See docs/auth-architecture.md.
     app.add_option("--auth-lockout-threshold", cfg.auth_lockout_threshold,
@@ -404,6 +629,51 @@ int main(int argc, char* argv[]) {
     app.add_flag("--mcp-read-only", cfg.mcp_read_only,
                  "Restrict MCP to read-only tools only (no write/execute)")
         ->envname("YUZU_MCP_READ_ONLY");
+    // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
+    app.add_flag("--mcp-no-streaming", cfg.mcp_streaming_disable,
+                 "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
+                 "JSON-RPC POST only")
+        ->envname("YUZU_MCP_NO_STREAMING");
+    app.add_flag("--mcp-enable-streamed-post,!--no-mcp-streamed-post", cfg.mcp_streamed_post_enable,
+                 "Enable SSE-on-POST for execute_instruction callers that send a "
+                 "progressToken (default: true). Pass --no-mcp-streamed-post to disable.")
+        ->envname("YUZU_MCP_ENABLE_STREAMED_POST");
+    app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
+                   "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
+                   "repeatable). Empty rejects any present Origin (absent is always allowed).")
+        ->envname("YUZU_MCP_ALLOWED_ORIGINS");
+    app.add_option("--max-sse-streams", cfg.max_sse_streams,
+                   "Concurrent held-open SSE responses this server is sized for, across ALL "
+                   "streaming surfaces (MCP GET, MCP streamed POST, /api/v1/events, dashboard, "
+                   "legacy /events). "
+                   "The HTTP worker pool is derived from this: a stream costs one blocked "
+                   "thread (no CPU; resident cost is a fraction of a virtual, platform-dependent stack reservation and is not yet measured). 0 = default (128). See ADR-0034.")
+        ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))
+        ->envname("YUZU_MAX_SSE_STREAMS");
+    app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
+                   "Max concurrent MCP GET SSE streams for a single principal — an anti-monopoly "
+                   "policy, not a capacity limit (capacity is --max-sse-streams). Does NOT govern "
+                   "streamed POST responses: those are capped separately at a fixed 4 concurrent "
+                   "calls per principal — numerically the same as, but counted and enforced "
+                   "separately from, any single session's own replay-ring pin-slot count — so a "
+                   "principal's steady-state held-open sum across both channels is this value "
+                   "+ 4 — not a hard ceiling; a GET-channel reconnect can transiently double "
+                   "the GET component (see docs/user-manual/server-admin.md)")
+        // Range-checked like its two siblings above. 0 would admit nothing at all, so the
+        // floor is 1; the ceiling matches --max-sse-streams (a per-principal cap above the
+        // global capacity is meaningless, and the global cap clamps it anyway).
+        ->check(CLI::Range(std::size_t{1}, std::size_t{4096}))
+        ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
+    app.add_option("--http-worker-threads", cfg.http_worker_threads,
+                   "Pin the shared HTTP worker pool size by hand. 0 (default) derives it from "
+                   "--max-sse-streams, which is what you want; setting it clamps the stream "
+                   "target to what your pool can carry. The whole pool is created at BOOT, so "
+                   "size the host's process/thread limit (systemd TasksMax, container pids) at "
+                   "or above this number before starting.")
+        // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
+        // flag cannot accept a value the pool will silently refuse to honour.
+        ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
+        ->envname("YUZU_HTTP_WORKER_THREADS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,
@@ -431,6 +701,55 @@ int main(int argc, char* argv[]) {
                  "`server.unsigned_definitions_allowed` audit event + startup warning "
                  "when enabled.")
         ->envname("YUZU_ALLOW_UNSIGNED_DEFINITIONS");
+
+    // KEK rotation runaway control (#2530 B5). See kek_routes.hpp.
+    //
+    // This is a RUNAWAY/ABUSE GUARD, not a rotation-schedule knob — it exists
+    // to stop a looping caller (buggy automation, a compromised token) from
+    // hammering /rotate, not to express how often you intend to rotate. The
+    // default of 1h is sized for that job and most operators should never
+    // touch this flag.
+    //
+    // Raising it has a real, sharp cost the operator must see BEFORE they
+    // change it: it directly delays emergency re-rotation after a suspected
+    // KEK compromise — the single most time-critical operation this surface
+    // exists to support — and there is NO bypass. `/rewrap` only resumes a
+    // half-committed rotation; it does not mint a new version. If this is
+    // set to (say) 90 days to "match" a quarterly rotation cadence, a
+    // routine rotation followed by a compromise the next day leaves the
+    // operator refused with a 429 for the next three months, with no escape
+    // short of a restart with a lower value — mid-incident. Do NOT set this
+    // to your rotation cadence; leave it at the default unless you have a
+    // specific, understood reason to raise it.
+    //
+    // Upper bound 31536000s (365d) is a sanity ceiling that rejects a
+    // fat-fingered value, not an endorsement of setting the flag that high.
+    // `cooldown_retry_after_ms` is a uint32 millisecond count;
+    // evaluate_rotate_preconditions() (kek_rotate_control.hpp) saturates
+    // rather than wraps on overflow, so this bound is defence-in-depth on
+    // top of that, not the only thing keeping the retry hint honest.
+    app.add_option("--kek-min-rotate-interval", cfg.kek_min_rotate_interval_secs,
+                   "Durable rate limit (seconds) between KEK rotation attempts — a runaway/abuse "
+                   "guard against looping automation, NOT a rotation-schedule setting (default: "
+                   "3600 = 1h; most operators should never change this). Raising it delays "
+                   "emergency re-rotation after a suspected key compromise, with no bypass short "
+                   "of a restart. Read from the database server's own clock so it holds "
+                   "cluster-wide, not just per process (max: 31536000 = 365d, a sanity ceiling — "
+                   "not a suggestion to match your rotation cadence). A rotate request inside the "
+                   "window is refused with a 429 carrying an honest retry_after_ms.")
+        ->default_val(3600)
+        ->check(CLI::Range(1, 31536000))
+        ->envname("YUZU_KEK_MIN_ROTATE_INTERVAL");
+    app.add_option("--kek-max-live-versions", cfg.kek_max_live_versions,
+                   "Backstop ceiling on the number of non-retired KEK versions (default: 32). "
+                   "A rotate request at or above the ceiling is refused with a 409. There is no "
+                   "retire route (#2525), so raising this above the default is the supported "
+                   "escape hatch that keeps rotation usable once an install hits it — doing so "
+                   "is an explicit, logged and audited temporary risk acceptance pending #2525, "
+                   "not a routine tuning knob.")
+        ->default_val(yuzu::server::detail::kKekMaxLiveVersionsDefault)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_KEK_MAX_LIVE_VERSIONS");
 
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
@@ -529,6 +848,17 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    // ADR-2001 §1 — selects which validated ID token claim is used as the
+    // SCIM-externalId join key at login. "sub" (default) matches Okta's
+    // typical externalId; "oid" matches Entra (whose externalId rides the
+    // `oid` claim, not `sub`). Boot rejects anything outside the allow-list
+    // fail-closed (CLI::IsMember below), never a silent fallback.
+    app.add_option("--oidc-scim-link-claim", cfg.oidc_scim_link_claim,
+                   "ID token claim used as the SCIM externalId join key at OIDC login "
+                   "(default: sub). Entra deployments typically need \"oid\".")
+        ->default_val("sub")
+        ->check(CLI::IsMember({"sub", "oid"}))
+        ->envname("YUZU_OIDC_SCIM_LINK_CLAIM");
 
     // SAML 2.0 SSO options (not supported on Windows — fail-closed)
     app.add_option("--saml-idp-entity-id", cfg.saml_idp_entity_id,
@@ -546,6 +876,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
                    "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
         ->envname("YUZU_SAML_SP_ACS_URL");
+    app.add_option("--saml-sp-key", cfg.saml_sp_key,
+                   "Filesystem path to SP AuthnRequest signing private-key PEM (RSA); when "
+                   "set, AuthnRequests are signed (HTTP-Redirect binding)")
+        ->envname("YUZU_SAML_SP_KEY");
     app.add_option("--saml-group-attribute", cfg.saml_group_attribute,
                    "SAML <Attribute Name=\"...\"> whose values are group identifiers "
                    "(e.g. the Entra groups claim URI); empty disables group parsing")
@@ -553,6 +887,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-admin-group", cfg.saml_admin_group,
                    "SAML group value (from --saml-group-attribute) that maps to admin role")
         ->envname("YUZU_SAML_ADMIN_GROUP");
+    app.add_option("--saml-name-attribute", cfg.saml_name_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's display name "
+                   "(e.g. the Entra displayname claim URI); empty leaves the display as the raw "
+                   "NameID. Display/audit only, never an identity or authz input")
+        ->envname("YUZU_SAML_NAME_ATTRIBUTE");
+    app.add_option("--saml-email-attribute", cfg.saml_email_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's email "
+                   "(e.g. the Entra emailaddress claim URI); empty disables email parsing. "
+                   "Used only as a display fallback and logged, never stored or used for identity")
+        ->envname("YUZU_SAML_EMAIL_ATTRIBUTE");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
@@ -573,10 +917,15 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.analytics_enabled = false; });
     app.add_option("--analytics-drain-interval", cfg.analytics_drain_interval_seconds,
                    "Analytics drain interval in seconds (default: 10)")
-        ->default_val(10);
+        ->default_val(10)
+        // governance Gate 3 sre finding, 2026-08-16: an interval <= 0 makes
+        // run_drain()'s inner sleep loop execute zero iterations, busy-
+        // spinning claim transactions against the shared pool with no delay.
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-batch-size", cfg.analytics_batch_size,
                    "Analytics drain batch size (default: 100)")
-        ->default_val(100);
+        ->default_val(100)
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-jsonl", cfg.analytics_jsonl_path,
                    "Path for JSON Lines analytics output file")
         ->envname("YUZU_ANALYTICS_JSONL");
@@ -603,6 +952,62 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
+    // the settings page and the docs all report the value the server enforces.
+    yuzu::server::normalize_ota_options(cfg);
+
+    // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
+    // Comma-splitting, trimming, lowercasing and default-port stripping happen
+    // exactly once at boot rather than per request. Storing the normalised form
+    // back into cfg means every consumer compares like for like, and the gate
+    // itself stays a pure comparison.
+    // Count what was SUPPLIED before normalising, so a rejected entry can be
+    // reported. Normalisation legitimately drops pieces (empty, host-less,
+    // userinfo, the reserved `null`, an ambiguous bare `h:443`), and a raw token
+    // may itself be comma-separated, so the count is per piece, not per flag.
+    std::size_t supplied = 0;
+    for (const auto& token : cfg.csrf_trusted_origins) {
+        std::size_t pos = 0;
+        while (pos <= token.size()) {
+            const auto comma = token.find(',', pos);
+            const auto piece = token.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                           : comma - pos);
+            pos = (comma == std::string::npos) ? token.size() + 1 : comma + 1;
+            if (piece.find_first_not_of(" \t\r\n") != std::string::npos)
+                ++supplied;
+        }
+    }
+    cfg.csrf_trusted_origins = yuzu::server::normalise_trusted_origins(cfg.csrf_trusted_origins);
+    const std::size_t accepted = cfg.csrf_trusted_origins.size();
+
+    if (accepted > 0) {
+        // Boot-log the accepted set as deployment evidence: an operator who
+        // mistypes an entry sees an opaque 403 at the dashboard, and this line
+        // is what turns that into a two-second diagnosis.
+        std::string joined;
+        for (const auto& o : cfg.csrf_trusted_origins) {
+            if (!joined.empty())
+                joined += ", ";
+            joined += o;
+        }
+        spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
+                     "in addition to the request Host — {}",
+                     accepted, joined);
+    }
+    // A config whose entries were ALL rejected previously logged nothing — boot
+    // output byte-identical to not passing the flag, followed by every proxied
+    // dashboard POST 403ing opaquely. That is the exact diagnosis this logging
+    // exists to provide, so silence was the one outcome it could not afford.
+    // Partial rejection was equally quiet: `null,https://h` logged "1 origin"
+    // while the operator supplied two.
+    if (supplied > accepted) {
+        spdlog::warn("CSRF same-site gate: {} of {} supplied --csrf-trusted-origin value(s) were "
+                     "REJECTED as invalid and are NOT trusted. Rejected shapes: empty, host-less "
+                     "(`:443`), userinfo (`u@h`), the reserved token `null`, and a bare host with "
+                     "an explicit default port (`h:443` — write `https://h` or `http://h`).",
+                     supplied - accepted, supplied);
+    }
 
     // ── MFA enforcement mode advisory ──
     // Surface the active enforcement mode once at startup so an auditor
@@ -638,18 +1043,19 @@ int main(int argc, char* argv[]) {
     // deployments that pre-seed --break-glass-user are warned there too.
     // Account lockout posture (SOC 2 CC6.3 evidence). Surfaced once at boot
     // so an operator/auditor can confirm the deployment's brute-force
-    // protection from journald without scraping per-event logs. The posture
-    // is gated on the auth.db store actually being wired (--data-dir set):
-    // lockout state lives in auth.db, so in a config-file-only deployment
-    // (auth_db_ == nullptr, the legacy fallback) every lockout op no-ops.
-    // Claiming "active" there would overstate the deployed control
-    // (governance/adversarial C4) — fail honest instead.
+    // protection from journald without scraping per-event logs. The posture is
+    // gated on the Postgres auth store being wired (--postgres-dsn set):
+    // lockout state lives in Postgres (users.failed_login_count / locked_until,
+    // ADR-0006), not the legacy auth.db. Without --postgres-dsn there is no
+    // auth store at all (ADR-0006/0007 fail-closed, no SQLite fallback) and the
+    // server will refuse to start below — claiming "active" here would overstate
+    // a deployment that will not boot (governance/adversarial C4), so warn honest.
     if (cfg.auth_lockout_threshold > 0) {
-        if (cfg.data_dir.empty()) {
+        if (cfg.postgres_dsn.empty()) {
             spdlog::warn("Account lockout CONFIGURED (threshold={}) but INACTIVE: failed-login "
-                         "lockout requires the auth.db store, which is created only when "
-                         "--data-dir is set. This config-file-only deployment has NO account "
-                         "lockout. Set --data-dir to activate it.",
+                         "lockout requires the Postgres auth store, which needs --postgres-dsn "
+                         "(or YUZU_POSTGRES_DSN). This deployment has no auth store wired and "
+                         "will fail closed at boot.",
                          cfg.auth_lockout_threshold);
         } else {
             spdlog::info("Account lockout active: {} failed local-password attempts → locked "
@@ -688,14 +1094,36 @@ int main(int argc, char* argv[]) {
     // through without re-prompting. The helper itself doesn't log on
     // every skip (too noisy), so we surface it once at startup so the
     // operator sees the disabled state in journald and an auditor
-    // reading the boot log can spot a misconfigured deployment.
+    // reading the boot log can spot a misconfigured deployment. The JIT
+    // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
+    // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
+    // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
-            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
-            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
-            "(default 300) to re-enable.",
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
+            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
+            "and the elevation-eligibility routes), which still require an MFA-enrolled "
+            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
+            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
+            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
+            "to re-enable.",
             cfg.mfa_step_up_window_secs);
+    }
+
+    // KEK rotation runaway control posture (#2530 B5). --kek-max-live-versions
+    // above the shipped default of 32 is a deliberate, temporary risk
+    // acceptance pending #2525 (no retire route exists yet, so raising the
+    // ceiling is the only way to keep rotation usable once an install hits
+    // it) — surface it loudly here; the matching `server.kek_ceiling_raised`
+    // audit event fires in server.cpp once audit_store_ exists (mirrors the
+    // --allow-unsigned-packs log+audit pattern above).
+    if (yuzu::server::detail::kek_ceiling_is_risk_acceptance(cfg.kek_max_live_versions)) {
+        spdlog::warn("--kek-max-live-versions={} is ABOVE the default of {} — this is a "
+                     "deliberate, temporary risk acceptance: there is no KEK retire route "
+                     "(#2525), so raising the ceiling is the supported way to keep rotation "
+                     "usable once an install hits it. This will be audited as "
+                     "`server.kek_ceiling_raised`.",
+                     cfg.kek_max_live_versions, yuzu::server::detail::kKekMaxLiveVersionsDefault);
     }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
@@ -706,6 +1134,20 @@ int main(int argc, char* argv[]) {
         cfg.csp_extra_sources = std::move(*validated);
     } else {
         std::cerr << "Invalid --csp-extra-sources: " << validated.error() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    // ── Validate --gateway-cluster-addr (HA WS-4 4.3) ──
+    // A malformed/duplicate entry here is a routing-correctness defect, not
+    // an advisory allowlist like --trusted-nat-cidr's own lenient parse —
+    // fail the CLI outright rather than silently dropping or half-applying
+    // an entry (Fable pre-implementation review, 4.3 plan).
+    if (auto parsed = yuzu::server::parse_gateway_cluster_addrs(
+            gateway_cluster_addr_entries, yuzu::server::detail::kMaxClusterIdLen);
+        parsed.has_value()) {
+        cfg.gateway_cluster_addresses = std::move(*parsed);
+    } else {
+        std::cerr << "Invalid --gateway-cluster-addr: " << parsed.error() << "\n";
         return EXIT_FAILURE;
     }
 
@@ -796,16 +1238,52 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
+    // ── Multi-host Postgres DSN guard (HA WS-8) ──
+    // A multi-host DSN without target_session_attrs=read-write lets libpq put the
+    // pool's connections on a standby, and /readyz cannot see them all. Add
+    // read-write when the attribute is absent; refuse a weaker explicit value, and
+    // refuse load_balance_hosts. Done after logging is configured (so the line
+    // reaches --log-file and --log-format json) and before the auth bootstrap
+    // pool and Server::create, so every connection — both pools, the leader
+    // elector and the readiness probe — uses the same normalised DSN. See
+    // pg/multi_host_dsn.hpp.
+    if (auto guarded = yuzu::server::pg::enforce_multi_host_read_write(cfg.postgres_dsn);
+        guarded.has_value()) {
+        if (guarded->appended)
+            spdlog::warn("Postgres connection names {} hosts{} without target_session_attrs; "
+                         "using target_session_attrs=read-write so the server only connects to "
+                         "a writable primary (set it explicitly to silence this)",
+                         guarded->hosts,
+                         guarded->hosts_from_env ? " (from PGHOST/PGHOSTADDR)" : "");
+        cfg.postgres_dsn = std::move(guarded->dsn);
+    } else {
+        spdlog::critical("Invalid --postgres-dsn: {}", guarded.error());
+        return EXIT_FAILURE;
+    }
+
+    // ── TLS cipher policy self-check (#4722) ─────────────────────────────────
+    // Refuse to start rather than silently serve on an OpenSSL build where our
+    // allow-list resolves to zero usable TLS 1.2 ciphers.
+    {
+        const auto tls_policy = yuzu::tls::resolve_cipher_policy();
+        if (!tls_policy) {
+            spdlog::critical("{}", yuzu::tls::describe_cipher_policy_error(tls_policy.error()));
+            return EXIT_FAILURE;
+        }
+        for (const auto& line : yuzu::tls::tls_policy_report_lines(*tls_policy))
+            spdlog::info("{}", line);
+    }
+
     // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
     // Disabling client certificate verification requires BOTH a CLI flag AND
     // an explicit environment variable, so that no single misconfiguration
     // (typo, copy-pasted command, leaked CLI history) can silently downgrade
     // the agent listener from mTLS to one-way TLS.
-    if (deprecated_allow_one_way_tls_flag) {
+    if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
     }
-    if (cfg.allow_one_way_tls && cfg.tls_enabled) {
+    if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {
             spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
                           "in the environment as a second confirmation. Refusing to start.");
@@ -876,18 +1354,275 @@ int main(int argc, char* argv[]) {
 
     cfg.auth_config_path = cfg_path;
 
-    // AuthDB lifetime — declared at function scope (NOT inside the
-    // --data-dir block) so the unique_ptr outlives Server::create() and
-    // server->run(). Storing &auth_db in AuthManager from inside the
-    // else block (the previous shape) destroyed the AuthDB at the close
-    // of the block, leaving AuthManager holding a dangling pointer for
-    // the rest of main() — every authenticate() / upsert_user /
-    // update_role / list_users call hit use-after-free in production
-    // deployments with --data-dir set (governance round arch-B1
-    // CRITICAL). Stays nullptr when no --data-dir is configured.
+    // AuthDB is now Postgres-backed (ADR-0006 substrate migration) and, for
+    // actual SERVING, is constructed + owned by ServerImpl off its own
+    // pg_pool_ (server.cpp) — main.cpp no longer builds the long-lived
+    // instance or calls auth_mgr.set_auth_db() (server.cpp does, inside
+    // Server::create()).
+    //
+    // main.cpp DOES still need its own short-lived AuthDB here, for two
+    // reasons that both run BEFORE Server::create() exists to ask:
+    //   1. Fresh-start admin bootstrap (below) — auth.users is empty on a
+    //      brand-new Postgres database, so the config-file admin (loaded
+    //      into auth_mgr above) must be persisted once, atomically with its
+    //      Administrator RBAC grant, via RbacStore::provision_first_admin()
+    //      (TOCTOU-free against a second server instance racing first
+    //      boot); AuthDB::seed_admin_if_empty() is NOT called here at all
+    //      (a redundant second no-op call was removed — see its own header
+    //      comment for why it stays exported regardless).
+    //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
+    //      --auth-mode=sso-only break-glass validation, all of which run
+    //      (and may exit) before Server::create() is ever called.
+    // Constructing a second, independent PgPool/FileKeyProvider/SecretCodec/
+    // AuthDB stack here is safe: schema migration (PgMigrationRunner) and
+    // secret-column registration + first-boot KEK generation
+    // (SecretCodec::init) are both idempotent — ServerImpl's own stack,
+    // built moments later against the same database, just re-verifies an
+    // already-migrated schema and an already-generated KEK. Declared in the
+    // same dependency order server.cpp uses (pool → provider → codec →
+    // authdb) so destruction is safe, and torn down (out of scope) before
+    // Server::create() is invoked below — this process never holds two
+    // live AuthDB reaper threads at once.
+    std::optional<yuzu::server::pg::PgPool> auth_pg_pool;
+    std::optional<yuzu::server::FileKeyProvider> auth_key_provider;
+    std::optional<yuzu::server::pg::SecretCodec> auth_secret_codec;
     std::unique_ptr<yuzu::server::AuthDB> auth_db;
 
-    // If --data-dir was specified, ensure it exists and resolve to canonical path
+    if (cfg.postgres_dsn.empty()) {
+        // Server::create() will itself refuse to start (ADR-0006/0007 fail
+        // closed, no SQLite fallback) — nothing to seed or validate here.
+        spdlog::warn("--postgres-dsn is not set: no auth store is available. Server startup will "
+                     "fail closed; any --mfa-reset / --break-glass-arm one-shot will also fail.");
+    } else {
+        // Small, short-lived pool — this stack exists only to seed/validate
+        // before Server::create() builds the real, fully-sized pool.
+        auth_pg_pool.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = cfg.postgres_dsn, .size = 2});
+        if (!auth_pg_pool->valid()) {
+            spdlog::error("Cannot connect to PostgreSQL for auth store bootstrap: {}",
+                          auth_pg_pool->last_error());
+            return EXIT_FAILURE;
+        }
+        // HA WS-8: the multi-host guard above sees only the DSN and PG* env; a
+        // service file (service= / PGSERVICE) is applied by libpq at connect time.
+        // Check what libpq actually resolved on a live connection, and refuse to
+        // start on load_balance_hosts or a host list without read-write (Gate 8
+        // round 7). libpq re-reads a service file on every connect; the readiness
+        // probe repeats this check on each connection IT makes, so a later edit
+        // shows on /readyz only at the probe's next reconnect (contract residual
+        // (2), pg_reachability_probe.hpp) — restart the server after editing it.
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot connect to PostgreSQL to check the connection settings");
+                return EXIT_FAILURE;
+            }
+            if (auto ok = yuzu::server::pg::check_effective_connection(lease.get()); !ok) {
+                spdlog::critical("Invalid Postgres connection settings: {}", ok.error());
+                return EXIT_FAILURE;
+            }
+        }
+        const std::filesystem::path key_dir =
+            cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
+        auth_key_provider.emplace(key_dir);
+        auth_secret_codec.emplace(*auth_key_provider);
+        auth_db = std::make_unique<yuzu::server::AuthDB>(*auth_pg_pool, *auth_secret_codec);
+        if (!auth_db->is_open()) {
+            spdlog::error("Failed to open the Postgres auth store (auth.users migration failed)");
+            return EXIT_FAILURE;
+        }
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot acquire a connection to run SecretCodec::init() for the "
+                              "auth store bootstrap: {}",
+                              auth_pg_pool->last_error());
+                return EXIT_FAILURE;
+            }
+            auto init_res = auth_secret_codec->init(lease.get());
+            lease.reset();
+            if (!init_res) {
+                spdlog::error("SecretCodec::init() failed for the auth store bootstrap — {}: {}",
+                              yuzu::server::pg::SecretCodec::to_string(init_res.error().kind),
+                              init_res.error().message);
+                return EXIT_FAILURE;
+            }
+        }
+
+        // Fresh-start bootstrap (RBAC-safe-by-default + ADR-0006 cutover):
+        // provision the configured admin's account, and a durable fleet-wide
+        // Administrator grant, iff auth.users is genuinely empty (a
+        // brand-new Postgres database), via `RbacStore::provision_first_admin`
+        // (`WHERE NOT EXISTS (SELECT 1 FROM auth.users)`, so it can only ever
+        // fire once — the account+grant land in ONE transaction so a crash
+        // between the two can never strand an account with no grant, and
+        // every later boot then sees a non-empty table and cleanly no-ops).
+        // `AuthDB::seed_admin_if_empty` is NOT called here — it would be a
+        // redundant second no-op by the time this runs (it stays exported
+        // for its own tests and API completeness; see its header doc
+        // comment). A bootstrap failure is FATAL — never warning-only (a
+        // boot that silently fails to provision leaves an operator locked
+        // out of a brand-new deployment with no diagnosis — and once RBAC
+        // defaults to enabled, with no route left able to authorize the fix
+        // either).
+        const auto cfg_users = auth_mgr.list_users();
+        const yuzu::server::auth::UserEntry* seed_user = nullptr;
+        for (const auto& u : cfg_users) {
+            if (u.role == yuzu::server::auth::Role::admin) {
+                seed_user = &u;
+                break;
+            }
+        }
+        if (!seed_user && !cfg_users.empty()) {
+            // A non-admin-role config entry must never be silently promoted
+            // to Administrator (this used to fall back to cfg_users.front()
+            // and provision whatever the first entry was). The interactive
+            // first_run_setup flow (auth.cpp) always creates the admin
+            // account with Role::admin explicitly, so this is reachable
+            // only via a hand-edited config file — but it must still fail
+            // loudly here, not silently provision the wrong identity as the
+            // fleet's first Administrator.
+            //
+            // Deliberately unconditional — this refusal fires on EVERY boot
+            // that reaches this shape, including a database that already
+            // has admins and where nothing would actually be provisioned
+            // (seed_user's only use is passing an identity to
+            // provision_first_admin below, which no-ops harmlessly on a
+            // non-empty auth.users regardless). Gating the refusal on
+            // auth.users emptiness would need a new read before this point;
+            // kept simple and fail-loud instead — an operator who hand-edits
+            // config to remove the admin-role entry (e.g. moving fully to
+            // SSO) gets a clear, immediately recoverable boot error rather
+            // than a config file that quietly stops doing what it used to
+            // do. SEE docs/user-manual/server-admin.md "Upgrade Notes" for
+            // the operator-facing version of this paragraph — this fires on
+            // an EXISTING deployment's next restart too, not only first
+            // boot, if its config carries this shape.
+            spdlog::error(
+                "Fatal: the loaded config lists {} local user(s) but none has role=admin; "
+                "refusing to provision a non-admin account as Administrator. Fix: either mark "
+                "one config entry role=admin, or (if this fleet is SSO-only) remove all local "
+                "user entries from the config so this check is skipped entirely.",
+                cfg_users.size());
+            return EXIT_FAILURE;
+        }
+        if (seed_user != nullptr) {
+            // Short-lived, scoped to this block only — never referenced
+            // again below, so a plain local destructs it (default dtor, no
+            // background thread) well before auth_pg_pool.reset() further
+            // down; no explicit teardown needed. Constructing a second,
+            // independent RbacStore/PgPool pairing here is safe for the
+            // same reason the comment above auth_pg_pool.emplace() gives for
+            // AuthDB: schema migration and default-seeding are idempotent —
+            // ServerImpl's own RbacStore, built moments later against the
+            // same database, just re-verifies an already-migrated schema.
+            yuzu::server::RbacStore bootstrap_rbac_store(*auth_pg_pool);
+            if (!bootstrap_rbac_store.is_open()) {
+                spdlog::error(
+                    "Fatal: failed to open the Postgres RBAC store for the fresh-start "
+                    "Administrator bootstrap — refusing to start rather than boot into an "
+                    "unusable authorization substrate.");
+                return EXIT_FAILURE;
+            }
+
+            // Audit pre-flight (compliance Gate 6 finding, governance round
+            // 2026-09-28): mirrors --mfa-reset/--break-glass-arm's own
+            // "audit is MANDATORY" posture (main.cpp's open_one_shot_audit,
+            // above) — verify the audit store is WRITABLE *before* minting
+            // the fleet's single most privileged account, so a durable
+            // record of this event is never silently impossible. This is
+            // the ONE case where log-and-continue (used below, after the
+            // mutation commits) would be wrong: WHERE NOT EXISTS guarantees
+            // provision_first_admin never gets a second chance to try, so an
+            // audit-store outage at exactly this boot would otherwise
+            // PERMANENTLY forfeit the evidence row for the one event that
+            // most needs one.
+            //
+            // Known residual, deliberately not chased further here (Gate 5
+            // chaos finding): if the account+grant commit succeeds
+            // server-side but the client never observes the COMMIT ack
+            // (network fault between PG processing COMMIT and the reply),
+            // provision_first_admin returns ok=false and this whole block
+            // never reaches the post-write audit call below — yet the
+            // mutation is live. A restart then sees a non-empty table and
+            // cleanly no-ops, so the account+grant are safe, but that one
+            // narrow window can still lose the audit row despite the
+            // pre-flight passing. Accepted: closing it needs either a
+            // same-transaction audit write (AuditStore::log() always
+            // self-acquires its own lease, no connection-scoped write API
+            // exists to fold into provision_first_admin's transaction) or a
+            // durable pre-commit marker, both disproportionate to this
+            // narrow, self-healing-for-the-mutation residual.
+            auto audit = open_one_shot_audit(
+                *auth_pg_pool, cfg.audit_retention_days, "fresh-start bootstrap",
+                "provision the fleet's first Administrator",
+                " Check --postgres-dsn reachability and retry.");
+            if (!audit)
+                return EXIT_FAILURE;
+
+            auto provisioned = bootstrap_rbac_store.provision_first_admin(
+                seed_user->username, seed_user->hash_hex, seed_user->salt_hex);
+            if (!provisioned) {
+                spdlog::error(
+                    "Fatal: failed to provision the first Administrator grant into the "
+                    "Postgres RBAC store (error={}) — refusing to start rather than boot into "
+                    "an unusable authorization substrate.",
+                    provisioned.error());
+                return EXIT_FAILURE;
+            }
+            if (*provisioned) {
+                spdlog::warn(
+                    "RBAC BOOTSTRAP — admin user '{}' was provisioned into the Postgres auth "
+                    "store (it was empty) and granted a durable fleet-wide Administrator role. "
+                    "This warning is logged once, only when a fresh-start provision actually "
+                    "occurs. If this database previously held a legacy SQLite auth.db or a "
+                    "different Postgres database's auth data, that prior data is NOT migrated "
+                    "and is gone — see docs/auth-architecture.md \"fresh-start cutover\" if that "
+                    "applies to this deployment.",
+                    seed_user->username);
+                // Threaded into ServerImpl via Config (metrics_ doesn't exist
+                // yet at this point — Server::create() hasn't run) — see
+                // Config::auth_fresh_start_seeded doc comment.
+                cfg.auth_fresh_start_seeded = true;
+
+                const std::string os_user = resolve_os_principal();
+                yuzu::server::AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.principal_role = "system";
+                ev.action = "rbac.bootstrap.first_admin";
+                ev.target_type = "User";
+                ev.target_id = seed_user->username;
+                ev.result = "success";
+                ev.detail = std::format(
+                    "reason=fresh_install_bootstrap account+Administrator grant provisioned "
+                    "atomically at boot (os_identity={})",
+                    os_user);
+                if (!audit->log(ev)) {
+                    // The pre-flight passed but the write itself failed
+                    // (e.g. disk filled between the check and the write) —
+                    // a narrow TOCTOU, not the ack-loss residual documented
+                    // above. The mutation already committed and is
+                    // non-retriable (WHERE NOT EXISTS), so failing boot here
+                    // would strand an otherwise-healthy install for no
+                    // benefit — log-and-continue, loudly, distinctly (no
+                    // Prometheus counter exists this early in boot to carry
+                    // this signal — the log line IS the only one).
+                    spdlog::error(
+                        "RBAC BOOTSTRAP: admin '{}' was provisioned but the audit row failed to "
+                        "persist — record this bootstrap event manually in your change-"
+                        "management system NOW.",
+                        seed_user->username);
+                }
+            }
+        }
+    }
+
+    // If --data-dir was specified, ensure it exists and resolve to canonical path.
+    // Unrelated to AuthDB (now Postgres-backed) — this still gates the
+    // legacy SQLite stores (audit.db, responses.db, ...).
     if (!cfg.data_dir.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(cfg.data_dir, ec);
@@ -924,53 +1659,7 @@ int main(int argc, char* argv[]) {
         // location) because set_data_dir() hadn't been called yet.
         auth_mgr.reload_state();
 
-        // -- Auth DB: Initialize SQLite-backed auth persistence -----------------
-        // When --data-dir is specified, create and initialize the auth DB.
-        // This provides persistent user/session/token storage that survives
-        // container restarts (fixes GitHub issues #618, #388, #527, #391, #526).
-        //
-        // arch-B1 fix: assign through the function-scope unique_ptr declared
-        // above. Do NOT redeclare a local AuthDB inside this block — the
-        // pointer must outlive Server::create() and server->run() below.
-        spdlog::info("Initializing auth DB in data directory: {}", cfg.data_dir.string());
-        auth_db = std::make_unique<yuzu::server::AuthDB>(cfg.data_dir);
-        auto db_result = auth_db->initialize();
-        if (!db_result) {
-            spdlog::error("Failed to initialize auth DB: {}", static_cast<int>(db_result.error()));
-            return EXIT_FAILURE;
-        }
-        spdlog::info("Auth DB initialized successfully");
-
-        // First-boot seeding: if auth DB has no users, seed admin from config file.
-        // This ensures backwards compatibility — existing config-based users
-        // are automatically migrated to the DB on first start.
-        auto users_result = auth_db->list_users();
-        if (users_result && users_result->empty()) {
-            spdlog::info("Auth DB is empty — seeding admin user from config file");
-            // The admin user was already loaded into auth_mgr via load_config(),
-            // so we can read it back and persist to the DB.
-            for (const auto& user : auth_mgr.list_users()) {
-                auto seed_result =
-                    auth_db->upsert_user(user.username, user.hash_hex, user.salt_hex, user.role);
-                if (seed_result) {
-                    spdlog::info("Seeded user '{}' (role={}) into auth DB", user.username,
-                                 auth::role_to_string(user.role));
-                } else {
-                    spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
-                }
-            }
-        }
-
         spdlog::info("Data directory: {}", cfg.data_dir.string());
-
-        // Wire AuthDB into AuthManager AFTER seeding is complete.
-        // This ensures auth_mgr.list_users() reads from in-memory (config file)
-        // during seeding, then delegates to AuthDB for all subsequent operations.
-        // The raw pointer is safe: auth_db (the unique_ptr) lives in the outer
-        // function scope and is destroyed only after server->run() returns
-        // and AuthManager has gone out of scope.
-        auth_mgr.set_auth_db(auth_db.get());
-        spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
     // -- Break-glass MFA reset mode (exits without starting server) -----------
@@ -981,9 +1670,8 @@ int main(int argc, char* argv[]) {
     // re-enrollment at their next login.
     if (!mfa_reset_user.empty()) {
         if (!auth_db) {
-            spdlog::error("--mfa-reset requires the persistent auth store (auth.db); none is "
-                          "configured for data dir '{}'",
-                          cfg.data_dir.string());
+            spdlog::error("--mfa-reset requires the Postgres auth store; --postgres-dsn is not "
+                          "configured (or could not be opened above).");
             return EXIT_FAILURE;
         }
         // Defence-in-depth: validate the CLI arg before it touches the store
@@ -1015,17 +1703,16 @@ int main(int argc, char* argv[]) {
         // it isn't, refuse to proceed rather than silently clear a second factor
         // with no record (H-1). This also gives the operator an actionable error
         // instead of a buried warning during a stressful recovery.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
-        if (!audit.is_open()) {
-            spdlog::error("--mfa-reset: audit store (audit.db in '{}') is not writable; refusing "
-                          "to clear MFA without an audit record. Fix audit.db permissions/disk and "
-                          "retry, or perform the reset via your documented break-glass SQL path "
-                          "(which you must then record in change management).",
-                          cfg.data_dir.string());
-            std::cerr << "error: audit store unavailable; refusing to clear MFA without an audit "
-                         "record\n";
+        // ADR-0040: AuditStore is Postgres-backed. Reuse the already-open,
+        // validated break-glass PgPool (auth_pg_pool is non-null here — this
+        // block is guarded by `if (!auth_db)` above, and auth_db only exists
+        // when auth_pg_pool is valid).
+        auto audit = open_one_shot_audit(
+            *auth_pg_pool, cfg.audit_retention_days, "--mfa-reset", "clear MFA",
+            " Or perform the reset via your documented break-glass SQL path (which you must then "
+            "record in change management).");
+        if (!audit)
             return EXIT_FAILURE;
-        }
         if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
             spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
             return EXIT_FAILURE;
@@ -1047,7 +1734,7 @@ int main(int argc, char* argv[]) {
         ev.result = "success";
         ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
                                 os_user);
-        if (!audit.log(ev)) {
+        if (!audit->log(ev)) {
             // The pre-check passed but the write failed (e.g. disk filled mid-op).
             // MFA is already cleared; fail loudly and non-zero so automation and
             // the operator know the evidence row is missing and must be recorded.
@@ -1084,9 +1771,8 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         if (!auth_db) {
-            spdlog::error("--break-glass-arm requires the persistent auth store (auth.db); none "
-                          "is configured for data dir '{}'",
-                          cfg.data_dir.string());
+            spdlog::error("--break-glass-arm requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
             return EXIT_FAILURE;
         }
         // Same fail-closed validation the running server applies: the account
@@ -1099,14 +1785,12 @@ int main(int argc, char* argv[]) {
         }
         // Audit is MANDATORY (CC6.6): verify the audit store is WRITABLE before
         // arming, so the exemption is never granted without a record.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
-        if (!audit.is_open()) {
-            spdlog::error("--break-glass-arm: audit store (audit.db in '{}') is not writable; "
-                          "refusing to arm break-glass without an audit record.",
-                          cfg.data_dir.string());
-            std::cerr << "error: audit store unavailable; refusing to arm without an audit record\n";
+        // ADR-0040: Postgres-backed AuditStore; reuse the validated PgPool
+        // (auth_pg_pool non-null — guarded by `if (!auth_db)` above).
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.audit_retention_days,
+                                         "--break-glass-arm", "arm break-glass");
+        if (!audit)
             return EXIT_FAILURE;
-        }
         auto armed = auth_db->arm_break_glass(cfg.break_glass_user, cfg.break_glass_window_secs);
         if (!armed) {
             spdlog::error("--break-glass-arm: failed to arm '{}' (auth store error {})",
@@ -1126,14 +1810,15 @@ int main(int argc, char* argv[]) {
             std::cerr << "error: window too large; account not armed\n";
             return EXIT_FAILURE;
         }
-        // Non-atomic across two databases: the arm mutated auth.db; the audit
-        // row goes to audit.db, so they cannot share a transaction. The order is
-        // arm-then-audit (a false audit row for an arm that didn't happen would
-        // be worse), but a HANDLED audit-write failure is COMPENSATED below by
-        // un-arming, so the "never granted without a record" guarantee holds
-        // (review #1735 HIGH-2). The only residual window is a SIGKILL / power
-        // loss in the ~microseconds between the UPDATE and the INSERT — genuinely
-        // unavoidable without cross-DB atomicity, and the next break-glass login
+        // Non-atomic across two stores: the arm mutated schema `auth`, the audit
+        // row lands in schema `audit_store`. Same Postgres database since
+        // ADR-0040, but each store takes its OWN pool lease, so the two writes
+        // are still separate transactions. The order is arm-then-audit (a false
+        // audit row for an arm that didn't happen would be worse), but a HANDLED
+        // audit-write failure is COMPENSATED below by un-arming, so the "never
+        // granted without a record" guarantee holds (review #1735 HIGH-2). The
+        // only residual window is a SIGKILL / power loss in the ~microseconds
+        // between the UPDATE and the INSERT — and the next break-glass login
         // still emits auth.breakglass.login as a backstop signal.
         const std::string os_user = resolve_os_principal();
         yuzu::server::AuditEvent ev;
@@ -1149,7 +1834,7 @@ int main(int argc, char* argv[]) {
         ev.detail = std::format("break-glass armed until {} ({}s window) via --break-glass-arm "
                                 "CLI (os_identity={})",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
-        if (!audit.log(ev)) {
+        if (!audit->log(ev)) {
             // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence
             // row didn't persist, so roll the arm back — the exemption must never
             // stand without a record (docs/ops-runbooks/auth-db-recovery.md).
@@ -1167,8 +1852,8 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             spdlog::error("--break-glass-arm: audit row for '{}' failed to persist; the arm was "
-                          "ROLLED BACK (account NOT armed). Fix audit.db (disk/permissions) and "
-                          "retry.",
+                          "ROLLED BACK (account NOT armed). Fix the Postgres audit_store schema "
+                          "(reachability/permissions/disk) and retry.",
                           cfg.break_glass_user);
             std::cerr << "error: audit row failed to persist; arm rolled back (account not armed)\n";
             return EXIT_FAILURE;
@@ -1211,20 +1896,19 @@ int main(int argc, char* argv[]) {
     // Runs HERE (just before serving), after every host-CLI one-shot has already
     // early-returned, so --break-glass-arm / --mfa-reset are never blocked by it.
     if (cfg.auth_mode == "sso-only") {
-        // sso-only disables the local-password path, so OIDC must be configured
-        // or every operator is locked out (the break-glass account is for an IdP
-        // OUTAGE, not for never wiring SSO at all). Fail closed rather than
-        // booting an unreachable server. Gate on the SAME predicate the OIDC
-        // provider uses to enable itself — `oidc::Config::is_enabled()` requires
-        // BOTH issuer and client-id (oidc_provider.hpp), and `/auth/oidc/start`
-        // 404s when the provider is disabled — so checking only `oidc_issuer`
-        // would let `--oidc-issuer=… ` with NO `--oidc-client-id` boot with SSO
-        // silently non-functional (review #1735 HIGH-1).
-        if (cfg.oidc_issuer.empty() || cfg.oidc_client_id.empty()) {
-            spdlog::error("--auth-mode=sso-only disables local-password login but OIDC is not "
-                          "fully configured (need both --oidc-issuer and --oidc-client-id). This "
-                          "would lock every operator out (SSO would be non-functional). Configure "
-                          "OIDC SSO completely, or use --auth-mode=standard.");
+        // sso-only disables the local-password path, so at least one SSO provider
+        // must be able to mint a session or every operator is locked out (the
+        // break-glass account is for an IdP OUTAGE, not for never wiring SSO at
+        // all). Fail closed rather than booting an unreachable server. The
+        // OIDC/SAML/HTTPS/platform preconditions live in the testable
+        // `sso_only_boot_guard_ok` (sso_boot_guard.cpp), which gates on the SAME
+        // predicate each provider uses to enable itself — OIDC needs BOTH issuer
+        // and client-id (review #1735 HIGH-1); SAML (non-Windows) needs its five
+        // SP fields AND HTTPS (server.cpp leaves the provider null under
+        // --no-https). Mirrors the SCIM boot guard below.
+        std::string sso_err;
+        if (!yuzu::server::sso_only_boot_guard_ok(cfg, sso_err)) {
+            spdlog::error("{}", sso_err);
             return EXIT_FAILURE;
         }
         // The break-glass account is the ONLY local-login path under sso-only, so
@@ -1234,7 +1918,7 @@ int main(int argc, char* argv[]) {
         if (!cfg.break_glass_user.empty()) {
             if (!auth_db) {
                 spdlog::error("--auth-mode=sso-only with --break-glass-user requires the "
-                              "persistent auth store (auth.db); set --data-dir.");
+                              "Postgres auth store; set --postgres-dsn.");
                 return EXIT_FAILURE;
             }
             std::string why;
@@ -1246,8 +1930,19 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
         }
+        // Name the active SSO path(s) so this CC6.3 evidence line is accurate
+        // under an OIDC-only, SAML-only, or dual deployment (the boot guard above
+        // has already proven at least one is present).
+        std::string sso_providers;
+        if (yuzu::server::oidc_config_complete(cfg))
+            sso_providers = "OIDC";
+#ifndef _WIN32
+        if (yuzu::server::saml_config_complete(cfg) && cfg.https_enabled)
+            sso_providers += sso_providers.empty() ? "SAML" : " + SAML";
+#endif
         spdlog::warn("Hardened auth mode ACTIVE (--auth-mode=sso-only): local-password login is "
-                     "DISABLED fleet-wide; only OIDC SSO can mint a session.{}",
+                     "DISABLED fleet-wide; only SSO ({}) can mint a session.{}",
+                     sso_providers,
                      cfg.break_glass_user.empty()
                          ? std::string(" No break-glass account is configured.")
                          : std::format(" Break-glass account '{}' is exempt only while armed "
@@ -1280,13 +1975,160 @@ int main(int argc, char* argv[]) {
                      "operator accounts (read-only 'user' role only).");
     }
 
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    // Tear down the standalone auth-store bootstrap stack now — ServerImpl
+    // builds its own long-lived AuthDB (off its own pg_pool_) inside
+    // Server::create() below; this process must never hold two live AuthDB
+    // background-reaper threads / PgPool connections open at once. Reverse
+    // declaration order (authdb → codec → provider → pool) via the optional/
+    // unique_ptr destructors below is the same safe order server.cpp uses.
+    auth_db.reset();
+    auth_secret_codec.reset();
+    auth_key_provider.reset();
+    auth_pg_pool.reset();
+
+    // #3007: installed BEFORE Server::create(), not deferred to right-before-publish
+    // the way the agent's make_agent() registration is. Server::create() is not the
+    // agent's trivial construction — TLS cert bootstrap, the gateway mTLS client, and
+    // the full gRPC BuildAndStart() can run for a real interval — and the server ships
+    // as PID 1 in every published container image, where a default disposition is
+    // discarded by the kernel. Nothing can be served gracefully yet, so a signal here
+    // should make the process LEAVE rather than hang: this replaces the old behaviour
+    // (silently swallowed, because g_server was still null and on_signal no-ops) with
+    // something strictly better (killable), at the honest cost of losing the
+    // graceful-attempt illusion the old code never actually delivered on this window
+    // anyway. Upgraded to the real handler once the watcher is live and g_server is
+    // published, below.
+    std::signal(SIGINT, on_signal_hard_exit);
+    std::signal(SIGTERM, on_signal_hard_exit);
 
     try {
-        auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
+        auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr); // 1st: destroyed LAST
+
+#ifndef _WIN32
+        // RAII, and DECLARATION ORDER IS LOAD-BEARING: declared AFTER `server`, so
+        // reverse-order destruction destroys the watcher FIRST — joining its thread,
+        // which runs any in-flight stop() to completion — before the Server it calls
+        // stop() on is destroyed. This is also half of the #3007 addendum fix: the old
+        // stop_entered_ CAS let a losing caller (~ServerImpl, reached via `server`'s own
+        // destructor below) return immediately while another thread was still
+        // mid-teardown; ~ShutdownWatcher's join() now makes main WAIT for that teardown
+        // to finish before ~ServerImpl even runs, so ServerImpl::stop()'s own completion
+        // barrier (server.cpp) never has to arbitrate a live race on this path — only
+        // the redundant, sequential, same-thread re-entry from run()'s
+        // startup_failed_ early return.
+        //
+        // CONSTRUCTED INSIDE A TRY. ShutdownWatcher's constructor body firewalls
+        // std::thread's ctor itself (catches std::system_error under EAGAIN internally,
+        // calls degrade(), never rethrows) — so this try is NOT for that. It's for
+        // `state_{std::make_shared<WatcherState>(...)}` in the ctor's mem-init-list,
+        // which runs BEFORE the body's try block and so is NOT firewalled: a bad_alloc
+        // there escapes to here. (#3007 governance cpp-expert LOW — corrected from an
+        // earlier version of this comment that misattributed the throw source.) Either
+        // way: if it throws, the hard-exit handler installed above is simply left in
+        // place.
+        std::optional<yuzu::ShutdownWatcher> shutdown_watcher;
+        try {
+            shutdown_watcher.emplace(
+                g_shutdown_wfd,
+                [] {
+                    auto* s = g_server.load(std::memory_order_acquire);
+                    if (!s)
+                        return false; // not published yet — keep waiting, don't consume
+                    s->stop();        // ordinary thread: safe to lock, join, malloc, log
+                    return true;
+                },
+                [] {
+                    // TRAP 6 (shutdown_watcher.hpp) — the watcher died on a read()
+                    // error. Leaving the handlers installed means on_signal keeps
+                    // writing bytes into a pipe with no reader: every SIGTERM is
+                    // swallowed and the server becomes unkillable by anything but
+                    // SIGKILL. SIG_DFL is not the answer either — the server is PID 1
+                    // in every shipped container image, and the kernel discards a
+                    // default-disposition signal there.
+                    std::signal(SIGINT, on_signal_hard_exit);
+                    std::signal(SIGTERM, on_signal_hard_exit);
+                });
+        } catch (...) {
+            // Firewalled — see shutdown_watcher.hpp's construction-failure comment. The
+            // hard-exit handler is already installed (pre-create, above), so this path
+            // just means it stays installed instead of being upgraded below.
+            spdlog::warn("could not construct the shutdown watcher (out of memory or "
+                         "threads) — SIGINT/SIGTERM will exit the process immediately "
+                         "and UNGRACEFULLY (no store flush, no clean DB close).");
+        }
+#endif
+
         g_server.store(server.get(), std::memory_order_release);
+
+        // UNPUBLISH ON EVERY PATH, BEFORE the watcher is destroyed — declared AFTER
+        // both `server` and `shutdown_watcher`, so reverse-order destruction runs this
+        // FIRST. On Windows this also WAITS (via g_server_mu) for any in-flight
+        // console-handler stop() to return before nulling g_server, closing the same
+        // race the POSIX side closes structurally via ~ShutdownWatcher's join(). Mirrors
+        // agents/core/src/main.cpp's AgentUnpublisher (#1822 / Gate-8 round 8 UP8-1).
+        //
+        // #3007 governance (cpp-expert LOW, unhappy-path UP-1): also reinstalls the
+        // hard-exit handlers, unconditionally. The explicit reinstall a few lines below
+        // `server->run();` only runs on NORMAL return — if run() itself throws, that
+        // line is skipped by the unwind, and the still-installed graceful `on_signal`
+        // would find a retracted/about-to-retract pipe for the whole span of
+        // `~ShutdownWatcher`'s join + `~ServerImpl`'s (first-time, synchronous) teardown,
+        // silently swallowing a signal there instead of leaving. This destructor runs
+        // FIRST on every exit path including that one, so putting the reinstall here
+        // covers both — redundant-but-harmless on the normal path (the explicit call
+        // already ran), and the only reinstall on the unwind path.
+        struct ServerUnpublisher {
+            ~ServerUnpublisher() {
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
+#ifdef _WIN32
+                std::lock_guard<std::mutex> lock(g_server_mu);
+#endif
+                g_server.store(nullptr, std::memory_order_release);
+            }
+        } server_unpublisher;
+
+#ifndef _WIN32
+        // ONLY install the graceful handlers if the watcher is live. If it is not (pipe
+        // or thread creation failed), on_signal would catch the signal, find no pipe,
+        // and RETURN — swallowing it, with no default disposition left. The fallback is
+        // the hard-exit handler installed above (never SIG_DFL — pid 1 discards it).
+        if (shutdown_watcher && shutdown_watcher->ok()) {
+            std::signal(SIGINT, on_signal);
+            std::signal(SIGTERM, on_signal);
+            // RE-CHECK after the install (TOCTOU): a watcher dying between the ok()
+            // test above and these installs runs its died-callback FIRST — which
+            // installs the hard-exit handler — and the two std::signal calls above
+            // would then OVERWRITE it with on_signal, which finds wfd < 0 and returns:
+            // signal swallowed, server unkillable. See agents/core/src/main.cpp
+            // Gate-8 SHOULD-1.
+            if (!shutdown_watcher->ok()) {
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
+            }
+        } else {
+            spdlog::warn("shutdown watcher unavailable — SIGINT/SIGTERM will now exit "
+                         "the process IMMEDIATELY and UNGRACEFULLY (no store flush, no "
+                         "clean DB close). A default disposition would be IGNORED by "
+                         "PID 1 in a container, so this is the killable posture.");
+        }
+#else
+        std::signal(SIGINT, on_signal);
+        std::signal(SIGTERM, on_signal);
+#endif
+
         server->run();
+
+        // THE HANDLERS MUST NOT OUTLIVE WHAT SERVES THEM. From here the watcher is
+        // about to be joined and g_shutdown_wfd cleared — on_signal would find wfd == -1
+        // and simply return, swallowing the signal, for the whole span of
+        // ~ServerImpl's teardown, which is not brief: #3261's quiesce waits alone total
+        // up to 120s. Leave a handler that guarantees the process LEAVES instead of
+        // hanging to the supervisor's kill timeout. See agents/core/src/main.cpp
+        // Gate-8 round 7 UP-2.
+        std::signal(SIGINT, on_signal_hard_exit);
+        std::signal(SIGTERM, on_signal_hard_exit);
+
         if (server->startup_failed()) {
 #ifdef _WIN32
             WSACleanup();

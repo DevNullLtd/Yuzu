@@ -1,7 +1,7 @@
 ## Hardware Inventory Plugin Definitions
 ## Queries manufacturer, model, BIOS/UEFI, processor, memory, and disk
 ## information from each endpoint using WMI (Windows), sysfs/dmidecode
-## (Linux), or sysctl/system_profiler (macOS).
+## (Linux), or sysctlbyname/IOKit and system_profiler (macOS).
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -13,7 +13,7 @@ metadata:
   description: >
     Returns the system manufacturer string (e.g. "Dell Inc.",
     "Apple Inc.", "Lenovo"). Uses Win32_ComputerSystem on Windows,
-    /sys/class/dmi/id/sys_vendor on Linux, sysctl on macOS.
+    /sys/class/dmi/id/sys_vendor on Linux, sysctlbyname(3) on macOS.
   tags: [hardware, inventory]
 
 spec:
@@ -33,6 +33,9 @@ spec:
     columns:
       - name: manufacturer
         type: string
+        description: 'The system manufacturer string, or "unknown" when the probe could not read one. Values: free text, or the sentinel "unknown".'
+        example: "PCSpecialist"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get hardware manufacturer"
 
@@ -63,7 +66,7 @@ metadata:
   description: >
     Returns the system model or product name (e.g. "OptiPlex 7090",
     "MacBookPro18,1"). Uses Win32_ComputerSystem on Windows,
-    /sys/class/dmi/id/product_name on Linux, sysctl hw.model on macOS.
+    /sys/class/dmi/id/product_name on Linux, sysctlbyname(3) hw.model on macOS.
   tags: [hardware, inventory]
 
 spec:
@@ -83,6 +86,9 @@ spec:
     columns:
       - name: model
         type: string
+        description: 'The system model or product name string, or "unknown" when the probe could not read one. Values: free text, or the sentinel "unknown".'
+        example: "Amd Am4 Gen3"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get hardware model"
 
@@ -133,10 +139,19 @@ spec:
     columns:
       - name: bios_vendor
         type: string
+        description: 'BIOS/firmware vendor name; the fixed literal "Apple" on macOS, or "unknown" when unread. Values: free text, the literal "Apple" (macOS only), or the sentinel "unknown".'
+        example: "American Megatrends Inc."
+        platforms: [windows, linux, darwin]
       - name: bios_version
         type: string
+        description: 'BIOS/firmware version string, or "unknown" when unread. Values: free text, or the sentinel "unknown".'
+        example: "3801"
+        platforms: [windows, linux, darwin]
       - name: bios_date
         type: string
+        description: 'BIOS release date as YYYY-MM-DD on Windows/Linux; the fixed literal "N/A" on macOS (no BIOS date concept); "unknown" when unread. Values: YYYY-MM-DD format, the literal "N/A" (macOS only), or the sentinel "unknown".'
+        example: "2021-07-30"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get BIOS/UEFI information"
 
@@ -167,7 +182,7 @@ metadata:
   description: >
     Lists installed CPUs with model name, physical core count, logical
     thread count, and clock speed in MHz. Uses Win32_Processor on Windows,
-    /proc/cpuinfo on Linux, sysctl on macOS. Returns one row per physical
+    /proc/cpuinfo on Linux, sysctlbyname(3) on macOS. Returns one row per physical
     CPU socket.
   tags: [hardware, inventory, cpu]
 
@@ -188,14 +203,29 @@ spec:
     columns:
       - name: index
         type: int32
+        description: 'Physical socket index (Linux DMI "physical id"; always 0 on macOS; enumeration order on Windows). Values: integer, 0-based.'
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: model
         type: string
+        description: 'CPU brand/model string, or "unknown" when no CPU rows were found. Values: free text, or the sentinel "unknown".'
+        example: "AMD Ryzen 9 5900X 12-Core Processor"
+        platforms: [windows, linux, darwin]
       - name: cores
         type: int32
+        description: 'Physical core count for this socket. Values: integer.'
+        example: "12"
+        platforms: [windows, linux, darwin]
       - name: threads
         type: int32
+        description: 'Logical thread count for this socket. Values: integer.'
+        example: "24"
+        platforms: [windows, linux, darwin]
       - name: clock_mhz
         type: int32
+        description: 'Reported/maximum clock speed in MHz; 0 when the OS exposes no frequency (e.g. Apple Silicon has no hw.cpufrequency). Values: integer, or 0 when unreadable.'
+        example: "4200"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List installed processors"
 
@@ -227,7 +257,7 @@ metadata:
     Lists installed memory DIMMs with slot locator, capacity in MB,
     memory type (DDR3/DDR4/DDR5), and speed in MHz. Uses
     Win32_PhysicalMemory on Windows, dmidecode on Linux (falls back to
-    /proc/meminfo total), sysctl hw.memsize on macOS.
+    /proc/meminfo total), sysctlbyname(3) hw.memsize on macOS.
   tags: [hardware, inventory, memory]
 
 spec:
@@ -247,12 +277,24 @@ spec:
     columns:
       - name: slot
         type: string
+        description: 'DIMM locator on Windows/Linux dmidecode, or the fixed literal "total" for an aggregate-only row (macOS always, Linux when dmidecode is unavailable or unprivileged). Values: free text locator, or the literal "total".'
+        example: "DIMM_A2"
+        platforms: [windows, linux]
       - name: size_mb
         type: int64
+        description: 'Module capacity in MB, or the aggregate total in MB on an aggregate-only row. Values: integer.'
+        example: "8192"
+        platforms: [windows, linux, darwin]
       - name: type
         type: string
+        description: 'Memory type (DDR2/DDR3/DDR4/DDR5); "unknown" on every aggregate-only row (macOS, and the Linux /proc/meminfo fallback carry no type). Values: DDR2, DDR3, DDR4, DDR5, or the sentinel "unknown".'
+        example: "DDR4"
+        platforms: [windows, linux]
       - name: speed_mhz
         type: int32
+        description: 'Module speed in MHz; 0 on every aggregate-only row. Values: integer, or 0 on an aggregate-only row.'
+        example: "3600"
+        platforms: [windows, linux]
 
   readablePayload: "List installed memory modules"
 
@@ -283,7 +325,7 @@ metadata:
   description: >
     Lists physical disk drives with model name, capacity in GB, media
     type (SSD/HDD/Removable), and interface type (SCSI, NVMe, SATA, USB).
-    Uses Win32_DiskDrive on Windows, lsblk on Linux, system_profiler on
+    Uses Win32_DiskDrive on Windows, native /sys/block on Linux, system_profiler on
     macOS.
   tags: [hardware, inventory, storage]
 
@@ -304,14 +346,29 @@ spec:
     columns:
       - name: index
         type: int32
+        description: 'Enumeration index (Windows Win32_DiskDrive.Index; macOS/Linux assigned during enumeration, not guaranteed stable across runs). Values: integer, 0-based.'
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: model
         type: string
+        description: 'Disk model/device string, or "unknown" when nothing was found. Values: free text, or the sentinel "unknown".'
+        example: "Samsung SSD 970 EVO Plus 1TB"
+        platforms: [windows, linux, darwin]
       - name: size_gb
         type: int64
+        description: Disk capacity in GB, integer-divided from raw bytes (Windows/macOS) or 512-byte sectors (Linux).
+        example: "931"
+        platforms: [windows, linux, darwin]
       - name: media_type
         type: string
+        description: 'Media classification. Windows matches the WMI MediaType string; macOS treats every NVMe device as SSD and looks up SATA media from SPStorageDataType; Linux reads the removable/rotational sysfs attributes. Values: SSD, HDD, Removable, or the sentinel "unknown".'
+        example: "SSD"
+        platforms: [windows, linux, darwin]
       - name: interface
         type: string
+        description: 'Bus/interface label. Windows reports the WMI storage-stack InterfaceType (often "SCSI" even for NVMe/SATA disks, not the physical bus); macOS reports "NVMe"/"SATA"; Linux infers a transport from the /sys/block symlink target. Values: SCSI (Windows); NVMe or SATA (macOS); nvme, usb, virtio, mmc, sata, scsi, or unknown (Linux).'
+        example: "SCSI"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List physical disk drives"
 
@@ -343,9 +400,10 @@ metadata:
   description: >
     Lists installed device drivers with name, version, date, provider, and
     device class. Uses Win32_PnPSignedDriver on Windows (the canonical
-    signed-driver registry; the query can take several seconds) and loaded
-    kernel modules via lsmod on Linux (module names only — version/date are
-    not available without a per-module walk). Supports fleet queries like
+    signed-driver registry; the query can take several seconds) and a direct
+    read of /proc/modules on Linux (module names only — version/date are
+    not available without a per-module walk). Not supported on macOS (no
+    public per-driver/kext enumeration API). Supports fleet queries like
     "devices running driver X older than version Y".
   tags: [hardware, inventory, drivers]
 
@@ -366,16 +424,34 @@ spec:
     columns:
       - name: index
         type: int32
+        description: 'Enumeration order; on the truncation-marker row (Windows only), carries the reached row count instead of an index. Values: integer, 0-based, or the reached count on a truncation-marker row.'
+        example: "0"
+        platforms: [windows, linux]
       - name: name
         type: string
+        description: 'Driver/module display name; "unknown" when nothing was found; the literal "__truncated__" marks a Windows WMI row-cap hit (512 rows, agents/shared/wmi_bounded.hpp). Values: free text, the sentinel "unknown", or the literal "__truncated__".'
+        example: "Realtek Audio Universal Service"
+        platforms: [windows, linux]
       - name: version
         type: string
+        description: 'Driver version string (Windows only; Linux /proc/modules carries no version, always empty). Values: free text, or empty.'
+        example: "6.0.9977.1"
+        platforms: [windows]
       - name: date
         type: string
+        description: 'Driver release date as YYYY-MM-DD, parsed from the WMI CIM datetime (Windows only; empty if malformed or on Linux). Values: YYYY-MM-DD format, or empty.'
+        example: "2026-04-14"
+        platforms: [windows]
       - name: provider
         type: string
+        description: 'Driver publisher (Windows DriverProviderName; the fixed literal "kernel" on Linux). Values: free text, or the literal "kernel".'
+        example: "Realtek Semiconductor Corp."
+        platforms: [windows, linux]
       - name: device_class
         type: string
+        description: 'Windows DeviceClass (e.g. NET, SYSTEM, MEDIA); the fixed literal "module" on Linux. Values: free text WMI device class, or the literal "module".'
+        example: "MEDIA"
+        platforms: [windows, linux]
 
   readablePayload: "List installed device drivers"
 
@@ -410,7 +486,9 @@ metadata:
     Windows reads Win32_BIOS.SerialNumber and Win32_ComputerSystemProduct.UUID via
     WMI; Linux reads /sys/class/dmi/id/product_serial and product_uuid (0400, via
     the agent's cap_dac_read_search capability); macOS reads IOPlatformSerialNumber
-    and IOPlatformUUID from ioreg. An absent value (e.g. a VM with no SMBIOS serial)
+    and IOPlatformUUID via native IOKit (IOServiceGetMatchingService +
+    IORegistryEntryCreateCFProperty against IOPlatformExpertDevice). An absent
+    value (e.g. a VM with no SMBIOS serial)
     returns the literal "unknown". This is the building block the device_ci
     daily-sync source (ADR-0016) collects in-process.
   tags: [hardware, inventory]
@@ -432,8 +510,14 @@ spec:
     columns:
       - name: serial
         type: string
+        description: 'Hardware serial number, or "unknown" when absent (e.g. a VM with no SMBIOS serial) or unreadable. Values: free text, or the sentinel "unknown".'
+        example: "EXAMPLE0001"
+        platforms: [windows, linux, darwin]
       - name: system_uuid
         type: string
+        description: 'SMBIOS/firmware system UUID, or "unknown" when absent or unreadable. Values: free text UUID, or the sentinel "unknown".'
+        example: "00000000-0000-0000-0000-000000000001"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get the device serial number and system UUID"
 

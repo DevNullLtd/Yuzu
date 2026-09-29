@@ -28,6 +28,10 @@ updates:
           - "github/codeql-action/*"
     cooldown:
       default-days: 7
+    # Dependabot updates repository refs in `uses:` (including the SHA-pinned
+    # ilammy/msvc-dev-cmd action). Action inputs such as `with.sdk` are not a
+    # dependency ecosystem; tests/test_windows_sdk_contract.py guards that
+    # reviewed Windows SDK pin instead.
 
   - package-ecosystem: "docker"
     # NOT recursive — cedar-vale's tier Dockerfiles need their own entry.

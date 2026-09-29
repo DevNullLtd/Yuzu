@@ -3,7 +3,8 @@
 /// SOCK_DIAG/INET_DIAG (proven to match `ss -ti`) + device throughput from
 /// /proc/net/dev. Windows reads device throughput via GetIfTable2 and a
 /// system-wide TCP retransmit rate via GetTcpStatisticsEx (RTT deferred — needs
-/// ESTATS). macOS + other platforms return all-invalid.
+/// ESTATS). macOS reads device throughput via NET_RT_IFLIST2 (retransmit + RTT
+/// deferred — see the macOS block below). Other platforms return all-invalid.
 
 #include "net_quality_sampler.hpp"
 
@@ -31,6 +32,7 @@
 #include <cstddef> // offsetof
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // std::strtoull — /proc/net/dev field walk
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -211,12 +213,25 @@ NetCounters read_net_counters() {
         if (std::strcmp(name, "lo") == 0)
             continue;
         // rx: bytes packets errs drop fifo frame compressed multicast | tx: bytes ...
-        unsigned long long rxb = 0, txb = 0, junk = 0;
-        // 8 rx fields then tx bytes is field 9 overall.
-        if (std::sscanf(colon + 1, "%llu %llu %llu %llu %llu %llu %llu %llu %llu", &rxb, &junk,
-                        &junk, &junk, &junk, &junk, &junk, &junk, &txb) >= 9) {
-            rx_total += rxb;
-            tx_total += txb;
+        // 8 rx fields then tx bytes is field 9 overall. strtoull walk instead of
+        // sscanf "%llu"x9 (glibc 2.38's __isoc23_sscanf redirect breaks older-glibc
+        // hosts); like %llu, strtoull skips leading whitespace, and all 9 fields
+        // must convert — matching the old `>= 9` (i.e. all-nine) conversion-count gate.
+        const char* p = colon + 1;
+        unsigned long long fields[9]{};
+        bool ok = true;
+        for (auto& fv : fields) {
+            char* end{};
+            fv = std::strtoull(p, &end, 10);
+            if (end == p) {
+                ok = false;
+                break;
+            }
+            p = end;
+        }
+        if (ok) {
+            rx_total += fields[0]; // rx bytes
+            tx_total += fields[8]; // tx bytes
         }
     }
     c.valid = true;
@@ -380,7 +395,153 @@ NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& 
 
 } // namespace yuzu::agent::netq
 
-#else // ── other platforms: all-invalid (macOS later) ─────────────────────────
+// ── macOS implementation (THROUGHPUT ONLY — retransmit + RTT deferred) ──────
+#elif defined(__APPLE__)
+
+#include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <net/route.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+namespace yuzu::agent::netq {
+
+NetCounters read_net_counters() {
+    // v1 throughput is a deliberately COARSE device aggregate — the sum of
+    // every non-loopback interface's byte counters, read via the routing-socket
+    // interface list (NET_RT_IFLIST2). This mirrors the Linux /proc/net/dev and
+    // Windows GetIfTable2 paths, including the same over-counting caveat: on a
+    // host with stacked interfaces (a bridge + its member NICs, a VPN utun over
+    // a physical NIC) the same packet is counted on each layer it traverses, so
+    // this is an upper bound on device traffic, not a wire-accurate figure (see
+    // docs/user-manual/network.md "Throughput").
+    NetCounters c;
+
+    int mib[6] = {CTL_NET, AF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}; // family 0 = all
+    std::size_t needed = 0;
+    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) < 0 || needed == 0)
+        return c; // invalid
+
+    std::vector<char> buf(needed);
+    if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) < 0)
+        return c; // invalid — no fd/heap handle to own, the vector frees itself
+
+    uint64_t rx_total = 0, tx_total = 0;
+    char* ptr = buf.data();
+    std::size_t remaining = needed;
+    // Walk the buffer message-by-message. This is a trusted kernel buffer, but
+    // FULL BOUNDS CHECKS are still mandatory (PLAN-002): a truncated/short
+    // final message or a zero ifm_msglen must never over-read the buffer,
+    // spin forever, or be tolerated as "close enough" — any malformation
+    // invalidates the whole sample rather than publishing a partial
+    // aggregate as if it were complete.
+    // Every routing-socket message type (if_msghdr, if_msghdr2, ifa_msghdr, …)
+    // shares this exact leading prefix (see net/route.h / net/if.h). The
+    // interface list interleaves RTM_IFINFO2 records with RTM_NEWADDR address
+    // records whose total length is routinely SHORTER than sizeof(if_msghdr)
+    // (if_msghdr embeds a full if_data), so the per-message minimum is this
+    // prefix — requiring a full if_msghdr would misread a legitimate short
+    // trailing address record as truncation and invalidate the whole sample.
+    struct MsgPrefix {
+        unsigned short msglen;
+        unsigned char version;
+        unsigned char type;
+    };
+    static_assert(sizeof(MsgPrefix) == 4);
+    // Pin the mirrored layout to the SDK's real headers — if Apple ever moved
+    // these fields, the walk would misparse silently without this.
+    static_assert(offsetof(struct if_msghdr2, ifm_msglen) == offsetof(MsgPrefix, msglen) &&
+                  offsetof(struct if_msghdr2, ifm_version) == offsetof(MsgPrefix, version) &&
+                  offsetof(struct if_msghdr2, ifm_type) == offsetof(MsgPrefix, type));
+
+    while (remaining > 0) {
+        if (remaining < sizeof(MsgPrefix))
+            return c; // truncated trailing header — not a successful walk
+
+        // memcpy into a local, aligned object rather than reinterpret_cast
+        // the raw kernel bytes: same discipline as the Linux tcp_info read
+        // above — no real object of these types lives in `buf`, so a typed
+        // cast would be alignment + strict-aliasing UB; memcpy moots both.
+        MsgPrefix pfx{};
+        std::memcpy(&pfx, ptr, sizeof(pfx));
+        const std::size_t msglen = pfx.msglen;
+        if (msglen < sizeof(MsgPrefix) || msglen > remaining)
+            return c; // malformed/truncated — never advance by 0, never overrun
+
+        if (pfx.type == RTM_IFINFO2) {
+            // A short RTM_IFINFO2 IS the malformation the fail-whole-sample
+            // contract above exists for (unlike a legitimately-short
+            // RTM_NEWADDR, which the generic msglen check above already lets
+            // through) — invalidate the whole sample rather than silently
+            // skip a truncated interface record and publish a partial
+            // aggregate as if it were complete.
+            if (msglen < sizeof(struct if_msghdr2))
+                return c; // invalid — truncated RTM_IFINFO2
+            // Reject a routing-message ABI version we don't know how to lay
+            // out as if_msghdr2 (prospective guard: a future kernel revision
+            // could change the layout under a new RTM_VERSION without
+            // changing msglen enough to be caught above).
+            if (pfx.version != RTM_VERSION)
+                return c; // invalid — unrecognized RTM_IFINFO2 layout version
+            struct if_msghdr2 ifm2 {};
+            std::memcpy(&ifm2, ptr, sizeof(ifm2));
+            // Skip the loopback — it is not "the network", and dwarfs real
+            // traffic (mirrors the Linux "lo" skip / Windows
+            // IF_TYPE_SOFTWARE_LOOPBACK skip).
+            if (!(ifm2.ifm_flags & IFF_LOOPBACK)) {
+                // if_data64 fields — 64-bit, no wrap concern.
+                rx_total += ifm2.ifm_data.ifi_ibytes;
+                tx_total += ifm2.ifm_data.ifi_obytes;
+            }
+        }
+        ptr += msglen;
+        remaining -= msglen;
+    }
+
+    // Reached only when the walk consumed the entire buffer cleanly (no
+    // malformed/truncated message forced an early, invalid return above) —
+    // valid is set only after that successful, complete walk.
+    c.valid = true;
+    c.rx_bytes = rx_total;
+    c.tx_bytes = tx_total;
+    c.at = std::chrono::steady_clock::now();
+    return c;
+}
+
+NetQualitySample sample_net_quality(const NetCounters& prev, const NetCounters& cur) {
+    NetQualitySample s;
+
+    // (a) Throughput from the interface-counter delta (the pure helper) — via
+    // NET_RT_IFLIST2, measurement-first, same coarse over-counting caveat as
+    // the Linux and Windows paths above.
+    if (auto bps = throughput_bps(prev, cur)) {
+        s.throughput_valid = true;
+        s.throughput_bps = *bps;
+    }
+
+    // (b) Retransmit is DEFERRED on macOS in v1. The originally-planned source
+    // (the global net.inet.tcp.stats OID, read for tcps_sndrexmitpack /
+    // tcps_sndpack) is UNUSABLE: it reads back all-zero counters on current
+    // macOS (verified 26.5.2 — every one of its 228 u32 fields is 0, matching
+    // Apple's own `netstat -s -p tcp`), so `segs` would always be 0 and a
+    // 'retransmit' claim would be false. We deliberately do not read that
+    // OID. Retransmit defers to a per-flow source (the NetworkStatistics/
+    // nstat client, roadmap 2.x).
+    // s.retrans_valid stays false — absent, never a fabricated 0.
+
+    // (c) RTT is deferred on macOS, exactly as on Windows in v1 — needs a
+    // per-connection source. s.rtt_valid stays false — absent, never 0.
+
+    return s;
+}
+
+} // namespace yuzu::agent::netq
+
+#else // ── other platforms: all-invalid ────────────────────────────────────
 
 namespace yuzu::agent::netq {
 

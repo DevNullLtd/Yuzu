@@ -1,0 +1,14 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e724207e0989
+== action=list
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+[rc] 1
+
+== action=running
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+[rc] 1
+
+== action=set_start_mode
+error|missing required parameter: name
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

@@ -72,7 +72,7 @@ jobs:
           echo "kernel-arch: $(uname -m)"
           echo "runner-name: $RUNNER_NAME"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -142,7 +142,7 @@ jobs:
             New toolchain takes effect on the runner's next workflow.
 
             Verify after restart:
-              gh api repos/Tr3kkR/Yuzu/actions/runners | jq '.runners[] | select(.name=="<runner>")'
+              gh api repos/DevNullLtd/Yuzu/actions/runners | jq '.runners[] | select(.name=="<runner>")'
               # then dispatch a workflow without setup-beam and confirm OTP $OTP_VERSION on PATH
           ═══════════════════════════════════════════════════════════════════════
           EOF

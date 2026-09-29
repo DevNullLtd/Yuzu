@@ -11,7 +11,9 @@ const base = import.meta.env.BASE_URL; // ends with '/'
     <div class="nav-grp">
       <div class="gh">{sec.heading}</div>
       {sec.entries.map((e) => (
-        <a href={`${base}manual/${e.slug}/`} class={e.slug === active ? 'on' : ''}>{e.title}</a>
+        // Plugin READMEs route under /plugins/<name>/ (src/pages/plugins/[slug].astro);
+        // every manual entry routes under /manual/<slug>/.
+        <a href={e.slug.startsWith('plugins/') ? `${base}${e.slug}/` : `${base}manual/${e.slug}/`} class={e.slug === active ? 'on' : ''}>{e.title}</a>
       ))}
     </div>
   ))}

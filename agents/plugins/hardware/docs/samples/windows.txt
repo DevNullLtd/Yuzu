@@ -1,0 +1,289 @@
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash fc050dca8530
+== action=manufacturer
+manufacturer|PCSpecialist
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=model
+model|Amd Am4 Gen3
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=bios
+bios_vendor|American Megatrends Inc.
+bios_version|3801
+bios_date|2021-07-30
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=processors
+cpu|0|AMD Ryzen 9 5900X 12-Core Processor            |12|24|4200
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=memory
+dimm|DIMM_A2|8192|DDR4|3600
+dimm|DIMM_B2|8192|DDR4|3600
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=disks
+disk|1|Samsung SSD 970 EVO Plus 1TB|931|HDD|SCSI
+disk|0|Samsung SSD 970 EVO Plus 250GB|232|HDD|SCSI
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=drivers
+driver|0|Tailscale Tunnel|0.14.0.0|2021-10-13|WireGuard LLC|NET
+driver|1|Xvdd SCSI Miniport|10.0.22029.3|2026-07-16|Xbox|SCSIADAPTER
+driver|2|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|3|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE
+driver|4|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE
+driver|5|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE
+driver|6|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE
+driver|7|Local Print Queue|10.0.26100.1|2006-06-21|Microsoft|PRINTQUEUE
+driver|8|WAN Miniport (Network Monitor)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|9|WAN Miniport (IPv6)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|10|WAN Miniport (IP)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|11|WAN Miniport (PPPOE)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|12|WAN Miniport (PPTP)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|13|WAN Miniport (L2TP)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|14|WAN Miniport (IKEv2)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|15|WAN Miniport (SSTP)|10.0.26100.1|2006-06-21|Microsoft|NET
+driver|16|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|17|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|18|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|19|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|20|Generic software device|10.0.26100.1|2006-06-21|Microsoft|SOFTWAREDEVICE
+driver|21|Voice Clarity|1.0.4.7057|2026-06-16|Microsoft Corporation|AUDIOPROCESSINGOBJECT
+driver|22|Computer Device|10.0.26100.1|2006-06-21|Microsoft|COMPUTER
+driver|23|Remote Desktop Device Redirector Bus|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM
+driver|24|Plug and Play Software Device Enumerator|10.0.26100.4202|2025-05-23|Microsoft|SYSTEM
+driver|25|Microsoft System Management BIOS Driver|10.0.26100.1|2006-06-21|Microsoft|SYSTEM
+driver|26|NDIS Virtual Network Adapter Enumerator|10.0.26100.1|2006-06-21|Microsoft|SYSTEM
+driver|27|NVIDIA Virtual Audio Device (Wave Extensible) (WDM)|4.65.0.12|2025-05-13|NVIDIA|MEDIA
+driver|28|Microsoft Hyper-V Virtual Disk Server|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|29|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|30|Steam Streaming Speakers|17.56.13.764|2017-07-20|Valve Corporation|MEDIA
+driver|31|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|32|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|33|Steam Streaming Microphone|8.33.15.17|2017-07-28|Valve Corporation|MEDIA
+driver|34|Microsoft Basic Render Driver|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM
+driver|35|Microsoft Hyper-V PCI Server|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM
+driver|36|System Firmware|10.0.26100.4768|2006-06-21|Microsoft|FIRMWARE
+driver|37|Microsoft UEFI-Compliant System|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM
+driver|38|ACPI Fixed Feature Button|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|39|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|40|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|41|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|42|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|43|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|44|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|45|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|46|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|47|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|48|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|49|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|50|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|51|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|52|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|53|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|54|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|55|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|56|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|57|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|58|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|59|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|60|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|61|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|62|AMD Processor|10.0.26100.9278|2009-04-21|Microsoft|PROCESSOR
+driver|63|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|64|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|65|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|66|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|67|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|68|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|69|Trusted Platform Module 2.0|10.0.26100.8972|2006-06-21|Microsoft|SECURITYDEVICES
+driver|70|AMD GPIO Controller|2.2.0.130|2020-11-03|Advanced Micro Devices, Inc|SYSTEM
+driver|71|High precision event timer|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|72|ACPI Power Button|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|73|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|74|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|75|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|76|System board|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|77|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|78|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|79|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|80|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|81|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|82|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|83|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|84|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|85|Microsoft ACPI-Compliant Embedded Controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|86|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|87|System speaker|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|88|System CMOS/real time clock|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|89|System timer|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|90|Direct memory access controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|91|Programmable interrupt controller|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|92|PCI standard ISA bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|93|AMD SMBus|5.12.0.38|2020-08-03|Advanced Micro Devices, Inc|SYSTEM
+driver|94|Motherboard resources|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|95|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|96|Realtek Audio Universal Service|1.0.660.0|2023-10-24|Realtek|SOFTWARECOMPONENT
+driver|97|Realtek Hardware Support Application|11.0.6000.311|2023-10-24|Realtek|SOFTWARECOMPONENT
+driver|98|Generic software component|10.0.26100.1|2006-06-21|Microsoft|SOFTWARECOMPONENT
+driver|99|Generic software component|10.0.26100.1|2006-06-21|Microsoft|SOFTWARECOMPONENT
+driver|100|Nahimic 3 APO|3.5.1.0|2021-10-27|A-Volute|SOFTWARECOMPONENT
+driver|101|Sonic Studio Virtual Mixer|1.0.2.0|2021-10-14|Nahimic|MEDIA
+driver|102|Realtek High Definition Audio|6.0.9977.1|2026-04-14|Realtek Semiconductor Corp.|MEDIA
+driver|103|High Definition Audio Controller|10.0.26100.8972|2026-07-22|Microsoft|SYSTEM
+driver|104|HID-compliant touch pad|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|105|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|106|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|107|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|108|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|109|HID-compliant device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|110|HID-compliant system controller|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|111|HID-compliant consumer control device|10.0.26100.1|2006-06-21|Microsoft|HIDCLASS
+driver|112|HID-compliant mouse|10.0.26100.1150|2006-06-21|Microsoft|MOUSE
+driver|113|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|114|HID Keyboard Device|10.0.26100.8972|2006-06-21|Microsoft|KEYBOARD
+driver|115|Logitech USB Input Device|1.10.80.0|2021-08-24|Logitech|HIDCLASS
+driver|116|USB Composite Device|10.0.26100.9278|2006-06-21|Microsoft|USB
+driver|117|USB Root Hub (USB 3.0)|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|118|USB xHCI Compliant Host Controller|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|119|AMD PSP 11.0 Device|5.17.0.0|2021-11-06|Advanced Micro Devices Inc.|SECURITYDEVICES
+driver|120|AMD PCI|1.0.0.83|2021-05-18|Advanced Micro Devices|SYSTEM
+driver|121|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|122|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|123|AMD PCI|1.0.0.83|2021-05-18|Advanced Micro Devices|SYSTEM
+driver|124|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|125|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|126|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|127|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|128|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|129|NVIDIA High Definition Audio|1.4.5.7|2025-01-12|NVIDIA Corporation|MEDIA
+driver|130|High Definition Audio Controller|10.0.26100.8972|2026-07-22|Microsoft|SYSTEM
+driver|131|Generic PnP Monitor|10.0.26100.9278|2006-06-21|Microsoft|MONITOR
+driver|132|NVIDIA GeForce RTX 3060 Ti|32.0.16.1074|2026-02-07|NVIDIA|DISPLAY
+driver|133|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|134|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|135|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|136|Standard SATA AHCI Controller|10.0.26100.8972|2006-06-21|Microsoft|HDC
+driver|137|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|138|Standard SATA AHCI Controller|10.0.26100.8972|2006-06-21|Microsoft|HDC
+driver|139|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|140|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|141|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|142|HID-compliant touch pad|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|143|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|144|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|145|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|146|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|147|HID-compliant device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|148|HID-compliant system controller|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|149|HID-compliant consumer control device|10.0.26100.1|2006-06-21|Microsoft|HIDCLASS
+driver|150|HID-compliant mouse|10.0.26100.1150|2006-06-21|Microsoft|MOUSE
+driver|151|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|152|HID Keyboard Device|10.0.26100.8972|2006-06-21|Microsoft|KEYBOARD
+driver|153|Logitech USB Input Device|1.10.80.0|2021-08-24|Logitech|HIDCLASS
+driver|154|USB Composite Device|10.0.26100.9278|2006-06-21|Microsoft|USB
+driver|155|Generic USB Hub|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|156|Generic SuperSpeed USB Hub|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|157|USB Root Hub (USB 3.0)|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|158|USB xHCI Compliant Host Controller|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|159|Bluetooth LE Generic Attribute Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|160|Bluetooth Low Energy GATT compliant HID device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|161|Bluetooth LE Generic Attribute Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|162|Device Information Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|163|Generic Attribute Profile|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|164|Generic Access Profile|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|165|Bluetooth LE Device|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|166|Bluetooth LE Generic Attribute Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|167|Bluetooth LE Generic Attribute Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|168|Device Information Service|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|169|Generic Attribute Profile|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|170|Generic Access Profile|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|171|Bluetooth LE Device|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|172|Microsoft Bluetooth LE Enumerator|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|173|Bluetooth Device (Personal Area Network)|10.0.26100.8972|2006-06-21|Microsoft|NET
+driver|174|Microsoft Bluetooth Hands-Free Audio device|10.0.26100.9278|2026-08-24|Microsoft|MEDIA
+driver|175|Microsoft Bluetooth Hands-Free Profile AudioGateway role|10.0.26100.1|2024-03-31|Microsoft|SYSTEM
+driver|176|Microsoft Bluetooth Avrcp Transport Driver|10.0.26100.9278|2026-08-24|Microsoft|BLUETOOTH
+driver|177|Microsoft Bluetooth Avrcp Transport Driver|10.0.26100.9278|2026-08-24|Microsoft|BLUETOOTH
+driver|178|Microsoft Bluetooth A2dp Source|10.0.26100.1|2024-03-31|Microsoft|MEDIA
+driver|179|Bluetooth Device|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|180|Bluetooth Peripheral Device||||
+driver|181|Microsoft Bluetooth Enumerator|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|182|Bluetooth Device (RFCOMM Protocol TDI)|10.0.26100.9278|2006-06-21|Microsoft|BLUETOOTH
+driver|183|Intel(R) Wireless Bluetooth(R)|24.10.0.4|2025-10-11|Intel Corporation|BLUETOOTH
+driver|184|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|185|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|186|WinUsb Device|10.0.26100.9278|2006-06-21|Microsoft|USBDEVICE
+driver|187|USB Composite Device|10.0.26100.9278|2006-06-21|Microsoft|USB
+driver|188|Generic USB Hub|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|189|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|190|HID-compliant consumer control device|10.0.26100.1|2006-06-21|Microsoft|HIDCLASS
+driver|191|HID-compliant vendor-defined device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|192|HID-compliant headset|10.0.26100.9278|2009-04-21|Microsoft|HIDCLASS
+driver|193|USB Input Device|10.0.26100.9278|2006-06-21|Microsoft|HIDCLASS
+driver|194|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|195|Audio Endpoint|10.0.26100.1|2024-03-31|Microsoft|AUDIOENDPOINT
+driver|196|USB Audio Device|10.0.26100.9278|2026-08-25|Microsoft|MEDIA
+driver|197|USB Composite Device|10.0.26100.9278|2006-06-21|Microsoft|USB
+driver|198|USB Root Hub (USB 3.0)|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|199|USB xHCI Compliant Host Controller|10.0.26100.9278|2026-08-24|Microsoft|USB
+driver|200|AMD PCI|1.0.0.83|2021-05-18|Advanced Micro Devices|SYSTEM
+driver|201|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|202|Microsoft Wi-Fi Direct Virtual Adapter|10.0.26100.8972|2006-06-21|Microsoft|NET
+driver|203|Microsoft Wi-Fi Direct Virtual Adapter|10.0.26100.8972|2006-06-21|Microsoft|NET
+driver|204|Intel(R) Wi-Fi 6 AX200 160MHz|24.20.2.1|2026-12-02|Intel|NET
+driver|205|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|206|Intel(R) I211 Gigabit Network Connection|14.1.24.0|2025-02-09|Intel|NET
+driver|207|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|208|Realtek PCIe 2.5GbE Family Controller|1125.29.202.2026|2026-02-02|Realtek|NET
+driver|209|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|210|Disk drive|10.0.26100.8972|2006-06-21|Microsoft|DISKDRIVE
+driver|211|Standard NVM Express Controller|10.0.26100.9278|2006-06-21|Microsoft|SCSIADAPTER
+driver|212|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|213|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|214|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|215|Disk drive|10.0.26100.8972|2006-06-21|Microsoft|DISKDRIVE
+driver|216|Standard NVM Express Controller|10.0.26100.9278|2006-06-21|Microsoft|SCSIADAPTER
+driver|217|PCI-to-PCI Bridge|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|218|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|219|PCI standard host CPU bridge|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|220|PCI Express Root Complex|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|221|Microsoft Windows Management Interface for ACPI|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|222|Microsoft ACPI-Compliant System|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|223|ACPI x64-based PC|10.0.26100.1|2006-06-21|Microsoft|COMPUTER
+driver|224|UMBus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|225|Remote Desktop USB Hub|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|226|UMBus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|227|UMBus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|228|UMBus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|229|UMBus Root Bus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|230|Microsoft Kernel Debug Network Adapter|10.0.26100.8521|2006-06-21|Microsoft|NET
+driver|231|Microsoft Storage Spaces Controller|10.0.26100.9278|2006-06-21|Microsoft|SCSIADAPTER
+driver|232|Microsoft Virtual Drive Enumerator|10.0.26100.1591|2006-06-21|Microsoft|SYSTEM
+driver|233|Composite Bus Enumerator|10.0.26100.1150|2006-06-21|Microsoft|SYSTEM
+driver|234|Microsoft Hyper-V Virtualization Infrastructure Driver|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|235|OpenVPN Data Channel Offload|1.3.3.0|2025-06-08|OpenVPN, Inc|NET
+driver|236|TAP-NordVPN Windows Adapter V9|9.27.0.0|2024-02-27|TAP-NordVPN Windows Provider V9|NET
+driver|237|Microsoft Hypervisor Service|10.0.26100.8972|2006-06-21|Microsoft|SYSTEM
+driver|238|Microsoft Basic Display Driver|10.0.26100.8521|2006-06-21|Microsoft|SYSTEM
+driver|239|Microsoft Hyper-V Virtual Machine Bus Provider|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+driver|240|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|241|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|242|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|243|Generic volume shadow copy|10.0.26100.1|2006-06-21|Microsoft|VOLUMESNAPSHOT
+driver|244|Generic volume shadow copy|10.0.26100.1|2006-06-21|Microsoft|VOLUMESNAPSHOT
+driver|245|Generic volume shadow copy|10.0.26100.1|2006-06-21|Microsoft|VOLUMESNAPSHOT
+driver|246|Generic volume shadow copy|10.0.26100.1|2006-06-21|Microsoft|VOLUMESNAPSHOT
+driver|247|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|248|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|249|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|250|Volume|10.0.26100.5074|2006-06-21|Microsoft|VOLUME
+driver|251|Volume Manager|10.0.26100.9278|2006-06-21|Microsoft|SYSTEM
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=system
+serial|1234567890
+system_uuid|00000000-0000-0000-0000-000000000002
+[result_status] UNDECLARED / UNKNOWN / 
+

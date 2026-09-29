@@ -1,0 +1,105 @@
+{
+  "schema": "yuzu/windows-toolchain/v1",
+  "probe_timeout_seconds": 10,
+  "pins": {
+    "python": "3.14.6",
+    "meson": "1.11.1",
+    "erlang": "28.4.2",
+    "rebar3": "3.24.0",
+    "postgres": "18.4",
+    "windows_sdk": "10.0.26100.0"
+  },
+  "accepted_host_pins": {
+    "python": ["3.14.6"],
+    "meson": ["1.11.1"],
+    "erlang": ["28.4.2"],
+    "rebar3": ["3.24.0"],
+    "postgres": ["18.4"],
+    "windows_sdk": ["10.0.26100.0"]
+  },
+  "job_pins": {
+    "vcpkg_baseline": "4b77da7fed37817f124936239197833469f1b9a8"
+  },
+  "required_env": [
+    "CCACHE_DIR",
+    "RUNNER_TOOL_CACHE",
+    "YUZU_ESCRIPT",
+    "YUZU_REBAR3",
+    "YUZU_TEST_POSTGRES_DSN"
+  ],
+  "required_tools": [
+    "python",
+    "meson",
+    "ninja",
+    "cmake",
+    "git",
+    "ccache",
+    "escript",
+    "rebar3",
+    "msvc",
+    "msys2_bash",
+    "postgres",
+    "windows_sdk_header",
+    "windows_sdk_lib",
+    "windows_sdk_rc"
+  ],
+  "artifact_probes": [
+    {
+      "tool": "windows_sdk_header",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\{pin}\\um\\Windows.h"
+    },
+    {
+      "tool": "windows_sdk_lib",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\{pin}\\um\\x64\\kernel32.lib"
+    },
+    {
+      "tool": "windows_sdk_rc",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\{pin}\\x64\\rc.exe"
+    }
+  ],
+  "effective_commands": [
+    { "command": "python", "tool": "python" },
+    { "command": "meson", "tool": "meson" },
+    { "command": "git", "tool": "git" }
+  ],
+  "tool_probes": [
+    {
+      "tool": "python",
+      "pin": "python",
+      "arguments": ["--version"],
+      "version_regex": "^Python\\s+(?<version>[0-9]+(?:\\.[0-9]+){1,3})\\s*$"
+    },
+    {
+      "tool": "meson",
+      "pin": "meson",
+      "arguments": ["--version"],
+      "version_regex": "^(?<version>[0-9]+(?:\\.[0-9]+){1,3})\\s*$"
+    },
+    {
+      "tool": "rebar3",
+      "executable_tool": "escript",
+      "pin": "rebar3",
+      "arguments": ["{tool_path}", "version"],
+      "version_regex": "^rebar\\s+(?<version>[0-9]+(?:\\.[0-9]+){1,3})\\b"
+    },
+    {
+      "tool": "postgres",
+      "pin": "postgres",
+      "arguments": ["--version"],
+      "version_regex": "\\b(?<version>[0-9]+(?:\\.[0-9]+){1,3})\\b"
+    }
+  ],
+  "file_probes": [
+    {
+      "name": "Erlang OTP",
+      "anchor_tool": "escript",
+      "pin": "erlang",
+      "root_ascend": 3,
+      "path_glob": "releases/*/OTP_VERSION",
+      "version_regex": "^(?<version>[0-9]+(?:\\.[0-9]+){1,3})\\s*$"
+    }
+  ]
+}

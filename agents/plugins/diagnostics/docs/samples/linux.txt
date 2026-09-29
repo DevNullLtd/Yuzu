@@ -1,0 +1,22 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash c768172a2281
+== action=log_level
+log_level|info
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=certificates
+cert|ca_cert|(not configured)|false
+cert|client_cert|(not configured)|false
+cert|client_key|(not configured)|false
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=connection_info
+server_address|(not configured)
+tls_enabled|false
+session_id|(none)
+grpc_channel_state|unknown
+reconnect_count|0
+latency_ms|0
+uptime_seconds|0
+connected_since|0
+[result_status] UNDECLARED / UNKNOWN / 
+

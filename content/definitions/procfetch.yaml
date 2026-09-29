@@ -36,12 +36,28 @@ spec:
     columns:
       - name: pid
         type: int64
+        description: >-
+          The process ID assigned by the OS. Values: integer.
+        example: "1052"
+        platforms: [windows, linux, darwin]
       - name: name
         type: string
+        description: >-
+          The process's short or executable name, as reported by the OS. Values: free text.
+        example: "svchost.exe"
+        platforms: [windows, linux, darwin]
       - name: path
         type: string
+        description: >-
+          Absolute path to the process's executable image on disk; empty when the OS refuses or fails to resolve it (a protected process, a permission-denied read, or a pseudo-process with no backing binary). Values: absolute path or empty.
+        example: "/usr/bin/dash"
+        platforms: [windows, linux, darwin]
       - name: sha1
         type: string
+        description: >-
+          Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file could not be opened or its path could not be resolved. Values: 40-char lowercase hex or empty.
+        example: "e5355187cbd952a5bc9dfca430d10383f0f8750c"
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - name

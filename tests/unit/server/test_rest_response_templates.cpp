@@ -22,6 +22,7 @@
  */
 
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
@@ -42,9 +43,13 @@ using namespace yuzu::server;
 
 namespace {
 
-fs::path uniq(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate rt_instr_tpl{"restrtinstr", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    InstructionStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rt_instr template: store failed to migrate");
+}};
 
 struct AuditRecord {
     std::string action, result, target_type, target_id, detail;
@@ -52,39 +57,46 @@ struct AuditRecord {
 
 struct RtHarness {
     yuzu::server::test::TestRouteSink sink;
-    fs::path inst_db;
+    std::optional<yuzu::test::PostgresTestDb> inst_pg_db;
+    std::optional<pg::PgPool> inst_pool;
     std::unique_ptr<InstructionStore> instruction_store;
     bool perm_grant{true};
     std::vector<AuditRecord> audit_log;
     RestApiV1 api;
 
-    RtHarness() : inst_db(uniq("rest-rt")) {
-        fs::remove(inst_db);
-        instruction_store = std::make_unique<InstructionStore>(inst_db);
+    RtHarness() {
+        construct_store();
+        register_with(/*store_present=*/true);
+    }
+
+    explicit RtHarness(bool with_store) {
+        if (with_store)
+            construct_store();
+        register_with(with_store);
+    }
+
+    // Manual equivalent of YUZU_REQUIRE_PG_DB_TPL (test_helpers.hpp) — the
+    // macro declares a local, non-movable PostgresTestDb/PgPool, so it can't
+    // populate a data member directly; emplace() constructs them in place
+    // instead (mirrors test_discovery_routes.cpp's DiscoverHarness).
+    void construct_store() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        inst_pg_db.emplace(rt_instr_tpl);
+        INFO("[RtHarness instr fixture] status (blank == came up OK): " << inst_pg_db->error());
+        REQUIRE(inst_pg_db->available());
+        inst_pool.emplace(pg::PgPool::Options{.conninfo = inst_pg_db->dsn(), .size = 4});
+        REQUIRE(inst_pool->valid());
+        instruction_store = std::make_unique<InstructionStore>(*inst_pool);
         REQUIRE(instruction_store->is_open());
         // #1073: opt out of signature enforcement for these tests — they
         // exercise the import + response-templates normalisation, not the
         // signature gate.
         instruction_store->set_require_signed_definitions(false);
-        register_with(/*store_present=*/true);
     }
 
-    explicit RtHarness(bool with_store) : inst_db(uniq("rest-rt")) {
-        if (with_store) {
-            fs::remove(inst_db);
-            instruction_store = std::make_unique<InstructionStore>(inst_db);
-            REQUIRE(instruction_store->is_open());
-            instruction_store->set_require_signed_definitions(false); // #1073
-        }
-        register_with(with_store);
-    }
-
-    ~RtHarness() {
-        instruction_store.reset();
-        fs::remove(inst_db);
-        fs::remove(inst_db.string() + "-wal");
-        fs::remove(inst_db.string() + "-shm");
-    }
+    ~RtHarness() { instruction_store.reset(); }
 
     void register_with(bool with_store) {
         auto auth_fn = [](const httplib::Request&,
@@ -530,8 +542,9 @@ TEST_CASE("REST templates: import_definition_json strips reserved __default__ id
     auto created = h.instruction_store->import_definition_json(json_payload);
     REQUIRE(created.has_value());
     auto def = h.instruction_store->get_definition(*created);
-    REQUIRE(def);
-    auto parsed_arr = nlohmann::json::parse(def->response_templates_spec);
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    auto parsed_arr = nlohmann::json::parse((*def)->response_templates_spec);
     REQUIRE(parsed_arr.is_array());
     REQUIRE(parsed_arr.size() == 1);
     CHECK(parsed_arr[0]["id"] == "valid");
@@ -557,88 +570,17 @@ TEST_CASE("REST templates: import_definition_json drops oversized string form (s
     auto created = h.instruction_store->import_definition_json(payload.dump());
     REQUIRE(created.has_value());
     auto def = h.instruction_store->get_definition(*created);
-    REQUIRE(def);
-    CHECK(def->response_templates_spec == "[]");
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    CHECK((*def)->response_templates_spec == "[]");
 }
 
-TEST_CASE("REST templates: migration v3 probe-and-stamp on pre-existing column (qe-B3)",
-          "[response_templates][migration]") {
-    // Build a DB at schema_meta v1 with the response_templates_spec column
-    // already present (simulates a hand-applied ALTER from the recovery
-    // workflow in server-admin.md). The probe-and-stamp guard must
-    // recognise the column and stamp v3 directly without re-running the
-    // ALTER (which would otherwise fail with SQLITE_ERROR
-    // "duplicate column name").
-    auto raw_db_path = yuzu::test::unique_temp_path("rt-mig-v3-probe-");
-    {
-        std::error_code ec;
-        std::filesystem::remove(raw_db_path, ec);
-    }
-
-    // Pre-seed the DB by hand: open with the v0.10 layout (incl. the column),
-    // stamp schema_meta to v1.
-    {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(raw_db_path.string().c_str(), &db,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                                nullptr) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db, R"(
-            CREATE TABLE schema_meta (store TEXT PRIMARY KEY, version INTEGER, upgraded_at INTEGER);
-            CREATE TABLE instruction_definitions (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '1.0',
-                type TEXT NOT NULL,
-                plugin TEXT NOT NULL,
-                action TEXT NOT NULL DEFAULT '',
-                description TEXT NOT NULL DEFAULT '',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                instruction_set_id TEXT NOT NULL DEFAULT '',
-                gather_ttl_seconds INTEGER NOT NULL DEFAULT 300,
-                response_ttl_days INTEGER NOT NULL DEFAULT 90,
-                created_by TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL DEFAULT 0,
-                yaml_source TEXT NOT NULL DEFAULT '',
-                parameter_schema TEXT NOT NULL DEFAULT '{}',
-                result_schema TEXT NOT NULL DEFAULT '{}',
-                approval_mode TEXT NOT NULL DEFAULT 'auto',
-                concurrency_mode TEXT NOT NULL DEFAULT 'per-device',
-                platforms TEXT NOT NULL DEFAULT '',
-                min_agent_version TEXT NOT NULL DEFAULT '',
-                required_plugins TEXT NOT NULL DEFAULT '',
-                readable_payload TEXT NOT NULL DEFAULT '',
-                visualization_spec TEXT NOT NULL DEFAULT '{}',
-                response_templates_spec TEXT NOT NULL DEFAULT '[]'
-            );
-            INSERT INTO schema_meta (store, version, upgraded_at) VALUES ('instruction_store', 1, 0);
-        )",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
-    }
-
-    // Now open with InstructionStore — probe-and-stamp must move v1 → v3
-    // without crashing. Scoped so the SQLite handle releases before the
-    // post-test cleanup tries to remove the file (Windows won't delete an
-    // open file).
-    {
-        InstructionStore store(raw_db_path);
-        REQUIRE(store.is_open());
-
-        // Validate by writing + reading back through the normal path.
-        InstructionDefinition d;
-        d.name = "post-migration-write";
-        d.type = "question";
-        d.plugin = "procfetch";
-        auto created = store.create_definition(d);
-        REQUIRE(created.has_value());
-        auto fetched = store.get_definition(*created);
-        REQUIRE(fetched);
-        CHECK(fetched->response_templates_spec == "[]");
-    }
-
-    std::error_code ec;
-    std::filesystem::remove(raw_db_path, ec);
-    std::filesystem::remove(raw_db_path.string() + "-wal", ec);
-    std::filesystem::remove(raw_db_path.string() + "-shm", ec);
-}
+// "REST templates: migration v3 probe-and-stamp on pre-existing column (qe-B3)"
+// RETIRED (ADR-0058) — it hand-built a raw SQLite file at schema_meta v1 with
+// the response_templates_spec column already present, to prove
+// InstructionStore's probe-and-stamp guard could recognise a pre-existing
+// column and skip re-running the ALTER (SQLite's "duplicate column name"
+// hazard). That whole mechanism — the legacy_alters[] compat ALTERs and the
+// v1→v2→v3 schema_meta probe-and-stamp dance — no longer exists: the
+// Postgres schema is born fresh in a single v1 migration (no ALTER-table
+// compat dance to test). Nothing analogous applies on Postgres.

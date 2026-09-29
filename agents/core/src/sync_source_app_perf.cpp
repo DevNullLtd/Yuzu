@@ -1,7 +1,7 @@
 #include "sync_source_app_perf.hpp"
 
 #include "local_dispatcher.hpp"
-#include "sync_source_installed_software.hpp" // sha256_hex (shared agent util)
+#include "sync_canonical.hpp" // sha256_hex (shared agent util)
 
 #include <yuzu/version_string.hpp>
 
@@ -76,13 +76,18 @@ std::string build_app_perf_query(std::int64_t window_start, std::int64_t today_s
     // positionally). Sample-weighted averages reconstruct the true daily mean from
     // procperf_hourly's per-hour AVG×COUNT; max-of-max for peaks; SUM for counts.
     // $ProcPerf_Hourly is translated to procperf_hourly by the TAR sql validator.
+    // `AND NOT is_kthread` excludes Linux kernel threads (PF_KTHREAD) and the
+    // Windows System process (pid 4) from the daily app-perf-over-time
+    // history — see tar_proc_perf.hpp's "Kernel-thread marker" note. This is
+    // the ONLY consumer that filters on the flag: the live TAR procperf tiers
+    // this query reads FROM keep kernel threads unfiltered by design.
     return std::format(
         "SELECT name, version, (hour_ts/86400)*86400 AS day, "
         "SUM(samples) AS samples, MAX(instances_max) AS instances_max, "
         "SUM(cpu_avg*samples)/SUM(samples) AS cpu_avg, MAX(cpu_max) AS cpu_max, "
         "SUM(ws_avg_bytes*samples)/SUM(samples) AS ws_avg_bytes, MAX(ws_max_bytes) AS ws_max_bytes "
         "FROM $ProcPerf_Hourly "
-        "WHERE hour_ts >= {} AND hour_ts < {} "
+        "WHERE hour_ts >= {} AND hour_ts < {} AND NOT is_kthread "
         "GROUP BY name, version, (hour_ts/86400)*86400",
         window_start, today_start);
 }

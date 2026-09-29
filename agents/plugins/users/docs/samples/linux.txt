@@ -1,0 +1,27 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 5734018da5be
+== action=logged_on
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=sessions
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=local_users
+local_user|root|true|unknown|root
+local_user|nobody|false|unknown|nobody
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+
+== action=local_admins
+admin|root|user|root
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=group_members group=sudo
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=primary_user
+primary_user|unknown|0|last command failed
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+
+== action=session_history
+session_history|error|last command failed
+[result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
+

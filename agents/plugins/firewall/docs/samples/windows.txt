@@ -1,0 +1,113 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 8ef7b004fc8a
+== action=state
+profile|Domain|enabled
+profile|Private|enabled
+profile|Public|enabled
+ruleset|717
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=rules
+rule|HNS Container Networking - DNS (UDP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647
+rule|HNS Container Networking - ICS DNS (TCP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647
+rule|Logi Plugin Service|enabled|in|allow|2147483647
+rule|Logi Options+ Updater|enabled|out|allow|2147483647
+rule|Logi Options+ Updater|enabled|in|allow|2147483647
+rule|Logi Options+ Voice|enabled|out|allow|2147483647
+rule|Logi Options+ Voice|enabled|in|allow|2147483647
+rule|Logi Options+ Agent|enabled|out|allow|2147483647
+rule|Logi Options+ Agent|enabled|in|allow|2147483647
+rule|WhatsApp|enabled|out|allow|7
+rule|@{Microsoft.WindowsFeedbackHub_2.2608.301.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsFeedbackHub/Resources/AppStoreName}|enabled|out|allow|7
+rule|Microsoft Store|enabled|in|allow|7
+rule|Microsoft Store|enabled|out|allow|7
+rule|@{SpotifyAB.SpotifyMusic_1.300.277.0_x64__zpdnekdrzrea0?ms-resource://SpotifyAB.SpotifyMusic/Resources/AppTitle}|enabled|out|allow|7
+rule|Tailscale-In|enabled|in|allow|3
+rule|Tailscale-In|enabled|in|allow|3
+rule|Tailscale-Process|enabled|in|allow|2147483647
+rule|@{MicrosoftWindows.Client.CoreAI_1000.26100.9457.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.CoreAI/AIXHost/ClickToDo/AppDisplayName}|enabled|out|allow|7
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ChatGPT|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|out|allow|2147483647
+rule|ms-resource:AppTitle|enabled|out|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|out|allow|2147483647
+rule|ms-resource:AppTitle|enabled|out|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|ms-resource:AppTitle|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|@{Microsoft.WindowsCamera_2026.2607.1.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsCamera/LensSDK/Resources/AppStoreName}|enabled|in|allow|3
+rule|@{Microsoft.WindowsCamera_2026.2607.1.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsCamera/LensSDK/Resources/AppStoreName}|enabled|out|allow|7
+rule|@{Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsCalculator/Resources/AppStoreName}|enabled|out|allow|7
+rule|@{Microsoft.StorePurchaseApp_22607.1401.4.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.StorePurchaseApp/Resources/DisplayTitle}|enabled|in|allow|3
+rule|@{Microsoft.StorePurchaseApp_22607.1401.4.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.StorePurchaseApp/Resources/DisplayTitle}|enabled|out|allow|7
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|out|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|4
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|2
+rule|ms-resource:ProductPkgDisplayName|enabled|in|allow|4
+rule|@{MicrosoftWindows.Client.OOBE_1000.26100.55.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.OOBE/resources/ProductPkgDisplayName}|enabled|in|allow|7
+rule|@{MicrosoftWindows.Client.OOBE_1000.26100.55.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.OOBE/resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.Client.FileExp_1000.26100.10.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.FileExp/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.Client.Core_1000.26100.133.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.Core/Resources/ProductPkgDisplayName}|enabled|in|allow|3
+rule|@{MicrosoftWindows.Client.Core_1000.26100.133.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.Core/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.Client.CBS_1000.26100.360.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.CBS/resources/ProductPkgDisplayName}|enabled|in|allow|7
+rule|@{MicrosoftWindows.Client.CBS_1000.26100.360.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.Client.CBS/resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.61869836.InpApp_1000.26100.9278.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.61869836.InpApp/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.61869722.Speion_1000.26100.9278.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.61869722.Speion/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.61869721.Livtop_1000.26100.9278.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.61869721.Livtop/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{MicrosoftWindows.61869720.Voiess_1000.26100.9278.0_x64__cw5n1h2txyewy?ms-resource://MicrosoftWindows.61869720.Voiess/Resources/ProductPkgDisplayName}|enabled|out|allow|7
+rule|@{Microsoft.LockApp_10.0.26100.9278_neutral__cw5n1h2txyewy?ms-resource://Microsoft.LockApp/resources/AppDisplayName}|enabled|in|allow|3
+rule|@{Microsoft.LockApp_10.0.26100.9278_neutral__cw5n1h2txyewy?ms-resource://Microsoft.LockApp/resources/AppDisplayName}|enabled|out|allow|7
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Game Bar|enabled|in|allow|7
+rule|Game Bar|enabled|out|allow|7
+rule|@{Microsoft.DesktopAppInstaller_1.29.290.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.DesktopAppInstaller/Resources/appDisplayName}|enabled|in|allow|3
+rule|@{Microsoft.DesktopAppInstaller_1.29.290.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.DesktopAppInstaller/Resources/appDisplayName}|enabled|out|allow|7
+rule|WinDbg|enabled|in|allow|2147483647
+rule|WinDbg|enabled|in|allow|2147483647
+rule|WinDbg|enabled|in|allow|2147483647
+rule|WinDbg|enabled|in|allow|2147483647
+rule|WinDbg|enabled|in|allow|2147483647
+rule|WinDbg|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|@{Microsoft.GetHelp_10.2409.42162.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.GetHelp/Resources/appDisplayName}|enabled|out|allow|7
+rule|Windows Web Experience Pack|enabled|out|allow|7
+rule|@{Microsoft.GamingServices_38.116.6003.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.GamingServices/Resources/GamingServicesDisplayName}|enabled|out|allow|7
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|@{Microsoft.ZuneVideo_10.26061.10051.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.ZuneVideo/resources/IDS_MANIFEST_VIDEO_APP_NAME}|enabled|in|allow|3
+rule|@{Microsoft.ZuneVideo_10.26061.10051.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.ZuneVideo/resources/IDS_MANIFEST_VIDEO_APP_NAME}|enabled|out|allow|7
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
+rule|Solitaire & Casual Games|enabled|in|allow|3
+rule|Solitaire & Casual Games|enabled|out|allow|7
+rule|OpenSSH SSH Server (sshd)|enabled|in|allow|2
+rule|@{Microsoft.StartExperiencesApp_1.380.2.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.StartExperiencesApp/Resources/PackageDisplayName}|enabled|out|allow|7
+ruleset|100
+truncated|true
+[result_status] UNDECLARED / UNKNOWN / 
+

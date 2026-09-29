@@ -5,8 +5,9 @@
 #
 # mode: code-change — fuzzes only what the PR touches, short budget
 # (fuzz-seconds below), so this is a fast regression net, not a soak.
-# Deep exploration belongs to a future scheduled batch leg (deferred
-# until the harness set stabilizes). NOT a required status check.
+# Deep exploration is cflite-batch.yml's job (batch + coverage + prune;
+# it also feeds this job's corpus and pruning data). NOT a required
+# status check.
 #
 # This also satisfies the OpenSSF Scorecard Fuzzing check (0/10 before
 # this workflow existed — the check detects the .clusterfuzzlite/ config).
@@ -16,15 +17,32 @@ name: ClusterFuzzLite PR fuzzing
 on:
   pull_request:
     branches: [dev, main]
-    # Only fuzz PRs that can change fuzzed behavior — the harnesses
-    # compile first-party C++ directly (no meson/vcpkg), so workflows,
-    # docs, gateway-Erlang, YAML-content or script changes can't affect
-    # them. Keep this list in sync with .clusterfuzzlite/build.sh inputs.
+    # Only fuzz PRs that can change fuzzed behavior. The harnesses compile
+    # first-party C++ directly (no meson/vcpkg), and their entire compile
+    # closure is the six parser families below plus tests/fuzz/ itself -
+    # nothing in agents/, sdk/, proto/, or the rest of server/ reaches
+    # them. Family globs (not exact files) so a sibling header/impl added
+    # to a family stays covered. KEEP IN SYNC with BOTH
+    # .clusterfuzzlite/build.sh's inputs AND cflite-batch.yml's identical
+    # paths list - the batch leg uses the SAME filter, so a PR this list
+    # misses is missed by both legs; when a fuzzed file grows an
+    # out-of-family include, add the new family glob to both workflows in
+    # the same change. Narrowing matters because affected-target pruning
+    # fails OPEN (an empty affected set keeps ALL targets), so this filter
+    # is the only mechanism that makes an unrelated PR free. KNOWN
+    # EXCEPTION (#1978 class): GitHub evaluates event-level paths: against
+    # a bounded diff window, so a very large PR touching a fuzzed file
+    # can skip BOTH legs entirely - the same limitation that moved ci.yml
+    # onto detect-code-change.sh. Accepted for now (documented in
+    # docs/ci-architecture.md; adopting the detect-code-change pattern is
+    # tracked on #3771).
     paths:
-      - 'server/**'
-      - 'agents/**'
-      - 'sdk/**'
-      - 'proto/**'
+      - 'server/core/src/preflight_parse*'
+      - 'server/core/src/deployment_parse*'
+      - 'server/core/src/yaml_scan*'
+      - 'server/core/src/guardian_rule_spec*'
+      - 'server/core/src/guardian_resilience_schema*'
+      - 'server/core/src/guardian_schema_registry*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
@@ -33,7 +51,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions: read-all
+# Job blocks below declare their own scopes; keep the workflow default
+# minimal so a future job cannot silently inherit a broad grant.
+permissions:
+  contents: read
 
 jobs:
   fuzz:
@@ -42,20 +63,129 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read            # cifuzz filestore reads cross-workflow artifacts
+                               # (cifuzz-corpus-<target>, cifuzz-coverage-latest)
+                               # via the REST artifact API; unspecified scopes
+                               # in this block are none, which silently breaks
+                               # both corpus download and target pruning
       security-events: write   # SARIF upload of crash findings
     steps:
+      # #3770: a non-empty-but-STALE cifuzz-coverage-latest actively prunes a
+      # target that IS affected by this PR (upstream's own fail-open only
+      # protects the EMPTY-match case - see docs/ci-architecture.md's
+      # ClusterFuzzLite section). This step re-runs the SAME name-scoped
+      # artifact lookup build_fuzzers itself uses (`actions: read`, already
+      # granted above) and, if the newest match is older than MAX_AGE_DAYS
+      # or its age can't be trusted at all, forces build_fuzzers into
+      # keep-all instead of letting it prune off a possibly-stale map. No
+      # new permission scope: keep-all only means NOT passing
+      # keep-unaffected-fuzz-targets=false, it never deletes or writes
+      # anything. Every failure path below (API error, a matched artifact
+      # record with no created_at, an unparseable, calendar-invalid, or
+      # future-dated created_at) explicitly writes force_keep_all=true via
+      # the fail_safe() helper and exits 0, rather than relying on the job
+      # to hard-fail closed - a tool hiccup degrades this run to "fuzz
+      # everything", it never silently misreads garbage as fresh (round-1
+      # governance findings UP-1/CH-1: GNU `date -d` parses non-ISO8601
+      # junk as a plausible-looking timestamp near "now" instead of
+      # erroring; round-2 findings: a
+      # shape-valid-but-calendar-invalid timestamp still reached the
+      # unguarded `date -d` call, and a present-but-malformed artifact
+      # record collapsed into the same branch as "no artifact at all").
+      - name: Check coverage-artifact age
+        id: coverage_age
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Max age (days) before cifuzz-coverage-latest is trusted to drive
+          # affected-target pruning. Chosen against the ~10-day measured
+          # cadence of cflite-batch.yml's only trigger (closure-touching dev
+          # pushes; no cron, see that workflow's header) - 30 days is 3x that
+          # cadence, so a healthy refresh cycle never trips this, while a
+          # stalled batch leg (an unfixed cflite-batch-broken issue, or a
+          # long quiet period on the fuzzed closure) does.
+          MAX_AGE_DAYS: 30
+        run: |
+          set -euo pipefail
+          fail_safe() {
+            echo "::warning title=cflite coverage age::$1 - failing safe to keep-all."
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          artifact=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=cifuzz-coverage-latest&per_page=1" \
+            --jq '.artifacts[0] // empty') || fail_safe "could not query the GitHub artifacts API (gh api exit $?)"
+          if [ -z "$artifact" ]; then
+            echo "::notice title=cflite coverage age::no cifuzz-coverage-latest artifact found - build_fuzzers will fail open to keep-all on its own (nothing to prune against)."
+            echo "force_keep_all=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A matched-but-malformed artifact record (missing/null created_at)
+          # is NOT the same as no artifact: the "not found" branch above is
+          # safe only because build_fuzzers's own lookup will find nothing
+          # either, whereas here an artifact genuinely exists and we just
+          # can't read its age - defaulting that to "prune normally" would
+          # be the least safe of the two, not the most.
+          created_at=$(jq -r '.created_at // empty' <<< "$artifact")
+          if [ -z "$created_at" ]; then
+            fail_safe "found a cifuzz-coverage-latest artifact record with no created_at field"
+          fi
+          # Reject anything that isn't the exact ISO-8601 shape GitHub's API
+          # documents before handing it to `date -d`: GNU date's fallback
+          # parser accepts strings like "today" or "0" as valid and silently
+          # resolves them to a plausible-looking timestamp near the current
+          # time instead of erroring, which would misreport a malformed/
+          # schema-drifted API response as a fresh artifact instead of
+          # failing safe.
+          if ! [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            fail_safe "cifuzz-coverage-latest's created_at ('$created_at') is not a recognizable ISO-8601 timestamp"
+          fi
+          # Shape-valid but calendar-invalid (month 13, hour 25, ...) still
+          # reaches here and `date -d` rejects it - guard this the same way
+          # rather than trusting the regex to also prove calendar validity.
+          created_epoch=$(date -u -d "$created_at" +%s) || fail_safe "could not parse created_at ('$created_at') as a date"
+          now_epoch=$(date -u +%s)
+          age_days=$(( (now_epoch - created_epoch) / 86400 ))
+          if [ "$age_days" -lt 0 ]; then
+            fail_safe "cifuzz-coverage-latest's created_at ($created_at) is in the future relative to this runner's clock"
+          fi
+          if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
+            echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - STALE, falling back to keep-all (no affected-target pruning this run)."
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - within range, affected-target pruning proceeds normally."
+            echo "force_keep_all=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build fuzzers
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           language: c++
           sanitizer: address
+          # Pruning of unaffected targets happens in THIS step and needs the
+          # coverage report artifact; the input has no default, so omitting
+          # it leaves the build container with an empty token and pruning
+          # silently keeps all targets. The age check above forces keep-all
+          # when the coverage report is too stale (or its age can't be
+          # trusted) to drive pruning (#3770) - a fresh-TIMESTAMP
+          # stale-CONTENT artifact (e.g. from a main-ref dispatch) would
+          # still slip this check, but cflite-batch.yml's dev ref-guards
+          # close the known producer of that case.
+          keep-unaffected-fuzz-targets: ${{ steps.coverage_age.outputs.force_keep_all }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 300
+          # Total wall budget split across the retained targets (sequential).
+          # 180s keeps the whole job under ~5.5 min (measured fixed costs:
+          # ~35s image pull + ~68s build + ~37s run-step overhead) - the
+          # operator ceiling is 6 min. parallel-fuzzing runs libFuzzer with
+          # one worker per vCPU inside each target's slice, so total
+          # executions EXCEED the old 300s single-worker budget (~720
+          # core-seconds vs 300 on the 4-vCPU public runners).
+          fuzz-seconds: 180
+          parallel-fuzzing: true
           mode: code-change
           sanitizer: address
           output-sarif: true

@@ -14,8 +14,6 @@
 
 #include <yuzu/plugin.hpp>
 
-#include <array>
-#include <cstdio>
 #include <ctime>
 #include <format>
 #include <string>
@@ -25,11 +23,13 @@
 #include <sys/utsname.h>
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 #include <fstream>
 #endif
 
 #if defined(__APPLE__)
+#include "os_info_macos.hpp"
+#include <sstream>
 #include <sys/sysctl.h>
 #endif
 
@@ -49,20 +49,46 @@ namespace {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 #if defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+// Read a string sysctl (kern.osproductversion / kern.osversion). Empty on
+// failure or absence -- both verified byte-identical to their `sw_vers`
+// counterparts on this host (kern.osproductversion == `sw_vers
+// -productVersion`; kern.osversion == `sw_vers -buildVersion`), but there is
+// no equivalent sysctl for the product NAME, so that field never calls this.
+std::string mac_sysctl_string(const char* name) {
+    char buf[256]{};
+    size_t len = sizeof(buf);
+    if (sysctlbyname(name, buf, &len, nullptr, 0) != 0)
+        return {};
+    return std::string(buf);
+}
+
+// SystemVersion.plist is the one source that carries the product name; read
+// it once per action call (empty on failure -- missing file, permissions).
+std::string mac_read_system_version_plist() {
+    std::ifstream f("/System/Library/CoreServices/SystemVersion.plist", std::ios::binary);
+    if (!f)
+        return {};
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// Fallback chain per field: plist -> sysctlbyname (when a sysctl exists for
+// this field; nullptr skips straight to the literal) -> literal fallback.
+// Never empty -- always resolves to something reportable.
+std::string mac_version_field(std::string_view plist, std::string_view plist_key,
+                              const char* sysctl_name, std::string_view literal_fallback) {
+    if (!plist.empty()) {
+        if (auto v = yuzu::os_info::parse_system_version_plist(plist, plist_key);
+            v && !v->empty())
+            return *v;
     }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
+    if (sysctl_name != nullptr) {
+        auto sysctl_v = mac_sysctl_string(sysctl_name);
+        if (!sysctl_v.empty())
+            return sysctl_v;
     }
-    return result;
+    return std::string(literal_fallback);
 }
 #endif
 
@@ -167,13 +193,10 @@ int do_os_name(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("os_name|{}", name));
 
 #elif defined(__APPLE__)
-    auto product = run_command("sw_vers -productName");
-    auto version = run_command("sw_vers -productVersion");
-    if (!product.empty() && !version.empty()) {
-        ctx.write_output(std::format("os_name|{} {}", product, version));
-    } else {
-        ctx.write_output("os_name|macOS");
-    }
+    auto plist = mac_read_system_version_plist();
+    auto product = mac_version_field(plist, "ProductName", nullptr, "macOS");
+    auto version = mac_version_field(plist, "ProductVersion", "kern.osproductversion", "unknown");
+    ctx.write_output(std::format("os_name|{} {}", product, version));
 
 #elif defined(_WIN32)
     auto name = read_registry_string(HKEY_LOCAL_MACHINE, kWinNtCurrentVersion, "ProductName");
@@ -227,10 +250,9 @@ int do_os_version(yuzu::CommandContext& ctx) {
 
 #ifdef __APPLE__
     // Also provide the user-facing product version
-    auto product_ver = run_command("sw_vers -productVersion");
-    if (!product_ver.empty()) {
-        ctx.write_output(std::format("os_product_version|{}", product_ver));
-    }
+    auto plist = mac_read_system_version_plist();
+    auto product_ver = mac_version_field(plist, "ProductVersion", "kern.osproductversion", "unknown");
+    ctx.write_output(std::format("os_product_version|{}", product_ver));
 #endif
     return 0;
 }
@@ -264,8 +286,9 @@ int do_os_build(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto build = run_command("sw_vers -buildVersion");
-    ctx.write_output(std::format("os_build|{}", build.empty() ? "unknown" : build));
+    auto plist = mac_read_system_version_plist();
+    auto build = mac_version_field(plist, "ProductBuildVersion", "kern.osversion", "unknown");
+    ctx.write_output(std::format("os_build|{}", build));
 
 #elif defined(_WIN32)
     auto build_num =
@@ -355,6 +378,54 @@ int do_uptime(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204). Every leg is now native in-process:
+// Linux and Windows read native kernel/OS surfaces throughout (sysfs/proc
+// reads, uname(2), the registry, RtlGetVersion, GetNativeSystemInfo,
+// sysctl(2), GetTickCount64); macOS os_name/os_version/os_build read
+// SystemVersion.plist (mac_read_system_version_plist +
+// os_info_macos.hpp's parse_system_version_plist) with a sysctlbyname
+// fallback (kern.osproductversion / kern.osversion — no equivalent exists
+// for the product NAME) — zero subprocesses anywhere. Rung 1 throughout.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "os_name",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/etc/os-release", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "SystemVersion.plist + sysctlbyname", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W CurrentVersion\\ProductName + build-number correction",
+         nullptr},
+    },
+    {
+        /* .action      = */ "os_version",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "uname(2) + SystemVersion.plist + sysctlbyname", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "RtlGetVersion (ntdll)", nullptr},
+    },
+    {
+        /* .action      = */ "os_build",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/version", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "SystemVersion.plist + sysctlbyname", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W CurrentBuildNumber + UBR", nullptr},
+    },
+    {
+        /* .action      = */ "os_arch",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetNativeSystemInfo", nullptr},
+    },
+    {
+        /* .action      = */ "uptime",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/uptime", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(2) KERN_BOOTTIME", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetTickCount64", nullptr},
+    },
+};
+
 } // namespace
 
 class OsInfoPlugin final : public yuzu::Plugin {
@@ -369,6 +440,14 @@ public:
         static const char* acts[] = {"os_name", "os_version", "os_build",
                                      "os_arch", "uptime",     nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

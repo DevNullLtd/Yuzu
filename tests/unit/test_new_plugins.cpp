@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -126,6 +127,12 @@ PluginHandle load_plugin(const std::string& name) {
     }
     // Also try builddir directly
     search_dirs.push_back(fs::path{"builddir"} / "agents" / "plugins" / name);
+    // Canonical per-OS build dirs, so the tests-build-* symlink invocation
+    // from the project root (CLAUDE.md "Direct binary invocation") finds the
+    // plugins instead of silently skipping every descriptor test.
+    for (const char* os_dir : {"build-macos", "build-linux", "build-windows"}) {
+        search_dirs.push_back(fs::path{os_dir} / "agents" / "plugins" / name);
+    }
 
     std::string lib_name = name + kPluginExt;
     fs::path found_path;
@@ -324,10 +331,38 @@ DESCRIPTOR_TEST("content_dist", "content_dist", 5, "stage", "execute_staged", "l
 DESCRIPTOR_TEST("interaction", "interaction", 5, "notify", "message_box", "input", "survey", "set_dnd")
 DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")
 DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear")
-DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value")
+DESCRIPTOR_TEST("registry", "registry", 9, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value", "list_profiles")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
 DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
+DESCRIPTOR_TEST("disk_actions", "disk_actions", 2, "smart", "volumes")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
+DESCRIPTOR_TEST("antivirus", "antivirus", 3, "products", "status", "av_exclusions")
+DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
+
+// DESCRIPTOR_TEST has no per-plugin version parameter (shared across ~15
+// plugins with unrelated version histories) -- a standalone case pins the
+// version bump so a future revert of firewall_plugin.cpp's version()
+// string is caught, not just observed once in a manual capture
+// (code-review r1, FV-codex-05). The pinned value tracks the highest bump
+// merged onto this plugin -- 0.5.0 for the macOS parity-residual work,
+// then 0.6.0 once the nftables netlink hardening bump landed on top.
+TEST_CASE("firewall: version reflects the parity-residual bump",
+          "[plugins][descriptor][firewall]") {
+    auto ph = load_plugin("firewall");
+    if (!ph) {
+        WARN("firewall plugin DLL/SO not found in build tree -- skipping "
+             "(build with -Dbuild_agent=true)");
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ph.desc != nullptr);
+    REQUIRE(ph.desc->version != nullptr);
+    CHECK(std::string_view(ph.desc->version) == "0.6.0");
+}
+
+DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")
+DESCRIPTOR_TEST("sccm", "sccm", 2, "client_version", "site")
+DESCRIPTOR_TEST("filesystem_posture", "filesystem_posture", 3, "mounts", "quotas", "snapshots")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)

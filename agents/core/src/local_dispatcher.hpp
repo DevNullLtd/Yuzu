@@ -24,16 +24,30 @@
  * so the server-side parser cleanly rejects the payload rather than
  * ingesting a half-finished structure; the dispatcher signals the
  * truncation through the `truncated` field on the result.
+ *
+ * BR-001 (Wave 5 PR5.1 whole-branch review): `result_status`/
+ * `result_completeness`/`result_provenance` surface whatever the plugin
+ * reported via `CommandContext::set_result_status()` (the ABI4 CC-07
+ * result-status seam, `yuzu_ctx_set_result_status`), read back from the
+ * SAME `CommandContextImpl` `dispatch_with_capture` already constructs --
+ * same shape as `truncated` above, not a second dispatch mechanism. Added
+ * so a unit test can prove a migrated plugin's `forward_runner_failure`
+ * call (runner_status.hpp) actually reaches the host seam, not just that
+ * the call site exists.
  */
 
 #include <yuzu/plugin.h>
 
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace yuzu::agent {
+
+class KvStore;
 
 class YUZU_EXPORT LocalDispatcher {
 public:
@@ -41,6 +55,12 @@ public:
         int rc{0};             ///< plugin's return code; 0 == success
         std::string captured;  ///< concatenated output (newline-joined)
         bool truncated{false}; ///< true iff capture hit the byte cap
+        /// ABI4 CC-07 typed result the plugin reported via
+        /// CommandContext::set_result_status(), if any -- UNDECLARED/UNKNOWN/
+        /// empty when the plugin never called it (see the file header).
+        YuzuResultStatus result_status{YUZU_RESULT_STATUS_UNDECLARED};
+        YuzuResultCompleteness result_completeness{YUZU_RESULT_COMPLETENESS_UNKNOWN};
+        std::string result_provenance;
     };
 
     /// Matches the server-side `FleetTopologyStore::kPushedSnapshotMaxBytes`.
@@ -59,6 +79,36 @@ public:
     Result run(const YuzuPluginDescriptor* descriptor, std::string_view action,
                std::span<const YuzuParam> params = {},
                std::size_t capture_cap = kCaptureMaxBytes);
+};
+
+/// A plugin context for an in-process host that is not the agent daemon
+/// (tools/plugin-capture). Carries the configuration map every plugin reads
+/// through `yuzu_ctx_get_config`; no trigger engine, and no KV store unless the
+/// KvStore* overload is used, so the storage and trigger ABI calls fail closed
+/// exactly as they do under the agent when those services are absent. Hand
+/// `get()` to `descriptor->init` before the first dispatch and to
+/// `descriptor->shutdown` after the last, in that order, so a plugin whose init
+/// is load-bearing (reads its config, opens a store, stashes the context)
+/// behaves as it does under the real host. The context must outlive every
+/// dispatch made against it.
+class YUZU_EXPORT StandalonePluginContext {
+public:
+    StandalonePluginContext(std::string plugin_name,
+                            std::unordered_map<std::string, std::string> config);
+    /// As above, with a non-owning KV store so the storage ABI calls
+    /// (`yuzu_ctx_storage_*`) work; `kv` must outlive this context.
+    StandalonePluginContext(std::string plugin_name,
+                            std::unordered_map<std::string, std::string> config, KvStore* kv);
+    StandalonePluginContext(const StandalonePluginContext&) = delete;
+    StandalonePluginContext& operator=(const StandalonePluginContext&) = delete;
+
+    [[nodiscard]] YuzuPluginContext* get() const noexcept;
+
+private:
+    // PluginContextImpl is private to agent.cpp (it is what every yuzu_ctx_*
+    // accessor reinterpret_casts a YuzuPluginContext* to); owned through a
+    // type-erased deleter defined there.
+    std::unique_ptr<void, void (*)(void*)> impl_;
 };
 
 } // namespace yuzu::agent

@@ -38,6 +38,8 @@ env:
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
+  # Self-hosted Big Tam and Wee Tam runners each own one 8C/16T L3 domain.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
@@ -56,7 +58,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -119,6 +121,12 @@ jobs:
             echo "::error::libsystemd-dev (pkg-config 'libsystemd') missing on self-hosted runner — sudo apt-get install -y libsystemd-dev"
             exit 1
           fi
+          # libblkid-dev — bitlocker's Linux LUKS-detection leg links it;
+          # without the .pc file `meson setup` fails the agent configure.
+          if ! pkg-config --exists blkid; then
+            echo "::error::libblkid-dev (pkg-config 'blkid') missing on self-hosted runner — sudo apt-get install -y libblkid-dev"
+            exit 1
+          fi
 
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux
@@ -168,7 +176,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-linux
+        run: meson compile -C build-linux -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
         if: always()
@@ -230,7 +238,7 @@ jobs:
       # Output two formats because customer questionnaires ask for one
       # or the other inconsistently and both are trivial to emit.
       - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: cyclonedx-json
@@ -239,7 +247,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -252,7 +260,7 @@ jobs:
       # workflow run. Stored in GitHub's attestation registry; verified
       # customer-side with `gh attestation verify <file>`.
       - name: Attest provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             yuzu-linux-x64.tar.gz
@@ -316,7 +324,7 @@ jobs:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -411,7 +419,7 @@ jobs:
       # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
       # runtime bundled into the release.
       - name: Generate gateway SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: gateway
           format: cyclonedx-json
@@ -420,7 +428,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate gateway SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: gateway
           format: spdx-json
@@ -429,7 +437,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest gateway provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             yuzu-gateway-linux-x64.tar.gz
@@ -489,13 +497,15 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       - name: Install Meson and ccache
         run: |
@@ -512,6 +522,10 @@ jobs:
             Write-Host "ccache already present: $((Get-Command ccache).Source)"
           }
 
+      - name: Assert toolchain manifest (self-hosted)
+        shell: pwsh
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
+
       # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
       # persist on the self-hosted Windows runner between jobs. The
       # original cache/restore@v5 calls were already restore-only —
@@ -525,6 +539,10 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Assert effective vcpkg checkout
+        shell: pwsh
+        run: ./deploy/windows/Assert-VcpkgCheckout.ps1 -VcpkgRoot (Join-Path $env:GITHUB_WORKSPACE 'vcpkg')
 
       - name: vcpkg sentinel (x64-windows)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
@@ -554,7 +572,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-windows
+        run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
 
       - name: ccache stats
         if: always()
@@ -698,7 +716,6 @@ jobs:
           & $iscc `
             "/DAppVersion=${version}" `
             "/DBuildDir=${{ github.workspace }}\build-windows" `
-            "/DContentDir=${{ github.workspace }}\content" `
             "deploy\packaging\windows\yuzu-server.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
 
@@ -745,7 +762,7 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       - name: Generate Windows SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: cyclonedx-json
@@ -754,7 +771,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate Windows SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -763,7 +780,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest Windows provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             yuzu-windows-x64.zip
@@ -801,10 +818,13 @@ jobs:
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
-    # macos-15 = Apple Silicon, Xcode 16 / Apple Clang 16 (accepts -std=c++23).
-    # macos-14 ships Apple Clang 15, which rejects -std=c++23 ("invalid value
-    # 'c++23'") — that broke the v0.12.0 first cut. Matches ci.yml's macOS job.
-    runs-on: macos-15
+    # Pinned to the self-hosted BigMags macOS pool (Apple Silicon, Xcode 16 /
+    # Apple Clang 16, accepts -std=c++23), matching how build-linux/build-gateway
+    # pin Big Tam and build-windows pins Wee Tam. release.yml triggers only on
+    # `push: tags: v*` + workflow_dispatch (both require repo write — no untrusted
+    # fork context), so no pool-health preflight gate is needed here, mirroring the
+    # self-hosted Linux/Windows release jobs. Matches ci.yml's self-hosted macOS job.
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
     permissions:
       contents: read
       id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
@@ -813,9 +833,14 @@ jobs:
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
+      # Override the workflow-scope YUZU_BUILD_JOBS: "16" (sized for the 16-core
+      # Big Tam / Wee Tam). BigMags is a 12-core / 24 GiB M4 Pro shared by 2
+      # agents, so bound the release+LTO build to 6 here at JOB scope — otherwise
+      # the workflow env wins and the `-j` below silently runs at 16.
+      YUZU_BUILD_JOBS: "6"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -825,7 +850,46 @@ jobs:
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
-          brew install cmake ninja ccache pipx autoconf automake libtool
+          #
+          # cmake deliberately excluded from this brew line, pinned via pipx
+          # below instead. 2026-07-16: brew's floating `cmake` drifted to
+          # 4.4.0 underneath us with no code change on our side, and that
+          # release crashes resolving httplib's CMake package: FindThreads'
+          # try_compile() trips CMake's own internal "This should not have
+          # happened" guard in Internal/CheckSourceCompiles.cmake, which
+          # poisons every subsequent cmake-method dependency lookup in the
+          # same configure. Broke macOS CI fleet-wide the same way (ci.yml,
+          # #2224) before it could hit a release build here. Pin like meson
+          # below so a future brew bump can't repeat this.
+          # pkg-config: the self-hosted BigMags box does not ship the hosted
+          # image's baked-in pkg-config that the Configure step's PKG_CONFIG_PATH
+          # assumes exists. The GitHub-hosted macos-15 image bundled it implicitly.
+          brew install ninja ccache pipx autoconf automake libtool pkg-config
+          # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
+          # independent of this workflow's brew line, so dropping cmake
+          # above doesn't remove it. Unlink it so it can never win a PATH
+          # race against the pinned pipx cmake below. `|| true`: fine if a
+          # future image doesn't pre-bake cmake at all; stderr is left
+          # visible so a genuine unlink failure still shows in the log.
+          brew unlink cmake || true
+          # 4.3.4 is the latest 4.x release before the 4.4.0 regression
+          # above. Bump deliberately once a fixed release is confirmed clean
+          # here. Query pipx's own shim dir and prepend it to GITHUB_PATH so
+          # it's guaranteed to win on PATH rather than assumed to. Captured
+          # into a variable first (not inlined into the `echo` argument):
+          # under `set -e`, a failing/empty command substitution inlined
+          # into `echo "$(...)"` would NOT abort the step (echo's own exit
+          # status is what -e checks), silently writing a blank PATH entry.
+          pipx install cmake==4.3.4
+          pipx_bin_dir="$(pipx environment --value PIPX_BIN_DIR)"
+          test -n "$pipx_bin_dir"
+          echo "$pipx_bin_dir" >> "$GITHUB_PATH"
+          # GITHUB_PATH only takes effect from the next step onward, not
+          # within this script, so verify via the resolved dir directly
+          # rather than a bare `cmake` (which may still hit an empty PATH
+          # slot right here). Self-documents the fix in every future log:
+          # today's incident was exactly this kind of silent version drift.
+          "$pipx_bin_dir/cmake" --version
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
@@ -836,55 +900,16 @@ jobs:
           # the same hash-pinned requirements file used elsewhere.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
-      - name: Cache ccache
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ccache-release-macos-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-release-macos-
-
+      # No actions/cache round-trip on the self-hosted BigMags pool. ccache
+      # persists at ~/Library/Caches/ccache in the runner user's HOME between
+      # jobs by definition, and vcpkg restores from the persistent binary cache
+      # in runner.tool_cache (populated below, and warmed by the ci.yml macOS
+      # test leg that shares the same path). The GHA cache/restore round-trip +
+      # the ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export it fed are dead
+      # wiring on a self-hosted runner. Mirrors the Linux/Windows self-hosted
+      # release jobs and the ci.yml macOS conversion (PR #3217). Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        #
-        # Cache key follows the universal contract from the CI overhaul
-        # plan: vcpkg.json + vcpkg-configuration.json + every overlay
-        # triplet + the pinned VCPKG_COMMIT baseline. Same shape as the
-        # ci.yml macOS cache key.
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
-          restore-keys: |
-            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
-            vcpkg-arm64-osx-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -893,7 +918,18 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace on the self-hosted
+          # BigMags runner. Without this, lukka/run-vcpkg defaults to a per-run
+          # temp dir → 0% hit rate every run → every port rebuilt from source.
+          # runner.tool_cache survives actions/checkout's default clean, and this
+          # is the SAME warm cache path the ci.yml macOS test leg already
+          # populates on BigMags. Plain (unconditional) form: release.yml triggers
+          # only on tag push + workflow_dispatch, so there is no untrusted-fork
+          # context to isolate against (unlike ci.yml's trusted_execution branch).
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-macos
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
             --x-manifest-root=${{ github.workspace }}
@@ -902,16 +938,32 @@ jobs:
         env:
           CC: ccache cc
           CXX: ccache c++
+          # spdlog/fmt resolve via pkg-config, not cmake (CLAUDE.md Manual
+          # Configure). Set explicitly to match ci.yml's macOS job and the Linux
+          # release Configure step above — the brew `pkg-config` install is inert
+          # without this, and the earlier comment referenced a var no step set.
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
         run: |
+          # -Dbackend_max_links=1 serialises the link steps. `-j` bounds ninja's
+          # job COUNT, not the per-process RSS of a monolithic full-LTO link of
+          # yuzu-server/yuzu-agent — the real memory spike. Serialising caps peak
+          # to one big LTO link at a time on the 24 GiB box; the full-LTO artifact
+          # is unchanged.
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=false \
-            -Db_lto=true
+            -Db_lto=true \
+            -Dbackend_max_links=1
 
       - name: Build
-        run: meson compile -C build-macos
+        # -j pinned to YUZU_BUILD_JOBS = "6", set at JOB scope above (overriding the
+        # workflow-scope "16" that's sized for the 16-core Tams). Load-bearing on
+        # BigMags: 2 agents share 12 cores / 24 GiB and release+LTO links are
+        # memory-heavy, so an unbounded ninja oversubscribes memory when both
+        # agents build at once. Paired with -Dbackend_max_links=1 in Configure.
+        run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
 
       - name: ccache stats
         if: always()
@@ -1087,7 +1139,7 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       - name: Generate macOS SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: cyclonedx-json
@@ -1096,7 +1148,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate macOS SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -1105,7 +1157,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest macOS provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             yuzu-macos-arm64.tar.gz
@@ -1161,7 +1213,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1172,20 +1224,23 @@ jobs:
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1208,9 +1263,54 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Build WITHOUT pushing, verify the image still provides the tool its
+      # compose healthcheck invokes (bash + /dev/tcp for server; busybox wget
+      # --spider for gateway), and only then push.
+      #
+      # Verifying AFTER the push would be too late: a broken tag would already
+      # be in GHCR for users to pull. The failure mode is silent -- a base-image
+      # swap or a dropped apt package breaks nothing at build time and nothing
+      # at boot, only the healthcheck, so Compose parks every container in
+      # `unhealthy` forever with no application error to point at.
+      #
+      # No `cache-to` here. Both builds run against the SAME buildkitd instance
+      # (one `setup-buildx-action` builder per job), so "Build and push" below
+      # hits BuildKit's own in-memory solver cache from this build and rebuilds
+      # nothing -- it pays only for the registry upload. A second `mode=max` local
+      # export would be a full duplicate write of a cache that already includes
+      # the vcpkg builder stage, for no benefit.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+          build-args: |
+            TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
+
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1228,6 +1328,7 @@ jobs:
           # build-arg is still safe -- unused build-args are ignored.
           build-args: |
             TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
@@ -1245,7 +1346,7 @@ jobs:
       # will pull. Output goes to artifacts/ for the release job to
       # attach alongside the per-platform archive SBOMs.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1254,7 +1355,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1274,7 +1375,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1343,7 +1444,7 @@ jobs:
       attestations: write    # actions/attest-build-provenance
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1356,17 +1457,17 @@ jobs:
       # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. See
       # docker-publish-chisel for the same rationale.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN — see docker-publish for the full rationale.
-          username: Tr3kkR
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1391,7 +1492,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile.postgres
@@ -1412,7 +1513,7 @@ jobs:
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1421,7 +1522,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1441,7 +1542,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1547,7 +1648,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.agent.chisel
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1562,22 +1663,25 @@ jobs:
       # arm64 runner exists. docker-container driver retained for the local
       # layer-cache export (cache-to type=local) below.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
@@ -1602,9 +1706,47 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # ── Healthcheck runtime invariants (#751) ──────────────────────────
+      # Same pre-push gate as docker-publish, and it matters MORE here: these
+      # images are FROM scratch, so their healthcheck depends entirely on a
+      # busybox binary the chisel stage symlinks into place. A slice change that
+      # stops shipping it breaks the demo-stack healthchecks and nothing else.
+      # docker-compose.demo.yml invokes busybox by ABSOLUTE path
+      # (`/bin/busybox wget --spider`) for the server and gateway chisel images,
+      # which is exactly what the script probes. The `agent` leg of this matrix is
+      # pre-emptive — no compose healthchecks an agent image today.
+      #
+      # NO TRIPLET build-arg, matching "Build and push" below.
+      - name: Build for healthcheck verification (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
+          cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
+          provenance: false
+          sbom: false
+
+      - name: Verify healthcheck runtime invariant
+        env:
+          ROLE: ${{ matrix.image }}-chisel
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
+
+      - name: Remove the verification image
+        if: always()
+        env:
+          IMAGE: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+        run: docker image rm -f "$IMAGE" || true
+
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1613,6 +1755,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
           # Dockerfiles derive the vcpkg triplet from buildx's per-arch
           # TARGETARCH when TRIPLET is empty
@@ -1640,7 +1784,7 @@ jobs:
       # multi-arch image by digest. Same SHA-pinned anchore/sbom-action +
       # upload-artifact versions as docker-publish.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1649,7 +1793,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1669,7 +1813,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1732,7 +1876,7 @@ jobs:
       id-token: write        # cosign keyless + Sigstore OIDC
       attestations: write    # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -1750,22 +1894,25 @@ jobs:
       # amd64-only: linux/arm64 (QEMU) dropped — not needed yet. The bundle
       # script builds the host-arch (amd64) image when --multiarch is omitted.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
-          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # GHCR_PAT (write:packages-only PAT) instead
           # of GITHUB_TOKEN so we can push to GHCR packages whose
           # Actions-access policy isn't pinned to this repo (e.g.
           # yuzu-agent-bundle-chisel, originally created via local
           # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
           # don't have access to the secret. Username pinned to the
-          # PAT owner ('Tr3kkR') since github.actor varies per actor.
-          username: Tr3kkR
+          # PAT owner since github.actor varies per actor. The owner is a
+          # USER, not the org, so it is carried in the `GHCR_USERNAME` repo
+          # variable rather than hardcoded — see the DevNullLtd migration
+          # note in .github/runner-inventory.json.
+          username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
@@ -1793,7 +1940,7 @@ jobs:
           echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
 
       - name: Generate bundle SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: cyclonedx-json
@@ -1802,7 +1949,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate bundle SBOM (SPDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: spdx-json
@@ -1821,7 +1968,7 @@ jobs:
           retention-days: 3
 
       - name: Attest bundle provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.ref.outputs.image }}
           subject-digest: ${{ steps.digest.outputs.value }}
@@ -1864,7 +2011,7 @@ jobs:
       id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

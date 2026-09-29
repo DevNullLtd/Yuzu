@@ -34,6 +34,13 @@ struct OidcConfig {
     std::string exchange_script; // Path to oidc_token_exchange.py
     std::string admin_group_id;  // Entra group ID that maps to admin role
     bool skip_tls_verify{false}; // Disable TLS cert verification (insecure, dev only)
+    // ADR-2001 §1 — which claim `validate_claims` treats as the SCIM link
+    // key (`"sub"` default or `"oid"`), threaded from
+    // Config::oidc_scim_link_claim. Only `"oid"` changes validate_claims'
+    // behaviour: it gates whether a missing/malformed `oid` claim fails the
+    // login (sub-equivalent fail-closed validation applies only when `oid`
+    // IS the configured link claim — see `IdTokenClaims::oid`).
+    std::string scim_link_claim{"sub"};
 
     bool is_enabled() const { return !issuer.empty() && !client_id.empty(); }
 };
@@ -49,6 +56,15 @@ struct PkceChallenge {
 
 struct IdTokenClaims {
     std::string sub;
+    /// Entra/Azure AD object id (ADR-2001 §1). Entra's `externalId` on the
+    /// SCIM side rides this claim, not `sub` — so this is the second
+    /// allowed value for `--oidc-scim-link-claim`. Validated with the SAME
+    /// fail-closed rules as `sub` (see `validate_claims`) ONLY when the
+    /// operator selected `oid` as the link claim — a missing/malformed
+    /// `oid` must not fail a login under the default `sub` link-claim
+    /// configuration. Empty when the IdP omits the claim (Okta typically
+    /// does).
+    std::string oid;
     std::string email;
     std::string preferred_username;
     std::string name;

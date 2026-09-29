@@ -1,0 +1,27 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash f062fb9a3dfd
+== action=smart
+smart|disk0|APPLE SSD AP0512Z|nvme|ssd|unknown|-|-|device advertises SMART; health attributes are not read on macOS (they require Apple's private IONVMeSMARTUserClient interface)
+[result_status] CONSTRAINED / PARTIAL / macos:iokit:health_unread
+
+== action=volumes
+volume|disk0s1|-|disk0|-|524288000|-
+volume|disk0s3|-|disk0|-|5368664064|-
+volume|disk0s2|-|disk0|-|494384795648|-
+volume|disk1|-|disk0|-|524288000|-
+volume|disk2|-|disk0|-|5368664064|-
+volume|disk3|-|disk0|-|494384795648|-
+volume|disk1s1|/System/Volumes/iSCPreboot|disk0|apfs|524288000|-
+volume|disk1s4|-|disk0|-|524288000|-
+volume|disk1s2|/System/Volumes/xarts|disk0|apfs|524288000|-
+volume|disk1s3|/System/Volumes/Hardware|disk0|apfs|524288000|-
+volume|disk2s1|-|disk0|-|5368664064|-
+volume|disk2s2|-|disk0|-|5368664064|-
+volume|disk3s1|-|disk0|-|494384795648|-
+volume|disk3s2|/System/Volumes/Preboot|disk0|apfs|494384795648|-
+volume|disk3s3|-|disk0|-|494384795648|-
+volume|disk3s4|/System/Volumes/Update|disk0|apfs|494384795648|-
+volume|disk3s5|/System/Volumes/Data|disk0|apfs|494384795648|-
+volume|disk3s6|/System/Volumes/VM|disk0|apfs|494384795648|-
+volume|disk3s1s1|/|disk0|apfs|494384795648|-
+[result_status] UNDECLARED / UNKNOWN / 
+

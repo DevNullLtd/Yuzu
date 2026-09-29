@@ -79,7 +79,7 @@ echo "────────────────────────�
 DISPATCH=$(curl -s -b "$UAT/cookies.txt" \
     -X POST "$BASE/api/instructions/$DEF_ID/execute" \
     -H "Content-Type: application/json" \
-    -d '{"scope":"","agent_ids":[]}')
+    -d '{"scope":"__all__"}')
 
 CMD_ID=$(echo "$DISPATCH" | python3 -c \
     "import sys,json; print(json.load(sys.stdin).get('command_id',''))")

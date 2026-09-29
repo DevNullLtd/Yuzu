@@ -263,7 +263,7 @@ echo -e "${BOLD}[Network Diagnostics]${NC}"
 dispatch_and_poll network_diag listening
 dispatch_and_poll network_diag connections
 dispatch_and_poll netstat netstat_list
-dispatch_and_poll sockwho sockwho_list
+dispatch_and_poll netstat attribution
 echo ""
 
 # ── Group 6: Users & Sessions ───────────────────────────────────────────

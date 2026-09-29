@@ -3,6 +3,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_retention_guard.hpp"
 #include "pg/pg_raii.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -55,9 +56,23 @@ const std::vector<pg::PgMigration>& migrations() {
          "  updated_at   BIGINT NOT NULL,"
          "  PRIMARY KEY (app_name, version, day));"
          "CREATE INDEX app_perf_fleet_day_idx ON app_perf_fleet (day);"},
+        // WS-10 (#2508): durable anchor + dedup state for the clock-guarded,
+        // single-writer retention prune (shared shape, see run_retention_prune).
+        {2, "CREATE TABLE IF NOT EXISTS retention_meta ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
     };
     return kMigrations;
 }
+
+// WS-10 retention-guard constants — PER-STORE. The `day` column is a day-floored
+// UNIX-SECONDS bucket, so every value here is in SECONDS. app_perf fleet history
+// is non-regenerable aggregated analytics at a ~1h prune cadence, 180-day
+// retention; part-6 missing-anchor = Decline (audit_store's answer).
+constexpr std::int64_t kPruneBigStepFloorSecs = 86'400;      // 24h absolute (> any legit inter-pass gap at 1h cadence)
+constexpr std::int64_t kPruneImplausibilitySecs = 86'400;    // day buckets are never future; >1d ahead is skew
+constexpr std::int64_t kPruneMinPlausibleSecs = 946'684'800; // year 2000 in seconds
+// kPruneCapPerPass is a PUBLIC static member (app_perf_fleet_store.hpp) so the
+// roll-up thread can detect a cap-hit and re-arm; referenced below via the member.
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -270,20 +285,40 @@ std::optional<std::vector<AppPerfAppSummary>> AppPerfFleetStore::list_apps(bool&
     return out;
 }
 
-void AppPerfFleetStore::prune(std::int64_t before_day) {
+int AppPerfFleetStore::run_retention_prune(std::int64_t retention_window_secs) {
     if (!open_)
-        return;
-    auto lease = pool_.try_acquire_for(kPruneAcquireTimeout);
-    if (!lease) {
-        spdlog::debug("AppPerfFleetStore: prune skipped, no connection in time ({})",
-                      pool_.last_error());
-        return;
-    }
-    pg::PgResult res = pg::exec_params(
-        lease.get(), "DELETE FROM app_perf_fleet_store.app_perf_fleet WHERE day < $1::bigint",
-        std::vector<std::string>{std::to_string(before_day)});
-    if (res.status() != PGRES_COMMAND_OK)
-        spdlog::debug("AppPerfFleetStore: prune failed: {}", PQerrorMessage(lease.get()));
+        return -1;
+    // WS-10 (#2508): clock-guarded, single-writer, capped retention. All units are
+    // SECONDS (the `day` column is a day-floored unix-seconds bucket). Part-6
+    // missing-anchor = Decline: fleet perf history is non-regenerable aggregated
+    // analytics, so a from-boot skewed clock must not silently wipe it.
+    // now_expr is RAW epoch seconds (NOT day-floored): the anchor + big_step need
+    // the true reading, or an hourly tick across UTC midnight false-fires a 24h
+    // Step and pauses retention (WS-10 C1). The DAY alignment lives in
+    // `cutoff_align = 86400` below, which floors ONLY the cutoff to the `day`
+    // bucket — matching the pre-WS-10 caller (`(now/86400)*86400 - window`) and the
+    // sibling app_perf_daily_store, so the 180-day boundary bucket is not deleted
+    // ~24h early.
+    const pg::ClockGuardedPruneSpec spec{
+        .store_label = kStoreName,
+        .target_table = "app_perf_fleet_store.app_perf_fleet",
+        .ts_column = "day",
+        .now_expr = "(EXTRACT(EPOCH FROM now()))::bigint",
+        .meta_table = "app_perf_fleet_store.retention_meta",
+        .anchor_key = "app_perf_prune_last_pass_now",
+        .settled_key = "app_perf_prune_bootstrap_settled",
+        .facts_key = "app_perf_prune_last_anomaly_facts",
+        .advisory_lock_key = "hashtext('app_perf_fleet_store:app_perf_prune')",
+        .retention_window = retention_window_secs,
+        .big_step_floor = kPruneBigStepFloorSecs,
+        .implausibility_bound = kPruneImplausibilitySecs,
+        .min_plausible_reading = kPruneMinPlausibleSecs,
+        .cap_per_pass = kPruneCapPerPass,
+        .missing_anchor = pg::MissingAnchorPolicy::Decline,
+        .cutoff_align = 86'400, // day-align the cutoff to the `day` bucket (raw now stays for big_step)
+    };
+    const auto r = pg::run_clock_guarded_prune(pool_, spec, kPruneAcquireTimeout);
+    return r.error ? -1 : r.deleted;
 }
 
 } // namespace yuzu::server

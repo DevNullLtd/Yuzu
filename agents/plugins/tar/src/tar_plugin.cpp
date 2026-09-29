@@ -20,13 +20,19 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "tar_capture_status.hpp" // yuzu::tar::collect_or_retain
 #include "tar_collectors.hpp"
+#include "tar_cursor.hpp" // yuzu::tar::CursorSource, make_cursor_sources
+#include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
 #include "tar_proc_stream.hpp"
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
+#include "tar_usage.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_source_health.hpp"
+#include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
 #include "tar_netqual_boot.hpp"
 #include "tar_perf.hpp"
@@ -45,6 +51,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <charconv>
 #include <chrono>
 #include <format>
 #include <iterator>
@@ -261,7 +269,13 @@ json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
         arr.push_back({{"name", s.name},
                        {"display_name", s.display_name},
                        {"status", s.status},
-                       {"startup_type", s.startup_type}});
+                       {"startup_type", s.startup_type},
+                       // Finding 3: persisted across ticks so a Windows
+                       // per-service query-failure row loaded back as
+                       // "previous" next tick still suppresses the
+                       // startup_type comparison symmetrically (see
+                       // ServiceInfo::startup_type_query_failed's comment).
+                       {"startup_type_query_failed", s.startup_type_query_failed}});
     }
     return arr;
 }
@@ -278,6 +292,7 @@ std::vector<yuzu::tar::ServiceInfo> json_to_services(const std::string& s) {
             si.display_name = j.value("display_name", "");
             si.status = j.value("status", "");
             si.startup_type = j.value("startup_type", "");
+            si.startup_type_query_failed = j.value("startup_type_query_failed", false);
             result.push_back(std::move(si));
         }
     } catch (...) {}
@@ -368,6 +383,161 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     return {};
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order. Legs are grounded
+// in two places: reading each collector's own #ifdef structure directly, and
+// cross-checking against the pre-existing per-capture-source support table
+// this plugin already ships (tar_schema_registry.cpp build_sources(),
+// consumed by the `compatibility` action) — its OsSupportStatus enumerators
+// alias the SAME YuzuSupportLevel values (tar_schema_registry.hpp:66-70), so
+// its judgments are reused directly rather than re-derived from scratch.
+//
+//   - status/query/export/configure/rollup/sql/compatibility/purge_source:
+//     pure in-process SQLite reads/writes against tar.db (TarDatabase) — no
+//     OS acquisition at all, native in-process on every OS (rung 1).
+//   - collect_fast: process (ETW/Endpoint-Security/procfs) + network
+//     (iphlpapi/procfs/libproc, always the poll — see
+//     effective_network_capture_method) + opt-in netqual are each native
+//     (rung 1) on every OS. macOS's process/tcp legs self-heal to a poll
+//     without the ES entitlement / nstat root privilege
+//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); the
+//     opt-in arp sub-source is now wired natively on both non-Windows legs
+//     too (tar_arp_collector.cpp: /proc/net/arp on Linux, the shared
+//     route_sysctl_arp.hpp sysctl dump on macOS — constrained there,
+//     entry_type always 'unknown'), while dns remains kPlanned
+//     (tar_dns_collector.cpp) on both — CONSTRAINED, not a bare SUPPORTED,
+//     on those two legs.
+//   - collect_slow: service (SCM native / systemctl+launchctl, rung-2 argv
+//     via the shared subprocess runner) + user (native WTS/utmp/utmpx) +
+//     opt-in netconn/mapdrive. Windows is all native (scm/wts/wnet/wevtapi,
+//     rung 1). Linux/macOS service enumeration runs bounded argv
+//     (tar_service_collector.cpp, rung 2 — the worst rung actually
+//     exercised on that OS); mapdrive is native getfsstat (rung 1,
+//     outbound-live-only, constrained) on macOS and a rung-1/rung-2 mix on
+//     Linux (native /proc/mounts + /etc/fstab reads, rung-2 argv for
+//     smbstatus/journalctl), and netconn is kPlanned (no-op) on both non-
+//     Windows OSes (tar_netconn_win.cpp #else).
+//   - collect_perf: device counters (tar_perf.cpp) native on Windows/Linux,
+//     kPlanned (host_statistics) on macOS — the target rung is still 1
+//     (native syscalls once wired).
+//   - collect_software: HKLM Uninstall registry walk on Windows (native,
+//     rung 1); kPlanned (dpkg_rpm / pkgutil, tar_software_collector.cpp
+//     #else) on Linux/macOS — an argv subprocess once wired (target rung 2).
+//   - fleet_snapshot: enumerate_processes()/enumerate_connections() only —
+//     ALWAYS the poll, never nstat (tar_schema_registry.cpp:1093-1105
+//     effective_network_capture_method). Native on every OS; macOS's poll
+//     (proc_pidfdinfo) carries the same TOCTOU caveat the schema table
+//     records for that leg (tar "tcp" row 2) — CONSTRAINED there.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "status",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "query",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "snapshot",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "procfs+systemctl+dpkg_rpm(planned)",
+         "software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; "
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess runner"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned)",
+         "software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only "
+         "(getfsstat, no username, no inbound, no history); service enumeration runs bounded "
+         "argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll "
+         "without the Endpoint Security entitlement or nstat root privilege"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi+scm+wts+wnet+wevtapi+registry", nullptr},
+    },
+    {
+        "export",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "configure",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "collect_fast",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "procfs",
+         "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is "
+         "native (procfs, /proc/net/arp); core process/network/netqual collection is "
+         "native"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat+route_sysctl",
+         "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the "
+         "Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source "
+         "is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained "
+         "(route_sysctl, entry_type always 'unknown')"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi", nullptr},
+    },
+    {
+        "collect_slow",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "systemctl+utmp",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED "
+         "(no-op) on Linux"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "launchctl+utmpx+getfsstat",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; no startup_type; mapdrive opt-in source is wired but "
+         "outbound-live-only (getfsstat, no username, no inbound, no history); "
+         "netconn opt-in source is PLANNED (no-op) on macOS"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "scm+wts+wnet+wevtapi", nullptr},
+    },
+    {
+        "collect_perf",
+        {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+        {YUZU_SUPPORT_PLANNED, 1, "host_statistics", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "ntcounters", nullptr},
+    },
+    {
+        "collect_software",
+        {YUZU_SUPPORT_PLANNED, 2, "dpkg_rpm", nullptr},
+        {YUZU_SUPPORT_PLANNED, 2, "pkgutil", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "registry", nullptr},
+    },
+    {
+        "rollup",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "sql",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "compatibility",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "fleet_snapshot",
+        {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "libproc(proc_pidfdinfo)",
+         "inherent TOCTOU between pid enumeration and per-fd query; short-lived "
+         "sockets may be missed"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "iphlpapi+win32_process_enum", nullptr},
+    },
+    {
+        "purge_source",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+};
+
 } // namespace
 
 class TarPlugin final : public yuzu::Plugin {
@@ -385,6 +555,14 @@ public:
                                      "rollup",         "sql",           "compatibility",
                                      "fleet_snapshot", "purge_source",  nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
@@ -410,6 +588,7 @@ public:
                 yuzu::PluginError{1, std::format("TAR: failed to open db: {}", result.error())});
         }
         db_ = std::make_unique<yuzu::tar::TarDatabase>(std::move(*result));
+        reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
 
         // Load config
         int fast_interval = 60;
@@ -486,6 +665,24 @@ public:
         if (stream_active_) {
             spdlog::info("TAR: {} process stream active (process poll superseded)",
                          proc_stream_->method_name());
+        }
+
+        // roadmap 2.2: construct + start the nstat client alongside the ES
+        // process stream above (same lifetime/teardown ordering discipline —
+        // both are torn down together in shutdown() under collect_mu_).
+        // Unconditional/no #ifdef: start() is a documented no-op off-macOS,
+        // so this line is inert everywhere except macOS. Registered so the
+        // netqual free functions in tar_network_collector.cpp (a different
+        // TU, platform-dispatched) can reach it without a second,
+        // independently-owned client (tar_collectors.hpp,
+        // netqual_nstat_register_client).
+        nstat_client_ = std::make_unique<yuzu::tar::NstatClient>();
+        if (nstat_client_->start()) {
+            spdlog::info("TAR: nstat client active (netqual + tcp lifecycle)");
+        }
+        yuzu::tar::netqual_nstat_register_client(nstat_client_.get());
+
+        if (stream_active_) {
 
             // Boot-window backfill: replay the AutoLogger .etl (configured at
             // install time WITH a FlushTimer so it's continuously written to
@@ -588,6 +785,22 @@ public:
         // starts disabled.
         if (db_->get_config("mapdrive_enabled", "").empty()) {
             db_->set_config("mapdrive_enabled", "false");
+        }
+        // Wave 7 PR7.2b: boot is one of the THREE call sites (boot, configure,
+        // fast-tick) that must all reconcile the `usage` fold's lifecycle
+        // through this SAME function -- see tar_usage.hpp's file banner for
+        // why a boot-time path that instead wrote its own marker directly
+        // (the original PR7.2 shape) could stamp coverage while the source
+        // was disabled, or race a later enable-edge rebaseline into
+        // retrospectively over-collecting the disabled window. A best-effort
+        // attempt here is a latency optimisation only -- run_usage_fold()
+        // itself calls the identical function on every fast tick, so a
+        // failure here is never fatal, only slower to notice.
+        if (auto baseline = yuzu::tar::usage::usage_ensure_baselined(*db_, now_epoch_seconds());
+            !baseline.has_value()) {
+            spdlog::warn("TAR: boot-time usage baseline attempt failed ({}); the fast-tick fold "
+                        "will retry it",
+                        baseline.error());
         }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
@@ -727,6 +940,63 @@ public:
             }
         }
 
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Built once here as TarPlugin-owned members (P-002 — never a
+        // function-local static); make_cursor_sources() returns an empty
+        // vector this wave, so this loop is a no-op until wave 2's
+        // integrator adds the two push_backs. start()ed unconditionally
+        // (like proc_stream_/nstat_client_ above) so an operator flipping
+        // `<name>_enabled` later has a live subscription to resume against —
+        // the `<name>_enabled` gate itself is applied in collect_slow_impl's
+        // per-source region, not here.
+        cursor_sources_ = yuzu::tar::make_cursor_sources();
+        // A consumer's factory returning a null entry would be dereferenced
+        // unguarded at four sites; drop them once, here, rather than checking
+        // at each. (cpp-safety, Gate 3.)
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
+        // start() is not noexcept in the CursorSource contract, and this runs
+        // inside init(): an escaping exception would cross the plugin C-ABI.
+        // One source failing to arm its subscription must not take the whole
+        // TAR plugin down with it -- the mapdrive block above guards the same
+        // hazard for the same reason.
+        for (auto& src : cursor_sources_) {
+            try {
+                src->start(*db_);
+                // A source is constructed CAPTURING. start() arms the OS
+                // subscription regardless of the configured enable state --
+                // deliberately, so a later enable does not have to pay a cold
+                // arm -- so a source whose persisted state is DISABLED must be
+                // told so immediately, before the first callback can arrive.
+                // Without this, an agent restarted while the source is disabled
+                // buffers the forbidden window (macOS queues callbacks, Linux's
+                // netlink socket fills) and commits it on the first later
+                // enable: on_enabled_changed(true) is a no-op because the fresh
+                // process never saw a disable. tar_cursor.hpp's lifecycle rule
+                // is absolute -- NOTHING from a paused window is ever stored --
+                // and the disabled-collect path only skips the tick, it does
+                // not discard what the OS already handed the source.
+                if (!source_enabled(*db_, src->name()))
+                    src->on_enabled_changed(false);
+            } catch (const std::exception& e) {
+                spdlog::error("TAR: cursor source '{}' failed to start: {} -- dropping it",
+                              src->name(), e.what());
+                src.reset();
+            } catch (...) {
+                spdlog::error("TAR: cursor source '{}' failed to start (unknown exception) -- "
+                              "dropping it",
+                              src->name());
+                src.reset();
+            }
+        }
+        // A source whose start() threw has NO armed subscription, so leaving it
+        // in the vector meant collect() ran against it every tick and returned
+        // an ordinary Advanced/0-events result -- a dead source reporting
+        // health, which is worse than an absent one. It also never received the
+        // on_enabled_changed(false) that the block above argues must land
+        // before the first callback can arrive, because that call is inside the
+        // same try. Found by both the architect and cpp-safety.
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
         return {};
@@ -738,6 +1008,14 @@ public:
         ctx.unregister_trigger("tar.perf");
         ctx.unregister_trigger("tar.software");
         ctx.unregister_trigger("tar.rollup");
+        // Unregister the nstat client BEFORE tearing it down: collect_tcp_quality()
+        // / netqual_effective_capture_method() (tar_network_collector.cpp) both run
+        // OUTSIDE collect_mu_ (do_collect_fast's pre-collection stage), so a call
+        // in flight right now could otherwise race nstat_client_->stop() below.
+        // This narrows, but does not by itself eliminate, that window — the same
+        // level of care the ES process stream already accepts (see the collect_mu_
+        // comment right below).
+        yuzu::tar::netqual_nstat_register_client(nullptr);
         // Take collect_mu_ around the collector teardown: a collect_fast tick may
         // still be draining proc_stream_ (reads impl_ via drain()/running()), and
         // stop() resets impl_. The host quiesces the trigger engine before
@@ -757,6 +1035,21 @@ public:
                 // consumer thread (idempotent; safe if never started).
                 module_stream_->stop();
             }
+            if (nstat_client_) {
+                // Closes the kctl socket (unblocks the reader's recv) and joins
+                // the reader + query threads. Same teardown-ordering discipline
+                // as proc_stream_/module_stream_ above — the tcp leg only drains
+                // nstat_client_ under collect_mu_ (collect_fast_impl).
+                nstat_client_->stop();
+            }
+            // Cursor-model sources (tar_cursor.hpp): every source's stop() is
+            // a bounded unregister/drain/join of everything it owns — called
+            // here, under collect_mu_, BEFORE db_.reset() below, exactly the
+            // proc_stream_/module_stream_/nstat_client_ ordering above. A
+            // source's stop() contract forbids it from touching db_ (or
+            // taking collect_mu_ itself) once this returns.
+            for (auto& src : cursor_sources_)
+                src->stop();
         }
         db_.reset();
         spdlog::info("TAR plugin shut down");
@@ -801,8 +1094,104 @@ public:
         return 1;
     }
 
+    // Record a source's terminal outcome for this tick in the health ledger.
+    // `registry_name` is a capture_sources() name (NOT a tar_state key).
+    void note_health(std::string_view registry_name, std::string_view token) {
+        const auto now = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        std::lock_guard lock(health_mu_);
+        health_.record(registry_name, token, now);
+    }
+
+    // #1567: idempotent reconcile of the persisted quarantine fact (tar_config)
+    // into the plugin's heartbeat KV keys. The agent bridges `heartbeat.*` keys
+    // into `yuzu.plugin.tar.*` heartbeat tags. Runs at init and at the top of
+    // every collect_slow tick, so a crash between the quarantine and the publish,
+    // or a failed storage_set, is replayed rather than lost. The ledger is never
+    // overwritten when it exists but is unreadable (storage_get returns "" for
+    // absent AND read-failure). Known host-layer gap: storage_exists reports a
+    // READ FAILURE as absent (KvStore::exists folds closed-handle/prepare/step
+    // failures into false and agent.cpp maps that to not-found, against
+    // plugin.h's negative-on-error contract), so a read fault on the ledger
+    // probe followed by a successful write in the same tick restarts the count
+    // at 1 — the count is monotonic per agent except for that fault; tracked as
+    // a follow-up, #5037 (KvStore::exists tri-state). The two windows where the fact is
+    // lost are a crash between the quarantine rename and the fresh DB's config
+    // write inside TarDatabase::open(), and that config write failing (logged by
+    // open(); db_health|quarantined still shows for this process).
+    void reconcile_db_health_publish(yuzu::PluginContext& pctx) {
+        if (!db_ || !db_->is_open())
+            return;
+        int64_t epoch = 0;
+        try {
+            epoch = std::stoll(db_->get_config("db_health_last_quarantine_epoch", "0"));
+        } catch (...) {
+            return;
+        }
+        const auto file = db_->get_config("db_health_last_quarantine_file", "");
+        if (epoch <= 0 || file.empty())
+            return;
+        const std::string want = std::format("{}:{}", epoch, file);
+        constexpr std::string_view kLastKey = "heartbeat.db_quarantine_last";
+        constexpr std::string_view kTotalKey = "heartbeat.db_corruption_total";
+        // One atomic ledger record `<count>:<epoch>:<basename>` in a private,
+        // non-bridged key holds the truth; the two published keys are derived
+        // from it by idempotent sets. A failed publish therefore replays the
+        // same computation on the next tick instead of re-counting. The
+        // identity key is withheld until the matching total is durable, so a
+        // torn publish never pairs a stale total with a newer identity.
+        constexpr std::string_view kLedgerKey = "db_health.ledger";
+        int64_t count = 0;
+        std::string ledger_identity;
+        if (pctx.storage_exists(kLedgerKey)) {
+            const auto raw = pctx.storage_get(kLedgerKey);
+            const auto colon = raw.find(':');
+            bool ok = colon != std::string::npos && colon > 0;
+            if (ok) {
+                const auto [p, ec] = std::from_chars(raw.data(), raw.data() + colon, count);
+                ok = ec == std::errc{} && p == raw.data() + colon && count >= 0;
+            }
+            if (!ok) {
+                spdlog::warn("TAR: db_health.ledger unreadable; not overwriting");
+                return;
+            }
+            ledger_identity = raw.substr(colon + 1);
+        }
+        if (ledger_identity != want) {
+            ++count;
+            if (!pctx.storage_set(kLedgerKey, std::format("{}:{}", count, want))) {
+                spdlog::warn("TAR: failed to record db quarantine ledger; will retry");
+                return;
+            }
+        }
+        const auto publish = [&](std::string_view key, const std::string& value) {
+            if (pctx.storage_exists(key) && pctx.storage_get(key) == value)
+                return true;
+            return pctx.storage_set(key, value);
+        };
+        // The identity is published only once the matching total is durable:
+        // publishing kLastKey after a failed kTotalKey write would let the KV
+        // hold a stale total paired with a newer identity.
+        if (!publish(kTotalKey, std::to_string(count))) {
+            spdlog::warn("TAR: failed to publish db quarantine total; will retry "
+                        "(identity withheld)");
+            return;
+        }
+        if (!publish(kLastKey, want))
+            spdlog::warn("TAR: failed to publish db quarantine identity; will retry");
+    }
+
 private:
     YuzuPluginContext* plugin_ctx_{nullptr};
+    std::mutex health_mu_;
+    yuzu::tar::SourceHealthLedger health_;
+    std::atomic<int64_t> procperf_procs_seen_{0};
+    // Set when the stream-fallback baseline seed failed: the poll must re-seed
+    // (no diff) on the next tick instead of diffing against a stale baseline.
+    // Guarded by collect_mu_.
+    bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
@@ -812,6 +1201,20 @@ private:
     // dedicated mutex serialises concurrent collect_software (manual vs trigger)
     // without that cross-collector coupling.
     std::mutex software_collect_mu_;
+    // Serialises whole rollup passes (#2361). do_rollup is reachable from two
+    // places at once: the 900s `tar.rollup` trigger and an operator-issued manual
+    // `tar rollup` instruction. run_retention's clock-guard state is plain
+    // in-memory maps that it reads and writes WITHOUT holding db_->mu_ (the
+    // database mutex only serialises individual statements), so two concurrent
+    // passes would race the latch and the decline counters -- exactly what TSan
+    // catches in CI. Serialising the pass is cleaner than making each map entry
+    // atomic, and rollup is a background maintenance tick where a rare wait costs
+    // nothing. Also makes the aggregate-then-retain ordering below atomic.
+    std::mutex rollup_mu_;
+    // Per-table retention clock-guard state. rollup_mu_ serialises whole PASSES;
+    // the state carries its own mutex for the brief map touches, so do_status can
+    // read the counters without waiting for a pass to finish.
+    yuzu::tar::RetentionGuardState retention_guard_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
     // Per-app version cache, keyed by (pid, create_time): resolves each top-N
@@ -842,6 +1245,11 @@ private:
     // High-water mark of ProcEventRing::dropped() already logged, so the overflow
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
+    // Epoch seconds of the last `usage` fold failure warning -- rate-limits
+    // run_usage_fold() failure logging to once per minute (Wave 7 PR7.2b) so
+    // a persistently wedged fold does not spam every fast tick. Guarded by
+    // collect_mu_ (only read/written from collect_fast_impl).
+    int64_t usage_last_fold_warn_ts_{0};
 
     // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
     // Unlike the always-on process stream, this is OPT-IN (module_enabled,
@@ -860,15 +1268,68 @@ private:
     // is disabled, so a later re-enable retries. Guarded by collect_mu_.
     bool module_start_failed_{false};
 
+    // ── roadmap 2.2: nstat (macOS netqual + tcp lifecycle; tar_netqual_nstat.hpp)
+    // ONE client feeds both the netqual leg (collect_tcp_quality(), reached via
+    // netqual_nstat_register_client() below — see tar_collectors.hpp) and the
+    // tcp lifecycle leg (drained directly here, see the "tcp" block in
+    // collect_fast_impl). Constructed + started UNCONDITIONALLY on every
+    // platform: off-macOS every NstatClient method is a documented no-op and
+    // start() returns false, so this never needs an #ifdef — same "inert
+    // elsewhere" contract the ES/ETW streams get via platform-specific
+    // construction, just without needing platform selection since there is
+    // only ever one concrete NstatClient type. Single-owner (this plugin);
+    // NOT an EsClientBroker — nstat has exactly one consumer surface (memo
+    // ~/.claude/plans/nstat-spike-2.1-memo.md §4.3).
+    std::unique_ptr<yuzu::tar::NstatClient> nstat_client_;
+    // High-water mark of NstatClient::dropped() already logged (same pattern
+    // as last_logged_dropped_/last_module_dropped_). Guarded by collect_mu_.
+    std::uint64_t last_nstat_dropped_{0};
+    // HIGH-3: events mapped from the nstat lifecycle ring but not yet
+    // persisted because a prior insert failed (DB locked/full) — mirrors
+    // pending_stream_evs_/pending_module_evs_ above so a transient DB failure
+    // never permanently loses tcp lifecycle events. Guarded by collect_mu_;
+    // bounded by kPendingStreamCap. HIGH-4 clears this when the tcp source is
+    // disabled (the buffered-but-undelivered batch belongs to the paused
+    // window and must never be persisted on re-enable); HIGH-5 also feeds it
+    // from the stream-death/stall drain-before-fallback path.
+    std::vector<yuzu::tar::NetworkEvent> pending_nstat_evs_;
+    // Whether nstat was the tcp lifecycle PRIMARY source on the previous
+    // collect_fast tick — lets the "tcp" leg detect a nstat→poll fallback
+    // transition and reseed the poll's diff baseline instead of misreporting
+    // every already-open tcp connection as newly "connected" (see the tcp
+    // block's self-heal comment). Guarded by collect_mu_.
+    bool nstat_tcp_primary_prev_{false};
+
+    // Cursor-model sources (tar_cursor.hpp: power, removable — wave 2). Built
+    // once in init() from make_cursor_sources() (empty this wave); NOT a
+    // function-local static (P-002) — these are TarPlugin-owned members with
+    // the same lifetime discipline as proc_stream_/module_stream_/
+    // nstat_client_ above: start()ed at init, stop()ped under collect_mu_
+    // in shutdown() BEFORE db_.reset() (see shutdown()).
+    std::vector<std::unique_ptr<yuzu::tar::CursorSource>> cursor_sources_;
+
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
     // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
     // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
     // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    // arp_pre is an optional<vector> (not a bare vector) so a precollection
+    // failure (enumerate_arp() threw -- incomplete capture, tar_capture_status.hpp's
+    // collect_or_retain contract) is preserved as nullopt through this layer
+    // instead of collapsing to an empty vector indistinguishable from a
+    // genuinely empty ARP table (BR-001, round 2) -- do_collect_fast sets it.
+    // skipped_sources: when non-null, the name of every enabled
+    // collect_or_retain-backed source this call skipped (arp) is appended --
+    // do_snapshot (round 3, B3-002) aggregates these across both
+    // collect_fast_impl and collect_slow_impl to decide whether the forced
+    // `snapshot` action can honestly report "complete". Null for the regular
+    // collect_fast trigger tick (do_collect_fast), which already logs the
+    // same skip via spdlog and has no separate completeness response to give.
     int collect_fast_impl(yuzu::CommandContext& ctx,
-                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::optional<std::vector<yuzu::tar::ArpEntry>>* arp_pre = nullptr,
                           std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr,
-                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr) {
+                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -934,6 +1395,7 @@ private:
                 }
                 if (!typed.empty()) {
                     if (!db_->insert_process_events(typed)) {
+                        note_health("process", "insert_failed");
                         spdlog::error("TAR: process stream insert failed — re-queuing {} events "
                                       "for the next tick",
                                       evs.size());
@@ -953,6 +1415,7 @@ private:
                     }
                     total_events += static_cast<int>(typed.size());
                 }
+                note_health("process", "events_recorded");
                 // No state save — the stream is continuous, not a snapshot.
 
                 // Ring-overflow visibility: dropped() is cumulative, so warn only
@@ -994,7 +1457,16 @@ private:
                             return yuzu::tar::should_redact(p.name, stab_excl);
                         });
                     }
-                    db_->set_state(proc_key, processes_to_json(current).dump());
+                    // Checked (#1654): a failed seed must not be followed by a diff
+                    // against a stale/empty baseline (ghost `started` storm), so the
+                    // poll re-seeds WITHOUT diffing on the next tick.
+                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                        spdlog::error("TAR: process poll-baseline seed failed after stream "
+                                      "fallback; will re-seed next tick");
+                        ctx.write_output("error|process state_save_failed");
+                        note_health("process", "state_save_failed");
+                        proc_poll_seed_pending_ = true;
+                    }
                 }
             } else {
                 // No active stream (poll-only platform, or stream unavailable):
@@ -1013,22 +1485,70 @@ private:
                     });
                 }
 
-                auto prev_json = db_->get_state(proc_key);
-                auto previous = json_to_processes(prev_json);
+                if (proc_poll_seed_pending_) {
+                    // A previous stream-fallback seed failed: re-seed the baseline
+                    // without diffing (no ghost `started` for every process).
+                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                        spdlog::error("TAR: process poll-baseline re-seed failed");
+                        ctx.write_output("error|process state_save_failed");
+                        note_health("process", "state_save_failed");
+                        return 1;
+                    }
+                    proc_poll_seed_pending_ = false;
+                    note_health("process", "baseline");
+                } else {
+                    auto prev_json = db_->get_state(proc_key);
+                    auto previous = json_to_processes(prev_json);
 
-                auto typed =
-                    yuzu::tar::compute_process_events(previous, current, ts, snap_id, redaction);
-                if (!typed.empty()) {
-                    if (!db_->insert_process_events(typed)) {
-                        spdlog::error("TAR: failed to insert process events, skipping state save");
-                        ctx.write_output("error|process insert failed");
+                    auto typed = yuzu::tar::compute_process_events(previous, current, ts, snap_id,
+                                                                   redaction);
+                    // Events + baseline commit in ONE transaction (#1654): a failed
+                    // baseline save can no longer leave events durable with a stale
+                    // baseline that the next tick would re-diff and double-emit.
+                    const std::string state_json = processes_to_json(current).dump();
+                    const bool ok =
+                        typed.empty()
+                            ? db_->set_state(proc_key, state_json)
+                            : db_->insert_process_events(
+                                  typed, yuzu::tar::StateWrite{proc_key, state_json});
+                    if (!ok) {
+                        const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                        spdlog::error("TAR: process poll {} — nothing persisted, next tick "
+                                      "re-diffs",
+                                      tok);
+                        ctx.write_output(typed.empty() ? "error|process state_save_failed"
+                                                       : "error|process insert failed");
+                        note_health("process", tok);
                         return 1;
                     }
                     total_events += static_cast<int>(typed.size());
+                    note_health("process", "events_recorded");
                 }
-
-                db_->set_state(proc_key, processes_to_json(current).dump());
             }
+        } else {
+            note_health("process", "source_disabled");
+        }
+
+        // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
+        // feeders above have had their chance to insert this tick (the
+        // gap-free stream branch or the snapshot-diff poll branch -- they are
+        // mutually exclusive per tick; the one-time boot-backfill, the third
+        // feeder, always runs at init, strictly before any fast tick can
+        // reach here). Still under collect_mu_ (this whole function runs
+        // under the caller's lock_guard). Gates itself on usage_enabled AND
+        // process_enabled, and on the lifecycle state internally -- a
+        // disabled or not-yet-baselined source is not a failure.
+        if (auto fold = yuzu::tar::usage::run_usage_fold(*db_, ts); !fold.ok) {
+            note_health("usage", "insert_failed");
+            if (ts - usage_last_fold_warn_ts_ >= 60) {
+                spdlog::warn("TAR: usage fold failed this tick ({}) -- hwm unchanged, retrying "
+                            "next tick",
+                            fold.error);
+                usage_last_fold_warn_ts_ = ts;
+            }
+        } else {
+            note_health("usage", source_enabled(*db_, "usage") ? "events_recorded"
+                                                               : "source_disabled");
         }
 
         // Network diff
@@ -1036,20 +1556,215 @@ private:
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
+
+            // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
+            // when the plugin's NstatClient is live and system-wide — its
+            // SRC_ADDED/SRC_REMOVED stream drains straight into network_live
+            // below, gap-free, mirroring the ES process-stream discipline
+            // above. enumerate_connections() (the proc_pidfdinfo poll, called
+            // unconditionally above regardless of platform) stays the
+            // FALLBACK + SEED: a not-running/stalled client self-heals onto
+            // the ordinary poll diff below with no silent loss. UDP has no
+            // nstat provider, so it is ALWAYS diffed via the poll, never
+            // routed through nstat.
+            bool nstat_primary = nstat_client_ && nstat_client_->running() &&
+                                 nstat_client_->system_wide() && !nstat_client_->stalled();
+
+            // #1846 M2: a failed nstat lifecycle insert this tick must win over
+            // a later successful poll-leg write when the tcp source's single
+            // terminal health token is recorded below (tcp_tick_status).
+            bool nstat_insert_failed = false;
+
+            // HIGH-3: maps a batch of drained lifecycle events into
+            // NetworkEvent rows, prepends anything held over from a prior
+            // failed insert (mirrors pending_stream_evs_/pending_module_evs_
+            // above), and inserts. On success the pending queue is cleared;
+            // on FAILURE the whole (already-typed) batch is retained,
+            // bounded, for a retry next tick — the previous behavior only
+            // logged "dropped this tick" and lost the batch for good.
+            auto persist_nstat_flow_events =
+                [&](std::vector<yuzu::tar::NstatFlowEvent> flow_events) {
+                    std::vector<yuzu::tar::NetworkEvent> typed;
+                    typed.reserve(flow_events.size());
+                    for (const auto& e : flow_events) {
+                        yuzu::tar::NetworkEvent ev;
+                        ev.ts = e.ts_unix;
+                        ev.snapshot_id = snap_id;
+                        ev.action = e.is_open ? "connected" : "disconnected";
+                        ev.proto = e.proto;
+                        ev.local_addr = e.local_addr;
+                        ev.local_port = e.local_port;
+                        ev.remote_addr = e.remote_addr;
+                        // nstat is a lifecycle event stream, not the
+                        // DNS-resolving poll (resolve_hostnames) —
+                        // remote_host stays empty, the same simplification
+                        // the ES process stream makes for cmdline.
+                        ev.remote_port = e.remote_port;
+                        // nstat's ADDED/REMOVED messages carry no TCP state
+                        // enum (only SRC_DESC's counters do, and only once
+                        // resolved) — ESTABLISHED/CLOSED is the honest
+                        // best-effort label for "flow just appeared" / "flow
+                        // just vanished" from the kernel's source table.
+                        ev.state = e.is_open ? "ESTABLISHED" : "CLOSED";
+                        ev.pid = e.pid;
+                        ev.process_name = e.process_name;
+                        typed.push_back(std::move(ev));
+                    }
+                    if (!pending_nstat_evs_.empty()) {
+                        typed.insert(typed.begin(),
+                                     std::make_move_iterator(pending_nstat_evs_.begin()),
+                                     std::make_move_iterator(pending_nstat_evs_.end()));
+                        pending_nstat_evs_.clear();
+                    }
+                    if (typed.empty())
+                        return;
+                    if (!db_->insert_network_events(typed)) {
+                        spdlog::error("TAR: nstat tcp lifecycle insert failed — re-queuing "
+                                      "{} events for the next tick",
+                                      typed.size());
+                        nstat_insert_failed = true;
+                        pending_nstat_evs_ = std::move(typed);
+                        if (pending_nstat_evs_.size() > kPendingStreamCap) {
+                            const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
+                                                     pending_nstat_evs_.begin() +
+                                                         static_cast<std::ptrdiff_t>(excess));
+                        }
+                    } else {
+                        total_events += static_cast<int>(typed.size());
+                    }
+                };
+
+            if (nstat_primary) {
+                persist_nstat_flow_events(nstat_client_->drain());
+                if (auto d = nstat_client_->dropped(); d > last_nstat_dropped_) {
+                    spdlog::warn("TAR: nstat lifecycle ring overflow — {} dropped (+{} since "
+                                 "last drain)",
+                                 d, d - last_nstat_dropped_);
+                    last_nstat_dropped_ = d;
+                }
+            } else if (nstat_tcp_primary_prev_ && nstat_client_) {
+                // HIGH-5: a stream-death/stall transition — nstat owned the
+                // tcp lifecycle LAST tick but is not primary THIS tick
+                // (running() self-detected the reader thread's death,
+                // system_wide() dropped, or stalled() tripped). drain() only
+                // needs the ring, not running(), so it can still hold events
+                // the reader buffered before it died; draining BEFORE
+                // seeding the poll's diff baseline below mirrors the process
+                // stream precedent of draining the ring before checking
+                // running() (see the "process" leg above) rather than
+                // abandoning a still-populated ring. A layout_mismatch()
+                // means our transcribed wire layout disagreed with this
+                // kernel, so the buffered bytes are untrustworthy and must
+                // be discarded, never persisted; the self-heal
+                // baseline-priming below (nstat_tcp_primary_prev_) applies
+                // either way.
+                if (!nstat_client_->layout_mismatch()) {
+                    persist_nstat_flow_events(nstat_client_->drain());
+                } else {
+                    // Discard, never persist: a layout mismatch is permanent
+                    // for this client's remaining session (running() stays
+                    // false — no future tick can ever become nstat_primary
+                    // again to retry a queued batch), so also drop any
+                    // already-typed pending_nstat_evs_ from an earlier failed
+                    // insert rather than let it sit stuck-forever bounded.
+                    nstat_client_->drain(); // discard — untrustworthy bytes
+                    pending_nstat_evs_.clear();
+                    spdlog::warn("TAR: nstat layout mismatch on stream death — discarding "
+                                 "the buffered tcp lifecycle ring");
+                }
+            } else if (!pending_nstat_evs_.empty() && nstat_client_) {
+                // R2-2: a poll-only steady-state tick (nstat never became
+                // primary again after a fallback) must still retry a stranded
+                // insert-retry backlog — a batch requeued on the one transition
+                // tick would otherwise sit in memory until disable/shutdown,
+                // since neither branch above runs once nstat_tcp_primary_prev_
+                // has flipped false. Mirrors pending_stream_evs_ being retried
+                // on every process tick.
+                persist_nstat_flow_events({});
+            }
+
             auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
-            auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_network_events(typed)) {
-                    spdlog::error("TAR: failed to insert network events, skipping state save");
-                    ctx.write_output("error|network insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
+            const std::vector<yuzu::tar::NetConnection>* diff_current = &current;
+            const std::vector<yuzu::tar::NetConnection>* diff_previous = &previous;
+            std::vector<yuzu::tar::NetConnection> udp_current;
+            std::vector<yuzu::tar::NetConnection> udp_previous;
+            auto is_tcp = [](const yuzu::tar::NetConnection& c) {
+                return c.proto == "tcp" || c.proto == "tcp6";
+            };
+            if (nstat_primary) {
+                // TCP already handled above via the nstat drain — diff the
+                // poll for UDP only so the same open/close is never recorded
+                // twice.
+                udp_current = current;
+                udp_previous = previous;
+                std::erase_if(udp_current, is_tcp);
+                std::erase_if(udp_previous, is_tcp);
+                diff_current = &udp_current;
+                diff_previous = &udp_previous;
+            } else if (nstat_tcp_primary_prev_) {
+                // Falling back from nstat to the poll THIS tick: `previous`
+                // only carries udp (nstat owned tcp lifecycle last tick), so
+                // diffing it against the full current snapshot would
+                // misreport every already-open tcp connection as a fresh
+                // "connected" — a self-heal artifact, not a real event.
+                // Prime the baseline with the full current snapshot instead
+                // (zero diff this tick), mirroring the process stream's
+                // self-heal seeding above.
+                diff_previous = &current;
             }
+            // `nstat_tcp_primary_prev_` shadows the stored baseline's shape, so it
+            // advances only after the events + baseline commit (below): a rolled
+            // back fallback tick must re-prime next tick, not diff a udp-only
+            // baseline against the full snapshot (#1654).
 
-            db_->set_state(net_key, connections_to_json(current).dump());
+            auto typed = yuzu::tar::compute_network_events(*diff_previous, *diff_current, ts, snap_id);
+
+            // While nstat is primary, persist the udp-only view so the next
+            // tick's poll diff stays apples-to-apples (never mistakes
+            // nstat-owned tcp state for a poll-observed disconnect);
+            // otherwise persist the full snapshot as before (the poll owns
+            // both protocols). Events + baseline commit in ONE transaction.
+            const std::string state_json =
+                connections_to_json(nstat_primary ? *diff_current : current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state(net_key, state_json)
+                                : db_->insert_network_events(
+                                      typed, yuzu::tar::StateWrite{net_key, state_json});
+            if (!ok) {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: network {} — nothing persisted, next tick re-diffs", tok);
+                ctx.write_output(typed.empty() ? "error|network state_save_failed"
+                                               : "error|network insert failed");
+                // A failed nstat lifecycle insert earlier this tick takes
+                // precedence over this leg's own outcome, so it is never
+                // silently overwritten (#1846 M2).
+                note_health("tcp", yuzu::tar::tcp_tick_status(nstat_insert_failed, tok));
+                return 1;
+            }
+            nstat_tcp_primary_prev_ = nstat_primary;
+            total_events += static_cast<int>(typed.size());
+            note_health("tcp", yuzu::tar::tcp_tick_status(nstat_insert_failed, "events_recorded"));
+        } else if (nstat_client_) {
+            note_health("tcp", "source_disabled");
+            // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat
+            // client keeps its reader thread running and filling its ring
+            // even while the `tcp` source is disabled (the whole block above
+            // is skipped, so nothing here would otherwise touch it), unlike
+            // the poll which simply stops enumerating. Drain-and-DISCARD
+            // each disabled tick so the paused window is never inserted on
+            // re-enable — mirrors the process/module stream drain-and-discard
+            // contract above (tar_plugin.cpp process/module leg comments).
+            // Drop any pre-disable insert-retry backlog too. The client
+            // itself stays running (it also feeds netqual, which has its own
+            // independent enable gate below) — only the lifecycle ring is
+            // discarded here.
+            nstat_client_->drain();
+            pending_nstat_evs_.clear();
+        } else {
+            note_health("tcp", "source_disabled");
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -1074,33 +1789,78 @@ private:
                 // committed, so returning 1 here would misreport a healthy cycle
                 // as failed (and suppress the events_recorded line the server
                 // reads for retention-pause detection). Log and skip instead.
-                if (db_->insert_netqual_samples(rows))
+                if (db_->insert_netqual_samples(rows)) {
                     total_events += static_cast<int>(rows.size());
-                else
+                    note_health("netqual", "sample_recorded");
+                } else {
                     spdlog::error("TAR: netqual insert failed this tick (skipped)");
+                    note_health("netqual", "insert_failed");
+                }
+            } else {
+                note_health("netqual", "sample_recorded");
             }
+        } else {
+            note_health("netqual", "source_disabled");
         }
 
         // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
-        // source_enabled returns false until an operator turns it on. Windows-only
-        // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
+        // source_enabled returns false until an operator turns it on. Implemented
+        // on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
+        // for the platform-specific field constraints. Non-fatal on insert
         // failure — the always-on legs above already committed, so a failure here
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
         // success so a failed insert retries the same deltas next tick.
+        //
+        // enumerate_arp() throws when the platform capture didn't genuinely
+        // complete (sysctl/procfs/GetIpNetTable2 read failure, a kernel-
+        // truncated parse, or the kArpEntryCap reached before the whole table
+        // was consumed -- tar_arp_collector.cpp / tar_capture_status.hpp). A
+        // partial ARP table must never be diffed against the last COMPLETE
+        // snapshot (it would manufacture false appeared/removed forensic
+        // events) or replace it as the new baseline -- same
+        // collect-or-retain contract as the service/mapdrive legs below.
+        // arp_pre, when supplied, carries the OUTCOME of a precollection
+        // attempt (nullopt if that threw -- do_collect_fast), not just the
+        // entries.
         if (source_enabled(*db_, "arp")) {
-            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
-            auto previous = json_to_arp(db_->get_state("arp"));
-            auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_arp_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+            std::optional<std::vector<yuzu::tar::ArpEntry>> current;
+            if (arp_pre) {
+                current = std::move(*arp_pre);
+            } else {
+                auto res = yuzu::tar::collect_or_retain(
+                    [] { return yuzu::tar::enumerate_arp(); });
+                current = std::move(res.current);
+                if (!current) {
+                    spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                                 res.skip_reason);
+                    if (skipped_sources)
+                        skipped_sources->push_back("arp");
+                }
             }
-            if (ok)
-                db_->set_state("arp", arp_to_json(current).dump());
+            if (current) {
+                auto previous = json_to_arp(db_->get_state("arp"));
+                auto typed = yuzu::tar::compute_arp_events(previous, *current, ts, snap_id);
+                // Events + baseline in one transaction (#1654); non-fatal, so a
+                // failure emits no `error|` line (the tick's events_recorded
+                // contract holds) and the ledger records the token.
+                const std::string state_json = arp_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state("arp", state_json)
+                                    : db_->insert_arp_events(
+                                          typed, yuzu::tar::StateWrite{"arp", state_json});
+                if (ok) {
+                    total_events += static_cast<int>(typed.size());
+                    note_health("arp", "events_recorded");
+                } else {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: arp {} this tick (nothing persisted)", tok);
+                    note_health("arp", tok);
+                }
+            } else {
+                note_health("arp", "capture_incomplete");
+            }
+        } else {
+            note_health("arp", "source_disabled");
         }
 
         // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
@@ -1110,16 +1870,21 @@ private:
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::tar::enumerate_dns();
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::tar::compute_dns_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_dns_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: dns insert failed this tick (state not advanced)");
+            const std::string state_json = dns_to_json(current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state("dns", state_json)
+                                : db_->insert_dns_events(
+                                      typed, yuzu::tar::StateWrite{"dns", state_json});
+            if (ok) {
+                total_events += static_cast<int>(typed.size());
+                note_health("dns", "events_recorded");
+            } else {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: dns {} this tick (nothing persisted)", tok);
+                note_health("dns", tok);
             }
-            if (ok)
-                db_->set_state("dns", dns_to_json(current).dump());
+        } else {
+            note_health("dns", "source_disabled");
         }
 
         // M2: module/image loads (Windows ETW). OPT-IN (module_enabled, default
@@ -1144,6 +1909,7 @@ private:
         if (!module_enabled) {
             module_start_failed_ = false; // re-enable should retry a previously-failed start
         }
+        const char* module_tok = nullptr; // ledger token for this tick (see below)
         if (module_stream_active_ && !module_enabled) {
             // Disabled mid-run (a true→false toggle): drain-and-discard so the
             // paused window is never stored, keeping the session warm. Mirrors
@@ -1151,6 +1917,7 @@ private:
             module_stream_->drain();
             pending_module_evs_.clear();
         } else if (module_stream_active_ && module_enabled) {
+            module_tok = "events_recorded";
             // drain() resolves signing (cached) and redacts module_dir off the
             // ETW thread, so events arrive fully populated + privacy-scrubbed.
             auto mevs = module_stream_->drain();
@@ -1182,6 +1949,7 @@ private:
                     // OPT-IN source: like netqual, do NOT fail the whole tick (the
                     // always-on legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
+                    module_tok = "insert_failed";
                     spdlog::error("TAR: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -1210,6 +1978,17 @@ private:
             }
         }
 
+        if (!module_enabled) {
+            module_tok = "source_disabled";
+        } else if (!module_tok) {
+            const auto st = yuzu::tar::os_support_status("module", yuzu::tar::current_platform_os());
+            module_tok = (st == yuzu::tar::OsSupportStatus::kSupported ||
+                          st == yuzu::tar::OsSupportStatus::kSupportedConstrained)
+                             ? "capture_incomplete"
+                             : "unsupported_platform";
+        }
+        note_health("module", module_tok);
+
         ctx.write_output(std::format("tar|collect_fast|{}|events_recorded", total_events));
         return 0;
     }
@@ -1227,22 +2006,35 @@ private:
         // Windows ESTATS pass is a per-connection enable+read syscall sweep, so
         // it pre-collects lock-free with arp/dns.
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // arp: precollected through collect_or_retain into an OPTIONAL (not a
+        // bare vector) so enumerate_arp()'s incomplete-capture throw (read
+        // failure / kernel-truncated parse / entry-cap reached --
+        // tar_arp_collector.cpp) is preserved as nullopt through this layer,
+        // rather than collapsing to an empty vector collect_fast_impl could
+        // not tell apart from a genuinely empty ARP table (BR-001, round 2).
+        // Isolated in its own try (via collect_or_retain) so an ARP failure
+        // does not also discard the independent dns/netqual precollection
+        // below.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre)
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }
@@ -1269,13 +2061,18 @@ private:
     int do_collect_perf(yuzu::CommandContext& ctx) {
         int rc = 0;
         if (!source_enabled(*db_, "perf")) {
+            note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_perf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
         } else {
             const auto cur = yuzu::tar::read_perf_counters(); // syscalls, no lock held
             if (!cur.valid) {
-                ctx.write_output(std::format("tar|collect_perf|0|{}",
-                                             yuzu::tar::kCollectStatusUnsupportedPlatform));
+                // counters_unavailable on an OS whose registry row says a perf
+                // collector exists; unsupported_platform where none does (#1846).
+                const auto tok = yuzu::tar::read_failure_token(
+                    yuzu::tar::os_support_status("perf", yuzu::tar::current_platform_os()));
+                note_health("perf", tok);
+                ctx.write_output(std::format("tar|collect_perf|0|{}", tok));
             } else {
                 bool perf_enabled_now = true;
                 yuzu::tar::PerfSample sample;
@@ -1293,9 +2090,11 @@ private:
                     }
                 }
                 if (!perf_enabled_now) {
+                    note_health("perf", yuzu::tar::kCollectStatusSourceDisabled);
                     ctx.write_output(std::format("tar|collect_perf|0|{}",
                                                  yuzu::tar::kCollectStatusSourceDisabled));
                 } else if (!sample.valid) {
+                    note_health("perf", yuzu::tar::kCollectStatusBaseline);
                     ctx.write_output(std::format("tar|collect_perf|0|{}",
                                                  yuzu::tar::kCollectStatusBaseline));
                 } else {
@@ -1312,9 +2111,11 @@ private:
                     row.net_rx_bps = sample.net_rx_bps;
                     row.net_tx_bps = sample.net_tx_bps;
                     if (!db_->insert_perf_sample(row)) {
+                        note_health("perf", "insert_failed");
                         ctx.write_output("error|perf insert failed");
                         rc = 1;
                     } else {
+                        note_health("perf", yuzu::tar::kCollectStatusSampleRecorded);
                         ctx.write_output(std::format("tar|collect_perf|1|{}",
                                                      yuzu::tar::kCollectStatusSampleRecorded));
                     }
@@ -1333,16 +2134,21 @@ private:
         // defaults missing keys to enabled). See docs/dex-brd-coverage.md and
         // memory project-telemetry-privacy-works-council.
         if (db_->get_config("procperf_enabled", "false") != "true") {
+            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         auto proc_cur = yuzu::tar::read_proc_counters(); // one snapshot, no lock held
         if (!proc_cur.valid) {
-            ctx.write_output(std::format("tar|collect_procperf|0|{}",
-                                         yuzu::tar::kCollectStatusUnsupportedPlatform));
+            const auto tok = yuzu::tar::read_failure_token(
+                yuzu::tar::os_support_status("procperf", yuzu::tar::current_platform_os()));
+            note_health("procperf", tok);
+            ctx.write_output(std::format("tar|collect_procperf|0|{}", tok));
             return rc;
         }
+        procperf_procs_seen_.store(static_cast<int64_t>(proc_cur.procs.size()),
+                                   std::memory_order_relaxed);
         const auto ts = proc_cur.ts_epoch; // before the move; never read prev_proc_ unlocked
         const auto redaction = load_redaction_patterns(*db_);
         bool procperf_enabled_now = true;
@@ -1361,11 +2167,13 @@ private:
             }
         }
         if (!procperf_enabled_now) {
+            note_health("procperf", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusSourceDisabled));
             return rc;
         }
         if (samples.empty()) {
+            note_health("procperf", yuzu::tar::kCollectStatusBaseline);
             ctx.write_output(std::format("tar|collect_procperf|0|{}",
                                          yuzu::tar::kCollectStatusBaseline));
             return rc;
@@ -1389,12 +2197,15 @@ private:
             r.instances = s.instances;
             r.cpu_pct = s.cpu_pct;
             r.ws_bytes = s.ws_bytes;
+            r.is_kthread = s.is_kthread;
             rows.push_back(std::move(r));
         }
         if (!db_->insert_proc_perf_samples(rows)) {
+            note_health("procperf", "insert_failed");
             ctx.write_output("error|procperf insert failed");
             return 1;
         }
+        note_health("procperf", yuzu::tar::kCollectStatusAppsRecorded);
         ctx.write_output(std::format("tar|collect_procperf|{}|{}", rows.size(),
                                      yuzu::tar::kCollectStatusAppsRecorded));
         return rc;
@@ -1402,29 +2213,62 @@ private:
 
     // ── collect_slow: services + users ────────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_slow_impl(yuzu::CommandContext& ctx) {
+    // skipped_sources: see collect_fast_impl's parameter doc above -- service
+    // and mapdrive are BOTH collected entirely inside this function (no
+    // outer precollection stage like arp/dns/netqual has), so this is the
+    // only place their collect_or_retain skip can be recorded for do_snapshot.
+    int collect_slow_impl(yuzu::CommandContext& ctx,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         int total_events = 0;
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
-            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
-            auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state(svc_key);
-            auto previous = json_to_services(prev_json);
+            // enumerate_services() throws when the underlying capture (systemctl/
+            // launchctl via run_bounded_subprocess) didn't genuinely complete --
+            // spawn failure, deadline, output-cap truncation, or non-zero exit
+            // (tar_service_collector.cpp, tar_capture_status.hpp). A partial
+            // service list must never be diffed against the last COMPLETE
+            // snapshot (it would manufacture false stopped/started events) or
+            // replace it as the new baseline -- so on a throw, skip this tick's
+            // diff and state-advance entirely and retry next tick, exactly the
+            // same "leave state untouched, retry" contract already used for the
+            // mapdrive historical backfill (init(), enumerate_mapdrive_history).
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_services(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("TAR: service snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("service");
+                note_health("service", "capture_incomplete");
+            }
+            if (current) {
+                const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
+                auto prev_json = db_->get_state(svc_key);
+                auto previous = json_to_services(prev_json);
 
-            auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_service_events(typed)) {
-                    spdlog::error("TAR: failed to insert service events, skipping state save");
-                    ctx.write_output("error|service insert failed");
+                auto typed = yuzu::tar::compute_service_events(previous, *current, ts, snap_id);
+                // Events + baseline in ONE transaction (#1654).
+                const std::string state_json = services_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state(svc_key, state_json)
+                                    : db_->insert_service_events(
+                                          typed, yuzu::tar::StateWrite{svc_key, state_json});
+                if (!ok) {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: service {} — nothing persisted, next tick re-diffs", tok);
+                    ctx.write_output(typed.empty() ? "error|service state_save_failed"
+                                                   : "error|service insert failed");
+                    note_health("service", tok);
                     return 1;
                 }
                 total_events += static_cast<int>(typed.size());
+                note_health("service", "events_recorded");
             }
-
-            db_->set_state(svc_key, services_to_json(current).dump());
+        } else {
+            note_health("service", "source_disabled");
         }
 
         // User diff
@@ -1435,16 +2279,24 @@ private:
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_user_events(typed)) {
-                    spdlog::error("TAR: failed to insert user events, skipping state save");
-                    ctx.write_output("error|user insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
+            // Events + baseline in ONE transaction (#1654).
+            const std::string state_json = users_to_json(current).dump();
+            const bool ok = typed.empty()
+                                ? db_->set_state(usr_key, state_json)
+                                : db_->insert_user_events(
+                                      typed, yuzu::tar::StateWrite{usr_key, state_json});
+            if (!ok) {
+                const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: user {} — nothing persisted, next tick re-diffs", tok);
+                ctx.write_output(typed.empty() ? "error|user state_save_failed"
+                                               : "error|user insert failed");
+                note_health("user", tok);
+                return 1;
             }
-
-            db_->set_state(usr_key, users_to_json(current).dump());
+            total_events += static_cast<int>(typed.size());
+            note_health("user", "events_recorded");
+        } else {
+            note_health("user", "source_disabled");
         }
 
         // netconn: OS-logged connectivity transitions (ADR-0020). OPT-IN with an
@@ -1479,6 +2331,7 @@ private:
                 // Empty/backward window (lookback 0 forward-only, or clock skew):
                 // read nothing, but advance the hwm so forward reads begin.
                 db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                note_health("netconn", "baseline");
             } else {
                 auto rows = yuzu::tar::backfill_netconn_events(plan.from, plan.to);
                 for (auto& r : rows)
@@ -1487,13 +2340,18 @@ private:
                     // Nothing in the window (or channels missing) — still advance
                     // so the next tick doesn't re-scan the same empty window.
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
+                    note_health("netconn", "events_recorded");
                 } else if (db_->insert_netconn_events(rows)) {
                     db_->set_config("netconn_backfill_hwm", std::to_string(plan.hwm));
                     total_events += static_cast<int>(rows.size());
+                    note_health("netconn", "events_recorded");
                 } else {
                     spdlog::error("TAR: netconn insert failed this tick (skipped)");
+                    note_health("netconn", "insert_failed");
                 }
             }
+        } else {
+            note_health("netconn", "source_disabled");
         }
 
         // §3.8 — mapped-drive diff (both directions). Opt-in (default_enabled=false),
@@ -1504,20 +2362,179 @@ private:
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
         if (source_enabled(*db_, "mapdrive")) {
-            const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
-            auto current = yuzu::tar::enumerate_mapdrive();
-            auto previous = json_to_mapdrive(db_->get_state(md_key));
-            auto typed = yuzu::tar::compute_mapdrive_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_mapdrive_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+            // enumerate_mapdrive() throws when its underlying LIVE capture
+            // didn't genuinely complete -- WNet/NetSessionEnum on Windows,
+            // /proc/mounts/smbstatus on Linux, or on macOS a getfsstat(2)
+            // failure/over-cap snapshot (tar_mapdrive_collector.cpp, BR-002
+            // round 2) -- same contract as enumerate_services() above.
+            // (wevtutil/journalctl are used only by the SEPARATE one-time
+            // enumerate_mapdrive_history() backfill, not this live path --
+            // BR4-007, round 4: an earlier version of this comment named
+            // them here and could mislead a reader auditing live
+            // completeness into thinking the live WNet/procfs legs were
+            // history-tool-guarded too.) Skip the whole tick's
+            // diff/state-advance on a throw rather than diff a partial snapshot
+            // against the last COMPLETE one.
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_mapdrive(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("TAR: mapdrive snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("mapdrive");
+                note_health("mapdrive", "capture_incomplete");
             }
-            if (ok)
-                db_->set_state(md_key, mapdrive_to_json(current).dump());
+            if (current) {
+                const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
+                auto previous = json_to_mapdrive(db_->get_state(md_key));
+                auto typed = yuzu::tar::compute_mapdrive_events(previous, *current, ts, snap_id);
+                const std::string state_json = mapdrive_to_json(*current).dump();
+                const bool ok = typed.empty()
+                                    ? db_->set_state(md_key, state_json)
+                                    : db_->insert_mapdrive_events(
+                                          typed, yuzu::tar::StateWrite{md_key, state_json});
+                if (ok) {
+                    total_events += static_cast<int>(typed.size());
+                    note_health("mapdrive", "events_recorded");
+                } else {
+                    const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
+                    spdlog::error("TAR: mapdrive {} this tick (nothing persisted)", tok);
+                    note_health("mapdrive", tok);
+                }
+            }
+        } else {
+            note_health("mapdrive", "source_disabled");
+        }
+
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Generic driver over every constructed cursor source -- empty this
+        // wave (make_cursor_sources() returns {}), so this loop is a no-op
+        // until the wave-2 integrator adds the two push_backs; nothing else
+        // in tar_plugin.cpp needs to change when it does. Honours
+        // `<name>_enabled` the same way every other source above does
+        // (registry default via source_enabled -- power/removable default
+        // TRUE per the Alex ruling, tar_schema_registry.cpp).
+        for (auto& src : cursor_sources_) {
+            const std::string src_name = src->name();
+            if (!source_enabled(*db_, src_name)) {
+                note_health(src_name, yuzu::tar::kCollectStatusSourceDisabled);
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusSourceDisabled));
+                continue;
+            }
+            auto cursor_read = db_->get_cursor(src_name);
+            if (!cursor_read) {
+                // The cursor could not be READ. That is a transient failure of
+                // the store, not evidence about this source, so rule 1 applies:
+                // retain the cursor exactly as last written and skip the tick.
+                // Passing nullopt through would tell the source it had never
+                // run, and it would re-baseline forward -- skipping everything
+                // between the durable cursor and now, with no capture_gap.
+                spdlog::warn("TAR: {} cursor read failed ({}) -- retaining cursor, skipping tick",
+                            src_name, cursor_read.error());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+                continue;
+            }
+            const auto& cursor = *cursor_read;
+            try {
+                // The source persists its own events+cursor atomically via
+                // insert_power_events_and_cursor / insert_removable_events_
+                // and_cursor (tar_db.hpp) from inside collect() -- this
+                // driver only orchestrates the enable gate, cursor load, the
+                // transient-failure skip (rule 1), and the status line.
+                auto result = src->collect(*db_, cursor);
+                total_events += static_cast<int>(result.events_emitted);
+                std::string_view token;
+                switch (result.outcome) {
+                case yuzu::tar::CursorOutcome::Baseline:
+                    token = yuzu::tar::kCollectStatusBaseline;
+                    break;
+                case yuzu::tar::CursorOutcome::Advanced:
+                    token = yuzu::tar::kCollectStatusCursorAdvanced;
+                    break;
+                case yuzu::tar::CursorOutcome::CursorLost:
+                    token = yuzu::tar::kCollectStatusCursorLost;
+                    break;
+                }
+                // S1: a heartbeat an operator can alert on. `live_rows == 0` is
+                // ambiguous -- a healthy quiet source and a wedged one look the
+                // same -- so record WHEN this source last completed a tick.
+                // Staleness relative to slow_interval is then an expressible
+                // alert, which absence never was.
+                note_health(src_name, token);
+                db_->set_config(std::string(src_name) + "_last_collect_ts",
+                                std::to_string(now_epoch_seconds()));
+                ctx.write_output(std::format("tar|collect_{}|{}|{}", src_name,
+                                             result.events_emitted, token));
+            } catch (const yuzu::tar::IncompleteCaptureError& e) {
+                // Rule 1: a transient read failure. The source must not have
+                // persisted anything on this path, so the cursor stays
+                // exactly as last written -- skip this tick's status/persist
+                // entirely, same collect_or_retain skip-and-retain contract
+                // as service/mapdrive above (tar_capture_status.hpp:187).
+                spdlog::warn("TAR: {} cursor collect incomplete ({}) -- retaining cursor",
+                            src_name, e.what());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            } catch (const std::exception& e) {
+                // ABI containment. The SDK's execute trampoline
+                // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
+                // no try/catch of its own, so ANY exception that escapes here
+                // crosses it and std::terminate()s the whole agent -- and TAR
+                // is in-process and default-on, so that is the agent, not just
+                // this plugin. A collector is REQUIRED to map its failures to
+                // IncompleteCaptureError or CursorLost (tar_cursor.hpp rules 1
+                // and 2), but rule 2 names "the cursor JSON fails to parse" as
+                // a first-class outcome and nlohmann::json throws by default,
+                // so the single most likely consumer mistake is exactly the one
+                // that would take the process down. Contain it and lose the
+                // tick instead. Same reasoning as start()'s guard above and the
+                // dns/netqual pre-collection stage's catch (...).
+                spdlog::error("TAR: {} cursor collect threw ({}) -- source skipped this tick; "
+                              "a CursorSource must map failures to IncompleteCaptureError or "
+                              "CursorOutcome::CursorLost, never throw",
+                              src_name, e.what());
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            } catch (...) {
+                spdlog::error("TAR: {} cursor collect threw a non-std exception -- source "
+                              "skipped this tick", src_name);
+                note_health(src_name, yuzu::tar::kCollectStatusCaptureIncomplete);
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            }
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -1527,6 +2544,10 @@ private:
     }
 
     int do_collect_slow(yuzu::CommandContext& ctx) {
+        {
+            yuzu::PluginContext pctx{plugin_ctx_};
+            reconcile_db_health_publish(pctx);
+        }
         std::lock_guard lock(collect_mu_);
         return collect_slow_impl(ctx);
     }
@@ -1558,6 +2579,7 @@ private:
         db_->set_config("software_last_run_ts", std::to_string(ts));
 
         if (!source_enabled(*db_, "software")) {
+            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
@@ -1570,6 +2592,7 @@ private:
         // paused window nor re-seed a baseline after the disable cleared it
         // (mirrors the perf/procperf post-lock re-check).
         if (!source_enabled(*db_, "software")) {
+            note_health("software", yuzu::tar::kCollectStatusSourceDisabled);
             ctx.write_output("tar|collect_software|0|source_disabled");
             return 0;
         }
@@ -1592,24 +2615,41 @@ private:
         case Kind::kCorruptSkip:
             spdlog::error("TAR: software state is not a JSON array — skipping tick "
                           "(baseline preserved, not re-seeded)");
+            note_health("software", "state_unreadable");
             ctx.write_output("tar|collect_software|0|state_unreadable");
             return 0;
         case Kind::kColdStartSeed:
-            db_->set_state("software", result.new_state_json);
+            // Checked (#1654): on failure the next run re-detects the empty
+            // baseline and re-seeds, so nothing is emitted against a stale one.
+            if (!db_->set_state("software", result.new_state_json)) {
+                spdlog::error("TAR: software baseline seed failed");
+                note_health("software", "state_save_failed");
+                ctx.write_output("tar|collect_software|0|state_save_failed");
+                return 1;
+            }
+            note_health("software", "baseline_seeded");
             ctx.write_output("tar|collect_software|0|baseline_seeded");
             return 0;
-        case Kind::kSteady:
-            if (!result.events.empty()) {
-                if (!db_->insert_software_events(result.events)) {
-                    spdlog::error("TAR: failed to insert software events, skipping state save");
-                    ctx.write_output("error|software insert failed");
-                    return 1;
-                }
+        case Kind::kSteady: {
+            // Events + baseline in ONE transaction (#1654).
+            const bool ok = result.events.empty()
+                                ? db_->set_state("software", result.new_state_json)
+                                : db_->insert_software_events(
+                                      result.events,
+                                      yuzu::tar::StateWrite{"software", result.new_state_json});
+            if (!ok) {
+                const char* tok = result.events.empty() ? "state_save_failed" : "insert_failed";
+                spdlog::error("TAR: software {} — nothing persisted, next run re-diffs", tok);
+                ctx.write_output(result.events.empty() ? "error|software state_save_failed"
+                                                       : "error|software insert failed");
+                note_health("software", tok);
+                return 1;
             }
-            db_->set_state("software", result.new_state_json);
+            note_health("software", "events_recorded");
             ctx.write_output(
                 std::format("tar|collect_software|{}|events_recorded", result.events.size()));
             return 0;
+        }
         }
         return 0; // unreachable — switch is exhaustive over Kind
     }
@@ -1617,6 +2657,43 @@ private:
     // ── status action ─────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
+        // ALWAYS emitted, and first. With a closed store every getter below
+        // returns its default -- record_count 0, live_rows 0, and each source
+        // reporting its DEFAULT enabled state -- which reads as a healthy, empty
+        // database rather than a dead one. This action is the only operator- and
+        // agentic-readable surface the agent has (no /metrics), so that
+        // false-healthy report would be the whole signal (#2361 Gate 8).
+        const bool storage_ok = db_->is_open();
+        if (!storage_ok) {
+            // `error|` FIRST, before storage_state. The server-side consumers gate
+            // on `output.starts_with("error|")` (tar_tree_routes.cpp), and
+            // poll_command treats any non-empty output as success -- so leading
+            // with `storage_state|` made the dashboard fall through to the
+            // capture-sources renderer, which parses only `config|` lines. With
+            // none present it drew all ten sources blank: the one frame an
+            // operator opens to ask "why is this device's data missing" rendered
+            // identically to a healthy device (#2361 Gate 6, enterprise-readiness).
+            //
+            // Built by a free function in tar_status_format.hpp rather than
+            // inline, because the ORDER above is a contract with the server and
+            // TarPlugin is TU-local -- nothing could assert it here. See that
+            // header, and the test that pins `lines[0]` starting with `error|`.
+            for (const auto& line :
+                 yuzu::tar::format_storage_offline_lines(db_->query_engine_available()))
+                ctx.write_output(line);
+            return 1;
+        }
+        ctx.write_output("storage_state|ok");
+        {
+            // #1567: db_health|<ok|quarantined>|<epoch>. The epoch survives restarts
+            // (tar_config); "quarantined" is true only for the open that did it.
+            int64_t last_q = 0;
+            try {
+                last_q = std::stoll(db_->get_config("db_health_last_quarantine_epoch", "0"));
+            } catch (...) {}
+            const auto q = db_->quarantined_this_open();
+            ctx.write_output(yuzu::tar::format_db_health_line(q.has_value(), q ? *q : last_q));
+        }
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -1670,6 +2747,56 @@ private:
             }
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
         }
+        // Retention clock-guard declines, per warehouse table (#2361). The agent
+        // has no /metrics endpoint, so this action is the ONLY fleet-readable
+        // signal that an endpoint's clock moved in a way that would have wiped
+        // its forensic window - a `spdlog::warn` on an unattended endpoint is not
+        // an operator surface. Only tables with a non-zero count are emitted, so
+        // a healthy fleet pays two lines; both totals are always present.
+        // Per-table state is in-memory and resets on agent restart, deliberately,
+        // since a reboot re-declines anyway.
+        //
+        // Reads the guard's OWN mutex (inside format_retention_guard_lines), NOT
+        // rollup_mu_. Taking rollup_mu_ here would make the diagnostic an
+        // operator runs WHEN TAR IS MISBEHAVING block for a full rollup pass.
+        for (const auto& line : yuzu::tar::format_retention_guard_lines(retention_guard_))
+            ctx.write_output(line);
+
+        // Usage-fold health (run_usage_fold, tar_usage.cpp) — the derived
+        // process-pairing fold behind the app_usage plugin has no channel of
+        // its own out of tar.db: it is not a CursorSource and has no
+        // collector, so unlike every capture source above it was previously
+        // readable ONLY by the (not yet landed) single-target Forensics-
+        // gated `app_usage` plugin's own `summary` action. Emitted
+        // UNCONDITIONALLY, same key-always-present NFR-visibility contract
+        // as process/module/nstat above (no agent /metrics endpoint; `tar
+        // status` is the operator/agentic surface). `usage_lifecycle_state`
+        // is the one status line worth reading FIRST: "collecting" is the
+        // only state under which any of the counters below are currently
+        // advancing.
+        {
+            const char* lifecycle = "disabled";
+            switch (yuzu::tar::usage::usage_lifecycle_state(*db_)) {
+                case yuzu::tar::usage::LifecycleState::Disabled: lifecycle = "disabled"; break;
+                case yuzu::tar::usage::LifecycleState::PendingBaseline:
+                    lifecycle = "baseline_pending"; break;
+                case yuzu::tar::usage::LifecycleState::Active: lifecycle = "collecting"; break;
+            }
+            ctx.write_output(std::format("config|usage_lifecycle_state|{}", lifecycle));
+        }
+        ctx.write_output(
+            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
+        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
+                                     db_->get_config("usage_gap_lost_events", "0")));
+        ctx.write_output(
+            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
+        ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
+                                     db_->get_config("usage_expiry_declined_count", "0")));
+        ctx.write_output(std::format("config|usage_coverage_since|{}",
+                                     db_->get_config("usage_coverage_since", "-")));
+        ctx.write_output(
+            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
+
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
@@ -1723,10 +2850,36 @@ private:
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
 
+        // nstat (macOS tcp lifecycle) stream health — emitted UNCONDITIONALLY,
+        // same key-always-present NFR-visibility contract as the process/module
+        // streams above (there is no agent /metrics endpoint; tar.status is the
+        // operator/agentic surface, so ring-overflow / kernel-desync / flow-table
+        // growth must never be silent). All 0/false/"none" off-macOS or when no
+        // client. nstat_flow_table_size + nstat_flow_reaped are the observable
+        // signals of the bounded kernel-flow table (a lost SRC_REMOVED shows up
+        // as reaped, never as unbounded growth).
+        ctx.write_output(std::format("config|nstat_capture_method|{}",
+                                     nstat_client_ ? nstat_client_->method_name() : "none"));
+        ctx.write_output(std::format("config|nstat_stream_dropped|{}",
+                                     nstat_client_ ? nstat_client_->dropped() : 0));
+        ctx.write_output(std::format("config|nstat_stream_kernel_dropped|{}",
+                                     nstat_client_ ? nstat_client_->kernel_dropped() : 0));
+        ctx.write_output(std::format("config|nstat_flow_table_size|{}",
+                                     nstat_client_ ? nstat_client_->flow_table_size() : 0));
+        ctx.write_output(std::format("config|nstat_flow_reaped|{}",
+                                     nstat_client_ ? nstat_client_->flow_reaped() : 0));
+        ctx.write_output(std::format("config|nstat_stalled|{}",
+                                     (nstat_client_ && nstat_client_->stalled()) ? "true" : "false"));
+        ctx.write_output(
+            std::format("config|nstat_layout_mismatch|{}",
+                        (nstat_client_ && nstat_client_->layout_mismatch()) ? "true" : "false"));
+
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
         // active), "estats_pending" (Windows, gate not yet tested — or netqual
-        // off), "none" (Windows after the ACCESS_DENIED latch, macOS). Emitted
+        // off), "nstat" (macOS when the kctl client is live and system-wide),
+        // "none" (Windows after the ACCESS_DENIED latch; macOS unprivileged,
+        // layout-mismatch, or client down). Emitted
         // UNCONDITIONALLY (key-always-present contract, same as the process/
         // module keys above) so an operator can tell "netqual is on but the
         // agent can't collect" apart from "netqual is off".
@@ -1736,14 +2889,39 @@ private:
         // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
         // dependent path like process/module), so this reports the platform method
         // for parity with the other *_capture_method keys; the full per-OS matrix is
-        // in the `compatibility` action. "none" where the source is kPlanned.
+        // in the `compatibility` action. macOS reports "getfsstat" (outbound-live-only,
+        // constrained — see the mapdrive os_support row).
 #if defined(_WIN32)
         ctx.write_output("config|mapdrive_capture_method|wnet");
 #elif defined(__linux__)
         ctx.write_output("config|mapdrive_capture_method|procfs");
 #else
-        ctx.write_output("config|mapdrive_capture_method|none");
+        ctx.write_output("config|mapdrive_capture_method|getfsstat");
 #endif
+
+        // #1846(4): registry-derived perf capture method for the running OS
+        // ("none" when the OS has no perf collector), and (3) the process count of
+        // the last valid per-process counter snapshot.
+        {
+            const auto os = yuzu::tar::current_platform_os();
+            const auto st = yuzu::tar::os_support_status("perf", os);
+            const bool supported = st == yuzu::tar::OsSupportStatus::kSupported ||
+                                   st == yuzu::tar::OsSupportStatus::kSupportedConstrained;
+            ctx.write_output(std::format("config|perf_capture_method|{}",
+                                         supported ? yuzu::tar::supported_capture_method("perf", os)
+                                                   : std::string_view{"none"}));
+        }
+        ctx.write_output(std::format("config|procperf_procs_seen|{}",
+                                     procperf_procs_seen_.load(std::memory_order_relaxed)));
+
+        // #1846(2): per-source health ledger (process memory only; an agent
+        // restart resets every source to never_ran/0).
+        {
+            std::lock_guard hlock(health_mu_);
+            for (const auto& line :
+                 yuzu::tar::format_source_health_lines(health_, yuzu::tar::capture_sources()))
+                ctx.write_output(line);
+        }
         return 0;
     }
 
@@ -1753,25 +2931,14 @@ private:
     // on that platform and any known constraint. Pipe-delimited so the
     // existing dashboard renderer can show it as a table without a JSON
     // codec change.
+    // #2204: derived entirely from yuzu::tar::support_level_name(), the one
+    // place that maps the unified support-level enum to its operator-facing
+    // name — this function no longer keeps its own copy of that mapping.
     int do_compatibility(yuzu::CommandContext& ctx) {
         ctx.write_output("header|source|os|status|capture_method|notes");
         for (const auto& src : yuzu::tar::capture_sources()) {
             for (const auto& os : src.os_support) {
-                std::string_view status_str;
-                switch (os.status) {
-                case yuzu::tar::OsSupportStatus::kSupported:
-                    status_str = "supported";
-                    break;
-                case yuzu::tar::OsSupportStatus::kSupportedConstrained:
-                    status_str = "constrained";
-                    break;
-                case yuzu::tar::OsSupportStatus::kPlanned:
-                    status_str = "planned";
-                    break;
-                case yuzu::tar::OsSupportStatus::kUnsupported:
-                    status_str = "unsupported";
-                    break;
-                }
+                std::string_view status_str = yuzu::tar::support_level_name(os.status);
                 ctx.write_output(std::format("row|{}|{}|{}|{}|{}", src.name, os.os, status_str,
                                              os.capture_method, os.notes));
             }
@@ -2017,39 +3184,102 @@ private:
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // round 3 (B3-002): names of every enabled source classified
+        // incomplete this pass (arp/service/mapdrive) -- accumulated across
+        // the arp precollection below AND collect_slow_impl's service/
+        // mapdrive legs (collect_fast_impl's arp leg never adds to this: arp
+        // is always precollected here, so its own internal else-branch is
+        // unreachable for this caller). snapshot_result_line
+        // (tar_capture_status.hpp) turns this into the action's honest
+        // response -- the whole point being that a forced `snapshot` must
+        // never report "complete" while it silently skipped a source and
+        // left its baseline stale, which is exactly what happened before
+        // this round: the collect_*_impl return values were ignored and the
+        // action wrote "tar|snapshot|complete" unconditionally.
+        //
+        // round 4 (BR4-001): that fix covered only the collect_or_retain /
+        // IncompleteCaptureError skip path (arp/service/mapdrive). An
+        // ordinary persistence failure inside collect_fast_impl,
+        // collect_slow_impl, or do_collect_software (each already writes
+        // its own "error|... insert failed" line and returns 1) was still
+        // invisible here -- the three calls below were bare expression
+        // statements with their return values discarded, so the action
+        // still finished "tar|snapshot|complete" / rc 0 despite a failed
+        // write. fast_rc/slow_rc/software_rc capture those return codes;
+        // snapshot_phase_outcome (tar_capture_status.hpp) is the pure
+        // function deciding which phase names to add here and the action's
+        // own exit code, unit-tested directly since TarPlugin is
+        // translation-unit-local and cannot be exercised from
+        // tests/unit/*.cpp.
+        std::vector<std::string> skipped_sources;
+        // arp: same optional-through-collect_or_retain precollection as
+        // do_collect_fast, and for the identical reason (BR-001, round 2) --
+        // see that function's comment.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre) {
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                skipped_sources.push_back("arp");
+            }
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }
+        int fast_rc = 0;
+        int slow_rc = 0;
         {
             std::lock_guard lock(collect_mu_);
-            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
-                              netqual_on ? &netqual_pre : nullptr);
-            collect_slow_impl(ctx);
+            fast_rc = collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr,
+                                        dns_on ? &dns_pre : nullptr,
+                                        netqual_on ? &netqual_pre : nullptr, &skipped_sources);
+            slow_rc = collect_slow_impl(ctx, &skipped_sources);
         }
         // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
         // so collect it as a SEPARATE step after the collect_mu_ scope closes —
         // preserving the collect_mu_ ≺ software_collect_mu_ lock order. It self-gates
         // on source_enabled("software"), so a disabled source is a no-op. The manual
         // promises `snapshot` collects all enabled capture sources (#1620).
-        do_collect_software(ctx);
-        ctx.write_output("tar|snapshot|complete");
-        return 0;
+        const int software_rc = do_collect_software(ctx);
+        // BR4-001 (round 4): fold each phase's own return code into the
+        // honesty response -- see the comment above skipped_sources.
+        //
+        // round 5 (adversarial-review finding): by this point skipped_sources
+        // already holds every arp/service/mapdrive name collect_fast_impl /
+        // collect_slow_impl pushed for a collect_or_retain skip (each phase
+        // rc above stays 0 for that kind of skip -- it's not a persistence
+        // failure). Fold that into the honesty decision too, so a snapshot
+        // that silently retained a source's stale baseline returns nonzero
+        // at the action level, not just in the "tar|snapshot|partial|..."
+        // text line a generic/MCP/automation consumer may not parse.
+        const bool had_earlier_skips = !skipped_sources.empty();
+        const auto phase_outcome =
+            yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc, had_earlier_skips);
+        skipped_sources.insert(skipped_sources.end(), phase_outcome.failed_phases.begin(),
+                               phase_outcome.failed_phases.end());
+        if (!skipped_sources.empty()) {
+            // Structured ABI4 result seam (runner_status.hpp's pattern) --
+            // a partial/skipped-sources snapshot is CONSTRAINED/PARTIAL for
+            // any consumer reading the typed status, not only the text line.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "tar:snapshot_skipped_sources");
+        }
+        ctx.write_output(yuzu::tar::snapshot_result_line(skipped_sources));
+        return phase_outcome.return_code;
     }
 
     // ── fleet_snapshot action (single JSON document for fleet-topology viz) ──
@@ -2200,6 +3430,8 @@ private:
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
         auto netconn_lookback = params.get("netconn_lookback_seconds");
+        auto power_lookback = params.get("power_lookback_seconds");
+        auto removable_lookback = params.get("removable_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -2216,6 +3448,15 @@ private:
         // fat-fingered bound; a non-numeric value is rejected.
         int64_t netconn_lookback_secs = 0;
         bool netconn_lookback_provided = false;
+        // The same forward-only privacy control for the two cursor sources. The
+        // manual and the SOC 2 data inventory both present `0` as the works-council
+        // lawfulness lever, so the key has to be REACHABLE: do_configure enumerates
+        // a fixed key set and silently ignores anything outside it, which would have
+        // made a documented control inert.
+        int64_t power_lookback_secs = 0;
+        bool power_lookback_provided = false;
+        int64_t removable_lookback_secs = 0;
+        bool removable_lookback_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -2288,6 +3529,35 @@ private:
             }
             // Clamp rather than reject an out-of-range bound (see the field decl).
             netconn_lookback_secs = yuzu::tar::nq_clamp_lookback(netconn_lookback_secs);
+        }
+
+        struct LookbackSpec {
+            const char* key;
+            std::string_view raw;
+            int64_t* out;
+            bool* provided;
+        };
+        LookbackSpec power_lookback_spec{"power_lookback_seconds", power_lookback,
+                                         &power_lookback_secs, &power_lookback_provided};
+        LookbackSpec removable_lookback_spec{"removable_lookback_seconds", removable_lookback,
+                                             &removable_lookback_secs,
+                                             &removable_lookback_provided};
+        for (auto* spec : {&power_lookback_spec, &removable_lookback_spec}) {
+            if (spec->raw.empty())
+                continue;
+            *spec->provided = true;
+            bool parsed = false;
+            try {
+                *spec->out = std::stoll(std::string{spec->raw});
+                parsed = true;
+            } catch (...) {}
+            if (!parsed) {
+                ctx.write_output(std::format("error|{} must be an integer 0-7776000 "
+                                             "(0 = forward-only, no pre-enablement read)",
+                                             spec->key));
+                return 1;
+            }
+            *spec->out = yuzu::tar::nq_clamp_lookback(*spec->out);
         }
 
         // Cross-field validation BEFORE any writes
@@ -2455,6 +3725,17 @@ private:
                 std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
             changed = true;
         }
+        if (power_lookback_provided) {
+            db_->set_config("power_lookback_seconds", std::to_string(power_lookback_secs));
+            ctx.write_output(std::format("config|power_lookback_seconds|{}", power_lookback_secs));
+            changed = true;
+        }
+        if (removable_lookback_provided) {
+            db_->set_config("removable_lookback_seconds", std::to_string(removable_lookback_secs));
+            ctx.write_output(
+                std::format("config|removable_lookback_seconds|{}", removable_lookback_secs));
+            changed = true;
+        }
         if (have_redaction) {
             db_->set_config("redaction_patterns", std::string{redaction});
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
@@ -2463,6 +3744,23 @@ private:
         for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
             {
+                // #2361 Gate 8 (Sol): serialise against a whole RETENTION pass,
+                // outermost. run_retention decides which sources are enabled in a
+                // read phase and executes the queued deletes afterwards, so
+                // without this a pause landing between the two still deletes the
+                // rows the operator just asked to preserve -- and reports success
+                // to both sides. The pre-change code raced too (it read the flag
+                // one statement before deleting); the read/write split widened the
+                // window to the whole sweep, so the fix belongs here rather than
+                // in a narrower re-check.
+                //
+                // Lock order is rollup_mu_ ≺ collect_mu_ ≺ software_collect_mu_.
+                // do_rollup takes ONLY rollup_mu_ (then db_->mu_ -- per statement
+                // for the probes, and for the whole batch during the retention
+                // deletes) and never collect_mu_, so no cycle exists. Cost: a configure
+                // waits out an in-flight rollup, which is the correct trade for a
+                // mutation whose whole purpose is to stop data being deleted.
+                std::lock_guard rollup_lock(rollup_mu_);
                 // #538: collect_fast/slow hold collect_mu_ for their whole
                 // enumerate→diff→set_state cycle. Taking it here makes the
                 // enabled-flag write + baseline clear atomic w.r.t. a collection
@@ -2483,6 +3781,32 @@ private:
                 std::unique_lock<std::mutex> sw_lock;
                 if (src_name == "software")
                     sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
+                // C1 fix: capture the prior tcp enabled state BEFORE applying, so the
+                // R2-3 nstat-ring drain below fires only on an actual enable<->disable
+                // EDGE. An idempotent tcp_enabled=true re-assert (common from
+                // desired-state reconciliation) returns transition_ok==true but is NOT
+                // a pause boundary and must never discard live buffered lifecycle
+                // events (nstat stays primary and the poll is filtered to UDP, so the
+                // loss would be unobservable).
+                const bool tcp_prev_enabled =
+                    (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
+                // Same capture-before-apply for cursor sources (see the routing
+                // block below): read the prior state while it is still prior.
+                //
+                // Canonicalised the way apply_source_enabled_transition itself
+                // does it, NOT via source_enabled(). The two disagree on a
+                // corrupt value: source_enabled() fails closed, so "errored"
+                // reads as NOT enabled, while the transition's disable leg fires
+                // on any non-"false" prev -- errored included. Deriving the edge
+                // from the collect-time gate therefore made
+                // `<name>_enabled=false` over a tampered value write paused_at
+                // while routing NO on_enabled_changed(false), so the source
+                // never drained and discarded the paused window and committed it
+                // on the next enable. The forensic-pause contract is exactly
+                // what that breaks, so the edge must be the transition's own.
+                const std::string_view cursor_prev_canon = yuzu::tar::canonical_source_enabled(
+                   db_->get_config(std::string(src_name) + "_enabled",
+                                   yuzu::tar::source_default_enabled(src_name) ? "true" : "false"));
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -2504,18 +3828,77 @@ private:
                     else if (src_name == "procperf")
                         prev_proc_ = yuzu::tar::ProcSnapshot{};
                 }
+                // R2-3 (edge-gated per C1): drain-and-discard the nstat ring and
+                // insert-retry backlog on a real tcp enable<->disable EDGE, under
+                // collect_mu_ so it is atomic w.r.t. a collection tick. The disable
+                // edge clears everything buffered up to the pause; the enable edge
+                // clears whatever accumulated DURING a pause too short to have fired
+                // the per-tick disabled discard in collect_fast. The client keeps
+                // running (it also feeds netqual) — only the lifecycle ring is
+                // discarded. Gated on an actual state change so an idempotent
+                // re-assert never discards live events (C1).
+                if (transition_ok && src_name == "tcp" && nstat_client_ &&
+                    (v == "true") != tcp_prev_enabled) {
+                    nstat_client_->drain();
+                    pending_nstat_evs_.clear();
+                }
+                // Cursor-model sources (tar_cursor.hpp, P-002): forward the
+                // toggle to the matching source's on_enabled_changed(), under
+                // the same collect_mu_ a collection tick holds, so the
+                // transition is atomic w.r.t. an in-flight collect() -- same
+                // rationale as the #538 baseline-clear atomicity above. The
+                // source itself owns the disable-drain-discard /
+                // re-enable-rebaseline-and-gap contract (tar_cursor.hpp); this
+                // call site only routes the edge.
+                // Routed on an EDGE only. `cursor_prev_enabled` is captured before
+                // apply_source_enabled_transition() above, for the same reason the
+                // tcp/nstat drain is edge-gated (C1): an idempotent
+                // `<name>_enabled=true` re-assert is routine from desired-state
+                // reconciliation and is NOT a pause boundary. Routing it as one
+                // makes the source re-baseline forward and emit a capture_gap,
+                // silently discarding history it had not yet replayed -- the
+                // consumer cannot defend against this, because it cannot tell an
+                // edge from a re-assert.
+                // An EDGE is exactly what the transition treated as one.
+                const bool cursor_edge = (v == "false" && cursor_prev_canon != "false") ||
+                                         (v == "true" && cursor_prev_canon != "true");
+                if (transition_ok && cursor_edge) {
+                    for (auto& cs : cursor_sources_) {
+                        if (cs->name() == src_name) {
+                            // ABI containment, same reason as the collect loop:
+                            // on_enabled_changed() is declared noexcept-free and
+                            // the SDK execute trampoline is an extern "C"
+                            // boundary with no catch, so an escaping exception
+                            // here terminates the agent from a plain
+                            // configuration write. Losing the pause/resume
+                            // bookkeeping for one toggle is the strictly better
+                            // outcome, and it is logged loudly because a source
+                            // that throws here has an un-honoured P-002 contract.
+                            try {
+                                cs->on_enabled_changed(v == "true");
+                            } catch (const std::exception& e) {
+                                spdlog::error("TAR: {} on_enabled_changed threw ({}) -- the "
+                                              "source's pause/resume bookkeeping for this "
+                                              "toggle is not applied", src_name, e.what());
+                            } catch (...) {
+                                spdlog::error("TAR: {} on_enabled_changed threw a non-std "
+                                              "exception -- the source's pause/resume "
+                                              "bookkeeping for this toggle is not applied",
+                                              src_name);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             if (!transition_ok) {
-                // #538/UP-1: a disable that could not clear the baseline leaves
-                // the source ENABLED (fail-safe). This is an apply-time I/O failure
-                // (a busy DB), not a validation failure — Phase 1 already validated
-                // every parameter — so the two-phase atomicity contract still holds:
-                // the only writes that could precede this are the scalar set_config
-                // calls above, and the source stays enabled rather than being left
-                // disabled with a stale baseline. Report it so the operator retries.
+                // #538/UP-1 + #1654: the transition (baseline clear, flag, paused_at)
+                // is one transaction, so a failure leaves the source in its previous
+                // state. This is an apply-time I/O failure (a busy DB), not a
+                // validation failure -- Phase 1 already validated every parameter.
                 ctx.write_output(std::format(
-                    "error|{}_enabled disable failed: could not clear collection baseline "
-                    "(database busy); source left enabled",
+                    "error|{}_enabled transition failed: could not persist (database busy); "
+                    "source left in its previous state",
                     src_name));
                 return 1;
             }
@@ -2611,10 +3994,17 @@ private:
 
     int do_rollup(yuzu::CommandContext& ctx) {
         // No collect_mu_ needed — rollup operates on aggregate tables, not live-state diffs.
-        // The SQLite-level mutex (db_->mu_) provides thread safety.
+        // The SQLite-level mutex (db_->mu_) provides thread safety for individual
+        // statements. It does NOT cover run_retention's in-memory clock-guard
+        // state, which spans many statements - rollup_mu_ does (#2361), and it
+        // keeps the trigger tick and a manual `tar rollup` from interleaving.
+        std::lock_guard rollup_lock(rollup_mu_);
         auto ts = now_epoch_seconds();
+        // Ordering is load-bearing and unchanged: aggregation runs BEFORE
+        // retention so each tier consumes the tier below it before retention can
+        // delete from it.
         int total = yuzu::tar::run_aggregation(*db_, ts);
-        yuzu::tar::run_retention(*db_, ts);
+        yuzu::tar::run_retention(*db_, ts, retention_guard_);
         ctx.write_output(std::format("tar|rollup|{}|rows_aggregated", total));
         return 0;
     }

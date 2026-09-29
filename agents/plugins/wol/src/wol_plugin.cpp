@@ -5,28 +5,38 @@
  *   "wake"  — Sends a Wake-on-LAN magic packet to a specified MAC address.
  *             The magic packet is a UDP broadcast containing 6 bytes of 0xFF
  *             followed by the target MAC address repeated 16 times.
- *   "check" — Pings a host to verify it responded to a WoL wake.
+ *   "check" — Checks whether a host has become reachable, typically polled
+ *             after a `wake` to see whether the target booted. Native ICMP
+ *             echo (yuzu::shared::IcmpSession, agents/shared/icmp_probe.hpp)
+ *             with a TCP-connect fallback on port 443 for hosts/kernels
+ *             that drop or deny unprivileged ICMP — no shell-out, no
+ *             subprocess (ADR-3002 rung 1). See wol_check_plan.hpp for the
+ *             pure mechanism-selection / honest-degrade decision logic.
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   key|field1|field2|...
  *
  * Platform implementations:
- *   Windows: Winsock2 UDP broadcast (ws2_32)
- *   Linux:   POSIX UDP sockets
- *   macOS:   POSIX UDP sockets
+ *   Windows: Winsock2 UDP broadcast (ws2_32) + IcmpSendEcho (iphlpapi)
+ *   Linux:   POSIX UDP sockets + unprivileged ICMP ping socket
+ *   macOS:   POSIX UDP sockets + unprivileged ICMP ping socket
  */
 
 #include <yuzu/plugin.hpp>
 
-#include <array>
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <format>
-#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
+
+#include <host_arg.hpp>
+#include <icmp_probe.hpp>
+
+#include "wol_check_plan.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -46,32 +56,6 @@
 #endif
 
 namespace {
-
-// ── subprocess helper (all platforms) ──────────────────────────────────────
-
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
 
 // ── MAC address parsing ────────────────────────────────────────────────────
 
@@ -182,7 +166,8 @@ struct SocketGuard {
 };
 #endif
 
-// ── wake action ────────────────────────────────────────────────────────────
+// ── wake action (native UDP broadcast on every platform — no migration
+//    needed here; ADR-3002 rung 1 already) ───────────────────────────────────
 
 int do_wake(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto mac_param = params.get("mac");
@@ -265,7 +250,16 @@ int do_wake(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
-// ── check action ───────────────────────────────────────────────────────────
+// ── check action ─────────────────────────────────────────────────────────
+//
+// ADR-3002 rung 1: native ICMP echo (yuzu::shared::IcmpSession) as the
+// primary mechanism, with a TCP-connect fallback on
+// yuzu::wol::kFallbackTcpPort for hosts/kernels that drop or deny
+// unprivileged ICMP (e.g. Linux net.ipv4.ping_group_range). No shell-out,
+// no subprocess. wol_check_plan.hpp's classify_check() is the pure
+// decision function that turns the raw probe facts into a verdict —
+// including the honest CONSTRAINED/UNAVAILABLE degrade when NEITHER
+// mechanism could even be attempted (never reported as "unreachable").
 
 int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto host = params.get("host");
@@ -274,14 +268,13 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
         return 1;
     }
 
-    // Validate host to prevent command injection
-    // Only allow alphanumeric, dots, hyphens, colons (for IPv6)
-    for (char c : host) {
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-              c == '.' || c == '-' || c == ':')) {
-            ctx.write_output(std::format("check|error|Invalid host: {}", host));
-            return 1;
-        }
+    // Shared validator (ADR-3002 Decision 6) — same charset the old inline
+    // loop used (alphanumeric/dot/hyphen/colon), now factored so every
+    // plugin that hands an operator-supplied host to a network probe gets
+    // the same option-injection guard (no leading '-').
+    if (!yuzu::shared::is_safe_host_arg(host)) {
+        ctx.write_output(std::format("check|error|Invalid host: {}", host));
+        return 1;
     }
 
     auto count_param = params.get("count", "3");
@@ -294,44 +287,119 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
         count = 3;
     }
 
-    // Build ping command
-    std::string cmd;
-#ifdef _WIN32
-    cmd = std::format("ping -n {} -w 2000 {} 2>&1", count, host);
-#else
-    cmd = std::format("ping -c {} -W 2 {} 2>&1", count, host);
-#endif
-
-    auto ping_out = run_command(cmd.c_str());
-
-    // Determine if host is reachable
-    bool reachable = false;
-    if (!ping_out.empty()) {
-#ifdef _WIN32
-        // Windows: look for "Reply from" or "TTL="
-        reachable = ping_out.find("Reply from") != std::string::npos ||
-                    ping_out.find("TTL=") != std::string::npos;
-#else
-        // Unix: look for "bytes from" or "time="
-        reachable = ping_out.find("bytes from") != std::string::npos ||
-                    ping_out.find("time=") != std::string::npos;
-#endif
+    auto timeout_param = params.get("timeout_ms", "1000");
+    int timeout_ms = 1000;
+    try {
+        timeout_ms = std::stoi(std::string(timeout_param));
+        if (timeout_ms < 100 || timeout_ms > 5000)
+            timeout_ms = 1000;
+    } catch (...) {
+        timeout_ms = 1000;
     }
 
-    ctx.write_output(std::format("check|{}|{}|{}", host, reachable ? "reachable" : "unreachable",
-                                 count));
+    const std::string host_str{host};
+    constexpr auto kInterSampleGap = std::chrono::milliseconds(200);
+    yuzu::wol::ProbeOutcome outcome{};
 
-    // Output the raw ping result line by line
-    std::istringstream ss(ping_out);
-    std::string line;
-    while (std::getline(ss, line)) {
-        if (!line.empty()) {
-            ctx.write_output(std::format("ping_line|{}", line));
+    // ── ICMP echo (primary mechanism, IPv4 only — matches netprobe's own
+    //    icmp action scope; IPv6 is a tracked follow-up on that header) ────
+    auto icmp_dst = yuzu::shared::resolve_first(host_str, AF_INET);
+    outcome.icmp_resolved = icmp_dst.has_value();
+
+    yuzu::shared::IcmpSession session;
+    outcome.icmp_session_ok = session.ok();
+
+    if (icmp_dst && session.ok()) {
+        for (int i = 0; i < count && !outcome.icmp_replied; ++i) {
+            if (i > 0)
+                std::this_thread::sleep_for(kInterSampleGap);
+#ifdef _WIN32
+            const ULONG ipv4 = reinterpret_cast<sockaddr_in*>(&icmp_dst->addr)->sin_addr.s_addr;
+            if (session.sample(ipv4, timeout_ms).replied())
+                outcome.icmp_replied = true;
+#else
+            const auto& sin = *reinterpret_cast<sockaddr_in*>(&icmp_dst->addr);
+            if (session.sample(sin, timeout_ms).replied())
+                outcome.icmp_replied = true;
+#endif
         }
     }
 
+    // ── TCP-connect fallback ─────────────────────────────────────────────
+    // Only spent once ICMP has failed to prove reachability -- an early
+    // ICMP reply skips this entirely. AF_UNSPEC (unlike the ICMP probe
+    // above) so an IPv6-only host still gets a real reachability check.
+    if (!outcome.icmp_replied) {
+        auto tcp_dst = yuzu::shared::resolve_first(host_str, AF_UNSPEC);
+        outcome.tcp_resolved = tcp_dst.has_value();
+        if (tcp_dst) {
+            yuzu::shared::set_port(*tcp_dst, yuzu::wol::kFallbackTcpPort);
+            for (int i = 0; i < count && !outcome.tcp_connected && !outcome.tcp_refused; ++i) {
+                if (i > 0)
+                    std::this_thread::sleep_for(kInterSampleGap);
+                auto sample = yuzu::shared::tcp_sample(*tcp_dst, timeout_ms);
+                if (sample.rtt_ms)
+                    outcome.tcp_connected = true;
+                else if (sample.refused)
+                    outcome.tcp_refused = true;
+            }
+        }
+    }
+
+    const auto verdict = yuzu::wol::classify_check(outcome);
+
+    if (verdict.mechanism == yuzu::wol::CheckMechanism::unavailable) {
+        // Honest degrade: neither ICMP nor the TCP fallback could even be
+        // attempted (ICMP unusable/denied AND no resolvable TCP
+        // destination). Reported through the ABI4 CC-07 result-status seam
+        // as CONSTRAINED/PARTIAL -- never as "unreachable", which would
+        // read to an operator as "the WoL wake failed" when the truth is
+        // "we couldn't check at all".
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wol_plugin:check_unavailable");
+        ctx.write_output(std::format("check|{}|unavailable|{}", host, count));
+        ctx.write_output(
+            std::format("mechanism|{}", yuzu::wol::check_mechanism_label(verdict.mechanism)));
+        return 1;
+    }
+
+    ctx.write_output(std::format("check|{}|{}|{}", host,
+                                 verdict.reachable ? "reachable" : "unreachable", count));
+    ctx.write_output(
+        std::format("mechanism|{}", yuzu::wol::check_mechanism_label(verdict.mechanism)));
     return 0;
 }
+
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// wake builds and sends the magic packet over a raw UDP broadcast socket —
+// native in-process on every platform (rung 1), unchanged by this
+// migration. check is now native too (rung 1): unprivileged ICMP echo with
+// a TCP-connect fallback on port 443 — zero subprocess spawns on any
+// platform. Linux's ICMP leg is CONSTRAINED (not SUPPORTED) because
+// net.ipv4.ping_group_range can deny the unprivileged ping socket; the TCP
+// fallback covers that case, and check_unavailable (see do_check above)
+// covers the case where neither mechanism is usable.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "wake",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+    },
+    {
+        /* .action      = */ "check",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "SOCK_DGRAM ICMP ping socket + TCP-connect fallback",
+         "requires net.ipv4.ping_group_range to admit the process group for ICMP; falls back to "
+         "a TCP connect on port 443, and reports CONSTRAINED if neither mechanism is usable"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "SOCK_DGRAM ICMP ping socket + TCP-connect fallback",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "IcmpSendEcho + TCP-connect fallback", nullptr},
+    },
+};
 
 } // namespace
 
@@ -346,6 +414,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"wake", "check", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

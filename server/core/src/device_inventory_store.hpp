@@ -135,8 +135,11 @@ public:
     /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
 
-    /// Drop an agent's CI record (e.g. on agent removal). Best-effort.
-    void delete_agent(std::string_view agent_id);
+    /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
+    /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
+    /// a SQL failure — so the decommission cascade records Failed, not a false
+    /// "erased".
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
     pg::PgPool& pool_;

@@ -277,7 +277,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
             ++rendered;
             const std::string host = d.hostname.empty() ? d.agent_id : d.hostname;
             h += "<div class=\"dp-dev\" data-bucket=\"" + std::string(bkey) + "\">";
-            h += "<span class=\"hn\"><a href=\"/device?id=" + esc(d.agent_id) + "\">" + esc(host) +
+            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + esc(d.agent_id) + "\">" + esc(host) +
                  "</a></span>";
             h += "<span class=\"os\">" + esc(d.os.empty() ? "?" : d.os) + "</span>";
             h += "<span class=\"prog\">" + step_chips(d) + "</span></div>";

@@ -80,17 +80,16 @@ spec:
 ### Saving YAML via API
 
 ```bash
-# Save a definition from a YAML file
+# Save a definition from a YAML file (form-encoded; the yaml_source field
+# carries the document verbatim)
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/yaml \
-  -H "Content-Type: application/x-yaml" \
-  --data-binary @definitions/process-list.yaml
+  --data-urlencode "yaml_source@definitions/process-list.yaml"
 
 # Validate YAML without saving
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
-  -H "Content-Type: application/x-yaml" \
-  --data-binary @definitions/process-list.yaml
+  --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
 
 ### Dashboard YAML Editor
@@ -226,7 +225,7 @@ spec:
 |---|---|---|---|
 | `plugin` | string | -- | Plugin identifier (must match a registered plugin's `name`). |
 | `action` | string | -- | Action name (must exist in the plugin's `actions[]` array). Case-insensitive; normalized to lowercase at creation time and at dispatch. |
-| `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. |
+| `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. Only `per-device` is enforced — see [Section 8](#8-concurrency-model). |
 | `stagger.maxDelaySeconds` | int | `0` | Max random delay per agent before execution. `0` = no stagger. |
 | `stagger.fixedDelaySeconds` | int | `0` | Fixed delay per agent before execution, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
 | `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. |
@@ -489,34 +488,52 @@ curl -s -b cookies.txt \
 
 ## 8. Concurrency Model
 
-Five concurrency modes control parallel execution. The default (`per-device`) requires zero server coordination and scales to any fleet size.
+**Corrected 2026-08-31 (ADR-1007) — only `per-device` is actually enforced.** See
+`docs/yaml-dsl-spec.md` §12 for the full corrected model (mode-by-mode status, why enforcement is
+server-side rather than agent-side, the `plugin: server`-class catalog-definition caveat, what
+remains unenforced and why) and `docs/Instruction-Engine.md` §10 for the implementation summary.
+This section previously described a fully-implemented 5-mode system, including a wait queue; none
+of that was ever built except the one mode below.
 
 ### Modes
 
-| Mode | Enforcement | Scope | Use Case |
+| Mode | Enforcement | Scope | Status |
 |---|---|---|---|
-| `per-device` | Agent-side | One execution of this definition per device at a time | Default. Prevents conflicting operations on the same device. |
-| `per-definition` | Server-side | One fleet-wide execution of this definition at a time | Dangerous global operations (schema migration, bulk delete). |
-| `per-set` | Agent-side | One execution of any definition in the same set, per device | Set-level mutual exclusion (e.g. all patch operations). |
-| `global:<N>` | Server-side | At most N concurrent executions fleet-wide | Patch rollouts, license-limited operations. |
-| `unlimited` | None | No limits | Read-only queries, diagnostic gathering. |
+| `per-device` | Server-side | One execution of this definition per device at a time | **Enforced** (default; 191 real shipped definitions use it). |
+| `per-definition` | None | — | **Not enforced** — used only on catalog-only definitions with no live dispatch path. Do not rely on this for dangerous global operations (schema migration, bulk delete) — nothing prevents concurrent execution. |
+| `per-set` | None | — | **Not enforced, unspecified** — no grouping key defined anywhere. Zero real usage. |
+| `global:<N>` | None | — | **Not enforced** — not used in any shipped definition. |
+| `unlimited` | None | No limits | No enforcement needed. |
 
 ### How Enforcement Works
 
-**Agent-side** (`per-device`, `per-set`): The agent maintains an in-memory set of active definition IDs (or set IDs). If a slot is occupied when a `CommandRequest` arrives, the agent returns `REJECTED` with error code `3003`. No server round-trip is needed.
+**`per-device` (the only enforced mode):** enforced server-side. At dispatch, the server holds a
+claim on `(definition_id, agent_id)` in a dedicated Postgres table
+(`execution_tracker.concurrency_claims`, race-free via a partial unique index), excludes any agent
+already holding an open claim for this definition, and releases the claim when that agent reaches
+a terminal status. There is no wait queue — an excluded agent is simply not dispatched to on this
+attempt; retry once the in-flight execution completes. Error code `3003` is registered for this
+condition but not yet surfaced through the dispatch response. Not covered by this gate: raw MCP/REST
+dispatch (no `definition_id` in scope) and the fleet-broadcast arm of dispatch.
 
-**Server-side** (`per-definition`, `global:N`): The server checks a `concurrency_locks` table in SQLite before dispatch. If the lock is held (or the semaphore is at the limit), the execution enters a wait queue. The lock is released when the execution completes or times out.
+**One release exception worth knowing:** cancelling an execution does **not** release its claim
+(there is no way to tell the agent to stop, so a cancelled-but-still-running execution's claim
+behaves like a normal in-flight one until a terminal response or the reconciler's TTL bound releases
+it — worst case, one hour). A `per-device` definition dispatched via a **workflow step** (as opposed
+to a direct execute call or a schedule) releases and renews the same way as any other dispatch path
+— it just won't show progress in the executions drawer, since workflow-step dispatch doesn't yet
+correlate a real execution id there.
+
+**All other modes** are accepted and stored but have no enforcement effect — they behave exactly
+like `unlimited` in practice.
 
 ### YAML Syntax
 
 ```yaml
 spec:
   execution:
-    concurrency: per-device          # default
-    # concurrency: per-definition    # one fleet-wide at a time
-    # concurrency: per-set           # one per set per device
-    # concurrency: global:50         # at most 50 concurrent across fleet
-    # concurrency: unlimited         # no limits
+    concurrency: per-device          # default — the only mode actually enforced
+    # concurrency: unlimited         # no limits (also the practical effect of any unsupported value)
 ```
 
 ### Stagger
@@ -559,12 +576,21 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 ### Execution semantics
 
 A server-side poller checks for due schedules every 30 seconds, so a fire can
-land up to ~30 seconds after its due time. Scheduled runs travel the same
-dispatch path as manual runs: each fire creates a tracked execution
-(attributed to the schedule's creator) that appears in the Executions history,
-and emits an `instruction.schedule_fired` audit event. An occurrence that
-cannot run — unknown or disabled definition, no agents in scope, dispatch
-failure — is recorded and skipped; it does not retry into a backlog.
+land up to ~30 seconds after its due time — but firing is now two stages, not
+one. At fire time the poller creates a tracked execution (attributed to the
+schedule's creator, appearing immediately in the Executions history) and
+commits a durable occurrence to the command outbox, emitting an
+`instruction.schedule_fired` audit event with result `queued`. A leader-gated
+delivery loop then drains the outbox and performs the actual dispatch, within
+~5 seconds of enqueue — so up to ~35 seconds total from due time to dispatch.
+Delivery emits its own `command.outbox_delivered` audit event recording the
+real send outcome: `success` (dispatched, with the agents-reached count),
+`failure` (no agents currently in scope — recorded and skipped, not retried;
+or a malformed occurrence), or `denied` (authority was revoked between
+enqueue and delivery). The execution row's targeted-agent count fills in at
+delivery, once the real outcome is known. A systemic delivery-gate failure
+(for example, containment status unreadable) is treated as transient: the
+same occurrence is retried with back-off rather than failed outright.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the
@@ -745,11 +771,18 @@ Errors are categorized into four domains with non-overlapping numeric ranges.
 
 | Code | Name | Description | Retryable |
 |---|---|---|---|
-| 3001 | `ORCH_EXPIRED` | Instruction passed its `expires_at` before dispatch | No |
-| 3002 | `ORCH_AGENT_MISSING` | Target agent not connected at dispatch time | On reconnect |
-| 3003 | `ORCH_CONCURRENCY_LIMIT` | Concurrency mode blocked execution | After slot frees |
-| 3004 | `ORCH_APPROVAL_REQUIRED` | Execution blocked pending approval | Awaits human |
-| 3005 | `ORCH_CANCELLED` | Execution cancelled by operator | No |
+| 3001 | `DefinitionNotFound` | The referenced InstructionDefinition does not exist | No |
+| 3002 | `ApprovalRequired` | Execution blocked pending approval | Awaits human |
+| 3003 | `ConcurrencyBlocked` | Registered for `per-device` claim exclusion; not yet surfaced through the dispatch response (ADR-1007) | After slot frees |
+| 3004 | `ScopeEmpty` | The resolved target scope matched no agents | No |
+| 3005 | `ScheduleExpired` | The schedule's execution window has passed | No |
+
+Names above are the taxonomy's actual registered names (`server/core/src/error_codes.cpp`) — this
+row set was corrected from a stale naming scheme this table had carried (`ORCH_*` prefixes that
+never matched the code). Like 3003, none of 3001/3002/3004/3005 currently has a production call
+site that emits it (`error_codes.cpp`'s registration is not the same as being wired to a real
+error path yet) — the retry-semantics column above states the DESIGNED behavior per the taxonomy
+entry, not an observed one.
 
 ### 4xxx -- Agent Errors
 
@@ -777,7 +810,7 @@ All API endpoints require session-cookie authentication. Obtain a session by pos
 
 There are two API surface areas with different response envelopes:
 
-**`/api/*` endpoints** (instruction engine, registered in `server.cpp`) use domain-keyed responses:
+**`/api/*` endpoints** (instruction engine, registered in `instruction_routes.cpp`/`execution_routes.cpp` and `server.cpp`) use domain-keyed responses:
 
 ```json
 {
@@ -971,13 +1004,12 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 ```json
 {
   "agent_ids": ["agent-uuid-1"],
-  "scope": "",
   "params": {"path": "C:\\Windows\\System32\\notepad.exe"}
 }
 ```
 
 - `agent_ids` — optional array of specific agent IDs to target.
-- `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`). Empty string with empty `agent_ids` broadcasts to all connected agents.
+- `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
 
 **Response (200):**
@@ -1000,7 +1032,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
-  -d '{"params":{"path":"C:\\Windows"},"scope":""}'
+  -d '{"params":{"path":"C:\\Windows"}}'
 ```
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
@@ -1076,6 +1108,14 @@ curl -s -b cookies.txt http://localhost:8080/api/schedules
 curl -s -b cookies.txt "http://localhost:8080/api/schedules?enabled_only=true"
 ```
 
+The dashboard's Schedules tab (see [Dashboard UI](#13-dashboard-ui) below) is backed by the
+versioned `GET /api/v1/schedules` twin, not the legacy endpoint above. If the schedule store is
+temporarily unreachable, the tab shows "Schedule list temporarily unavailable — retry shortly"
+instead of an empty list. Schedule reads (dashboard, REST v1, and MCP `list_schedules` alike) are
+capped at 100 rows; if a fleet has more schedules than that, the tab shows a partial-list notice
+above the table, and `GET /api/v1/schedules`'s JSON response carries `result_truncated_by_cap: true`
+(see [REST API](rest-api.md#get-apiv1schedules)) — the two are the same underlying signal.
+
 #### Create a schedule
 
 ```
@@ -1141,6 +1181,10 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
+The reviewer must be a different operator than the submitter — self-approval
+is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
+and the denied attempt is recorded in the audit log.
+
 ```bash
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
@@ -1162,6 +1206,9 @@ curl -s -b cookies.txt \
 ```
 
 ### Executions
+
+All routes below are management-group confined (#3789) — see `rest-api.md`'s "Executions" section
+for the per-route permission and confinement/404 behavior.
 
 #### List executions
 
@@ -1262,7 +1309,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
 | **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
 ### YAML Editor
 
@@ -1306,7 +1353,7 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 - **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
 - **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
 - **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
-- **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its lightweight line-scanner does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
+- **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its schema-aware field extractor (`instruction_yaml`, which indexes the id/name/plugin/action/type/description/concurrency/approval columns from both the canonical nested and flat schemas) does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 
 See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
 

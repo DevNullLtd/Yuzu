@@ -35,6 +35,8 @@ registry_test_() ->
       {"store_pending and take_pending round-trip", fun pending_store_take/0},
       {"take_pending returns undefined for unknown session", fun pending_take_unknown/0},
       {"take_pending deletes entry atomically", fun pending_take_deletes/0},
+      {"take_pending: exactly one winner under concurrent racers (PR #4299 round 6)",
+       {timeout, 60, fun pending_take_concurrent_single_winner/0}},
       {"pending sweep removes expired entries", fun pending_sweep_expired/0},
       {"pending sweep preserves fresh entries", fun pending_sweep_preserves_fresh/0},
       %% Monitor ref leak test
@@ -192,6 +194,49 @@ pending_take_deletes() ->
     ?assertEqual(Info, yuzu_gw_registry:take_pending(<<"sess-pend-2">>)),
     %% Second take returns undefined (already deleted).
     ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<"sess-pend-2">>)).
+
+%% Regression pin for the take_pending atomicity fix (PR #4299 round 6).
+%% take_pending is called directly from yuzu_gw_agent_service:subscribe/2, which
+%% grpcbox runs as an independent process per incoming stream, against a `public`
+%% ETS table with no serialization. The old lookup-then-delete let two concurrent
+%% Subscribe handlers presenting the SAME session id BOTH consume the one pending
+%% registration, each spawning an agent process and each emitting its own
+%% CONNECTED(S) — a second-CONNECTED-per-session producer that breaks the HA WS-4
+%% routing directory's once-per-session invariant (ADR-2002 §7 #4246 #4 / #4324).
+%% ets:take/2 is a single atomic retrieve-and-delete: exactly one concurrent
+%% caller gets the object for a given key, the rest get []. Assert exactly one
+%% winner per round across many barrier-released rounds. (Empirically this fails
+%% intermittently on the old lookup+delete code and passes deterministically on
+%% ets:take — verified by reverting the fix on a scratch copy.)
+pending_take_concurrent_single_winner() ->
+    Racers = 50,
+    Rounds = 200,
+    Parent = self(),
+    lists:foreach(
+      fun(R) ->
+          Session = <<"race-sess-", (integer_to_binary(R))/binary>>,
+          Info = #{agent_id => <<"race-agent">>, round => R},
+          ok = yuzu_gw_registry:store_pending(Session, Info),
+          Go = make_ref(),
+          Pids = [spawn(fun() ->
+                              Parent ! {ready, self()},
+                              receive Go -> ok end,
+                              Res = yuzu_gw_registry:take_pending(Session),
+                              Parent ! {race_result, self(), Res}
+                          end) || _ <- lists:seq(1, Racers)],
+          %% TWO-PHASE barrier: wait until EVERY racer is blocked on Go, THEN
+          %% release them together — so the take_pending calls collide as tightly
+          %% as the scheduler allows, maximizing a reintroduced race's exposure
+          %% (a sequential release lets early racers finish before the last is
+          %% even woken). Green here is deterministic regardless (ets:take), so
+          %% this only strengthens RED power on a regression.
+          [receive {ready, P} -> ok end || P <- Pids],
+          lists:foreach(fun(P) -> P ! Go end, Pids),
+          Results = [receive {race_result, P, Res} -> Res end || P <- Pids],
+          Winners = [X || X <- Results, X =/= undefined],
+          ?assertEqual(1, length(Winners)),
+          ?assertEqual(Info, hd(Winners))
+      end, lists:seq(1, Rounds)).
 
 pending_sweep_expired() ->
     %% Directly insert an expired entry into the ETS table.

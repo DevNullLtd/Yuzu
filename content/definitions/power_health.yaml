@@ -1,0 +1,389 @@
+## Power Health Definitions
+## Reports battery, thermal, and power-plan state, plus a gated power-plan
+## switch.
+## Plugin: power_health | Actions: battery, thermal, power_plan, set_power_plan
+##
+## Sources by platform:
+##   Windows: GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState)
+##            (battery); PDH \Thermal Zone Information(*)\Temperature
+##            (thermal — CONSTRAINED, zero live instances is the measured
+##            normal case on desktop hardware); PowrProf PowerEnumerate /
+##            PowerReadFriendlyName / PowerGetActiveScheme / PowerSetActiveScheme
+##            (power_plan / set_power_plan). No WMI, no powercfg, no COM.
+##   macOS:   IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList (battery);
+##            NSProcessInfo.thermalState + IOPMGetThermalWarningLevel
+##            (thermal — a 4-level pressure enum, never degrees). power_plan
+##            is UNSUPPORTED: macOS has no named power schemes.
+##   Linux:   /sys/class/power_supply (battery), /sys/class/thermal (thermal)
+##            — CONSTRAINED, fixture-verified with no live venue in this
+##            run. power_plan is PLANNED (platform_profile), not implemented.
+##
+## Battery-PRESENT hardware verification: DONE on Windows (HP ZBook Firefly,
+## PR #4009 review) — it caught the AC-resting state being reported as
+## `unknown`, now `not_charging`. macOS battery-PRESENT is still fixture-only.
+## docs/user-manual/power-health.md carries the pass criteria.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.power.battery
+  displayName: Battery Status
+  version: 1.0.0
+  description: >
+    Reports one row per power source: present, state (charging/discharging/
+    full/not_charging/ac_no_battery/unknown), percent, time-to-empty in
+    minutes, cycle count, and health percent. not_charging is a REPORTED
+    state, not a failed read: a present battery on AC, neither charging nor
+    discharging and below 100%, held at a firmware charge threshold — the
+    ordinary state of a docked laptop. The latter two are -1 (unknown)
+    wherever the platform's mechanism has no honest source for them (Windows
+    and macOS, given the acquisition this plugin uses; Linux reports them
+    when the kernel driver exposes CHARGE_FULL/CHARGE_FULL_DESIGN/
+    CYCLE_COUNT). On a Windows host with no system battery (desktops),
+    BatteryFlag=128 reports
+    present=0, state=ac_no_battery — measured live, not inferred. The
+    battery-PRESENT path is verified on real Windows hardware (HP ZBook
+    Firefly); on macOS it is still fixture-tested through an injected
+    boundary and UNVERIFIED on real battery hardware — see
+    docs/user-manual/power-health.md.
+  tags: [power, battery, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: power_health
+    action: battery
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # battery|<present>|<state>|<percent>|<time_to_empty_min>|<cycle_count>|<health_percent>
+    columns:
+      - name: present
+        type: boolean
+        description: 'Whether a power source was found by the platform mechanism. Values: 1 (battery present), 0 (none) — a digit, never true/false.'
+        example: "0"
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'Reported battery state. Values: charging, discharging, full, not_charging, ac_no_battery, unknown.'
+        example: ac_no_battery
+        platforms: [windows, linux, darwin]
+      - name: percent
+        type: int64
+        description: 'Battery charge percentage. Values: 0-100, or -1 (unknown).'
+        example: -1
+        platforms: [windows, linux, darwin]
+      - name: time_to_empty_min
+        type: int64
+        description: 'Estimated minutes until empty. Values: non-negative integer, or -1 (unknown).'
+        example: -1
+        platforms: [windows, linux, darwin]
+      - name: cycle_count
+        type: int64
+        description: >-
+          Battery charge-cycle count. Neither GetSystemPowerStatus/ CallNtPowerInformation (Windows) nor IOPSKeys.h (macOS) expose a cycle counter, so this is structurally -1 on those two platforms; only the Linux leg has a real source (POWER_SUPPLY_CYCLE_COUNT). Values: non-negative integer, or -1 (unknown / not exposed by the platform mechanism).
+        example: -1
+        platforms: [linux]
+      - name: health_percent
+        type: int64
+        description: >-
+          Battery health as current-full-charge/design-capacity, derived only when the Linux kernel driver exposes both CHARGE_FULL and CHARGE_FULL_DESIGN. Windows and macOS have no equivalent source and are structurally -1. Values: 0-100, or -1 (unknown / not exposed by the platform mechanism).
+        example: -1
+        platforms: [linux]
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "Report battery status"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [power_health]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.power.thermal
+  displayName: Thermal Status
+  version: 1.0.0
+  description: >
+    Reports thermal state. On Windows and Linux this is per-zone Celsius, OR
+    an explicit CONSTRAINED "no_thermal_zones_exposed" success line when the
+    mechanism reports zero live zone instances — the measured normal case on
+    desktop hardware, never an error and never a fabricated zero. It is a
+    POSITIVE claim that no sensors exist, so every way the read can FAIL
+    (pdh_open_failed, pdh_add_counter_failed, pdh_collect_failed,
+    pdh_collect_timed_out, pdh_collect_rejected, pdh_fetch_failed) reports
+    "unavailable" instead — an empty result never means we failed to look. On macOS
+    this is NSProcessInfo's 4-level thermal-pressure enum (nominal/fair/
+    serious/critical), never a temperature reading; IOPMGetThermalWarningLevel
+    supplements it and a "not found" result (no thermal event ever recorded)
+    is reported as the healthy default, not an error.
+  tags: [power, thermal, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: power_health
+    action: thermal
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # thermal|<status>|<detail>            (status != ok: no celsius field)
+    # thermal|ok|<zone_name>|<celsius>      (one row per zone; repeats status=ok)
+    columns:
+      - name: status
+        type: string
+        description: >-
+          Thermal read outcome. constrained is a positive claim of no sensors; unavailable means the read itself failed. Values: ok, constrained, unavailable.
+        example: ok
+        platforms: [windows, linux, darwin]
+      - name: zone_or_detail
+        type: string
+        description: >-
+          The zone/sensor name on a Windows or Linux status=ok row, the macOS thermal-pressure level (nominal/fair/serious/critical) on a macOS status=ok row, or a failure/constrained token (no_thermal_zones_exposed, pdh_open_failed, pdh_add_counter_failed, pdh_collect_rejected, pdh_collect_timed_out, pdh_collect_failed, pdh_fetch_failed, pdh_provider_degraded, sys_class_thermal_not_readable) otherwise. Values: free text (zone name), nominal | fair | serious | critical (macOS), or a fixed failure/constrained token.
+        example: nominal
+        platforms: [windows, linux, darwin]
+      - name: celsius
+        type: number
+        description: >-
+          Sensor temperature in Celsius. Present only on a status=ok row that carries a real per-zone reading (Windows/Linux); the field is omitted entirely (not "-") on every macOS row and on any non-ok row, which is why this column's field count varies by row — see the plugin README's Outputs section. Values: decimal degrees Celsius, or the field is absent.
+        example: "-"
+        platforms: [windows, linux]
+
+  readablePayload: "Report thermal status"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [power_health]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.power.power_plan
+  displayName: Power Plan Inventory
+  version: 1.0.0
+  description: >
+    Enumerates power schemes and reports which is active. Windows reads
+    PowrProf (PowerEnumerate + PowerReadFriendlyName + PowerGetActiveScheme —
+    no WMI, no powercfg, no COM); 4 schemes verified live on a real desktop,
+    2026-09-04. macOS is UNSUPPORTED: it has no named power schemes
+    (IOPMSetPMPreferences is SPI and is not adopted here). Linux is PLANNED
+    (platform_profile) and reports a declared-only status, not implemented
+    in this package.
+  tags: [power, power_plan, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: power_health
+    action: power_plan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # power_plan|<guid>|<friendly_name>|<active 0/1/->|<status>
+    # A GUID of "-" (status != ok) means no scheme rows were produced
+    # (timeout, incomplete enumeration, no schemes enumerated, or the
+    # platform doesn't support named schemes) -- status carries the reason.
+    # active is "-" (unknown, not fabricated 0/1) only when every scheme WAS
+    # enumerated but the active-scheme read itself failed
+    # (status=active_unknown); active is never used to carry status text.
+    columns:
+      - name: guid
+        type: string
+        description: 'Power scheme GUID, or "-" when no scheme rows were produced. Values: GUID string, or -.'
+        example: 381b4222-f694-41f0-9685-ff5bb260df2e
+        platforms: [windows]
+      - name: friendly_name
+        type: string
+        description: >-
+          Operator-visible scheme name (Windows PowerReadFriendlyName; operator-settable via powercfg -changename, so it is untrusted input to the pipe-delimited grammar), or "-". Values: free text, or -.
+        example: Balanced
+        platforms: [windows]
+      - name: active
+        # string, NOT boolean: this column is a tri-state "0"/"1"/"-", and the
+        # "-" is load-bearing (see the note above — every scheme enumerated but
+        # the active-scheme read failed). Declaring it boolean made the schema
+        # dishonest to exactly the machine consumers a typed schema exists for
+        # (agentic-first A5 item 4); a generated client would reject or
+        # misparse the "-" row. Modelled as string like users.yaml's analogous
+        # tri-state rather than fabricating a 0.
+        type: string
+        description: >-
+          Tri-state: "1" active, "0" not active/inapplicable, "-" only when every scheme WAS enumerated but the active-scheme read itself failed (status=active_unknown). Values: "0", "1", "-".
+        example: "1"
+        platforms: [windows, linux, darwin]
+      - name: status
+        type: string
+        description: >-
+          Row outcome: ok (a real enumerated scheme), timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, or planned_not_implemented. Values: ok, timeout, enumeration_incomplete, no_schemes_enumerated, active_unknown, unsupported_on_macos, planned_not_implemented.
+        example: ok
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "List power plans"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [power_health]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.power.set_power_plan
+  displayName: Set Power Plan
+  version: 1.0.0
+  description: >
+    Switches the active Windows power scheme (PowrProf PowerSetActiveScheme).
+    The ONLY mutating action in this plugin. `scheme` resolves against the
+    live PowerEnumerate list: a GUID is passed through as-is; a friendly
+    name requires an EXACT, case-insensitive, single match — zero or more
+    than one match is refused with a typed error and no mutation. The prior
+    active scheme is read before any mutation, and the new scheme is read
+    back and verified to match the target after the switch; every failure
+    branch pairs a typed error with a non-zero exit. Every failure BEFORE
+    PowerSetActiveScheme is called (missing param, incomplete enumeration,
+    no/ambiguous match, prior-read failure) leaves NO mutation applied. A
+    failure AFTER PowerSetActiveScheme reports success (a post-set
+    read-back timeout or mismatch) means the mutation itself may already be
+    in effect — final state is reported as UNKNOWN, never claimed
+    unchanged; `previous_guid` is still emitted so the caller can
+    verify/revert manually. UNSUPPORTED on macOS (no named schemes) and
+    PLANNED on Linux (platform_profile, not implemented) — neither ever
+    mutates.
+    Gated Destructive/Reversible via the registry-driven gate on REST
+    /api/command, MCP execute_instruction, and the dashboard exec console.
+    ScheduleRunner keeps its own approval-gated scope/broadcast fan-out
+    (this gate is never wired into dispatch_confined), so an approved
+    fleet-wide scheduled set_power_plan is permitted under the platform's
+    schedule-approval posture.
+  tags: [power, power_plan, destructive]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: power_health
+    action: set_power_plan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [scheme]
+    properties:
+      scheme:
+        type: string
+        description: >
+          Target power scheme — a GUID, or a friendly name that must match
+          exactly one live scheme (case-insensitive).
+        maxLength: 256
+
+  result:
+    # EVERY branch emits four fields after the discriminator, matching the
+    # positional `columns` below; `-` marks an absent field, never an
+    # empty one. A success row that omitted `reason` would shift
+    # previous_guid into reason and new_guid into previous_guid.
+    # set_power_plan|ok|-|<previous_guid>|<new_guid>
+    # set_power_plan|error|<reason>|<guid_or_dash>|<guid_or_dash>
+    columns:
+      - name: status
+        type: string
+        description: 'Mutation outcome. Values: ok, error.'
+        example: error
+        platforms: [windows, linux, darwin]
+      - name: reason
+        type: string
+        description: >-
+          Failure token, or "-" on a success row. missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, and readback_mismatch are Windows failure branches; unsupported_on_macos and planned_not_implemented are the permanent macOS/Linux postures. Values: missing_param, timeout, enumeration_incomplete, ambiguous, no_match, read_prior_failed, set_failed, readback_failed, readback_mismatch, unsupported_on_macos, planned_not_implemented, or -.
+        example: missing_param
+        platforms: [windows, linux, darwin]
+      - name: previous_guid
+        type: string
+        description: >-
+          The scheme GUID active before the mutation attempt (read before any mutation runs), or "-" when not reached or not applicable. Values: GUID string, or -.
+        example: "-"
+        platforms: [windows]
+      - name: new_guid
+        type: string
+        description: >-
+          The scheme GUID observed by the post-set read-back, or "-" when not reached. Values: GUID string, or -.
+        example: "-"
+        platforms: [windows]
+
+  readablePayload: "Set power plan to {{scheme}}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    # role-gated == ExecuteGate::AdminOrApproval, which is what the capability
+    # fragment authors. `always` would map to AlwaysApproval and contradict it:
+    # an Administrator may dispatch this directly, and everyone else needs an
+    # approval decision. tests/test_capability_gate_consistency.py enforces the
+    # agreement between these two declarations.
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [power_health]
+
+status:
+  phase: active

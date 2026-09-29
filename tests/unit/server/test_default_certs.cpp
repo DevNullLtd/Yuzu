@@ -10,11 +10,18 @@
 #include "default_certs.hpp"
 
 #include "ca_store.hpp"
+#include "key_provider.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "x509_ca.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
+
+#include <libpq-fe.h> // PQconnectdb/PQstatus/PGRES_* used directly by the UP-3 side-lock rendezvous
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
@@ -22,13 +29,16 @@
 #include <openssl/x509v3.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -40,6 +50,16 @@
 using namespace yuzu::server;
 
 namespace {
+
+// Shared with test_ca_store.cpp's "castore" key — identical setup, replay-verified by the
+// PgTestTemplate registry (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate ca_store_tpl{
+    "castore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::CaStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("ca_store template: store failed to migrate");
+    }};
 
 struct TempDir {
     std::filesystem::path path;
@@ -343,10 +363,11 @@ TEST_CASE("default_certs: regenerates the whole set when a key is missing",
     REQUIRE(std::filesystem::exists(second.server_key));
 }
 
-TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][ca_store]") {
+TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][ca_store][pg]") {
     TempDir dir;
-    yuzu::test::TempDbFile db{std::string_view{"defcerts-ca-"}};
-    CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
     REQUIRE(store.is_open());
 
     DefaultCertSet set;
@@ -354,44 +375,531 @@ TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][c
 
     REQUIRE(store.has_root());
     auto root = store.get_root();
-    REQUIRE(root);
-    REQUIRE(root->algo == "EcP384");
-    REQUIRE(root->mode == CaMode::Builtin);
-    REQUIRE(root->fingerprint_sha256 == set.ca_fingerprint_sha256);
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    REQUIRE((*root)->algo == "EcP384");
+    REQUIRE((*root)->mode == CaMode::Builtin);
+    REQUIRE((*root)->fingerprint_sha256 == set.ca_fingerprint_sha256);
 
     auto issued = store.list_issued();
-    REQUIRE(issued.size() == 3); // https + server + gateway
-    for (const auto& rec : issued) {
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3); // https + server + gateway
+    for (const auto& rec : *issued) {
         REQUIRE_FALSE(rec.cert_pem.empty());
         REQUIRE(rec.issued_by == "system:default-certs");
     }
 }
 
-TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
-          "[default_certs][ca_store][security]") {
-    // B-2 (#1238): a wiped/corrupt on-disk cert dir on a PERSISTENT ca.db must NOT
-    // silently regenerate a fresh CA — that would re-root the fleet and orphan
-    // every agent enrolled under the old root. ensure_default_certs must refuse;
-    // the bootstrap caller turns that into a refuse-to-start with a restore hint.
+TEST_CASE("default_certs: UP-2 self-heals a corrupt on-disk set when the local CA key "
+          "still matches ca_store's root, WITHOUT re-rooting (Gate 4 unhappy-path fix, "
+          "2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // B-2 (#1238) originally refused OUTRIGHT on any on-disk corruption against a
+    // populated ca_store — correct for the danger it targets (minting a FRESH CA,
+    // which would re-root the fleet), but overbroad: it also refused the much
+    // narrower "this exact instance crashed mid-completion (or one of its leaf
+    // files was later lost) and still holds the same CA key" case, which has a
+    // provable-safe self-heal — see the same-root assertions below. Red-first
+    // regression recipe (advisor, 2026-08-21): complete a boot, delete a leaf file
+    // (simulating the UP-2 crash window / later corruption) but keep the local CA
+    // key + ca_store root, re-run, expect completion — NOT the old refusal.
     TempDir dir;
-    yuzu::test::TempDbFile db{std::string_view{"defcerts-ca-"}};
-    CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
     DefaultCertSet a;
     REQUIRE(ensure_default_certs(dir.path, "host", &store, a));
     REQUIRE(store.has_root());
-    REQUIRE(store.list_issued().size() == 3);
+    REQUIRE(store.list_issued()->size() == 3);
 
-    // Corrupt the on-disk set while ca.db stays populated.
+    // Corrupt the on-disk set while ca_store stays populated; the local CA key
+    // (default-ca.key, never touched here) is what makes this instance provably
+    // the same one that established the root.
     std::error_code ec;
     std::filesystem::remove(a.server_key, ec);
     DefaultCertSet b;
-    REQUIRE_FALSE(ensure_default_certs(dir.path, "host", &store, b)); // refuse, don't re-root
-    REQUIRE_FALSE(b.freshly_generated);
-    // ca.db root + inventory left intact (not REPLACEd, not purged).
+    REQUIRE(ensure_default_certs(dir.path, "host", &store, b)); // self-heals, does not refuse
+    REQUIRE(b.freshly_generated);
+    // The invariant B-2 exists to protect is untouched: SAME root, not a new one.
     auto root_after = store.get_root();
-    REQUIRE(root_after);
-    REQUIRE(root_after->fingerprint_sha256 == a.ca_fingerprint_sha256);
-    REQUIRE(store.list_issued().size() == 3);
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
+    REQUIRE(b.ca_fingerprint_sha256 == a.ca_fingerprint_sha256);
+    // Leaves were re-minted (purge + fresh record), still exactly 3.
+    REQUIRE(store.list_issued()->size() == 3);
+}
+
+TEST_CASE("default_certs: B-2 still refuses when the local CA key does NOT resolve — the "
+          "genuine wiped-volume / botched-restore case (Gate 4 unhappy-path fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // The self-heal above is gated on possessing the ORIGINAL instance's local CA
+    // key file. A different instance/host/directory — no local "default-ca" key at
+    // that ca_store-recorded key_ref (an absolute path under the FIRST instance's
+    // own dir) — must still hit the original heavyweight refusal: this is the
+    // actual danger B-2 exists for (an operator about to mint a fresh CA over a
+    // fleet that already has one).
+    TempDir dir_a;
+    TempDir dir_b; // never shares dir_a's local key material
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    DefaultCertSet a;
+    REQUIRE(ensure_default_certs(dir_a.path, "host", &store, a));
+    REQUIRE(store.has_root());
+
+    DefaultCertSet b;
+    REQUIRE_FALSE(ensure_default_certs(dir_b.path, "host", &store, b)); // refuse, don't re-root
+    REQUIRE_FALSE(b.freshly_generated);
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
+    REQUIRE(store.list_issued()->size() == 3); // dir_a's inventory untouched
+}
+
+TEST_CASE("default_certs: two concurrent self-heal resumes on ONE shared cert dir never "
+          "produce a mismatched cert/key pair (Gate 8 fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Gate 8 (security-guardian + unhappy-path) found the self-heal ownership
+    // proof — local key resolves + cryptographically pairs with the stored root
+    // — is a STATIC predicate every process sharing the same cert directory
+    // satisfies IDENTICALLY. It is not a claim/CAS, so without a lock, two such
+    // processes (e.g. two HA replicas restarting against one shared volume,
+    // which docs/user-manual/upgrading.md's ADR-0053 HA note explicitly
+    // describes as supported) could both reach complete_default_cert_set()
+    // concurrently: unsynchronized per-file renames could leave a purpose's
+    // on-disk .pem from one racer and .key from the other, and both purges
+    // could each delete the other's just-recorded rows. The fix wraps entry to
+    // complete_default_cert_set() in a Postgres advisory lock + re-validate.
+    //
+    // ONE shared TempDir (not two, unlike the fresh-root race test above) — this
+    // is the multi-process-same-volume topology the bug required.
+    //
+    // HONEST LIMITATION (advisor-flagged, verified empirically 2026-08-21):
+    // this test does NOT reliably reproduce the pre-fix corruption — run 60x
+    // against the pre-lock commit (f4631a78a) in a throwaway worktree, it
+    // passed 60/60. The vulnerable window (two threads' fs::rename() calls to
+    // the SAME cert/key paths landing in an interleaved, mismatched order) is
+    // narrow enough that ordinary OS thread scheduling for two threads doing a
+    // short burst of synchronous file I/O essentially never lands there in
+    // practice, even though the race is real (confirmed by three independent
+    // code readings: security-guardian, unhappy-path, cpp-safety — plain
+    // rename() has no O_EXCL-equivalent collision detection, and nothing
+    // serialized entry before this fix). This test still asserts genuinely
+    // useful correctness properties (exactly 3 issued rows, every on-disk
+    // cert/key pair cryptographically matched) and DOES catch a
+    // fully-broken/absent lock (e.g. a lock that never actually blocks), but
+    // is NOT proof the specific corruption class is closed — that closure
+    // rests on the by-construction verification of the lock's mutual
+    // exclusion (lease/guard destruction ordering), not on this test having
+    // been shown red. Do not cite this test alone as red/green closure
+    // evidence for Finding A in a governance ledger.
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    CaStore store{pool};
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "host", &store, first));
+    REQUIRE(store.list_issued()->size() == 3);
+
+    // Simulate the UP-2 crash window: on-disk incomplete, ca_store root +
+    // local CA key both still intact — the self-heal precondition.
+    std::error_code ec;
+    std::filesystem::remove(first.server_key, ec);
+
+    DefaultCertSet set_a, set_b;
+    bool ok_a = false, ok_b = false;
+    std::thread ta([&] { ok_a = ensure_default_certs(dir.path, "host", &store, set_a); });
+    std::thread tb([&] { ok_b = ensure_default_certs(dir.path, "host", &store, set_b); });
+    ta.join();
+    tb.join();
+
+    // Both resolve successfully: whichever wins the advisory lock re-mints;
+    // whichever loses re-validates inside the lock, finds the winner's work
+    // already complete, and uses it — neither refuses (the lock never times
+    // out here; the critical section is milliseconds).
+    CHECK(ok_a);
+    CHECK(ok_b);
+
+    // The root itself is untouched — self-heal never re-roots.
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == first.ca_fingerprint_sha256);
+
+    // The core assertion: exactly 3 issued rows survive (never 0 from a
+    // cross-purge, never 6 from double-recording), and — the specific
+    // corruption class Gate 8 identified — every on-disk cert/key pair still
+    // cryptographically matches, proving no interleaved rename left a
+    // purpose's .pem from one racer paired with the other racer's .key.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+    for (const auto& rec : *issued) {
+        REQUIRE_FALSE(rec.cert_pem.empty());
+        REQUIRE(rec.issuer_fingerprint == first.ca_fingerprint_sha256);
+    }
+    const std::pair<std::filesystem::path, std::filesystem::path> pairs[] = {
+        {first.https_cert, first.https_key},
+        {first.server_cert, first.server_key},
+        {first.gateway_cert, first.gateway_key},
+    };
+    for (const auto& [cert_path, key_path] : pairs) {
+        REQUIRE(std::filesystem::exists(cert_path));
+        REQUIRE(std::filesystem::exists(key_path));
+        const std::string cert_pem = read_file(cert_path);
+        const std::string key_pem = read_file(key_path);
+        CHECK(pki::cert_matches_key(cert_pem, key_pem));
+        CHECK(pki::verify_chain(cert_pem, read_file(first.ca_cert)));
+    }
+}
+
+TEST_CASE("default_certs: a present-but-WRONG local key falls through to the B-2 refusal, "
+          "not a crash (Gate 8 fix, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Gate 8 (security-guardian NICE): the self-heal branch's KeyZeroGuard used
+    // to wrap the loaded key only AFTER cert_matches_key succeeded, leaving the
+    // load-succeeds-but-match-fails case unwiped in freed heap. Also: this exact
+    // branch had no coverage — the "still refuses" test above never reaches
+    // load_key() at all (has_key() short-circuits for an absent file). This
+    // exercises the present-but-mismatched path directly: a stale/mistaken
+    // local key from a botched restore, real operational case per the Gate 8
+    // report, not hypothetical.
+    TempDir dir_a;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    DefaultCertSet a;
+    REQUIRE(ensure_default_certs(dir_a.path, "host-a", &store, a));
+
+    // Plant an unrelated, real, well-formed EC P-384 key at the exact path
+    // ca_store's root already points at — key PRESENT, but the WRONG one
+    // (simulating a botched restore that copied the wrong CA key into place).
+    const auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    std::error_code ec;
+    std::filesystem::remove(a.server_key, ec); // force past the idempotent fast path
+    yuzu::server::FileKeyProvider dir_a_kp(dir_a.path);
+    auto unrelated_key = pki::generate_private_key(pki::KeyAlgo::EcP384);
+    REQUIRE(unrelated_key.has_value());
+    REQUIRE(dir_a_kp.store_key("default-ca", *unrelated_key)); // overwrite dir_a's real key
+
+    DefaultCertSet c;
+    REQUIRE_FALSE(ensure_default_certs(dir_a.path, "host-a", &store, c)); // still refuses
+    REQUIRE_FALSE(c.freshly_generated);
+    auto root_after = store.get_root();
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256); // unchanged
+}
+
+TEST_CASE("default_certs: a mismatched cert/key pair that lands on disk (however it got "
+          "there) self-heals on the very next boot, never validates as intact forever "
+          "(chaos-injector C5-1, Gate 5, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // C5-1's scenario: the bootstrap advisory lock's holding connection could
+    // die mid-critical-section (killed, idle-reaped, network-blackholed)
+    // without the process dying, silently releasing the session lock while a
+    // sibling racer's writes interleave with this attempt's still-in-flight
+    // ones — potentially leaving one purpose's on-disk cert from one racer
+    // paired with its key from the other. The fencing check added alongside
+    // this test (a liveness round-trip immediately before the marker write)
+    // closes the PREVENTION side; this test proves the DETECTION side: if a
+    // mismatched pair ever lands on disk regardless of cause, it must not
+    // validate as an intact, trustworthy set on every subsequent boot
+    // (before this fix, try_use_existing_complete_set() chain-verified but
+    // never checked key-pairing — a corrupted pair would have survived
+    // undetected indefinitely, worse than the crash-recovery gap UP-2 itself
+    // was about).
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "host", nullptr, set));
+    REQUIRE(set.freshly_generated);
+
+    // Simulate the corruption directly: swap the server leaf's key for an
+    // unrelated (but real, well-formed) one — same shape as an interleaved
+    // rename would produce, without needing to actually win the race.
+    auto unrelated_key = pki::generate_private_key(pki::KeyAlgo::EcP256);
+    REQUIRE(unrelated_key.has_value());
+    {
+        std::ofstream out_key(set.server_key, std::ios::binary | std::ios::trunc);
+        out_key << *unrelated_key;
+    }
+    // Sanity: the corruption is real — chain verification alone does NOT
+    // catch it (both the cert and the unrelated key are independently valid).
+    REQUIRE(pki::verify_chain(read_file(set.server_cert), read_file(set.ca_cert)));
+    REQUIRE_FALSE(pki::cert_matches_key(read_file(set.server_cert), *unrelated_key));
+
+    DefaultCertSet healed;
+    REQUIRE(ensure_default_certs(dir.path, "host", nullptr, healed));
+    REQUIRE(healed.freshly_generated); // did NOT accept the corrupted set as intact
+    // (No ca_store here, so regeneration mints a fresh CA — expected for this
+    // no-PG mode; the self-heal-under-the-SAME-root case is covered
+    // separately by the ca_store-backed self-heal tests above.)
+    // Post-heal, every pair is genuinely consistent again.
+    for (const auto& [cert_path, key_path] :
+        {std::pair{healed.https_cert, healed.https_key},
+         std::pair{healed.server_cert, healed.server_key},
+         std::pair{healed.gateway_cert, healed.gateway_key}}) {
+        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
+    }
+}
+
+TEST_CASE("default_certs: two racing first-boot instances never cross-purge each other's "
+          "leaf inventory (architect review, 2026-08-21)",
+          "[default_certs][ca_store][security][pg]") {
+    // Two SEPARATE local --ca-dir trees (simulating two server instances) racing the
+    // SAME shared ca_store, both starting from a genuinely empty root — the exact
+    // first-boot race ADR-0053's try_insert_root() exists to resolve. Before the fix,
+    // try_insert_root() ran AFTER leaf generation/record_issued(), so both instances
+    // could pass the B-2 empty-root check, generate + record their own 3 leaves, and
+    // whichever purged ("system:default-certs", an unscoped WHERE) SECOND would
+    // delete the FIRST instance's already-committed rows — including the eventual
+    // winner's, permanently orphaning its certs from ca_store. The fix moved
+    // try_insert_root() before any leaf generation/purge/record_issued() call, so a
+    // losing thread returns before touching ca_store's issued-cert table at all.
+    //
+    // NOTE (security-guardian, Gate 8 domain re-review of the UP-3 fix, 2026-08-21):
+    // since dir_a/dir_b are SEPARATE, the loser's UP-3 poll loop (default_certs.cpp)
+    // can never find the winner's files (they land in the OTHER directory) — this
+    // test now incurs the full kLoserSelfHealPollWindow (15s) wall-clock cost on the
+    // loser before it correctly falls back to refuse-and-restart. Expected, not a
+    // regression; noted so a slower run of this specific test isn't mistaken for
+    // infra flakiness.
+    TempDir dir_a;
+    TempDir dir_b;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE_FALSE(store.has_root()); // genuinely empty — the race precondition
+
+    DefaultCertSet set_a, set_b;
+    bool ok_a = false, ok_b = false;
+    std::thread ta([&] { ok_a = ensure_default_certs(dir_a.path, "host-a", &store, set_a); });
+    std::thread tb([&] { ok_b = ensure_default_certs(dir_b.path, "host-b", &store, set_b); });
+    ta.join();
+    tb.join();
+
+    // Exactly one side wins (generates a root + writes local certs); the other loses
+    // (try_insert_root reads back the winner's DIFFERENT fingerprint and refuses,
+    // per the existing single-instance loser-discards-material contract).
+    REQUIRE(ok_a != ok_b);
+    const DefaultCertSet& winner = ok_a ? set_a : set_b;
+    REQUIRE(winner.freshly_generated);
+
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    REQUIRE((*root)->fingerprint_sha256 == winner.ca_fingerprint_sha256);
+
+    // The core assertion: exactly the WINNER's 3 leaves survive — never 0 (the
+    // pre-fix cross-purge defect), never 6 (both sides' leaves double-counted).
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+    for (const auto& rec : *issued) {
+        REQUIRE_FALSE(rec.cert_pem.empty());
+        REQUIRE(rec.issuer_fingerprint == winner.ca_fingerprint_sha256);
+    }
+}
+
+TEST_CASE("default_certs: a losing HA replica self-heals from the shared cert dir instead "
+          "of needing a restart (UP-3, built on operator request)",
+          "[default_certs][ca_store][pg]") {
+    // Same race as above, but ONE SHARED cert directory (the only topology where
+    // self-heal is even possible — it reads the WINNER's material off the same
+    // disk both instances point at) instead of two separate ones. Before this
+    // fix, a loser returned false unconditionally, needing a process restart to
+    // pick up the winner's certs.
+    //
+    // SIX racers, not two: with a shared dir, a loser that checks get_root()
+    // AFTER the winner has already committed short-circuits through the
+    // pre-existing UP-2 self-heal branch (it finds the winner's key already on
+    // disk and adopts it there) WITHOUT ever reaching this fix's own code. The
+    // new fingerprint-mismatch poll loop only fires for a racer whose OWN
+    // get_root() gate saw EMPTY, generated its own candidate, and only THEN
+    // lost the try_insert_root() CAS.
+    //
+    // DETERMINISTIC RENDEZVOUS AT THE CAS (was a 15-attempt retry-until-lucky
+    // loop, #3475 — deflaked here). The old test spawned the six racers and
+    // RETRIED the whole scenario up to 15× hoping the scheduler produced that
+    // interleaving; under a loaded runner (Big Tam: four agents + parallel PG
+    // shards) every racer's get_root() could land after the winner committed
+    // all 15× — a hard, mechanism-less red. A thread-launch start barrier was
+    // tried and measured WORSE (it synchronizes thread launch, not the
+    // get_root()-vs-commit ordering that actually matters).
+    //
+    // The rendezvous IS the CAS itself, forced at the Postgres layer with ZERO
+    // production-code change (mirrors test_engine_principal_store.cpp's side
+    // lock and test_auth.cpp's pg_stat_activity observation): a side connection
+    // holds `LOCK TABLE ca_store.ca_root IN EXCLUSIVE MODE`, which ADMITS the
+    // six get_root() SELECTs (ACCESS SHARE) but BLOCKS the six try_insert_root
+    // INSERTs (ROW EXCLUSIVE). Because no INSERT can commit while the lock is
+    // held, every racer's earlier empty-root gate necessarily sees empty → every
+    // racer generates a candidate → every racer reaches the CAS. We poll
+    // pg_stat_activity until all six backends are genuinely WAITING on that lock
+    // (a direct observation of the mechanism, not a wall-clock proxy), then
+    // ROLLBACK to release them together: ON CONFLICT DO NOTHING picks exactly
+    // one winner and the other five read back the winner's fingerprint — five
+    // GENUINE UP-3 losers, every run. The losers then poll the shared dir for
+    // the winner's on-disk complete set (the real kLoserSelfHealPollWindow poll
+    // — NOT stubbed), so the self-heal wait is still genuinely exercised.
+    //
+    // The rendezvous also eliminates the CAPG-042 deferred-key-write refusal
+    // window the retry version had to tolerate: that refusal requires the
+    // top-of-function B-2 check to observe a COMMITTED root, which cannot happen
+    // while the lock blocks every INSERT — so all six racers succeed and the
+    // tolerance block is gone.
+    constexpr int kRacers = 6;
+
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    // Racer pool: lock_timeout raised well above the poll budget below so a
+    // racer INSERT blocked on the side lock can never lock_timeout-error before
+    // the unconditional ROLLBACK releases it (the 10s default would race a slow
+    // sixth racer on a loaded box). Sized generously above server-admin.md's
+    // "N+1 connections per racer needing the bootstrap lock" floor — several
+    // racers independently reach the lock, each needing an outer lease plus
+    // nested per-call leases; a small pool would hit that documented capacity
+    // limit, a property of this test's exaggerated concurrency, not a defect.
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 32, .lock_timeout_ms = 60000}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE_FALSE(store.has_root());
+
+    // Side connection holds ca_store.ca_root EXCLUSIVE so every racer blocks at
+    // its INSERT while its get_root() SELECT still passes. Manual BEGIN/LOCK/
+    // ROLLBACK (PgConn's dtor also PQfinishes, tearing down any open txn) —
+    // matches test_engine_principal_store.cpp's side-lock shape.
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(),
+                                          "LOCK TABLE ca_store.ca_root IN EXCLUSIVE MODE",
+                                          std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // Dedicated connection for observing the blocked backends — pg_stat_activity
+    // reflects live backend state synchronously, not an MVCC snapshot.
+    yuzu::server::pg::PgConn watch{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(watch.get()) == CONNECTION_OK);
+
+    std::array<DefaultCertSet, kRacers> sets;
+    std::array<bool, kRacers> oks{};
+    std::string logs;
+    int observed = 0;        // written on the main thread while racers are joinable
+    bool rollback_ok = false;
+    {
+        yuzu::test::LogCapture log;
+        std::vector<std::thread> threads;
+        threads.reserve(kRacers);
+        for (int i = 0; i < kRacers; ++i) {
+            threads.emplace_back([&, i] {
+                oks[static_cast<size_t>(i)] = ensure_default_certs(
+                    dir.path, "host-" + std::to_string(i), &store,
+                    sets[static_cast<size_t>(i)]);
+            });
+        }
+        // Poll (≤15s, 5ms interval — well under the racer pool's 60s
+        // lock_timeout) until all six racers are genuinely WAITING on the
+        // ca_store.ca_root lock. Scoped to THIS test's own database and
+        // excluding this connection's own backend: pg_stat_activity is
+        // cluster-wide and this repo runs many [pg] shards concurrently against
+        // one Postgres under the same role and table names (#1871), so an
+        // unscoped query could match an unrelated shard. NO Catch2 macro runs
+        // in this window — the racer threads are still joinable, and a throwing
+        // REQUIRE here would unwind past them and std::terminate the shard
+        // (test_auth.cpp's documented hazard); only plain locals are written,
+        // and std::atoi never throws (garbage → 0 → keep polling).
+        for (int i = 0; i < 3000 && observed < kRacers; ++i) {
+            yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+                watch.get(),
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND query ILIKE '%INSERT INTO ca_store.ca_root%' "
+                "AND datname = current_database() AND pid <> pg_backend_pid()",
+                std::vector<std::string>{});
+            if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1)
+                observed = std::atoi(PQgetvalue(res.get(), 0, 0));
+            if (observed >= kRacers)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        // Release the blocked INSERTs together — UNCONDITIONAL, so a racer that
+        // never blocked (a genuine keygen/dir failure → oks[i]==false, caught
+        // below) still completes and the threads can join rather than hang.
+        rollback_ok =
+            yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK;
+        for (auto& t : threads)
+            t.join();
+        log.stop();
+        logs = log.text();
+    }
+    INFO("captured boot logs:\n" << logs);
+
+    REQUIRE(rollback_ok);
+    // Every racer reached the CAS and blocked on the side lock — the whole point
+    // of the rendezvous. Fewer than six means the interleaving this test asserts
+    // never formed (investigate — never retry away).
+    REQUIRE(observed == kRacers);
+
+    // All six succeed: under the lock no INSERT commits, so no racer's top-of-
+    // function gate can see a committed root, so none diverts to UP-2 and none
+    // hits the CAPG-042 deferred-key-write refusal window.
+    REQUIRE(std::count(oks.begin(), oks.end(), true) == kRacers);
+
+    // Exactly one racer won the CAS and generated; the other five lost it and
+    // self-healed via the NEW poll-loop branch. COUNT occurrences, not mere
+    // presence (a presence check would let one masked case hide another): the
+    // loser needle "lost the first-boot CA-root race" (default_certs.cpp) is
+    // distinct from ca_store.cpp's "LOST the first-boot race" (case-sensitive,
+    // no "CA-root"), so == kRacers - 1 is exact.
+    auto count_occurrences = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (std::size_t pos = logs.find(needle); pos != std::string::npos;
+             pos = logs.find(needle, pos + needle.size()))
+            ++n;
+        return n;
+    };
+    REQUIRE(count_occurrences("lost the first-boot CA-root race") ==
+            static_cast<std::size_t>(kRacers - 1));
+    REQUIRE(count_occurrences("self-healed onto the winning root") ==
+            static_cast<std::size_t>(kRacers - 1));
+
+    // Exactly one racer actually generated; try_use_existing_complete_set()
+    // never sets this true, so every self-healed loser reads false.
+    const auto winners = std::count_if(sets.begin(), sets.end(),
+                                       [](const auto& s) { return s.freshly_generated; });
+    REQUIRE(winners == 1);
+
+    auto root = store.get_root();
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+
+    // Every racer converges on the SAME winning root's material — no divergent
+    // view, and nobody adopted its own discarded generation.
+    for (int i = 0; i < kRacers; ++i)
+        REQUIRE(sets[static_cast<size_t>(i)].ca_fingerprint_sha256 ==
+               (*root)->fingerprint_sha256);
+
+    // Still exactly 3 issued rows — no racer re-purges or re-records once it
+    // adopts the winner's already-written set.
+    auto issued = store.list_issued();
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3);
+
+    // Every on-disk pair is genuinely consistent (every racer's `out` points at
+    // the same shared dir, so this checks the one real set on disk).
+    for (const auto& [cert_path, key_path] :
+        {std::pair{sets[0].https_cert, sets[0].https_key},
+         std::pair{sets[0].server_cert, sets[0].server_key},
+         std::pair{sets[0].gateway_cert, sets[0].gateway_key}}) {
+        CHECK(pki::cert_matches_key(read_file(cert_path), read_file(key_path)));
+    }
 }
 
 TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be created",

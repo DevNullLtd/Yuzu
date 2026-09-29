@@ -1,0 +1,11 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a8a6121c1219
+== action=query wql="SELECT Caption FROM Win32_OperatingSystem"
+error|WMI not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+
+== action=get_instance class=Win32_OperatingSystem
+error|WMI not available on this platform
+[result_status] UNDECLARED / UNKNOWN / 
+[rc] 1
+

@@ -91,9 +91,9 @@ ESTATS — see its row.
 |---|---|---|---|
 | Linux | Full — netlink `INET_DIAG` per-connection `TCP_INFO` | Yes — per-connection sum | Yes (`/proc/net/dev`) |
 | Windows | Heartbeat: not yet · **per-connection: yes via the opt-in `netqual` tier (ESTATS, elevated — ADR-0020)** | Yes — `GetTcpStatisticsEx` (system-wide; see caveat) | Yes (`GetIfTable2`) |
-| macOS | Not yet | Not yet | Not yet |
+| macOS | Not yet (deferred) | Not yet (deferred) | Yes (`NET_RT_IFLIST2`) |
 
-**Linux and Windows agents emit network facts; macOS does not yet.** At the
+**Linux, Windows, and macOS agents all emit heartbeat network facts.** At the
 **heartbeat** layer Windows reports device throughput (`GetIfTable2`) and an
 interval retransmit rate (`GetTcpStatisticsEx`) but **not RTT** — the fleet
 gauge has no per-connection ESTATS sweep. **Per-connection smoothed RTT IS
@@ -106,10 +106,17 @@ retransmit MIB, so it
 *includes loopback* and cannot be scoped to real interfaces; (2) it is
 **measurement-first, unvalidated on Windows** — the interval-delta signal's
 separation-under-loss was validated under `netem` on Linux only, and on a
-loopback-dominated host (e.g. a single-box UAT rig) it dilutes toward ~0. macOS
-agents emit *nothing* yet (a later slice). Absent metrics are always omitted from
-rollups; a device that does not report a metric is excluded from that metric's
-denominator, never counted as zero.
+loopback-dominated host (e.g. a single-box UAT rig) it dilutes toward ~0.
+**macOS reports device throughput only**, via `NET_RT_IFLIST2` (a
+routing-socket interface-list walk) — the same coarse, non-loopback aggregate
+as the Linux/Windows paths. **Retransmit and RTT are deferred on macOS in v1.**
+The originally-planned retransmit source — the global `net.inet.tcp.stats` OID
+— is unusable: it returns an all-zero counter struct on current macOS (every
+field reads 0, matching Apple's own `netstat -s -p tcp`), so it cannot back a
+retransmit metric. A retransmit fact will follow from a per-flow source (a planned
+NetworkStatistics/`nstat` client). Absent metrics are always
+omitted from rollups; a device that does not report a metric is excluded from
+that metric's denominator, never counted as zero.
 
 ## Collection & privacy
 
@@ -137,12 +144,26 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 - **On-device.** These rows stay in the local warehouse (queryable via the
   Execute-gated TAR SQL surface as `$NetQual_Live`); they are not shipped to the
   server. A per-tick top-N cap and a row-count retention ceiling bound storage.
-- **Linux and Windows.** Linux reads netlink INET_DIAG; Windows reads TCP ESTATS
-  (ADR-0020) and **requires an elevated agent** — non-elevated it records
-  nothing and `tar.status` reports `netqual_capture_method|none`. Windows RTT is
-  ms-resolution and `retrans`/`segs_out` count from first observation of the
-  connection, not connection start (constraints listed in the compatibility
-  matrix). macOS is planned.
+- **Linux, Windows, and macOS.** Linux reads netlink INET_DIAG; Windows reads
+  TCP ESTATS (ADR-0020) and **requires an elevated agent** — non-elevated it
+  records nothing and `tar.status` reports `netqual_capture_method|none`.
+  Windows RTT is ms-resolution and `retrans`/`segs_out` count from first
+  observation of the connection, not connection start (constraints listed in
+  the compatibility matrix). **macOS reads per-socket `tcp_connection_info`
+  via `nstat`**, the private `com.apple.network.statistics` kernel control
+  (no framework, no entitlement) that also drives the macOS `tcp` source's
+  event-driven lifecycle. It carries the same elevation caveat as
+  Windows in spirit but a different mechanism: **system-wide flow visibility
+  requires root**, so a non-root agent records nothing and reports
+  `netqual_capture_method|none` rather than a silently partial capture. macOS
+  RTT is already microsecond-resolution (no unit conversion); `lost` is a
+  per-tick delta like Windows, since nstat exposes cumulative retransmit
+  counters, not an instantaneous loss gauge. The struct layout is a private,
+  version-unstable interface — a runtime self-check falls back to
+  `capture_method=none` on a layout mismatch rather than emit wrong values,
+  and the mechanism is pending validation on real hardware (see
+  `docs/darwin-compat.md` and the compatibility matrix in
+  [the TAR dashboard doc](tar.md)).
 - **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
   boot from since-boot OS counters — a coarse "network quality before TAR was
   running this boot" baseline — and the separate opt-in **`netconn`** source

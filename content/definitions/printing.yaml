@@ -1,0 +1,314 @@
+## Printing Definitions
+## Reports printers and their queued jobs, plus one narrowly-scoped mutation
+## that cancels EXACTLY ONE job.
+## Plugin: printing | Actions: printers, jobs, clear_queue
+##
+## Sources by platform:
+##   Windows: winspool EnumPrintersW/EnumJobsW level 2 (printers/jobs);
+##            SetJobW(JOB_CONTROL_CANCEL) on one job id (clear_queue).
+##   macOS/Linux: raw IPP (RFC 8010) over the CUPS Unix domain socket via
+##            cpp-httplib — no libcups. Reads fall back to TCP
+##            localhost:631 when no socket is found; clear_queue never
+##            falls back to TCP (it needs the socket for peer-credential
+##            authorization — see below).
+##
+## clear_queue AUTHORIZATION (macOS, measured): cupsd's Cancel-Job policy
+## consults the Unix-socket peer's credentials only when the request carries
+## header `Authorization: PeerCred <username>`, so this action sends both
+## `requesting-user-name` in the IPP body and that header, over the Unix
+## socket only. See docs/user-manual/agent-plugins.md for the measured
+## with/without-header behaviour.
+##
+## clear_queue is Destructive+Irreversible — see
+## server/core/src/capability_decls/plugin_action_catalogue_printing.hpp for
+## the full targeting-gate reach.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.printing.printers
+  displayName: List Printers
+  version: 1.0.0
+  description: >
+    Lists every printer known to the local print system: name, state
+    (idle/processing/stopped/unknown), state reasons, whether it is the
+    system default, make and model, uri/port, and queued job count.
+  tags: [printing, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: printing
+    action: printers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # printer|<name>|<state>|<state_reasons>|<is_default>|<make_model>|<uri>|<queued_jobs>
+    columns:
+      - name: name
+        type: string
+        description: 'Printer name/identifier as reported by the platform mechanism.'
+        example: Office-LaserJet
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'Reported printer state. Values: idle, processing, stopped, unknown.'
+        example: idle
+        platforms: [windows, linux, darwin]
+      - name: state_reasons
+        type: string
+        description: 'Comma-joined printer-state-reasons keywords, or "-" when none reported. winspool has no equivalent vocabulary and always reports "-".'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: is_default
+        type: boolean
+        description: 'Whether this is the system default printer. Values: 1, 0 — a digit, never true/false.'
+        example: "1"
+        platforms: [windows, linux, darwin]
+      - name: make_model
+        type: string
+        description: 'Make/model string (IPP printer-make-and-model, or the winspool driver name), or "-" when unavailable.'
+        example: "Local Raw Printer"
+        platforms: [windows, linux, darwin]
+      - name: uri
+        type: string
+        description: 'Printer URI (IPP printer-uri-supported, or the winspool port name), or "-" when unavailable.'
+        example: "ipp://localhost/printers/Office-LaserJet"
+        platforms: [windows, linux, darwin]
+      - name: queued_jobs
+        type: int64
+        description: 'Number of jobs currently queued on this printer. Values: 0 or greater, or -1 (unknown — the mechanism did not report a count).'
+        example: "0"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "List printers"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [printing]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.printing.jobs
+  displayName: List Print Jobs
+  version: 1.0.0
+  description: >
+    Lists queued print jobs, optionally filtered to one printer: printer,
+    job id, owner, document name, status, submission time (ISO-8601 UTC),
+    and size in bytes. The document field is the job's user-supplied
+    title/filename — it is treated as instruction-result user content
+    (server instruction-result retention only; never forwarded to
+    daily-sync, TAR, or DEX). It exists so an operator can identify which
+    job a subsequent clear_queue call should target.
+  tags: [printing, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: printing
+    action: jobs
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      printer:
+        type: string
+        displayName: Printer Name
+        description: 'Optional printer name to filter to. When omitted, jobs across every printer are listed.'
+        validation:
+          maxLength: 256
+
+  result:
+    # job|<printer>|<job_id>|<owner>|<document>|<status>|<submitted_at>|<size_bytes>
+    columns:
+      - name: printer
+        type: string
+        description: 'The printer this job is queued on (URI on the IPP leg, printer name on Windows), or "-" when unavailable.'
+        example: "ipp://localhost/printers/Office-LaserJet"
+        platforms: [windows, linux, darwin]
+      - name: job_id
+        type: int64
+        description: 'Job identifier — the value clear_queue''s job_id parameter targets. Values: 1 or greater.'
+        example: "42"
+        platforms: [windows, linux, darwin]
+      - name: owner
+        type: string
+        description: 'The submitting user, or "-" when unavailable.'
+        example: alex
+        platforms: [windows, linux, darwin]
+      - name: document
+        type: string
+        description: 'The job''s document name/title, or "-" when unavailable. User content — see this definition''s retention note above.'
+        example: hosts
+        platforms: [windows, linux, darwin]
+      - name: status
+        type: string
+        description: 'Job status. Values: pending, held, processing, stopped, canceled, aborted, completed, unknown.'
+        example: processing
+        platforms: [windows, linux, darwin]
+      - name: submitted_at
+        type: string
+        description: 'ISO-8601 UTC submission timestamp, or "-" when unavailable.'
+        example: "2026-09-08T12:00:00Z"
+        platforms: [windows, linux, darwin]
+      - name: size_bytes
+        type: int64
+        description: 'Job size in bytes, or -1 (unknown).'
+        example: "1024"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "List print jobs{{#if printer}} on {{printer}}{{/if}}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [printing]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.printing.clear_queue
+  displayName: Cancel Print Job
+  version: 1.0.0
+  description: >
+    Cancels EXACTLY ONE queued print job, identified by printer and job id
+    (both required). This is a state-changing, Destructive+Irreversible
+    action requiring role-gated approval — there is no purge-all/cancel-all
+    path. On Windows, uses SetJobW(JOB_CONTROL_CANCEL); the spooler itself
+    looks the job up on the named printer. On macOS/Linux, over the CUPS Unix
+    domain socket with Authorization: PeerCred (it refuses, and never falls
+    back to TCP, when no socket is found), the agent first lists the named
+    printer's not-completed jobs and only then sends an IPP Cancel-Job request
+    (cupsd's Cancel-Job ignores the printer, so the job must be proven to be on
+    it first).
+  tags: [printing, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: printing
+    action: clear_queue
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [printer, job_id]
+    properties:
+      printer:
+        type: string
+        displayName: Printer Name
+        description: >-
+          The printer's name, as shown by `printers`. The job must be on this
+          printer: a job id that belongs to a different printer, or a printer that
+          does not exist, is reported as not_found and nothing is cancelled. On
+          macOS/Linux the destination URI that `jobs` prints
+          (`ipp://localhost:631/printers/NAME`) is also accepted, a job submitted
+          to a printer class is addressed by the class name, and a name over 127
+          bytes, containing control characters, or not valid UTF-8 (for example a
+          pasted `%FF`) is refused (invalid_printer), as is, on Windows, a name
+          containing a comma, a control character or invalid UTF-8.
+          macOS/Linux match the name
+          case-insensitively, as cupsd does.
+        validation:
+          minLength: 1
+          maxLength: 256
+      job_id:
+        type: string
+        displayName: Job ID
+        description: 'The job identifier to cancel, from the jobs action''s job_id column.'
+        validation:
+          pattern: "^[1-9][0-9]{0,8}$"
+
+  result:
+    # clear_queue|<printer>|<job_id>|<outcome>|<detail>
+    columns:
+      - name: printer
+        type: string
+        description: 'The printer the target job was on (its name; on macOS/Linux a pasted destination URI is reduced to the name), or "-" when the param itself was missing or invalid.'
+        example: Office-LaserJet
+        platforms: [windows, linux, darwin]
+      - name: job_id
+        type: int64
+        description: 'The job id targeted, or 0 when the param itself was missing/invalid.'
+        example: "42"
+        platforms: [windows, linux, darwin]
+      - name: outcome
+        type: string
+        description: >-
+          Values: canceled, not_found, refused, error. `canceled` means the
+          spooler/cupsd ACCEPTED the cancel request, not that the job has already
+          left the queue: an actively printing job can take a moment to clear, so
+          confirm with `jobs`.
+        example: canceled
+        platforms: [windows, linux, darwin]
+      - name: detail
+        type: string
+        description: >-
+          "-" on a successful cancel; otherwise a <os>:<source>:<detail> failure token, or missing_printer/invalid_job_id/invalid_printer for a parameter validation failure.
+        example: "-"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Cancel job {{job_id}} on {{printer}}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    # role-gated == ExecuteGate::AdminOrApproval — see
+    # plugin_action_catalogue_printing.hpp. `always` would map to
+    # AlwaysApproval and contradict it: an Administrator may dispatch this
+    # directly, and everyone else needs an approval decision.
+    # tests/test_capability_gate_consistency.py enforces the agreement
+    # between these two declarations.
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [printing]
+
+status:
+  phase: active

@@ -84,6 +84,33 @@ inline std::string escape_pipes(std::string_view s) {
     return out;
 }
 
+/// Escape a value for a pipe-delimited output field, safely.
+///
+/// The shared server decoder (server/core/src/result_parsing.hpp) only knows
+/// how to undo a single backslash before a pipe ("\|" -> "|"); it treats any
+/// other backslash, including a doubled one, as literal data. Making this
+/// function fully reversible would require changing that shared decoder,
+/// which would silently corrupt '\\' values already emitted by every other
+/// producer on the wire. So this is intentionally LOSSY on literal
+/// backslashes: a literal '\' folds to '/' before pipe-escaping, and CR/LF
+/// fold to spaces (newlines are the row separator and have no escape
+/// representation in this grammar). A fully reversible escape grammar is
+/// deferred to a versioned protocol migration that updates the decoder and
+/// every producer together.
+inline std::string safe_output_field(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\\')
+            out += '/';
+        else if (ch == '\r' || ch == '\n')
+            out += ' ';
+        else
+            out += ch;
+    }
+    return escape_pipes(out);
+}
+
 /// Sanitize input: only allow alphanumeric, spaces, dots, hyphens, underscores,
 /// and slashes. Used to prevent command injection in subprocess arguments.
 inline std::string sanitize_input(std::string_view input) {

@@ -237,7 +237,7 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
 std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
                                 const std::string& repoll_url, bool run_complete,
-                                const std::string& run_id) {
+                                const std::string& run_id, const std::string& degrade_note) {
     using preflight::Bucket;
     using preflight::Verdict;
 
@@ -282,6 +282,9 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
         h += " hx-get=\"" + esc(repoll_url) +
              "\" hx-trigger=\"load delay:700ms\" hx-swap=\"outerHTML\"";
     h += ">";
+
+    if (!degrade_note.empty())
+        h += "<div class=\"result-degrade-banner\"><b>" + esc(degrade_note) + "</b></div>";
 
     h += "<div class=\"af-rhd\">Pre-flight &mdash; <b>" + esc(scope_label) + "</b>";
     if (!config_summary.empty())
@@ -366,8 +369,8 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
                 }
             h += "<div class=\"af-dev\" data-bucket=\"" + std::string(bucket_key(bk)) +
                  "\" data-fails=\"" + esc(fails) + "\">";
-            // Device name links into the per-device view (/device?id=).
-            h += "<span class=\"hn\"><a href=\"/device?id=" + esc(d.agent_id) + "\">" + esc(host) +
+            // Device name links into the per-device view (/hardware/ci?id=).
+            h += "<span class=\"hn\"><a href=\"/hardware/ci?id=" + esc(d.agent_id) + "\">" + esc(host) +
                  "</a></span>";
             h += "<span class=\"os\">" + esc(osline) + "</span><span class=\"badges\">";
             // Every check's status (pass = green), so the full per-device picture

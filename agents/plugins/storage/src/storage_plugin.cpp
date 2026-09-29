@@ -24,6 +24,63 @@ namespace {
 
 YuzuPluginContext* g_ctx = nullptr;
 
+// ABI4 capability declarations (#2204). Every action goes through the
+// in-process agent KV store (yuzu_ctx_storage_*) — no OS-specific code and
+// no subprocess anywhere in this plugin — so every leg is rung 1 uniformly.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "set",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_set)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_set)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_set)", nullptr},
+    },
+    {
+        /* .action      = */ "get",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_get)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_get)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_get)", nullptr},
+    },
+    {
+        /* .action      = */ "delete",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_delete)",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_delete)",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_delete)",
+         nullptr},
+    },
+    {
+        /* .action      = */ "list",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_list)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_list)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "in-process agent KV store (yuzu_ctx_storage_list)", nullptr},
+    },
+    {
+        /* .action      = */ "clear",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key)", nullptr},
+    },
+};
+
 } // namespace
 
 class StoragePlugin final : public yuzu::Plugin {
@@ -37,6 +94,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"set", "get", "delete", "list", "clear", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

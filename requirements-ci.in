@@ -8,7 +8,7 @@
 # colorlog on win32 only), and the Windows release leg then fails
 # `pip install --require-hashes` because colorama arrives unpinned. The
 # colorama entry in requirements-ci.txt is currently hand-maintained.
-meson==1.11.1
+meson==1.12.0
 # pyyaml is a build-time dep of server/core/scripts/embed_content.py, which
 # converts content/definitions/*.yaml + content/packs/*.yaml into the
 # bundled_content.cpp JSON envelopes the server auto-imports on startup.

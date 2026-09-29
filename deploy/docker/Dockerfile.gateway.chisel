@@ -48,10 +48,10 @@ RUN rebar3 as prod release \
     && ldd _build/prod/rel/yuzu_gw/erts-*/bin/beam.smp || true
 
 # ── Stage 3: chisel — cut Ubuntu 26.04 rootfs + lay down the release ──────
-FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS chisel
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS chisel
 
 ARG TARGETARCH
-ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_VERSION=v1.4.2
 ARG CHISEL_RELEASE=ubuntu-26.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -63,8 +63,8 @@ ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chis
 # single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
-      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      amd64) want=3b3d86ea38045e54a13334e358ab8da12e6dd33342163c5c1ba13525f1070cfe ;; \
+      arm64) want=398050085cf32d7718ba1e2fad144b179e0943d0e0376b2a0614577c51d331e8 ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
@@ -114,6 +114,18 @@ RUN set -eux; \
       [ "$app" = busybox ] && continue; \
       ln -sf busybox "$BBDIR/$app"; \
     done; \
+    # WARNING: busybox has NO `bash` applet. This symlink makes /bin/bash EXIST
+    # while ALWAYS failing -- `/bin/bash -c ...` exits 127 "applet not found"
+    # (verified against the published gateway-chisel image). It is here only so a
+    # `#!/bin/bash` shebang resolves to something; nothing in this image actually
+    # runs bash (the OTP boot script is `#!/bin/sh`).
+    #
+    # NEVER healthcheck this image with bash. Copying the server's
+    # `bash -c 'exec 3<>/dev/tcp/...'` healthcheck onto a chisel image would park
+    # the container `unhealthy` forever while every test still passed -- the exact
+    # failure class #751 exists to prevent, and a `test -x /bin/bash` would not
+    # catch it. Use `/bin/busybox wget --spider`, which is what the demo compose
+    # does and what scripts/ci/verify-healthcheck-invariants.sh enforces.
     ln -sf busybox "$BBDIR/bash"; \
     test -x "$BBDIR/busybox" && test -L "$BBDIR/sh" && test -L "$BBDIR/dirname" && test -L "$BBDIR/sed"
 

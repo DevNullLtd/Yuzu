@@ -79,8 +79,38 @@ name: "CodeQL"
 # the OpenSSF Scorecard SAST check measures (it scored 7/10 with the
 # nightly-only cadence: "0 of 21 commits checked"). Do not "simplify"
 # by folding the PR leg into the heavy matrix or vice versa.
+#
+# STANDING INVARIANT — never workflow_dispatch this on a non-default
+# branch. A dispatch uploads SARIF attributed to whatever ref it ran on,
+# which plants a durable code-scanning *configuration* on that branch.
+# GitHub's PR code-scanning check then compares the base branch's
+# configurations against the ones the PR produced — and PRs only ever
+# produce `/language:actions-pr` (the fast-path above), never the c-cpp
+# pair. Result: every PR into that branch gets a permanent
+# "N configurations not found" neutral check. It does NOT self-heal;
+# nothing re-runs c-cpp on a non-default branch (no `push:` trigger, and
+# `schedule:` fires only on the default branch), so the planted config
+# is orphaned the moment the dispatch finishes. Re-dispatching makes it
+# worse, not better — the only cure is deleting every stale analysis on
+# that ref via `DELETE /repos/{o}/{r}/code-scanning/analyses/{id}`
+# (newest-first per category; `?confirm_delete` on the last of a chain).
+#
+# To iterate on this workflow, open a PR and let the fast-path run, or
+# dispatch from the default branch. If you must dispatch from a topic
+# branch, plan to delete the analyses it leaves behind.
+#
+# History:
+#   2026-05-04 + 2026-05-19: workflow_dispatch runs on `dev` while
+#     debugging the SARIF filter planted 28 c-cpp analyses there.
+#   2026-07-04 (c5072788): the PR fast-path leg started posting a CodeQL
+#     check on every PR, which surfaced the orphans as a neutral
+#     "2 configurations not found" on every PR into dev for ~3 weeks.
+#   2026-07-29: all 28 stale `dev` analyses deleted; check went green.
 
 on:
+  # See the STANDING INVARIANT above: default branch only. Dispatching
+  # from a topic branch plants an orphaned code-scanning configuration
+  # that red-flags every subsequent PR into that branch.
   workflow_dispatch:
   pull_request:
     branches: [dev, main]
@@ -120,18 +150,18 @@ jobs:
       security-events: write   # github/codeql-action/analyze SARIF upload
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: actions
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           # Distinct category from the nightly Linux leg's actions scan so
           # the two analysis series don't overwrite each other's alerts.
@@ -178,8 +208,8 @@ jobs:
             # [self-hosted, Windows, X64] set matches BOTH pools; pinning routes
             # the daily trace to the proven Wee Tam fleet (shared vcpkg binary
             # cache, meets the 45 GB disk floor). Wee Tam runners are CCD-pinned
-            # to 16 threads, so the Build step passes -j $YUZU_BUILD_JOBS (set by
-            # the pin wrapper) — without it ninja sizes -j from the 64-CPU host
+            # to 16 threads, so the Build step passes the job-level
+            # -j $YUZU_BUILD_JOBS cap — without it ninja sizes -j from the 64-CPU host
             # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
             # CCACHE_RECACHE's forced full recompile makes acute.
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
@@ -208,9 +238,13 @@ jobs:
         # Per-leg shell override — see the matrix `shell:` values above
         # for why Windows can't use the default `bash` keyword.
         shell: ${{ matrix.shell }}
+    env:
+      # Both matrix legs run on one-CCD self-hosted runners (Big Tam Linux or
+      # Wee Tam Windows), each with 16 logical CPUs.
+      YUZU_BUILD_JOBS: "16"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -226,6 +260,8 @@ jobs:
       - name: Setup MSVC (windows)
         if: matrix.os == 'windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       # Big Tam (the Linux leg's runner) does not carry meson on the default
       # PATH: ci.yml pip-installs it under ~/.local/bin and adds that to PATH
@@ -243,7 +279,7 @@ jobs:
             sudo apt-get -o DPkg::Lock::Timeout=300 update
             sudo apt-get -o DPkg::Lock::Timeout=300 install -y \
               cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-              bison flex libsystemd-dev autoconf automake libtool gcc-15 g++-15
+              bison flex libsystemd-dev libblkid-dev autoconf automake libtool gcc-15 g++-15
           ) 9>/tmp/yuzu-ci-apt.lock
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -377,7 +413,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -470,11 +506,9 @@ jobs:
         # the cache update and degrade subsequent CI builds.
         env:
           CCACHE_RECACHE: "true"
-        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS on
-        # Wee Tam (unset elsewhere → ninja default, so the Linux leg is
-        # unaffected). Essential here because CCACHE_RECACHE forces every TU to
-        # actually compile, so an uncapped ninja oversubscribes the pinned CCD.
-        run: meson compile -C ${{ matrix.build_dir }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        # Essential because CCACHE_RECACHE forces every TU to compile. Both
+        # hosts are one-CCD-per-runner, so cap Ninja to that 16-thread domain.
+        run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
         if: always()
@@ -486,7 +520,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -542,7 +576,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

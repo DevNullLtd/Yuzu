@@ -4,6 +4,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_retention_guard.hpp"
 #include "pg/pg_raii.hpp"
 
 #include <libpq-fe.h>
@@ -63,9 +64,26 @@ const std::vector<pg::PgMigration>& migrations() {
          "  checks_json   TEXT NOT NULL DEFAULT '',"
          "  updated_at_ms BIGINT NOT NULL DEFAULT 0,"
          "  PRIMARY KEY (run_id, agent_id));"},
+        // WS-10 (#2508): durable anchor + dedup state for the clock-guarded,
+        // single-writer retention prune (shared shape, see run_retention_prune).
+        {2, "CREATE TABLE IF NOT EXISTS retention_meta ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // WS-10 (#2508): leading `created_at_ms` index so the retention guard's
+        // EXISTS probe is index-eligible (runs_owner_idx leads on created_by, not
+        // the timestamp). Small table (14-day pruned) → a plain in-txn CREATE INDEX
+        // is fine (no CONCURRENTLY needed).
+        {3, "CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at_ms);"},
     };
     return kMigrations;
 }
+
+// WS-10 retention-guard constants — PER-STORE (copy the SHAPE, never the numbers;
+// clock-guarded-retention routed concern). preflight runs are non-regenerable
+// operator go/no-go records at a ~60s prune cadence, 14-day retention.
+constexpr std::int64_t kPruneBigStepFloorMs = 86'400'000;    // 24h absolute: > any legit inter-pass gap at 60s cadence, < the 14d window
+constexpr std::int64_t kPruneImplausibilityMs = 86'400'000;  // created_at_ms is never future; a row >1d ahead is skew, excluded from would-wipe
+constexpr std::int64_t kPruneMinPlausibleMs = 946'684'800'000; // year 2000 in ms — an anchor below this is unusable
+constexpr std::int64_t kPruneCapPerPass = 5'000;             // bounded drain per pass (kRowCap=20000)
 
 std::int64_t to_i64(const char* s) {
     if (s == nullptr || s[0] == '\0')
@@ -195,11 +213,24 @@ bool PreflightRunStore::create_run(const PreflightRunRow& run,
 
 std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run_id,
                                                          const std::string& created_by) {
-    if (!open_ || run_id.empty())
-        return std::nullopt;
+    auto r = get_run_checked(run_id, created_by);
+    // Discard the store-error channel — see the header's doc comment: this
+    // wrapper exists to preserve the pre-#4036 fail-soft contract for the
+    // HTML-fragment callers, which never distinguished "absent" from "store
+    // faulted". A checked caller error also degrades to nullopt here (never
+    // throws), same shape as every other pre-existing call site.
+    return r.value_or(std::nullopt);
+}
+
+std::expected<std::optional<PreflightRunRow>, std::string>
+PreflightRunStore::get_run_checked(const std::string& run_id, const std::string& created_by) {
+    if (run_id.empty())
+        return std::optional<PreflightRunRow>{std::nullopt}; // caller-input miss, not a store fault
+    if (!open_)
+        return std::unexpected("preflight run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return std::unexpected("pool acquire timeout");
     std::string sql =
         std::string("SELECT ") + kRunCols + " FROM preflight_run_store.runs WHERE run_id = $1";
     std::vector<std::string> params{run_id};
@@ -208,19 +239,28 @@ std::optional<PreflightRunRow> PreflightRunStore::get_run(const std::string& run
         params.push_back(created_by);
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
-    return read_run(res.get(), 0);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    if (PQntuples(res.get()) == 0)
+        return std::optional<PreflightRunRow>{std::nullopt};
+    return std::optional<PreflightRunRow>{read_run(res.get(), 0)};
 }
 
 std::vector<PreflightRunRow> PreflightRunStore::list_runs(const std::string& viewer, bool is_admin,
                                                           int limit) {
-    std::vector<PreflightRunRow> out;
+    auto r = list_runs_checked(viewer, is_admin, limit);
+    // Discard the store-error channel — same rationale as get_run above:
+    // preserves the pre-#4036 fail-soft rail-rendering contract.
+    return r.value_or(std::vector<PreflightRunRow>{});
+}
+
+std::expected<std::vector<PreflightRunRow>, std::string>
+PreflightRunStore::list_runs_checked(const std::string& viewer, bool is_admin, int limit) {
     if (!open_)
-        return out;
+        return std::unexpected("preflight run store not open");
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return out;
+        return std::unexpected("pool acquire timeout");
     const int cap = (limit > 0 && limit < kRunListCap) ? limit : kRunListCap;
     const std::string sql_admin =
         std::string("SELECT ") + kRunCols +
@@ -235,7 +275,8 @@ std::vector<PreflightRunRow> PreflightRunStore::list_runs(const std::string& vie
                  : pg::exec_params(lease.get(), sql_owner.c_str(),
                                    std::vector<std::string>{viewer, std::to_string(cap)});
     if (res.status() != PGRES_TUPLES_OK)
-        return out;
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<PreflightRunRow> out;
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
@@ -404,20 +445,32 @@ bool PreflightRunStore::complete_run(const std::string& run_id, std::int64_t com
     return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
-int PreflightRunStore::prune_older_than(std::int64_t cutoff_ms) {
+int PreflightRunStore::run_retention_prune(std::int64_t retention_window_ms) {
     if (!open_)
         return -1;
-    auto lease = pool_.try_acquire_for(kWriteTimeout); // a DELETE — write budget
-    if (!lease)
-        return -1;
-    pg::PgResult res =
-        pg::exec_params(lease.get(),
-                        "DELETE FROM preflight_run_store.runs WHERE created_at_ms < $1::bigint "
-                        "RETURNING run_id",
-                        std::vector<std::string>{std::to_string(cutoff_ms)});
-    if (res.status() != PGRES_TUPLES_OK)
-        return -1;
-    return PQntuples(res.get());
+    // WS-10 (#2508): clock-guarded, single-writer, capped retention. Part-6
+    // missing-anchor decision = Decline: a preflight run is a non-regenerable
+    // record of an operator go/no-go decision, so a from-boot skewed clock must
+    // not silently delete it (audit_store's answer, NOT ResultSetStore's).
+    const pg::ClockGuardedPruneSpec spec{
+        .store_label = kStoreName,
+        .target_table = "preflight_run_store.runs",
+        .ts_column = "created_at_ms",
+        .now_expr = "(EXTRACT(EPOCH FROM now())*1000)::bigint",
+        .meta_table = "preflight_run_store.retention_meta",
+        .anchor_key = "runs_prune_last_pass_now",
+        .settled_key = "runs_prune_bootstrap_settled",
+        .facts_key = "runs_prune_last_anomaly_facts",
+        .advisory_lock_key = "hashtext('preflight_run_store:runs_prune')",
+        .retention_window = retention_window_ms,
+        .big_step_floor = kPruneBigStepFloorMs,
+        .implausibility_bound = kPruneImplausibilityMs,
+        .min_plausible_reading = kPruneMinPlausibleMs,
+        .cap_per_pass = kPruneCapPerPass,
+        .missing_anchor = pg::MissingAnchorPolicy::Decline,
+    };
+    const auto r = pg::run_clock_guarded_prune(pool_, spec, kWriteTimeout);
+    return r.error ? -1 : r.deleted;
 }
 
 bool PreflightRunStore::delete_run(const std::string& run_id, const std::string& created_by) {

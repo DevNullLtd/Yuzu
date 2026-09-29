@@ -112,6 +112,21 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 
 } // namespace
 
+bool validate_inventory_report_source_count(const std::string& agent_id,
+                                            const pb::InventoryReport& report,
+                                            ::yuzu::MetricsRegistry* metrics) {
+    if (report.content_hashes_size() <= kMaxSources && report.plugin_data_size() <= kMaxSources)
+        return true;
+    spdlog::warn("inventory: report from agent={} carries too many sources "
+                 "(hashes={}, blobs={}, cap={}) — rejecting whole report",
+                 agent_id, report.content_hashes_size(), report.plugin_data_size(), kMaxSources);
+    if (metrics)
+        metrics->counter("yuzu_inventory_ingest_total",
+                         {{"source", "__report__"}, {"outcome", "rejected"}})
+            .increment();
+    return false;
+}
+
 void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& agent_id,
                              const pb::InventoryReport& report, pb::InventoryAck& ack,
                              ::yuzu::MetricsRegistry* metrics) {
@@ -123,7 +138,7 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
     };
     if (agent_id.empty())
         return;
-    if (report.content_hashes_size() > kMaxSources || report.plugin_data_size() > kMaxSources) {
+    if (!validate_inventory_report_source_count(agent_id, report, metrics)) {
         // Whole-report reject (malformed/abusive). Deliberately NO need_full nack — we do
         // not amplify resends to a misbehaving agent; the empty ack means the agent records
         // the cycle done until the weekly floor. Safety rests on the legit source count
@@ -132,11 +147,6 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         // oversized-blob-specific: nacked + never-self-heals; this reject is neither) so a
         // flooding agent is observable without misdirecting the dropped-blob runbook (gov
         // consistency). YuzuInventoryReportRejected alerts on it.
-        spdlog::warn("inventory: report from agent={} carries too many sources "
-                     "(hashes={}, blobs={}, cap={}) — rejecting whole report",
-                     agent_id, report.content_hashes_size(), report.plugin_data_size(),
-                     kMaxSources);
-        emit("__report__", "rejected");
         return;
     }
 

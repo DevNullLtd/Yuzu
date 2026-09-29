@@ -69,6 +69,39 @@ message StreamStatusNotification {
   string peer_addr = 4;
   // Gateway node handling this agent.
   string gateway_node = 5;
+
+  // CC-03: wire capabilities this gateway build supports, advertised with
+  // every CONNECTED notification. yuzu_gw_upstream:notify_stream_status/5
+  // sends "command_dispatch_tag_v1" here as proof this build's vendored
+  // agent.proto carries CommandRequest.dispatch_tag = 9 and forwards it
+  // untouched. Mirrors the canonical proto/yuzu/gateway/v1/gateway.proto
+  // field 6; both gateway copies (priv/proto/gateway.proto and
+  // priv/proto/yuzu/gateway/v1/gateway.proto) must carry it identically or
+  // gpb drops it on one of the two build paths.
+  repeated string wire_capabilities = 6;
+
+  // Gateway cluster this agent is connected through (trust zone / region).
+  // The gateway is the only party that knows this; the server records it in
+  // the agent→cluster routing directory (HA WS-4). Empty from a gateway
+  // build predating WS-4.
+  string cluster_id = 7;
+
+  // Opaque random id minted ONCE per gateway-side connection process
+  // instance (yuzu_gw_agent, one per agent Subscribe stream) — NOT a
+  // counter. Must be collision-safe across gateway nodes and across a
+  // rolling-upgrade mixed-version cluster, so it is generated from a CSPRNG
+  // (crypto:strong_rand_bytes/1), never a per-BEAM-node monotonic integer.
+  // The SAME value is stamped on both the CONNECTED and the DISCONNECTED
+  // notification a given process instance ever sends. The server uses it
+  // to fence a stale DISCONNECTED — one belonging to an already-torn-down
+  // placement — from tearing down a NEWER re-home under the same reused
+  // session id (HA WS-4, issue #4324). Absent/empty from an older gateway
+  // build means no fence is available (legacy behavior); this field is
+  // additive and optional-safe. Mirrors the canonical
+  // proto/yuzu/gateway/v1/gateway.proto field 8; both gateway copies
+  // (priv/proto/gateway.proto and priv/proto/yuzu/gateway/v1/gateway.proto)
+  // must carry it identically or gpb drops it on one of the two build paths.
+  string stream_home_id = 8;
 }
 
 message StreamStatusAck {

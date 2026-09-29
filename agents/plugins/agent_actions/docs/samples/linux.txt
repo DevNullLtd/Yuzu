@@ -1,0 +1,14 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 2688724a5dd5
+== action=set_log_level level=info
+status|ok
+level|info
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=info
+agent.id|(not set)
+agent.version|(not set)
+agent.server_address|(not set)
+agent.heartbeat_interval|(not set)
+agent.plugins.count|(not set)
+[result_status] UNDECLARED / UNKNOWN / 
+

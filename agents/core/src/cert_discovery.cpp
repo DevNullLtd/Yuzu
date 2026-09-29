@@ -8,6 +8,11 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h> // geteuid()
+#endif
 
 namespace yuzu::agent {
 
@@ -121,6 +126,30 @@ discover_install_ca_path(std::span<const std::filesystem::path> candidates) {
 }
 
 std::optional<std::filesystem::path> discover_install_ca_path() {
+#if defined(__APPLE__)
+    // macOS has two legitimate install locations. /etc/yuzu/certs is the
+    // packaged/privileged-install convention shared with Linux, and is the
+    // only candidate for a root agent (a LaunchDaemon, or the _yuzu service
+    // account, which has no writable $HOME to speak of). A non-root agent
+    // (dev/UAT rigs) also checks the per-user Application Support path that
+    // server::auth::default_cert_dir() falls back to for a non-root native
+    // server run, since /etc/yuzu is root-owned. Gated on euid, not just
+    // __APPLE__: macOS sudo preserves $HOME by default, so an unqualified
+    // $HOME candidate would let a root agent adopt a CA from an unprivileged
+    // user's home as its pinned trust anchor. Built at call time (not a
+    // static array) because the second candidate depends on $HOME — both are
+    // still trusted, code-controlled paths, not operator input.
+    std::vector<std::filesystem::path> candidates = {
+        std::filesystem::path{"/etc/yuzu/certs/default-ca.pem"},
+    };
+    if (::geteuid() != 0) {
+        if (const char* home = std::getenv("HOME")) {
+            candidates.push_back(std::filesystem::path(home) /
+                                  "Library/Application Support/Yuzu/certs/default-ca.pem");
+        }
+    }
+    return discover_install_ca_path(candidates);
+#else
     static const std::array<std::filesystem::path, 1> kInstallCaPaths = {{
 #ifdef _WIN32
         std::filesystem::path{"C:/ProgramData/Yuzu/certs/default-ca.pem"},
@@ -129,6 +158,7 @@ std::optional<std::filesystem::path> discover_install_ca_path() {
 #endif
     }};
     return discover_install_ca_path(std::span<const std::filesystem::path>{kInstallCaPaths});
+#endif
 }
 
 } // namespace yuzu::agent

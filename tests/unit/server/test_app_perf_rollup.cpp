@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,18 @@ using yuzu::server::AppPerfRollup;
 using yuzu::server::pg::PgPool;
 
 namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): mirrors the
+// tests' store set (the rollup query owner carries no migration of its own).
+yuzu::test::PgTestTemplate apperf_rollup_tpl{"apperf_rollup", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    AppPerfDailyStore b1{pool};
+    AppPerfFleetStore b2{pool};
+    AppPerfRollup rollup{pool};
+    if (!b1.is_open())
+        throw std::runtime_error("apperf_rollup template: B1 store failed to migrate");
+    if (!b2.is_open())
+        throw std::runtime_error("apperf_rollup template: B2 store failed to migrate");
+}};
 std::int64_t today_utc() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -57,7 +70,7 @@ TEST_CASE("build_hist_array_sql emits half-open [lo,hi) FILTER buckets", "[app_p
 }
 
 TEST_CASE("AppPerfRollup B1->B2 roll-up", "[pg][app_perf]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, apperf_rollup_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AppPerfDailyStore b1{pool};
@@ -160,12 +173,48 @@ TEST_CASE("AppPerfRollup B1->B2 roll-up", "[pg][app_perf]") {
         CHECK((*rows)[0].ws_sum == std::int64_t{9223372036854775807}); // saturated, not aborted
     }
 
-    SECTION("prune deletes day < before_day, keeps day == before_day") {
-        seed(b1, "a1", "p.exe", "1.0.0.0", day, 5.0, 1000);
-        REQUIRE(rollup.roll_day(day));
-        b2.prune(day); // day < day is false -> kept
-        REQUIRE(b2.get_app_fleet_perf("p.exe", "")->size() == 1);
-        b2.prune(day + 1); // day < day+1 -> deleted
-        REQUIRE(b2.get_app_fleet_perf("p.exe", "")->empty());
+    SECTION("prune deletes day-buckets older than the retention window (clock-guarded)") {
+        // Both within B1's 31-day retention so roll_day rolls them into B2; the
+        // prune window sits between them.
+        const std::int64_t old_day = today_utc() - 25 * 86400; // 25 days ago
+        const std::int64_t recent_day = today_utc() - 1 * 86400; // 1 day ago
+        seed(b1, "a1", "p.exe", "1.0.0.0", old_day, 5.0, 1000);
+        seed(b1, "a1", "p.exe", "1.0.0.0", recent_day, 5.0, 1000);
+        REQUIRE(rollup.roll_day(old_day));
+        REQUIRE(rollup.roll_day(recent_day));
+        // WS-10: run_retention_prune reads Postgres now() and takes the retention
+        // WINDOW in SECONDS (the `day` column is day-floored unix-seconds). A
+        // 12-day window deletes the 25-day bucket and keeps the 1-day one. The
+        // clock guard's part-6 Decline means the FIRST pass on a store with data
+        // but no persisted anchor declines (records the anchor, deletes nothing).
+        const std::int64_t window = 12LL * 86400;
+        CHECK(b2.run_retention_prune(window) == 0); // bootstrap decline
+        CHECK(b2.run_retention_prune(window) >= 1);
+        REQUIRE(b2.get_app_fleet_perf("p.exe", "")->size() == 1); // only recent survives
+    }
+
+    SECTION("prune DAY-FLOORS the cutoff — the boundary bucket is not deleted ~24h early (WS-10 S1)") {
+        // The spec's cutoff_align=86400 floors ONLY the cutoff (now_expr stays RAW —
+        // flooring the reading itself would false-fire a 24h Step at every midnight,
+        // WS-10 C1). So cutoff = floor((raw_now - window)/day)*day is day-aligned and a
+        // bucket EXACTLY at floor(now)-window survives (== cutoff, not < cutoff).
+        // Without cutoff alignment the cutoff would be raw_now - window, up to ~24h
+        // later, and delete that boundary bucket. At any non-midnight-UTC second — the
+        // normal case — the two cutoffs differ.
+        const std::int64_t window = 10LL * 86400;
+        const std::int64_t old_day = today_utc() - 11 * 86400;      // < cutoff → deleted
+        const std::int64_t boundary_day = today_utc() - 10 * 86400; // == floored cutoff → survives
+        const std::int64_t recent_day = today_utc();                // survivor (avoids would_wipe)
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", old_day, 5.0, 1000);
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", boundary_day, 5.0, 1000);
+        seed(b1, "a1", "bnd.exe", "1.0.0.0", recent_day, 5.0, 1000);
+        REQUIRE(rollup.roll_day(old_day));
+        REQUIRE(rollup.roll_day(boundary_day));
+        REQUIRE(rollup.roll_day(recent_day));
+        CHECK(b2.run_retention_prune(window) == 0); // bootstrap decline
+        CHECK(b2.run_retention_prune(window) >= 1);
+        // Boundary + recent survive; only the strictly-older bucket is gone. A
+        // non-day-floored cutoff would delete the boundary bucket too (size == 1).
+        REQUIRE(b2.get_app_fleet_perf("bnd.exe", "")->size() == 2);
     }
 }

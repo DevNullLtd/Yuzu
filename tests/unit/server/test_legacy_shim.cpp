@@ -7,6 +7,10 @@
 
 #include "legacy_shim.hpp"
 
+#include "pg/pg_pool.hpp"
+
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -14,6 +18,18 @@
 #include <vector>
 
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using yuzu::server::pg::PgPool;
+
+namespace {
+yuzu::test::PgTestTemplate legacy_shim_instr_tpl{
+    "legacyshiminstr", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("legacy_shim_instr template: store failed to migrate");
+    }};
+} // namespace
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -99,8 +115,11 @@ TEST_CASE("LegacyShim: generate with empty actions produces nothing", "[legacy_s
 
 // ── sync_legacy_definitions ─────────────────────────────────────────────────
 
-TEST_CASE("LegacyShim: sync creates new definitions", "[legacy_shim][db]") {
-    InstructionStore store(":memory:");
+TEST_CASE("LegacyShim: sync creates new definitions", "[legacy_shim][db][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, legacy_shim_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto caps = make_test_capabilities();
     int created = sync_legacy_definitions(store, caps);
@@ -109,11 +128,15 @@ TEST_CASE("LegacyShim: sync creates new definitions", "[legacy_shim][db]") {
 
     // Verify they exist in the store
     auto all = store.query_definitions();
-    CHECK(all.size() == 5);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 5);
 }
 
-TEST_CASE("LegacyShim: sync skips existing definitions", "[legacy_shim][db]") {
-    InstructionStore store(":memory:");
+TEST_CASE("LegacyShim: sync skips existing definitions", "[legacy_shim][db][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, legacy_shim_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto caps = make_test_capabilities();
 
@@ -126,11 +149,15 @@ TEST_CASE("LegacyShim: sync skips existing definitions", "[legacy_shim][db]") {
 
     // Total count should still be 5
     auto all = store.query_definitions();
-    CHECK(all.size() == 5);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 5);
 }
 
-TEST_CASE("LegacyShim: sync is idempotent", "[legacy_shim][db]") {
-    InstructionStore store(":memory:");
+TEST_CASE("LegacyShim: sync is idempotent", "[legacy_shim][db][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, legacy_shim_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     auto caps = make_test_capabilities();
 
@@ -140,11 +167,16 @@ TEST_CASE("LegacyShim: sync is idempotent", "[legacy_shim][db]") {
     int third = sync_legacy_definitions(store, caps);
 
     CHECK(third == 0);
-    CHECK(store.query_definitions().size() == 5);
+    auto all = store.query_definitions();
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 5);
 }
 
-TEST_CASE("LegacyShim: sync with new capability adds only new", "[legacy_shim][db]") {
-    InstructionStore store(":memory:");
+TEST_CASE("LegacyShim: sync with new capability adds only new", "[legacy_shim][db][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, legacy_shim_instr_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
 
     // First sync with one plugin
     std::vector<PluginCapability> caps1 = {{"plugin_a", "1.0.0", "Plugin A", {"action1"}}};
@@ -158,5 +190,7 @@ TEST_CASE("LegacyShim: sync with new capability adds only new", "[legacy_shim][d
     int second = sync_legacy_definitions(store, caps2);
     CHECK(second == 2);
 
-    CHECK(store.query_definitions().size() == 3);
+    auto all = store.query_definitions();
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 3);
 }

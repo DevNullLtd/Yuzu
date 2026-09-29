@@ -15,10 +15,24 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+// pem.h MUST precede cms.h (DECLARE_PEM_rw(CMS, CMS_ContentInfo) is a pem.h
+// macro cms.h expands against — see detached_signature.cpp's identical note);
+// not sorted alphabetically for that reason.
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/cms.h>
+#include <openssl/evp.h>
+#include <openssl/objects.h>
+#include <openssl/rsa.h> // EVP_RSA_gen — gov B1 weak-key-floor coverage
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/x509_vfy.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +85,207 @@ TestCa make_test_ca(const std::string& cn = "Yuzu Test CA") {
 
 bool contains(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
+}
+
+// gov B1: unencrypted RSA private key PEM at the given modulus size — used ONLY
+// to build a CSR whose SUBJECT key the floor must classify. Mirrors
+// test_saml_provider.cpp's generate_small_rsa_key_pem/EVP_RSA_gen idiom.
+std::string generate_rsa_key_pem(int bits) {
+    EVP_PKEY* pkey = EVP_RSA_gen(static_cast<unsigned int>(bits));
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard {
+        EVP_PKEY* k;
+        ~PkeyGuard() {
+            if (k)
+                EVP_PKEY_free(k);
+        }
+    } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard {
+        BIO* b;
+        ~BioGuard() {
+            if (b)
+                BIO_free(b);
+        }
+    } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+// gov MED-2: an Ed25519 private key PEM — used ONLY to build a CSR whose
+// SUBJECT key the floor must now REJECT (openssl cms -sign fails on an
+// Ed25519 codeSigning cert with "no default digest", so the floor must refuse
+// to issue one even though detached_signature.cpp's own CMS_verify would
+// accept it).
+std::string generate_ed25519_key_pem() {
+    EVP_PKEY* pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519");
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard {
+        EVP_PKEY* k;
+        ~PkeyGuard() {
+            if (k)
+                EVP_PKEY_free(k);
+        }
+    } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard {
+        BIO* b;
+        ~BioGuard() {
+            if (b)
+                BIO_free(b);
+        }
+    } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+// ── Raw-OpenSSL helpers for the code-signing test cases ────────────────────────
+//
+// CertDetails (parse_certificate's public shape) does not expose EKU/keyUsage,
+// and CsrParams (make_csr's public shape) has no EKU field at all — both are
+// dug out / injected with raw OpenSSL here, local to this TU. The RAII pattern
+// mirrors x509_ca.cpp's own YUZU_SSL_PTR macro and the agent-side
+// detached_signature.cpp / cms_test_fixtures.hpp verifier tests, which is the
+// SAME check the CMS round-trip case below reproduces.
+struct SslFreer {
+    void operator()(BIO* p) const noexcept { BIO_free(p); }
+    void operator()(X509* p) const noexcept { X509_free(p); }
+    void operator()(X509_REQ* p) const noexcept { X509_REQ_free(p); }
+    void operator()(EVP_PKEY* p) const noexcept { EVP_PKEY_free(p); }
+    void operator()(X509_STORE* p) const noexcept { X509_STORE_free(p); }
+    void operator()(CMS_ContentInfo* p) const noexcept { CMS_ContentInfo_free(p); }
+};
+template <typename T> using ssl_ptr = std::unique_ptr<T, SslFreer>;
+
+ssl_ptr<X509> load_x509(const std::string& pem) {
+    ssl_ptr<BIO> bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
+    REQUIRE(bio);
+    return ssl_ptr<X509>{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
+}
+
+ssl_ptr<EVP_PKEY> load_pkey(const std::string& pem) {
+    ssl_ptr<BIO> bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
+    REQUIRE(bio);
+    return ssl_ptr<EVP_PKEY>{PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr)};
+}
+
+// Extended-key-usage OIDs as their config-string short names ("serverAuth",
+// "clientAuth", "codeSigning") — the exact literals eku_value() (x509_ca.cpp)
+// builds, so this reads the wire content straight back rather than re-deriving
+// it a different way.
+std::vector<std::string> cert_eku(const std::string& cert_pem) {
+    auto cert = load_x509(cert_pem);
+    REQUIRE(cert);
+    std::vector<std::string> out;
+    auto* eku = static_cast<EXTENDED_KEY_USAGE*>(
+        X509_get_ext_d2i(cert.get(), NID_ext_key_usage, nullptr, nullptr));
+    if (!eku)
+        return out;
+    for (int i = 0; i < sk_ASN1_OBJECT_num(eku); ++i) {
+        const char* sn = OBJ_nid2sn(OBJ_obj2nid(sk_ASN1_OBJECT_value(eku, i)));
+        out.emplace_back(sn ? sn : "");
+    }
+    sk_ASN1_OBJECT_pop_free(eku, ASN1_OBJECT_free);
+    return out;
+}
+
+// True iff keyUsage is present, critical, and sets digitalSignature ONLY (bit
+// 0) — the fixed keyUsage build_and_sign_leaf sets on every leaf regardless of
+// LeafUsage (x509_ca.cpp: "critical,digitalSignature", every leaf, always).
+bool cert_key_usage_is_digital_signature_only(const std::string& cert_pem) {
+    auto cert = load_x509(cert_pem);
+    REQUIRE(cert);
+    int crit = -1;
+    auto* ku = static_cast<ASN1_BIT_STRING*>(
+        X509_get_ext_d2i(cert.get(), NID_key_usage, &crit, nullptr));
+    if (!ku)
+        return false;
+    bool ok = crit == 1 && ASN1_BIT_STRING_get_bit(ku, 0) == 1; // digitalSignature
+    for (int bit = 1; bit <= 8 && ok; ++bit)                    // nonRepudiation..decipherOnly
+        ok = ASN1_BIT_STRING_get_bit(ku, bit) == 0;
+    ASN1_BIT_STRING_free(ku);
+    return ok;
+}
+
+// Build a self-signed CSR whose extensionRequest attribute carries an
+// ATTACKER-CHOSEN EKU + DNS SAN — the exact shape sign_csr's documented
+// security contract (x509_ca.hpp: "the CSR's own subject/SAN are deliberately
+// IGNORED") must defeat. CsrParams (make_csr's public shape) has no EKU field,
+// so this is built with raw OpenSSL rather than through make_csr.
+std::string build_csr_with_eku_and_san(EVP_PKEY* key, const std::string& cn,
+                                       const char* eku_value, const char* dns_san) {
+    ssl_ptr<X509_REQ> req{X509_REQ_new()};
+    REQUIRE(req);
+    REQUIRE(X509_REQ_set_version(req.get(), 0) == 1);
+    X509_NAME* name = X509_REQ_get_subject_name(req.get());
+    REQUIRE(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                       reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1,
+                                       0) == 1);
+    REQUIRE(X509_REQ_set_pubkey(req.get(), key) == 1);
+
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, nullptr, nullptr, req.get(), nullptr, 0);
+    auto* exts = sk_X509_EXTENSION_new_null();
+    REQUIRE(exts);
+    const std::string san_val = std::string("DNS:") + dns_san;
+    auto* san_ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_subject_alt_name, san_val.c_str());
+    REQUIRE(san_ext);
+    sk_X509_EXTENSION_push(exts, san_ext);
+    auto* eku_ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_ext_key_usage, eku_value);
+    REQUIRE(eku_ext);
+    sk_X509_EXTENSION_push(exts, eku_ext);
+    // Same X509_REQ_add_extensions idiom as make_csr (x509_ca.cpp): serialises
+    // `exts` into a request attribute WITHOUT taking ownership — pop_free frees
+    // both the stack and the two pushed extensions.
+    REQUIRE(X509_REQ_add_extensions(req.get(), exts) == 1);
+    sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+
+    REQUIRE(X509_REQ_sign(req.get(), key, EVP_sha256()) > 0);
+
+    ssl_ptr<BIO> bio{BIO_new(BIO_s_mem())};
+    REQUIRE(bio);
+    REQUIRE(PEM_write_bio_X509_REQ(bio.get(), req.get()) == 1);
+    char* data = nullptr;
+    const long len = BIO_get_mem_data(bio.get(), &data);
+    REQUIRE(len > 0);
+    return std::string(data, static_cast<std::size_t>(len));
+}
+
+// gov MED-2: a bare CSR (subject CN only, no extensions) signed with a NULL
+// digest — required for Ed25519/Ed448, which are "pure" signature schemes and
+// reject `X509_REQ_sign`'s normal digest-then-sign path (the exact "no
+// default digest" failure `openssl cms -sign` hits, which is why the floor
+// must reject these keys). `make_csr` (x509_ca.cpp) always passes a concrete
+// digest, so it cannot build this CSR — only used to get an Ed25519 CSR PEM
+// past parsing; `subject_key_meets_code_signing_floor` never verifies the
+// CSR's own signature, only its subject public key.
+std::string make_csr_null_digest(EVP_PKEY* key, const std::string& cn) {
+    ssl_ptr<X509_REQ> req{X509_REQ_new()};
+    REQUIRE(req);
+    REQUIRE(X509_REQ_set_version(req.get(), 0) == 1);
+    X509_NAME* name = X509_REQ_get_subject_name(req.get());
+    REQUIRE(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                       reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1,
+                                       0) == 1);
+    REQUIRE(X509_REQ_set_pubkey(req.get(), key) == 1);
+    REQUIRE(X509_REQ_sign(req.get(), key, nullptr) > 0);
+
+    ssl_ptr<BIO> bio{BIO_new(BIO_s_mem())};
+    REQUIRE(bio);
+    REQUIRE(PEM_write_bio_X509_REQ(bio.get(), req.get()) == 1);
+    char* data = nullptr;
+    const long len = BIO_get_mem_data(bio.get(), &data);
+    REQUIRE(len > 0);
+    return std::string(data, static_cast<std::size_t>(len));
 }
 
 } // namespace
@@ -204,6 +419,193 @@ TEST_CASE("x509_ca: SAN values cannot inject extra entries", "[pki][leaf][securi
     REQUIRE(d->san.dns.size() == 1);
     REQUIRE(d->san.dns[0] == "good.example,DNS:evil.example");
     REQUIRE_FALSE(contains(d->san.dns, "evil.example"));
+}
+
+// ── Code-signing leaves (LeafUsage::code_signing) ───────────────────────────────
+// No production caller mints these yet — this is the engine primitive's own
+// coverage, proving it is safe to build on (PKI / internal CA routed concern).
+
+TEST_CASE("x509_ca: code-signing leaf carries codeSigning EKU only", "[pki][leaf][cms]") {
+    auto ca = make_test_ca();
+    LeafParams lp;
+    lp.subject = {"yuzu-plugin-signer", "Yuzu"};
+    lp.validity = validity_days_from_now(365);
+    lp.usage = LeafUsage{.code_signing = true};
+    auto kc = issue_leaf(ca.cert, ca.key, KeyAlgo::EcP256, lp);
+    REQUIRE(kc);
+
+    auto eku = cert_eku(kc->cert_pem);
+    REQUIRE(eku.size() == 1);
+    REQUIRE(contains(eku, "codeSigning"));
+    REQUIRE_FALSE(contains(eku, "clientAuth"));
+    REQUIRE_FALSE(contains(eku, "serverAuth"));
+
+    // keyUsage is the FIXED digitalSignature-only, critical, regardless of
+    // LeafUsage — every leaf gets it (x509_ca.cpp's build_and_sign_leaf).
+    REQUIRE(cert_key_usage_is_digital_signature_only(kc->cert_pem));
+
+    // basicConstraints=critical,CA:FALSE — reuse the engine's own predicate.
+    REQUIRE_FALSE(cert_is_ca(kc->cert_pem));
+}
+
+// The security-critical property, restated for a code-signing leaf: sign_csr
+// must take EKU (like subject/SAN) ONLY from server-supplied LeafParams, never
+// from the (attacker-controlled) CSR's own extensionRequest attribute. A CSR
+// requesting clientAuth + a foreign SAN must not smuggle either into the issued
+// cert — proven against the shared cert_eku()/parse_certificate() readback.
+TEST_CASE("x509_ca: sign_csr ignores CSR-requested EKU and SAN (code-signing leaf)",
+          "[pki][leaf][security][cms]") {
+    auto ca = make_test_ca();
+    auto leaf_key_pem = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key_pem);
+    auto leaf_key = load_pkey(*leaf_key_pem);
+    REQUIRE(leaf_key);
+
+    const std::string evil_csr = build_csr_with_eku_and_san(
+        leaf_key.get(), "requested-cn", "clientAuth", "evil-requested.example.com");
+    REQUIRE(evil_csr.find("CERTIFICATE REQUEST") != std::string::npos);
+
+    LeafParams lp;
+    lp.subject = {"signer-1", "Yuzu"};
+    lp.san.uris = {"yuzu://install-abc/signer/signer-1"};
+    lp.validity = validity_days_from_now(365);
+    lp.usage = LeafUsage{.code_signing = true};
+    auto issued = sign_csr(evil_csr, ca.cert, ca.key, lp);
+    REQUIRE(issued);
+
+    // EKU is EXACTLY what LeafParams asked for — codeSigning only. The CSR's
+    // requested clientAuth does not survive.
+    auto eku = cert_eku(issued->cert_pem);
+    REQUIRE(eku.size() == 1);
+    REQUIRE(contains(eku, "codeSigning"));
+    REQUIRE_FALSE(contains(eku, "clientAuth"));
+
+    // SAN is EXACTLY what LeafParams asked for — the CSR's requested DNS SAN
+    // does not survive either (same invariant the existing
+    // "sign_csr ignores CSR-supplied subject and SAN" case covers for
+    // client-auth leaves, restated here for a code-signing leaf + an EKU
+    // request, which CsrParams cannot even express).
+    auto d = parse_certificate(issued->cert_pem);
+    REQUIRE(d);
+    REQUIRE(d->subject.common_name == "signer-1");
+    REQUIRE(contains(d->san.uris, "yuzu://install-abc/signer/signer-1"));
+    REQUIRE(d->san.dns.empty());
+    REQUIRE_FALSE(contains(d->san.dns, "evil-requested.example.com"));
+}
+
+// End-to-end: a code-signing leaf this engine issues must actually satisfy the
+// agent's real plugin-signature verifier's check — X509_STORE_set_purpose(
+// X509_PURPOSE_CODE_SIGN) + CMS_verify(..., CMS_BINARY|CMS_DETACHED), the exact
+// pair detached_signature.cpp's load_trust_store()/verify_with_content_bio()
+// run (see that file's header comments for why the purpose is set: it is what
+// makes CMS_verify enforce EKU=codeSigning rather than accepting any leaf that
+// merely chains to a trusted root). This TU links x509_ca.cpp AND OpenSSL CMS
+// (yuzu_server_tests / test_x509_ca.cpp), so the round-trip is exercised
+// directly rather than through the agent's wrapper, which this test target does
+// not link.
+TEST_CASE("x509_ca: code-signing leaf verifies a CMS detached signature "
+          "(the agent plugin verifier's exact check)",
+          "[pki][leaf][cms]") {
+    auto ca = make_test_ca();
+    auto root_cert = load_x509(ca.cert);
+    REQUIRE(root_cert);
+
+    LeafParams signer_lp;
+    signer_lp.subject = {"yuzu-plugin-signer", "Yuzu"};
+    signer_lp.validity = validity_days_from_now(365);
+    signer_lp.usage = LeafUsage{.code_signing = true};
+    auto signer = issue_leaf(ca.cert, ca.key, KeyAlgo::EcP256, signer_lp);
+    REQUIRE(signer);
+    auto signer_cert = load_x509(signer->cert_pem);
+    auto signer_key = load_pkey(signer->private_key_pem);
+    REQUIRE(signer_cert);
+    REQUIRE(signer_key);
+
+    const std::string blob = "yuzu-plugin-artifact-bytes";
+    auto sign_and_verify = [&](X509* leaf_cert, EVP_PKEY* leaf_key) {
+        ssl_ptr<BIO> content{BIO_new_mem_buf(blob.data(), static_cast<int>(blob.size()))};
+        REQUIRE(content);
+        ssl_ptr<CMS_ContentInfo> cms{
+            CMS_sign(leaf_cert, leaf_key, nullptr, content.get(), CMS_BINARY | CMS_DETACHED)};
+        REQUIRE(cms);
+
+        ssl_ptr<X509_STORE> store{X509_STORE_new()};
+        REQUIRE(store);
+        REQUIRE(X509_STORE_add_cert(store.get(), root_cert.get()) == 1);
+        REQUIRE(X509_STORE_set_purpose(store.get(), X509_PURPOSE_CODE_SIGN) == 1);
+
+        ssl_ptr<BIO> verify_content{BIO_new_mem_buf(blob.data(), static_cast<int>(blob.size()))};
+        REQUIRE(verify_content);
+        return CMS_verify(cms.get(), nullptr, store.get(), verify_content.get(), nullptr,
+                          CMS_BINARY | CMS_DETACHED);
+    };
+
+    REQUIRE(sign_and_verify(signer_cert.get(), signer_key.get()) == 1);
+
+    // Negative: a client-auth-only leaf (no codeSigning EKU) signed the SAME
+    // way must FAIL the SAME purpose check — proves the check actually
+    // discriminates by EKU rather than accepting any leaf chaining to the CA.
+    LeafParams not_signer_lp;
+    not_signer_lp.subject = {"agent-not-a-signer", "Yuzu"};
+    not_signer_lp.validity = validity_days_from_now(365);
+    not_signer_lp.usage = LeafUsage{.client_auth = true};
+    auto not_signer = issue_leaf(ca.cert, ca.key, KeyAlgo::EcP256, not_signer_lp);
+    REQUIRE(not_signer);
+    auto not_signer_cert = load_x509(not_signer->cert_pem);
+    auto not_signer_key = load_pkey(not_signer->private_key_pem);
+    REQUIRE(not_signer_cert);
+    REQUIRE(not_signer_key);
+
+    REQUIRE(sign_and_verify(not_signer_cert.get(), not_signer_key.get()) != 1);
+}
+
+// gov B1 (UP-1, HIGH, fleet-RCE class): the subject-key strength floor
+// `issue_code_signing_leaf` (server.cpp) checks BEFORE ever calling sign_csr on
+// an operator-submitted CSR. Exercises the shared pki:: predicate directly —
+// the crypto is the engine's job. The server.cpp call site that runs this floor
+// BEFORE sign_csr is verified by inspection only: the REST/MCP tests inject a
+// stub issuance fn, so no test yet exercises the real issue_code_signing_leaf
+// ordering (tracked with the reissue-block/usage-pin end-to-end coverage
+// follow-up, F4/F5). This case covers the shared pki:: predicate directly.
+TEST_CASE("x509_ca: subject_key_meets_code_signing_floor rejects a sub-2048-bit RSA key and "
+          "Ed25519, accepts RSA-2048 and P-256 EC",
+          "[pki][leaf][security]") {
+    CsrParams cp;
+    cp.subject = {"weak-signer", "Yuzu"};
+
+    // 1024-bit RSA — factorable, must be REJECTED.
+    auto weak_key_pem = generate_rsa_key_pem(1024);
+    auto weak_csr = make_csr(weak_key_pem, cp);
+    REQUIRE(weak_csr);
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor(*weak_csr));
+
+    // RSA-2048 — meets the floor, must be ACCEPTED.
+    auto ok_rsa_key_pem = generate_rsa_key_pem(2048);
+    auto ok_rsa_csr = make_csr(ok_rsa_key_pem, cp);
+    REQUIRE(ok_rsa_csr);
+    REQUIRE(subject_key_meets_code_signing_floor(*ok_rsa_csr));
+
+    // P-256 EC — an approved curve, must be ACCEPTED.
+    auto ec_key_pem = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(ec_key_pem);
+    auto ec_csr = make_csr(*ec_key_pem, cp);
+    REQUIRE(ec_csr);
+    REQUIRE(subject_key_meets_code_signing_floor(*ec_csr));
+
+    // gov MED-2: Ed25519 — `openssl cms -sign` (the documented signing tool)
+    // fails on an Ed25519 codeSigning cert, so the floor must now REJECT it
+    // even though it is cryptographically strong. make_csr (x509_ca.cpp)
+    // always signs with a concrete digest, which Ed25519 rejects — build the
+    // CSR with the NULL-digest raw helper instead (the floor never verifies
+    // the CSR's own signature, only its subject public key).
+    auto ed25519_key_pem = generate_ed25519_key_pem();
+    auto ed25519_key = load_pkey(ed25519_key_pem);
+    REQUIRE(ed25519_key);
+    auto ed25519_csr = make_csr_null_digest(ed25519_key.get(), cp.subject.common_name);
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor(ed25519_csr));
+
+    // A garbage / unparseable CSR fails CLOSED — never a default-accept.
+    REQUIRE_FALSE(subject_key_meets_code_signing_floor("not a csr"));
 }
 
 TEST_CASE("x509_ca: leaf may not outlive the issuing CA", "[pki][leaf][security]") {

@@ -40,11 +40,16 @@ agent_test_() ->
       {"streaming keeps pending on RUNNING response", fun streaming_keeps_running/0},
       {"streaming handles orphaned response", fun streaming_orphaned_response/0},
       {"agent stops on stream_closed", fun stops_on_close/0},
+      {"stream_home_id is identical on CONNECTED and DISCONNECTED (#4324)", fun stream_home_id_identical_on_connect_and_disconnect/0},
       {"agent stops on stream_error", fun stops_on_error/0},
       {"disconnect notifies pending waiters", fun disconnect_notifies_pending/0},
       {"get_info returns state", fun get_info_works/0},
       {"stream handler death triggers disconnect", fun stream_handler_death/0},
-      {"stream handler death in connecting state", fun stream_handler_death_connecting/0}
+      {"stream handler death in connecting state", fun stream_handler_death_connecting/0},
+      {"HA WS-4 4.4: reannounce for the CURRENT session re-sends CONNECTED",
+       fun reannounce_same_session_resends_connected/0},
+      {"HA WS-4 4.4: reannounce for a DIFFERENT (superseded) session is ignored",
+       fun reannounce_different_session_ignored/0}
      ]}.
 
 setup() ->
@@ -65,7 +70,7 @@ setup() ->
     %% Mock external deps.
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status,
-                fun(_, _, _, _) -> ok end),
+                fun(_, _, _, _, _) -> ok end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.
@@ -195,6 +200,66 @@ stops_on_error() ->
     Pid ! {stream_error, some_error},
     ok = wait_for_death(Pid, 2000),
     ?assertEqual(error, yuzu_gw_registry:lookup(AgentId)).
+
+%% HA WS-4 #4324: stream_home_id is minted ONCE in init/1 and must be the
+%% SAME value on the CONNECTED call (made during start_agent's init/1) and
+%% the later DISCONNECTED call (do_cleanup, triggered by stream_closed) for
+%% one process instance. Correctness is structurally guaranteed today (a
+%% single #data{} construction site + record-update syntax on every
+%% transition, verified by code review) -- this locks it with a real
+%% assertion so a future edit that re-mints the id on a second call site
+%% regresses loudly instead of silently.
+stream_home_id_identical_on_connect_and_disconnect() ->
+    {Pid, AgentId} = start_agent(<<"shi-1">>, self()),
+    Pid ! stream_closed,
+    ok = wait_for_death(Pid, 2000),
+    Calls = meck:history(yuzu_gw_upstream),
+    NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
+                            lists:nth(1, Args) =:= AgentId],
+    ?assertEqual(2, length(NotifyCalls)), % exactly one CONNECTED, one DISCONNECTED
+    [ConnectedArgs, DisconnectedArgs] = NotifyCalls,
+    ?assertEqual(connected, lists:nth(3, ConnectedArgs)),
+    ?assertEqual(disconnected, lists:nth(3, DisconnectedArgs)),
+    ConnectedHomeId = lists:nth(5, ConnectedArgs),
+    DisconnectedHomeId = lists:nth(5, DisconnectedArgs),
+    ?assert(is_binary(ConnectedHomeId)),
+    ?assertNotEqual(<<>>, ConnectedHomeId), % genuinely minted, not left empty
+    ?assertEqual(ConnectedHomeId, DisconnectedHomeId).
+
+reannounce_same_session_resends_connected() ->
+    %% HA WS-4 4.4 (`#4246` #6): reannounce/2 for THIS process's own
+    %% session must re-send CONNECTED — the mechanism that converges the
+    %% server's freshly-installed AgentSession after a replay-adopted
+    %% ProxyRegister wipes its gateway_node/wire_capabilities/
+    %% stream_home_id (gateway_service_impl.cpp's ProxyRegister).
+    {Pid, AgentId} = start_agent(<<"rsc-1">>, self()),
+    SessionId = <<"sess-", AgentId/binary>>,
+    meck:reset(yuzu_gw_upstream), % discard the init/1 CONNECTED call
+    ok = yuzu_gw_agent:reannounce(Pid, SessionId),
+    timer:sleep(20),
+    Calls = meck:history(yuzu_gw_upstream),
+    NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
+                            lists:nth(1, Args) =:= AgentId],
+    ?assertEqual(1, length(NotifyCalls)),
+    [Args] = NotifyCalls,
+    ?assertEqual(SessionId, lists:nth(2, Args)),
+    ?assertEqual(connected, lists:nth(3, Args)),
+    stop_agent(Pid).
+
+reannounce_different_session_ignored() ->
+    %% A reannounce for a session this process no longer holds (it moved
+    %% on to a different one, or a stale drip entry) must be a no-op —
+    %% the process's own subsequent reconnect already carries the correct
+    %% placement.
+    {Pid, AgentId} = start_agent(<<"rdi-1">>, self()),
+    meck:reset(yuzu_gw_upstream), % discard the init/1 CONNECTED call
+    ok = yuzu_gw_agent:reannounce(Pid, <<"sess-someone-else">>),
+    timer:sleep(20),
+    Calls = meck:history(yuzu_gw_upstream),
+    NotifyCalls = [Args || {_, {yuzu_gw_upstream, notify_stream_status, Args}, _} <- Calls,
+                            lists:nth(1, Args) =:= AgentId],
+    ?assertEqual(0, length(NotifyCalls)),
+    stop_agent(Pid).
 
 disconnect_notifies_pending() ->
     {Pid, _AgentId} = start_agent(<<"dnp-1">>, self()),

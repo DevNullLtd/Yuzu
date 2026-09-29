@@ -146,6 +146,17 @@ int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204). "free" is a single in-process stat
+// call on every OS — no subprocess anywhere in this plugin.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "free",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "statvfs(2)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "statfs(2)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetDiskFreeSpaceExW", nullptr},
+    },
+};
+
 } // namespace
 
 class DiskSpacePlugin final : public yuzu::Plugin {
@@ -159,6 +170,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"free", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

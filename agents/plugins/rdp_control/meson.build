@@ -8,6 +8,7 @@ shared_library(
   'rdp_control',
   files('src/rdp_control_plugin.cpp'),
   name_prefix: '',
+  include_directories: include_directories('../../shared'),  # win_com.hpp
   dependencies: rdp_control_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

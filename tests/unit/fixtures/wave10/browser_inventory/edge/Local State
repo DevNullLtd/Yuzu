@@ -1,0 +1,68 @@
+{
+  "profile": {
+    "info_cache": {
+      "Default": {
+        "active_time": 1782756478.696862,
+        "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_20",
+        "background_apps": false,
+        "edge_account_cid": "REDACTED",
+        "edge_account_environment": 2,
+        "edge_account_environment_string": "REDACTED",
+        "edge_account_first_name": "REDACTED",
+        "edge_account_last_name": "REDACTED",
+        "edge_account_oid": "REDACTED",
+        "edge_account_sovereignty": 2,
+        "edge_account_tenant_id": "REDACTED",
+        "edge_account_type": 2,
+        "edge_force_signout_restore_info": {},
+        "edge_force_signout_state": 0,
+        "edge_image_hash": -508522176,
+        "edge_kids_mode": false,
+        "edge_muid": "",
+        "edge_non_signin_profile_type": 1,
+        "edge_previously_signin_user_name": "",
+        "edge_profile_can_be_deleted": true,
+        "edge_signed_in_default_name": 67108865,
+        "edge_sync_enabled": true,
+        "edge_test_on_premises": false,
+        "edge_wam_aad_for_app_account_type": 2,
+        "edge_was_previously_signin": false,
+        "enterprise_label": "",
+        "force_signin_profile_locked": false,
+        "gaia_given_name": "",
+        "gaia_id": "REDACTED",
+        "gaia_name": "REDACTED",
+        "gaia_picture_file_name": "REDACTED",
+        "hosted_domain": "",
+        "is_consented_primary_account": true,
+        "is_ephemeral": false,
+        "is_using_default_avatar": false,
+        "is_using_default_name": true,
+        "last_downloaded_gaia_picture_url_with_size": "REDACTED",
+        "managed_user_id": "",
+        "metrics_bucket_index": 1,
+        "name": "Profile 1",
+        "shortcut_name": "REDACTED",
+        "sign_in_source": 1,
+        "signin.with_credential_provider": false,
+        "use_gaia_picture": true,
+        "user_name": "REDACTED"
+      }
+    },
+    "last_active_profiles": [],
+    "last_used": "Default",
+    "metrics": {
+      "next_bucket_index": 2
+    },
+    "profile_counts_reported": "13428590956788821",
+    "profiles_order": [
+      "Default"
+    ]
+  },
+  "browser": {
+    "browser_build_version": "149.0.4022.98",
+    "browser_version_of_last_seen_whats_new": "149.0.4022.98",
+    "build_version_for_update_tracker": "98.0.1108.55",
+    "last_seen_whats_new_page_version": "149.0.0000.00"
+  }
+}

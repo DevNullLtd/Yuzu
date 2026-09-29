@@ -10,7 +10,8 @@ metadata:
   version: 1.0.0
   description: >
     Store a key-value pair in the agent's persistent KV storage.
-    Keys are namespaced per plugin.
+    Keys are namespaced per plugin. Identical behavior on Windows, macOS,
+    and Linux (in-process KV store, no OS-specific code path).
   tags: [storage, agent, state]
 
 spec:
@@ -29,18 +30,27 @@ spec:
       key:
         type: string
         displayName: Key
-        description: Storage key name.
+        description: Storage key name, arbitrary text, e.g. "yuzu_capture_tmp".
       value:
         type: string
         displayName: Value
-        description: Value to store.
+        description: Value to store, arbitrary text, stored and returned byte-for-byte.
 
   result:
     columns:
       - name: status
         type: string
+        description: >
+          Write outcome. Present and equal to "ok" only when the write
+          succeeded; on failure this row is absent and an "error|<message>"
+          line is written instead (not represented as a column).
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: key
         type: string
+        description: 'The key name that was stored, echoed back unchanged. Values: free text.'
+        example: "yuzu_capture_tmp"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Set storage key '${key}'"
 
@@ -70,6 +80,8 @@ metadata:
   version: 1.0.0
   description: >
     Retrieve a value from the agent's persistent KV storage by key.
+    Returns the sentinel "not_found" if the key has no stored value.
+    Identical behavior on Windows, macOS, and Linux.
   tags: [storage, agent, state]
 
 spec:
@@ -88,14 +100,22 @@ spec:
       key:
         type: string
         displayName: Key
-        description: Storage key to retrieve.
+        description: Storage key to retrieve, e.g. "yuzu_capture_tmp".
 
   result:
     columns:
       - name: key
         type: string
+        description: >-
+          The requested key name, echoed back unchanged. (The literal "key" row-discriminator emitted before this field is not itself a separate column.). Values: free text.
+        example: "yuzu_capture_tmp"
+        platforms: [windows, linux, darwin]
       - name: value
         type: string
+        description: >-
+          The stored value, or the literal sentinel "not_found" when the key has no stored value. Values: free text, or the sentinel not_found.
+        example: "not_found"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Get storage key '${key}'"
 
@@ -124,7 +144,9 @@ metadata:
   displayName: Delete Storage Key
   version: 1.0.0
   description: >
-    Delete a key from the agent's persistent KV storage.
+    Delete a key from the agent's persistent KV storage. Reports "ok"
+    unconditionally once the delete call returns, even if the underlying
+    delete failed. Identical behavior on Windows, macOS, and Linux.
   tags: [storage, agent, state]
 
 spec:
@@ -143,14 +165,23 @@ spec:
       key:
         type: string
         displayName: Key
-        description: Storage key to delete.
+        description: Storage key to delete, e.g. "yuzu_capture_tmp".
 
   result:
     columns:
       - name: status
         type: string
+        description: >
+          Write outcome. Always the literal "ok" when present — written
+          unconditionally once the delete call returns, without checking
+          whether the delete actually succeeded.
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: key
         type: string
+        description: 'The key name that was targeted for deletion, echoed back unchanged. Values: free text.'
+        example: "yuzu_capture_tmp"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Delete storage key '${key}'"
 
@@ -180,7 +211,7 @@ metadata:
   version: 1.0.0
   description: >
     List all keys in the agent's persistent KV storage, optionally
-    filtered by prefix.
+    filtered by prefix. Identical behavior on Windows, macOS, and Linux.
   tags: [storage, agent, state]
 
 spec:
@@ -198,14 +229,23 @@ spec:
       prefix:
         type: string
         displayName: Key Prefix
-        description: Only return keys starting with this prefix. Default is all keys.
+        description: >
+          Only return keys starting with this prefix, e.g. "yuzu_".
+          Default is all keys.
 
   result:
     columns:
       - name: count
         type: int32
+        description: 'Number of keys returned, written once as the first row of every response. Values: integer >= 0.'
+        example: "0"
+        platforms: [windows, linux, darwin]
       - name: key
         type: string
+        description: >-
+          One row per matching key name; no key rows at all when count is 0. Values: free text.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List storage keys (prefix=${prefix})"
 
@@ -234,7 +274,11 @@ metadata:
   displayName: Clear Storage
   version: 1.0.0
   description: >
-    Delete all keys from the storage plugin's namespace.
+    Delete all keys from the storage plugin's namespace. Destructive and
+    irreversible; requires an explicit, in-scope target (cannot be
+    dispatched fleet-wide or with an omitted target). Identical behavior
+    on Windows, macOS, and Linux. Not executed live by the docs capture
+    driver — see the plugin README's Caveats section.
   tags: [storage, agent, state]
 
 spec:
@@ -254,8 +298,15 @@ spec:
     columns:
       - name: status
         type: string
+        description: Write outcome. Always the literal "ok", written after the clear loop completes.
+        example: "ok"
+        platforms: [windows, linux, darwin]
       - name: cleared
         type: int32
+        description: >-
+          Count of keys deleted in this run — the size of the key list read at the start of the pass, not a per-key confirmed-delete count. Values: integer >= 0.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Clear all storage keys"
 

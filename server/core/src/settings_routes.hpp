@@ -10,6 +10,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
@@ -30,6 +31,10 @@
 namespace yuzu::server {
 
 struct Config;
+class RbacStore;
+class AccessReviewStore;
+class DirectorySync;
+class ScimStore;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -44,6 +49,30 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// #4028 — bool-returning audit hook for the fail-closed REST read-twins
+    /// (`GET /api/v1/settings/tls|https|plugin-signing|analytics` +
+    /// `GET /api/v1/agent/plugin-policy`). Distinct from `AuditFn` above
+    /// (fire-and-forget void, used by every existing dashboard-fragment
+    /// mutation in this class) because docs/api-twin-recipe.md §4 requires a
+    /// REST JSON read to FAIL CLOSED (503) on an audit-persist failure,
+    /// which needs the real persisted-or-not bool that `rest_audit.hpp`'s
+    /// `try_persist_audit`/`emit_behavioral_audit` return — `AuditFn`'s void
+    /// return erases that. Optional (defaults empty): when unset, calling
+    /// `try_persist_audit`/`emit_behavioral_audit` with it behaves exactly
+    /// like an audit-off deployment (returns `true`, never blocks a read) —
+    /// see `rest_audit.hpp`'s "null/empty audit_fn is not a persistence
+    /// failure" contract. Not all 8 sub-areas are wired to it: only the four
+    /// judged high/mixed-high sensitivity in #4028's Evidence section
+    /// (tls, https, plugin-signing, analytics) call it; the other four
+    /// (gateway, server-config, mcp, data-retention — "nothing secret" per
+    /// the same Evidence section) issue no audit call at all, matching the
+    /// unaudited posture the existing `/fragments/settings/*` HTML renderers
+    /// for those four already have today.
+    using AuditReadFn =
+        std::function<bool(const httplib::Request&, const std::string& action,
+                           const std::string& result, const std::string& target_type,
+                           const std::string& target_id, const std::string& detail)>;
+
     /// Callback to get agents JSON from AgentRegistry (avoids incomplete-type dep).
     using AgentsJsonFn = std::function<std::string()>;
 
@@ -56,6 +85,51 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Inject the engine-principal store (nullable — a null pointer means
+    /// the feature is not yet wired; server.cpp wiring is a separate task
+    /// from this one, same deferral pattern as `AuthRoutes::
+    /// set_engine_principal_store`). While unset, the DELETE-user
+    /// owner-delete guard (design doc §3.1) and the Engine Principals
+    /// admin-console fragment are both skipped/inert. Setter rather than a
+    /// ctor param to keep the stacked-PR wiring in server.cpp low-risk.
+    void set_engine_principal_store(EnginePrincipalStore* store) {
+        engine_principal_store_ = store;
+    }
+
+    /// Inject the RBAC store (nullable — same deferred-wiring pattern as
+    /// `set_engine_principal_store` above; server.cpp wiring is a separate
+    /// follow-up task). Required by `access_review_model::build_access_review`
+    /// for the Access Reviews Settings fragment (SOC 2 CC6.2); while unset,
+    /// that fragment renders its "data unavailable" notice instead of
+    /// crashing (build_access_review returns `std::unexpected` on a null/
+    /// closed RbacStore — see access_review_model.hpp).
+    void set_rbac_store(RbacStore* store) { rbac_store_ = store; }
+
+    /// Inject the Access Review campaign store (nullable, same deferred-
+    /// wiring pattern). Backs the campaign-view sub-fragment
+    /// (`render_access_review_campaign_fragment`) — while unset, that
+    /// fragment renders a "store unavailable" notice. The fragment's write
+    /// actions (open/attest/close) do NOT go through this pointer — they
+    /// call the REST endpoints in rest_api_v1.cpp directly (the ADR-1005
+    /// API-parity surface), so this pointer is read-only-path use only.
+    void set_access_review_store(AccessReviewStore* store) { access_review_store_ = store; }
+
+    /// Inject DirectorySync for the access-review read-model's optional
+    /// user-email enrichment (nullable — see access_review_model.hpp's
+    /// "optional enrichment" contract; a null pointer degrades only the
+    /// `owner_or_email` field, never fails the export). Same deferred-wiring
+    /// pattern as the setters above.
+    void set_access_review_directory_sync(DirectorySync* dirsync) { directory_sync_ = dirsync; }
+
+    /// Inject ScimStore (nullable, same deferred-wiring pattern as the
+    /// setters above). ADR-2001 §§1,3: `DELETE /api/settings/users/
+    /// {username}` resolves the deleted username's SCIM slug -> linked-OIDC
+    /// principal set through this pointer before revoking credentials.
+    /// While unset (or not open), the resolver degrades to the slug-only
+    /// set rather than failing closed — see `deprovision_revoke.hpp`'s
+    /// `resolve_deprovision_principals_for_username` doc comment.
+    void set_scim_store(ScimStore* store) { scim_store_ = store; }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -76,7 +150,7 @@ public:
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                          yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         StepUpFn step_up_fn = {});
+                         StepUpFn step_up_fn = {}, AuditReadFn audit_read_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesized requests directly,
@@ -95,7 +169,7 @@ public:
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                          yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         StepUpFn step_up_fn = {});
+                         StepUpFn step_up_fn = {}, AuditReadFn audit_read_fn = {});
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -163,6 +237,38 @@ private:
     /// is recomputed at render time directly from the PEM file rather
     /// than denormalised, to avoid drift between disk + DB.
     std::string render_plugin_signing_fragment();
+    /// Render the Engine Principals admin-console fragment — a table of
+    /// every engine principal (`EnginePrincipalStore::list_all`, including
+    /// revoked rows) with owner, classification, lifecycle state, and
+    /// active-credential count (`ApiTokenStore::list_active_for_principal`).
+    /// Revoked rows surface the `superseded_by` linkage AND the revocation
+    /// reason explicitly (design doc §3.1) — never a merged history that
+    /// hides that a revocation occurred. Admin-only; a null
+    /// `engine_principal_store_` renders an inert "not configured" panel.
+    std::string render_engine_principals_fragment();
+
+    /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a
+    /// CONVENIENCE dashboard surface only; the REST endpoints under
+    /// `/api/v1/access-reviews*` (rest_api_v1.cpp) and their MCP twins are
+    /// the ADR-1005 API-parity surface. Shows the current cross-principal
+    /// grant export (`access_review_model::build_access_review`) + a CSV
+    /// download link; an operator holding `AccessReview:Attest` additionally
+    /// sees the "open review campaign" control (probed via a throwaway
+    /// `httplib::Response`, mirroring `dex_routes.cpp`'s `can_execute`
+    /// pattern — never gates the whole route on Attest, since a read-only
+    /// auditor must still see the table). `req` is needed for that probe.
+    std::string render_access_review_fragment(const httplib::Request& req);
+
+    /// Render one review campaign's evidentiary state (metadata + frozen
+    /// attestation rows) as a sub-fragment — used both for the initial
+    /// `?id=` deep link and for the JS-driven refresh after an attest/flag/
+    /// close action. Gated by the caller on `AccessReview:Read` (matches the
+    /// REST `GET /api/v1/access-reviews/{id}` gate); per-row Attest/Flag
+    /// buttons and the Close-campaign button are additionally probed against
+    /// `AccessReview:Attest` inside this function, same pattern as the top-level
+    /// fragment above. Empty `campaign_id` renders an empty container.
+    std::string render_access_review_campaign_fragment(const httplib::Request& req,
+                                                        const std::string& campaign_id);
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 
@@ -170,11 +276,24 @@ private:
     AdminFn admin_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;
+    AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
     ApiTokenStore* api_token_store_{};
+    // Nullable — see set_engine_principal_store(). Non-owning; lifetime is
+    // server.cpp's, which outlives this object.
+    EnginePrincipalStore* engine_principal_store_{nullptr};
+    // Nullable — see set_rbac_store() / set_access_review_store() /
+    // set_access_review_directory_sync(). Non-owning; lifetime is
+    // server.cpp's, which outlives this object.
+    RbacStore* rbac_store_{nullptr};
+    AccessReviewStore* access_review_store_{nullptr};
+    DirectorySync* directory_sync_{nullptr};
+    // Nullable — see set_scim_store(). Non-owning; lifetime is server.cpp's,
+    // which outlives this object.
+    ScimStore* scim_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};

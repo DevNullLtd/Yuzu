@@ -1,0 +1,10 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/settings/engine-principals",
+    "capability_id": "get.fragments-settings-engine-principals",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

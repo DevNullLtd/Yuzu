@@ -7,12 +7,14 @@
 #
 # KEEP IN SYNC with tests/fuzz/meson.build (same harness list, same extra
 # sources). Drift is caught by the cflite-pr.yml build job on any PR touching
-# these paths.
+# these paths. A new or changed source here also needs its family glob in
+# BOTH workflows' paths: lists (cflite-pr.yml + cflite-batch.yml) — the
+# filters are what decide whether fuzzing runs at all on a source change.
 
 # EXACT repo-name case — CFLite mounts the checkout at $SRC/Yuzu (see the
 # Dockerfile comment).
 SRC_DIR="$SRC/Yuzu"
-INC="-I$SRC_DIR/server/core/src -I$SRC/nlohmann_json/include"
+INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
 STD="-std=c++23"
 
 build_target() {

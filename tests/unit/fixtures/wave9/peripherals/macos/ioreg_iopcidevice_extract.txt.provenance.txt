@@ -1,0 +1,7 @@
+host: braga (braga.local)
+os: macOS 26.6.2 (Darwin 25.6.0), Xcode CLT clang
+identity: alex (unprivileged, uid 501)
+command: ioreg -l -r -c IOPCIDevice -d 1 | grep -E '\+-o|"vendor-id"|"device-id"|"class-code"|"subsystem-vendor-id"|"subsystem-id"|"IOName"|"pcidebug"'
+date: 2026-09-08
+status: REAL CAPTURE (grep-extracted subset of an 2,105-line raw `ioreg -l -r -c IOPCIDevice -d 1` capture, per-node header plus the seven fields peripherals_macos.cpp reads; not a plutil/JSON reshape since ioreg -l's own text form already isolates these keys one-per-line)
+lines: 54 (budget 150)

@@ -17,7 +17,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -33,41 +33,29 @@ using yuzu::server::auth::Role;
 namespace {
 
 struct LockoutFixture {
-    std::filesystem::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    // AuthDbPg defaults to cleanup_interval_secs=0 — no background reaper
+    // jthread (the rapid create/destruct of one fixture per
+    // TEST_CASE_METHOD otherwise spawns+joins it once per case).
+    yuzu::test::AuthDbPg db;
 
     LockoutFixture() {
-        // cleanup_interval_secs=0 — no background reaper jthread (the rapid
-        // create/destruct of one fixture per TEST_CASE_METHOD otherwise
-        // triggers the macOS-arm64 SIGSEGV diagnosed in PR #1199).
-        data_dir = yuzu::test::unique_temp_path("yuzu-lockout-");
-        std::filesystem::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         auto salt = AuthManager::random_bytes(16);
         auto salt_hex = AuthManager::bytes_to_hex(salt);
         auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
         REQUIRE(db->upsert_user("alice", hash, salt_hex, Role::admin).has_value());
     }
-
-    ~LockoutFixture() {
-        db.reset();
-        std::error_code ec;
-        std::filesystem::remove_all(data_dir, ec);
-    }
 };
 
 } // namespace
 
-TEST_CASE_METHOD(LockoutFixture, "fresh user is not locked", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "fresh user is not locked", "[pg][auth][lockout]") {
     auto st = db->lockout_status("alice");
     REQUIRE(st.has_value());
     CHECK_FALSE(st->locked);
     CHECK(st->failed_count == 0);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "failures below threshold do not lock", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "failures below threshold do not lock", "[pg][auth][lockout]") {
     const int threshold = 5;
     for (int i = 1; i < threshold; ++i) {
         auto rec = db->record_failed_login("alice", threshold, 900);
@@ -82,7 +70,7 @@ TEST_CASE_METHOD(LockoutFixture, "failures below threshold do not lock", "[auth]
     CHECK(st->failed_count == threshold - 1);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "threshold-th failure locks exactly once", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "threshold-th failure locks exactly once", "[pg][auth][lockout]") {
     const int threshold = 3;
     db->record_failed_login("alice", threshold, 900);
     db->record_failed_login("alice", threshold, 900);
@@ -106,7 +94,7 @@ TEST_CASE_METHOD(LockoutFixture, "threshold-th failure locks exactly once", "[au
     CHECK(st->locked);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "clear resets lockout state", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "clear resets lockout state", "[pg][auth][lockout]") {
     const int threshold = 2;
     db->record_failed_login("alice", threshold, 900);
     auto locked = db->record_failed_login("alice", threshold, 900);
@@ -121,7 +109,7 @@ TEST_CASE_METHOD(LockoutFixture, "clear resets lockout state", "[auth][lockout]"
     CHECK(st->failed_count == 0);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "threshold <= 0 disables recording", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "threshold <= 0 disables recording", "[pg][auth][lockout]") {
     auto rec = db->record_failed_login("alice", /*threshold=*/0, 900);
     REQUIRE(rec.has_value());
     CHECK(rec->failed_count == 0);
@@ -132,7 +120,7 @@ TEST_CASE_METHOD(LockoutFixture, "threshold <= 0 disables recording", "[auth][lo
     CHECK(st->failed_count == 0);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "non-existent user never creates a row", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "non-existent user never creates a row", "[pg][auth][lockout]") {
     // Anti-enumeration + no storage growth: spraying random usernames must
     // not lock (or create) an account that does not exist.
     auto rec = db->record_failed_login("ghost", 5, 900);
@@ -146,7 +134,7 @@ TEST_CASE_METHOD(LockoutFixture, "non-existent user never creates a row", "[auth
     CHECK(st->failed_count == 0);
 }
 
-TEST_CASE_METHOD(LockoutFixture, "malformed username is rejected", "[auth][lockout]") {
+TEST_CASE_METHOD(LockoutFixture, "malformed username is rejected", "[pg][auth][lockout]") {
     // A ':' is config-injection-reserved and rejected by is_valid_username,
     // so all three methods surface InvalidUsername rather than silently
     // touching a divergent row.
@@ -157,7 +145,7 @@ TEST_CASE_METHOD(LockoutFixture, "malformed username is rejected", "[auth][locko
 }
 
 TEST_CASE_METHOD(LockoutFixture, "expired window unlocks and grants a fresh budget",
-                 "[auth][lockout][slow]") {
+                 "[pg][auth][lockout][slow]") {
     const int threshold = 2;
     // Lock with a 1-second window.
     db->record_failed_login("alice", threshold, 1);

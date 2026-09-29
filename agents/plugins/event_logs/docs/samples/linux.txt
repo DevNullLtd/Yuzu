@@ -1,0 +1,9 @@
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 81838b2b5566
+== action=errors
+error|none|-|journalctl did not run
+[result_status] UNAVAILABLE / PARTIAL / event_logs_journalctl:errors_unavailable
+
+== action=query log=system filter=error
+event|none|-|journalctl did not run
+[result_status] UNAVAILABLE / PARTIAL / event_logs_journalctl:query_unavailable
+

@@ -25,7 +25,7 @@ extern "C" {
 
 /* ── Version ────────────────────────────────────────────────────────────────── */
 
-#define YUZU_PLUGIN_ABI_VERSION 3
+#define YUZU_PLUGIN_ABI_VERSION 4
 
 /**
  * Compile-time SDK version string embedded in every plugin descriptor.
@@ -36,6 +36,17 @@ extern "C" {
 /**
  * Plugins compiled against ABI version 1 are still loadable.
  * The agent checks descriptor->abi_version >= YUZU_PLUGIN_ABI_VERSION_MIN.
+ *
+ * ABI evolution convention (pin, do not violate): YuzuPluginDescriptor grows
+ * strictly by APPENDING new fields at the end. Existing fields are never
+ * reordered or repurposed — a plugin built against an older ABI must keep
+ * loading and its existing fields must keep meaning what they always meant.
+ * The descriptor declaration below is therefore NEVER #ifdef'd on target OS:
+ * a single-OS build still emits all three OS columns of every
+ * YuzuActionDescriptor leg (unknown/undeclared legs for OSes the plugin
+ * doesn't target), so the struct layout is identical across every platform
+ * build and #2204's capability-matrix generator can dlopen a plugin built on
+ * any one OS and read a stable, complete shape.
  */
 #define YUZU_PLUGIN_ABI_VERSION_MIN 1
 
@@ -65,6 +76,65 @@ typedef struct {
 typedef int (*YuzuCommandHandler)(YuzuCommandContext* ctx, const char* action,
                                   const YuzuParam* params, size_t param_count);
 
+/* ── OS capability descriptor (ABI v4+, #2204) ───────────────────────────────── */
+
+/**
+ * Per-OS support level for one action. Values are ordered least- to
+ * most-capable so a numeric comparison ("at least constrained") is
+ * meaningful, but callers should match on the named value rather than rely
+ * on ordering.
+ *
+ * `YUZU_SUPPORT_UNDECLARED` (the zero value) is what every leg reads as when
+ * the plugin was built against ABI < 4 (no action_descriptors array at all)
+ * or the plugin declares actions but leaves a specific OS leg unset — it
+ * means "no data", never "unsupported". Only the plugin's own declaration
+ * ever sets one of the other four values.
+ */
+typedef enum {
+    YUZU_SUPPORT_UNDECLARED  = 0, /* no data — ABI<4 plugin, or leg left unset */
+    YUZU_SUPPORT_UNSUPPORTED = 1, /* this OS cannot supply the capability at all */
+    YUZU_SUPPORT_PLANNED     = 2, /* not implemented yet; mechanism names the plan */
+    YUZU_SUPPORT_CONSTRAINED = 3, /* works, with a known limitation (see fallback) */
+    YUZU_SUPPORT_SUPPORTED   = 4  /* fully wired and exercised in CI */
+} YuzuSupportLevel;
+
+/**
+ * One per-OS leg of an action's capability declaration.
+ *
+ * `rung` states HOW this leg acquires the capability on this OS, per the
+ * acquisition ladder fixed by docs/adr/3002-acquisition-ladder.md: rung 1 =
+ * the native OS interface (syscalls / kernel-published surfaces / OS APIs —
+ * zero processes, the best rung), rung 2 = the argv runner (a subprocess
+ * exec'd through the shared agent-core subprocess_runner), rung 3 = the
+ * governed shell (a runner-spawned shell — two-plus processes, string-as-
+ * code, the worst rung). 0 means undeclared. It is deliberately independent
+ * of `support`: e.g. a PLANNED leg may already name its target rung, and a
+ * SUPPORTED leg's rung says which acquisition method is actually wired —
+ * never how mature or hardened that wiring is.
+ */
+typedef struct {
+    YuzuSupportLevel support;
+    uint8_t rung; /* 1-3; 0 = undeclared */
+    /** Short mechanism name, e.g. "etw", "procfs", "endpoint_security". NULL/empty = undeclared. */
+    const char* mechanism;
+    /** Optional human-readable fallback/limitation note. NULL if none. */
+    const char* fallback;
+} YuzuOsLeg;
+
+/**
+ * Per-action capability declaration: one action name plus its three
+ * per-OS legs. A single-OS build still populates all three legs — never
+ * #ifdef the leg out — so the capability matrix generator (#2204) sees a
+ * complete, stable shape regardless of which OS built the plugin.
+ */
+typedef struct {
+    /** Action name; should match one entry in YuzuPluginDescriptor.actions. */
+    const char* action;
+    YuzuOsLeg linux_leg;
+    YuzuOsLeg macos_leg;
+    YuzuOsLeg windows_leg;
+} YuzuActionDescriptor;
+
 /* ── Plugin descriptor ────────────────────────────────────────────────────────── */
 
 /**
@@ -72,7 +142,13 @@ typedef int (*YuzuCommandHandler)(YuzuCommandContext* ctx, const char* action,
  * The struct must remain valid for the lifetime of the plugin (i.e. static).
  */
 typedef struct {
-    /** Must equal YUZU_PLUGIN_ABI_VERSION. Checked at load time. */
+    /**
+     * Must lie within [YUZU_PLUGIN_ABI_VERSION_MIN, YUZU_PLUGIN_ABI_VERSION]
+     * (checked at load time — PluginHandle::load(), plugin_loader.cpp).
+     * Set this to YUZU_PLUGIN_ABI_VERSION when building against the current
+     * SDK; a plugin built against an older ABI within the range keeps
+     * loading, per the append-only convention above.
+     */
     uint32_t abi_version;
 
     /** Short unique identifier (e.g. "inventory", "patch"). */
@@ -111,6 +187,25 @@ typedef struct {
      */
     const char* sdk_version;
 
+    /**
+     * ABI v4+: per-action, per-OS capability declarations (#2204). NULL for
+     * plugins compiled with ABI version < 4 — every capability query then
+     * reports YUZU_SUPPORT_UNDECLARED for that plugin, which is honest: the
+     * data simply doesn't exist at that ABI version. Never NULL-terminated;
+     * length is action_descriptor_count.
+     *
+     * APPEND-ONLY CONVENTION: this is the last field of YuzuPluginDescriptor
+     * today. Any future addition (e.g. mac-parity's ES-broker fields on ABI4,
+     * or a subsequent ABI5) must APPEND further fields after this one and
+     * bump YUZU_PLUGIN_ABI_VERSION again — never reorder or repurpose an
+     * existing field, and never #ifdef this declaration on target OS (see
+     * YUZU_PLUGIN_ABI_VERSION_MIN's comment above).
+     */
+    const YuzuActionDescriptor* action_descriptors;
+
+    /** Number of entries in action_descriptors. 0 when the array is NULL. */
+    size_t action_descriptor_count;
+
 } YuzuPluginDescriptor;
 
 /* ── Required export symbol ──────────────────────────────────────────────────── */
@@ -139,6 +234,38 @@ typedef const YuzuPluginDescriptor* (*yuzu_plugin_descriptor_fn)(void);
 #define YUZU_PLUGIN_API __attribute__((visibility("default")))
 #endif
 
+/* ── Plugin→host typed result seam (ABI v4+, CC-07) ──────────────────────────── */
+
+/**
+ * Typed runtime status a plugin reports for the command it is currently
+ * executing, in addition to execute()'s int return code. This is the
+ * plugin→host CC-07 status ONLY — it is NOT the subprocess-runner
+ * termination-reason enum (a separate concept scoped to the runner header)
+ * and carries no mapping to/from it.
+ *
+ * `YUZU_RESULT_STATUS_UNDECLARED` (the zero value / the value the agent
+ * assumes when a plugin never calls yuzu_ctx_set_result_status()) means "no
+ * typed status reported" — the agent then falls back to deriving a coarse
+ * status from execute()'s int return code alone (0 -> ok-ish, non-zero ->
+ * unavailable-ish), which is exactly what happens for every ABI<4 plugin and
+ * is why the seam is fully backward compatible with the int-only execute()
+ * path.
+ */
+typedef enum {
+    YUZU_RESULT_STATUS_UNDECLARED        = 0,
+    YUZU_RESULT_STATUS_OK                = 1,
+    YUZU_RESULT_STATUS_UNAVAILABLE       = 2,
+    YUZU_RESULT_STATUS_PERMISSION_DENIED = 3,
+    YUZU_RESULT_STATUS_CONSTRAINED       = 4
+} YuzuResultStatus;
+
+/** How complete the reported result is, independent of its status. */
+typedef enum {
+    YUZU_RESULT_COMPLETENESS_UNKNOWN = 0, /* not reported; the default */
+    YUZU_RESULT_COMPLETENESS_FULL    = 1,
+    YUZU_RESULT_COMPLETENESS_PARTIAL = 2
+} YuzuResultCompleteness;
+
 /* ── Context helpers (implemented by the agent host) ─────────────────────────── */
 
 /**
@@ -151,6 +278,30 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
  * Report progress (0–100). Optional; agents may display this in the UI.
  */
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent);
+
+/**
+ * Report the CC-07 typed result status for the command currently executing
+ * on this context (ABI v4+). Optional; a plugin that never calls this
+ * leaves the status YUZU_RESULT_STATUS_UNDECLARED and the agent derives a
+ * coarse status from execute()'s int return code instead. May be called at
+ * most meaningfully once per command — a later call in the same execute()
+ * overwrites the earlier one.
+ *
+ * @param ctx           Command context passed into execute().
+ * @param status        Typed outcome; see YuzuResultStatus. A value outside
+ *                      YuzuResultStatus's declared range is stored as
+ *                      YUZU_RESULT_STATUS_UNDECLARED rather than kept raw.
+ * @param completeness  How complete the result is; see YuzuResultCompleteness.
+ * @param provenance    Optional short string identifying the source of the
+ *                      status (e.g. a mechanism or sub-component name).
+ *                      NULL if not applicable. The host copies this string
+ *                      synchronously before the call returns — the plugin
+ *                      does not need to keep the pointed-to memory alive
+ *                      past this call.
+ */
+YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultStatus status,
+                                            YuzuResultCompleteness completeness,
+                                            const char* provenance);
 
 /**
  * Retrieve a named configuration value set by the server for this plugin.
@@ -260,7 +411,12 @@ YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefi
  * @param directory    Override temp directory. NULL uses the system default.
  * @param path_out     Buffer to receive the null-terminated absolute path.
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
- * @return             0 on success, non-zero on failure.
+ * @return             0 on success, non-zero on failure. On Windows, a
+ *                     non-zero return always leaves GetLastError() carrying a
+ *                     meaningful code for THIS call (never a stale value left
+ *                     over from an earlier, unrelated Win32 call) -- callers
+ *                     may report it directly, e.g. as a `dest_dir_create_<N>`
+ *                     style constrained-reason token.
  */
 YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, const char* directory,
                                       char* path_out, size_t path_out_size);
@@ -274,7 +430,8 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
  * @param directory    Override parent directory. NULL uses the system default.
  * @param path_out     Buffer to receive the null-terminated absolute path.
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
- * @return             0 on success, non-zero on failure.
+ * @return             0 on success, non-zero on failure. Same GetLastError()
+ *                     guarantee as yuzu_create_temp_file above.
  */
 YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
                                      size_t path_out_size);

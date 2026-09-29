@@ -104,6 +104,52 @@ TEST_CASE("procperf derive: same-name processes aggregate into one app row",
     CHECK(out[0].ws_bytes == 3LL * (100 << 20));
 }
 
+TEST_CASE("procperf derive: is_kthread flows through to the aggregated sample",
+          "[tar][procperf]") {
+    auto prev = snap(1000), cur = snap(1030);
+    // A kernel thread and a normal process, tracked independently by name.
+    auto kt_prev = proc(2, 1, 0, 0, "kworker/0:1");
+    auto kt_cur = proc(2, 1, kSec100ns, 0, "kworker/0:1");
+    kt_prev.is_kthread = kt_cur.is_kthread = true;
+    prev.procs.push_back(kt_prev);
+    cur.procs.push_back(kt_cur);
+    prev.procs.push_back(proc(10, 1, 0, 1 << 20, "normal.exe"));
+    cur.procs.push_back(proc(10, 1, kSec100ns, 1 << 20, "normal.exe"));
+
+    const auto out = derive_proc_samples(prev, cur, kNoRedaction);
+    REQUIRE(out.size() == 2);
+    for (const auto& s : out) {
+        if (s.name == "kworker/0:1")
+            CHECK(s.is_kthread == true);
+        else if (s.name == "normal.exe")
+            CHECK(s.is_kthread == false);
+        else
+            FAIL("unexpected sample name: " << s.name);
+    }
+}
+
+TEST_CASE("procperf derive: is_kthread is OR'd across same-name instances",
+          "[tar][procperf]") {
+    // Same name, one instance flagged is_kthread and one not — the aggregate
+    // must read true (the conservative/inclusive direction, matching the
+    // comm-width redaction fallback's own "only ever ADDS" precedent).
+    auto prev = snap(1000), cur = snap(1030);
+    auto a_prev = proc(11, 1, 0, 0, "shared-name");
+    auto a_cur = proc(11, 1, kSec100ns, 0, "shared-name");
+    a_prev.is_kthread = a_cur.is_kthread = true;
+    auto b_prev = proc(12, 1, 0, 0, "shared-name");
+    auto b_cur = proc(12, 1, kSec100ns, 0, "shared-name");
+    prev.procs.push_back(a_prev);
+    cur.procs.push_back(a_cur);
+    prev.procs.push_back(b_prev);
+    cur.procs.push_back(b_cur);
+
+    const auto out = derive_proc_samples(prev, cur, kNoRedaction);
+    REQUIRE(out.size() == 1);
+    CHECK(out[0].instances == 2);
+    CHECK(out[0].is_kthread == true);
+}
+
 TEST_CASE("procperf derive: PID reuse (different create_time) finds no baseline",
           "[tar][procperf]") {
     // Same PID, different create_time = a DIFFERENT process. Its inherited
@@ -283,6 +329,11 @@ TEST_CASE("procperf: hourly rollup SQL exists and groups per (hour, name, versio
     CHECK(sql.find("GROUP BY (ts / 3600) * 3600, name, version") != std::string::npos);
     CHECK(sql.find("(hour_ts, name, version,") != std::string::npos);
     CHECK(sql.find("MAX(instances)") != std::string::npos);
+    // is_kthread rides the GROUP BY as an identity column (never aggregated)
+    // so a kernel-thread and non-kernel-thread row sharing a (name, version)
+    // never collapse into one mislabelled row.
+    CHECK(sql.find("is_kthread") != std::string::npos);
+    CHECK(sql.find("GROUP BY (ts / 3600) * 3600, name, version, is_kthread") != std::string::npos);
 }
 
 TEST_CASE("procperf: live columns carry name but never a cmdline", "[tar][procperf][schema]") {
@@ -295,6 +346,7 @@ TEST_CASE("procperf: live columns carry name but never a cmdline", "[tar][procpe
     const auto table_ddl = ddl.substr(pos, end - pos);
     CHECK(table_ddl.find("name TEXT") != std::string::npos);
     CHECK(table_ddl.find("version TEXT") != std::string::npos); // the app-identity dimension
+    CHECK(table_ddl.find("is_kthread INTEGER") != std::string::npos); // kernel-thread marker
     CHECK(table_ddl.find("cmdline") == std::string::npos);
     CHECK(table_ddl.find("user") == std::string::npos);
     CHECK(table_ddl.find("path") == std::string::npos); // never the image PATH (privacy)
@@ -340,6 +392,9 @@ TEST_CASE("procperf: Linux pid-stat parse — field indices and unit conversions
     CHECK(p->cpu_100ns == 3000ULL * 100'000);            // ticks ×1e7/clk_tck @ 100 Hz
     CHECK(p->create_time_100ns == 5000LL * 100'000);     // boot-relative, identity-only
     CHECK(p->ws_bytes == 2048ULL * 4096);                // rss pages × page size
+    // flags=4194560 (0x400100) — PF_KTHREAD (0x00200000) is NOT set; a normal
+    // user-space process (nginx) must never read as a kernel thread.
+    CHECK(p->is_kthread == false);
 
     SECTION("clk_tck scaling") {
         const char* line = "1 (a) S 0 0 0 0 0 0 0 0 0 0 1500 1500 0 0 20 0 1 0 5000 0 10 0";
@@ -397,6 +452,9 @@ TEST_CASE("procperf: Linux pid-stat parse — comm adversaries and malformed inp
         REQUIRE(p);
         CHECK(p->name == "kthreadd");
         CHECK(p->ws_bytes == 0); // self-excludes from the working-set top-N
+        // flags=2129984 (0x208040) — PF_KTHREAD (0x00200000) IS set: a real
+        // captured kthreadd flags word, not a synthetic fixture.
+        CHECK(p->is_kthread == true);
     }
     SECTION("malformed content is nullopt, never a throw") {
         CHECK(!parse_linux_pid_stat(1, "", 100, 4096));
@@ -409,6 +467,41 @@ TEST_CASE("procperf: Linux pid-stat parse — comm adversaries and malformed inp
         const std::string line = std::string("1 (a)") + tail;
         CHECK(!parse_linux_pid_stat(1, line, 0, 4096));
         CHECK(!parse_linux_pid_stat(1, line, 100, 0));
+    }
+}
+
+TEST_CASE("procperf: is_kthread is PF_KTHREAD-flag-derived, not comm-derived",
+          "[tar][procperf][linux]") {
+    // A process can trivially name itself "kworker/0:1" via prctl(PR_SET_NAME)
+    // (tar_proc_perf.hpp's "Kernel-thread marker" note) — the flag bit, never
+    // the name, is what parse_linux_pid_stat consults.
+    auto stat_line = [](std::uint32_t pid, std::string_view comm, std::uint64_t flags) {
+        return std::to_string(pid) + " (" + std::string(comm) + ") S 0 0 0 0 -1 " +
+               std::to_string(flags) + " 0 0 0 0 5 5 0 0 20 0 1 0 25 0 0 0";
+    };
+    SECTION("exact PF_KTHREAD bit (0x00200000) set, comm looks like a real app") {
+        const auto p = parse_linux_pid_stat(5, stat_line(5, "totally-legit.exe", 0x00200000),
+                                            100, 4096);
+        REQUIRE(p);
+        CHECK(p->name == "totally-legit.exe");
+        CHECK(p->is_kthread == true); // 0x00200000 exactly
+    }
+    SECTION("adjacent bits set, PF_KTHREAD itself clear, comm looks like a kernel thread") {
+        // 0x00100000 (PF_KSWAPD, an adjacent-but-different flag) — spoofing the
+        // NAME to "kworker/0:1" must not fool the flag check either.
+        const auto p = parse_linux_pid_stat(6, stat_line(6, "kworker/0:1", 0x00100000), 100, 4096);
+        REQUIRE(p);
+        CHECK(p->name == "kworker/0:1");
+        CHECK(p->is_kthread == false);
+    }
+    SECTION("flags=0 is never a kernel thread") {
+        const auto p = parse_linux_pid_stat(7, stat_line(7, "a", 0), 100, 4096);
+        REQUIRE(p);
+        CHECK(p->is_kthread == false);
+    }
+    SECTION("unparseable flags field rejects the row (same discipline as utime/rss)") {
+        CHECK(!parse_linux_pid_stat(
+            8, "8 (a) S 0 0 0 0 -1 notanumber 0 0 0 0 5 5 0 0 20 0 1 0 25 0 0 0", 100, 4096));
     }
 }
 

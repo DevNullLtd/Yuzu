@@ -34,12 +34,24 @@ spec:
     columns:
       - name: username
         type: string
+        description: 'The account name of a currently logged-on user. Values: free text.'
+        example: alex
+        platforms: [windows, linux, darwin]
       - name: domain
         type: string
+        description: 'The host or domain the session belongs to, or the literal "local" when it has none. Values: hostname/domain or the literal "local".'
+        example: local
+        platforms: [windows, linux, darwin]
       - name: logon_type
         type: string
+        description: 'How the session was established. Values: console, remote, RDP (Windows only).'
+        example: console
+        platforms: [windows, linux, darwin]
       - name: session_id
         type: string
+        description: "The session's terminal identifier — a utmp line name (Linux), a tty (macOS), or a numeric WTS session ID (Windows). Values: free text."
+        example: console
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List currently logged-on users"
 
@@ -71,7 +83,8 @@ metadata:
     Lists active interactive sessions on the endpoint, including session
     state (Active, Connected, Disconnected, Idle), the connected user,
     remote client name or host, and idle time. Uses WTS session APIs on
-    Windows and the 'w' command on Linux/macOS.
+    Windows and the 'w' command on Linux/macOS. The idle field is always
+    "0" on Windows — idle-time decoding is not implemented there.
   tags: [users, sessions, security, inventory]
 
 spec:
@@ -91,14 +104,29 @@ spec:
     columns:
       - name: session_id
         type: string
+        description: "The session's controlling tty (Linux/macOS) or numeric WTS session ID (Windows). Values: free text."
+        example: console
+        platforms: [windows, linux, darwin]
       - name: username
         type: string
+        description: 'The account that owns this session. Values: free text.'
+        example: alex
+        platforms: [windows, linux, darwin]
       - name: state
         type: string
+        description: "The session's connection state. Values: Active (Linux/macOS, always); Windows: Active, Connected, Disconnected, Idle, Listen, Other."
+        example: Active
+        platforms: [windows, linux, darwin]
       - name: client
         type: string
+        description: "The remote host the session connects from ('w' FROM column) or the RDP client name on Windows; \"-\" when none. Values: free text or \"-\"."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: idle
         type: string
+        description: "Idle time as reported by 'w' on Linux/macOS; always the literal \"0\" on Windows, where idle-time decoding is unimplemented. Values: free text (Linux/macOS) or the literal \"0\" (Windows)."
+        example: "13:35"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List active interactive sessions"
 
@@ -130,7 +158,12 @@ metadata:
     Enumerates local user accounts on the endpoint. Reports the username,
     enabled/disabled status, last logon timestamp, and account description.
     On Linux reads /etc/passwd (skipping system accounts with UID < 1000),
-    on macOS uses dscl, on Windows uses NetUserEnum.
+    on macOS uses dscl, on Windows uses NetUserEnum. On macOS, also reports
+    console_state — a tri-state ("true"/"false"/"unknown") signal for
+    whether the account is the current GUI/console-login user; Linux and
+    Windows omit this field entirely rather than leaving it empty. On
+    Linux, a username containing characters outside [A-Za-z0-9._-] skips
+    the lastlog lookup and reports last_logon as "unknown".
   tags: [users, accounts, security, compliance, inventory]
 
 spec:
@@ -150,12 +183,29 @@ spec:
     columns:
       - name: username
         type: string
+        description: "The local account's username. Values: free text."
+        example: Alex
+        platforms: [windows, linux, darwin]
       - name: enabled
         type: bool
+        description: 'Whether the account is enabled. Values: true, false.'
+        example: "true"
+        platforms: [windows, linux, darwin]
       - name: last_logon
         type: string
+        description: "The account's most recent login timestamp, or a sentinel when unknown or never logged in. Values: \"YYYY-MM-DD HH:MM:SS\", \"Never\", \"unknown\"."
+        example: "2026-09-07 11:08:37"
+        platforms: [windows, linux, darwin]
       - name: description
         type: string
+        description: "The account's comment/description text (Windows comment, macOS RealName, Linux GECOS field), or \"-\" when empty. Values: free text or \"-\"."
+        example: Built-in account for administering the computer/domain
+        platforms: [windows, linux, darwin]
+      - name: console_state
+        type: string
+        description: 'Tri-state flag for whether this account is the current GUI/console-login user; the field is entirely absent (not empty) on Linux and Windows. Values: true, false, unknown.'
+        example: "true"
+        platforms: [darwin]
 
   readablePayload: "Enumerate local user accounts"
 
@@ -208,10 +258,19 @@ spec:
     columns:
       - name: member_name
         type: string
+        description: 'The name of an account or group belonging to the local admin membership. Values: free text.'
+        example: Alex
+        platforms: [windows, linux, darwin]
       - name: member_type
         type: string
+        description: 'The kind of member. Values: user (always on Linux/macOS); Windows: user, group, well_known_group, alias, unknown.'
+        example: user
+        platforms: [windows, linux, darwin]
       - name: domain_or_group
         type: string
+        description: 'The domain owning the member (Windows), or the source group/account name (Linux "sudo"/"wheel"/"root", macOS literal "admin"). Values: free text.'
+        example: DESKTOP-04DNSIG
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List local administrator group members"
 
@@ -274,10 +333,19 @@ spec:
     columns:
       - name: member_name
         type: string
+        description: 'The account (or nested group, on Windows) belonging to the queried group. Values: free text.'
+        example: Alex
+        platforms: [windows, linux, darwin]
       - name: group_name
         type: string
+        description: 'The group name from the "group" parameter, echoed back on every row. Values: free text.'
+        example: Administrators
+        platforms: [windows, linux, darwin]
       - name: member_type
         type: string
+        description: 'The kind of membership. Values: user, primary_group (Linux only); Windows: user, group, well_known_group, alias.'
+        example: user
+        platforms: [windows, linux, darwin]
 
   readablePayload: "List members of group '${group}'"
 
@@ -309,10 +377,13 @@ metadata:
     Identifies the primary user of the endpoint by analyzing login
     frequency. On Windows queries Security Event Log for Event ID
     4624 (logon) events and counts occurrences per user, falling back
-    to the registry profile list. On Linux and macOS parses the output
-    of the 'last' command. Returns the user with the most login events
-    and the count. Machine accounts (ending with $) and SYSTEM are
-    excluded.
+    to the registry profile list when the Security channel is
+    unreadable. On Linux and macOS parses the output of the 'last'
+    command instead, capped at the 200 most recent lines. Returns the
+    user with the most login events and the count. On Windows, machine
+    accounts (ending with $) and SYSTEM are excluded from the Security
+    Event Log count; on Linux/macOS, 'last' boilerplate lines (reboot,
+    shutdown, wtmp) are excluded instead.
   tags: [users, inventory, compliance, primary-user]
 
 spec:
@@ -332,10 +403,19 @@ spec:
     columns:
       - name: username
         type: string
+        description: 'The account with the most login events in the examined history, or "unknown" when none could be determined. Values: free text or "unknown".'
+        example: Alex
+        platforms: [windows, linux, darwin]
       - name: login_count
         type: int32
+        description: 'The number of login events counted for this user; "0" for the Windows ProfileList fallback, which carries no count. Values: integer.'
+        example: "118"
+        platforms: [windows, linux, darwin]
       - name: source
         type: string
+        description: 'How the answer was derived. Values: last (Linux/macOS); event_log_4624, profile_list (Windows); free text on a query failure.'
+        example: event_log_4624
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Identify primary user of this endpoint"
 
@@ -367,9 +447,15 @@ metadata:
     Shows historical login and logout session records. On Windows
     queries the Security Event Log for Event IDs 4624 (logon) and
     4634 (logoff), parsing logon type, source address, and timestamps.
-    On Linux and macOS parses the 'last' command output. The count
-    parameter controls how many records to return. Requires elevated
-    privileges on Windows to read the Security event log.
+    On Linux and macOS parses the 'last' command output instead — the
+    six output fields are populated positionally from 'last', not from
+    the same event-log semantics as Windows: the "event_type" field
+    carries the tty, "logon_type" carries last's host/source token,
+    "source" carries the derived console/remote/system classification,
+    "timestamp" carries the completed/active/crash status, and the real
+    date/time lives in "detail" as free text. The count parameter
+    controls how many records to return (clamped to 1-500). Requires
+    elevated privileges on Windows to read the Security event log.
   tags: [users, sessions, security, audit, compliance, history]
 
 spec:
@@ -388,8 +474,9 @@ spec:
         type: string
         displayName: Record Count
         description: >
-          Maximum number of session records to return (1-500).
-          Defaults to 50 if not specified.
+          Maximum number of session records to return, as a digit string
+          (e.g. "100"); values outside 1-500 are clamped back to the
+          default of 50.
         default: "50"
         validation:
           pattern: "^[0-9]+$"
@@ -398,16 +485,34 @@ spec:
     columns:
       - name: username
         type: string
+        description: 'The account named in the record. Values: free text.'
+        example: Alex
+        platforms: [windows, linux, darwin]
       - name: event_type
         type: string
+        description: "Windows: \"logon\" or \"logoff\". Linux/macOS: actually the session's tty, not an event-type label — see the plugin README's Caveats. Values: logon, logoff (Windows); a tty name (Linux/macOS)."
+        example: logoff
+        platforms: [windows, linux, darwin]
       - name: logon_type
         type: string
+        description: "Windows: the mapped LogonType name or raw numeric code, empty when absent. Linux/macOS: actually last's host/source token, usually empty for a local session. Values: interactive, network, batch, service, unlock, network_cleartext, new_credentials, remote_interactive, cached_interactive, or a raw numeric code (Windows); free text, often empty (Linux/macOS)."
+        example: network
+        platforms: [windows, linux, darwin]
       - name: source
         type: string
+        description: "Windows: the event's IpAddress, or \"-\". Linux/macOS: actually the derived console/remote/system classification, not a network source. Values: an IP address or \"-\" (Windows); console, remote, system (Linux/macOS)."
+        example: "-"
+        platforms: [windows, linux, darwin]
       - name: timestamp
         type: string
+        description: "Windows: the event's TimeCreated, full-precision UTC. Linux/macOS: actually the completed/active/crash status word, not a timestamp — the real date/time is embedded in \"detail\". Values: ISO-8601 UTC (Windows); completed, active, crash (Linux/macOS)."
+        example: "2026-09-07T10:08:37.8345208Z"
+        platforms: [windows, linux, darwin]
       - name: detail
         type: string
+        description: "Windows: the raw EventID text. Linux/macOS: the remainder of the 'last' line verbatim (weekday, date, time, and logout/duration or \"still logged in\"). Values: free text."
+        example: "4634"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Show session history (last ${count} records)"
 

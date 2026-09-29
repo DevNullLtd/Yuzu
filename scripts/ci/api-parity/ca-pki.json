@@ -1,0 +1,32 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/ca/import-chain",
+    "capability_id": "post.api-settings-ca-import-chain",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/ca/import-chain"
+    },
+    "mcp_twin": "import_ca_chain",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/ca/revoke",
+    "capability_id": "post.api-settings-ca-revoke",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/ca/revoke"
+    },
+    "mcp_twin": "revoke_certificate",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/ca",
+    "capability_id": "get.fragments-settings-ca",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

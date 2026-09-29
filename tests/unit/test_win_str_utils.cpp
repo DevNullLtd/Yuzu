@@ -50,6 +50,32 @@ TEST_CASE("to_wide / from_wide round-trip preserves non-ASCII", "[win][str][utf8
     REQUIRE(from_wide(kCafeWide.c_str()) == kCafeUtf8);
 }
 
+// BR-007 (adversarial review, HIGH): script_exec_plugin.cpp's Windows
+// app-directory search stage used to build its search path via
+// `std::filesystem::path::string()`, which narrows through the process'
+// active code page rather than UTF-8 -- an install path containing a
+// character outside that code page would silently corrupt or throw. The fix
+// mirrors content_dist_exec_seam.hpp's existing pattern: convert the wide
+// form directly via `from_wide(path.c_str())`. This proves that exact
+// call shape round-trips correctly for an install-path-shaped string (drive
+// letter, separators, a non-ACP directory name) -- a pure string-conversion
+// property, independent of any real filesystem path resolution.
+TEST_CASE("from_wide round-trips an install-path-shaped non-ACP wide path "
+          "(BR-007, matches script_exec_plugin.cpp's app-directory fix)",
+          "[win][str][utf8][pathconv]") {
+    // U+00E9 (Café-class, cp1252-representable) AND U+65E5 (Japanese "day",
+    // NOT representable in cp1252/cp1251/any single-byte ACP) in the same
+    // path -- a narrowing .string() call would corrupt or throw on the
+    // latter regardless of which single-byte code page is active.
+    const std::wstring wide_path = L"C:\\Program Files\\Caf\u00E9\\\u65E5\\bin";
+    const std::string expected_utf8 = "C:\\Program Files\\Caf\xC3\xA9\\\xE6\x97\xA5\\bin";
+
+    REQUIRE(from_wide(wide_path.c_str()) == expected_utf8);
+    // Round-trip back through to_wide reproduces the original wide form --
+    // the conversion loses nothing in either direction.
+    REQUIRE(to_wide(expected_utf8) == wide_path);
+}
+
 TEST_CASE("from_wide handles empty and null input", "[win][str][utf8]") {
     REQUIRE(from_wide(nullptr).empty());
     REQUIRE(from_wide(L"").empty());

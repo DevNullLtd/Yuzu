@@ -1,0 +1,227 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/instructions",
+    "capability_id": "get.api-instructions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/instructions"
+    },
+    "mcp_twin": "list_definitions",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions",
+    "capability_id": "post.api-instructions",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/import",
+    "capability_id": "post.api-instructions-import",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/validate-yaml",
+    "capability_id": "post.api-instructions-validate-yaml",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/yaml",
+    "capability_id": "post.api-instructions-yaml",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/instructions/{param}",
+    "capability_id": "delete.api-instructions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/instructions/{param}",
+    "capability_id": "get.api-instructions-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/instructions/{param}"
+    },
+    "mcp_twin": "get_definition",
+    "status": "twinned"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/instructions/{param}",
+    "capability_id": "put.api-instructions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/{param}/execute",
+    "capability_id": "post.api-instructions-param-execute",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/instructions/{param}/export",
+    "capability_id": "get.api-instructions-param-export",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/instructions/{param}/export"
+    },
+    "mcp_twin": "export_definition",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/product-packs",
+    "capability_id": "get.api-product-packs",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/product-packs"
+    },
+    "mcp_twin": "list_product_packs",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/product-packs",
+    "capability_id": "post.api-product-packs",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/product-packs/{param}",
+    "capability_id": "delete.api-product-packs-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/product-packs/{param}",
+    "capability_id": "get.api-product-packs-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/product-packs/{param}"
+    },
+    "mcp_twin": "get_product_pack",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/scope/estimate",
+    "capability_id": "post.api-scope-estimate",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/workflow-executions/{param}",
+    "capability_id": "get.api-workflow-executions-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflow-executions/{param}"
+    },
+    "mcp_twin": "get_workflow_execution",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/api/workflows",
+    "capability_id": "get.api-workflows",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows"
+    },
+    "mcp_twin": "list_workflows",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/workflows",
+    "capability_id": "post.api-workflows",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/workflows/{param}",
+    "capability_id": "delete.api-workflows-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/workflows/{param}",
+    "capability_id": "get.api-workflows-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/workflows/{param}"
+    },
+    "mcp_twin": "get_workflow",
+    "status": "twinned"
+  },
+  {
+    "method": "POST",
+    "path": "/api/workflows/{param}/execute",
+    "capability_id": "post.api-workflows-param-execute",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/executions",
+    "capability_id": "get.fragments-executions",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions"
+    },
+    "mcp_twin": "list_executions",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/executions/{param}/detail",
+    "capability_id": "get.fragments-executions-param-detail",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/executions/{param}"
+    },
+    "mcp_twin": "get_execution_status",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/schedules",
+    "capability_id": "get.fragments-schedules",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/schedules"
+    },
+    "mcp_twin": "list_schedules",
+    "status": "twinned"
+  }
+]

@@ -1,0 +1,794 @@
+{
+  "actions": [
+    {
+      "action": "delete",
+      "definition_ids": [
+        "security.certificates.delete"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "libcrypto X509 match + held-dirfd openat/fstatat/unlinkat with pre-unlink identity recheck",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported",
+          "mechanism": "security delete-certificate via subprocess runner",
+          "rung": "2",
+          "support": "constrained"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "CryptoAPI (CertDeleteCertificateFromStore)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "details",
+      "definition_ids": [
+        "security.certificates.details"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "libcrypto X509 (in-process PEM parse)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner",
+          "mechanism": "SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "CryptoAPI (CertEnumCertificatesInStore)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list",
+      "definition_ids": [
+        "security.certificates.list"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "libcrypto X509 (in-process PEM parse)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner",
+          "mechanism": "SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login)",
+          "rung": "2",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "CryptoAPI (CertEnumCertificatesInStore)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**Windows store-open failures are no longer silent, `delete` on Windows never substitutes the CurrentUser store for an unopenable LocalMachine store (#4377), the Linux delete recheck still has a narrow residual window, and a macOS System/root keychain's empty answer is only trusted when the keychain is confirmed readable.** A CryptoAPI store that neither `CertOpenStore` attempt can open now reports `not_available|<store> store could not be opened` (`list`/`details`) or `error|<store> store could not be opened; nothing removed` with a non-zero exit (`delete`), and marks the result CONSTRAINED/PARTIAL via `cryptoapi:store-open` — the Windows leg does call `set_result_status` for this case (`certificates_plugin.cpp:422-430,487,613-619`); `delete` opens the named store under LocalMachine only and has no CurrentUser retry path at all (`certificates_plugin.cpp:602-611`), unlike `list`/`details`, which disclose a CurrentUser fallback rather than presenting it as a clean LocalMachine read. On Linux, the held-dirfd scan/delete core now lives in `certificates_linux_store.hpp`, with syscall-level tests in `tests/unit/test_certificates_linux_store.cpp` covering symlink retarget, inode swap, a failed recheck, and mid-enumeration failure; `delete` re-derives the matched entry's identity — its own device/inode and, for a symlink, the target's link text plus the target's device/inode — immediately before `unlinkat`, but POSIX has no unlink-by-fd, so a residual `fstatat`-then-`unlinkat` window remains (`certificates_linux_store.hpp:342-358,389-431`); because identity binds inode and target text/inode rather than content, an in-place rewrite of the SAME inode between match and unlink is not detected. A FIFO, device, socket or directory encountered during the scan is skipped silently via a nonblocking, post-open `S_ISREG` check rather than blocking the scan (`certificates_linux_store.hpp:232-252`), and deleting a symlinked entry always removes the link itself via `unlinkat`, never the file it points to. On macOS, a System/root keychain whose `SecItemCopyMatching` answer comes back empty is classified `zero certificates` only when the keychain's own read-permission status bit is set (`keychain_read.cpp:116`); otherwise it is reported as `not_available|<keychain> not readable (no read permission)` (`certificates_plugin.cpp:1586-1610`) and the result is CONSTRAINED/PARTIAL — an unreadable keychain is never a silent empty inventory (#2318).",
+    "**The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain via agent-core's `read_keychain_bounded` and abandoned (not cancelled) on timeout (`certificates_plugin.cpp:1031,1170-1185`); the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23`) — do not \"fix\" this to a direct API call. Immediately before that subprocess spawn the plugin re-reads `/dev/console`'s owner in-process and refuses to spawn on a mismatch, shrinking (not eliminating) the fast-user-switch race window from tens of seconds to microseconds (`certificates_plugin.cpp:1497-1533`).",
+    "**SystemRootCertificates.keychain delete is permanently rejected.** It is sealed under System Integrity Protection; `delete_cert_macos` rejects `store=root` outright before ever shelling out (`certificates_plugin.cpp:2089-2099`) — a hard OS limitation, not a bug to fix.",
+    "**A macOS delete self-verifies before reporting success.** `delete_cert_macos` re-enumerates the target keychain after `security delete-certificate` exits 0 and only reports `status|deleted` on a positively-proven absence; a keychain that can't be re-read or still shows the certificate reports `error|...`, never a false `status|deleted` (`certificates_plugin.cpp:2191-2229`).",
+    "**The macOS sample was captured unprivileged and shows the login-keychain leg degrading live, and test-only environment overrides exist on the macOS path that must never be set in production.** At euid 501 with no console session reachable via `launchctl asuser` without root, `list`'s login-keychain read failed and the result carries `CONSTRAINED`/`PARTIAL`/`login-keychain` (`macos.txt:164-165`) — expected under the capture harness, but it means this sample never exercises a successful login-keychain read. Separately, `YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE` / `YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE` (absolute paths; `agents/shared/macos_console_user.hpp`, `system_keychain_path`/`root_keychain_path`) redirect the System/root keychain reads of `list`/`details` to a fixture keychain — `delete` never consults them: `resolve_delete_keychain_path` returns the fixed literal paths regardless, so a destructive action can never be pointed at a substituted keychain. `YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE` replaces the `stat -f%Su /dev/console` console-user lookup with a fixed username (still validated and resolved through the bounded passwd lookup); `YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE` replaces the in-process `/dev/console` owner recheck's uid (an unparsable value is a failed recheck); `YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE` makes the login-keychain read report a failed read carrying that value instead of spawning `security`. They exist so `tests/unit/test_certificates_macos_actions.cpp` can drive the real plugin's SecItem-failure sentinels and the console-owner recheck end to end (#4374); each is read on every call, never cached, and is ignored when unset."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a certificate from a system store by SHA-1 thumbprint. On Windows this targets a specific named store (defaults to MY). On Linux it removes the matching PEM/CRT file from /etc/ssl/certs/. On macOS it uses the security CLI to delete from System.keychain by default; store=root is rejected as unsupported (returns a non-zero exit code) because SystemRootCertificates.keychain is sealed by System Integrity Protection on modern macOS and cannot actually be modified. A macOS delete verifies the certificate is actually absent from the target keychain afterward before reporting success. This is a destructive action and requires approval.",
+      "display_name": "Delete Certificate",
+      "execute_roles": [
+        "endpoint-admin",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "security.certificates.delete",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Retrieve full details for a specific certificate identified by its SHA-1 thumbprint. Searches all available certificate stores on the device.",
+      "display_name": "Certificate Details",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 60
+      },
+      "id": "security.certificates.details",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enumerate certificates in system certificate stores. On Windows this queries the CryptoAPI stores (MY, ROOT, CA, Trust). On Linux it parses PEM files in /etc/ssl/certs/. On macOS it reads System.keychain and SystemRootCertificates.keychain, plus the current console user's login keychain when one is logged in. Results can be filtered by store name and by expiration window.",
+      "display_name": "List Certificates",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 120
+      },
+      "id": "security.certificates.list",
+      "platforms": [
+        "windows",
+        "linux",
+        "darwin"
+      ]
+    }
+  ],
+  "description": "Certificate inventory and management for system stores",
+  "how_it_works": "`list` and `details` enumerate certificates in the OS's own stores and emit the same eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`), `details` returns the one row whose thumbprint matches (case-insensitive) or a `status|not_found`. `delete` is destructive: it hex-validates the thumbprint, then removes the certificate from the named store. On macOS `delete` additionally pre-checks presence before ever running the destructive command (so deleting an absent cert reports `status|not_found` instead of a command failure) and re-enumerates the keychain afterward to prove the certificate is actually gone before reporting `status|deleted` — a zero exit code alone is not trusted.\n\nWindows reads/writes CryptoAPI stores (MY, ROOT, CA, Trust) natively, in-process, no subprocess. `delete` opens the named store under the LocalMachine hive only and reports an error rather than falling back to CurrentUser; `list`/`details` do fall back to the CurrentUser hive when LocalMachine cannot be opened, and say so in the output and result status. Linux parses PEM files under `/etc/ssl/certs` via in-process libcrypto (`certificates_x509.hpp`) — the `openssl x509` subprocess this used to shell out to is gone. macOS is a genuine hybrid: System.keychain and SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain through agent-core's `read_keychain_bounded` seam and abandoned (not cancelled) if `securityd` wedges past that bound, but the login keychain (the console user's own keychain, which the LaunchDaemon has none of itself) still reads through a `launchctl asuser`/`sudo -u`/`security find-certificate` subprocess hop — immediately preceded by an in-process re-check of `/dev/console`'s owner, so a fast-user-switch between console-user resolution and the spawn is refused rather than read against the wrong session — and `delete` always shells out to `/usr/bin/security delete-certificate`. Every macOS action runs under a shared 60-second wall-clock budget covering console-user resolution and every keychain read/parse it performs, so a wedged Directory Service or a pathological keychain degrades honestly (a `not_available|<reason>` row plus a `CONSTRAINED`/`PARTIAL` result status) instead of hanging or silently truncating.\n\nThis plugin deliberately does not validate a certificate's trust chain, check revocation (CRL/OCSP), import or renew certificates, or read anything beyond the fixed set of stores/keychains named above.",
+  "inputs": [
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "security.certificates.delete",
+      "description": "SHA-1 thumbprint (hex string, no colons) of the certificate to delete. Case-insensitive.\n",
+      "name": "thumbprint",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "MY",
+      "definition_id": "security.certificates.delete",
+      "description": "The certificate store to delete from. On Windows: MY, ROOT, CA, or Trust. Defaults to \"MY\". On macOS: \"MY\" (the default) or \"System\" deletes from /Library/Keychains/System.keychain, matching prior behaviour. \"root\" is REJECTED (non-zero exit, unsupported) -- SystemRootCertificates.keychain is sealed by System Integrity Protection on modern macOS and cannot actually be modified, so attempting it would report a change that never took effect. \"login\" and \"all\" are also not supported for delete and are rejected with an error rather than silently deleting from an unintended store, as is any other unrecognized value. Ignored on Linux. On Windows the named store is opened under the LocalMachine hive only; if it cannot be opened there the action reports error|<store> store could not be opened; nothing removed (non-zero exit) and never falls back to the CurrentUser hive.\n",
+      "name": "store",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "security.certificates.details",
+      "description": "SHA-1 thumbprint (hex string, no colons) of the certificate to retrieve. Case-insensitive.\n",
+      "name": "thumbprint",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "all",
+      "definition_id": "security.certificates.details",
+      "description": "On macOS, restrict the search to one store: \"login\" (the current console user's login keychain -- returns not_available|no console session when nobody is logged in at the console, or not_available|<reason> when the console user could not be determined; in the latter case the search result is PARTIAL and never a definitive status|not_found, because the login keychain was not opened), \"System\" (/Library/Keychains/System.keychain), \"root\" (SystemRootCertificates.keychain), or \"all\" (System and root, plus login when a console user is present). Ignored on Windows and Linux, which always search every store. Defaults to \"all\".\n",
+      "name": "store",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": "all",
+      "definition_id": "security.certificates.list",
+      "description": "Filter by store name. On Windows: MY, ROOT, CA, Trust, or \"all\" for all stores. On macOS: \"login\" (the current console user's login keychain -- returns not_available|no console session when nobody is logged in at the console, or not_available|<reason> when the console user could not be determined, e.g. the directory lookup timed out; the two are deliberately distinct, a degraded lookup is never reported as an empty console), \"System\" (/Library/Keychains/System.keychain), \"root\" (SystemRootCertificates.keychain), or \"all\" (System and root, plus login when a console user is present). Ignored on Linux, which always enumerates every available certificate. Defaults to \"all\".\n",
+      "name": "store",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "minimum": 0
+      },
+      "default": 0,
+      "definition_id": "security.certificates.list",
+      "description": "Only return certificates expiring within this many days. Set to 0 to return all certificates regardless of expiry. Useful for compliance audits of soon-to-expire certificates.\n",
+      "name": "expiring_within_days",
+      "required": false,
+      "type": "int32"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": true,
+    "mutating": true
+  },
+  "leg_hash": "12fa059e66fa",
+  "manifest_version": 1,
+  "name": "certificates",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "A successful macOS delete emits status|deleted; a delete targeting a certificate already provably absent from the keychain emits status|not_found (rc 0), matching the Windows/Linux contract for an absent cert. store=root is rejected with error|MESSAGE (SystemRootCertificates.keychain is sealed by System Integrity Protection). Every other macOS rejection or failure -- an unsupported store, a failed delete command, or a post-delete verification that still finds the certificate or could not re-read the keychain -- also emits error|MESSAGE. Windows and Linux emit status|deleted, status|delete_failed, or status|not_found on a store that opened successfully; either OS instead emits error|<store> store could not be opened; nothing removed if every open attempt for the target store fails. Values: status|deleted, status|not_found, status|delete_failed (Windows/Linux only), error|<message> (any OS: bad thumbprint, unsupported/rejected store, an unopenable Windows/Linux store, or a macOS delete that could not be verified), not_available|<reason> (macOS only, pre-validation).",
+          "example": "error|thumbprint parameter required",
+          "name": "status",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.certificates.delete"
+    },
+    {
+      "columns": [
+        {
+          "description": "The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name).",
+          "example": "CN=com.apple.systemdefault, O=System Identity",
+          "name": "subject",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name).",
+          "example": "CN=com.apple.systemdefault, O=System Identity",
+          "name": "issuer",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- always equal to the request's `thumbprint` parameter (canonicalized to uppercase) on a matching row. Values: 40 uppercase hex characters.",
+          "example": "0C24DA5DE02640D8924F5C7BCB7D5F734815228D",
+          "name": "thumbprint",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed.",
+          "example": "2026-07-18",
+          "name": "not_before",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Validity-period end date, YYYY-MM-DD. Values: date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed.",
+          "example": "2046-07-13",
+          "name": "not_after",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex).",
+          "example": "076C11D1",
+          "name": "serial",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Which store/keychain/directory the matching row was found in. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path \"/etc/ssl/certs\"..",
+          "example": "System.keychain",
+          "name": "store",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Comma-separated X.509 Key Usage extension names, or \"(none)\" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or \"(none)\".",
+          "example": "Digital Signature, Key Encipherment, Data Encipherment",
+          "name": "key_usage",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.certificates.details"
+    },
+    {
+      "columns": [
+        {
+          "description": "The certificate's Subject distinguished name, rendered by the OS's own name printer (CryptoAPI simple display name on Windows, OpenSSL/libcrypto's default name rendering on Linux and macOS System/root reads, the `security find-certificate` subprocess's `subject=` line on the macOS login keychain). Values: free text (distinguished name).",
+          "example": "Logitech Inc",
+          "name": "subject",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The certificate's Issuer distinguished name, rendered the same way as subject. Values: free text (distinguished name).",
+          "example": "DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1",
+          "name": "issuer",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "SHA-1 fingerprint of the certificate's DER encoding, uppercase hex with no separators -- the identifier `details`/`delete` match against (the request parameter is case-insensitive, this column is always uppercase). \"(unknown)\" when the row's identity could not be established (a failed/timed-out per-block parse) and \"(skipped)\" for a Linux file that could not be read at all. Values: 40 uppercase hex characters, or \"(unknown)\"/\"(skipped)\".",
+          "example": "FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057",
+          "name": "thumbprint",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Validity-period start date, YYYY-MM-DD (no time-of-day). Values: date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed.",
+          "example": "2025-01-09",
+          "name": "not_before",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Validity-period end date, YYYY-MM-DD. Also the field `expiring_within_days` filters on. Values: date (YYYY-MM-DD), or \"(unknown)\" when the source date could not be parsed.",
+          "example": "2026-01-09",
+          "name": "not_after",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Certificate serial number as hex text, via the OS's own serial renderer (Windows: little-endian byte reversal; Linux/macOS: `i2a_ASN1_INTEGER` or the openssl `-serial` line). Values: free text (hex).",
+          "example": "09CFB6DE3AB5124757FFEFDF3759BBF2",
+          "name": "serial",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Which store/keychain/directory the row was read from. Values: Windows: MY, ROOT, CA, Trust. macOS: System.keychain, SystemRootCertificates.keychain, login.keychain-db. Linux: the literal path \"/etc/ssl/certs\" for every row..",
+          "example": "ROOT",
+          "name": "store",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Comma-separated X.509 Key Usage extension names, or \"(none)\" when the extension is absent, empty, or could not be read. Values: comma-separated usage names, or \"(none)\".",
+          "example": "Digital Signature",
+          "name": "key_usage",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.certificates.list"
+    }
+  ],
+  "outputs_note": "`list` and `details` write a header row followed by zero or more pipe-delimited certificate rows, or a `status|not_found` / `not_available|<reason>` line in place of a row when nothing matched or a store couldn't be read; on Windows, a `not_available|<store> store (LocalMachine) could not be opened; rows read from CurrentUser` line precedes that store's own rows rather than replacing them, disclosing the CurrentUser fallback. `delete` writes one line only: `status|<value>`, `error|<message>`, or (macOS only) `not_available|<reason>`. `(unknown)` is the honest per-field sentinel for a value that failed to parse — it never means zero or empty; `subject`/`issuer`/`serial`/`key_usage` are escaped so a hostile value can never inject an extra pipe-delimited column or newline-delimited row.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "`list`/`details`: none — `CertEnumCertificatesInStore` needs no elevation. `delete`: `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store; already granted to the service account under LocalSystem today, no new grant.",
+      "if_refused": "`enumerate_store()` returns a typed result that records whether the store actually opened under LocalMachine or fell back to CurrentUser, never a silent empty vector (`certificates_plugin.cpp:337-408`); `list` reports `not_available|<store> store could not be opened` (provenance `cryptoapi:store-open`, `certificates_plugin.cpp:420-428`) or `not_available|<store> store enumeration incomplete` when `CertEnumCertificatesInStore` ends abnormally part-way through a store (provenance `cryptoapi:store-enum`, `certificates_plugin.cpp:430-435`), then keeps scanning the remaining stores; when LocalMachine could not be opened but CurrentUser could, `list` emits a `not_available|<store> store (LocalMachine) could not be opened; rows read from CurrentUser` row before that store's rows (provenance `cryptoapi:store-fallback`, `certificates_plugin.cpp:437-449`); `details` marks the result partial per store internally and, unlike `list`, does not emit a row for a plain open/enumeration failure at the point it happens — it keeps scanning, and only if a match is never found does it report one combined `not_available|<store(s)> could not be opened/enumeration incomplete/read from CurrentUser; scan incomplete` row naming every affected store, instead of a false `status|not_found`; a CurrentUser fallback, an unopened store, or an incompletely-enumerated store are the exceptions to \"no row until the end\" — `details_cert_win` discloses each such earlier store immediately alongside a later match, right before the matched certificate's own row, rather than waiting for the combined end-of-scan summary — see the Result-status table's `cryptoapi:store-fallback`/`cryptoapi:store-open`/`cryptoapi:store-enum` entries below for the exact shape (`details_cert_win`); `delete` opens the named store under LocalMachine only, with no CurrentUser retry (#4377) — a store that cannot be opened there reports `error|<store> store could not be opened; nothing removed` (`certificates_plugin.cpp:615`), and a store whose enumeration ends abnormally reports `error|<store> store enumeration ended abnormally; nothing removed` (`certificates_plugin.cpp:651`), both with a non-zero exit instead of `status|not_found`",
+      "measured": "2026-09-07, bare-metal Windows 10.0.26200.0 x64, as SYSTEM",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "System/root keychain reads: none (in-process `SecItemCopyMatching`, no subprocess). Login keychain read: root, via `launchctl asuser` + `sudo -u` — live today only because the daemon runs as root; needs a dormant sudoers grant once #1455 narrows the agent off root. `delete` (System/MY only): a sudoers grant for `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` under the future non-root account; moot today.",
+      "if_refused": "System/root keychain read failure emits `not_available|<keychain> not readable (no read permission)`, `not_available|<keychain> read timed out` (15 s per-keychain bound exceeded), `not_available|<keychain> read refused (bounded-call ceiling)`, `not_available|<keychain> read failed`, or `not_available|<keychain> scan incomplete` (the read was capped before it finished) — each + `CONSTRAINED`/`PARTIAL` (`certificates_macos_parsers.hpp:516-538`); an in-process `/dev/console` owner recheck immediately before the login-keychain spawn emits `not_available|console user changed` (`certificates_plugin.cpp:1636`) or `not_available|console user recheck failed` (`certificates_plugin.cpp:1640`); a failed login-keychain spawn emits `not_available|login keychain read failed (<detail>)` naming the termination reason, on both `list` (`certificates_plugin.cpp:1697`) and `details` (`certificates_plugin.cpp:1945`) — the macOS sample shows a login-keychain degradation (`macos.txt:164-165`)",
+      "measured": "2026-09-07, bare-metal macOS 26.6.2 arm64, euid 501 (jsmith) — unprivileged, captured via the test harness (`PluginHandle::load` + `LocalDispatcher::run`, no `init()`), not the production root LaunchDaemon",
+      "os": "macOS",
+      "runs_as": "agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured)"
+    },
+    {
+      "grant": "`list`/`details`: none — native filesystem read + in-process libcrypto parse, no subprocess. `delete`: write access to `/etc/ssl/certs` to remove the matching file via `unlinkat` on the held `/etc/ssl/certs` dirfd (`certificates_linux_store.hpp:418`).",
+      "if_refused": "An unreadable/unparseable PEM file reports `(unreadable)`/`(skipped)` and `CONSTRAINED`/`PARTIAL` rather than being silently dropped, provenance `libcrypto:unreadable-file` (`certificates_plugin.cpp:691-696`); `details` reports `not_available|... scan incomplete` rather than a false `status|not_found` when a candidate file couldn't be inspected (`certificates_plugin.cpp:805-811`); `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) reports `not_available|/etc/ssl/certs could not be opened` and CONSTRAINED/PARTIAL, provenance `posix:cert-dir` (`certificates_plugin.cpp:855-857`); a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` that fails part-way through reports `not_available|/etc/ssl/certs enumeration incomplete` (`list`) or folds into `delete`'s `error|/etc/ssl/certs enumeration incomplete; nothing removed`, provenance `posix:cert-enum` (`certificates_plugin.cpp:727-729,894-897`); a `delete` whose target's identity (link inode, target text, and target inode) changed between match and unlink reports `error|certificate file changed during delete; nothing removed`, provenance `posix:delete-recheck` (`certificates_linux_store.hpp:389-431`; `certificates_plugin.cpp:883,890`), instead of unlinking a different file than the one matched",
+      "measured": "2026-09-06, Debian GNU/Linux 13 (trixie) aarch64 container, euid 0",
+      "os": "Linux",
+      "runs_as": "dedicated unprivileged `yuzu` account in production; this sample was captured as euid 0 in a container, not representative of that account"
+    }
+  ],
+  "readme": "agents/plugins/certificates/README.md",
+  "result_status": [
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`libcrypto:unreadable-file`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: a PEM file under `/etc/ssl/certs` could not be read or parsed (`certificates_plugin.cpp:747,923`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`cryptoapi:store-open`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: a CryptoAPI store could not be opened for `list`/`details`/`delete` (`certificates_plugin.cpp:429,487,617`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`cryptoapi:store-enum`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: `CertEnumCertificatesInStore` ended abnormally part-way through a store for `list`/`details`/`delete` (`certificates_plugin.cpp:436,493,653`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`cryptoapi:store-fallback`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: the LocalMachine store could not be opened and `list`/`details` read the CurrentUser store instead; `list_certs_win` discloses it with a `not_available` row before that store's rows; `details_cert_win` discloses every such store the same way — either as its own row immediately before a match served from it, or, if an earlier fallback store didn't match, as a combined row emitted alongside whichever later store's match ends the scan — and folds every fallback store into the combined scan-incomplete verdict only when no store ever matches"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`posix:cert-dir`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: `/etc/ssl/certs` could not be opened (including a non-directory or symlink at that path) (`certificates_plugin.cpp:767,799,913`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`posix:cert-enum`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: a readdir(3)/fdopendir enumeration of `/etc/ssl/certs` failed part-way through (`certificates_plugin.cpp:729,794,896`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`posix:delete-recheck`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: `delete`'s pre-unlink identity recheck found the entry changed or could not be re-derived since the earlier match (`certificates_plugin.cpp:883,890`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`login-keychain`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS: console-user resolution failed, the console user changed or its owner recheck failed immediately before the login-keychain spawn, or the login-keychain read/scan failed, degraded, or was capped (`certificates_plugin.cpp:1573,1636,1640,1697,1945`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`secitem:System.keychain`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS: System.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`secitem:SystemRootCertificates.keychain`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS: SystemRootCertificates.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_macos_parsers.hpp:516-538`)"
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 152,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign",
+            "C=ES, O=IZENPE S.A., CN=Izenpe.com|C=ES, O=IZENPE S.A., CN=Izenpe.com|2F783D255218A74A653971B52CA29C45156FE919|2007-12-13|2037-12-13|B0B75A16485FBFE1CBF58BD719E67D|/etc/ssl/certs|Certificate Sign, CRL Sign",
+            "C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 2 G3|C=BM, O=QuoVadis Limited, CN=QuoVadis Root CA 2 G3|093C61F38B8BDC7D55DF7538020500E125F5C836|2012-01-12|2042-01-12|445734245B81899B35F2CEB82B3B5BA726F07528|/etc/ssl/certs|Certificate Sign, CRL Sign",
+            "C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign Root CA - C1|C=US, OU=emSign PKI, O=eMudhra Inc, CN=emSign Root CA - C1|E72EF1DFFCB20928CF5DD4D56737B151CB864F01|2018-02-18|2043-02-18|AECF00BAC4CF32F843B2|/etc/ssl/certs|Certificate Sign, CRL Sign"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "details",
+          "not_captured": null,
+          "params": "thumbprint=77D30367B5E00C15F60C3861DF7CE13B92464D47",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "C=US, O=Google Trust Services LLC, CN=GTS Root R4|C=US, O=Google Trust Services LLC, CN=GTS Root R4|77D30367B5E00C15F60C3861DF7CE13B92464D47|2016-06-22|2036-06-22|0203E5C068EF631A9C72905052|/etc/ssl/certs|Digital Signature, Certificate Sign, CRL Sign"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|thumbprint parameter required"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-06",
+        "host_class": "container",
+        "leg_hash": "12fa059e66fa",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "login-keychain",
+            "status": "CONSTRAINED"
+          },
+          "row_count": 162,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|0C24DA5DE02640D8924F5C7BCB7D5F734815228D|2026-07-18|2046-07-13|076C11D1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment",
+            "CN=com.apple.kerberos.kdc, O=System Identity|CN=com.apple.kerberos.kdc, O=System Identity|3CB6CE678431CB8DD8FDCF6601AA6A4F8CAD329A|2026-07-18|2046-07-13|38F8E0C5|System.keychain|Digital Signature, Key Encipherment",
+            "C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|C=US, O=DigiCert, Inc., CN=DigiCert TLS ECC P384 Root G5|17F3DE5E9F0F19E98EF61F32266E20C407AE30EE|2021-01-15|2046-01-14|09E09365ACF7D9C8B93E1C0B042A2EF3|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign",
+            "C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|C=US, OU=www.xrampsecurity.com, O=XRamp Security Services Inc, CN=XRamp Global Certification Authority|B80186D1EB9C86A54104CF3054F34C52B7E558C6|2004-11-01|2035-01-01|50946CEC18EAD59C4DD597EF758FA0AD|SystemRootCertificates.keychain|Digital Signature, Certificate Sign, CRL Sign"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "details",
+          "not_captured": null,
+          "params": "thumbprint=0C24DA5DE02640D8924F5C7BCB7D5F734815228D",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "CN=com.apple.systemdefault, O=System Identity|CN=com.apple.systemdefault, O=System Identity|0C24DA5DE02640D8924F5C7BCB7D5F734815228D|2026-07-18|2046-07-13|076C11D1|System.keychain|Digital Signature, Key Encipherment, Data Encipherment"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|thumbprint parameter required"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "12fa059e66fa",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "list",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 81,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057|2025-01-09|2026-01-09|09CFB6DE3AB5124757FFEFDF3759BBF2|ROOT|Digital Signature",
+            "Microsoft Identity Verification Root Certificate Authority 2020|Microsoft Identity Verification Root Certificate Authority 2020|F40042E2E5F7E8EF8189FED15519AECE42C3BFA2|2020-04-16|2045-04-16|5498D2D1D45B1995481379C811C08799|ROOT|Digital Signature, Certificate Signing, CRL Signing",
+            "Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|D8D11D216CC42B72EA838CAD51F4F4932A1940A0|2026-01-08|2027-01-13|0CADE25B085DD33813FD746151BF6B5E|ROOT|Digital Signature",
+            "Baltimore CyberTrust Root|Baltimore CyberTrust Root|D4DE20D05E66FC53FE1A50882C78DB2852CAE474|2000-05-12|2025-05-12|020000B9|ROOT|Certificate Signing, CRL Signing"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "details",
+          "not_captured": null,
+          "params": "thumbprint=FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage",
+            "Logitech Inc|DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1|FBD3B2C0991549EC5FB12FA1A994D2E0C32D8057|2025-01-09|2026-01-09|09CFB6DE3AB5124757FFEFDF3759BBF2|ROOT|Digital Signature"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "error|thumbprint parameter required"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "12fa059e66fa",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "list",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "details",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "delete",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Security"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/certificates.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/certificates/src/certificates_linux_store.hpp",
+      "agents/plugins/certificates/src/certificates_macos_parsers.hpp",
+      "agents/plugins/certificates/src/certificates_plugin.cpp",
+      "agents/plugins/certificates/src/certificates_x509.hpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_certificates_linux_store.cpp",
+      "tests/unit/test_certificates_macos.cpp",
+      "tests/unit/test_certificates_macos_actions.cpp",
+      "tests/unit/test_certificates_store_honesty.cpp",
+      "tests/unit/test_certificates_x509.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention, `server/core/src/response_store.hpp:8,152`), queryable at `/api/responses/{id}` and aggregatable (`list` groups by `store`/`issuer` per its YAML `aggregation` block).",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — no reference to the `certificates` plugin or its definition ids exists outside `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`.",
+    "**Sensitivity.** `list`/`details` rows carry every certificate's `subject` and `issuer` — for code-signing certs (the Windows sample) this is effectively an installed-software-publisher inventory (e.g. `Logitech Inc`, `Microsoft Corporation`) by another route, and on macOS a successful login-keychain read can surface the signed-in user's own personal certificates; `thumbprint`/`serial` uniquely identify a specific certificate but not a device or person directly.",
+    "**Siblings:** none in this plugin group; the `diagnostics.certificates` action (a different plugin, TLS cert/key diagnostics) is unrelated despite the similar name.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.certificates.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

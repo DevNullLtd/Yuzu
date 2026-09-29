@@ -1,37 +1,51 @@
 #pragma once
 
 /**
- * auth_db.hpp — SQLite-backed authentication persistence for Yuzu Server
- * 
- * Provides persistent storage for users, sessions, enrollment tokens,
- * and pending agents. Replaces config-file-based auth persistence.
- * 
+ * auth_db.hpp — Postgres-backed authentication persistence for Yuzu Server
+ * (ADR-0006 server substrate migration; schema `auth`).
+ *
+ * Born-on-Postgres (no `migrate_from_sqlite()` — the legacy `auth.db` is
+ * retired by the release that ships this; server.cpp's construction helper
+ * fails startup closed on `!is_open()`, same pattern as every other PG
+ * store, ADR-0012 §1). Posture: AUTHORITATIVE — a runtime DB error is
+ * surfaced via the typed `std::expected` channel, never papered over as a
+ * quiet success/empty-result.
+ *
+ * Provides persistent storage for users, enrollment tokens, and pending
+ * agents. Sessions are NOT persisted here (v1 status unchanged from the
+ * SQLite era — see AuthManager's in-memory `sessions_` map, which is the
+ * sole authoritative session store; this class carries no session surface
+ * at all, dead-write mirror included, per the PG-migration cleanup).
+ *
  * Security features:
- * - All SQL uses prepared statements (no string concatenation)
- * - Thread-safe (SQLITE_OPEN_FULLMUTEX + WAL mode)
- * - PRAGMA integrity_check on startup
- * - Atomic enrollment token consumption
+ * - All SQL is parameterized via `pg::exec_params` (no string concatenation)
+ * - `mfa_totp_secret` is envelope-encrypted at rest via `pg::SecretCodec`
+ *   (ADR-0010) — never a plaintext BYTEA column
  * - Input validation on all user-controlled data
  * - Separate update_role() method (never touches credentials)
  */
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
-#include "yuzu/server/auth.hpp"  // For Role, UserEntry, Session, etc.
+#include "yuzu/server/auth.hpp"  // For Role, UserEntry, PendingAgent, etc.
+
+namespace yuzu::server::pg {
+class PgPool;
+class SecretCodec;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
 
-/// Canonical `users.provisioning_source` values (auth.db migration v7). Every
+/// Canonical `users.provisioning_source` values (auth.db migration v7,
+/// carried unchanged into the `auth.users` Postgres schema). Every
 /// read/write site MUST go through these constants rather than a raw string
 /// literal — a typo in either fails the SCIM provenance guard OPEN (S-PROV-
 /// CONST, consistency S2): a mismatched write would tag a fresh account with
@@ -45,15 +59,9 @@ inline constexpr std::string_view kProvisioningSourceLocal = "local";
 // Explicit underlying type — locks ABI/serialization width so adding new
 // values can never silently widen the enum across the plugin/wire boundary.
 enum class AuthDBError : std::uint8_t {
-    CannotCreateDirectory,
-    CannotOpenDatabase,
-    DatabaseCorrupt,
-    SchemaCreationFailed,
-    StatementPrepareFailed,
     WriteFailed,
     QueryFailed,
     UserNotFound,
-    SessionNotFound,
     InvalidUsername,
     InvalidCredentials,
     UserAlreadyExists,
@@ -65,27 +73,120 @@ enum class AuthDBError : std::uint8_t {
     /// account already exists at creation" — both surface as 409 to
     /// the wire, but the audit-detail and operator messaging differ.
     MfaAlreadyEnrolled,
+    /// ★ SECURITY: an MFA operation could not confirm the state of
+    /// `mfa_totp_secret` — the row's `mfa_enrolled_at` says enrolled but the
+    /// stored envelope is NULL/malformed, or `pg::SecretCodec::decrypt`
+    /// failed (tamper, wrong/rotated KEK unresolvable, corrupt blob). This is
+    /// a DISTINCT outcome from "not enrolled" (`MfaStatus::enrolled = false`)
+    /// and from "code didn't match" (`false`) — every MFA reader that touches
+    /// the secret (`mfa_status`, `mfa_verify_login_code`,
+    /// `mfa_verify_enrollment`, and `mfa_init_enrollment`'s provisional-reuse
+    /// arm) returns this rather than silently reporting "not enrolled" or
+    /// "code invalid". A caller that collapses this into either of those
+    /// would let a corrupted/undecryptable secret degrade a privileged
+    /// account's second factor to effectively disabled without an operator
+    /// ever being told. Callers MUST surface this distinctly (503-class —
+    /// retry/alert, never "reduced security posture and proceed").
+    SecretUnavailable,
+    /// ★ The pool lease could not be acquired (an empty lease) — a TRANSIENT
+    /// store outage (pool saturation, or the shared pool's connect-backoff
+    /// breaker fast-failing every acquire for its 200ms..5s window after a
+    /// connectivity hiccup), NOT a query that ran and errored. Distinct from
+    /// `QueryFailed`/`WriteFailed` (a SELECT/UPDATE that executed against a live
+    /// connection and came back non-`PGRES_TUPLES_OK`) so the fail-closed 503
+    /// site can label its degrade metric `reason=pool_acquire_timeout` vs
+    /// `reason=query_error` (#2396/#2401). It is a store-unavailable outcome —
+    /// `is_store_unavailable()` returns true for it and every existing 503
+    /// mapping is preserved. StoreBusy means "empty lease", period: the bounded
+    /// acquire-retry (`acquire_with_retry`) is orthogonal — it just reduces how
+    /// often StoreBusy is returned on the two off-stripe login-decision reads
+    /// (`mfa_status`/`load_mfa_row`) that can afford to wait, and there StoreBusy
+    /// follows retry-exhaustion; the stripe-held login acquires
+    /// (`lockout_status`/`record_failed_login`/`clear_failed_logins`) return it
+    /// on a single un-retried acquire (retrying under the login stripe would
+    /// amplify an outage into worker starvation — see `acquire_with_retry`).
+    /// Either way it never weakens fail-closed: a genuine outage still 503s.
+    /// (Other AuthDB methods outside this login set still report an acquire
+    /// timeout as `QueryFailed`/`WriteFailed`; they emit no degrade metric, so
+    /// the reason split does not reach them — see `is_store_unavailable`.)
+    StoreBusy,
+};
+
+/// True iff `e` reflects the AuthDB store itself being unavailable (PG
+/// unreachable, pool-lease timeout, secret-decrypt failure) rather than a
+/// genuine business-logic outcome (bad credentials, not found, etc.). Every
+/// MFA/auth call site that needs to distinguish "the store is down — 503,
+/// retry" from "the request was legitimately rejected" MUST route through
+/// this helper rather than inlining its own `==` chain — `WriteFailed` is
+/// included because the MFA write-lease acquire (login-code consume,
+/// recovery-code consume, enrollment init/verify) surfaces a PG lease-acquire
+/// outage as `WriteFailed`, and a caller that only checked
+/// `SecretUnavailable`/`QueryFailed` would let that outage fall through to a
+/// wrong-code 401 (burning a lockout attempt) or an unhandled 500 instead of
+/// the intended fail-closed 503.
+[[nodiscard]] inline bool is_store_unavailable(AuthDBError e) noexcept {
+    return e == AuthDBError::SecretUnavailable || e == AuthDBError::QueryFailed ||
+           e == AuthDBError::WriteFailed || e == AuthDBError::StoreBusy;
+}
+
+/// `list_users_including_inactive()` row — same fields as `auth::UserEntry`
+/// plus the `is_active` flag `list_users()` deliberately filters out. A NEW
+/// type rather than extending `auth::UserEntry` itself: that struct is a
+/// broadly-shared read contract (session/login paths never care about
+/// disabled accounts), so adding a field there would be a cross-cutting
+/// change out of scope for the one caller (periodic access reviews, CC6.2)
+/// that needs to see disabled-but-still-granted users.
+struct UserWithStatus {
+    std::string username;
+    auth::Role role;
+    std::string identity_source{"local"};
+    bool is_active{true};
 };
 
 // ── AuthDB Class ─────────────────────────────────────────────────────────────
 
 class AuthDB {
 public:
-    /// Construct with the directory where auth.db should live.
-    /// Call initialize() before any other method.
-    explicit AuthDB(const std::filesystem::path& data_dir);
+    /// Construct against the shared server `PgPool` + the shared
+    /// `pg::SecretCodec` (ADR-0010) — the ctor never calls
+    /// `secret_codec.init()` itself. Runs the `auth` schema migration on a
+    /// pinned (unbounded, construction-only) lease and registers
+    /// `mfa_totp_secret` as a secret column; the CALLER (server.cpp /
+    /// main.cpp's bootstrap) runs `secret_codec.init()` AFTER this
+    /// constructor returns, not before — `init()` validates every registered
+    /// secret column exists, so it must run once this ctor has both migrated
+    /// `auth.users` and registered the column, never ahead of it (authdb
+    /// MEDIUM, governance hardening round — register-then-init, not
+    /// init-then-register). `is_ready()`/
+    /// `is_open()` reflects construction success (fail-CLOSED per ADR-0012
+    /// §1 — a reachable database whose schema can't migrate, or a lease that
+    /// can't be acquired, leaves the store closed; server.cpp's construction
+    /// helper turns that into a fatal startup error, never a silent
+    /// degraded-serve).
+    explicit AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec);
 
-    /// Construct with an explicit cleanup-thread cadence.
-    /// `cleanup_interval_secs` ≤ 0 disables the background reaper
-    /// entirely — used by unit tests that construct + destruct many
-    /// AuthDB instances back-to-back (see PR #1199: on macOS arm64 the
-    /// rapid `std::jthread` create/destroy cycle was triggering a
-    /// non-deterministic SIGSEGV in `test_mfa_store.cpp`). Production
-    /// callers use the single-argument overload and inherit the
-    /// 60-second default.
-    AuthDB(const std::filesystem::path& data_dir, int cleanup_interval_secs);
+    /// Construct with an explicit background-reaper cadence (the reaper now
+    /// sweeps ONLY stale provisional MFA enrollments — session expiry reaping
+    /// is gone along with the session surface, see the file header note).
+    /// `cleanup_interval_secs` ≤ 0 disables the background reaper entirely —
+    /// used by unit tests that construct + destruct many AuthDB instances
+    /// back-to-back (see PR #1199 for the historical macOS-arm64 rationale;
+    /// still applicable to any tight construct/destruct loop). Production
+    /// callers use the two-argument overload and inherit the 60-second
+    /// default.
+    AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_interval_secs);
 
     ~AuthDB();
+
+    /// Signal the background provisional-MFA reaper to stop, WITHOUT joining.
+    /// Idempotent and thread-safe; the join still happens in the destructor.
+    /// `ServerImpl::stop()` calls this early — alongside the other pool-leasing
+    /// background threads it stops up front — so the reaper has the whole
+    /// teardown window to wind down (it checks the stop flag each 1s), making
+    /// the later `auth_db_.reset()` join near-instant instead of potentially
+    /// waiting out an in-flight cleanup UPDATE (which is itself bounded by the
+    /// pool's statement_timeout/lock_timeout, but need not be waited on inline).
+    void request_stop() noexcept;
 
     // Non-copyable, non-movable
     AuthDB(const AuthDB&) = delete;
@@ -93,15 +194,17 @@ public:
     AuthDB(AuthDB&&) = delete;
     AuthDB& operator=(AuthDB&&) = delete;
 
-    /// Open/create the database and run migrations.
-    /// Must be called once before any other method.
-    std::expected<void, AuthDBError> initialize();
-
-    /// True iff initialize() succeeded AND the SQLite handle is still
-    /// open (integrity_check passed, schema migrations ran cleanly).
-    /// Wired into /readyz so an operator can detect a corrupt or
-    /// half-migrated auth.db without having to scrape spdlog. Lock-free.
+    /// True iff construction succeeded (schema migrated, secret column
+    /// registered) — wired into `/readyz` so an operator can detect a
+    /// half-migrated `auth` schema without scraping spdlog. Lock-free.
     bool is_ready() const noexcept;
+
+    /// Alias for `is_ready()` — the naming convention every other born-on-PG
+    /// store (`ApiTokenStore`, `EnginePrincipalStore`, ...) uses. Kept as a
+    /// distinct name (not a rename) because `AuthManager::is_auth_db_ok()`
+    /// already calls `is_ready()`; both names reflect the identical
+    /// construction-success flag.
+    bool is_open() const noexcept;
 
     // ── User Operations ──────────────────────────────────────────────────
 
@@ -115,6 +218,36 @@ public:
         const std::string& salt_hex,
         auth::Role role
     );
+
+    /// Seed the very first (admin) user, atomically, iff the `users` table
+    /// is genuinely empty — the born-on-PG replacement for the config-file/
+    /// first-boot admin bootstrap. **Production seeding calls
+    /// `RbacStore::provision_first_admin` instead** — `main.cpp`'s
+    /// fresh-start block atomically inserts this same account plus its
+    /// Administrator RBAC grant via that method, and no longer calls THIS
+    /// function at all (a redundant second no-op call was removed;
+    /// governance round, 2026-09-28). This function stays exported for its
+    /// own unit tests and as an available primitive should a genuine
+    /// "seed the first admin, no grant" need ever arise elsewhere — but it
+    /// has no production caller today. Do NOT add a new fresh-start-seeding
+    /// call site here — the grant-less account it would create is the exact
+    /// stranded-account hazard `provision_first_admin` exists to close.
+    /// `INSERT ... SELECT ... WHERE NOT EXISTS`
+    /// alone is NOT race-free under READ COMMITTED (two concurrent server
+    /// instances racing first boot can both see zero rows and both insert);
+    /// the statement runs inside a transaction guarded by a
+    /// `pg_advisory_xact_lock`, so the two processes serialize and the loser
+    /// re-evaluates `WHERE NOT EXISTS` against the winner's already-committed
+    /// row and correctly no-ops (governance hardening round, unhappy F2).
+    ///   * `true`  — the table was empty; `username` is now the sole row,
+    ///     role='admin'.
+    ///   * `false` — the table already had ≥1 row; no-op, no write.
+    ///   * `unexpected(msg)` — fail-CLOSED: the lease/query/write failed, or
+    ///     `username` is not a valid local username. The caller MUST treat
+    ///     this as "cannot determine/seed" — never as "already seeded".
+    std::expected<bool, AuthDBError> seed_admin_if_empty(const std::string& username,
+                                                          const std::string& password_hash,
+                                                          const std::string& salt_hex);
 
     /// Auto-provision (or refresh) a durable row for an SSO-authenticated
     /// principal (#1852). The gate is `is_valid_principal` — a SUPERSET of
@@ -135,15 +268,14 @@ public:
     /// caller.
     /// On first login this INSERTs a row with `password_hash`/`salt_hex` = ''
     /// (never resolvable on the local login path — see file header note),
-    /// `role='user'`, `elevation_eligible=0`. On every subsequent login the
-    /// `ON CONFLICT` arm refreshes ONLY `display_name`/`last_seen_at`/
-    /// `is_active` — it deliberately does NOT touch `role` or
-    /// `elevation_eligible`, so an admin's standing role grant and JIT-
-    /// elevation eligibility for this principal survive re-login. Call from
-    /// the OIDC callback AFTER minting the session (independent auth.db I/O,
-    /// not under AuthManager's `mu_`); a failure here degrades to "this
-    /// principal cannot elevate", never "cannot log in" (fail-soft — see
-    /// `AuthManager::provision_sso_identity`).
+    /// `role='user'`, `elevation_eligible=false`. On every subsequent login
+    /// the `ON CONFLICT` arm refreshes ONLY `display_name`/`last_seen_at` —
+    /// it deliberately does NOT touch `role` or `elevation_eligible`, so an
+    /// admin's standing role grant and JIT-elevation eligibility for this
+    /// principal survive re-login. Call from the OIDC callback AFTER minting
+    /// the session (independent DB I/O, not under AuthManager's `mu_`); a
+    /// failure here degrades to "this principal cannot elevate", never
+    /// "cannot log in" (fail-soft — see `AuthManager::provision_sso_identity`).
     std::expected<void, AuthDBError> upsert_sso_identity(const std::string& principal,
                                                           const std::string& iss,
                                                           const std::string& sub,
@@ -156,19 +288,43 @@ public:
     /// List all active users.
     std::expected<std::vector<auth::UserEntry>, AuthDBError> list_users();
 
-    /// Stamp `users.last_login_at = CURRENT_TIMESTAMP` for the named
-    /// user. Called by AuthManager after every successful local /
-    /// recovery-code login (the MFA-verified login path stamps it as
-    /// part of the same UPDATE that advances mfa_last_counter, so
-    /// this method is only needed for the no-MFA and OIDC paths).
-    /// SOC 2 CC7.2 — without it, `last_login_at` reports stale data on
-    /// dashboards and access reviews. Best-effort; failure is logged
-    /// but not surfaced to the caller (session creation has already
-    /// succeeded at the call site).
+    /// List EVERY user row (active AND disabled), each carrying its
+    /// `is_active` flag. Mirrors `list_users()`'s query with no `WHERE
+    /// is_active` filter — deliberately does NOT modify or replace
+    /// `list_users()` (other callers depend on its active-only contract).
+    /// The sole intended caller is the periodic access review builder
+    /// (`access_review_model.cpp`): a disabled user still holding a grant is
+    /// materially different CC6.2 evidence than an "orphan" grant with no
+    /// matching roster row at all, so the reviewer needs the full roster,
+    /// not just the active slice.
+    std::expected<std::vector<UserWithStatus>, AuthDBError> list_users_including_inactive();
+
+    /// Read-only prefix scan over `users.username` (active AND soft-deleted)
+    /// — backs the T8 startup collision-scan preflight (auth-engine-
+    /// principals design decision log #3). `prefix` must be a code-
+    /// controlled literal (e.g. `"engine:"`) — see the `.cpp` for the
+    /// LIKE-metacharacter fail-closed guard. Returns nullopt on a scan error
+    /// (lease/query failure) so the collision-scan preflight can fail CLOSED
+    /// — an empty vector means a genuinely-completed scan with no collision,
+    /// never a failed scan (symmetric with `RbacStore::find_local_groups_
+    /// with_prefix`; governance G3 residual).
+    std::optional<std::vector<std::string>> find_reserved_prefix_users(const std::string& prefix);
+
+    /// Stamp `users.last_login_at = now()` for the named user. Called by
+    /// AuthManager after every successful local / recovery-code login (the
+    /// MFA-verified login path stamps it as part of the same UPDATE that
+    /// advances mfa_last_counter, so this method is only needed for the
+    /// no-MFA and OIDC paths). SOC 2 CC7.2 — without it, `last_login_at`
+    /// reports stale data on dashboards and access reviews. Best-effort;
+    /// failure is logged but not surfaced to the caller (session creation
+    /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
-    /// Soft-delete a user (sets is_active = 0).
-    /// Also invalidates all sessions for this user.
+    /// Soft-delete a user (sets is_active = false), clears MFA enrollment
+    /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
+    /// touch sessions (no session surface on this class — see file header;
+    /// AuthManager wipes its own in-memory `sessions_` map for this
+    /// username).
     std::expected<bool, AuthDBError> remove_user(const std::string& username);
 
     /// Check if a user exists (active only).
@@ -182,12 +338,78 @@ public:
         auth::Role new_role
     );
 
+    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
+    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
+    /// Serializes against ANY concurrent `update_role()` write to this row:
+    /// if one is already committed, this call's SELECT sees it directly; if
+    /// one is mid-flight (issued, not yet committed), this call's SELECT FOR
+    /// UPDATE blocks until it commits, then reads the fresh row (standard
+    /// Postgres row-lock semantics — a plain `UPDATE` already takes an
+    /// equivalent row lock for its own transaction's duration, so the writer
+    /// side needs no changes). Either way, the value handed to
+    /// `under_row_lock` is never a value some OTHER writer's already-
+    /// in-flight commit could invalidate a moment later.
+    ///
+    /// `reactivate_user()` is asymmetric (authdb Gate 8 finding), because its
+    /// `UPDATE` deliberately carries no `is_active` filter (it's the only
+    /// writer allowed to flip a row from inactive back to active) while THIS
+    /// SELECT is filtered to `is_active = TRUE`. So: if the row is active
+    /// when this call runs, it genuinely serializes against a concurrent
+    /// `reactivate_user()` exactly like `update_role()` (either blocks
+    /// behind that UPDATE's in-flight lock, or that UPDATE blocks behind
+    /// this one). But if the row's last-COMMITTED state is already inactive,
+    /// this SELECT's `is_active = TRUE` qualifier excludes it under its own
+    /// READ COMMITTED snapshot — zero rows, `UserNotFound`, immediately, with
+    /// nothing to wait on. That holds regardless of whether a
+    /// `reactivate_user()` happens to be concurrently uncommitted at that
+    /// exact instant (authdb Gate 8 correction: an earlier draft attributed
+    /// this to "no writer in flight," which isn't the actual discriminator —
+    /// READ COMMITTED never sees another transaction's uncommitted write in
+    /// the first place, so the row's last-committed value is what decides
+    /// this, not in-flight timing). That's not a missed serialization, it's
+    /// the correct fail-closed answer (a recheck on an inactive account
+    /// should deny), but it means this call never blocks a *fresh*
+    /// `reactivate_user()` call starting against an already-inactive row —
+    /// there is no lock to contend for at that point.
+    ///
+    /// `under_row_lock` runs WHILE the row lock is held, immediately before
+    /// this call commits (releasing the lock) — use it to update
+    /// AuthManager's in-process cache under `mu_` before the lock is
+    /// released, so nothing else can commit a role change to this row while
+    /// the cache write is happening. Do NOT do any additional DB I/O inside
+    /// the callback (same rule `with_txn_on`'s doc states for its own
+    /// callers) — only fast, local, in-process work.
+    ///
+    /// This closes the SAME-PROCESS divergence residual (#4107) that an
+    /// in-memory-only version counter could only detect after the fact, not
+    /// prevent — but it does NOT close the separate, narrower "check-then-
+    /// mint" gap between this call returning and the caller actually minting
+    /// a session (`persist_new_session`): that gap is inherent to any
+    /// recheck that isn't ITSELF serialized all the way through session
+    /// creation, which this is not (external adversarial review, fjarvis,
+    /// PR #4076 — "an inherent check-then-mint gap no non-serialized recheck
+    /// can close").
+    ///
+    /// Returns `UserNotFound` (callback not invoked) if the account is not
+    /// active — mirrors `get_user()`'s filter, including for a
+    /// `remove_user()` that lands first (its soft-delete UPDATE sets
+    /// `is_active = FALSE`, participating in the SAME row-lock protocol, so
+    /// this SELECT's `WHERE ... AND is_active` correctly sees zero rows once
+    /// a concurrent removal has committed, or blocks until one in flight
+    /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
+    /// failures, callback not invoked either way.
+    std::expected<void, AuthDBError>
+    recheck_role_locked(const std::string& username,
+                        const std::function<void(auth::Role)>& under_row_lock);
+
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
     /// distinct from holding standing admin. Admin-managed. Single
-    /// UPDATE ... RETURNING (no sqlite3_changes() — #1033); UserNotFound when no
-    /// active row matched, InvalidUsername for malformed input. Never touches
-    /// credentials or role.
+    /// UPDATE ... RETURNING (RETURNING is the mutate-and-return idiom on this
+    /// store — never `sqlite3_changes()`-equivalent row-count polling).
+    /// UserNotFound when no active row matched, InvalidUsername for malformed
+    /// input. Never touches credentials or role.
     std::expected<void, AuthDBError> set_elevation_eligible(const std::string& username,
                                                             bool eligible);
 
@@ -202,9 +424,9 @@ public:
     /// deprovisioning path refuse to deactivate/delete a user it did not
     /// create. `source` is caller-supplied ("local" | "scim") — this
     /// storage-layer accessor does not itself enforce the enum; the SCIM
-    /// route layer is the trusted caller. Single UPDATE ... RETURNING (no
-    /// sqlite3_changes() — #1033). UserNotFound when no active row matched,
-    /// InvalidUsername for malformed input. Never touches credentials or role.
+    /// route layer is the trusted caller. Single UPDATE ... RETURNING.
+    /// UserNotFound when no active row matched, InvalidUsername for malformed
+    /// input. Never touches credentials or role.
     std::expected<void, AuthDBError> set_provisioning_source(const std::string& username,
                                                               const std::string& source);
 
@@ -218,27 +440,28 @@ public:
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
 
-    /// Set the `identity_source` marker (auth.db migration v6) directly —
-    /// distinct from `set_provisioning_source` (WHO manages the account's
-    /// lifecycle) — this is HOW the account authenticates, the same column
+    /// Set the `identity_source` marker (auth.db migration v6, carried
+    /// unchanged into `auth.users`) directly — distinct from
+    /// `set_provisioning_source` (WHO manages the account's lifecycle) —
+    /// this is HOW the account authenticates, the same column
     /// `upsert_sso_identity` writes for OIDC rows and the Settings user list
     /// reads to render the "SSO" badge (S-IDENTITY-SRC). SCIM provisioning is
     /// its own login surface (IdP-driven, no local password usable — see
     /// `scim_routes.cpp`), so it gets its own value rather than being rendered
     /// as `'local'`-login-capable. `source` is caller-supplied; this storage-
     /// layer accessor does not itself enforce an enum. Single UPDATE ...
-    /// RETURNING (no sqlite3_changes() — #1033). UserNotFound when no active
-    /// row matched, InvalidUsername for malformed input. Never touches
-    /// credentials, role, or provisioning_source.
+    /// RETURNING. UserNotFound when no active row matched, InvalidUsername
+    /// for malformed input. Never touches credentials, role, or
+    /// provisioning_source.
     std::expected<void, AuthDBError> set_identity_source(const std::string& username,
                                                           const std::string& source);
 
-    /// Reactivate a soft-deleted (`is_active = 0`) user row — the SCIM v2
+    /// Reactivate a soft-deleted (`is_active = false`) user row — the SCIM v2
     /// PATCH/PUT `active: true` (un-suspend) path, and the only writer of
-    /// `is_active = 1` on an EXISTING row (every other UPDATE in this file
-    /// filters `WHERE ... AND is_active = 1`, and `upsert_user` is INSERT ...
-    /// ON CONFLICT DO NOTHING — neither can revive a soft-deleted row).
-    /// Single UPDATE ... RETURNING (no sqlite3_changes() — #1033).
+    /// `is_active = true` on an EXISTING row (every other UPDATE in this
+    /// file filters `WHERE ... AND is_active = TRUE`, and `upsert_user` is
+    /// INSERT ... ON CONFLICT DO NOTHING — neither can revive a soft-deleted
+    /// row).
     ///
     /// Semantics (deliberate, do not "improve" without a fresh security
     /// review): clears `failed_login_count` / `last_failed_login_at` /
@@ -255,63 +478,14 @@ public:
     /// user is a harmless no-op (still returns success).
     std::expected<void, AuthDBError> reactivate_user(const std::string& username);
 
-    // ── Session Operations ───────────────────────────────────────────────
-    //
-    // v1 status: AuthManager retains its in-memory `sessions_` map and does
-    // NOT delegate session lifecycle to AuthDB. The methods below WRITE
-    // through to the DB (so role-change / user-delete cascades hit the
-    // sessions table) but the in-memory map is the authoritative read path.
-    // Persistence-across-restart for sessions is v2 (see governance H-Round
-    // arch-S1) — when that lands, AuthManager will call validate_session
-    // on AuthDB during validate_session() and the dead-write gap closes.
-    //
-    // The methods are kept on the surface (rather than #if-gated out) so
-    // the v2 wire-up is mechanical: only the AuthManager call sites change.
-
-    /// Create a new session. Returns the session token.
-    /// Note: Sessions do NOT persist across restarts (by design, v1).
-    ///       Session restoration is tracked as future work.
-    std::expected<std::string, AuthDBError> create_session(
-        const std::string& username,
-        auth::Role role,
-        const std::string& auth_source = "password",
-        const std::string& oidc_sub = ""
-    );
-
-    /// Validate a session token. Returns Session on success.
-    /// Note: Does NOT check expiry — caller (AuthManager) must validate
-    ///       expires_at against current time.
-    std::expected<auth::Session, AuthDBError> validate_session(const std::string& token);
-
-    /// Destroy a single session (logout).
-    std::expected<void, AuthDBError> invalidate_session(const std::string& token);
-
-    /// Destroy all sessions for a user (logout all devices). `username` is
-    /// validated with `is_valid_principal` (governance round cons-S1) — a
-    /// target-lookup DELETE, so a durable SSO principal (`oidc:<iss>#<sub>`)
-    /// is accepted alongside a strict local username.
-    std::expected<void, AuthDBError> invalidate_all_sessions(const std::string& username);
-
-    /// Remove expired sessions. Returns count of sessions removed.
-    /// Called periodically by the background cleanup thread that
-    /// `initialize()` spawns; safe to call manually as well.
-    std::expected<int, AuthDBError> cleanup_expired_sessions();
-
-    /// Best-effort durable mirror of a session's `last_activity_at` for the
-    /// idle-timeout feature (SOC 2 CC6.3). The in-memory session map is the
-    /// authoritative idle-timeout read path; AuthManager throttles this call to
-    /// at most once per session per `kActivityPersistGranularity`, so it is not
-    /// a per-request SQL write. Parameterised, no `sqlite3_changes()` (#1033).
-    std::expected<void, AuthDBError> touch_session_activity(const std::string& session_token);
-
     /// Reap provisional MFA enrollment rows (init'd but never verified)
     /// older than `older_than`. Clears `mfa_totp_secret` to NULL on any
     /// row whose `mfa_enrolled_at IS NULL` AND `updated_at` is older
     /// than the cutoff. Returns the count of rows cleared. SOC 2 CC6.6 —
     /// dangling provisional secrets are usable until verified, and a
     /// stale provisional row that survives indefinitely is a CC6.6
-    /// finding. Called on the same 60 s cadence as
-    /// `cleanup_expired_sessions`.
+    /// finding. Called on the background-reaper cadence (constructor's
+    /// `cleanup_interval_secs`).
     std::expected<int, AuthDBError>
     cleanup_provisional_mfa(std::chrono::seconds older_than = std::chrono::hours(1));
 
@@ -320,7 +494,7 @@ public:
     // SOC 2 CC6.3 — brute-force / credential-stuffing protection on the
     // local-password login path. See `/auth-and-authz` skill gap matrix
     // entry P0 #2 and docs/auth-architecture.md. Lockout state lives as
-    // three columns on the users table (migration v3): failed_login_count,
+    // three columns on `auth.users`: failed_login_count,
     // last_failed_login_at, locked_until. A non-existent username has no
     // row, so spraying random usernames cannot grow storage and cannot lock
     // a non-existent account. Policy (threshold + window) is owned by the
@@ -328,18 +502,19 @@ public:
     // an operator can retune without a schema change. The lockout is
     // temporary/auto-expiring (locked_until is a future timestamp), so it
     // cannot be weaponised to permanently DoS a legitimate principal.
+    // `locked_until > now()` is evaluated in SQL, never a parsed string.
 
     struct LockoutStatus {
         bool locked{false};       // locked_until is set AND still in the future
         int failed_count{0};      // current consecutive-failure counter
-        std::string locked_until; // SQLite DATETIME string, or "" when unlocked
+        std::string locked_until; // UTC timestamp text, or "" when unlocked
     };
 
     struct LockoutRecord {
         int failed_count{0};      // counter value AFTER this failure
         bool locked{false};       // account is locked after this failure
         bool just_locked{false};  // this failure is the one that crossed the threshold
-        std::string locked_until; // SQLite DATETIME string, or "" when not locked
+        std::string locked_until; // UTC timestamp text, or "" when not locked
     };
 
     /// Read-only lockout pre-check. Returns a zero-initialised LockoutStatus
@@ -351,9 +526,9 @@ public:
 
     /// Record one failed local-password attempt. Increments the counter,
     /// stamps last_failed_login_at, and sets locked_until = now + window the
-    /// moment the counter reaches `threshold`. Single UPDATE ... RETURNING
-    /// (no sqlite3_changes() — #1033). No-op (failed_count=0, not locked)
-    /// when `threshold <= 0` or the user row is absent.
+    /// moment the counter reaches `threshold`. Single UPDATE ... RETURNING.
+    /// No-op (failed_count=0, not locked) when `threshold <= 0` or the user
+    /// row is absent.
     std::expected<LockoutRecord, AuthDBError>
     record_failed_login(const std::string& username, int threshold, int window_secs);
 
@@ -367,15 +542,15 @@ public:
     // SOC 2 CC6.6. See docs/auth-architecture.md "Hardened mode". The single
     // configured break-glass account (Config::break_glass_user) is exempt from
     // --auth-mode=sso-only ONLY while armed. "Armed" is a future timestamp in
-    // users.break_glass_armed_until, evaluated in SQL against CURRENT_TIMESTAMP
-    // exactly like locked_until, so the exemption auto-expires and is never a
+    // users.break_glass_armed_until, evaluated in SQL against now() exactly
+    // like locked_until, so the exemption auto-expires and is never a
     // permanent standing bypass. Arming is an out-of-band host operation
     // (--break-glass-arm), not a session-authenticated route, so it works when
     // the IdP is down (the case break-glass exists for).
 
     struct BreakGlassStatus {
         bool armed{false};        // break_glass_armed_until set AND still in the future
-        std::string armed_until;  // SQLite DATETIME string, or "" when dormant
+        std::string armed_until;  // UTC timestamp text, or "" when dormant
     };
 
     /// Read-only break-glass arm check. Returns a zero-initialised
@@ -383,12 +558,10 @@ public:
     /// InvalidUsername for malformed input.
     std::expected<BreakGlassStatus, AuthDBError> break_glass_status(const std::string& username);
 
-    /// Arm the break-glass account for `window_secs` from now
-    /// (break_glass_armed_until = datetime('now', '+N seconds')). Single
-    /// UPDATE ... RETURNING (no sqlite3_changes() — #1033). Returns
-    /// UserNotFound when no active user row matched (so the host operator gets a
-    /// clear error rather than a silent no-op), InvalidUsername for malformed
-    /// input.
+    /// Arm the break-glass account for `window_secs` from now. Single
+    /// UPDATE ... RETURNING. Returns UserNotFound when no active user row
+    /// matched (so the host operator gets a clear error rather than a silent
+    /// no-op), InvalidUsername for malformed input.
     std::expected<BreakGlassStatus, AuthDBError> arm_break_glass(const std::string& username,
                                                                  int window_secs);
 
@@ -398,7 +571,7 @@ public:
     /// exemption is never left standing without an evidence row (review #1735
     /// HIGH-2; honours the "never granted without a record" guarantee in
     /// docs/ops-runbooks/auth-db-recovery.md). Idempotent; InvalidUsername for
-    /// malformed input. Parameterised, no sqlite3_changes() (#1033).
+    /// malformed input.
     std::expected<void, AuthDBError> disarm_break_glass(const std::string& username);
 
     // ── MFA / TOTP Operations ────────────────────────────────────────────
@@ -406,13 +579,28 @@ public:
     // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and
     // `/auth-and-authz` skill gap matrix entry P0 #1.
     //
+    // `mfa_totp_secret` is envelope-encrypted at rest (ADR-0010,
+    // `pg::SecretCodec`, `SecretId{"auth","users","mfa_totp_secret",<id>}`) —
+    // every reader below that TOUCHES the secret (as opposed to only the
+    // `mfa_enrolled_at`/`mfa_disabled_at` markers) attempts a decrypt and
+    // returns `AuthDBError::SecretUnavailable` — DISTINCT from "not
+    // enrolled" / "code didn't match" — on ANY decrypt failure. See
+    // `AuthDBError::SecretUnavailable`'s doc comment for why this matters:
+    // collapsing a decrypt failure into "not enrolled" would silently
+    // degrade a privileged account's second factor.
+    //
     // Lifecycle: mfa_init_enrollment writes a fresh 20-byte HMAC-SHA1
-    // secret to users.mfa_totp_secret but leaves mfa_enrolled_at NULL —
-    // the row is "provisional" until mfa_verify_enrollment lands a code
-    // that proves the user has actually scanned the otpauth URI. Calling
-    // mfa_init_enrollment again on a provisional row rotates the secret
-    // and resets mfa_last_counter; calling it on an already-enrolled row
-    // returns AuthDBError::UserAlreadyExists (caller must mfa_disable first).
+    // secret (envelope-encrypted) to users.mfa_totp_secret but leaves
+    // mfa_enrolled_at NULL — the row is "provisional" until
+    // mfa_verify_enrollment lands a code that proves the user has actually
+    // scanned the otpauth URI. Calling mfa_init_enrollment again on a
+    // provisional row REUSES (decrypts and re-reveals) the existing secret
+    // rather than rotating it — and on a decrypt failure of that provisional
+    // secret, FAILS CLOSED (`SecretUnavailable`) rather than silently
+    // minting a fresh one, which would silently invalidate an
+    // already-in-progress enrollment the operator believes is still valid.
+    // Calling it on an already-enrolled row returns
+    // AuthDBError::MfaAlreadyEnrolled (caller must mfa_disable first).
     //
     // Replay protection: mfa_verify_login_code persists the matched
     // counter as mfa_last_counter and rejects any subsequent code <= that
@@ -422,10 +610,10 @@ public:
 
     struct MfaStatus {
         bool enrolled{false};
-        // SQLite DATETIME strings ("YYYY-MM-DD HH:MM:SS UTC") or empty.
-        // Returned as strings rather than parsed time_points because v1 only
-        // displays them; converting at the DB boundary would require chrono
-        // parsing helpers that aren't yet in tree.
+        // UTC timestamp text ("YYYY-MM-DD HH:MM:SS") or empty. Returned as
+        // strings rather than parsed time_points because v1 only displays
+        // them; converting at the DB boundary would require chrono parsing
+        // helpers that aren't yet in tree.
         std::string enrolled_at;
         std::string disabled_at;
         int recovery_codes_remaining{0};
@@ -436,55 +624,78 @@ public:
         std::string otpauth_uri;
     };
 
-    /// Read MFA status for a user. Returns a zero-initialised MfaStatus
-    /// (enrolled=false, recovery_codes_remaining=0) if the row exists
-    /// but has no MFA configured.
+    /// Read MFA status for a user. TRI-STATE contract (★ security-critical —
+    /// see `AuthDBError::SecretUnavailable`):
+    ///   * `MfaStatus{enrolled=true, ...}`  — the row is enrolled AND the
+    ///     secret decrypted cleanly.
+    ///   * `MfaStatus{enrolled=false, ...}` — the row genuinely has no MFA
+    ///     configured (`mfa_enrolled_at IS NULL`; a provisional secret, if
+    ///     any, is not "enrolled").
+    ///   * `unexpected(SecretUnavailable)`  — the row IS enrolled
+    ///     (`mfa_enrolled_at` set) but the secret is NULL/malformed or fails
+    ///     to decrypt. NEVER collapsed into `enrolled=false` — a caller that
+    ///     did so would report a privileged account as having no second
+    ///     factor when it actually has one that is merely unreadable right
+    ///     now.
+    ///   * `unexpected(QueryFailed)` / `UserNotFound` / `InvalidUsername` —
+    ///     unchanged from the SQLite-era contract.
     std::expected<MfaStatus, AuthDBError> mfa_status(const std::string& username);
 
-    /// Generate a fresh TOTP secret and write it as provisional. Returns
-    /// the base32 form + otpauth URI for the enrollment UI. Idempotent on
-    /// provisional rows; returns UserAlreadyExists on already-enrolled rows.
+    /// Generate a fresh TOTP secret and write it as provisional (encrypted).
+    /// Returns the base32 form + otpauth URI for the enrollment UI.
+    /// Idempotent on provisional rows (reuse, not rotate — see the file
+    /// header MFA note); returns UserAlreadyExists — er, MfaAlreadyEnrolled —
+    /// on already-enrolled rows; returns SecretUnavailable (never a fresh
+    /// mint) if an existing provisional secret fails to decrypt.
     std::expected<MfaEnrollmentInit, AuthDBError>
     mfa_init_enrollment(const std::string& username, std::string_view issuer);
 
     /// Verify the first code against the provisional secret. On success,
-    /// stamps mfa_enrolled_at = CURRENT_TIMESTAMP, generates 10 recovery
-    /// codes (returned raw, hashed in DB), and returns the codes for the
-    /// one-time reveal. Idempotent on already-enrolled rows: returns
-    /// UserAlreadyExists.
+    /// stamps mfa_enrolled_at = now(), generates 10 recovery codes (returned
+    /// raw, hashed in DB), and returns the codes for the one-time reveal.
+    /// Idempotent on already-enrolled rows: returns MfaAlreadyEnrolled.
+    /// Returns SecretUnavailable if the provisional secret fails to decrypt
+    /// (never silently rejects the code as wrong).
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_verify_enrollment(const std::string& username, std::string_view code);
 
     /// Verify a TOTP code for login or step-up. Persists the matched
-    /// counter to mfa_last_counter on success. Returns true on match,
-    /// false on no-match. Rejects (false) if the user is not enrolled.
+    /// counter to mfa_last_counter on success. Returns `true` on match,
+    /// `false` on no-match OR on a user with no MFA configured at all (no
+    /// row / no secret present — genuinely nothing to verify against).
+    /// Returns `unexpected(SecretUnavailable)` — NEVER silently `false` — if
+    /// the user IS enrolled but the secret fails to decrypt: a caller that
+    /// treated a decrypt failure as "code didn't match" would let a
+    /// SecretCodec/KEK outage silently lock every MFA-enrolled user out
+    /// indistinguishably from a bad code, instead of surfacing the real
+    /// (retryable) fault.
     std::expected<bool, AuthDBError> mfa_verify_login_code(const std::string& username,
                                                           std::string_view code);
 
     /// Consume a single recovery code for login or step-up. Returns true
     /// if the code matched an unconsumed row (and that row is now
     /// consumed). False on no-match (also false if the user has no
-    /// recovery codes / is not enrolled).
+    /// recovery codes / is not enrolled). Recovery codes are PBKDF2-hashed,
+    /// not envelope-encrypted (verify-only, ADR-0010 — no SecretCodec
+    /// involvement, no SecretUnavailable outcome here).
     std::expected<bool, AuthDBError> mfa_consume_recovery_code(const std::string& username,
                                                                std::string_view raw_code);
 
     /// Wipe the user's existing recovery codes and issue 10 fresh ones.
-    /// Returns the raw codes for one-time display. Requires the user to
-    /// be enrolled; returns UserNotFound on no enrollment.
+    /// Returns the raw codes for one-time display. Serialized on the
+    /// `auth.users` row (`SELECT … FOR UPDATE`) so concurrent regenerates — and
+    /// a regenerate racing an enrollment/disable/remove — are ordered rather
+    /// than interleaving into a torn 20-row set with the returned codes not
+    /// matching storage (#3779). Returns `UserNotFound` when no ACTIVE user row
+    /// matches (a deactivated account never receives fresh codes);
+    /// `QueryFailed`/`WriteFailed` on a store outage (fail-closed 503).
     std::expected<std::vector<std::string>, AuthDBError>
     mfa_regenerate_recovery_codes(const std::string& username);
 
-    /// Disable MFA for a user. Clears the secret blob, stamps
+    /// Disable MFA for a user. Clears the secret column, stamps
     /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
-
-    /// Update sessions.mfa_verified_at = CURRENT_TIMESTAMP on the row
-    /// matching session_token. Returns SessionNotFound if no row.
-    /// In-memory session state (AuthManager::sessions_) is updated by
-    /// the caller — this method only persists to DB.
-    std::expected<void, AuthDBError>
-    mfa_mark_session_stepup(const std::string& session_token);
 
     // ── Enrollment Token Operations ───────────────────────────────────────
 
@@ -501,7 +712,7 @@ public:
 
     /// Consume an enrollment token atomically.
     /// Returns true if token was valid and consumed, false if already used/invalid.
-    /// C2 FIX: Persists to DB BEFORE returning — survives server restart.
+    /// Persists to DB BEFORE returning — survives server restart.
     /// Defense-in-depth: Also checks expiry in same atomic operation.
     std::expected<bool, AuthDBError> consume_enrollment_token(
         const std::string& plain_token,
@@ -528,9 +739,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-
-    /// Create database schema (idempotent — safe to call multiple times).
-    std::expected<void, AuthDBError> create_schema();
 };
 
 // ── Utility Functions ────────────────────────────────────────────────────────
@@ -539,12 +747,14 @@ private:
 /// Rules: 1-64 chars, alphanumeric + . _ - only, no ':' (config injection).
 bool is_valid_username(const std::string& username);
 
-/// True iff `username` begins with a reserved SSO-principal namespace prefix
-/// (`oidc:`, `saml:`, `ad:`; case-insensitive). Defense-in-depth for the
-/// LOCAL-user CREATE path only — `is_valid_username`'s existing ':' rejection
-/// already makes the exact stable-principal string `oidc:<iss>#<sub>`
+/// True iff `username` begins with a reserved SSO-principal or engine-
+/// principal namespace prefix (`oidc:`, `saml:`, `ad:`, `engine:`; case-
+/// insensitive). Defense-in-depth for the LOCAL-user CREATE path only —
+/// `is_valid_username`'s existing ':' rejection already makes the exact
+/// stable-principal string `oidc:<iss>#<sub>` (or `engine:<slug>`)
 /// unconstructable as a local username, but an explicit reservation
 /// documents the intent and survives a future loosening of that charset.
+/// `engine:` reservation is the auth-engine-principals design §3.3 / PR 4.2.
 /// Without it, an admin could otherwise create a local user that collides
 /// with (or is later made to collide with) an SSO-derived principal — that
 /// local user's row would supply the eligibility/TOTP an SSO principal
@@ -565,6 +775,12 @@ bool is_reserved_identity_prefix(const std::string& username);
 /// — never at user-creation chokepoints, which must keep using
 /// `is_valid_username` (+ `is_reserved_identity_prefix` to reserve the SSO
 /// namespace) so a local account can never be created inside it.
+/// `is_reserved_identity_prefix` now also reserves `engine:` — this widens
+/// the *format* this validator accepts, but no `users` row can ever actually
+/// carry that prefix: local creation stays blocked by `is_valid_username`'s
+/// ':' ban, and `upsert_sso_identity`'s principal is always
+/// `source + ":" + iss + "#" + sub` with `source` a caller-controlled
+/// literal in {"oidc","saml","ad"} — never "engine".
 bool is_valid_principal(const std::string& s);
 
 /// Validate that `username` is usable as the hardened-mode break-glass account:
@@ -573,7 +789,7 @@ bool is_valid_principal(const std::string& s);
 /// reason string. Mandatory-MFA is enforced here, fail-closed (SOC 2 CC6.6) so
 /// the sso-only escape hatch can never be a bare-password account; a store read
 /// error is also a problem (never report a broken account as usable). Because
-/// `mfa_status` filters `is_active = 1`, a soft-deleted user reads as
+/// `mfa_status` filters `is_active = true`, a soft-deleted user reads as
 /// not-enrolled and is correctly rejected. Shared by the server boot guard and
 /// the `--break-glass-arm` one-shot so both apply one contract.
 std::optional<std::string> break_glass_account_problem(AuthDB& db, const std::string& username);

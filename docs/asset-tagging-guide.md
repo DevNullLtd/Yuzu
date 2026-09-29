@@ -28,14 +28,59 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
-> **Tag source precedence.** Every tag carries a `source` field — `"server"` for operator/API
-> writes (REST `PUT /api/v1/tags`, MCP `set_tag`) and `"agent"` for tags an agent self-reports
-> via its heartbeat `scopable_tags`. An agent-reported tag is written only when the stored row
-> is itself `"agent"`-sourced or absent; an operator/API-set tag for the same `(agent_id, key)`
-> is **authoritative and cannot be overwritten by the agent**. This prevents a rogue or
-> misconfigured agent from self-assigning into an operator-declared benchmark cohort. To force a
-> value regardless of the current source, write it via the REST API or MCP `set_tag` (source
-> `"server"`).
+> **Tag source precedence (write time).** Every tag carries a `source` field — `"api"` for
+> REST/dashboard writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for
+> server-internal writes, and `"agent"` for tags an agent self-reports at registration
+> (`scopable_tags`, synced to the store on gRPC `Register`). An agent-reported tag is
+> written only when the stored row is itself `"agent"`-sourced or absent; any
+> non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
+> overwritten by the agent**. This prevents a rogue or misconfigured agent from self-assigning
+> into an operator-declared benchmark cohort. To force a value regardless of the current
+> source, write it via the REST API or MCP `set_tag`.
+>
+> **The `service` key is a special case (#3289).** It is never accepted from an agent's
+> self-report at all — an agent-supplied `service` value is silently dropped during sync,
+> regardless of whether a stored row exists. `service` is the confinement boundary a
+> service-scoped API token is checked against, so it must always be operator/API-assigned,
+> never agent-claimed. A pre-existing agent-authored `service` row (from before this
+> restriction existed) is purged on the agent's next sync. A service-scoped token is also
+> denied writing or deleting its OWN `service` tag on any target, regardless of source — see
+> "Service-Scoped Tokens" under `docs/user-manual/authentication.md`.
+>
+> **Tag source precedence (read time, scope-DSL, #3295).** A `tag:<key>` expression in a
+> Scope (dispatch targeting, management-group membership, any `tag:` atom you write, including
+> `EXISTS`/`LEN`/`STARTSWITH` forms) resolves the TagStore row for that `(agent, key)` FIRST,
+> by presence alone — this is a separate rule from the write-time source precedence above, not
+> derived from it: the store row wins regardless of which source wrote it (even an
+> agent-sourced row beats a live, fresher in-memory claim from the same agent — see the
+> stale-sync note below). A connected agent's live self-reported value answers a `tag:<key>`
+> lookup ONLY when the store has NO row at all for that `(agent, key)` — e.g. a gateway-proxied
+> agent, whose tags are never synced to the store, or a tag not yet synced. `service` never
+> answers from the self-report at this stage either — it is dropped from the agent's live
+> session at registration, not just filtered from the store. An agent reporting an empty-string
+> value cannot mask an operator's non-empty stored value, and conversely an empty STORE value
+> is never masked by a non-empty in-memory claim: the store row, when present — even an empty
+> one — is always used regardless of the agent's own claim.
+>
+> **Accepted trade-off: a stale agent-sourced row can briefly outlast a fresher live claim.**
+> If an agent's most recent tag sync fails (a transient DB error, or exceeding the sync batch
+> limit), the store retains its PRIOR agent-sourced row for that agent while the agent's live
+> session already holds a newer value — read-time precedence still honors the (now stale)
+> store row until the agent's next successful sync. This is deliberate: the store remains the
+> single source of truth for scope-DSL reads, and the row self-heals automatically. See
+> `docs/adr/0050-tag-store-postgres-migration.md`'s 2026-08-20 amendment for the full rationale.
+>
+> **`preview_scope_targets` resolves `tag:<key>` identically to a real dispatch (#4981).**
+> Both MCP `preview_scope_targets` and its REST v1 twin `POST /api/v1/scope/preview` now
+> route through the SAME evaluation ladder a real dispatch uses (`AgentRegistry::evaluate_scope`),
+> so `tag:<key>` resolves store-first, falling back to a locally-connected agent's own live
+> self-report only when the store has no row for that agent — exactly like a real dispatch. A
+> presence-only cross-replica agent has no live session to read `scopable_tags` from, so it
+> still resolves store-only for such agents, same as real dispatch (this is not a preview-only
+> limitation). REST `POST /api/scope/estimate` also resolves `from_result_set:` against the
+> owner, but a failed owner-check there degrades to "zero members" rather than aborting the
+> whole evaluation like `preview_scope_targets`'s ladder does — a separate, still-open
+> fail-open gap, tracked `#5003`, not fixed by `#4981`.
 
 ### Via the REST API
 
@@ -108,7 +153,7 @@ curl -s -X DELETE "http://localhost:8080/api/v1/tags/agent-001/location" -b "$CO
 
 ### Via the Dashboard
 
-Tags can also be managed through the HTMX dashboard. Navigate to a device's detail page and use the tag editor to add, update, or remove tags. The `environment` dropdown is pre-populated with the three allowed values.
+Tags can also be managed through the HTMX dashboard. Open the device's Hardware CI record (`/hardware`, click the host, **Tags** tab): operators holding `Tag:Write` for that device see an **Add tag** row (key + value) and a **remove** link per tag. Both post to the same `/api/tags/set` and `/api/tags/delete` routes the API uses, so the same key validation, scoped RBAC gate and `tag.set` / `tag.delete` audit rows apply.
 
 ### Via YAML Instruction Definitions
 
@@ -345,6 +390,17 @@ These groups use `dynamic` membership — the scope engine can refresh which dev
 
 This means an ITServiceOwner assigned to "Service: payments" automatically has scoped access to every device tagged with `service=payments`.
 
+**Two distinct confinement axes.** The ITServiceOwner *role* documented above confines a
+management-group-scoped user via RBAC — that is unaffected by, and independent of, a
+*service-scoped API token*'s confinement (ADR-1006, "the flip"), which restricts what a
+minted token bound to a specific service value may reach. Holding ITServiceOwner (or
+Administrator, or Operator) with a plain `Tag:Write`/`Tag:Delete` grant remains sufficient
+to set or move any device's `service` tag — those are fleet-scoped RBAC roles, not
+service-scoped tokens, so moving a `service` tag through them is not a confinement bypass.
+The restriction in the callout above applies only to a session whose own API token carries
+a `token_scope_service` — such a token may never write or delete the `service` key on any
+target, in or out of its own scope (#3289).
+
 ### Setting up an IT Service Owner
 
 **Step 1: Tag devices with a service.**
@@ -495,6 +551,12 @@ NOT tag:environment == "Dev"
 This allows you to target instructions, policies, and reports at specific device subsets based on their tags.
 
 For **presence** (a tag key exists on the device, regardless of value) use `EXISTS tag:<name>` rather than an equality. The YAML `spec.scope.selector.tags` block-form authoring surface lowers each listed tag to `EXISTS tag:<name>` — a presence check — so a `selector.tags: [production]` entry matches any device carrying a `production` tag with a non-empty value. For value-equality matching, use the explicit `tag:<key> == "<value>"` form shown above.
+
+**Failure behavior (ADR-0050):** a scope evaluation whose `tag:<key>` values cannot be read
+from the tag store (a degraded database) **fails the whole evaluation** — the operation
+reports an error rather than resolving to fewer or more devices than the expression names. A
+`NOT tag:...` expression in particular can never silently expand to the whole fleet because a
+tag read failed.
 
 ---
 
@@ -715,6 +777,77 @@ devices always appear as an explicit "(untagged)" residual row.
 > scrapes `/metrics`. Use non-sensitive organizational identifiers (hardware
 > model, image name) — never personnel-relevant strings. See
 > [metrics.md security considerations](user-manual/metrics.md#security-considerations).
+
+---
+
+## Recipe: Reflex consent gate (`device_class`)
+
+The Reflex system (`docs/reflex-design.md`, ADR-0021 Decision 4 — design-only as of this writing,
+see `docs/roadmap.md` Phase 20) needs to know which devices have no end user present, because a
+dangerous (consequential) Reflex Reaction is **refused at compile unless all-server tag consent
+holds** — this is one unconditional rule, not something an escalation policy can widen, and **v1
+has exactly one consent basis: the asset tag.** (An earlier design draft proposed a second,
+in-chain "prompt the user first" path; it turned out not to bootstrap — the prompting Reaction is
+itself dangerous and would need a consent it cannot have — so v1 ships without it; see
+`docs/reflex-design.md` "Consent gate (D4)" for the full reasoning.) That classification is the
+free-form tag key `device_class`, with a closed vocabulary of two values:
+
+- `device_class=server` — no end user is normally present; a dangerous Reflex Reaction may be
+  admitted by tag consent alone on this device.
+- `device_class=workstation` — an end user is normally present; **no dangerous Reflex Reaction can
+  run on this device in v1, ever, including any `interaction.*` prompt** (all five `interaction.*`
+  actions are themselves dangerous). This is not a temporary gap to work around — it is v1's actual
+  scope. Reclassify the device `server` if that is genuinely true, or wait for a future chain-consent
+  extension if it is not.
+
+`device_class` is **not** one of the four structured categories (`role` / `environment` /
+`location` / `service`) — it has no entry in `tag-categories` and is not schema-validated the way
+`environment`'s `Dev`/`UAT`/`Production` values are; the vocabulary above is enforced entirely by
+the Reflex consent-gate reader (`evaluate_consent`, `docs/reflex-design.md` "Consent gate (D4)"),
+not by `TagStore` schema validation. **The match is exact-byte** against the literal string
+`"server"` — unlike the scope-DSL's `tag:` atom (case-insensitive), this is a **direct store read**,
+so `Server` or `" server"` reads as `workstation`, not `server`. **An untagged device is treated as
+`workstation` — fail-closed** — Reflex never infers "no user present" from the absence of a tag.
+
+**Sequencing: tag before you deploy.** A Reflex Set with a dangerous Reaction and any
+workstation-class device in its resolved assignment simply cannot compile in v1 — there is no
+in-chain fallback and no bulk `device_class` import specific to this recipe today (no automated
+pipeline exists yet), so tag your all-server fleet *before* authoring a Reflex Set that needs tag
+consent, the same way you would walk inventory to populate `model` in the DEX cohort recipe above.
+Setting or changing `device_class` requires the `Reflex:Write` permission (or admin) — a bare
+`Tag:Write` grant is not sufficient, because this tag is the sole input to a safety-relevant
+compiler gate.
+
+Tag a device as a server (no end user present):
+
+```bash
+curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "db-prod-01", "key": "device_class", "value": "server"}'
+```
+
+An unreadable `TagStore` read at evaluation time is treated as a consent-gate **error**, never as
+implicit consent — the compiler refuses to compile a Reflex Set whose consent could not be
+positively established, rather than defaulting to "allowed."
+
+**Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating (HOLD, not disarm).**
+This is the outcome for a *new* Reflex Set, or an edit to an existing one, that never establishes
+consent — the set is held at its last accepted generation (or never deployed at all, if it has none)
+rather than being pushed. The most common cause is a target device whose `device_class` is missing or not
+exactly `"server"` — in v1 there is no second consent path to check: either tag the device
+`device_class=server` if it genuinely has no end user, or narrow the assignment to exclude it.
+**Check the audit event's own reason before re-tagging**, because two other refusals share this
+verb: an **unreadable `TagStore`**, which is an evaluation error and never consent (`docs/reflex-
+design.md`, "Consent gate (D4)"), and a **validation or digest-drift refusal** of a new generation,
+which has nothing to do with consent at all (same file, "Generation, undeploy, and push semantics"). There is
+deliberately no "add an `interaction.*` Reaction to consent instead" option in v1 — see "Consent
+gate (D4)" in `docs/reflex-design.md` for why that does not work. **This is a different case from an
+already-armed set LOSING consent** (re-tagging a device from `server` to `workstation`,
+or a membership change that pulls a workstation into an all-server assignment) — that recompile does
+not hold anything; it **disarms** the affected device(s) via an explicit, generation-advancing
+removal push (`docs/reflex-design.md` "Generation, undeploy, and push semantics"), because leaving a
+dangerous set armed under a now-false consent basis is the exact failure this gate exists to
+prevent.
 
 ---
 

@@ -281,7 +281,8 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/result-sets" class="nav-link active">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>

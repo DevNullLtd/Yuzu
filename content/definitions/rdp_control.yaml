@@ -9,19 +9,27 @@
 # succeeds with no extra grant. A non-elevated agent returns reg_status|error:5
 # on every set_state.
 #
-# ENFORCEMENT REALITY (read before relying on the gate below): the only control
-# enforced on EVERY dispatch path is the `Execution:Execute` RBAC permission.
-# `approval.mode: role-gated` is enforced ONLY on the governed
-# POST /api/instructions/{id}/execute path; the raw dispatch paths
-# (POST /api/command, MCP execute_instruction) do NOT load this definition, so
-# they apply neither the approval workflow nor `executeRoles`. `executeRoles`
-# is advisory (not consumed by the server today) and `endpoint-admin` is a
-# content-convention label, not a server RBAC role (those are
-# Administrator/PlatformEngineer/Operator). Net: anyone holding
-# `Execution:Execute` (incl. an MCP token defaulting scope to __all__) can run
-# this. Restrict `Execution:Execute` and MCP token scope accordingly, and keep
-# the Guardian fDenyTSConnections backstop deployed. Enforcing definition-level
-# governance on raw dispatch is tracked as a platform follow-up (issue #1401).
+# ENFORCEMENT REALITY (read before relying on the gate below, #1398): two
+# independent controls now cover EVERY dispatch path -- the governed
+# POST /api/instructions/{id}/execute path AND raw dispatch
+# (POST /api/command, MCP execute_instruction, dashboard, workflow, schedule).
+# (1) RBAC: rdp_control.set_state classifies as `Security:Write` in the
+# compiled capability catalogue (capability_decls/plugin_action_catalogue_c.hpp)
+# -- NOT the generic `Execution:Execute` -- so a caller needs the narrower
+# `Security:Write` grant, checked at the one dispatch chokepoint
+# (classify_and_authorize_dispatch) every surface funnels through.
+# (2) Approval: this pair's compiled ExecuteGate is `AdminOrApproval`, derived
+# strictest-wins from this definition's `approval.mode: role-gated` -- a
+# non-admin caller without a proven approval decision (a consumed ticket, or
+# an equivalent governed pipeline) is denied `ApprovalRequired` at that same
+# chokepoint, on raw dispatch exactly as on the governed path.
+# `executeRoles` below remains advisory only -- it is not consumed by the
+# server (embed_content.py drops the whole `permissions` block at build time)
+# and `endpoint-admin` is a content-convention label, not a server RBAC role
+# (those are Administrator/PlatformEngineer/Operator/ApiTokenManager/
+# ITServiceOwner/Viewer/Reviewer). Actual enforcement is entirely the two
+# controls above. Keep the Guardian fDenyTSConnections backstop deployed
+# regardless -- defense in depth, not a substitute for either control.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -54,19 +62,33 @@ spec:
       state:
         type: string
         displayName: RDP State
-        description: enable allows Remote Desktop connections; disable blocks them.
+        description: >
+          enable allows Remote Desktop connections; disable blocks them
+          (e.g. state: enable).
         validation:
           enum: ["enable", "disable"]
   result:
     columns:
       - name: reg_status
         type: string
+        description: 'Outcome of writing HKLM fDenyTSConnections; ok or a Win32 error code. Values: ok, error:<win32 code> (e.g. error:5 = ERROR_ACCESS_DENIED).'
+        example: "not observed in any capture" # only the rejection path was run
+        platforms: [windows]
       - name: firewall_status
         type: string
+        description: 'Outcome of toggling the Remote Desktop firewall rule group via INetFwPolicy2. Values: ok, error:com_init, error:group_not_found, error:0x<hresult>.'
+        example: "not observed in any capture"
+        platforms: [windows]
       - name: service_status
         type: string
+        description: 'TermService outcome — running once start is confirmed by polling (enable), untouched (disable), or a Win32 error. Values: running, untouched, error:<win32 code>.'
+        example: "not observed in any capture"
+        platforms: [windows]
       - name: overall
         type: string
+        description: 'Terminal verdict for the whole set_state call; ok only when every step above succeeded. Values: ok, error.'
+        example: "not observed in any capture"
+        platforms: [windows]
   readablePayload: "Set Remote Desktop state to ${state}"
   approval:
     mode: role-gated
@@ -110,12 +132,24 @@ spec:
     columns:
       - name: deny_ts_connections
         type: string
+        description: 'Raw fDenyTSConnections registry value (0 = RDP allowed, 1 = RDP denied), or a Win32 error if the read failed. Values: 0, 1, error:<win32 code>.'
+        example: "0"
+        platforms: [windows]
       - name: firewall_group
         type: string
+        description: 'Whether the Remote Desktop firewall rule group is enabled, or why it could not be read. Values: enabled, disabled, group_not_found, error:com_init, error:0x<hresult>.'
+        example: "enabled"
+        platforms: [windows]
       - name: term_service
         type: string
+        description: 'Current SCM state name for TermService, or a Win32 error if the query failed. Values: running, start_pending, stopped, stop_pending, paused, pause_pending, continue_pending, unknown, error:<win32 code>.'
+        example: "not observed in any capture"
+        platforms: [windows]
       - name: rdp
         type: string
+        description: 'Derived RDP posture — on only when all three gates are readable and open, unknown when any gate could not be read, off otherwise. Values: on, off, unknown.'
+        example: "on"
+        platforms: [windows]
   approval:
     mode: auto
   permissions:

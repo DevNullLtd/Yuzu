@@ -1,6 +1,9 @@
 ## Netstat Definitions
 ## Enumerates active network connections and listening sockets.
 ## Plugin: netstat | Actions: netstat_list
+## (see also netstat_attribution.yaml for the `attribution` action, which
+## additionally resolves the owning process -- folds the retired `sockwho`
+## plugin into netstat, #3403)
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetExtendedTcpTable, GetExtendedUdpTable)
@@ -41,18 +44,43 @@ spec:
     columns:
       - name: proto
         type: string
+        description: Transport protocol and IP version of the socket.
+        values: [tcp, tcp6, udp, udp6]
+        example: "tcp"
+        platforms: [windows, linux, darwin]
       - name: local_addr
         type: string
+        description: "The connection's local IP address, in the address family matching proto. Values: free text (IPv4 or IPv6 address)."
+        example: "198.51.100.77"
+        platforms: [windows, linux, darwin]
       - name: local_port
         type: int32
+        description: "The connection's local TCP or UDP port number. Values: integer, 0-65535."
+        example: 52882
+        platforms: [windows, linux, darwin]
       - name: remote_addr
         type: string
+        description: >-
+          The connection's remote IP address. UDP sockets report the literal '*' on macOS and Windows (no fixed peer); Linux instead parses the real value from /proc/net/udp* (normally 0.0.0.0). Values: free text (IPv4 or IPv6 address) or "*".
+        example: "198.51.100.121"
+        platforms: [windows, linux, darwin]
       - name: remote_port
         type: int32
+        description: "The connection's remote port; always 0 for UDP (no fixed peer). Values: integer, 0-65535."
+        example: 22
+        platforms: [windows, linux, darwin]
       - name: state
         type: string
+        description: >-
+          TCP connection state name; always empty for UDP rows (never a fabricated LISTEN). The exact name set differs slightly per OS. Values: ESTABLISHED, SYN_SENT, SYN_RECV, FIN_WAIT1, FIN_WAIT2, TIME_WAIT, CLOSE_WAIT, LAST_ACK, LISTEN, CLOSING, UNKNOWN, CLOSE (Linux only), CLOSED/DELETE_TCB (Windows only), or empty (UDP).
+        example: "ESTABLISHED"
+        platforms: [windows, linux, darwin]
       - name: pid
         type: int32
+        description: >-
+          PID of the process holding the socket, or -1 (Linux only) when no matching /proc/[pid]/fd inode was found. Values: integer, or -1 on Linux.
+        example: 9653
+        platforms: [windows, linux, darwin]
     aggregation:
       groupBy:
         - proto

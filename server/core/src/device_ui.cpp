@@ -15,7 +15,7 @@
 
 #include "device_routes.hpp"
 
-#include "dex_routes.hpp"        // dex_signal_label for the DEX lens
+#include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
 #include "tar_process_tree.hpp"  // tar_is_suspicious_spawn — shared LOLBin/shell denylist
 #include "web_utils.hpp"
 
@@ -35,6 +35,60 @@ namespace yuzu::server {
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+
+// raw column name -> display header text, for render_device_live_generic's <th>.
+// Backs the round-3 item 11 "physical-kit" kinds only; an unrecognised key falls
+// back to itself unchanged — never crash on a column a future kind introduces.
+std::string column_label(const std::string& raw) {
+    static const std::unordered_map<std::string, std::string> kLabels{
+        {"index", "#"},
+        {"model", "Model"},
+        {"size_gb", "Size (GB)"},
+        {"media_type", "Media"},
+        {"interface", "Interface"},
+        {"slot", "Slot"},
+        {"size_mb", "Size (MB)"},
+        {"type", "Type"},
+        {"speed_mhz", "Speed (MHz)"},
+        {"cores", "Cores"},
+        {"threads", "Threads"},
+        {"clock_mhz", "Clock (MHz)"},
+        {"name", "Name"},
+        {"version", "Version"},
+        {"date", "Date"},
+        {"provider", "Provider"},
+        {"device_class", "Class"},
+        {"present", "Present"},
+        {"state", "State"},
+        {"percent", "Percent"},
+        {"time_to_empty_min", "Time to empty (min)"},
+        {"cycle_count", "Cycle count"},
+        {"health_percent", "Health %"},
+        {"status", "Status"},
+        {"zone_or_detail", "Zone / detail"},
+        {"celsius", "degC"},
+        {"device", "Device"},
+        {"bus", "Bus"},
+        {"media", "Media"},
+        {"health", "Health"},
+        {"pct_used", "% used"},
+        {"spare_pct", "Spare %"},
+        {"detail", "Detail"},
+        {"volume", "Volume"},
+        {"mount_points", "Mount points"},
+        {"fstype", "FS type"},
+        {"total_bytes", "Size"},
+        {"mac", "MAC"},
+        {"speed_mbps", "Speed (Mbps)"},
+        {"ssid", "SSID"},
+        {"signal", "Signal"},
+        {"security", "Security"},
+        {"bssid", "BSSID"},
+        {"interface_or_channel", "Interface / channel"},
+    };
+    const auto it = kLabels.find(raw);
+    return it == kLabels.end() ? raw : it->second;
+}
 
 std::string url_encode(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
@@ -181,8 +235,6 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
     for (const auto& d : rows) {
         const std::string label = d.hostname.empty() ? d.agent_id : d.hostname;
         std::string tagline = esc(d.agent_id.substr(0, 12));
-        if (!d.segment.empty())
-            tagline += " &middot; " + esc(d.segment);
         h += "<tr class=\"gp-rowlink\" style=\"cursor:pointer\" "
              "onclick=\"location.href='/device?id=" +
              url_encode(d.agent_id) + "'\">";
@@ -223,10 +275,7 @@ std::string render_device_info_fragment(const DeviceRow& d) {
                                   kv("OS", os_label(d.os)) +
                                   kv("Architecture", esc(d.arch.empty() ? "&mdash;" : d.arch)));
     h += ci_group("Management",
-                  kv("Segment", d.segment.empty() ? std::string("<span class=\"gp-mute\">&mdash;"
-                                                                "</span>")
-                                                  : esc(d.segment)) +
-                      kv("Tags", tags) +
+                  kv("Tags", tags) +
                       kv("Agent version", d.agent_version.empty() ? std::string("&mdash;")
                                                                   : esc(d.agent_version)) +
                       kv("Status", d.online ? "<span style=\"color:#4ed27e\">online</span>"
@@ -241,14 +290,15 @@ std::string render_device_info_fragment(const DeviceRow& d) {
 }
 
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message) {
-    return device_lens_tabs(active, agent_id) +
+                                           const std::string& message, bool tabs) {
+    return (tabs ? device_lens_tabs(active, agent_id) : std::string()) +
            "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>" + esc(message) + "</div>";
 }
 
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                   const std::vector<std::pair<std::string, std::int64_t>>& signals) {
-    std::string h = device_lens_tabs("dex", agent_id);
+                                   const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                   bool tabs) {
+    std::string h = tabs ? device_lens_tabs("dex", agent_id) : std::string();
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\">";
     if (score < 0)
         h += "<div class=\"n\">&mdash;</div>";
@@ -386,23 +436,38 @@ std::string render_device_live_shell(const std::string& agent_id) {
     // Hidden uptime loader: fills the Uptime KPI (uptime has no card of its own).
     h += "<div style=\"display:none\" hx-get=\"/fragments/device/live/run?id=" + e +
          "&amp;kind=uptime\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
+    // Each card group (Live cards / Physical) is its own [data-lsgroup] container so
+    // lsToggleAll (guardian_page_ui.cpp) can scope its "expand all" to the button's
+    // OWN group only — a document-wide querySelectorAll would also snap open the
+    // OTHER group's lazy cards, firing every one of their dispatches at once (the
+    // exact storm the lazy toggle-once:closest-details design exists to prevent).
+    h += "<div class=\"ls-group\" data-lsgroup=\"live\">";
     h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Live cards</h2>"
          "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
     h += "<div class=\"ls-grid\">";
     // One collapsed card per kind; its body auto-dispatches the live query on load
     // (same proven run/poll seam as before) and renders into the scrollable body.
-    auto card = [&](const char* kind, const char* title, const char* os_tag, const char* preview) {
+    auto card = [&](const char* kind, const char* title, const char* os_tag, const char* preview,
+                    bool lazy = false) {
         std::string c = "<details class=\"ls-card\"><summary><span class=\"ls-ttl\">" +
                         std::string(title) + "</span><span class=\"ls-cnt\" id=\"ls-cnt-" + kind +
                         "\"></span>";
         if (os_tag && *os_tag)
             c += "<span class=\"ls-os\">" + std::string(os_tag) + "</span>";
+        // Eager cards dispatch on load (the proven run/poll seam); the new Physical
+        // cards are behind a collapsed <details> by default, so lazy=true defers
+        // dispatch to first expand (htmx 2.0.4 `EVENT MODIFIER from:SELECTOR`
+        // grammar — see dashboard_ui.cpp/settings_ui.cpp's "... from:body" and
+        // tar_tree_routes.cpp's "change from:#tar-tree-host" for the same "from:"
+        // usage already relied on in this codebase; "closest details" is htmx's
+        // standard extended CSS selector for the nearest ancestor <details>).
         c += "<span class=\"ls-prev\">" + std::string(preview) +
              "</span><button class=\"ls-pop\" title=\"Pop out\" onclick=\"lsPopOut(event,this)\">"
              "&#10530;</button></summary>"
              "<div class=\"ls-body\" hx-get=\"/fragments/device/live/run?id=" +
-             e + "&amp;kind=" + kind +
-             "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><div class=\"gp-mute\">Loading&hellip;"
+             e + "&amp;kind=" + kind + "\" hx-trigger=\"" +
+             (lazy ? "toggle once from:closest details" : "load") +
+             "\" hx-swap=\"innerHTML\"><div class=\"gp-mute\">Loading&hellip;"
              "</div></div></details>";
         return c;
     };
@@ -410,13 +475,40 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("services", "Services", "", "run state");
     h += card("users", "Logged-in users", "", "sessions");
     h += card("netconfig", "Adapters &amp; IP", "", "addresses");
-    h += card("arp", "ARP / neighbours", "Win", "neighbour table");
-    h += card("dns_cache", "DNS cache", "Win", "resolver cache");
+    // arp is live on all three platforms; the Linux and macOS legs are
+    // constrained (Linux: IPv4 ARP only; macOS: no interface name or entry
+    // type), so no OS badge but the limit is stated in the preview.
+    h += card("arp", "ARP / neighbours", "", "neighbour table &middot; limited on Linux/macOS");
+    h += card("dns_cache", "DNS cache", "Win &middot; Linux", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
     h += card("disk", "Disk space", "", "system volume only");
-    h += "</div></div>";
+    h += "</div>"; // close .ls-grid (live)
+    h += "</div>"; // close .ls-group[data-lsgroup=live]
+    // Physical cards are lazy (dispatch only on individual expand) — their OWN
+    // "Expand all" reuses lsToggleAll(this), scoped to this group by data-lsgroup
+    // above, so a deliberate click here mass-expands only these 10 (a legitimate,
+    // explicit dispatch of all 10), never as a side effect of the Live-cards button.
+    h += "<div class=\"ls-group\" data-lsgroup=\"physical\">";
+    h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Physical</h2>"
+         "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
+    h += "<div class=\"ls-grid\">";
+    h += card("hw_disks", "Disks", "", "model &middot; size &middot; interface", true);
+    h += card("hw_memory", "Memory", "", "slots &middot; size &middot; speed", true);
+    h += card("hw_processors", "Processors", "", "cores &middot; threads &middot; clock", true);
+    h += card("hw_drivers", "Drivers", "Win and Linux", "name &middot; version &middot; provider",
+              true);
+    h += card("battery", "Battery", "", "state &middot; percent &middot; health", true);
+    h += card("thermal", "Thermal", "", "zones &middot; temperature", true);
+    h += card("smart", "Disk health (SMART)", "Win and macOS", "health &middot; wear &middot; spare",
+              true);
+    h += card("volumes", "Volumes", "Win and macOS", "mounts &middot; filesystem &middot; size", true);
+    h += card("adapters", "Network adapters", "", "MAC &middot; speed &middot; status", true);
+    h += card("wifi", "Wi-Fi", "", "SSID &middot; signal &middot; security", true);
+    h += "</div>"; // close .ls-grid (physical)
+    h += "</div>"; // close .ls-group[data-lsgroup=physical]
+    h += "</div>"; // close #device-live-snapshot
     return h;
 }
 
@@ -695,8 +787,8 @@ std::string render_device_live_tree(const std::vector<LiveProcNode>& nodes,
 
 std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows) {
     if (rows.empty())
-        return "<div class=\"gp-note\">No ARP entries &mdash; not available on this OS (Windows-only) "
-               "or the neighbour table is empty.</div>";
+        return "<div class=\"gp-note\">ARP / neighbour table not available on this platform, "
+               "or the table is empty.</div>";
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Interface</th><th>IP</th><th>MAC</th>"
                     "<th>Type</th></tr></thead><tbody>";
     for (const auto& r : rows) {
@@ -851,6 +943,43 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
     return h;
 }
 
+/// Generic table renderer backing the 10 round-3 item 11 "physical-kit" live-info
+/// kinds (disks, memory, processors, drivers, battery, thermal, disk health,
+/// volumes, network adapters, Wi-Fi) added via a data-only LiveKind.columns /
+/// .row_prefix extension in live_kinds.hpp — no per-kind bespoke renderer needed
+/// since the wire shape is uniform pipe-delimited rows whose field order already
+/// matches the declared column order. Parsing/prefix filtering happens in
+/// device_routes.cpp's render_live_result, NOT here — this function is pure over
+/// already-parsed rows, matching every other render_device_live_* function in
+/// this file. `raw_rows` are lines that did NOT match the kind's row_prefix
+/// (e.g. a plugin-emitted "warning|..."/"error|..." diagnostic alongside its
+/// data rows) — preserved verbatim rather than silently dropped, rendered as
+/// their own full-width diagnostic row at the end of the table body, muted via
+/// this file's established `gp-mute` convention for a diagnostic/placeholder
+/// cell (see e.g. dex_perf_ui.cpp / dex_app_perf_ui.cpp's `colspan` + `gp-mute`
+/// "n too small" rows) rather than inventing a new one.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows) {
+    if (rows.empty() && raw_rows.empty())
+        return "<div class=\"gp-note\">Not available on this platform, or the table is empty.</div>";
+    const std::string colspan = std::to_string(columns.size());
+    std::string h = "<table class=\"ls-tbl\"><thead><tr>";
+    for (const auto& c : columns) h += "<th>" + esc(column_label(c)) + "</th>";
+    h += "</tr></thead><tbody>";
+    for (const auto& row : rows) {
+        h += "<tr>";
+        for (const auto& cell : row)
+            h += "<td>" + (cell.empty() ? "<span class=\"gp-mute\">&mdash;</span>" : esc(cell)) + "</td>";
+        h += "</tr>";
+    }
+    for (const auto& raw : raw_rows)
+        h += "<tr class=\"ls-raw\"><td colspan=\"" + colspan + "\" class=\"gp-mute\">" + esc(raw) +
+             "</td></tr>";
+    h += "</tbody></table>";
+    return h;
+}
+
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows) {
     if (rows.empty())
         return "<div class=\"gp-note\">TAR is not running on this device, or it reported no "
@@ -877,8 +1006,8 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
 }
 
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards) {
-    std::string h = device_lens_tabs("guardian", agent_id);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs) {
+    std::string h = tabs ? device_lens_tabs("guardian", agent_id) : std::string();
     if (guards.empty()) {
         h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
              "evaluated on this device yet.</div>";
@@ -938,6 +1067,13 @@ std::string render_device_not_found(const std::string& agent_id) {
     return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
            "<div class=\"gp-placeholder\"><b>Device not found</b>No enrolled device with id " +
            esc(agent_id) + ".</div>";
+}
+
+std::string render_device_degraded(const std::string& agent_id) {
+    return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
+           "<div class=\"gp-placeholder\"><b>Device data unavailable</b>The device store is "
+           "temporarily degraded &mdash; try again shortly (" +
+           esc(agent_id) + ").</div>";
 }
 
 } // namespace yuzu::server

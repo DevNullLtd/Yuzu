@@ -667,17 +667,20 @@ bool ci_starts_with(std::string_view text, std::string_view prefix) {
 }
 
 bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
-    // Synthetic __startswith:<attr> — resolve real attribute then prefix-check
-    if (cond.attribute.starts_with("__startswith:")) {
-        auto real_attr = cond.attribute.substr(13);
-        auto resolved = resolver(real_attr);
+    // Synthetic attributes (`__len:`/`__startswith:`) — decoded through the
+    // ONE shared classifier so the preload collector can never miss a form
+    // this dispatch handles (ADR-0050 governance DSL-1).
+    const SyntheticAttr synthetic = classify_synthetic(cond.attribute);
+
+    // __startswith:<attr> — resolve real attribute then prefix-check
+    if (synthetic.kind == SyntheticKind::kStartswith) {
+        auto resolved = resolver(synthetic.real);
         return ci_starts_with(resolved, cond.value);
     }
 
-    // Synthetic __len:<attr> — resolve real attribute then compare length
-    if (cond.attribute.starts_with("__len:")) {
-        auto real_attr = cond.attribute.substr(6);
-        auto resolved = resolver(real_attr);
+    // __len:<attr> — resolve real attribute then compare length
+    if (synthetic.kind == SyntheticKind::kLen) {
+        auto resolved = resolver(synthetic.real);
         auto len_str = std::to_string(resolved.size());
         // Eq/Neq: direct string compare (both are numeric strings)
         if (cond.op == CompOp::Eq)
@@ -807,6 +810,32 @@ std::string_view operator_token(CompOp op) {
         return "EXISTS";
     }
     return ""; // unreachable if the switch stays exhaustive
+}
+
+SyntheticAttr classify_synthetic(std::string_view attribute) {
+    if (attribute.starts_with("__startswith:"))
+        return {SyntheticKind::kStartswith, attribute.substr(13)};
+    if (attribute.starts_with("__len:"))
+        return {SyntheticKind::kLen, attribute.substr(6)};
+    return {SyntheticKind::kNone, attribute};
+}
+
+void collect_attribute_suffixes(const Expression& expr, std::string_view prefix,
+                                std::vector<std::string>& out) {
+    if (const auto* cond = std::get_if<Condition>(&expr)) {
+        // Decode synthetic forms FIRST: `LEN(tag:x)` carries attribute
+        // `__len:tag:x`, and eval_condition asks the resolver for `tag:x` —
+        // so `tag:x` is what the preload must cover (governance DSL-1: the
+        // pre-fix collector matched the raw attribute and silently dropped
+        // LEN/STARTSWITH-referenced keys from the store preload).
+        const std::string_view real = classify_synthetic(cond->attribute).real;
+        if (real.starts_with(prefix))
+            out.push_back(std::string(real.substr(prefix.size())));
+    } else if (const auto* comb = std::get_if<std::unique_ptr<Combinator>>(&expr)) {
+        if (*comb)
+            for (const auto& child : (*comb)->children)
+                collect_attribute_suffixes(child, prefix, out);
+    }
 }
 
 } // namespace yuzu::scope

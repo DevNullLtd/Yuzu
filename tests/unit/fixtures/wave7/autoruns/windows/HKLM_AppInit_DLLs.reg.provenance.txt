@@ -1,0 +1,5 @@
+host: the-rig (desktop-04dnsig, admin session desktop-04dnsig\alex)
+command: reg export "HKLM\Software\Microsoft\Windows NT\CurrentVersion\Windows" HKLM_AppInit_DLLs.reg /y
+date: 2026-09-06
+status: REAL CAPTURE
+note: AppInit_DLLs is a value under ...\Windows NT\CurrentVersion\Windows (not its own key); whole parent key exported so the AppInit_DLLs and LoadAppInit_DLLs values are present verbatim.

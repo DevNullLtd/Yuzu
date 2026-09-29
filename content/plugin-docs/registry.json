@@ -1,0 +1,1503 @@
+{
+  "actions": [
+    {
+      "action": "delete_key",
+      "definition_ids": [
+        "windows.registry.delete_key"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "delete_value",
+      "definition_ids": [
+        "windows.registry.delete_value"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "enumerate_keys",
+      "definition_ids": [
+        "windows.registry.enumerate_keys"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "enumerate_values",
+      "definition_ids": [
+        "windows.registry.enumerate_values"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_user_value",
+      "definition_ids": [
+        "windows.registry.get_user_value"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry+hive_mount",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "get_value",
+      "definition_ids": [
+        "windows.registry.get_value"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "key_exists",
+      "definition_ids": [
+        "windows.registry.key_exists"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "list_profiles",
+      "definition_ids": [
+        "windows.registry.list_profiles"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "set_value",
+      "definition_ids": [
+        "windows.registry.set_value"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "win32_registry",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**`enumerate_values`'s wire format carries an undocumented literal tag.** Each line is `value|<name>|<type>` (`registry_plugin.cpp:383`), but the definition's `result.columns` lists only `name` and `type` — the leading `value` segment is a fixed literal, not a third data column, and a naive \"split on the declared column count\" parser will misread every row by one field.",
+    "**`get_value`/`enumerate_values` do not decode `REG_MULTI_SZ`/`REG_LINK` values; `get_user_value` does.** Both fall to the hex-dump default branch on the first two actions (`registry_plugin.cpp:277-280`) but are decoded (semicolon-joined records / sanitised target string) on the third via the shared `read_reg_value` (`agents/shared/win_profiles.hpp:660-742`). This is a declared, deliberate inconsistency (`catalog.md`'s value-type notes) — closing it changes `get_value`'s output for existing callers and is out of scope here.",
+    "**`set_value`/`delete_value`/`delete_key` cannot distinguish \"access denied\" from \"does not exist\" in their error text.** `do_set_value`'s `RegCreateKeyExW` failure always reports `error|failed to open/create key` (`registry_plugin.cpp:296-299`) and `do_delete_value`'s `RegOpenKeyExW` failure always reports `error|key not found` (`registry_plugin.cpp:324-326`) regardless of the underlying `LSTATUS` — unlike `get_user_value`'s ladder, which does separate `key_access_denied` from `key_not_found` (`agents/shared/user_profile_model.hpp:266-278`).",
+    "**`PrivilegeScope`'s `AdjustTokenPrivileges` call must keep its `ReturnLength` argument.** A prior version omitted it and the call failed with `ERROR_NOACCESS` on every invocation, so the offline per-user hive fallback silently never enabled `SeBackup`/`SeRestore` from the plugin's initial ship until #2771 (`agents/shared/win_profiles.hpp:358-371`, `changelog.d/2771-privilegescope-token-adjust-bug.fixed.md`) — do not \"simplify\" that call signature.",
+    "**The `get_user_value` capture exercised the live-hive path, not the offline mount.** `list_profiles` in the same Windows capture reports the target SID's `hive_state` as `loaded`, so `with_user_hive`'s first `RegOpenKeyExW(HKEY_USERS, <sid>, ...)` succeeded and the offline `RegLoadKeyW`/`SeBackup`+`SeRestore` fallback (`win_profiles.hpp:495-534`) was never reached — this sample does not exercise that branch, the unload-warning line, or the `mount_failed`/`privilege_missing` error text."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a Windows registry key and every value and subkey beneath it in one call. Windows-only.",
+      "display_name": "Delete Registry Key",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "windows.registry.delete_key",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Delete a specific value from a Windows registry key; the key itself is left in place. Windows-only.",
+      "display_name": "Delete Registry Value",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "windows.registry.delete_value",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "List all immediate subkeys under a registry key, one row per subkey. Windows-only.",
+      "display_name": "Enumerate Registry Subkeys",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.registry.enumerate_keys",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "List all value names and types under a Windows registry key, one row per value. Value data itself is not returned — use get_value to read a specific value. Windows-only.",
+      "display_name": "Enumerate Registry Values",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.registry.enumerate_values",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Read a registry value from a specific user's registry hive. Resolves the target profile via ProfileList (by username or an explicit SID), then reads the live HKEY_USERS\\<SID> hive if the user is logged in, or loads that profile's NTUSER.DAT via RegLoadKey as a fallback. SeBackupPrivilege and SeRestorePrivilege are required only for the offline fallback when the target user is not logged in; reading an already-loaded live hive needs no elevated privilege. Windows-only.",
+      "display_name": "Get Per-User Registry Value",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "windows.registry.get_user_value",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Read a value from the Windows registry. Value data is decoded for REG_SZ/REG_EXPAND_SZ/REG_DWORD/REG_QWORD; every other type, including REG_MULTI_SZ and REG_LINK, is returned as hex-encoded bytes rather than decoded (get_user_value decodes both of those). Windows-only.",
+      "display_name": "Get Registry Value",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.registry.get_value",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Check whether a registry key exists, without reading any of its values. Windows-only.",
+      "display_name": "Check Registry Key Exists",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.registry.key_exists",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Enumerate local Windows user profiles from HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList: SID, resolved profile name, profile path, and whether the profile's registry hive is currently loaded under HKEY_USERS. System profiles (LocalSystem, LocalService, NetworkService) are excluded. Windows-only.",
+      "display_name": "List User Profiles",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {},
+      "id": "windows.registry.list_profiles",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "role-gated",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Write a value to the Windows registry, creating the key if it does not exist. Value data is written as REG_SZ (a UTF-16 string) or REG_DWORD (a 32-bit integer) per `type`. Windows-only.",
+      "display_name": "Set Registry Value",
+      "execute_roles": [
+        "endpoint-admin"
+      ],
+      "gather": {},
+      "id": "windows.registry.set_value",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "description": "Windows Registry — get, set, delete, enumerate keys and values",
+  "how_it_works": "All nine actions are direct, synchronous Win32 registry calls — there is no scheduled gather. `get_value`/`key_exists`/`enumerate_keys`/`enumerate_values` open a key read-only and read or list it; `set_value` opens the key with `KEY_WRITE` (creating it if absent); `delete_value`/`delete_key` open with `KEY_SET_VALUE` or call `RegDeleteKeyW` directly. Every one of these six validates `hive`+`key` through one shared `parse_params` helper, which also logs (never blocks) access to a small set of sensitive `HKLM` subtrees (`...CurrentVersion\\Run*`, `...Services`) via `spdlog::info` — an audit trail, not a policy gate.\n\n`get_user_value` is the odd one out: it resolves the target profile through the same `ProfileList` walk `list_profiles` exposes as its own action, reads the live `HKEY_USERS\\<SID>` hive if the user is logged in, and only falls back to an offline `RegLoadKeyW` mount of that profile's `NTUSER.DAT` — under `SeBackup`/`SeRestore` privilege and a process-wide mutex serialising the whole offline arm — when the user is logged out. `list_profiles` is the discovery step the other per-user action needs: SID, resolved name, path, and live hive-load state, with the three well-known system SIDs filtered out.\n\nThe plugin deliberately does **not** decode `REG_MULTI_SZ`/`REG_LINK` *values* on `get_value`/`enumerate_values` — both are left hex-encoded there, unlike `get_user_value`, which decodes both; closing that gap would change `get_value`'s output shape for existing callers and is out of scope for this plugin as it stands. On macOS/Linux every action honestly reports `registry|unsupported|...` — reads return rc 0 (an honest \"unsupported\" read is itself a successful read) and the three mutators return rc 1 (a state-changing action that touched nothing must never report SUCCESS).",
+  "inputs": [
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.delete_key",
+      "description": "Registry hive containing the key, e.g. \"HKCU\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.delete_key",
+      "description": "Registry key path to delete, relative to the hive root.\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.delete_value",
+      "description": "Registry hive containing the value, e.g. \"HKCU\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.delete_value",
+      "description": "Registry key path containing the value, relative to the hive root.\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.delete_value",
+      "description": "The value name to delete.",
+      "name": "name",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.enumerate_keys",
+      "description": "Registry hive to enumerate, e.g. \"HKLM\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.enumerate_keys",
+      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\".\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.enumerate_values",
+      "description": "Registry hive to enumerate, e.g. \"HKLM\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.enumerate_values",
+      "description": "Registry key path relative to the hive root.\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "windows.registry.get_user_value",
+      "description": "Windows profile folder name to resolve via ProfileList (see list_profiles), matched case-insensitively. This is not always the same as the account name (renamed accounts, domain profiles). Either username or sid is required; sid takes precedence if both are given.\n",
+      "name": "username",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "windows.registry.get_user_value",
+      "description": "Windows security identifier (e.g., \"S-1-5-21-...-1001\") of the target profile, as an alternative to username. Must match one of the profiles list_profiles would report; a sid not found there is rejected. Either username or sid is required.\n",
+      "name": "sid",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 1024
+      },
+      "default": null,
+      "definition_id": "windows.registry.get_user_value",
+      "description": "Registry key path relative to the resolved user's hive root (e.g., \"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Explorer\").\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "maxLength": 256
+      },
+      "default": null,
+      "definition_id": "windows.registry.get_user_value",
+      "description": "The registry value name to read.",
+      "name": "name",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.get_value",
+      "description": "Registry hive to read from, e.g. \"HKLM\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.get_value",
+      "description": "Registry key path relative to the hive root, e.g. \"SOFTWARE\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\".\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.get_value",
+      "description": "The value name to read, e.g. \"ProductName\".",
+      "name": "name",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.key_exists",
+      "description": "Registry hive to check, e.g. \"HKLM\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.key_exists",
+      "description": "Registry key path relative to the hive root.\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "HKLM",
+          "HKCU",
+          "HKCR",
+          "HKU"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "Registry hive to write to, e.g. \"HKCU\".\n",
+      "name": "hive",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "Registry key path relative to the hive root; created if it does not already exist, e.g. \"Software\\\\MyApp\".\n",
+      "name": "key",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "The value name to write, e.g. \"InstallPath\".",
+      "name": "name",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": null,
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "The value data to write, as text; interpreted per `type` (decimal digits for REG_DWORD, literal text for REG_SZ).\n",
+      "name": "value",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "REG_SZ",
+          "REG_DWORD"
+        ]
+      },
+      "default": null,
+      "definition_id": "windows.registry.set_value",
+      "description": "Registry value type to write. Defaults to REG_SZ when omitted.\n",
+      "name": "type",
+      "required": false,
+      "type": "string"
+    }
+  ],
+  "kind": {
+    "collector": false,
+    "gathered": false,
+    "mutating": true
+  },
+  "leg_hash": "6255117edeb8",
+  "manifest_version": 1,
+  "name": "registry",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.delete_key"
+    },
+    {
+      "columns": [
+        {
+          "description": "Confirms the delete succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.delete_value"
+    },
+    {
+      "columns": [
+        {
+          "description": "One immediate subkey name under the given key; zero rows means the key has no subkeys. Values: free text.",
+          "example": "ProfileList",
+          "name": "subkey",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.enumerate_keys"
+    },
+    {
+      "columns": [
+        {
+          "description": "The value's name; zero rows means the key has no values. Values: free text.",
+          "example": "ProductName",
+          "name": "name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The value's registry type, named via the shared type table shared with get_value and get_user_value. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.",
+          "example": "REG_SZ",
+          "name": "type",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.enumerate_values"
+    },
+    {
+      "columns": [
+        {
+          "description": "The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text.",
+          "example": "alex",
+          "name": "username",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The value's data, decoded the same way get_value decodes it, plus REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target string) — the two types get_value leaves hex-encoded — both sanitised against '|'/CR/LF so a value cannot forge a column or row. Values: free text.",
+          "example": "1",
+          "name": "value",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The registry value type, named via the shared type table. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.",
+          "example": "REG_DWORD",
+          "name": "type",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.get_user_value"
+    },
+    {
+      "columns": [
+        {
+          "description": "The value's data, decoded to a display string. Never truncated or fabricated; a value over the registry's own limits fails the action rather than returning a partial string. Values: free text.",
+          "example": "Windows 10 Pro",
+          "name": "value",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The registry value type, named via the shared type table shared with get_user_value and enumerate_values. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN.",
+          "example": "REG_SZ",
+          "name": "type",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.get_value"
+    },
+    {
+      "columns": [
+        {
+          "description": "Whether the key could be opened for read. Values: true, false.",
+          "example": "true",
+          "name": "exists",
+          "platforms": [
+            "windows"
+          ],
+          "type": "bool",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.key_exists"
+    },
+    {
+      "columns": [
+        {
+          "description": "The profile's Windows security identifier. Values: free text (a Windows SID string).",
+          "example": "S-1-5-21-571721511-16201247-3531262703-1001",
+          "name": "sid",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The resolved profile folder name (the last path component of ProfileImagePath); rendered \"-\" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or \"-\".",
+          "example": "Alex",
+          "name": "profile_name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "The profile's ProfileImagePath, environment-expanded; rendered \"-\" when it is absent or unreadable. Values: free text or \"-\".",
+          "example": "C:\\Users\\Alex",
+          "name": "profile_path",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Whether the profile's registry hive is reachable right now. Values: loaded, loaded_classes_only, not_loaded.",
+          "example": "loaded",
+          "name": "hive_state",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.list_profiles"
+    },
+    {
+      "columns": [
+        {
+          "description": "Confirms the write succeeded; only ever emitted on success — a failure is reported as an `error|` line and a non-zero exit instead of this column. Values: ok.",
+          "example": "ok",
+          "name": "status",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.registry.set_value"
+    }
+  ],
+  "outputs_note": "This plugin does not emit a uniform pipe-joined \"row\"; each action has its own shape. `get_value`, `get_user_value`, `key_exists`, `set_value`, `delete_value` and `delete_key` each write one self-describing `field_name|value` line per field, on success only — a failure instead writes an `error|...` line and returns rc 1, so `-` is never used as an absence placeholder anywhere in this plugin. `enumerate_keys` writes one `subkey|<name>` line per subkey; a genuinely empty key emits zero lines with rc 0 (a key that cannot be opened at all instead reports `error|key not found`, rc 1). `enumerate_values` writes one line per value shaped `value|<name>|<type>` — the leading `value` is a fixed literal tag, not one of the two documented columns (`name`, `type`); see Caveats. `list_profiles` writes one true pipe-joined row per profile (`<sid>|<name>|<path>|<state>`, no discriminator prefix) and zero rows is a structural success, not an error, when the host has no non-system profiles.",
+  "platforms": {
+    "linux": "unsupported",
+    "macos": "unsupported",
+    "windows": "supported"
+  },
+  "privileges": [
+    {
+      "grant": "`set_value`/`delete_value`/`delete_key` against `HKLM\\*` need the service account in `Administrators`; `HKCU\\*` needs no elevation. `get_user_value`'s offline-hive fallback needs `SeBackupPrivilege`+`SeRestorePrivilege`, already granted to the service account — no new grant; its live-hive path and `list_profiles` need no elevated privilege at all.",
+      "if_refused": "`error|key not found` / `error|value not found` (reads); `error|failed to open/create key` / `error|failed to delete key` (writes/deletes) — Win32 does not distinguish \"access denied\" from \"does not exist\" in these two messages",
+      "measured": "2026-09-07, bare-metal, as `SYSTEM`",
+      "os": "Windows",
+      "runs_as": "agent service account (LocalSystem today, #1442)"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists`, rc 0 (reads) / rc 1 (mutators)",
+      "measured": "2026-09-07, bare-metal, euid 501 (jsmith)",
+      "os": "macOS",
+      "runs_as": "n/a — plugin loads but every action is the honest `unsupported` leg"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "always `registry|unsupported|Windows registry is not available on this platform`, rc 0 (reads) / rc 1 (mutators)",
+      "measured": "2026-09-07, container, euid 0",
+      "os": "Linux",
+      "runs_as": "n/a — plugin loads but every action is the honest `unsupported` leg"
+    }
+  ],
+  "readme": "agents/plugins/registry/README.md",
+  "result_status": [],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "get_value",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" name=ProductName",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe value=1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_key",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "key_exists",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_keys",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_values",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_user_value",
+          "not_captured": null,
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_profiles",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry is not available on this platform"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "container",
+        "leg_hash": "6255117edeb8",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "get_value",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" name=ProductName",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe value=1",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_key",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp",
+          "rc": 1,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "key_exists",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_keys",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_values",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_user_value",
+          "not_captured": null,
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_profiles",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6255117edeb8",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501 (jsmith)"
+      }
+    },
+    "windows": {
+      "actions": [
+        {
+          "action": "get_value",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" name=ProductName",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 2,
+          "rows": [
+            "value|Windows 10 Pro",
+            "type|REG_SZ"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "set_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe value=1",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_value",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp name=probe",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "delete_key",
+          "not_captured": null,
+          "params": "hive=HKCU key=Software\\YuzuCaptureTmp",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|ok"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "key_exists",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "exists|true"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_keys",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 99,
+          "rows": [
+            "subkey|Accessibility",
+            "subkey|AdaptiveDisplayBrightness",
+            "subkey|AeDebug",
+            "subkey|AppCompatFlags",
+            "subkey|ASR"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "enumerate_values",
+          "not_captured": null,
+          "params": "hive=HKLM key=\"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 32,
+          "rows": [
+            "value|SystemRoot|REG_SZ",
+            "value|BaseBuildRevisionNumber|REG_DWORD",
+            "value|BuildBranch|REG_SZ",
+            "value|BuildGUID|REG_SZ",
+            "value|BuildLab|REG_SZ"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "get_user_value",
+          "not_captured": null,
+          "params": "username=jsmith key=Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced name=Hidden",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 3,
+          "rows": [
+            "username|jsmith",
+            "value|1",
+            "type|REG_DWORD"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_profiles",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "",
+            "status": "UNDECLARED"
+          },
+          "row_count": 1,
+          "rows": [
+            "S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\\Users\\Alex|loaded"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-07",
+        "host_class": "bare-metal",
+        "leg_hash": "6255117edeb8",
+        "os": "windows",
+        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
+        "privilege": "SYSTEM"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "get_value",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "set_value",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "delete_value",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "High",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "delete_key",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Irreversible",
+      "operation": "Delete",
+      "risk_tier": "Critical",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "key_exists",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "enumerate_keys",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "enumerate_values",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "get_user_value",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Medium",
+      "securable": "Infrastructure"
+    },
+    {
+      "action": "list_profiles",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Infrastructure"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/registry.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/registry/src/registry_plugin.cpp"
+    ],
+    "privilege_row": true,
+    "tests": [
+      "tests/unit/test_registry_local_dispatcher.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows/lines travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing here runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its nine definitions.",
+    "**Sensitivity.** `get_value`/`enumerate_values`/`get_user_value` can return arbitrary registry data — the real captures above include `ProductName`/`CurrentVersion`/`BuildLab` (installed-software/OS-version identification) and `RegisteredOwner`/`DigitalProductId` (a person's name and a device-specific product-key hash) among the readable values; `get_user_value`'s `username` field and `list_profiles`' `profile_name`/`profile_path` (e.g. `Alex`/`C:\\Users\\Alex`) directly identify a specific person and their home directory.",
+    "**Siblings:** none. Guardian's own real-time registry-key watch (`guard_type: \"registry\"`, `spark_fleet_tags.hpp:112`) is an unrelated detection mechanism, not this plugin — this plugin is on-demand CRUD only, with no watch/trigger surface.",
+    "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.registry.get_value\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
+  ]
+}

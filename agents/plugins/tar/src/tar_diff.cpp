@@ -309,9 +309,20 @@ std::vector<TarEvent> compute_service_diff(
             ev.snapshot_id = snapshot_id;
             events.push_back(std::move(ev));
         } else {
-            // Check for state change (status or startup_type changed)
+            // Check for state change (status or startup_type changed).
+            // Finding 3 (adversarial-review round 5): a startup_type carried
+            // on either side by a FAILED per-service query (Windows
+            // OpenServiceW/QueryServiceConfigW; ServiceInfo::
+            // startup_type_query_failed) is not an authoritative
+            // observation -- it must never participate in this comparison,
+            // or a transient query hiccup manufactures a false
+            // "automatic -> unknown" event now and a false inverse event on
+            // the next successful read.
             const auto* prev = it->second;
-            if (prev->status != s.status || prev->startup_type != s.startup_type) {
+            const bool startup_type_changed = !prev->startup_type_query_failed &&
+                                              !s.startup_type_query_failed &&
+                                              prev->startup_type != s.startup_type;
+            if (prev->status != s.status || startup_type_changed) {
                 TarEvent ev;
                 ev.timestamp = timestamp;
                 ev.event_type = "service";
@@ -526,8 +537,13 @@ std::vector<ServiceEvent> compute_service_events(
             events.push_back({timestamp, snapshot_id, "started", s.name, s.display_name,
                               s.status, "", s.startup_type, ""});
         } else {
+            // Same startup_type_query_failed guard as compute_service_diff
+            // above -- see its comment.
             const auto* prev = it->second;
-            if (prev->status != s.status || prev->startup_type != s.startup_type) {
+            const bool startup_type_changed = !prev->startup_type_query_failed &&
+                                              !s.startup_type_query_failed &&
+                                              prev->startup_type != s.startup_type;
+            if (prev->status != s.status || startup_type_changed) {
                 events.push_back({timestamp, snapshot_id, "state_changed", s.name, s.display_name,
                                   s.status, prev->status, s.startup_type, prev->startup_type});
             }

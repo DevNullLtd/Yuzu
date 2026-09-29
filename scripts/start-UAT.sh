@@ -30,7 +30,8 @@
 # native processes with per-run random credentials; the DSN is exported
 # to the server as YUZU_POSTGRES_DSN (inert until #1320 PR 3 wires the
 # consumer). Host port 15433 — deliberately NOT 5432 (local clusters),
-# 5433 (dev pg-canary convention), or 15432 (yuzu-ci-postgres).
+# 5433 (dev pg-canary convention), 15432 (yuzu-ci-postgres), or
+# 15440-15449 (per-agent yuzu-ci-postgres-<n> CI containers, #2094).
 # NON-FATAL while the server boots without Postgres: no docker → warn and
 # continue. Flip PG_SOFT_FAIL to 0 when #1320 PR 3 lands fail-closed boot.
 #

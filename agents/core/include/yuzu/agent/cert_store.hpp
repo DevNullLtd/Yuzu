@@ -18,12 +18,18 @@ struct YUZU_EXPORT CertStoreResult {
 
 /// Read a client certificate and private key from the OS certificate store.
 ///
-/// @param store_name  Windows: store name (e.g. "MY" for Personal). Ignored on other platforms.
+/// @param store_name  Windows: store name (e.g. "MY" for Personal). Ignored on macOS/Linux.
 /// @param subject     Subject CN or substring to match (e.g. "yuzu-agent", "*.corp.example.com").
 /// @param thumbprint  Hex-encoded SHA-1 thumbprint. Takes priority over subject if non-empty.
 ///
-/// On Windows, uses CryptoAPI to read from the Local Machine store.
-/// On Linux/macOS, returns an error — use PEM files or PKCS#11 instead.
+/// On Windows, uses CryptoAPI to read from the Local Machine (falling back to
+/// Current User) store.
+/// On macOS, always returns an honest error — the agent runs as a root
+/// LaunchDaemon (docs/agent-privilege-model.md) with no attached user login
+/// session, and therefore no user login keychain an OS-certificate-store
+/// identity could come from. Use --client-cert/--client-key PEM files (or
+/// cert_auto_discovery) instead.
+/// On Linux, returns an error — use PEM files instead.
 YUZU_EXPORT CertStoreResult read_cert_from_store(const std::string& store_name,
                                                  const std::string& subject,
                                                  const std::string& thumbprint);
