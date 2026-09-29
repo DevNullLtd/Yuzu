@@ -52,7 +52,7 @@
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 6-role set
-#include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
@@ -1417,7 +1417,9 @@ static const ToolDef kTools[] = {
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
      "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
      "audit-logged (dex.signal.view). A well-formed obs_type with no observations returns empty "
-     "arrays. Mirrors GET /api/v1/dex/signals/{obs_type}. Requires GuaranteedState:Read.",
+     "arrays. Every field, including the devices list, is a fleet-wide aggregate with no "
+     "per-caller confinement; denied outright to a service-scoped API token. Mirrors GET "
+     "/api/v1/dex/signals/{obs_type}. Requires a global GuaranteedState:Read grant.",
      R"j({"type":"object","properties":{)j"
      R"j("obs_type":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","maxLength":64,"description":"Catalogue key, e.g. process.crashed, os.boot"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
@@ -1467,9 +1469,10 @@ static const ToolDef kTools[] = {
     // dex.device.view/dex.observation.view, matching their fragments).
     {"get_dex_app",
      "App blast-radius drill: crash/hang summary + faulting modules + exception codes + the "
-     "affected-device list for one application. The devices list names affected agent IDs "
-     "(behavioral data), confined to the caller's management-group scope — every call is "
-     "audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. Requires GuaranteedState:Read.",
+     "affected-device list for one application. ALL of it, including the devices list of "
+     "affected agent IDs (behavioral data), is a fleet-wide aggregate with no per-caller "
+     "confinement — every call is audit-logged (dex.app.view). Mirrors GET /api/v1/dex/app. "
+     "Requires GuaranteedState:Read; denied outright to a service-scoped API token.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":512,"description":"Process image name, e.g. notepad.exe"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
@@ -1491,6 +1494,22 @@ static const ToolDef kTools[] = {
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","crashes","hangs","distinct_devices","last_seen"]}}},)j"
      R"j("required":["window","apps"]})j"},
 
+    {"get_dex_catalogue",
+     "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
+     "monitored/total type count, its own health-score slice, window event count and busiest "
+     "member type, plus an 'other' list of obs_types seen on the wire but not yet in a curated "
+     "family. No per-agent identity — not audited. Mirrors GET /api/v1/dex/catalogue. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all"},)j"
+     R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("os":{"type":"string"},"window":{"type":"string"},"monitored_types":{"type":"integer"},"total_types":{"type":"integer"},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"monitored":{"type":"integer"},"total":{"type":"integer"},"health_score":{"type":["number","null"]},"events":{"type":"integer"},"top_obs_type":{"type":["string","null"]}},"required":["name","monitored","total","health_score","events","top_obs_type"]}},)j"
+     R"j("uncatalogued":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}})j"
+     R"j(},"required":["os","window","monitored_types","total_types","families","uncatalogued"]})j"},
+
     {"get_dex_catalogue_group",
      "One signal family's member signals (Catalogue View 2): per-type monitored/not-collected "
      "state, coverage platforms, event count + blast radius, plus the family's own health-score "
@@ -1504,7 +1523,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("group_name":{"type":"string"},"os":{"type":"string"},"window":{"type":"string"},)j"
      R"j("monitored_count":{"type":"integer"},"total_type_count":{"type":"integer"},)j"
-     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},)j"
+     R"j("health_score":{"type":["number","null"]},"active_events":{"type":"integer"},"max_signal_devices":{"type":"integer"},"benign":{"type":"boolean"},)j"
      R"j("types":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"monitored":{"type":"boolean"},"coverage_platforms":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","monitored","coverage_platforms","count","distinct_devices","last_seen"]}})j"
      R"j(},"required":["group_name","os","window","monitored_count","total_type_count","active_events","max_signal_devices","types"]})j"},
 
@@ -1568,16 +1587,18 @@ static const ToolDef kTools[] = {
     {"get_dex_overview",
      "The /dex landing page's fleet summary: per-device experience score distribution + "
      "Device/App/Network composite, measured crash-free rate, top apps, and the most-affected- "
-     "devices list. The devices list names affected agent IDs (behavioral data), confined to "
-     "the caller's management-group scope — every call is audit-logged (dex.overview.view). "
-     "unscored (#4855) counts connected devices whose per-device score could not be computed "
-     "(no store, or a degraded per-device read) — treat a non-zero unscored as partial "
-     "coverage, not a healthier fleet than reported. Mirrors GET /api/v1/dex/overview. Requires "
-     "GuaranteedState:Read.",
+     "devices list. ALL of it, including the top-devices list of affected agent IDs (behavioral "
+     "data), is a fleet-wide aggregate with no per-caller confinement — every call is "
+     "audit-logged (dex.overview.view). unscored (#4855) counts connected devices whose "
+     "per-device score could not be computed (no store, or a degraded per-device read) — treat "
+     "a non-zero unscored as partial coverage, not a healthier fleet than reported. Mirrors GET "
+     "/api/v1/dex/overview. Requires GuaranteedState:Read; denied outright to a service-scoped "
+     "API token.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{)j"
      R"j("window":{"type":"string"},"overall_experience":{"type":"integer"},"device_score":{"type":"integer"},"app_score":{"type":"integer"},"network_score":{"type":"integer"},)j"
      R"j("great":{"type":"integer"},"fair":{"type":"integer"},"poor":{"type":"integer"},"unscored":{"type":"integer"},"coverage_monitored":{"type":"integer"},"coverage_total":{"type":"integer"},)j"
+     R"j("connected_platforms":{"type":"integer"},"busiest_family":{"type":["string","null"]},"busiest_family_events":{"type":"integer"},)j"
      R"j("crash_free_pct":{"type":["number","null"]},"windows_reporting":{"type":"integer"},"crashes_per_1k_device_days":{"type":["number","null"]},)j"
      R"j("total_crashes":{"type":"integer"},"devices_impacted":{"type":"integer"},"total_online":{"type":"integer"},)j"
      R"j("active_signal_types":{"type":"integer"},"health_score":{"type":["number","null"]},"os_reporting_count":{"type":"integer"},)j"
@@ -3408,6 +3429,27 @@ static const ToolDef kTools[] = {
      "Requires SoftwareDeployment:Execute.",
      R"j({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Deployment id from list_software_deployments"}},"required":["id"]})j",
      R"j({"type":"object","properties":{"cancelled":{"const":true},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["cancelled"]})j"},
+
+    // Fleet-wide RBAC role assignment listing — MCP twin of GET
+    // /api/v1/rbac/roles/assignments, reusing the SAME
+    // RbacStore::list_all_principal_roles_checked() bulk read
+    // build_access_review() (access_review_model.cpp) already uses for the
+    // SOC 2 CC6.2 grant-table export. Gated on the SAME dedicated
+    // AccessReview:Read securable that store method was built for (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role above, which
+    // mint/revoke standing authority — a stronger decision than reading the
+    // grant table). Appended at the VERY END of kTools[] per the standing
+    // governance note above (KEK rotation tools) — minimizes rebase conflict
+    // with any concurrent PR inserting tools earlier in this array.
+    {"list_rbac_role_assignments",
+     "List every current RBAC role assignment fleet-wide: every "
+     "(principal_type, principal_id, role_name) grant row on record, across "
+     "all three principal types (user/group/engine), in one bulk read — the "
+     "grant table itself, not a per-roster-member derivation. Read-only. "
+     "Mirrors GET /api/v1/rbac/roles/assignments. Self-audited as "
+     "rbac.assignments.list. Requires AccessReview:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"assignments":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["principal_type","principal_id","role_name"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","assignments"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -3795,6 +3837,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // per-tool about "is this data really safe", so these follow suit).
     {"get_dex_app", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_apps", {"GuaranteedState", "Read"}},
+    {"get_dex_catalogue", {"GuaranteedState", "Read"}},
     {"get_dex_catalogue_group", {"GuaranteedState", "Read"}},
     {"get_dex_device_history", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_observation", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
@@ -3927,6 +3970,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_access_review", {"AccessReview", "Read"}},
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
+    // Fleet-wide RBAC role assignment listing — SAME dedicated
+    // AccessReview:Read securable as the access-review family above (not
+    // Security:Write like assign_rbac_role/unassign_rbac_role, which mint/
+    // revoke standing authority rather than read the grant table).
+    {"list_rbac_role_assignments", {"AccessReview", "Read"}},
     // KEK rotation (#2395 track C) — parity with the REST twins'
     // Security:Write (rotate/rewrap) and Security:Read (status) gates.
     {"rotate_kek", {"Security", "Write"}},
@@ -4493,6 +4541,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_dex_device_app_perf", {ToolEffect::ReadOnly, true, "Get per-device DEX app performance"}},
     {"get_dex_app", {ToolEffect::ReadOnly, true, "Get DEX app blast radius"}},
     {"list_dex_apps", {ToolEffect::ReadOnly, true, "List DEX app stability"}},
+    {"get_dex_catalogue", {ToolEffect::ReadOnly, true, "Get DEX signal catalogue"}},
     {"get_dex_catalogue_group", {ToolEffect::ReadOnly, true, "Get DEX catalogue signal family"}},
     {"get_dex_device_history", {ToolEffect::ReadOnly, true, "Get per-device DEX signal history"}},
     {"get_dex_observation", {ToolEffect::ReadOnly, true, "Get DEX single-observation detail"}},
@@ -4532,6 +4581,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
     {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
     {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
+    {"list_rbac_role_assignments",
+     {ToolEffect::ReadOnly, true, "List fleet-wide RBAC role assignments"}},
     {"get_kek_status", {ToolEffect::ReadOnly, true, "Get KEK rotation status"}},
 
     // ── Mutating tools (effect Additive/Destructive) ──────────────────────────
@@ -14709,9 +14760,8 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // Routed through the DexApi seam (ADR-0031 WS-A4) — the four raw
                 // reads the REST twin also bundles, same obs_type/window/os/limit.
-                const auto detail =
-                    dex_api_->signal_detail(obs_type, param_str(args, "window", "7d"),
-                                            param_str(args, "os", ""), limit);
+                const auto detail = dex_api_->signal_detail(
+                    obs_type, param_str(args, "window", "7d"), param_str(args, "os", ""), limit);
                 JArr subjects;
                 for (const auto& s : detail.subjects) {
                     subjects.add(JObj()
@@ -14944,17 +14994,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the affected-devices
-                // list to the caller's management-group scope (ADR-0017 World
-                // A) -- deny_fleet_wide_service_scoped above closes the
-                // service-scoped-token axis only; this is the independent
-                // confined-OPERATOR axis the REST twin now also applies (see
-                // rest_api_v1.cpp's GET /dex/app handler).
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = dex_api_->app(name, window, vis ? &*vis : nullptr);
-                // Fail-closed success audit (matches REST twin's posture --
-                // see rest_api_v1.cpp's route comment above GET /dex/app).
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::app`
+                // no longer takes a `visible` parameter at all — the
+                // per-caller resolver this used to thread through
+                // (`dex_visible_fn_`) was retired permanently (see
+                // dex_api.hpp's own doc comment), so every admitted caller
+                // gets the same unfiltered device list.
+                const auto model = dex_api_->app(name, window);
+                // Set-and-proceed success audit (MCP's posture, NOT the REST
+                // twin's fail-closed one -- see rest_api_v1.cpp's route
+                // comment above GET /dex/app): a dropped audit row surfaces
+                // as `audit_persisted:false` in the JSON result below rather
+                // than refusing the response.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.app.view", "success", "GuaranteedState", "",
                     "DEX app affected-devices read via MCP get_dex_app");
@@ -14993,6 +15044,57 @@ McpServer::HandlerFn McpServer::build_handler(
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(dex_apps_json(model), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_dex_catalogue") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!dex_api_) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string window = param_str(args, "window", "7d");
+                if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid window (expected 24h|7d|30d|all)"),
+                        "application/json");
+                    return;
+                }
+                const std::string os = param_str(args, "os", "all");
+                if (os != "all" && os != "windows" && os != "linux" && os != "macos") {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid os (expected all|windows|linux|macos)"),
+                        "application/json");
+                    return;
+                }
+                const auto model = dex_api_->catalogue(os, window);
+                // Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet
+                // signal-summary read must never render as a healthy,
+                // zero-event catalogue -- an error, matching the REST
+                // twin's 503 and get_dex_device_score's degrade branch.
+                if (model.degraded) {
+                    mcp_audit("failure", "DEX signal-summary store read degraded");
+                    res.set_content(
+                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(dex_catalogue_json(model), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -15246,14 +15348,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // #4035 hardening (governance): confine the top-devices list
-                // to the caller's management-group scope (ADR-0017 World A) --
-                // same independent second belt as get_dex_app above.
-                const std::optional<std::set<std::string>> vis =
-                    dex_visible_fn_ ? dex_visible_fn_(session->username) : std::nullopt;
-                const auto model = dex_api_->overview(window, vis ? &*vis : nullptr);
-                // Fail-closed success audit (matches REST twin's posture --
-                // see rest_api_v1.cpp's route comment above GET /dex/overview).
+                // WS-A4 PR-1 Gate 7 fix round: `DexApi::
+                // overview` no longer takes a `visible` parameter at all —
+                // see get_dex_app's comment above for why. Every admitted
+                // caller gets the same unfiltered top-devices list.
+                const auto model = dex_api_->overview(window);
+                // Set-and-proceed success audit (MCP's posture, NOT the REST
+                // twin's fail-closed one -- see rest_api_v1.cpp's route
+                // comment above GET /dex/overview): a dropped audit row
+                // surfaces as `audit_persisted:false` in the JSON result
+                // below rather than refusing the response.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "dex.overview.view", "success", "GuaranteedState", "",
                     "DEX overview top-devices read via MCP get_dex_overview");
@@ -24905,6 +25009,54 @@ McpServer::HandlerFn McpServer::build_handler(
                                                "", "count=" + std::to_string(rows_res->size()));
                 JObj payload;
                 payload.add("count", static_cast<int64_t>(rows_res->size())).raw("campaigns", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_rbac_role_assignments") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    mcp_audit("failure", "rbac store unavailable");
+                    res.set_content(a4_error(kInternalError, "rbac store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto grants_res = rbac_store->list_all_principal_roles_checked();
+                if (!grants_res) {
+                    mcp_audit("failure", grants_res.error());
+                    (void)audit_fn(req, "rbac.assignments.list", "failure", "AccessReview", "",
+                                   grants_res.error());
+                    res.set_content(a4_error(kInternalError, grants_res.error(),
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& g : *grants_res) {
+                    arr.add(JObj()
+                                .add("principal_type", g.principal_type)
+                                .add("principal_id", g.principal_id)
+                                .add("role_name", g.role_name));
+                }
+                const bool audit_ok = audit_fn(req, "rbac.assignments.list", "success", "AccessReview",
+                                               "", "count=" + std::to_string(grants_res->size()));
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(grants_res->size()))
+                    .raw("assignments", arr.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success");

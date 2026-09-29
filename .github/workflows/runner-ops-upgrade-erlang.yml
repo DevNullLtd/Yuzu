@@ -142,7 +142,7 @@ jobs:
             New toolchain takes effect on the runner's next workflow.
 
             Verify after restart:
-              gh api repos/Tr3kkR/Yuzu/actions/runners | jq '.runners[] | select(.name=="<runner>")'
+              gh api repos/DevNullLtd/Yuzu/actions/runners | jq '.runners[] | select(.name=="<runner>")'
               # then dispatch a workflow without setup-beam and confirm OTP $OTP_VERSION on PATH
           ═══════════════════════════════════════════════════════════════════════
           EOF

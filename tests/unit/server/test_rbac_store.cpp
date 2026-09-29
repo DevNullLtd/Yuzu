@@ -4174,3 +4174,289 @@ TEST_CASE("RbacStore Gate7-Fix2: an unrelated flag-less writer's generation bump
     // flag_generation_ (still 0), so 2 >= 0 and it correctly publishes.
     CHECK(store.is_rbac_enabled());
 }
+
+// ── provision_first_admin (fresh-install RBAC-safe-by-default bootstrap) ─────
+//
+// `RbacStore::provision_first_admin` delegates to
+// `RbacAdminAuthorityOwner::provision_first_admin` (third owner consumer,
+// same shape as `unassign_role`/`set_rbac_enforcement` above). Uses
+// RBAC_STORE_WITH_AUTH (not the shared RBAC_STORE template) because this
+// call inserts into `auth.users` directly and needs that schema in the SAME
+// database — same reason the A2 last-Administrator guard tests above use it.
+// `RBAC_STORE_WITH_AUTH` deliberately does NOT call `seed_active_user`
+// itself, so `auth.users` is genuinely empty right after the macro expands —
+// exactly the fresh-install precondition every "first call" case below
+// depends on.
+
+TEST_CASE("RbacStore::provision_first_admin provisions the first admin "
+          "exactly once — a second call on the same now-non-empty store is a "
+          "clean no-op, never a duplicate grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    auto first = store.provision_first_admin("firstadmin", "hash", "salt");
+    REQUIRE(first.has_value());
+    CHECK(*first == true);
+    CHECK(store.get_principal_roles("user", "firstadmin").size() == 1);
+    CHECK(store.get_principal_roles("user", "firstadmin").front().role_name == "Administrator");
+
+    // Pin the auth.users row contents themselves, not just the grant — a
+    // column-order regression in provision_first_admin's INSERT (e.g.
+    // hash/salt swapped, or role not 'admin') would otherwise pass every
+    // assertion in this file while shipping an unusable/non-admin account.
+    auto row = auth_db->get_user("firstadmin");
+    REQUIRE(row.has_value());
+    CHECK(row->username == "firstadmin");
+    CHECK(row->role == auth::Role::admin);
+    CHECK(row->hash_hex == "hash");
+    CHECK(row->salt_hex == "salt");
+
+    // Restart-idempotency: calling again (as main.cpp does unconditionally
+    // on every boot) with the SAME args must not re-provision or duplicate
+    // the grant.
+    auto second = store.provision_first_admin("firstadmin", "hash", "salt");
+    REQUIRE(second.has_value());
+    CHECK(*second == false);
+    CHECK(store.get_principal_roles("user", "firstadmin").size() == 1);
+
+    // A call with DIFFERENT args also cleanly no-ops — auth.users is no
+    // longer empty, so no second account and no second grant are created,
+    // regardless of what identity is passed.
+    auto third = store.provision_first_admin("seconduser", "hash2", "salt2");
+    REQUIRE(third.has_value());
+    CHECK(*third == false);
+    CHECK(store.get_principal_roles("user", "seconduser").empty());
+}
+
+TEST_CASE("RbacStore::provision_first_admin under real concurrency — two "
+          "calls racing a genuinely empty auth.users — exactly one "
+          "provisions, the other cleanly no-ops, exactly one grant exists",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    std::atomic<bool> provisioned1{false}, provisioned2{false};
+    std::atomic<bool> ok1{false}, ok2{false};
+    std::atomic<bool> done1{false}, done2{false};
+    // Mirrors the real-concurrency pattern above (unassign_role's own
+    // last-Administrator guard test): two genuine std::thread callers
+    // against the SAME RbacStore object, each racing the advisory-lock-
+    // guarded INSERT — no hand-held lock/puppeteered connection needed here,
+    // since the invariant under test (exactly one winner) is what the
+    // advisory lock itself is meant to guarantee, not one specific
+    // interleaving.
+    ScopedJoin t1{std::thread([&] {
+        auto r = store.provision_first_admin("raceadmin1", "hash1", "salt1");
+        ok1 = r.has_value();
+        if (r.has_value())
+            provisioned1 = *r;
+        done1 = true;
+    })};
+    ScopedJoin t2{std::thread([&] {
+        auto r = store.provision_first_admin("raceadmin2", "hash2", "salt2");
+        ok2 = r.has_value();
+        if (r.has_value())
+            provisioned2 = *r;
+        done2 = true;
+    })};
+    t1.join();
+    t2.join();
+    CHECK(done1.load());
+    CHECK(done2.load());
+
+    // Neither call is ever an ERROR — the loser's outcome is a clean no-op,
+    // not a failure (the HA conditioning this method exists to provide).
+    CHECK(ok1.load());
+    CHECK(ok2.load());
+
+    // Exactly one provisioned — never both (two Administrators from one
+    // fresh install) and never neither (the whole point of this bootstrap).
+    CHECK(provisioned1.load() != provisioned2.load());
+
+    // Exactly one auth.users row, exactly one Administrator grant, and they
+    // name the SAME winning identity.
+    const std::size_t admin1_grants = store.get_principal_roles("user", "raceadmin1").size();
+    const std::size_t admin2_grants = store.get_principal_roles("user", "raceadmin2").size();
+    CHECK(admin1_grants + admin2_grants == 1);
+    CHECK((provisioned1.load() ? admin1_grants : admin2_grants) == 1);
+}
+
+TEST_CASE("RbacStore::provision_first_admin races AuthDB::seed_admin_if_empty "
+          "cleanly — the two share one advisory lock, so exactly one account "
+          "is ever created regardless of which entry point wins",
+          "[rbac_store][pg]") {
+    // Pins the actual cross-method serialization K5/C3 (adversarial review,
+    // 2026-09-28) flagged as untested: the concurrency test above only ever
+    // races provision_first_admin against itself, through one TU's lock
+    // literal — this races it against the OTHER entry point, through the
+    // OTHER TU's literal (auth_db.cpp's kSeedAdminLockSql), which is the
+    // actual shape a mixed-version rolling-restart first boot produces (see
+    // docs/adr/1008's fresh-install bootstrap delivery note, "Residual:
+    // mixed-version first boot"). This test does NOT close that residual —
+    // it documents today's correct half (no duplicate account is ever
+    // created) and would catch a future drift between the two lock literals.
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    std::atomic<bool> ok1{false}, ok2{false};
+    ScopedJoin t1{std::thread([&] {
+        auto r = store.provision_first_admin("newpath", "hash1", "salt1");
+        ok1 = r.has_value();
+    })};
+    ScopedJoin t2{std::thread([&] {
+        auto r = auth_db->seed_admin_if_empty("legacypath", "hash2", "salt2");
+        ok2 = r.has_value();
+    })};
+    t1.join();
+    t2.join();
+    CHECK(ok1.load());
+    CHECK(ok2.load());
+
+    // Exactly one account exists, whichever entry point won.
+    const bool new_exists = auth_db->get_user("newpath").has_value();
+    const bool legacy_exists = auth_db->get_user("legacypath").has_value();
+    CHECK(new_exists != legacy_exists);
+
+    // If provision_first_admin won, it also wrote the Administrator grant;
+    // if the legacy seed_admin_if_empty won instead, NO grant exists — the
+    // exact stranded-account shape the ADR residual note now discloses.
+    if (new_exists) {
+        CHECK(store.get_principal_roles("user", "newpath").size() == 1);
+    } else {
+        CHECK(store.get_principal_roles("user", "legacypath").empty());
+    }
+}
+
+// quality-engineer (Gate 3, governance round 2026-09-28): the two race tests
+// above spawn two genuine std::thread callers with no rendezvous — the
+// invariant they assert (exactly one winner) would hold trivially even if
+// the two calls never actually overlapped on the advisory lock (e.g. the
+// loser's own connection/query setup happened to fully serialize behind the
+// winner for unrelated reasons). This test proves the underlying mechanism
+// both of them rely on: a real `provision_first_admin` call GENUINELY BLOCKS
+// on `kProvisionFirstAdminLockSql` when another connection already holds it
+// — using the same puppeteer-connection + `poll_for_blocked_backend_pid`
+// technique the file's own last-Administrator-guard tests use (see that
+// helper's doc comment above), never a blind sleep_for (CLAUDE.md).
+TEST_CASE("RbacStore::provision_first_admin genuinely blocks on the shared "
+          "advisory lock — not merely a two-thread race that could pass "
+          "without real contention",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // Connection A: take the SAME lock provision_first_admin itself takes
+    // (kProvisionFirstAdminLockSql / kSeedAdminLockSql, byte-identical) and
+    // hold it open, uncommitted.
+    auto lease_a = auth_db.pool().acquire();
+    REQUIRE(lease_a);
+    const int lease_a_pid = PQbackendPID(lease_a.get());
+    REQUIRE(lease_a_pid > 0);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(), "SELECT pg_advisory_xact_lock(2037545589, 1)",
+                            std::vector<std::string>{})
+                .ok());
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> ok{false};
+    std::atomic<bool> provisioned{false};
+    // ScopedJoin (not a bare std::thread + ad-hoc joiner): if a REQUIRE below
+    // throws while the worker is still genuinely blocked on lease_a's held
+    // advisory lock, before_join releases lease_a first, so the worker can
+    // finish and the join below never waits out a lock_timeout (same pattern
+    // as the last-Administrator-guard tests above, e.g. line ~1177).
+    ScopedJoin worker{std::thread([&] {
+        auto r = store.provision_first_admin("blockedadmin", "hash", "salt");
+        ok = r.has_value();
+        if (r.has_value())
+            provisioned = *r;
+        done = true;
+    }), [&] { lease_a.reset(); }};
+
+    // Prove the worker is GENUINELY blocked on connection A's held lock —
+    // not merely slow to start.
+    REQUIRE(poll_for_blocked_backend_pid(auth_db.dsn(), lease_a_pid) != 0);
+    CHECK_FALSE(done.load());
+
+    // Release the lock; the worker must then proceed and win (auth.users is
+    // genuinely empty at this point — connection A never wrote a row).
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+    worker.join();
+    CHECK(ok.load());
+    CHECK(provisioned.load());
+    CHECK(store.get_principal_roles("user", "blockedadmin").size() == 1);
+}
+
+TEST_CASE("RbacStore::provision_first_admin refuses an invalid username "
+          "before touching auth.users — no account, no grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // is_valid_username runs first in the owner (rbac_admin_authority_owner.cpp),
+    // mirroring AuthDB::seed_admin_if_empty's own InvalidUsername refusal —
+    // this is now the ONLY production entry point that seeds auth.users, so
+    // the guard has to live here rather than relying on seed_admin_if_empty
+    // (no longer called in production) to ever catch it.
+    auto result = store.provision_first_admin("not a valid username!", "hash", "salt");
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+    // get_user ALSO validates its own input and refuses to even look up a
+    // syntactically-invalid username (InvalidUsername, not UserNotFound) —
+    // which is tautological proof by itself (it would return the same
+    // answer whether or not the guard above actually ran). Prove the guard
+    // ran BEFORE touching auth.users with a raw count on a second
+    // connection instead — this fails if a future regression removes the
+    // pre-INSERT guard and lets a malformed username reach the table
+    // (quality-engineer, governance round 2026-09-28).
+    {
+        pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "SELECT count(*) FROM auth.users")};
+        REQUIRE(r.ok());
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0");
+    }
+    CHECK(auth_db->get_user("not a valid username!").error() == AuthDBError::InvalidUsername);
+    CHECK(store.get_principal_roles("user", "not a valid username!").empty());
+}
+
+TEST_CASE("RbacStore::provision_first_admin cleanly no-ops when auth.users "
+          "is already non-empty — no account, no grant, not an error",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+    seed_active_user(auth_db, "existinguser");
+
+    auto result = store.provision_first_admin("newadmin", "hash", "salt");
+    REQUIRE(result.has_value());
+    CHECK(*result == false);
+    CHECK(store.get_principal_roles("user", "newadmin").empty());
+}
+
+TEST_CASE("RbacStore::provision_first_admin fails closed — ok=false with a "
+          "non-empty err — on a genuine store/query failure",
+          "[rbac_store][pg]") {
+    RBAC_STORE_WITH_AUTH(store, auth_db);
+
+    // DROP TABLE on a second connection (same technique as the A1/A2 admin-
+    // surface tests in test_rbac_role_assignment.cpp): auth.users is
+    // genuinely empty, so the account INSERT succeeds; the subsequent grant
+    // INSERT against rbac_store.principal_roles then fails at the query
+    // level, which must roll back the WHOLE transaction (account included —
+    // provision_first_admin's account+grant atomicity contract), not just
+    // report a partial success.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto result = store.provision_first_admin("failadmin", "hash", "salt");
+    REQUIRE_FALSE(result.has_value());
+    CHECK_FALSE(result.error().empty());
+
+    // Prove the rollback, not just the error return: the earlier
+    // auth.users INSERT must not survive the later grant-INSERT failure —
+    // a regression that split account and grant into separate transactions
+    // would otherwise leave "failadmin" stranded with no grant while this
+    // test still passed on the error check alone.
+    CHECK(auth_db->get_user("failadmin").error() == AuthDBError::UserNotFound);
+}

@@ -206,7 +206,7 @@ first**, then remove:
 sudo launchctl bootout system/com.yuzu.ci-runner.r0 2>/dev/null || true
 sudo rm -f /Library/LaunchDaemons/com.yuzu.ci-runner.r0.plist
 ( cd /opt/ci/actions-runner/r0 && sudo -u yuzuci ./config.sh remove \
-    --token "$(gh api -X POST repos/Tr3kkR/Yuzu/actions/runners/remove-token --jq .token)" )
+    --token "$(gh api -X POST repos/DevNullLtd/Yuzu/actions/runners/remove-token --jq .token)" )
 ```
 
 **Bump the runner version**: deregister, then re-run

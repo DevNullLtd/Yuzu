@@ -1,6 +1,6 @@
 [Unit]
 Description=Yuzu Endpoint Management Agent
-Documentation=https://github.com/Tr3kkR/Yuzu
+Documentation=https://github.com/DevNullLtd/Yuzu
 After=network-online.target
 Wants=network-online.target
 
