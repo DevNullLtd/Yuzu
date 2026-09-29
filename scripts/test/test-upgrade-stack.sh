@@ -129,7 +129,7 @@ fi
 # pipeline still runs on a fresh clone without gh configured.
 if [[ -z "$OLD_VERSION" ]]; then
     if command -v gh >/dev/null 2>&1; then
-        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-Tr3kkR/Yuzu}/releases/latest" \
+        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-DevNullLtd/Yuzu}/releases/latest" \
                       --jq '.tag_name' 2>/dev/null | sed 's/^v//') || resolved=""
     fi
     if [[ -n "${resolved:-}" ]]; then
@@ -253,7 +253,7 @@ if ! YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     exit 1
 fi
 record_timing "pull-old-images" "$(elapsed_ms "$T_START")"
-ok "pulled ghcr.io/tr3kkr/yuzu-server:${OLD_VERSION}"
+ok "pulled ghcr.io/devnullltd/yuzu-server:${OLD_VERSION}"
 
 # --- Step 2: stack up at OLD version --------------------------------------
 
@@ -342,7 +342,7 @@ fi
 phase "step: image swap to NEW ${NEW_VERSION}"
 if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
     info "pulling new image (--new-image-loaded 0)"
-    if ! docker pull "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
+    if ! docker pull "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
         fl "docker pull of new image failed"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image pull failed"
         exit 1
@@ -350,14 +350,14 @@ if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
 fi
 
 # Verify the new image is locally available
-if ! docker image inspect "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
+if ! docker image inspect "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
     # fall back: maybe the image is just `yuzu-server:test-${RUN_ID}` without ghcr prefix
     if docker image inspect "yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
         info "using local image yuzu-server:${NEW_VERSION} (no ghcr prefix)"
         # Tag it with the ghcr prefix so the compose file picks it up
-        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}"
+        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}"
     else
-        fl "new image ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION} not in local daemon"
+        fl "new image ghcr.io/devnullltd/yuzu-server:${NEW_VERSION} not in local daemon"
         warn "Phase 1 should have built it as 'yuzu-server:${NEW_VERSION}' or pulled it"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image missing"
         exit 1

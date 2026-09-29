@@ -27,7 +27,7 @@ name: Runner inventory sentinel
 # loud with an actionable "create a PAT" message on the gh api call.
 # To create the PAT: gh-web → Settings → Developer settings → Personal
 # access tokens → Fine-grained tokens → Generate, repository permission =
-# "Administration: read-only" on Tr3kkR/Yuzu, then `gh secret set
+# "Administration: read-only" on DevNullLtd/Yuzu, then `gh secret set
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:

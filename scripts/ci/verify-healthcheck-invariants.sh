@@ -62,7 +62,7 @@
 #
 # Example:
 #   scripts/ci/verify-healthcheck-invariants.sh \
-#       server=ghcr.io/tr3kkr/yuzu-server:0.13.0 \
+#       server=ghcr.io/devnullltd/yuzu-server:0.13.0 \
 #       gateway-chisel=yuzu-gateway-chisel:ci
 #
 # Exits non-zero, naming the missing tool, if any invariant is broken.
