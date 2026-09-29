@@ -11956,6 +11956,38 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "create_result_set") {
+                // #5047 AC2 (mirrored verbatim at pin_result_set/
+                // unpin_result_set/delete_result_set below):
+                // (a) the EMPTY-tier gap -- a plain RBAC session or a
+                //     non-MCP-tiered API token skips C8's tier/approval belt
+                //     here too, same as it always has -- is a SEPARATE,
+                //     already-tracked, OPEN design question (#4309), not
+                //     attempted by this fix.
+                // (b) Infrastructure:Write is never approval-gated at ANY
+                //     tier (see the #4353 comment just below: it is absent
+                //     from requires_approval()'s Delete/Execution:Execute/
+                //     Policy:Write/Security:Write|Execute/UserManagement:
+                //     Write/ManagementGroup:Write/ApiToken:Write list), and
+                //     tier_allows() already confines operator tier out of
+                //     Infrastructure:Write entirely -- so a supervised-tier
+                //     caller of THIS tool never needed a ticket in the first
+                //     place.
+                // (c) REST result-set routes carry no step_up_fn (MFA
+                //     step-up), so the deny-and-redirect-to-REST pattern
+                //     other empty-tier-affected tools use for their OWN gap
+                //     (e.g. delete_guardian_rule, assign_rbac_role,
+                //     rotate_api_token) is deliberately NOT applied here --
+                //     redirecting to an equally-unprotected REST route would
+                //     be theatre.
+                // (d) What #5047 DOES fix: the CROSS-TRANSPORT gap for a
+                //     TIERED bearer. `AuthRoutes::require_tier_policy`
+                //     (auth_routes.cpp, extracted from require_permission)
+                //     is now also wired into the /api/v1/result-sets REST
+                //     write routes and their dashboard fragment twins, so a
+                //     supervised/operator-tier bearer can no longer reach
+                //     this tool's identical mutation unrestricted by calling
+                //     REST instead of /mcp/v1/ -- this tool's own C8 gate
+                //     already prevented that on the MCP transport.
                 CreateRequest cr;
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
@@ -13112,6 +13144,17 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "pin_result_set") {
+                // #5047 AC2 — see create_result_set's identical comment
+                // above for the full (a)-(d) rationale: (a) the empty-tier
+                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // is never approval-gated at any tier (confirmed by the
+                // #4353 comment just below); (c) no step_up_fn exists on
+                // this route family, so the deny-and-redirect-to-REST
+                // pattern used elsewhere is deliberately not applied; (d)
+                // this fix closes the cross-transport gap for a TIERED
+                // bearer via AuthRoutes::require_tier_policy, now also wired
+                // into POST /api/v1/result-sets/{id}/pin and its dashboard
+                // fragment twin.
                 auto rs_id = param_str(args, "id");
                 if (rs_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "id is required"),
@@ -13161,6 +13204,17 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "unpin_result_set") {
+                // #5047 AC2 — see create_result_set's identical comment
+                // above for the full (a)-(d) rationale: (a) the empty-tier
+                // gap is #4309's, not this fix's; (b) Infrastructure:Write
+                // is never approval-gated at any tier (confirmed by the
+                // #4353 comment just below); (c) no step_up_fn exists on
+                // this route family, so the deny-and-redirect-to-REST
+                // pattern used elsewhere is deliberately not applied; (d)
+                // this fix closes the cross-transport gap for a TIERED
+                // bearer via AuthRoutes::require_tier_policy, now also wired
+                // into POST /api/v1/result-sets/{id}/unpin and its
+                // dashboard fragment twin.
                 auto rs_id = param_str(args, "id");
                 if (rs_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "id is required"),
@@ -13220,11 +13274,40 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #4353 follow-up (Gate 2 finding on #4364): Infrastructure:Delete
                 // IS approval-gated at supervised tier (requires_approval()
                 // fires for any Delete op), and tier_allows() denies operator
-                // tier for it entirely - but requires_approval() returns false
-                // for an EMPTY mcp_tier, and /mcp/v1/'s auth_fn (require_auth)
-                // admits a plain RBAC session or non-MCP-tiered API token the
-                // same as any REST route, so C8's validate() never runs for
-                // that caller class either.
+                // tier for it entirely.
+                //
+                // #5047 AC2 (replaces this comment's prior text, which
+                // stopped at "so an EMPTY mcp_tier caller's C8 belt never
+                // runs either" and left that framed as a bug rather than a
+                // decision — see create_result_set's identical comment above
+                // for the fuller version of the same four points):
+                // (a) the EMPTY-tier gap this paragraph originally flagged —
+                //     `requires_approval()` returns false for an EMPTY
+                //     `mcp_tier`, and `/mcp/v1/`'s `auth_fn` (`require_auth`)
+                //     admits a plain RBAC session or non-MCP-tiered API
+                //     token the same as any REST route, so C8's `validate()`
+                //     never runs for that caller class on ANY transport — is
+                //     a SEPARATE, already-tracked, OPEN design question
+                //     (#4309), not attempted by this fix. This tool is one
+                //     more instance of it, no different from the rest.
+                // (b) N/A here — unlike create/pin/unpin, Infrastructure:
+                //     Delete DOES require approval at supervised tier (the
+                //     paragraph above).
+                // (c) REST result-set routes carry no step_up_fn (MFA
+                //     step-up), so the deny-and-redirect-to-REST pattern
+                //     other empty-tier-affected tools use for their OWN gap
+                //     (e.g. delete_guardian_rule, assign_rbac_role,
+                //     rotate_api_token) is deliberately NOT applied here —
+                //     redirecting to an equally-unprotected REST route would
+                //     be theatre.
+                // (d) What #5047 DOES fix: the CROSS-TRANSPORT gap for a
+                //     TIERED bearer. `AuthRoutes::require_tier_policy`
+                //     (auth_routes.cpp, extracted from `require_permission`)
+                //     is now also wired into `DELETE /api/v1/result-sets/{id}`
+                //     and its dashboard fragment twin, so a supervised-tier
+                //     bearer can no longer bypass the ticket-then-recall
+                //     approval flow by calling REST instead of `/mcp/v1/` —
+                //     this tool's own C8 gate already prevented that here.
                 if (rs_id.size() > kResultSetIdMaxLen) {
                     reject_field_too_large(
                         std::format("id must be at most {} bytes", kResultSetIdMaxLen));
