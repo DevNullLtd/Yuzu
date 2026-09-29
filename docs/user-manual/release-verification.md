@@ -33,8 +33,11 @@ OWNER=tr3kkr;      SIGNER_REPO=Tr3kkR/Yuzu
 # OWNER=devnullltd; SIGNER_REPO=DevNullLtd/Yuzu
 ```
 
-Image *pulls* follow the same split: pre-transfer tags remain published under
-`ghcr.io/tr3kkr/` and are not mirrored forward.
+Image *pulls* do **not** follow this split: every historical tag was mirrored
+into `ghcr.io/devnullltd/` on 2026-09-29, so `OWNER=devnullltd` works for every
+release. `ghcr.io/tr3kkr/` is retained read-only for anything already pinned to
+it. Only the SIGNING IDENTITY is era-dependent, because it is fixed in the
+certificate at build time and cannot be restamped.
 
 ## What ships with every release
 

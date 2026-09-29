@@ -181,7 +181,17 @@ class _FakeWorld:
             "issue_with_comments": cli.issue_with_comments,
             "has_open_linked_pr": cli.has_open_linked_pr,
             "gh_api": cli.gh_api,
+            "has_write_access": cli.has_write_access,
         }
+        # Marker trust is a real collaborators-API lookup in production; these
+        # are network-free tests, so resolve it from the fixture's own
+        # author_association instead. The fixtures still express intent as
+        # OWNER/MEMBER/COLLABORATOR; only the PRODUCTION resolver changed.
+        cli.has_write_access = lambda login: any(
+            ((c.get("user") or {}).get("login")) == login
+            and (c.get("author_association") or "") in {"OWNER", "MEMBER", "COLLABORATOR"}
+            for cs in self.comments.values() for c in cs
+        )
         cli.issue_with_comments = lambda n: (
             self.issues.get(n),
             cli.trusted_comment_blob(self.comments.get(n, [])),
@@ -283,6 +293,38 @@ def run_plan_tests(failures):
         plan = cli.build_plan([_pr(504, "Closes #55")], dnc)
     if [(a) for _p, n, a, _r, _i in plan if n == 55] != [cli.SKIP]:
         failures.append(f"marker trust: collaborator marker must suppress (idempotency), got {plan}")
+
+    # Org-transfer regression (2026-09-28, Tr3kkR/Yuzu -> DevNullLtd/Yuzu).
+    # author_association reports MEMBER for ANY org member, and DevNullLtd's
+    # default_repository_permission is `read`, so association is no longer a
+    # proxy for push access. Trust must follow the collaborators API instead:
+    # a MEMBER who cannot push must NOT be able to suppress a close.
+    saved_hwa = cli.has_write_access
+    member_ro = [{"user": {"login": "readonly-org-member"},
+                  "author_association": "MEMBER",
+                  "body": "<!-- yuzu-close-linked: pr=505 issue=56 -->"}]
+    world = _FakeWorld(issues={56: _issue(56, labels=["bug"])}, comments={56: member_ro})
+    with world:
+        cli.has_write_access = lambda login: False   # the API says: no push
+        try:
+            plan = cli.build_plan([_pr(505, "Closes #56")], dnc)
+        finally:
+            cli.has_write_access = saved_hwa
+    if [(a) for _p, n, a, _r, _i in plan if n == 56] != [cli.CLOSE]:
+        failures.append(
+            f"marker trust: a read-only org MEMBER must not suppress the close, got {plan}")
+
+    # ...and the same login DOES suppress once the API grants push.
+    world = _FakeWorld(issues={56: _issue(56, labels=["bug"])}, comments={56: member_ro})
+    with world:
+        cli.has_write_access = lambda login: login == "readonly-org-member"
+        try:
+            plan = cli.build_plan([_pr(505, "Closes #56")], dnc)
+        finally:
+            cli.has_write_access = saved_hwa
+    if [(a) for _p, n, a, _r, _i in plan if n == 56] != [cli.SKIP]:
+        failures.append(
+            f"marker trust: push-capable author must suppress (idempotency), got {plan}")
 
     # Cap goes through the plan (CAPSKIP) and never reaches per-issue actions.
     world = _FakeWorld(issues={})

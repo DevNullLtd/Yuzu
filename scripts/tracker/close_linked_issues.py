@@ -44,9 +44,10 @@ Decision ladder, order load-bearing (issue-standard.md 5.1; A1 par.4-5):
   issue if the close PATCH failed, blinding every liveness mechanism at once).
 
 Marker idempotency trusts only comments whose author is github-actions[bot]
-or whose author_association is OWNER/MEMBER/COLLABORATOR -- a drive-by
-commenter cannot suppress the automation by pasting a marker (anyone who CAN
-plant a trusted marker already has write access and could close directly).
+or who actually has PUSH access to this repo, resolved per-author against the
+collaborators API rather than inferred from author_association -- a drive-by
+commenter cannot suppress the automation by pasting a marker, and neither can
+a read-only org member (which is what author_association reports as MEMBER).
 
 FAIL-CLOSED invariants:
   - scripts/tracker/do-not-close.txt missing or unparseable => the run refuses
@@ -96,11 +97,48 @@ ADVISORY_MARKER = "yuzu-close-linked-advisory: pr={pr} issue={issue}"
 CAPSKIP_MARKER = "yuzu-close-linked-capskip: pr={pr}"
 UNDO_MARKER = "yuzu-close-linked-undo: pr={pr} issue={issue}"
 
-# CONTRIBUTOR is deliberately excluded (any merged-commit author gets it).
-# Note: on a user-owned repo COLLABORATOR implies explicit write access; if
-# the repo ever moves to an org with read/triage collaborator roles, revisit.
-TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+# Marker trust is decided by ACTUAL repository permission, never by
+# `author_association`. The previous version trusted OWNER/MEMBER/COLLABORATOR
+# and justified it with "anyone able to plant a trusted marker has write access
+# anyway" -- true on a user-owned repo, and its own comment flagged that the
+# rule had to be revisited "if the repo ever moves to an org with read/triage
+# collaborator roles". That happened on 2026-09-28 (Tr3kkR/Yuzu ->
+# DevNullLtd/Yuzu). On an org, GitHub returns MEMBER for ANY org member
+# regardless of repository permission, and COLLABORATOR covers read/triage
+# collaborators too -- and DevNullLtd's `default_repository_permission` is
+# `read`, so every org member was silently trusted. Trust buys the ability to
+# suppress a close, and to suppress the ADVISORY comment on a `security` or
+# `do-not-close` issue, which is the one that exists to demand human review.
+# So: ask the API who can actually push. Fails CLOSED -- an unresolvable or
+# erroring lookup is untrusted, because the failure mode of over-trusting is
+# silent suppression while the failure mode of under-trusting is a duplicate
+# comment.
+WRITE_PERMISSIONS = {"admin", "write"}
 TRUSTED_BOT = "github-actions[bot]"
+
+_write_access_cache: dict = {}
+
+
+def has_write_access(login: str) -> bool:
+    """True iff `login` can push to REPO. Cached per run: a PR's comment
+    thread is usually a handful of distinct authors, and this is called once
+    per comment."""
+    if not login:
+        return False
+    if login in _write_access_cache:
+        return _write_access_cache[login]
+    ok = False
+    try:
+        # 404 (gh_api -> None) means "not a collaborator", which is a real
+        # answer, not an error. `.permission` collapses maintain->write and
+        # triage->read, which is exactly the push/no-push line we want.
+        data = gh_api(f"repos/{REPO}/collaborators/{login}/permission")
+        if data:
+            ok = (data.get("permission") or "") in WRITE_PERMISSIONS
+    except GhError:
+        ok = False  # fail closed
+    _write_access_cache[login] = ok
+    return ok
 
 # Plan actions
 CLOSE, ADVISORY, SKIP, EXCLUDED, CAPSKIP = "CLOSE", "ADVISORY", "SKIP", "EXCLUDED", "CAPSKIP"
@@ -155,14 +193,16 @@ def load_do_not_close() -> set:
 
 def trusted_comment_blob(comments: list) -> str:
     """Concatenate only comments whose author can be trusted for marker
-    idempotency: the Actions bot, or an OWNER/MEMBER/COLLABORATOR. Anyone able
-    to plant a trusted marker has write access and could close issues
-    directly -- so spoofing buys an attacker nothing."""
+    idempotency: the Actions bot, or someone with push access to REPO.
+
+    `author_association` is NOT consulted -- see WRITE_PERMISSIONS above for
+    why it stopped being a proxy for write access when the repo moved into an
+    org. The bot short-circuits because it is not a collaborator, so the
+    permission lookup would 404 for it."""
     trusted = []
     for c in comments:
         login = ((c.get("user") or {}).get("login")) or ""
-        assoc = c.get("author_association") or ""
-        if login == TRUSTED_BOT or assoc in TRUSTED_ASSOCIATIONS:
+        if login == TRUSTED_BOT or has_write_access(login):
             trusted.append(c.get("body") or "")
     return "\n".join(trusted)
 
@@ -533,9 +573,11 @@ def verify_approval_url(url: str) -> bool:
     if not c:
         return False
     login = ((c.get("user") or {}).get("login")) or ""
-    assoc = c.get("author_association") or ""
     on_2139 = (c.get("issue_url") or "").endswith("/issues/2139")
-    return on_2139 and (login == TRUSTED_BOT or assoc in TRUSTED_ASSOCIATIONS)
+    # Same permission-not-association rule as trusted_comment_blob, and it
+    # matters more here: this gates a BACKFILL authorization, so an org member
+    # with read-only access could otherwise self-authorize one by commenting.
+    return on_2139 and (login == TRUSTED_BOT or has_write_access(login))
 
 
 # ---------------------------------------------------------------------------
