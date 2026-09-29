@@ -1,13 +1,17 @@
 #include "result_set_routes.hpp"
 
+#include "authz_model.hpp" // #4983 -- authz::in_scope
 #include "http_route_sink.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <cstddef>
+#include <format>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server::result_set {
@@ -243,6 +247,119 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 flush();
             }
+
+            // #4983: full existence + scope check on a non-empty device_ids,
+            // mirroring the identical fix on POST /api/v1/result-sets (REST)
+            // and MCP create_result_set (same PR) -- this fragment's
+            // CSV-paste import had the identical gap: a caller-supplied
+            // device_ids list with no lookup against the agent registry at
+            // all. Scoped to fire ONLY when device_ids was actually supplied
+            // and non-empty -- see this file's header comment ("#4983 (added
+            // after the initial extraction)") for why the rejection shape
+            // here is this file's own toast+sidebar idiom, not REST's
+            // rs_err/A4-envelope or MCP's JSON-RPC error.
+            if (!members.empty()) {
+                // Checked SEPARATELY, in the same order as REST/MCP's fix --
+                // fleet_read_fn unwired first, then (only once the gate has
+                // actually run and admitted) all_agent_ids_fn -- rather than
+                // one combined check, so a wired fleet_read_fn is always
+                // consulted even when all_agent_ids_fn is the piece that's
+                // missing (matters for RBAC-audit-of-the-attempt parity with
+                // the other two surfaces).
+                if (!deps.fleet_read_fn) {
+                    spdlog::error("result_set.create (fragment): fleet_read_fn unwired -- "
+                                  "misconfigured call site; failing closed");
+                    deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                  "RESULT_SET_STORE_UNAVAILABLE");
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{
+                            {"showToast",
+                             {{"level", "error"},
+                              {"message", "RESULT_SET_STORE_UNAVAILABLE: device visibility "
+                                          "check unavailable"}}}}
+                            .dump());
+                    std::string next;
+                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                auto gate = deps.fleet_read_fn(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote its own (JSON) 401/403/503 body -- the
+                            // same accepted shape dashboard_routes.cpp's
+                            // /fragments/results uses for an HTMX consumer.
+
+                if (!deps.all_agent_ids_fn) {
+                    spdlog::error("result_set.create (fragment): all_agent_ids_fn unwired -- "
+                                  "misconfigured call site; failing closed");
+                    deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                  "RESULT_SET_STORE_UNAVAILABLE");
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{
+                            {"showToast",
+                             {{"level", "error"},
+                              {"message",
+                               "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable"}}}}
+                            .dump());
+                    std::string next;
+                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+
+                // Called ONCE (not per-id) and cached in a set for O(1)
+                // per-id membership checks -- same rationale as the REST/MCP
+                // fix (see RestApiV1::AllAgentIdsFn's doc comment).
+                // Presence-merged (AgentRegistry::all_ids()), NOT a
+                // local-only snapshot.
+                const std::vector<std::string> known = deps.all_agent_ids_fn();
+                const std::unordered_set<std::string> known_set(known.begin(), known.end());
+
+                // #3564-style oracle safety (see GET /api/v1/devices/{id}'s
+                // identical rationale): a nonexistent id and a real-but-out-
+                // of-scope id are indistinguishable here. Unlike that route,
+                // these ids are the CALLER'S OWN submitted list, so citing
+                // which one(s) failed back is not a disclosure of someone
+                // else's device existence.
+                std::vector<std::string> bad_ids;
+                for (const auto& mid : members) {
+                    if (!known_set.contains(mid) || !authz::in_scope(gate.scope, mid))
+                        bad_ids.push_back(mid);
+                }
+                if (!bad_ids.empty()) {
+                    constexpr std::size_t kMaxCitedBadIds = 20;
+                    std::string cited;
+                    for (std::size_t i = 0; i < bad_ids.size() && i < kMaxCitedBadIds; ++i) {
+                        if (i)
+                            cited += ", ";
+                        cited += bad_ids[i];
+                    }
+                    if (bad_ids.size() > kMaxCitedBadIds)
+                        cited += std::format(" (+{} more)", bad_ids.size() - kMaxCitedBadIds);
+                    deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                  "RESULT_SET_UNKNOWN_DEVICE_ID");
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{
+                            {"showToast",
+                             {{"level", "error"},
+                              {"message",
+                               "RESULT_SET_UNKNOWN_DEVICE_ID: device_ids contains an id "
+                               "that does not exist or is not visible to you: " +
+                                   cited}}}}
+                            .dump());
+                    std::string next;
+                    auto sets = deps.store->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+            }
+
             auto created = deps.store->create_materialized(cr, members);
             if (!created) {
                 // Surface quota / too-many-members / store errors instead of

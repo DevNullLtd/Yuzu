@@ -14763,11 +14763,22 @@ private:
         // sibling) because this module needs auth_fn + the just-defined
         // deny_service_scoped_fn + audit_fn, none of which is in scope yet
         // at that earlier point.
+        // #4983: this fragment's `device_ids` (the dashboard CSV-paste
+        // import) had the identical unchecked-existence/scope gap the REST
+        // and MCP twins were fixed for in the same PR -- threads the SAME
+        // `fleet_read_fn` lambda defined above (already reused by several
+        // other Deps-based route modules) plus a direct
+        // `registry_.all_ids()` closure, the identical presence-merged
+        // domain RestApiV1's own `AllAgentIdsFn` wraps (HA WS-5) -- NOT
+        // `registry_.to_json_obj()`'s local-only snapshot, same #4981
+        // precedent reasoning as the REST fix's own wiring comment below.
         yuzu::server::result_set::register_result_set_routes(
             inline_sink, yuzu::server::result_set::Deps{
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .all_agent_ids_fn = [this] { return registry_.all_ids(); },
                              .store = result_set_store_.get(),
                              .metrics = &metrics_,
                          });

@@ -93,6 +93,18 @@ struct Harness {
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
 
+    /// #4983 -- the create route's device_ids existence/scope gate. Mirrors
+    /// test_rest_result_sets_async.cpp's AsyncHarness fields of the same
+    /// name/purpose. `wire_fleet_read_fn`/`wire_all_agent_ids_fn` false ->
+    /// leaves that Deps field genuinely unwired (default `{}`), modelling a
+    /// misconfigured call site -- same contract as that file's own flags.
+    bool wire_fleet_read_fn{true};
+    bool wire_all_agent_ids_fn{true};
+    bool fleet_read_admit{true};
+    yuzu::server::authz::VisibleSet fleet_read_scope{std::nullopt};
+    bool fleet_read_fn_reached{false};
+    std::vector<std::string> all_agent_ids_override{"dev-1", "dev-2", "dev-3"};
+
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
@@ -136,6 +148,23 @@ struct Harness {
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds;
         };
+        if (wire_fleet_read_fn) {
+            deps.fleet_read_fn =
+                [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+                fleet_read_fn_reached = true;
+                if (!fleet_read_admit) {
+                    res.status = 403;
+                    return {};
+                }
+                return {.admitted = true, .scope = fleet_read_scope};
+            };
+        }
+        if (wire_all_agent_ids_fn) {
+            deps.all_agent_ids_fn = [this]() -> std::vector<std::string> {
+                return all_agent_ids_override;
+            };
+        }
         result_set::register_result_set_routes(sink, deps);
     }
 
@@ -639,6 +668,159 @@ TEST_CASE("result_set_routes: [pg] delete success round trip audits and "
     auto gone = w.store.get(rs->id);
     REQUIRE(gone.has_value());
     CHECK_FALSE(gone->has_value());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4983: device_ids[] existence + scope check on POST /fragments/result-sets/create
+// (Fix 2 -- the dashboard CSV-paste import had the identical gap REST/MCP
+// were fixed for; this mirrors those two files' own test shapes).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("result_set_routes: [pg] create: a fully-valid, all-visible device_ids "
+          "list still succeeds (no regression, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h; // all_agent_ids_override defaults to {dev-1,dev-2,dev-3}
+    h.store = &w.store;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,dev-2",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger") == "resultSetsChanged");
+    CHECK(h.fleet_read_fn_reached);
+    std::string next;
+    auto sets = w.store.list_by_owner("alice", "", 10, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].device_count == 2);
+}
+
+TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
+          "nonexistent id is rejected with an error toast, and no result set "
+          "is created (#4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,ghost-nonexistent",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // this file's own idiom -- toast, not a real error status
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("ghost-nonexistent") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger") != "resultSetsChanged");
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "RESULT_SET_UNKNOWN_DEVICE_ID");
+}
+
+TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
+          "real but out-of-scope id is rejected identically to the "
+          "nonexistent case (oracle-safety, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    // A management-group-confined caller: "dev-2" genuinely exists (it's in
+    // all_agent_ids_override) but is outside this caller's own visible set.
+    h.fleet_read_scope = std::unordered_set<std::string>{"dev-1"};
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1,dev-2",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("dev-2") != std::string::npos);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+}
+
+TEST_CASE("result_set_routes: [pg] create: fleet_read_fn is never reached when "
+          "device_ids is absent or empty (no regression, #4983)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+
+    SECTION("device_ids absent") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Post("/fragments/result-sets/create", "name=x",
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+    SECTION("device_ids empty") {
+        Harness h;
+        h.store = &w.store;
+        h.wire();
+        auto r = h.sink.Post("/fragments/result-sets/create", "name=x&device_ids=",
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+}
+
+TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
+          "unwired fleet_read_fn fails closed with an error toast, and no "
+          "result set is created (#4983 Fix 10)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire_fleet_read_fn = false;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+}
+
+TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
+          "admitted fleet_read_fn but an unwired all_agent_ids_fn fails closed "
+          "with an error toast, and no result set is created (#4983 Fix 10)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire_all_agent_ids_fn = false;
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=dev-1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    CHECK(h.fleet_read_fn_reached); // gate itself ran and admitted before the 2nd check tripped
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
