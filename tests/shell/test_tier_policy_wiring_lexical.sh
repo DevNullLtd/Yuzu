@@ -18,19 +18,35 @@
 #   1. `result_set::Deps`'s designated-init field (the dashboard-fragment
 #      wiring, /fragments/result-sets/*) reads
 #      `.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),` --
-#      exactly once.
+#      exactly once, as an ACTIVE line (anchored start-of-line, not merely
+#      a substring -- a commented-out copy of this exact text does not
+#      count; #5047 governance re-review finding, independently converged
+#      by two reviewers).
 #   2. `rest_api_v1_->register_routes(...)`'s final positional argument
 #      (the REST /api/v1/result-sets JSON wiring) is
-#      `auth_routes_->gateless_tier_policy_fn());` -- exactly once.
+#      `auth_routes_->gateless_tier_policy_fn());` -- exactly once, same
+#      anchored-active-line requirement.
 #   3. The literal substring `auth_routes_->gateless_tier_policy_fn()`
-#      appears in server.cpp EXACTLY TWICE, total -- catches both a
-#      reversion at either known site (count drops below 2) and a new,
-#      undocumented third call site (count rises above 2).
+#      appears in server.cpp EXACTLY TWICE, total -- this one is
+#      DELIBERATELY a broad, unanchored substring count (not just the sum
+#      of clauses 1+2): it exists to catch a brand-new third call site
+#      written in some OTHER shape neither clause 1 nor 2 would recognise.
+#      The trade-off: an unrelated comment that happens to quote the
+#      literal string would also trip this clause -- a false RED, never a
+#      false GREEN, so left as-is.
 #
 # Static/text-only, no build required -- a lexical gate, not a semantic one
 # (mirrors test_log_handoff_wiring_lexical.sh's own framing): it cannot see
 # a relocation that keeps the same tokens but changes the surrounding
-# control flow -- that stays a review-enforced concern.
+# control flow, nor a `#if 0`/`/* */` block that comments out an entire
+# real site while preserving its exact leading whitespace and text -- both
+# stay review-enforced concerns clauses 1/2's anchoring cannot reach.
+#
+# Known limitation (NICE, not fixed): clause 3 only catches a new call
+# that reuses the gateless_tier_policy_fn() literal. A wholly new
+# gate-less route wired with its OWN fresh inline lambda -- one that never
+# references gateless_tier_policy_fn() at all -- is invisible to this
+# script; that class of regression stays a plain-review concern.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
@@ -44,7 +60,7 @@ fi
 fail=0
 
 total_count="$(grep -c 'auth_routes_->gateless_tier_policy_fn()' "$SERVER_CPP" || true)"
-designated_count="$(grep -c '\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "$SERVER_CPP" || true)"
+designated_count="$(grep -cE '^[[:space:]]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\),$' "$SERVER_CPP" || true)"
 positional_count="$(grep -c '^[[:space:]]*auth_routes_->gateless_tier_policy_fn());$' "$SERVER_CPP" || true)"
 
 if [ "$designated_count" -ne 1 ]; then
