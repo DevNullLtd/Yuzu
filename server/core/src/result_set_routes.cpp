@@ -1,6 +1,7 @@
 #include "result_set_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_audit.hpp" // detail::try_persist_audit (#5047 Gate 8 fix round, UP-10)
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 
@@ -49,9 +50,14 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         if (!session.mcp_tier.empty()) {
             // Same rule as the REST twin (rest_api_v1.cpp): a degraded
             // security control must leave an evidence trail, not just a
-            // test-covered response (#5047 governance fix round).
-            deps.audit_fn(req, "result_set.tier_policy_unavailable", "failure", "ResultSet", "",
-                          "tier-policy check misconfigured (unwired TierPolicyFn)");
+            // test-covered response (#5047 governance fix round). Routed
+            // through try_persist_audit (not a bare deps.audit_fn call, Gate 8
+            // UP-10): this handler installs no exception_handler_, so an
+            // audit sink that throws must not be allowed to replace the
+            // intended 503 with httplib's bare, undetailed default 500.
+            (void)detail::try_persist_audit(deps.audit_fn, req, "result_set.tier_policy_unavailable",
+                                            "failure", "ResultSet", "",
+                                            "tier-policy check misconfigured (unwired TierPolicyFn)");
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"tier-policy check misconfigured"}})",

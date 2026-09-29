@@ -1922,13 +1922,19 @@ TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
 // exercise what `server.cpp` actually WIRES into production. A regression
 // reverting either `server.cpp` call site back to naming `.permission` would
 // have passed every test above. `AuthRoutes::gateless_tier_policy_fn()` is
-// the SOLE production factory both `server.cpp` sites now call (no more
+// the SOLE production factory both `server.cpp` sites call TODAY (no more
 // locally-duplicated lambdas) — this test obtains the REAL callable via that
 // factory, the exact same object `server.cpp` wires into `RestApiV1`/
-// `result_set::Deps`, and drives it directly. A regression at either
-// `server.cpp` call site is now unreachable (they can no longer diverge from
-// this factory), and a regression IN the factory itself (e.g. someone
-// changes its `false` to `true`) fails this test.
+// `result_set::Deps`, and drives it directly. This proves the factory itself
+// is correct and gives both current call sites one shared, single-source
+// implementation to inherit from (a regression IN the factory, e.g. someone
+// changes its `false` to `true`, fails this test at both call sites at
+// once). It does NOT prove `server.cpp` keeps calling this factory — this
+// test only drives the factory's output and cannot observe whether a call
+// site actually invokes it; a future reversion of a `server.cpp` site to its
+// own hand-rolled lambda, or a new third gate-less call site written
+// in-line, would not be caught here (Gate 8 architect/quality-engineer
+// finding, independently converged).
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "

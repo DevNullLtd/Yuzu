@@ -10724,9 +10724,16 @@ void RestApiV1::register_routes(
                 // enforceable) MUST leave an evidence trail, not just a
                 // test-covered response — audited so a SOC 2 review of
                 // "does every access-control degradation get logged" finds
-                // this branch (#5047 governance fix round).
-                audit_fn(req, "result_set.tier_policy_unavailable", "failure", "ResultSet", "",
-                         "tier-policy check misconfigured (unwired TierPolicyFn)");
+                // this branch (#5047 governance fix round). Routed through
+                // try_persist_audit (not a bare audit_fn call, Gate 8 UP-10):
+                // this handler installs no exception_handler_ of its own, so
+                // an audit sink that throws must not be allowed to replace
+                // the intended 503 with httplib's bare, undetailed default
+                // 500 (see `deny_fleet_wide_service_scoped`'s identical
+                // rationale above for the precedent).
+                (void)detail::try_persist_audit(
+                    audit_fn, req, "result_set.tier_policy_unavailable", "failure", "ResultSet",
+                    "", "tier-policy check misconfigured (unwired TierPolicyFn)");
                 rs_err(res, 503,
                        "RESULT_SET_TIER_POLICY_UNAVAILABLE: tier-policy check misconfigured");
                 return false;
