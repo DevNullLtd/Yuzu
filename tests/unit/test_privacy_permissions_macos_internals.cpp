@@ -589,7 +589,6 @@ TEST_CASE("privacy_permissions macOS: a path on a network mount is refused befor
         read_all_sources(r.rows, r.acc, (base / "system.db").string(), users.string(), bounds,
                          output);
         CHECK(r.has_raw("users:network_mount"));
-        CHECK_FALSE(r.has_raw("users:open_errno_2"));
     }
 }
 

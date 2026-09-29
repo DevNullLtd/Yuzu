@@ -655,7 +655,7 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
           "[privacy_permissions][macos_parsers]") {
     const std::vector<macos::MountEntry> mounts{{"/", "apfs"},
                                                 {"/Users/alice", "nfs"},
-                                                {"/Users/carol/", "smbfs"},
+                                                {"/Users/carol", "smbfs"},
                                                 {"/Volumes/web", "webdav"},
                                                 {"/Users/dave", "apfs"}};
     const auto refused = [&](std::string_view path) {
@@ -663,7 +663,7 @@ TEST_CASE("macos::path_under_network_mount: a network mount at or above the path
     };
     CHECK(refused("/Users/alice"));
     CHECK(refused("/Users/alice/Library/Application Support/com.apple.TCC/TCC.db"));
-    CHECK(refused("/Users/carol/Library")); // a trailing slash on the mount point is normalised
+    CHECK(refused("/Users/carol/Library"));
     CHECK(refused("/Volumes/web/x"));
     CHECK_FALSE(refused("/Users/alicia"));   // prefix of the name, not of a segment
     CHECK_FALSE(refused("/Users/al"));

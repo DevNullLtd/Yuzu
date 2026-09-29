@@ -166,8 +166,7 @@ struct MountEntry {
 [[nodiscard]] inline bool path_under_network_mount(std::string_view path,
                                                    std::span<const MountEntry> mounts) {
     return std::any_of(mounts.begin(), mounts.end(), [&](const MountEntry& m) {
-        std::string_view mp = m.mount_point;
-        while (mp.size() > 1 && mp.back() == '/') mp.remove_suffix(1);
+        const std::string_view mp = m.mount_point;
         const bool covers = mp == "/" || path == mp ||
                             (path.size() > mp.size() && path.starts_with(mp) && path[mp.size()] == '/');
         return covers && is_network_mount_fstype(m.fstype);
