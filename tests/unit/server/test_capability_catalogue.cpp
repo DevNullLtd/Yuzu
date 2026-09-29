@@ -38,6 +38,7 @@
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
@@ -155,6 +156,7 @@ struct LabeledSpan {
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
+        {"local_security_policy", capdecls::plugin_action_catalogue_local_security_policy(), false},
         {"privacy_permissions", capdecls::plugin_action_catalogue_privacy_permissions(), false},
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
@@ -166,7 +168,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-four sources exactly as a live composition site would use.
+    // literally, twenty-five sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -188,6 +190,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
@@ -550,6 +553,36 @@ TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact
         CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
         CHECK_FALSE(it->system_reserved);
     }
+}
+
+/// Exact-row pin for the three `local_security_policy` rows shipped in this PR (Wave 8
+/// PR8.3, core): read-only posture class, so `Security` (the antivirus/bitlocker/firewall/
+/// autoruns class), never Inventory. Literals, not derived from the fragment, so a
+/// securable/gate/tier change fails here. `sudoers` (Medium risk tier, the owner's
+/// 2026-09-22 decision) is PLANNED, follows as its own PR -- this fragment has 3 rows,
+/// not 4, until then; `classify("local_security_policy", "sudoers")` must find nothing.
+TEST_CASE("capability catalogue: local_security_policy rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_local_security_policy();
+    REQUIRE(rows.size() == 3);
+    const char* const expected[3] = {"password_policy", "lockout_policy", "audit_policy"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto& row = rows[i];
+        INFO("action=" << expected[i]);
+        CHECK(row.plugin == "local_security_policy");
+        CHECK(row.action == expected[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Security");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == authz::RiskTier::Low);
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
+
+    auto registry = build_registry(all_labeled_sources());
+    CHECK_FALSE(registry.classify("local_security_policy", "sudoers").has_value());
+    CHECK_FALSE(registry.classify("local_security_policy", "set_policy").has_value());
 }
 
 /// Exact-row pin for `privacy_permissions` (Wave 8 PR8.5, Forensics-class): the same
