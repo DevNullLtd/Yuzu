@@ -3005,6 +3005,15 @@ Before upgrading any component:
   live `auth.import_meta` row is likewise **refused, not merged** — look for a `CRITICAL` log line
   naming the mismatched file and the `yuzu_server_enrollment_import_total{outcome="fingerprint_mismatch"}`
   metric; see [ADR-2002 §8](../adr/2002-high-availability-architecture.md#8-pki--ca-high-availability-q8) for the marker/fingerprint mechanics.
+  **A fingerprint mismatch does NOT block boot** — unlike a PG error or read failure with the file
+  present (which refuses to start, the same posture as the first-boot admin seed), a mismatch is
+  logged and the server starts normally with whatever enrollment state is already in Postgres; the
+  stale `.cfg` file's rows are simply never imported, and the file itself is left in place under its
+  original name (not renamed to `.imported`, since nothing was imported). Recover by comparing the
+  stale file's rows against the current `auth.enrollment_tokens`/`auth.pending_agents` (dashboard, or
+  `psql`), manually recreating anything genuinely missing (mint a new token / re-add the pending
+  agent), then archiving or deleting the leftover `enrollment-tokens.cfg` / `pending-agents.cfg` once
+  you've confirmed nothing in it is needed.
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server
