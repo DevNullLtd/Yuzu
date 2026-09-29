@@ -50,7 +50,7 @@ jobs:
           # interpreter, C:\Python314 (deploy/windows/Provision-Windows-Runner.ps1),
           # has PyYAML but ships no python3.exe.
           if ! python3 -c "import yaml" >/dev/null 2>&1; then
-            echo "::error::'python3' on this runner is not an interpreter with PyYAML, which instructions-tests.sh needs. This job does not install packages on the shared host: provide a python3 with PyYAML through runner provisioning instead."
+            echo "::error::'python3' on this runner is not an interpreter with PyYAML, which instructions-tests.sh needs (C:\Python314 has PyYAML but ships no python3.exe, and a WindowsApps store alias is not an interpreter). This job does not install packages on the shared host: provide a python3 with PyYAML through runner provisioning instead (tracked in #5128)."
             exit 1
           fi
           python3 -c "import yaml; print('PyYAML', yaml.__version__)"
