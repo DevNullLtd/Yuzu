@@ -29639,8 +29639,24 @@ TEST_CASE("MCP result-sets: happy-path lifecycle (create, get, members, lineage,
           "[pg][mcp][integration][result-sets]") {
     yuzu::test::ResultSetStorePg rs_bundle;
 
+    // #4983: create_result_set now checks a non-empty device_ids for
+    // existence/scope via fleet_read_fn_ + agent_registry — this test's
+    // step below supplies "dev-1"/"dev-2" as the ground set's members, so
+    // both must be registered (or the create now 503s "device registry
+    // unavailable" instead of exercising the lineage/pin/delete chain this
+    // test exists to cover).
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    for (const char* dev_id : {"dev-1", "dev-2"}) {
+        yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id(dev_id);
+        (void)registry.register_agent(info);
+    }
+
     McpTestServer ts;
     ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
     ts.mock_username = "alice";
     // Empty tier (not an MCP token, e.g. an interactive session): these tools
     // are owner-scoped with no perm_fn gate, and "operator" tier itself
@@ -29852,8 +29868,18 @@ TEST_CASE("MCP result-sets: a non-owner sees the same not-found as a nonexistent
           "[pg][mcp][integration][result-sets]") {
     yuzu::test::ResultSetStorePg rs_bundle;
 
+    // #4983: see the lifecycle test above — "dev-1" must be registered or
+    // this create now 503s instead of minting the set this test needs.
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    yuzu::agent::v1::AgentInfo dev1_info;
+    dev1_info.set_agent_id("dev-1");
+    (void)registry.register_agent(dev1_info);
+
     McpTestServer ts_owner;
     ts_owner.result_set_store_for_test = rs_bundle.get();
+    ts_owner.agent_registry_for_test = &registry;
     ts_owner.mock_username = "alice";
     ts_owner.start(); // empty tier — see the lifecycle test above for why
     auto created = ts_owner.call(
@@ -29875,6 +29901,153 @@ TEST_CASE("MCP result-sets: a non-owner sees the same not-found as a nonexistent
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
           std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4983: MCP twin of the identical REST fix (test_rest_result_sets_async.cpp)
+// — device_ids[] existence + scope check on create_result_set.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("MCP create_result_set: a fully-valid, all-visible device_ids list still "
+          "succeeds (no regression, #4983)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    for (const char* dev_id : {"dev-1", "dev-2"}) {
+        yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id(dev_id);
+        (void)registry.register_agent(info);
+    }
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":["dev-1","dev-2"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(body["result"]["structuredContent"]["device_count"] == 2);
+}
+
+TEST_CASE("MCP create_result_set: a device_ids list containing one nonexistent id is "
+          "rejected, and no result set is created (#4983)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    yuzu::agent::v1::AgentInfo info;
+    info.set_agent_id("dev-1");
+    (void)registry.register_agent(info);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":["dev-1","ghost-nonexistent"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("ghost-nonexistent") !=
+          std::string::npos);
+
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+TEST_CASE("MCP create_result_set: a device_ids list containing one real but "
+          "out-of-scope id is rejected identically to the nonexistent case "
+          "(oracle-safety, #4983)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    for (const char* dev_id : {"dev-1", "dev-2"}) {
+        yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id(dev_id);
+        (void)registry.register_agent(info);
+    }
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
+    // A management-group-confined caller: "dev-2" genuinely exists (it's
+    // registered above) but is outside this caller's own visible set.
+    ts.fleet_read_fn_for_test =
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {.admitted = true, .scope = std::unordered_set<std::string>{"dev-1"}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":["dev-1","dev-2"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("dev-2") != std::string::npos);
+
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+TEST_CASE("MCP create_result_set: the device_ids gate never fires when device_ids is "
+          "absent or empty (no regression for callers not using this field, #4983)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    // A captured bool, not a Catch2 FAIL() inside the lambda: the dispatcher
+    // likely wraps tool bodies in a catch(...) boundary, which would silently
+    // swallow an in-lambda FAIL() — same idiom as the #4980 C8 test above.
+    bool fleet_read_fn_reached = false;
+    auto make_fleet_read_fn = [&fleet_read_fn_reached] {
+        return [&fleet_read_fn_reached](
+                   const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+            fleet_read_fn_reached = true;
+            return {.admitted = true, .scope = std::nullopt};
+        };
+    };
+
+    SECTION("device_ids absent") {
+        McpTestServer ts;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.fleet_read_fn_for_test = make_fleet_read_fn();
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"create_result_set","arguments":{"name":"x"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK_FALSE(fleet_read_fn_reached);
+    }
+    SECTION("device_ids empty array") {
+        McpTestServer ts;
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.fleet_read_fn_for_test = make_fleet_read_fn();
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":[]}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK_FALSE(fleet_read_fn_reached);
+    }
 }
 
 TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-scoped tools "
