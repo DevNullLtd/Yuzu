@@ -109,7 +109,11 @@ services:
       server: { condition: service_healthy }
 
   agent:
-    image: ghcr.io/devnullltd/yuzu-agent:${YUZU_VERSION:-0.13.0}
+    # `-chisel` is the ONLY published agent image: release.yml builds the
+    # agent in docker-publish-chisel only, never in the plain docker-publish
+    # matrix, so `yuzu-agent` has never existed at any tag and this service
+    # could never start. Same binary and entrypoint as the other images.
+    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.13.0}
     command:
       - "--server=gateway:50051"
       # No --ca-cert: the agent auto-discovers the install CA at

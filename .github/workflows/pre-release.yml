@@ -263,7 +263,7 @@ jobs:
                   condition: service_healthy
 
             agent:
-              image: $REGISTRY/yuzu-agent:$VERSION
+              image: $REGISTRY/yuzu-agent-chisel:$VERSION
               command:
                 - "--server"
                 - "gateway:50051"
@@ -948,7 +948,7 @@ jobs:
                 server:
                   condition: service_healthy
             agent:
-              image: $REGISTRY/yuzu-agent:$VERSION
+              image: $REGISTRY/yuzu-agent-chisel:$VERSION
               command: ["--server","gateway:50051","--no-tls"]
               depends_on: [gateway]
           COMPOSE
@@ -1114,7 +1114,7 @@ jobs:
                 server:
                   condition: service_healthy
             agent:
-              image: $REGISTRY/yuzu-agent:\${YUZU_VER}
+              image: $REGISTRY/yuzu-agent-chisel:\${YUZU_VER}
               command: ["--server","gateway:50051","--no-tls"]
               depends_on: [gateway]
           COMPOSE
