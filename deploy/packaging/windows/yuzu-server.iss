@@ -1,6 +1,6 @@
 ; Yuzu Server - Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-server.iss
-; Silent: YuzuServerSetup.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=Password123!
+; Silent: YuzuServerSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=Password123!
 ;
 ; Silent parameters:
 ;   /ADMIN_USER=name       Admin username (required)

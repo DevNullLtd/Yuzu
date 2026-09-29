@@ -1,6 +1,6 @@
 ; Yuzu Agent — Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-agent.iss
-; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SERVER=myserver:50051 /TOKEN=abc123
+; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=abc123
 
 #ifndef AppVersion
   #define AppVersion "0.7.0"

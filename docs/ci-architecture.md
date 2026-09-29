@@ -179,11 +179,12 @@ fails the release when:
   cause is a package left in a reused self-hosted workspace by an earlier
   build of another version.
 
-Recovery: find the offending file in the error, fix its source (clear the
-runner workspace, or fix the builder's naming), then re-run **all** jobs of
-the release run. "Re-run failed jobs" re-downloads the same build artifacts
-and fails the same way. If the build artifacts have expired, delete and
-re-push the tag. The gate has no override; the naming forms it checks are a
+Recovery: find the offending file in the error. For a stale file, clear the
+runner workspace and re-run **all** jobs of the release run ("Re-run failed
+jobs" re-downloads the same build artifacts and fails the same way). For a
+builder naming defect, a re-run builds the tag's original commit again, so
+fix the builder, then delete and re-push the tag at the fixed commit; do the
+same if the run's build artifacts have expired. The gate has no override; the naming forms it checks are a
 second copy of the builders' naming and its header lists where each lives.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)

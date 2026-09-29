@@ -158,7 +158,8 @@ config page), or fully unattended —
 Service name `YuzuAgent`.
 
 Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
-(add `/LOG=<path>` to keep a log). A silent uninstall removes the program but
+(add `/LOG=<path>` to keep a log; if the agent was installed to another
+directory, use the path in its `UninstallString` registry value). A silent uninstall removes the program but
 **keeps `%ProgramData%\Yuzu`**, which holds the agent's identity and its mTLS
 private key; an interactive uninstall asks. To decommission a device, revoke its
 certificate on the server (find its serial in `GET /api/v1/ca/issued`, then

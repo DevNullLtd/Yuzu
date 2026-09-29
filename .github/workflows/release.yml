@@ -2290,7 +2290,7 @@ jobs:
             /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
 
-          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed with \`/DIR=\`). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
+          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash
