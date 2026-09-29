@@ -21,14 +21,22 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include "updater_rpc_guard.hpp"
+
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
+#include <chrono>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include "agent.grpc.pb.h"
 #include <openssl/evp.h>
@@ -426,6 +434,68 @@ TEST_CASE("updater: with no trust bundle configured, signatures are not checked 
     auto r = updater.check_and_apply(h.stub.get());
     REQUIRE(r.has_value());
     CHECK(*r);
+}
+
+namespace {
+
+namespace apb = ::yuzu::agent::v1;
+
+/// CheckForUpdate handler that parks until released. NO Catch2 macros here (handler thread).
+class BlockingCheckService final : public apb::AgentService::Service {
+  public:
+    std::promise<void> release_p;
+    std::shared_future<void> release{release_p.get_future().share()};
+
+    grpc::Status CheckForUpdate(grpc::ServerContext*, const apb::CheckForUpdateRequest*,
+                                apb::CheckForUpdateResponse*) override {
+        release.wait();
+        return grpc::Status::OK;
+    }
+};
+
+} // namespace
+
+// #2182: stop() can land after the caller's last stop check but before the RPC context is
+// published; the guard must re-check the flag after publishing and cancel. With stop already
+// true at guard construction, the un-cancelled RPC would park in the handler forever.
+TEST_CASE("ActiveRpcCtxGuard cancels an RPC published after stop was requested",
+          "[updater][stop][2182]") {
+    BlockingCheckService svc;
+    int port = 0;
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&svc);
+    auto server = builder.BuildAndStart();
+    REQUIRE(server != nullptr);
+    REQUIRE(port != 0);
+
+    // Owned by the detached thread so a regression fails the bound, not the destructor.
+    struct State {
+        std::mutex mu;
+        std::atomic<void*> slot{nullptr};
+        std::atomic<bool> stop{true};
+        std::promise<grpc::StatusCode> code;
+        std::unique_ptr<apb::AgentService::Stub> stub;
+    };
+    auto st = std::make_shared<State>();
+    st->stub = apb::AgentService::NewStub(grpc::CreateChannel(
+        "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+    auto fut = st->code.get_future();
+    std::thread([st] {
+        grpc::ClientContext ctx;
+        yuzu::agent::ActiveRpcCtxGuard guard{st->mu, st->slot, ctx, st->stop};
+        apb::CheckForUpdateRequest req;
+        apb::CheckForUpdateResponse resp;
+        st->code.set_value(st->stub->CheckForUpdate(&ctx, req, &resp).error_code());
+    }).detach();
+
+    const bool returned = fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    // Always free the parked handler so no server thread stays blocked.
+    svc.release_p.set_value();
+    REQUIRE(returned);
+    CHECK(fut.get() == grpc::StatusCode::CANCELLED);
+    // CANCELLED (not UNAVAILABLE) shows the cancel, not a failed connect, ended the call.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds{2});
 }
 
 #endif // !_WIN32 — see the linkage note above (#3957)

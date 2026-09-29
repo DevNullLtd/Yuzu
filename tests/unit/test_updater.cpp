@@ -232,7 +232,39 @@ TEST_CASE("Updater::stop ends run_check_loop mid-interval", "[updater][stop][218
 TEST_CASE("Updater::run_check_loop returns at once when already stopped",
           "[updater][stop][2182]") {
     UpdateConfig config;
-    Updater updater(config, "agent-2182", "0.1.0", "linux", "x86_64", current_executable_path());
-    updater.stop();
-    CHECK_FALSE(updater.run_check_loop(nullptr, std::chrono::hours{1}));
+    auto updater = std::make_shared<Updater>(config, "agent-2182", "0.1.0", "linux", "x86_64",
+                                             current_executable_path());
+    updater->stop();
+
+    auto done = std::make_shared<std::promise<bool>>();
+    auto fut = done->get_future();
+    std::thread([updater, done] {
+        done->set_value(updater->run_check_loop(nullptr, std::chrono::hours{1}));
+    }).detach();
+
+    REQUIRE(fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    CHECK_FALSE(fut.get());
+}
+
+TEST_CASE("Updater::run_check_loop clamps an absurd or non-positive interval",
+          "[updater][stop][2182]") {
+    // seconds::max() would overflow wait_for's now()+interval; 0 and negative would spin.
+    // Either way stop() must still end the loop promptly.
+    for (auto interval : {std::chrono::seconds::max(), std::chrono::seconds{0},
+                          std::chrono::seconds{-5}}) {
+        UpdateConfig config;
+        auto updater = std::make_shared<Updater>(config, "agent-2182", "0.1.0", "linux",
+                                                 "x86_64", current_executable_path());
+        auto done = std::make_shared<std::promise<bool>>();
+        auto fut = done->get_future();
+        std::thread([updater, done, interval] {
+            done->set_value(updater->run_check_loop(nullptr, interval));
+        }).detach();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        updater->stop();
+
+        REQUIRE(fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+        CHECK_FALSE(fut.get());
+    }
 }
