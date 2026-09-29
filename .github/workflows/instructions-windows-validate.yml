@@ -39,17 +39,19 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Ensure Python deps (PyYAML for instructions_runner.py)
+      - name: Check Python deps (PyYAML for instructions_runner.py)
         run: |
           set -e
-          # Runner has /c/Python314/python.exe and /c/msys64/usr/bin/python3.
-          # instructions-tests.sh shells out to the MSYS2 python3, so PyYAML
-          # must be available there.
-          python3 -c "import yaml" 2>/dev/null && exit 0 || true
-          if command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed python-yaml || pip install --no-warn-script-location pyyaml
-          else
-            pip install --no-warn-script-location pyyaml
+          # instructions-tests.sh runs a bare `python3`, so that must be an
+          # interpreter with PyYAML. Never install it here: all Wee Tam runner
+          # slots share one OS identity, and a pacman/pip install changes the
+          # toolchain every other job on the box sees (an MSYS2 python3 would
+          # also take over meson's find_program('python3')). The provisioned
+          # interpreter, C:\Python314 (deploy/windows/Provision-Windows-Runner.ps1),
+          # has PyYAML but ships no python3.exe.
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            echo "::error::'python3' on this runner is not an interpreter with PyYAML, which instructions-tests.sh needs. This job does not install packages on the shared host: provide a python3 with PyYAML through runner provisioning instead."
+            exit 1
           fi
           python3 -c "import yaml; print('PyYAML', yaml.__version__)"
 
