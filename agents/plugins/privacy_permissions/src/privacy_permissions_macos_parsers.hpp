@@ -233,11 +233,6 @@ struct FileStamp {
     friend bool operator==(const FileStamp&, const FileStamp&) = default;
 };
 
-[[nodiscard]] constexpr bool read_unchanged(const FileStamp& before,
-                                            const FileStamp& after) noexcept {
-    return before == after;
-}
-
 // ── /Users home enumeration ─────────────────────────────────────────────
 
 /// The autoruns collect_user_launchagents rule: a real home is uid 500 or above (below is a

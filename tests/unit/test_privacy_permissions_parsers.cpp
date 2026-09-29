@@ -607,14 +607,14 @@ TEST_CASE("macos::classify_tcc_header: WAL is either version byte; the change co
     CHECK(refusal(h) == "not_sqlite");
 }
 
-TEST_CASE("macos::read_unchanged: every field of the file stamp matters",
+TEST_CASE("macos::FileStamp: every field of the file stamp matters",
           "[privacy_permissions][macos_parsers]") {
     const macos::FileStamp base{7, 4096, 1700000000, 500, 12};
-    CHECK(macos::read_unchanged(base, base));
+    CHECK(base == base);
     const auto changed = [&](auto mutate) {
         auto other = base;
         mutate(other);
-        return !macos::read_unchanged(base, other);
+        return base != other;
     };
     CHECK(changed([](auto& s) { s.inode += 1; }));
     CHECK(changed([](auto& s) { s.size += 1; }));

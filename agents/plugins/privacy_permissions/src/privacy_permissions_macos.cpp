@@ -118,17 +118,16 @@ std::string sqlite_errmsg(sqlite3* db) {
     return yuzu::util::safe_output_field(msg);
 }
 
-/// Opens `db_path` (default: the system TCC.db) read-only through an immutable URI (no lock, so no
+/// Opens `db_path` read-only through an immutable URI (no lock, so no
 /// busy timeout either), bounds the schema parse, applies sqlite's untrusted-database posture and
 /// makes the connection query-only. `deadline`, when given, is installed before the first prepare.
 /// On failure returns an empty handle and sets `failure` -- classified by
 /// macos::classify_tcc_sqlite_failure from the real result code, the VFS's own failed-syscall
 /// errno (sqlite3_system_errno) and sqlite3_errmsg, never a guessed diagnostic. A failed
-/// `PRAGMA query_only=1` is a failure too: the source is never read without it. `db_path` is a
-/// parameter so a unit test can force the exact open-failure branch deterministically against a
-/// path this process genuinely cannot open, without a non-FDA identity or the real TCC.db.
+/// `PRAGMA query_only=1` is a failure too: the source is never read without it. A unit test
+/// can force the open-failure branch with a path this process genuinely cannot open.
 DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
-                    std::string_view db_path = kTccDbPath, Deadline* deadline = nullptr) {
+                    std::string_view db_path, Deadline* deadline = nullptr) {
     sqlite3* raw = nullptr;
     const int rc = sqlite3_open_v2(macos::immutable_uri(db_path).c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX,
@@ -167,23 +166,8 @@ DbPtr open_readonly(std::optional<macos::SourceFailure>& failure,
     return db;
 }
 
-/// Move-only RAII owner for a POSIX DIR* (autoruns_macos.cpp's DirHandle shape): closedir()s
-/// exactly once, on every path, including an exception out of a walk callback. closedir() also
-/// closes the fd fdopendir() adopted.
-class DirHandle {
-public:
-    explicit DirHandle(DIR* d) noexcept : dir_(d) {}
-    ~DirHandle() {
-        if (dir_ != nullptr) ::closedir(dir_);
-    }
-    DirHandle(const DirHandle&) = delete;
-    DirHandle& operator=(const DirHandle&) = delete;
-    [[nodiscard]] DIR* get() const noexcept { return dir_; }
-    [[nodiscard]] bool valid() const noexcept { return dir_ != nullptr; }
-
-private:
-    DIR* dir_;
-};
+/// Owns the DIR* fdopendir() returns; closedir() also closes the fd it adopted.
+using DirHandle = std::unique_ptr<DIR, int (*)(DIR*)>;
 
 /// One descriptor's state: fstat, and the SQLite header when it is a regular file.
 struct FdSnapshot {
@@ -208,21 +192,8 @@ std::optional<FdSnapshot> snapshot_fd(int fd) {
 }
 
 /// True when a journal/WAL/shm file sits beside `path`, or its absence cannot be shown. lstat never
-/// blocks, so a planted FIFO is reported, not opened.
-///
-/// Test-coverage gap, stated rather than assumed away (code-review Functional-axis finding,
-/// round 1): the `errno != ENOENT && errno != ENOTDIR` branch (a refused sidecar lstat reported
-/// as "present", the conservative direction) has no direct test. It is not reachable by
-/// chmod'ing the sidecar file itself -- lstat()'s only permission check is search (x) access on
-/// the PARENT directory, never anything on the target file's own mode bits, and the parent here
-/// is the same directory the main TCC.db lstat (earlier in read_tcc_source) already succeeded
-/// against, so restricting it would break that earlier, already-tested step instead. A genuine
-/// non-ENOENT/ENOTDIR errno (EACCES from a restricted intermediate component, ELOOP from an
-/// actual symlink cycle in an earlier path segment, ENAMETOOLONG) would need a path shape this
-/// function does not construct on its own. Every OTHER lstat outcome this function can reach
-/// (present, ENOENT/ENOTDIR-absent, and every "present" node type including a planted FIFO) IS
-/// covered -- see the internals test suite's "anything that is not one quiescent rollback-mode
-/// SQLite file..." case.
+/// blocks, so a planted FIFO is reported, not opened. Untested gap: the refused-lstat branch
+/// (errno other than ENOENT/ENOTDIR) needs a path shape this function does not construct.
 bool sidecar_present(const std::string& path) {
     for (const auto suffix : macos::kSidecarSuffixes) {
         struct stat st{};
@@ -340,7 +311,7 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
     const auto reads = read_services(stmt.get(), deadline, bounds.row_cap);
     const auto last = snapshot_fd(fd.get());
     if (!last) return fail({unreadable, "read_failed"});
-    if (!macos::read_unchanged(first->stamp, last->stamp))
+    if (first->stamp != last->stamp)
         return fail({unreadable, "changed_during_read"});
     if (sidecar_present(path)) return fail({unreadable, "sidecar_present"});
     macos::append_tcc_source_rows(owner, reads, rows, acc);
@@ -350,25 +321,10 @@ void read_tcc_source(std::string_view owner, const std::string& path, bool missi
 /// collect_user_launchagents rule, decided by macos::is_user_home_entry): a directory entry, not
 /// a symlink, owned by uid >= 500, named by the directory itself. Failures that lose a whole
 /// user or the whole walk are reported as rows (never silence); the returned names are sorted
-/// for stable output. The fd and the DIR* are RAII-owned on every path, including an exception
-/// out of the walk callback.
+/// for stable output. The fd and the DIR* are RAII-owned on every path.
 ///
-/// Test-coverage gap, stated rather than assumed away (code-review Functional-axis finding,
-/// round 1): `users:fdopendir_errno_<n>`, `<user>:home_stat_errno_<n>` and `users:readdir_error`
-/// have no direct test. Each names a real POSIX failure mode (fdopendir()/fstatat()/readdir()
-/// returning an error on an already-successfully-opened directory), but none is practically
-/// reachable from a unit test without a fault-injection seam this function does not have --
-/// unlike `open_readonly`'s deadline or `read_all_sources`' budgets, `users_dir` is the only
-/// injected parameter here, and none of these three failures can be forced through it
-/// deterministically (they need resource exhaustion or a race, not a path). `users:truncated`
-/// (the `kMaxUserHomes` cap) is real and reachable but not covered either, for a different
-/// reason: `kMaxUserHomes` is a compile-time constant, not injected, so proving the cap would
-/// mean actually creating 4097 real directories per test run -- expensive, against this repo's
-/// test-efficiency discipline, for a single edge case. `classify_read_errno`-shaped classifiers
-/// elsewhere in this file ARE unit-tested in isolation; what is untested here is only whether
-/// these three specific syscalls, on this specific already-open directory, can actually fail
-/// this way in practice -- a lower-value case than the source-open path, which IS forceable
-/// (chmod 000 -- see the internals test suite) and IS covered.
+/// Untested gaps: `users:fdopendir_errno_<n>`, `<user>:home_stat_errno_<n>`, `users:readdir_error`
+/// (no fault-injection seam) and `users:truncated` (`kMaxUserHomes` is not injected).
 std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                               yuzu::shared::ConstraintAccumulator& acc,
                                               const std::string& users_dir = std::string{kUsersDir}) {
@@ -380,8 +336,8 @@ std::vector<std::string> enumerate_user_homes(std::vector<PermissionRow>& rows,
                                    "users:open_errno_" + std::to_string(err), acc));
         return names;
     }
-    DirHandle dir{::fdopendir(fd.get())};
-    if (!dir.valid()) {
+    DirHandle dir{::fdopendir(fd.get()), ::closedir};
+    if (!dir) {
         const int err = errno;
         rows.push_back(failure_row("macos", "-", "-", false,
                                    "users:fdopendir_errno_" + std::to_string(err), acc));
@@ -436,17 +392,9 @@ void read_all_sources(std::vector<PermissionRow>& rows, yuzu::shared::Constraint
 
 } // namespace
 
-// `collect_macos_permissions` itself (below) is excluded when
-// YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY is defined -- the seam
-// test_privacy_permissions_macos_internals.cpp uses to #include this TU directly and reach the
-// internal-linkage `open_readonly`/`read_tcc_source` for deterministic open-failure unit tests
-// (denied-path composition), without pulling collect_macos_permissions's own
-// symbol into a second definition. This TU never statically links the real plugin either way
-// (test_privacy_permissions_local_dispatcher.cpp loads it via PluginHandle::load/dlopen at
-// runtime), so a second compilation of the same free functions here creates no ODR/duplicate-
-// symbol conflict. Never defined by this TU's own (real) build -- meson.build does not set it.
-// Mirrors autoruns_macos.cpp's identical seam for YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
-// and execution_artifacts_win.cpp's TU-inclusion precedent.
+// Excluded under YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY: the seam
+// test_privacy_permissions_macos_internals.cpp uses to #include this TU and reach the
+// internal-linkage helpers (mirrors autoruns_macos.cpp). Never defined by the real build.
 #ifndef YUZU_PRIVACY_PERMISSIONS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 int collect_macos_permissions(yuzu::CommandContext& ctx) {
