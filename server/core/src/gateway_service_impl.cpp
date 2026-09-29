@@ -476,7 +476,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
-                              .token_error = auth::EnrollmentTokenError::not_found}};
+                              .token_error = auth::EnrollmentTokenError::not_found,
+                              .already_consumed_by = {}}};
             if (!consumed) {
                 spdlog::error("[gateway] Register: enrollment consume failed for agent {}",
                               info.agent_id());

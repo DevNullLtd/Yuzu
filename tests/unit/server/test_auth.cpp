@@ -1875,10 +1875,35 @@ TEST_CASE("deny pending agent", "[auth][pending][pg]") {
 TEST_CASE("remove pending agent", "[auth][pending][pg]") {
     EnrollFixture f;
     f.mgr.add_pending_agent("agent-3", "host3", "linux", "arm64", "0.1.0").value();
-    REQUIRE(f.mgr.remove_pending_agent("agent-3").value());
+    REQUIRE(f.mgr.remove_pending_agent("agent-3").value() == RemovePendingOutcome::removed);
     auto status = f.mgr.get_pending_status("agent-3");
     REQUIRE(status.has_value());
     REQUIRE_FALSE(status->has_value()); // absent
+    // A second remove of the now-absent row is not_found, not removed again.
+    REQUIRE(f.mgr.remove_pending_agent("agent-3").value() == RemovePendingOutcome::not_found);
+}
+
+TEST_CASE("remove pending agent refuses a denied or approved row", "[auth][pending][pg]") {
+    EnrollFixture f;
+    f.mgr.add_pending_agent("agent-4", "host4", "linux", "arm64", "0.1.0").value();
+    REQUIRE(f.mgr.deny_pending_agent("agent-4", "alice").value());
+    // Removing the DENIED row is refused — the denial holds (governance
+    // Finding 1: it would otherwise delete the guard kEnrollUpsertSql's
+    // `WHERE status <> 'denied'` depends on, with no audit trail).
+    REQUIRE(f.mgr.remove_pending_agent("agent-4").value() == RemovePendingOutcome::wrong_status);
+    auto status = f.mgr.get_pending_status("agent-4");
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    REQUIRE(**status == PendingStatus::denied);
+
+    f.mgr.add_pending_agent("agent-5", "host5", "linux", "arm64", "0.1.0").value();
+    REQUIRE(f.mgr.approve_pending_agent("agent-5", "alice").value());
+    // Removing the APPROVED row is refused too — no silent deregistration.
+    REQUIRE(f.mgr.remove_pending_agent("agent-5").value() == RemovePendingOutcome::wrong_status);
+    status = f.mgr.get_pending_status("agent-5");
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    REQUIRE(**status == PendingStatus::approved);
 }
 
 TEST_CASE("list_pending_agents", "[auth][pending][pg]") {

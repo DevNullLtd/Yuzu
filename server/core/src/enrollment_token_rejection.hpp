@@ -60,19 +60,25 @@ namespace yuzu::server {
 
 /// Sanitize an AGENT-SUPPLIED descriptive string (hostname / os / arch /
 /// agent_version, and the "auto-approve:<rule>" attribution) before it reaches
-/// the enrollment store: drop embedded NUL bytes and truncate to
-/// `auth::kMaxEnrollmentTextLength` on a UTF-8 code-point boundary. The store
-/// REJECTS out-of-bounds text (`StoreError::InvalidInput`); doing that at
-/// Register would turn a long or odd hostname into a permanent INVALID_ARGUMENT
-/// that strands an otherwise-legitimate agent forever. These fields are
-/// descriptive only (identity is `agent_id`, which keeps its hard reject), so
+/// the enrollment store: drop embedded NUL bytes and other ASCII control
+/// characters (0x00-0x1F, 0x7F — `\n`/`\r` in particular could otherwise forge
+/// additional lines in a plain-string audit/log detail once these fields reach
+/// one) and truncate to `auth::kMaxEnrollmentTextLength` on a UTF-8
+/// code-point boundary. The store REJECTS out-of-bounds text
+/// (`StoreError::InvalidInput`); doing that at Register would turn a long or
+/// odd hostname into a permanent INVALID_ARGUMENT that strands an otherwise-
+/// legitimate agent forever. These fields are descriptive only (identity is
+/// `agent_id`, which keeps its own hard reject on the same control-character
+/// class — see `agent_id_ok` in auth_db.cpp — because `agent_id` also feeds a
+/// comma-joined bulk-audit-detail list, which no field here does today), so
 /// lossy sanitising is the safe direction. Shared by Register + ProxyRegister.
 [[nodiscard]] inline std::string sanitize_enrollment_text(std::string_view s) {
     std::string out;
     out.reserve(s.size() < auth::kMaxEnrollmentTextLength ? s.size()
                                                           : auth::kMaxEnrollmentTextLength);
     for (const char c : s) {
-        if (c != '\0')
+        const auto u = static_cast<unsigned char>(c);
+        if (u > 0x1FU && u != 0x7FU)
             out.push_back(c);
     }
     if (out.size() > auth::kMaxEnrollmentTextLength) {

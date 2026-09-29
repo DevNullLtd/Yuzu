@@ -231,7 +231,7 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     REQUIRE(j["tokens"].size() == 3);
     CHECK(j["count"] == 3);
 
-    const auto row = h.only("enrollment.token_create_batch");
+    const auto row = h.only("enrollment.bulk_token_create");
     CHECK(row.result == "success");
     CHECK(row.detail.find("count=3") != std::string::npos);
     CHECK(row.detail.find("by=admin") != std::string::npos);
@@ -252,7 +252,7 @@ TEST_CASE("settings enrollment: batch create with the store down is a 503 A4 err
     auto j = nlohmann::json::parse(res->body);
     CHECK(j.contains("error"));
     CHECK(j["count"] == 0);
-    const auto row = h.only("enrollment.token_create_batch");
+    const auto row = h.only("enrollment.bulk_token_create");
     CHECK(row.result == "failure");
     CHECK(row.detail.find("minted_before_failure=0") != std::string::npos);
 }
@@ -291,6 +291,38 @@ TEST_CASE("settings enrollment: single approve / deny / remove each write an aud
     row = h.only("enrollment.approve");
     CHECK(row.result == "denied");
     CHECK(row.detail.find("agent_not_found") != std::string::npos);
+}
+
+TEST_CASE("settings enrollment: remove REFUSES a denied/approved row — 409, denied audit, row "
+          "persists",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    h.queue("a-denied");
+    h.queue("a-approved");
+    REQUIRE(h.auth_mgr.deny_pending_agent("a-denied", "admin").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent("a-approved", "admin").value());
+    h.audit_calls.clear();
+
+    // Removing the DENIED row is refused: 409, "denied" audit outcome, the
+    // row is still there and still denied (governance Finding 1).
+    auto res = h.sink.Delete("/api/settings/pending-agents/a-denied");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    auto row = h.only("enrollment.remove");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(row.detail.find("by=admin") != std::string::npos);
+    CHECK(h.status_of("a-denied") == auth::PendingStatus::denied);
+
+    // Removing the APPROVED row is refused too.
+    h.audit_calls.clear();
+    res = h.sink.Delete("/api/settings/pending-agents/a-approved");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    row = h.only("enrollment.remove");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(h.status_of("a-approved") == auth::PendingStatus::approved);
 }
 
 TEST_CASE("settings enrollment: approve/deny/remove with the store down are 503 + failure audit",

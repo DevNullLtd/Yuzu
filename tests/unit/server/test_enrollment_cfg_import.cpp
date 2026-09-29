@@ -34,6 +34,7 @@ namespace fs = std::filesystem;
 using yuzu::server::auth::AuthManager;
 using yuzu::server::auth::EnrollmentTokenError;
 using yuzu::server::auth::PendingStatus;
+using yuzu::server::auth::RemovePendingOutcome;
 using CEK = yuzu::server::auth::ConsumeEnrollResult::Kind;
 
 namespace {
@@ -391,15 +392,18 @@ TEST_CASE("import: restoring the SAME bytes after admin changes does NOT resurre
     const auto h = AuthManager::sha256_hex(raw);
     const std::string tokens_file =
         kHeaderTokens + token_line(h, "t", 5, 0, 1700000000, 0, false) + "\n";
+    // "gone" imports as still-pending — a hard remove only ever succeeds on a
+    // pending row (removing an approved/denied row is refused, see
+    // RemovePendingOutcome's doc comment).
     const std::string pending_file = kHeaderPending + pending_line("keep", "h", "approved") + "\n" +
-                                     pending_line("gone", "h", "approved") + "\n" +
+                                     pending_line("gone", "h", "pending") + "\n" +
                                      pending_line("flip", "h", "pending") + "\n";
     write_file(f.cfg_dir.path / "enrollment-tokens.cfg", tokens_file);
     write_file(f.cfg_dir.path / "pending-agents.cfg", pending_file);
     REQUIRE_FALSE(f.run(f.cfg_only()).fatal);
 
-    // The operator acts: remove an approved agent, deny another, revoke the token.
-    REQUIRE(f.mgr.remove_pending_agent("gone").value());
+    // The operator acts: remove a pending agent, deny another, revoke the token.
+    REQUIRE(f.mgr.remove_pending_agent("gone").value() == RemovePendingOutcome::removed);
     REQUIRE(f.mgr.deny_pending_agent("flip", "admin").value());
     const auto token_id = f.mgr.list_enrollment_tokens().value()[0].token_id;
     REQUIRE(f.mgr.revoke_enrollment_token(token_id).value());

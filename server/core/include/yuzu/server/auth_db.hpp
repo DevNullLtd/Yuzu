@@ -778,8 +778,11 @@ public:
     std::expected<std::vector<std::string>, StoreError>
     deny_all_pending(const std::string& principal);
 
-    /// Hard-delete a row. `true` = row existed.
-    std::expected<bool, StoreError> remove_pending(const std::string& agent_id);
+    /// Hard-delete a row, but ONLY when its status is `pending` — see
+    /// `auth::RemovePendingOutcome`'s doc comment for why an `approved`/`denied`
+    /// row is refused instead of deleted.
+    std::expected<auth::RemovePendingOutcome, StoreError>
+    remove_pending(const std::string& agent_id);
 
     // ── One-time legacy .cfg import (WS-6 6.2; see enrollment_cfg_import.hpp) ──
     //

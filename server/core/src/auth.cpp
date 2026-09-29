@@ -2458,8 +2458,9 @@ AuthManager::deny_all_pending_agents(const std::string& principal) {
         "bulk_deny", [&](yuzu::server::AuthDB& db) { return db.deny_all_pending(principal); });
 }
 
-std::expected<bool, StoreError> AuthManager::remove_pending_agent(const std::string& agent_id) {
-    return enrollment_store_call<bool>(
+std::expected<RemovePendingOutcome, StoreError>
+AuthManager::remove_pending_agent(const std::string& agent_id) {
+    return enrollment_store_call<RemovePendingOutcome>(
         "remove", [&](yuzu::server::AuthDB& db) { return db.remove_pending(agent_id); });
 }
 

@@ -239,9 +239,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // -- W1.4 / #827 atomic consume ------------------------------------
             // The prior validate_enrollment_token returned a bare bool with a
             // race window between "valid?" and "++use_count". Replaced with
-            // consume_enrollment_token which performs the check-and-increment
-            // under one unique_lock and reports the typed outcome so we can
-            // audit the lost-race case with attribution.
+            // consume_and_enroll (WS-6 6.2 folded the standalone
+            // consume-then-enroll pair into one atomic store transaction) which
+            // reports the typed outcome so we can audit the lost-race case with
+            // attribution.
             // WS-6 6.2: shape pre-check BEFORE the consume (pre-auth Postgres
             // amplification: a caller-supplied junk token must not cost a write
             // txn). A shape-invalid token cannot exist, so it is answered exactly
@@ -261,7 +262,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
-                              .token_error = auth::EnrollmentTokenError::not_found}};
+                              .token_error = auth::EnrollmentTokenError::not_found,
+                              .already_consumed_by = {}}};
             if (!consumed) {
                 spdlog::error("Register: enrollment consume failed for agent {}", info.agent_id());
                 return enrollment_store_status(consumed.error());

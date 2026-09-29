@@ -367,12 +367,14 @@ struct EnrollmentToken {
     /// every successful consume so the lost-race audit detail can name the
     /// winner ("already_consumed_by=<agent_id>"). Empty on a freshly-created
     /// token or on a multi-use token before its first consume. Never the
-    /// raw token — only the agent_id presented to consume_enrollment_token.
+    /// raw token — only the agent_id presented to `consume_and_enroll`.
     std::string last_consumed_by_agent_id;
 };
 
-/// Typed rejection reason for `AuthManager::consume_enrollment_token`
-/// (W1.4 / #827). Naming style matches W1.2's `DeviceTokenValidateError`
+/// Typed rejection reason for `AuthManager::consume_and_enroll` (the token-half
+/// of its outcome; W1.4 / #827, folded into the atomic consume-and-enroll by
+/// WS-6 6.2 — see `ConsumeEnrollResult` below). Naming style matches W1.2's
+/// `DeviceTokenValidateError`
 /// (snake_case variants) so SIEM filters can grep across both. Variants
 /// are operator-facing — they surface in audit `detail` rows and as
 /// Prometheus label values; the public wire shape is uniform ("invalid,
@@ -399,8 +401,9 @@ enum class EnrollmentTokenError {
     internal_error,
 };
 
-/// Successful claim returned from `AuthManager::consume_enrollment_token`.
-/// Carries enough context for the success-path audit row and for telling
+/// Successful claim, carried in `ConsumeEnrollResult::claim` on the `enrolled`
+/// outcome of `AuthManager::consume_and_enroll`. Carries enough context for
+/// the success-path audit row and for telling
 /// "this consume won an actual race" from "this consume was uncontested".
 /// `prior_use_count` is the use_count BEFORE this consume — when it's > 0
 /// for a max_uses > 1 token, this consume shared the token with prior
@@ -480,6 +483,22 @@ struct PendingAgent {
     std::string agent_version;
     std::chrono::system_clock::time_point requested_at;
     PendingStatus status;
+};
+
+/// Outcome of `AuthDB::remove_pending`/`AuthManager::remove_pending_agent` (a hard
+/// delete). A plain bool cannot distinguish "no such row" from "a row exists but
+/// isn't `pending`" — and that distinction is load-bearing: the store only ever
+/// hard-deletes a row whose status is `pending`, so a caller (and the audit row)
+/// must be able to tell a refused reversal of an admin decision apart from a
+/// plain not-found. Removing a `denied` row would delete the very guard
+/// `kEnrollUpsertSql`'s `WHERE status <> 'denied'` depends on (the agent's
+/// still-valid token could then re-enroll it with no audit trail explaining the
+/// reversal); removing an `approved` row would silently deregister an enrolled
+/// agent with no admin decision behind it.
+enum class RemovePendingOutcome : std::uint8_t {
+    removed,      ///< The row existed, was `pending`, and was deleted.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
 };
 
 class AuthManager {
@@ -1005,8 +1024,11 @@ public:
     [[nodiscard]] std::expected<std::vector<std::string>, StoreError>
     deny_all_pending_agents(const std::string& principal);
 
-    /// Remove a pending agent entry (hard delete). `true` = the row existed.
-    [[nodiscard]] std::expected<bool, StoreError> remove_pending_agent(const std::string& agent_id);
+    /// Remove a pending agent entry (hard delete). Only a `pending` row is ever
+    /// deleted — see `RemovePendingOutcome`'s doc comment for why an
+    /// `approved`/`denied` row must be REFUSED, not silently reversed.
+    [[nodiscard]] std::expected<RemovePendingOutcome, StoreError>
+    remove_pending_agent(const std::string& agent_id);
 
     // -- Crypto primitives (platform-abstracted) --------------------------
 

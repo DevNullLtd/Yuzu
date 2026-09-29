@@ -2072,17 +2072,33 @@ bool read_pending_row(PGresult* res, int row, auth::PendingAgent& out) {
     return true;
 }
 
+/// True if `s` contains a byte that could corrupt a plain-string audit
+/// `detail` field or the comma-joined `bulk_audit_detail` list this store's
+/// caller (`settings_routes.cpp`) builds from `agent_id`s it reads back: any
+/// ASCII control character (0x00-0x1F, 0x7F — this subsumes `has_embedded_nul`;
+/// `\n`/`\r` in particular can forge additional log/audit lines) or a literal
+/// comma (the `bulk_audit_detail` delimiter). `agent_id` is the one field this
+/// store hard-rejects rather than sanitises (see `sanitize_enrollment_text`'s
+/// doc comment for why descriptive fields differ), so this is the single
+/// chokepoint — extend it, never add per-call-site escaping.
+bool has_audit_unsafe_byte(std::string_view s) {
+    for (const unsigned char c : s) {
+        if (c <= 0x1FU || c == 0x7FU || c == ',')
+            return true;
+    }
+    return false;
+}
+
+bool agent_id_ok(const std::string& id) {
+    return !id.empty() && id.size() <= auth::kMaxAgentIdLength && !has_audit_unsafe_byte(id);
+}
+
 bool pending_fields_ok(const auth::PendingAgent& a) {
-    return !a.agent_id.empty() && a.agent_id.size() <= auth::kMaxAgentIdLength &&
-           !has_embedded_nul(a.agent_id) &&
+    return agent_id_ok(a.agent_id) &&
            text_ok(a.hostname, AuthDB::kMaxEnrollmentTextLength) &&
            text_ok(a.os, AuthDB::kMaxEnrollmentTextLength) &&
            text_ok(a.arch, AuthDB::kMaxEnrollmentTextLength) &&
            text_ok(a.agent_version, AuthDB::kMaxEnrollmentTextLength);
-}
-
-bool agent_id_ok(const std::string& id) {
-    return !id.empty() && id.size() <= auth::kMaxAgentIdLength && !has_embedded_nul(id);
 }
 
 bool principal_ok(const std::string& p) {
@@ -2510,18 +2526,54 @@ AuthDB::deny_all_pending(const std::string& principal) {
     return bulk_transition(impl_->pool, kWriteTimeout, to_status_sql(false), principal);
 }
 
-std::expected<bool, StoreError> AuthDB::remove_pending(const std::string& agent_id) {
+std::expected<auth::RemovePendingOutcome, StoreError>
+AuthDB::remove_pending(const std::string& agent_id) {
     if (!agent_id_ok(agent_id))
         return std::unexpected(StoreError::InvalidInput);
+    // ADR-0012 bounded-acquire discipline: acquire via try_acquire_for, then
+    // hand the lease straight to with_txn_on with nothing in between (its own
+    // doc comment's three rules).
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(), "DELETE FROM auth.pending_agents WHERE agent_id = $1 RETURNING agent_id",
-        std::vector<std::string>{agent_id});
-    if (res.status() != PGRES_TUPLES_OK)
+
+    auth::RemovePendingOutcome outcome = auth::RemovePendingOutcome::not_found;
+    bool query_ok = true;
+    const bool committed = impl_->pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        // Only ever hard-delete a row that is STILL `pending` — never a row an
+        // admin already denied or approved (see RemovePendingOutcome's doc
+        // comment for why either reversal is dangerous).
+        pg::PgResult del = pg::exec_params(
+            conn,
+            "DELETE FROM auth.pending_agents WHERE agent_id = $1 AND status = 'pending' "
+            "RETURNING agent_id",
+            std::vector<std::string>{agent_id});
+        if (del.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        if (PQntuples(del.get()) > 0) {
+            outcome = auth::RemovePendingOutcome::removed;
+            return true;
+        }
+        // Nothing matched the guarded delete: tell "no such row" apart from "a
+        // row exists but isn't pending" for the caller's audit row.
+        pg::PgResult remaining = pg::exec_params(
+            conn, "SELECT 1 FROM auth.pending_agents WHERE agent_id = $1",
+            std::vector<std::string>{agent_id});
+        if (remaining.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        outcome = PQntuples(remaining.get()) > 0 ? auth::RemovePendingOutcome::wrong_status
+                                                  : auth::RemovePendingOutcome::not_found;
+        return true; // no row touched; still a clean, committable no-op txn
+    });
+    if (!committed || !query_ok)
         return std::unexpected(StoreError::QueryFailed);
-    return PQntuples(res.get()) > 0;
+    if (outcome == auth::RemovePendingOutcome::removed)
+        spdlog::info("Pending agent {} removed from enrollment queue", agent_id);
+    return outcome;
 }
 
 

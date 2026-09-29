@@ -607,6 +607,7 @@ using CEK = yuzu::server::AuthDB::ConsumeEnrollResult::Kind;
 using yuzu::server::auth::EnrollmentTokenError;
 using yuzu::server::auth::PendingAgent;
 using yuzu::server::auth::PendingStatus;
+using yuzu::server::auth::RemovePendingOutcome;
 
 PendingAgent mk_agent(const std::string& id, const std::string& host = "host") {
     PendingAgent a;
@@ -756,6 +757,11 @@ TEST_CASE("AuthDB consume_and_enroll: admin-denied agent rolls the token use bac
     REQUIRE(tok.has_value());
     REQUIRE(h.db.add_pending(mk_agent("evil")).value());
     REQUIRE(h.db.deny_pending("evil", "alice").value());
+
+    // An attempted removal of the denied row is REFUSED (Fix 1) — the denial
+    // holds, so the token below still cannot re-enroll the agent.
+    CHECK(h.db.remove_pending("evil").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("evil") == PendingStatus::denied);
 
     auto r = h.db.consume_and_enroll(tok->raw_token, "evil", "h", "", "", "");
     REQUIRE(r.has_value());
@@ -925,9 +931,30 @@ TEST_CASE("AuthDB enrollment store rejects out-of-bounds input", "[pg][auth_db][
     CHECK(bad(h.db.approve_all_pending("")));
     CHECK(bad(h.db.remove_pending("")));
     CHECK(bad(h.db.revoke_token("")));
-    // None of it reached the tables.
+
+    // agent_id charset (Fix 3, #compliance-officer Finding 2 / UP-3): a comma
+    // would corrupt the comma-joined bulk_audit_detail list; \n/\r could forge
+    // additional lines in a plain-string audit detail. Rejected everywhere
+    // agent_id reaches the store, not just at one call site.
+    CHECK(bad(h.db.add_pending(mk_agent("agent,evil"))));
+    CHECK(bad(h.db.add_pending(mk_agent("agent\nevil"))));
+    CHECK(bad(h.db.add_pending(mk_agent("agent\revil"))));
+    CHECK(bad(h.db.pending_status("agent,evil")));
+    CHECK(bad(h.db.approve_pending("agent,evil", "alice")));
+    CHECK(bad(h.db.deny_pending("agent\nevil", "alice")));
+    CHECK(bad(h.db.remove_pending("agent,evil")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "agent,evil", "h", "", "", "")));
+    CHECK(bad(h.db.consume_and_enroll(tok, "agent\nevil", "h", "", "", "")));
+
+    // Legitimate agent_id shapes (UUID, hostname-derived with dots/hyphens)
+    // still pass — the guard is not over-restrictive.
+    REQUIRE(h.db.add_pending(mk_agent("550e8400-e29b-41d4-a716-446655440000")).value());
+    REQUIRE(h.db.add_pending(mk_agent("host-01.example.com")).value());
+
+    // None of the rejected calls reached the tables (beyond the two valid
+    // adds just made above).
     CHECK(h.db.list_tokens().value().empty());
-    CHECK(h.db.list_pending().value().empty());
+    CHECK(h.db.list_pending().value().size() == 2);
 }
 
 TEST_CASE("AuthDB pending agents: add, five-state lookup, approve/deny/remove, ensure_enrolled",
@@ -980,10 +1007,21 @@ TEST_CASE("AuthDB pending agents: add, five-state lookup, approve/deny/remove, e
     CHECK(**h.db.pending_status("was-pending") == PendingStatus::approved);
     CHECK(scalar(h.conn.get(), "SELECT hostname FROM auth.pending_agents WHERE agent_id='was-pending'") == "hP");
 
-    // remove: hard delete
-    CHECK(h.db.remove_pending("agent-abc").value());
-    CHECK_FALSE(h.db.remove_pending("agent-abc").value());
-    CHECK_FALSE(h.db.pending_status("agent-abc").value().has_value());
+    // remove: hard delete, but ONLY a still-`pending` row.
+    REQUIRE(h.db.add_pending(mk_agent("to-remove", "hR")).value());
+    CHECK(h.db.remove_pending("to-remove").value() == RemovePendingOutcome::removed);
+    CHECK(h.db.remove_pending("to-remove").value() == RemovePendingOutcome::not_found);
+    CHECK_FALSE(h.db.pending_status("to-remove").value().has_value());
+
+    // remove REFUSES a denied row — the denial holds, no silent reversal
+    // (governance Finding 1: removing it would delete the very guard
+    // kEnrollUpsertSql's `WHERE status <> 'denied'` depends on).
+    CHECK(h.db.remove_pending("agent-abc").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("agent-abc") == PendingStatus::denied);
+
+    // remove REFUSES an approved row too — no silent deregistration.
+    CHECK(h.db.remove_pending("agent-xyz").value() == RemovePendingOutcome::wrong_status);
+    CHECK(**h.db.pending_status("agent-xyz") == PendingStatus::approved);
 }
 
 TEST_CASE("AuthDB bulk approve/deny transitions only currently-pending rows",
