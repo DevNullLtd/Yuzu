@@ -2378,6 +2378,15 @@ public:
                             // Per-iteration: the dtor retracts it under ctx_mu_ at the end of
                             // this loop body, before `ctx` is destroyed.
                             CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx};
+                            // Re-check after publishing. cancel_ctx() takes the same ctx_mu_ the
+                            // CtxSlot ctor publishes under, and teardown sets heartbeat_stop_ /
+                            // stop_requested_ BEFORE calling it, so either cancel_ctx() saw the
+                            // published slot and cancelled, or this re-check sees the flag. Without
+                            // it a teardown landing between the check above and the publish cancels
+                            // nothing, and the deadline-less Heartbeat RPC (#3989) wedges the join.
+                            // The break leaves the loop; ~CtxSlot retracts the slot (ctx dies after).
+                            if (should_stop())
+                                break;
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
