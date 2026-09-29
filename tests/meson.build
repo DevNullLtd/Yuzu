@@ -546,6 +546,8 @@ agent_test_exe = executable(
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure PAM/login.defs/auditd/pwpolicy parsers, no OS call (Linux+macOS legs; sudoers/secedit follow in their own PR's test file)
+    'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -572,6 +574,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
@@ -749,6 +752,7 @@ agent_test_exe = executable(
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
+                local_security_policy_plugin_lib,  # Wave 8 PR8.3
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
