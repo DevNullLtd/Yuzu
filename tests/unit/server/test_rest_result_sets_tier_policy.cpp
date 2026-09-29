@@ -167,7 +167,7 @@ struct Harness {
             /*stream_budget=*/nullptr,
             [](const auth::Session&) -> yuzu::server::authz::VisibleSet { return std::nullopt; },
             /*list_read_fn=*/{}, /*fleet_read_fn=*/{}, /*agents_fn=*/{},
-            /*response_visible_set_fn=*/{}, /*dex_visible_fn=*/{},
+            /*response_visible_set_fn=*/{},
             /*verify_api=*/{}, /*device_api=*/{}, /*dex_api=*/{}, /*dex_perf_api=*/{},
             /*guardian_api=*/{}, tier_policy_fn_wired ? tier_policy_fn : TierPolicyFn{});
     }

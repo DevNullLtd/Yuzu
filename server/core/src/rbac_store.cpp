@@ -528,7 +528,23 @@ void RbacStore::seed_defaults() {
         return true;
     };
 
-    // Durable meta defaults — never clobber a migrated value (DO NOTHING).
+    // Durable meta defaults — never clobber a migrated value (DO NOTHING),
+    // so this literal ONLY ever takes effect on a database that has never
+    // run this code before (a genuine fresh install) — an existing
+    // install's row is already written and untouched by this INSERT.
+    // Still 'false' here: main.cpp's fresh-start bootstrap
+    // (`RbacStore::provision_first_admin`, the sole production seeder)
+    // already guarantees a fresh install's first operator ends up with a
+    // durable Administrator grant before the server ever starts serving,
+    // so flipping this literal to 'true' would
+    // be MECHANICALLY safe on its own — but a large, separately-scoped
+    // swath of the existing test suite implicitly depends on a freshly
+    // constructed RbacStore seeding 'false' (rather than setting the flag
+    // explicitly), and bringing that suite up to date is deliberately
+    // deferred to a follow-up change rather than riding along here. See
+    // docs/adr/1008-rbac-management-groups-target-architecture.md's
+    // fresh-install bootstrap delivery note for what is and is not shipped
+    // in this delivery.
     exec("INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('rbac_enabled','false') "
          "ON CONFLICT (key) DO NOTHING");
     exec("INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('write_generation','0') "
@@ -2148,6 +2164,55 @@ std::expected<bool, std::string> RbacStore::unassign_role(const std::string& pri
         return std::unexpected(outcome.err.empty() ? "unassign_role failed" : outcome.err);
     apply_local_generation(*outcome.new_gen);
     return outcome.removed;
+}
+
+// See rbac_store.hpp for the full contract. Thin delegation to
+// `RbacAdminAuthorityOwner::provision_first_admin` (rbac_admin_authority_owner.cpp),
+// the ADR-0012 §3 cross-schema query owner — mirrors `unassign_role`'s own
+// delegation pattern exactly (this file constructs the owner per call,
+// never caches it).
+std::expected<bool, std::string> RbacStore::provision_first_admin(const std::string& username,
+                                                                   const std::string& password_hash,
+                                                                   const std::string& salt_hex) {
+    if (!open_)
+        return std::unexpected("database not open");
+    const RbacAdminAuthorityOwner::ProvisionFirstAdminOutcome outcome =
+        RbacAdminAuthorityOwner{pool_}.provision_first_admin(username, password_hash, salt_hex);
+    if (!outcome.ok) {
+        // `outcome.err` is empty when `run_in_txn` (via `with_txn_for`)
+        // returns false without the lambda itself having set it. That
+        // covers a PRE-lambda failure (pool-acquire timeout, connect
+        // backoff, BEGIN failure) AND a POST-lambda failure the lambda
+        // never observes: the PQTRANS_INTRANS abort-guard, or a later
+        // `PgTxn::commit()` failure (`PgTxn` holds only a bare `PGconn*`,
+        // no `PgPool&`, so it cannot call `set_error`). In the commit-
+        // failure case the mutation may already be durably committed
+        // server-side (ack loss — see the pre-flight/post-write comment
+        // above) even though this branch reports failure. `pool_.last_error()`
+        // is best-effort extra detail, not a reliable diagnosis of which of
+        // these occurred, so the fallback message names the symptom
+        // ("transaction did not complete") rather than a specific cause.
+        if (outcome.err.empty()) {
+            const std::string pool_err = pool_.last_error();
+            return std::unexpected(pool_err.empty() ? "provision_first_admin failed: "
+                                                       "transaction did not complete "
+                                                       "(no further detail)"
+                                                     : "provision_first_admin failed: " + pool_err);
+        }
+        return std::unexpected(outcome.err);
+    }
+    if (!outcome.provisioned)
+        return false; // ordinary no-op — not the first account, nothing to apply
+    // `!outcome.new_gen` is unreachable while `provisioned` (set by the
+    // outer `result.provisioned = provisioned && ok;` tail assignment, not
+    // by the lambda directly) implies the WHOLE transaction — grant INSERT
+    // and generation bump both — committed successfully; guards the
+    // dereference below if that ever changes — mirrors unassign_role's own
+    // `!outcome.new_gen` unreachable note.
+    if (!outcome.new_gen)
+        return std::unexpected("internal error: applied provisioning missing its generation bump");
+    apply_local_generation(*outcome.new_gen);
+    return true;
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────

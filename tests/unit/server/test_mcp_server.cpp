@@ -1188,15 +1188,6 @@ struct McpTestServer {
     /// field (read LIVE at request time via the wiring lambda below).
     DexFleet dex_fleet_for_test;
 
-    /// #4035 hardening (governance) — the visible-agent-set resolver for
-    /// get_dex_app/get_dex_overview (ADR-0017 World A confinement,
-    /// independent of the service-scoped-token deny belt). nullopt (default)
-    /// = unfiltered, matching every EXISTING test in this file. Ignores
-    /// `username` — this stub doesn't model per-username resolution, only
-    /// whether the caller's set is engaged (read LIVE at request time via the
-    /// wiring lambda below).
-    std::optional<std::set<std::string>> dex_visible_for_test;
-
     /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
     /// hoisted to a member (was a start()-local) so a test can read its #3564
     /// short-circuit witness `lookup_calls` — asserting an out-of-scope
@@ -1534,12 +1525,13 @@ private:
             mcp.set_dex_perf_api(std::make_shared<yuzu::server::test::FnDexPerfApi>(
                 dex_perf_fn_for_test, app_perf_providers_for_test));
 
-        // #4035 hardening (governance): same setter idiom, reads
-        // dex_visible_for_test LIVE at request time (see that field's doc
-        // comment) — unconditional, no-op-shaped default for every
-        // pre-existing test.
-        mcp.set_dex_visible_fn(
-            [this](const std::string&) { return dex_visible_for_test; });
+        // #4035 hardening (governance)'s bespoke `set_dex_visible_fn` wiring,
+        // and the WS-A4 PR-1 first/second fix rounds' migration of
+        // get_dex_app/get_dex_overview/get_dex_signal_detail onto
+        // `fleet_read_fn_` as their sole gate, are ALL RETIRED (reverted to
+        // base gating). Those three
+        // tools gate on `perm_fn` + `deny_fleet_wide_service_scoped` again —
+        // see each tool's own test for the current coverage shape.
 
         // #3685: the Destructive-targeting classifier ALSO rides a setter,
         // same pattern as the two above — wire before the handlers are
@@ -7560,9 +7552,16 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
-// SEC-3 sibling class (Gate 8 review): a service-scoped token must not read
-// the fleet-wide devices[] this tool returns — mirrors the REST sibling
-// GET /api/v1/dex/signals/{obs_type} deny.
+// WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
+// back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
+// worth of fleet-read-gate coverage this test replaced (a fixture-faked
+// FleetReadGate denial, then a real AuthRoutes/RbacStore/ManagementGroupStore
+// rig proving an admitted-but-confined caller is refused) no longer applies
+// — neither `fleet_read_fn_for_test` nor `ResponseExecutionAuthzPgRig` is a
+// call site of this tool's gate anymore. Restored to base's own coverage:
+// a service-scoped token is denied via the tool's own stub-driven
+// `deny_fleet_wide_service_scoped` call, same class as the REST sibling GET
+// /api/v1/dex/signals/{obs_type} deny.
 TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
           "denial audited",
           "[pg][mcp][integration][dex][security]") {
@@ -7595,6 +7594,13 @@ TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
     }
     CHECK(saw_denied);
 }
+
+// WS-A4 PR-1 Gate 7 fix round: the `fleet_read_fn_`-scope
+// boundary/unwired coverage this test, the sibling get_dex_app/
+// get_dex_overview "unwired fleet_read_fn_" tests, and the get_dex_app
+// engine-principal test provided is retired — `fleet_read_fn_` is no
+// longer one of these three tools' gates at all (reverted to base's
+// `perm_fn` + `deny_fleet_wide_service_scoped`).
 
 // ── #4035 (api-parity #2146 Batch A): get_dex_device_score — the MCP-only gap ──
 //    closing GET /api/v1/dex/devices/{id}'s REST-only twin. Per-device SCOPED
@@ -7946,6 +7952,12 @@ TEST_CASE("MCP DEX: get_dex_device_app_perf out-of-scope device -> 403, no provi
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX MCP twins ═══
 
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — a service-scoped token
+// is denied via the tool's own `deny_fleet_wide_service_scoped` call. The
+// round-1/round-2 "gate denial -> no data" (fixture-faked FleetReadGate)
+// and "refuses an admitted-but-confined caller" (canned-FleetReadGate-
+// lambda ADR-0017 INV-3 coverage) tests are retired — `fleet_read_fn_` is
+// no longer this tool's gate.
 TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.view, "
           "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
@@ -7985,46 +7997,6 @@ TEST_CASE("MCP DEX: get_dex_app returns the blast-radius shape, audits dex.app.v
         R"({"jsonrpc":"2.0","method":"tools/call","id":973,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe"}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap — get_dex_app's devices[] previously ALWAYS passed
-// visible=nullptr to the shared builder, the same defect as its REST twin
-// (see test_rest_guaranteed_state.cpp's matching regression test).
-TEST_CASE("MCP DEX: get_dex_app devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "sa1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "sa2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.start("readonly");
-
-    auto unconfined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9721,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    CHECK(upayload["devices"].size() == 2);
-
-    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
-    auto confined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9722,"params":{"name":"get_dex_app","arguments":{"name":"chrome.exe","window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    auto cpayload =
-        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(cpayload["devices"].is_array());
-    CHECK(cpayload["devices"].size() == 1);
-    CHECK(cpayload["devices"][0]["agent_id"] == "WS-1");
-    for (const auto& d : cpayload["devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregate)",
@@ -8081,6 +8053,96 @@ TEST_CASE("MCP DEX: get_dex_catalogue_group returns the family drill, unknown fa
     CHECK(unknown->body.find("-32602") != std::string::npos);
 }
 
+// ADR-0031 WS-A4 PR-1: get_dex_catalogue -- the Catalogue
+// View 1 family cards. Cross-checks the SAME shape GET /api/v1/dex/catalogue
+// serves (both call dex_api_->catalogue(...) / dex_catalogue_json, Rule 1).
+TEST_CASE("MCP DEX: get_dex_catalogue returns the family cards, bad os -> invalid params",
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "e1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":977,"params":{"name":"get_dex_catalogue","arguments":{"os":"all","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["os"] == "all");
+    CHECK(payload["window"] == "all");
+    CHECK(payload["total_types"].get<int>() > 0);
+    bool saw_app_reliability = false;
+    for (const auto& f : payload["families"])
+        if (f["name"] == "App reliability")
+            saw_app_reliability = true;
+    CHECK(saw_app_reliability);
+    // Aggregate exemption -- no per-agent identity anywhere in the payload.
+    CHECK(body["result"]["content"][0]["text"].get<std::string>().find("WS-1") ==
+         std::string::npos);
+
+    auto bad_os = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":978,"params":{"name":"get_dex_catalogue","arguments":{"os":"solaris"}}})");
+    REQUIRE(bad_os);
+    CHECK(bad_os->body.find("-32602") != std::string::npos);
+}
+
+// Fix 2 (WS-A4 PR-1 fix round, sec-5): a degraded fleet signal-summary read
+// must never render as a healthy, zero-event catalogue -- an error, matching
+// the REST twin's 503 and get_dex_device_score's own degrade branch. DROP
+// TABLE forces the fleet-wide read to degrade while the store stays open.
+TEST_CASE("MCP DEX: get_dex_catalogue reports a degraded read as an error, never a "
+          "healthy zero-event catalogue",
+          "[pg][mcp][integration][dex][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":979,"params":{"name":"get_dex_catalogue","arguments":{"os":"all","window":"all"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("\"result\"") == std::string::npos);
+    CHECK(res->body.find("\"error\"") != std::string::npos);
+}
+
+// tools/list must advertise get_dex_catalogue with an inputSchema/outputSchema
+// (the generic malformed-schema net at "tool families cover exactly the
+// tools/list surface" above already proves every kTools[] entry parses; this
+// targets the specific tool by name).
+TEST_CASE("MCP DEX: get_dex_catalogue is listed with schemas", "[mcp][dex]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    bool found = false;
+    for (const auto& t : tools) {
+        if (t["name"] != "get_dex_catalogue")
+            continue;
+        found = true;
+        REQUIRE(t.contains("inputSchema"));
+        REQUIRE(t.contains("outputSchema"));
+        REQUIRE(t.contains("annotations"));
+        CHECK(t["annotations"]["readOnlyHint"].get<bool>());
+        CHECK_FALSE(t["annotations"]["destructiveHint"].get<bool>());
+        CHECK(t["annotations"]["idempotentHint"].get<bool>());
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP DEX: get_dex_health suppressed with no reporting agents, real fleet -> real score",
           "[pg][mcp][integration][dex]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
@@ -8129,6 +8191,10 @@ TEST_CASE("MCP DEX: get_dex_trends returns families + days, no audit (aggregate)
     CHECK(ts.audit_log.back() == "mcp.get_dex_trends|success");
 }
 
+// WS-A4 PR-1 Gate 7 fix round: restored to base's own coverage — see get_dex_app's
+// equivalent test for the full rationale (the round-1/round-2 gate-denial
+// and admitted-but-confined tests this replaces relied on `fleet_read_fn_`,
+// which is no longer this tool's gate).
 TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overview.view, "
           "service-scoped token denied",
           "[pg][mcp][integration][dex]") {
@@ -8160,6 +8226,7 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
             saw_view = true;
     CHECK(saw_view);
 
+    // service-scoped token -> 403, no data.
     McpTestServer ts2;
     ts2.guaranteed_state_store_for_test = &store;
     ts2.mock_token_scope_service = "printers";
@@ -8168,46 +8235,6 @@ TEST_CASE("MCP DEX: get_dex_overview returns the fleet summary, audits dex.overv
         R"({"jsonrpc":"2.0","method":"tools/call","id":981,"params":{"name":"get_dex_overview","arguments":{}}})");
     REQUIRE(denied);
     CHECK(denied->body.find("chrome.exe") == std::string::npos);
-}
-
-// #4035 hardening (governance): closure evidence for the ADR-0017 World A
-// confinement gap on get_dex_overview's top_devices[] — same defect class
-// and same fix as get_dex_app above.
-TEST_CASE("MCP DEX: get_dex_overview top_devices[] confined to the caller's visible set "
-          "(ADR-0017 World A — regression coverage for the governance fix)",
-          "[pg][mcp][integration][dex][scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    mcp_seed_obs(store, "st1", "WS-1", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T10:00:00Z");
-    mcp_seed_obs(store, "st2", "WS-2", "process.crashed", "chrome.exe", "windows",
-                 "2026-06-10T11:00:00Z");
-    McpTestServer ts;
-    ts.guaranteed_state_store_for_test = &store;
-    ts.start("readonly");
-
-    auto unconfined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9801,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(unconfined);
-    auto ubody = nlohmann::json::parse(unconfined->body);
-    auto upayload =
-        nlohmann::json::parse(ubody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(upayload["top_devices"].is_array());
-    CHECK(upayload["top_devices"].size() == 2);
-
-    ts.dex_visible_for_test = std::set<std::string>{"WS-1"};
-    auto confined = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":9802,"params":{"name":"get_dex_overview","arguments":{"window":"all"}}})");
-    REQUIRE(confined);
-    auto cbody = nlohmann::json::parse(confined->body);
-    auto cpayload =
-        nlohmann::json::parse(cbody["result"]["content"][0]["text"].get<std::string>());
-    REQUIRE(cpayload["top_devices"].is_array());
-    CHECK(cpayload["top_devices"].size() == 1);
-    CHECK(cpayload["top_devices"][0]["agent_id"] == "WS-1");
-    for (const auto& d : cpayload["top_devices"])
-        CHECK(d["agent_id"].get<std::string>() != "WS-2");
 }
 
 TEST_CASE("MCP DEX: get_dex_device_history returns per-device history, audits dex.device.view "

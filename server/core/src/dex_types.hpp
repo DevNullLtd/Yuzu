@@ -23,13 +23,18 @@
 ///   3. The pure signal-catalogue accessors and health/roll-up COMPUTATION
 ///      over the above types (`dex_signal_groups`, `dex_catalogued_type_count`,
 ///      `dex_family_index`, `dex_obs_platforms`, `dex_family_rollup` +
-///      `DexFamilyRollup`, `dex_family_health_deduction`, `dex_compute_health`
-///      + `DexHealthResult`) — pure functions over groups 1–2 only, relocated
-///      from `dex_routes.hpp` (PR #4582) so `dex_read_model.cpp` no longer needs
-///      that httplib-coupled header. Unlike the sibling `*_types.hpp` (pure PODs
-///      only), this header therefore also hosts pure computation; a dedicated
-///      `dex_catalogue.hpp` is a legitimate future split (not required — the
-///      store-type-free seam property holds either way).
+///      `DexFamilyRollup`, `DexFamilyWeight`/`dex_family_weights`/
+///      `dex_severity_points`/`dex_preset_mult`, `dex_family_health_deduction`,
+///      `dex_compute_health` + `DexHealthResult`) — pure functions over groups
+///      1–2 only. Their DECLARATIONS were relocated to this header in PR #4582;
+///      their DEFINITIONS stayed behind in the presentation TU `dex_routes.cpp`
+///      until ADR-0031 WS-A4 PR-1's F1 fix (Fable review, 2026-09-28) moved
+///      them, verbatim, into this header's own `dex_types.cpp` — closing the
+///      core-links-against-presentation link residual #4579 noted for its two
+///      siblings in `dex_read_builders.hpp`. Unlike the sibling `*_types.hpp`
+///      (pure PODs only), this header therefore also hosts pure computation; a
+///      dedicated `dex_catalogue.hpp` is a legitimate future split (not
+///      required — the store-type-free seam property holds either way).
 
 #include <cstddef>
 #include <cstdint>
@@ -182,7 +187,12 @@ struct DexSignalGroup {
 // (declarations) from dex_routes.hpp (PR #4582 FIX 4) so dex_read_model.cpp can
 // call dex_signal_groups() without including dex_routes.hpp (which pulls
 // <httplib.h>); dex_routes.hpp re-includes this header, so its own callers are
-// unaffected. Definitions are unchanged in their .cpp.
+// unaffected. Definitions were LATER relocated too (ADR-0031 WS-A4 PR-1 F1
+// fix, closing the #4579 link residual's DEX half, Fable review
+// 2026-09-28): `dex_signal_groups`/`dex_catalogued_type_count`/
+// `dex_family_index`/`dex_obs_platforms` are now DEFINED in core's
+// `dex_types.cpp`, not `dex_routes.cpp` — so a core TU calling them no
+// longer links against presentation at all.
 
 /// The catalogued signal types, grouped for display — the server-side mirror of
 /// the agent catalogue (keep in sync; the paired drift-net tests bite).
@@ -202,7 +212,19 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 //    DexSignalCount only; no store, no httplib) — relocated from dex_routes.hpp
 //    (PR #4582 FIX 4) so dex_read_model.cpp can call them without that
 //    httplib-coupled header. dex_routes.hpp re-includes this header, so its
-//    own callers are unaffected; definitions are unchanged in their .cpp.
+//    own callers are unaffected. Definitions were LATER relocated too (same
+//    ADR-0031 WS-A4 PR-1 F1 fix as above): `dex_family_is_benign`/
+//    `dex_family_rollup`/`dex_family_weights`/`dex_severity_points`/
+//    `dex_preset_mult`/`dex_family_health_deduction` are now DEFINED in
+//    core's `dex_types.cpp`, not `dex_routes.cpp`.
+
+/// True for the ONE hand-picked family (name-matched, not data-driven) whose
+/// members are routine reports (boot/uptime), never deducted from health and
+/// displayed as "Reports" rather than "Events" in the Catalogue drill-down.
+/// Factored out of `dex_family_rollup` (ADR-0031 WS-A4 PR-1) so a second
+/// caller — the catalogue-group read-model builder — can carry the SAME
+/// classification without re-deriving it from `DexFamilyRollup::benign`.
+bool dex_family_is_benign(const std::string& family_name);
 
 /// One family's rolled-up signal counts — the shared basis both the Catalogue
 /// grid and the health-score deduction read.
@@ -216,6 +238,32 @@ struct DexFamilyRollup {
 };
 DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
                                   const std::vector<DexSignalCount>& signals);
+
+/// The composite-score weighting policy (mockup dex-health-score.html) — shared
+/// by `dex_compute_health`/`dex_family_health_deduction` below AND the
+/// per-device scoring formula `dex_score_from_signals` (declared in
+/// `dex_read_builders.hpp`, defined in core's `dex_read_model.cpp`), so every
+/// consumer scores against the SAME severity/preset weights (relocated from
+/// the presentation TU `dex_routes.cpp`, ADR-0031 WS-A4 PR-1 F1 fix — Fable
+/// review, 2026-09-28). `severity` = how much a failure of this family hurts
+/// experience; the four multipliers are the server-chosen weighting PRESETS —
+/// this is policy (transparent + shown), not data.
+struct DexFamilyWeight {
+    const char* name;
+    const char* severity; // "high" | "med" | "low"
+    double m_default, m_stability, m_productivity, m_security;
+};
+
+/// The full weighting table, one row per catalogue family (names MUST match
+/// `dex_signal_groups()`).
+const std::vector<DexFamilyWeight>& dex_family_weights();
+
+/// Severity label -> deduction points (policy constant).
+double dex_severity_points(const std::string& sev);
+
+/// The multiplier for one family's weight row under a named preset
+/// ("stability"/"productivity"/"security"; anything else -> `m_default`).
+double dex_preset_mult(const DexFamilyWeight& fw, const std::string& preset);
 
 /// One family's health deduction (the per-family term of dex_compute_health,
 /// "default" preset).

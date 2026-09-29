@@ -1,5 +1,5 @@
 {
-  "description": "Expected self-hosted runner inventory for Tr3kkR/Yuzu. The runner-inventory-sentinel workflow asserts GitHub's reported actions/runners state matches this declaration and fails loud on drift. Update deliberately: every change is a single-purpose PR with clear intent. When the actual inventory changes (new runner, retirement, label change) this file MUST be updated in the same change, or the sentinel fires on the next cron tick (every 30 min).",
+  "description": "Expected self-hosted runner inventory for DevNullLtd/Yuzu. The runner-inventory-sentinel workflow asserts GitHub's reported actions/runners state matches this declaration and fails loud on drift. Update deliberately: every change is a single-purpose PR with clear intent. When the actual inventory changes (new runner, retirement, label change) this file MUST be updated in the same change, or the sentinel fires on the next cron tick (every 30 min).",
   "strict_unknown_runners": true,
   "expected_runners": [
     {

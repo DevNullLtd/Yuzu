@@ -223,6 +223,28 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
+
+**What changed.** On every boot (not only first boot), the server checks the loaded config's local
+user list: if it is non-empty but none of the entries has `role=admin`, the server now refuses to
+start (`Fatal: the loaded config lists N local user(s) but none has role=admin`). Previously, this
+shape silently promoted the first configured user to Administrator regardless of its declared role
+— a real bug this change fixes — so the check is not new logic layered on top of prior behavior, it
+is a correction that happens to also be fail-loud where the old code was silently wrong.
+
+**Who this affects.** Any deployment whose `yuzu-server.cfg` local-user list was hand-edited to a
+shape with no `role=admin` entry — most plausibly a fleet that migrated fully to SSO/OIDC/SAML and
+removed or demoted its local admin config entry, relying on the old silent-promotion behavior (or
+simply never noticing it) rather than on the actual RBAC/session-role state in the database. This
+check is config-shape-based, independent of whether `auth.users` already has admins in Postgres —
+it fires even on a long-running, fully-provisioned deployment if its config happens to carry this
+shape on the next restart.
+
+**Fix, before or immediately after upgrading.** Either mark exactly one entry in the local user
+list `role=admin` in the config file, or — for an SSO-only fleet — remove all local user entries
+from the config so this check never triggers. The server logs the config's user count and refuses
+to guess; there is no other remediation needed once the config is corrected.
+
 ### vNEXT — `installed_apps list` rows carry two more fields (breaking)
 
 **What changed.** The `installed_apps` agent plugin's operator `list` action (definition
@@ -2169,6 +2191,14 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 **What to do.** Nothing required for the common case. If a confined operator reports dashboard/workflow results that look "smaller than before," that is the fix working as intended — confirm their management-group membership matches the agents they expect to see. If a service-scoped integration's error handling is keyed on a `403` from `get_agent_details` specifically, update it the same way as the `query_installed_software` note above.
 
+### vNEXT — `GET /api/v1/dex/app` and `GET /api/v1/dex/overview` (REST + MCP) stop narrowing an elevated administrator's device list
+
+**What changed.** `GET /api/v1/dex/app`/`get_dex_app` and `GET /api/v1/dex/overview`/`get_dex_overview` carried a per-caller `visible`-set resolver whose confinement was already dormant for the operator class it was meant to protect — a management-group-confined-only operator has no global grant, so the routes' bare `GuaranteedState:Read` permission gate denied them (`403`) before that resolver ever ran — but the SAME resolver ran for a **JIT-elevated administrator** and wrongly narrowed their device list to the base identity's own (usually empty) management-group grant instead of the unfiltered view elevation earns. The dormant, never-narrowing-anyone-real resolver has been retired outright; every admitted caller (a global grant, RBAC disabled, or an elevated administrator) now sees the same unfiltered `devices[]`/`top_devices[]` list. `GET /api/v1/dex/signals/{obs_type}`/`get_dex_signal_detail` never carried this resolver and is unaffected.
+
+**Who this affects.** A JIT-elevated administrator who previously received a narrowed (often empty) result from `GET /api/v1/dex/app` or `GET /api/v1/dex/overview` will now correctly see the unfiltered fleet. No other caller class changes: a management-group-confined operator still receives `403` from the unchanged permission gate, and a service-scoped API token is still denied outright.
+
+**What to do.** Nothing required.
+
 ### v0.10.0 — API token revocation is owner-scoped
 
 Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
@@ -3555,7 +3585,7 @@ Held-open SSE streams also lease this pool: each re-validates its credential eve
 
 ### Provisioning a native (non-container) install
 
-Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/tr3kkr/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
+Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/devnullltd/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). Native installs use the provisioning helper instead:
 
 | Install method | Helper location | Invocation |
 |---|---|---|

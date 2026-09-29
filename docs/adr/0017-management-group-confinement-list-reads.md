@@ -302,6 +302,23 @@ gate.
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
 - **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
   `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+  - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
+    /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
+    check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
+    Every field they return (`subjects[]`/`by_os[]`/`devices[]`/`by_day[]`/
+    `top_devices[]`/`top_apps[]`, etc.) is a query-time `GROUP BY` over agent-attributed rows —
+    **not** a precomputed rollup like `software_catalog`/`version_rollup` above, so the rationale
+    for pinning it global-only is different: it is simply **not yet confined per-caller** — an
+    INV-3-respecting per-caller SQL slice (a `WHERE agent_id IN (...)` narrowing derived from the
+    caller's visible set, applied INSIDE the aggregation, not a post-aggregate filter) has not been
+    built for these three queries yet; tracked as #5090. The `/fragments/dex/overview`, `/fragments/dex/app`, and
+    `/fragments/dex/catalogue/signal` dashboard fragments are UNCHANGED by this fix round: they also
+    gate on the SAME global `perm_fn` (a group-only operator is denied `403` there too, same as the
+    REST/MCP surfaces) — the residual is the OPPOSITE of a confined-caller leak: among callers who
+    DO hold the global grant, the fragments additionally narrow their device list by the
+    permission-agnostic `Infrastructure:Read` `visible_set_fn` (a DIFFERENT securable from this
+    row's `GuaranteedState:Read` gate) — tracked for the dashboard-rewire follow-up (PR-2), which
+    also owns deciding whether that narrowing is correct or itself a bug.
 
 ### Out of scope (global by design)
 

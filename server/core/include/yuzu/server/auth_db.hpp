@@ -221,7 +221,18 @@ public:
 
     /// Seed the very first (admin) user, atomically, iff the `users` table
     /// is genuinely empty — the born-on-PG replacement for the config-file/
-    /// first-boot admin bootstrap. `INSERT ... SELECT ... WHERE NOT EXISTS`
+    /// first-boot admin bootstrap. **Production seeding calls
+    /// `RbacStore::provision_first_admin` instead** — `main.cpp`'s
+    /// fresh-start block atomically inserts this same account plus its
+    /// Administrator RBAC grant via that method, and no longer calls THIS
+    /// function at all (a redundant second no-op call was removed;
+    /// governance round, 2026-09-28). This function stays exported for its
+    /// own unit tests and as an available primitive should a genuine
+    /// "seed the first admin, no grant" need ever arise elsewhere — but it
+    /// has no production caller today. Do NOT add a new fresh-start-seeding
+    /// call site here — the grant-less account it would create is the exact
+    /// stranded-account hazard `provision_first_admin` exists to close.
+    /// `INSERT ... SELECT ... WHERE NOT EXISTS`
     /// alone is NOT race-free under READ COMMITTED (two concurrent server
     /// instances racing first boot can both see zero rows and both insert);
     /// the statement runs inside a transaction guarded by a

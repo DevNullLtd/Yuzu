@@ -152,7 +152,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    ```powershell
    # repeat for r0..r3 with a fresh --token each (gh api ... /registration-token)
    C:\actions-runner\r0\config.cmd --unattended --replace `
-     --url https://github.com/Tr3kkR/Yuzu `
+     --url https://github.com/DevNullLtd/Yuzu `
      --name yuzu-weetam-windows-0 `
      --labels self-hosted,Windows,X64,yuzu-weetam-windows `
      --work D:\ci\work-0 --token <TOKEN>

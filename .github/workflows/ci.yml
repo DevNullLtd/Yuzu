@@ -1080,7 +1080,7 @@ jobs:
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant" "dex link no presentation symbols"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
@@ -1356,6 +1356,15 @@ jobs:
         env:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
+
+      # Fresh-install Administrator bootstrap: the fatal refusal when the config
+      # lists local users but none has role=admin, and the durable
+      # rbac.bootstrap.first_admin audit row on a successful bootstrap — neither
+      # is exercisable by the Catch2 suite (which never drives main()).
+      - name: First-admin bootstrap CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_first_admin_bootstrap_refusal.sh
 
       # Graceful shutdown is not exercisable by the Catch2 suite (which never drives main(), so
       # never installs a signal handler). Nothing in unit, integration or CI failed if it broke
