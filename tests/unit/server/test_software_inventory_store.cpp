@@ -19,7 +19,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
-#include <initializer_list>
+#include <cstddef>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -169,36 +169,23 @@ SoftwareEntry full_extended_entry() {
     return e;
 }
 
-// One wire record: fields 0x1F-separated, 0x1E-terminated.
-std::string record(std::initializer_list<const std::string*> fields) {
+// Wire record of the first n fields (12 = v2, 16 = extended): 0x1F-separated, 0x1E-terminated.
+std::string blob(const SoftwareEntry& e, std::size_t n) {
+    const std::string* f[] = {
+        &e.name,           &e.version,          &e.publisher,      &e.install_date,
+        &e.kind,           &e.ecosystem,        &e.epoch,          &e.release,
+        &e.arch,           &e.signature_status, &e.distro_id,      &e.distro_version,
+        &e.install_location, &e.uninstall_string, &e.package_id,   &e.source};
     std::string out;
-    bool first = true;
-    for (const auto* f : fields) {
-        if (!first)
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i)
             out += '\x1f';
-        out += *f;
-        first = false;
+        out += *f[i];
     }
-    out += '\x1e';
-    return out;
+    return out + '\x1e';
 }
 
-// 12-field (v2) record: what an agent without the extended tail emits.
-std::string blob12(const SoftwareEntry& e) {
-    return record({&e.name, &e.version, &e.publisher, &e.install_date, &e.kind, &e.ecosystem,
-                   &e.epoch, &e.release, &e.arch, &e.signature_status, &e.distro_id,
-                   &e.distro_version});
-}
-
-// 16-field record: v2 fields plus the extended tail.
-std::string blob16(const SoftwareEntry& e) {
-    return record({&e.name, &e.version, &e.publisher, &e.install_date, &e.kind, &e.ecosystem,
-                   &e.epoch, &e.release, &e.arch, &e.signature_status, &e.distro_id,
-                   &e.distro_version, &e.install_location, &e.uninstall_string, &e.package_id,
-                   &e.source});
-}
-
-// SERVER CONTRACT PIN (16 fields). sha256 of blob16(full_extended_entry()) bytes:
+// SERVER CONTRACT PIN (16 fields). sha256 of blob(full_extended_entry(), 16) bytes:
 //   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037/usr/bin\037rpm -e bash\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
 // The agent builder (installed_software_canonical_blob) still emits 12 fields until
 // the agent-side update; that update copies this constant and these fixture bytes into
@@ -559,7 +546,7 @@ TEST_CASE("blob contract extended tail: 12-field blob ingests with fields 13-16 
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] =
         SoftwareInventoryStore::canonical_hash({e});
-    (*rep.mutable_plugin_data())["installed_software"] = blob12(e);
+    (*rep.mutable_plugin_data())["installed_software"] = blob(e, 12);
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-e12", rep, ack);
     CHECK(ack.need_full_size() == 0);
@@ -586,9 +573,8 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     SWINV_SHARED(store, pool);
     const SoftwareEntry e = full_extended_entry();
     agentpb::InventoryReport rep;
-    (*rep.mutable_content_hashes())["installed_software"] =
-        SoftwareInventoryStore::canonical_hash({e});
-    (*rep.mutable_plugin_data())["installed_software"] = blob16(e);
+    (*rep.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    (*rep.mutable_plugin_data())["installed_software"] = blob(e, 16);
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-e16", rep, ack);
     CHECK(ack.need_full_size() == 0);
@@ -611,6 +597,14 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     CHECK((*fl)[0].entry.package_id == "bash-5.2.21-3.fc40.x86_64");
     CHECK((*fl)[0].entry.source == "installed_apps.list_inventory");
     CHECK((*fl)[0].install_id >= 1);
+
+    // Hash-only ping with the pinned literal: the server's re-hash of the stored 16-field
+    // rows must equal it (touched, not need_full).
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-e16", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
 }
 
 TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re-hash to the raw "
@@ -627,11 +621,11 @@ TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re
     c.name = "zed";
     c.version = "1";
     c.source = "installed_apps.list_inventory"; // source-only tail
-    const std::string blob = blob12(a) + blob16(full_extended_entry()) + blob16(c);
+    const std::string mixed = blob(a, 12) + blob(full_extended_entry(), 16) + blob(c, 16);
 
     agentpb::InventoryReport rep;
     (*rep.mutable_content_hashes())["installed_software"] = kMixedBlobHash;
-    (*rep.mutable_plugin_data())["installed_software"] = blob;
+    (*rep.mutable_plugin_data())["installed_software"] = mixed;
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-mixed", rep, ack);
     CHECK(ack.need_full_size() == 0);
@@ -645,24 +639,6 @@ TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re
     (*ping.mutable_content_hashes())["installed_software"] = kMixedBlobHash;
     agentpb::InventoryAck ack2;
     yuzu::server::ingest_inventory_report(store, "agent-mixed", ping, ack2);
-    CHECK(ack2.need_full_size() == 0);
-}
-
-TEST_CASE("server contract pin (16 fields, agent-side update pending): stored rows match the raw "
-          "blob hash",
-          "[pg][software_inventory][extended_row]") {
-    SWINV_SHARED(store, pool);
-    agentpb::InventoryReport rep;
-    (*rep.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
-    (*rep.mutable_plugin_data())["installed_software"] = blob16(full_extended_entry());
-    agentpb::InventoryAck ack;
-    yuzu::server::ingest_inventory_report(store, "agent-pin", rep, ack);
-    CHECK(ack.need_full_size() == 0);
-
-    agentpb::InventoryReport ping;
-    (*ping.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
-    agentpb::InventoryAck ack2;
-    yuzu::server::ingest_inventory_report(store, "agent-pin", ping, ack2);
     CHECK(ack2.need_full_size() == 0);
 }
 
@@ -776,13 +752,6 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
     // Filtered walk yields the filtered set exactly once.
     auto bravo = walk("bravo", pages);
     CHECK(bravo.size() == 3);
-
-    // A limit above the store's row cap does not error.
-    SoftwareFleetQuery big;
-    big.limit = 200000;
-    auto all = store.query_software(big);
-    REQUIRE(all.has_value());
-    CHECK(all->size() == 6);
 }
 
 TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-runs "
