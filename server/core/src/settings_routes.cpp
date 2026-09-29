@@ -1821,13 +1821,14 @@ std::string SettingsRoutes::render_pending_fragment() {
                         "hx-confirm=\"Deny agent enrollment?\""
                         ">Deny</button>";
             } else {
-                html += "<button class=\"btn btn-secondary\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                        "hx-delete=\"/api/settings/pending-agents/" +
-                        html_escape(a.agent_id) +
-                        "\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
-                        ">Remove</button>";
+                // This branch only ever reaches a `denied` row (approved rows are
+                // filtered out above, line ~1764). WS-6 6.2 (governance Finding 1)
+                // made removal of a denied row permanently refused (409) — the
+                // denial is a durable record and removing it would silently
+                // reverse the decision with no audit trail. There is no other
+                // action to offer here, so no button renders; the row stays
+                // visible in the queue as the durable evidence of the denial.
+                html += "<span style=\"color:#484f58;font-size:0.7rem\">denial recorded</span>";
             }
 
             html += "</td></tr>";
@@ -5847,6 +5848,9 @@ void SettingsRoutes::register_routes(
                         audit_fn_(req, "enrollment.remove", bad_input ? "denied" : "failure",
                                   "Agent", agent_id, "store_error by=" + session->username);
                         res.status = bad_input ? 400 : 503;
+                        res.set_header(
+                            "HX-Trigger",
+                            R"({"showToast":{"message":"Enrollment store unavailable - try again","level":"error"}})");
                     } else {
                         switch (*removed) {
                         case auth::RemovePendingOutcome::removed:

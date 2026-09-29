@@ -4278,6 +4278,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. |
 | `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
 
+The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
+
 ### Auto-Approval Policies
 
 | Method | Route | Description |
