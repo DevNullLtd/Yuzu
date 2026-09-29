@@ -38,10 +38,9 @@ if ls %{_sourcedir}/plugins/*.so 1>/dev/null 2>&1; then
 fi
 
 # Service account as a sysusers.d entry (#5142). rpm >= 4.19 turns the
-# yuzu-agent-owned paths in the files list into Requires: user(yuzu-agent)/group(yuzu-agent) and
-# this file into the matching Provides, so the package satisfies its own
-# requirement on Fedora/RHEL; rpm 4.19+ also creates the account from it.
-# The pre-install scriptlet still creates it for older rpm (e.g. RHEL/Rocky 9).
+# yuzu-agent-owned paths in %files into Requires: user(yuzu-agent) and
+# group(yuzu-agent), and this file into the matching Provides, so the package
+# satisfies its own requirement. %pre still creates the account.
 install -d -m 0755 %{buildroot}%{_sysusersdir}
 printf 'u yuzu-agent - "Yuzu agent" /var/lib/yuzu-agent /sbin/nologin\n' > %{buildroot}%{_sysusersdir}/yuzu-agent.conf
 

@@ -216,6 +216,11 @@ jobs:
 
       - name: Build .deb packages
         run: |
+          # This job runs in a reused self-hosted workspace (clean: false). Clear
+          # packages left by an earlier release first, or the "*.deb"/"*.rpm"
+          # attest and upload globs ship them as this release's output (v0.13.0-rc6
+          # published rc4 packages with rc6 provenance).
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
@@ -410,6 +415,11 @@ jobs:
 
       - name: Build .deb package
         run: |
+          # This job runs in a reused self-hosted workspace (clean: false). Clear
+          # packages left by an earlier release first, or the "*.deb"/"*.rpm"
+          # attest and upload globs ship them as this release's output (v0.13.0-rc6
+          # published rc4 packages with rc6 provenance).
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-gateway-deb.sh \
@@ -2130,7 +2140,9 @@ jobs:
           # SPDX SBOM, and both image SBOMs must be present. Missing any
           # of the above fails the release before we publish anything
           # customers will have to unwind. Tracked as #362 / #408.
-          bash scripts/check-release-artifacts.sh artifacts
+          # With the version it also checks every asset name is one GitHub
+          # stores unchanged and every package is from this release (#5141).
+          bash scripts/check-release-artifacts.sh artifacts "${GITHUB_REF_NAME#v}"
 
       - name: Generate SHA256SUMS
         run: |
@@ -2275,6 +2287,8 @@ jobs:
           YuzuServerSetup-*.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=<password> \`
             /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
+
+          A silent uninstall (\`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`) removes the program but keeps \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) — or, for the server, \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory. Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash

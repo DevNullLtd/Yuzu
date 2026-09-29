@@ -153,6 +153,15 @@ config page), or fully unattended —
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
 Service name `YuzuAgent`.
 
+Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
+(add `/LOG=<path>` to keep a log). A silent uninstall removes the program but
+**keeps `%ProgramData%\Yuzu`**, which holds the agent's identity and its mTLS
+private key; an interactive uninstall asks. To decommission a device, revoke its
+certificate on the server (`POST /api/v1/ca/revoke`, see
+`docs/user-manual/device-management.md`; a gateway-proxied agent must also be
+cut off at the gateway) and delete that directory. Uninstallers from releases up
+to 0.14.0-rc2 hang on a silent uninstall (#5147) — upgrade first.
+
 ## Verify integrity
 
 Every file is checksummed twice over:

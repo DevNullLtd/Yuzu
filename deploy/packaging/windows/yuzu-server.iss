@@ -764,10 +764,17 @@ begin
   begin
     // 1. Generate yuzu-server.cfg with PBKDF2 hashed credentials
     Exec('powershell.exe', GetConfigGenArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // SuppressibleMsgBox, not MsgBox: /SUPPRESSMSGBOXES does not suppress a
+    // plain MsgBox, so an unattended install would wait on it forever (#5147).
+    // Log it too, so a silent install records why setup is incomplete.
     if ResultCode <> 0 then
-      MsgBox('Warning: Failed to generate server configuration (exit code ' +
+    begin
+      Log('Failed to generate server configuration (exit code ' +
+          IntToStr(ResultCode) + ').');
+      SuppressibleMsgBox('Warning: Failed to generate server configuration (exit code ' +
              IntToStr(ResultCode) + '). You may need to run first-time setup manually.',
-             mbError, MB_OK);
+             mbError, MB_OK, IDOK);
+    end;
 
     // 2. Copy certificate files
     CopyCertificates;

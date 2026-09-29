@@ -20,10 +20,9 @@ install -d -m 0750 %{buildroot}/var/log/yuzu
 install -d -m 0750 %{buildroot}/etc/yuzu
 
 # Service account as a sysusers.d entry (#5142). rpm >= 4.19 turns the
-# yuzu-owned paths in the files list into Requires: user(yuzu)/group(yuzu) and
-# this file into the matching Provides, so the package satisfies its own
-# requirement on Fedora/RHEL; rpm 4.19+ also creates the account from it.
-# The pre-install scriptlet still creates it for older rpm (e.g. RHEL/Rocky 9).
+# yuzu-owned paths in %files into Requires: user(yuzu) and
+# group(yuzu), and this file into the matching Provides, so the package
+# satisfies its own requirement. %pre still creates the account.
 install -d -m 0755 %{buildroot}%{_sysusersdir}
 printf 'u yuzu - "Yuzu server" /var/lib/yuzu /sbin/nologin\n' > %{buildroot}%{_sysusersdir}/yuzu.conf
 
