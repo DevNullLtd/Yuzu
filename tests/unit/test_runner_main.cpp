@@ -41,12 +41,29 @@
 // hard_exit(0) here on Windows is intentional, not an oversight — do not
 // "fix" it to skip hard_exit on a zero result.
 //
-// Windows-only (#ifdef _WIN32, not a runtime check): nightly's coverage
-// (-Db_coverage) and Linux ASan/UBSan/TSan legs need a normal process exit
+// Windows AND macOS (#ifdef, not a runtime check): nightly's coverage
+// (-Db_coverage) and the ASan/UBSan/TSan legs need a normal process exit
 // for their atexit dumps (gcov's .gcda write, LSan's leak report) —
-// hard_exit() skips atexit entirely by design. The exit-42 hazard is a
-// Windows-debug-CI phenomenon (#1648); lifting this guard to other
-// platforms would silently break those legs' own instrumentation.
+// hard_exit() skips atexit entirely by design. Those legs are Linux and
+// Windows only (nightly.yml, sanitizer-tests.yml declare no macOS job), so
+// extending to __APPLE__ breaks no instrumentation that exists today; the
+// sanitizer exclusion below is still written to cover macOS, so a future
+// macOS ASan leg is correct by construction rather than by omission.
+//
+// macOS added 2026-09-29 (#3507 follow-up). The hazard was described as "a
+// Windows-debug-CI phenomenon (#1648)" when AC1 shipped, and that was true
+// of the evidence then available. It is not true now: BigMags reproduced
+// the identical signature — flake-retry.py reporting "suite failed but
+// enumeration re-run reproduced no failing case" against `exit status 42`
+// — on three of four attempts on PR #5101 and again on PR #5107 the same
+// afternoon, while Linux stayed green and the macOS-failing PR changed no
+// C++ at all. The teardown race this guard exists to prevent is not
+// OS-specific; only the original evidence was. See #3507 for the run table.
+//
+// NOT claimed: that this closes #3507. Windows #5107 failed with "not a
+// classifiable Catch2 run — crash/non-Catch2", i.e. death DURING
+// session.run(), which is the second bisect arm this file's own header
+// describes and which a hard_exit AFTER run() cannot reach.
 //
 // ALSO excluded from hard_exit on Windows (governance Gate 2/3, 2026-08-28):
 // nightly.yml's windows-asan leg, which DOES build and run this exact binary
@@ -61,17 +78,22 @@
 // never through flake-retry.py, so the #1648 exit-42 misclassification this
 // hard_exit call exists to prevent cannot occur on that leg — excluding it
 // costs this file's own stated purpose nothing. __SANITIZE_ADDRESS__ is a
-// real macro GCC and MSVC both define directly under their ASan flag
-// (Clang instead answers __has_feature(address_sanitizer) - irrelevant
-// here since Windows never uses Clang, docs/windows-build.md's standing
-// rule, and windows-asan's toolchain is confirmed cl.exe). This is not a
-// new, untested pattern: the identical cross-toolchain sanitizer-detect
-// need already lives in this exact codebase at
-// tests/unit/test_helpers.hpp's kSpinScale and
+// real macro GCC and MSVC both define directly under their ASan flag, but
+// Clang answers __has_feature(address_sanitizer) instead. That distinction
+// USED to be irrelevant here ("Windows never uses Clang",
+// docs/windows-build.md's standing rule, and windows-asan's toolchain is
+// confirmed cl.exe) — extending this guard to macOS, which is Apple Clang,
+// makes it load-bearing: a bare !defined(__SANITIZE_ADDRESS__) would NOT
+// exclude a macOS ASan build and would TerminateProcess before the leak
+// reporter ran, reintroducing on macOS exactly the hole the windows-asan
+// carve-out above exists to prevent. Hence YUZU_TEST_ASAN below, which ORs
+// both conventions. This is not a new, untested pattern: the identical
+// cross-toolchain sanitizer-detect need already lives in this exact
+// codebase at tests/unit/test_helpers.hpp's kSpinScale and
 // agents/core/include/yuzu/agent/guardian_engine.hpp's
 // YUZU_WORKER_MUTEX_GUARD (both OR in the __has_feature branch too, since
-// they also compile on Linux/macOS Clang; this Windows-only call site
-// doesn't need to).
+// they also compile on Linux/macOS Clang — and as of the macOS extension
+// this call site does too, via YUZU_TEST_ASAN).
 //
 // Session's own destructor (and any Catch2/system atexit handler) never
 // runs on this path. Verified empirically (2026-08-27, scratch experiment
@@ -132,6 +154,19 @@
 #define YUZU_TEST_TSAN 1
 #endif
 #endif
+// ASan detect for the hard_exit guard below. Same two-convention shape as
+// YUZU_TEST_TSAN directly above (and test_helpers.hpp's kSpinScale): GCC and
+// MSVC define __SANITIZE_ADDRESS__ under their ASan flag, Clang answers
+// __has_feature(address_sanitizer). Both arms are required now that the guard
+// covers macOS/Apple Clang — see the sanitizer-detect note in the header.
+#if defined(__SANITIZE_ADDRESS__)
+#define YUZU_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define YUZU_TEST_ASAN 1
+#endif
+#endif
+
 #ifdef YUZU_TEST_TSAN
 extern "C" __attribute__((visibility("default"), used)) const char*
 __tsan_default_suppressions() {
@@ -153,7 +188,7 @@ int main(int argc, char* argv[]) {
                  result);
     std::fflush(stderr);
     std::fflush(stdout);
-#if defined(_WIN32) && !defined(__SANITIZE_ADDRESS__)
+#if (defined(_WIN32) || defined(__APPLE__)) && !defined(YUZU_TEST_ASAN)
     yuzu::agent::hard_exit(result); // see the #3507 AC1 comment above
 #endif
     return result;
