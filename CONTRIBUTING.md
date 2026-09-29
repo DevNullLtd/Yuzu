@@ -49,7 +49,7 @@ maintainer at nathan.dornbrook@gmail.com.
 1. **Prerequisites**: Meson 1.12.0 (`requirements-ci.txt`), Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
-   git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu
+   git clone https://github.com/DevNullLtd/Yuzu.git && cd Yuzu
    ./scripts/setup.sh
    meson compile -C build-linux
    ```
@@ -112,7 +112,7 @@ Issue filing, labelling, and closing follow the repo standard:
   is a triage decision: set it if you have the context (agents and maintainers do);
   leave it off a drive-by report and triage will add it.
 - **Never file an exploitable security vulnerability as a public issue.** Use
-  [GitHub private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new)
+  [GitHub private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new)
   (see [SECURITY.md](SECURITY.md)). Public `security`-labelled issues are for hardening and
   defense-in-depth work only.
 - A PR that resolves an issue says `Closes #N` in its body; partial work says `Relates to #N`

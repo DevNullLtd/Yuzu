@@ -85,6 +85,6 @@ RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
 RUN git config --global --add safe.directory '*'
 
 # ── Labels ────────────────────────────────────────────────────────────
-LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
+LABEL org.opencontainers.image.source="https://github.com/DevNullLtd/Yuzu"
 LABEL org.opencontainers.image.description="Yuzu CI build environment (Linux x64 + ARM64 cross) with pre-built vcpkg dependencies"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"

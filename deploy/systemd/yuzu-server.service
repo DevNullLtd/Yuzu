@@ -1,6 +1,6 @@
 [Unit]
 Description=Yuzu Endpoint Management Server
-Documentation=https://github.com/Tr3kkR/Yuzu
+Documentation=https://github.com/DevNullLtd/Yuzu
 # postgresql.service ordering is SOFT (Wants=, not Requires=): a missing
 # unit in Wants= is silently ignored, so installs without a local Postgres
 # — including those pointing YUZU_POSTGRES_DSN at an external/managed

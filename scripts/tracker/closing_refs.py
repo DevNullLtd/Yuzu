@@ -41,6 +41,16 @@ import sys
 
 DEFAULT_REPO = "DevNullLtd/Yuzu"
 
+# Former slugs this repository has been served under. An `owner/repo#N` ref is
+# SAME-REPO if it names the current slug OR any of these: the repo moved from
+# Tr3kkR/Yuzu to DevNullLtd/Yuzu on 2026-09-28, GitHub itself still resolves
+# `Tr3kkR/Yuzu#N` as this repo, and roughly 1 in 12 dev refs uses the qualified
+# form (see the corpus note above). Treating an old-slug ref as FOREIGN would
+# silently decline to close a real issue -- no comment, no label, no error.
+# Add to this set on any future transfer; never remove an entry, because old
+# PR bodies are immutable.
+_REPO_ALIASES = frozenset({"tr3kkr/yuzu"})
+
 # Issue numbers: no leading zero, 1..9,999,999. GitHub renders #0 as text.
 _NUM = r"(?P<num>[1-9][0-9]{0,6})"
 
@@ -178,7 +188,11 @@ def extract(text: str, repo: str = DEFAULT_REPO) -> list:
         for m in refs:
             gd = m.groupdict()
             owner, rname = gd.get("owner"), gd.get("repo")
-            same = True if owner is None else f"{owner}/{rname}".lower() == repo_lc
+            if owner is None:
+                same = True
+            else:
+                slug = f"{owner}/{rname}".lower()
+                same = slug == repo_lc or slug in _REPO_ALIASES
             out.append(
                 ClosingRef(
                     number=int(m.group("num")),
@@ -215,6 +229,7 @@ _SELFTEST = [
     ("Fixes: #77", [77]),
     ("Resolved GH-9", [9]),
     ("Closes DevNullLtd/Yuzu#520, #630.", [520, 630]),
+    ("Closes Tr3kkR/Yuzu#521.", [521]),  # pre-transfer slug is still same-repo
     ("Closes other/repo#5", []),  # cross-repo: never act
     ("Closes https://github.com/DevNullLtd/Yuzu/issues/42", [42]),
     # PR #1711, the canonical negative -- emphasis-wrapped negation:

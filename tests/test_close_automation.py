@@ -60,6 +60,7 @@ PARSER_CORPUS = [
     ("GH- form", "closed GH-77", [77]),
     ("URL form", "Fixes https://github.com/DevNullLtd/Yuzu/issues/612", [612]),
     ("same-repo qualified", "Closes DevNullLtd/Yuzu#99", [99]),
+    ("pre-transfer slug still same-repo", "Closes Tr3kkR/Yuzu#98", [98]),
     ("cross-repo excluded", "Closes octo/kit#5 and fixes other/repo#6", []),
     ("newline between keyword and ref", "Closes\n#61", [61]),
     ("negation stops at contrast", "This does not fix #12, but closes #13", [13]),

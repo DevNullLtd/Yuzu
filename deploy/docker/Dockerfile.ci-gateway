@@ -57,6 +57,6 @@ RUN cd /tmp/gateway \
 RUN git config --global --add safe.directory '*'
 
 # ── Labels ────────────────────────────────────────────────────────────
-LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
+LABEL org.opencontainers.image.source="https://github.com/DevNullLtd/Yuzu"
 LABEL org.opencontainers.image.description="Yuzu CI gateway build environment (Erlang/OTP 28 + rebar3)"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"
