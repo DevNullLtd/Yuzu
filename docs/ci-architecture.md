@@ -170,8 +170,9 @@ flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 signature exists yet, but **the container images are already published**:
 the `release` job needs `docker-publish` and `docker-publish-postgres`, which
 push `:X.Y.Z` (and, on a stable tag, `:X.Y` and `:latest`) first, the chisel
-and agent-bundle images publish independently, and the build jobs' provenance
-attestations are already recorded. On a stable tag `:latest` therefore points
+images publish independently (the agent-bundle image needs `release`, so it is
+not published), and the build jobs' provenance attestations are already
+recorded. On a stable tag `:latest` therefore points
 at a release that does not exist until the release is fixed. It fails the
 release when:
 
@@ -187,14 +188,18 @@ release when:
 
 Recovery: find the offending file in the error. For a stale file, clear the
 runner workspace and re-run **all** jobs of the release run ("Re-run failed
-jobs" re-downloads the same build artifacts and fails the same way); a full
-re-run rebuilds everything, so expired build artifacts do not matter, but it
-must happen within GitHub's re-run window. For a builder naming defect, a
-re-run builds the tag's original commit again, so fix the builder, then delete
-and re-push the tag at the fixed commit. Either way the images are rebuilt and
-re-pushed under the same tags. If the release cannot be fixed promptly on a
-stable tag, move `:latest` back to the previous release's images. The gate has no override; the naming forms it checks are a
-second copy of the builders' naming and its header lists where each lives.
+jobs" re-downloads the same build artifacts and fails the same way). A full
+re-run rebuilds everything, so expired build artifacts do not matter; after
+GitHub's re-run window, `gh workflow run release.yml --ref vX.Y.Z` starts a
+fresh run of the same tag instead. For a builder naming defect, a re-run
+builds the tag's original commit again, so fix the builder, then delete and
+re-push the tag at the fixed commit. Either way the images are rebuilt and
+re-pushed under the same tags.
+
+If the release cannot be fixed promptly on a stable tag, move `:latest` back
+to the previous release's images. The gate has no override; the naming forms
+it checks are a second copy of the builders' naming, and its header lists
+where each lives.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
