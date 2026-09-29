@@ -211,18 +211,26 @@ const std::vector<pg::PgMigration>& migrations() {
          // (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
          // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
          // sequential pass at server start over a table bounded at agents x kMaxEntries
-         // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds the table's
-         // indexes anyway, so extending the composite name index in the same txn is
-         // marginal. IF NOT EXISTS keeps a white-box schema_meta rewind idempotent (a
-         // re-run adds no second sequence). install_id churns on every full replace
-         // (DELETE + INSERT) — it is a TIEBREAK inside (name, agent_id), never the page
-         // order on its own.
+         // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds every existing
+         // index, so the old name index is DROPPED FIRST (measured at 4M rows: rewrite
+         // 32 s with it, ~8 s without; the re-create is ~10 s) and re-created as
+         // (name, agent_id, install_id) at the end. The pool injects a 30 s
+         // statement_timeout on every connection and this migration runs inside the
+         // runner's txn, so SET LOCAL lifts it for this txn only (it cannot leak to the
+         // pool). lock_timeout (10 s) still bounds lock acquisition; only the finite
+         // rewrite work is uncapped, because at fleet scale a cancelled boot migration
+         // is a permanently fail-closed server, not a protection. IF [NOT] EXISTS keeps
+         // a white-box schema_meta rewind idempotent (a re-run adds no second sequence;
+         // the column drop cascades the index, so DROP IF EXISTS no-ops). install_id
+         // churns on every full replace (DELETE + INSERT) — it is a TIEBREAK inside
+         // (name, agent_id), never the page order on its own.
+         "SET LOCAL statement_timeout = 0;"
+         "DROP INDEX IF EXISTS installed_software_name_idx;"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS uninstall_string TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS package_id       TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS source           TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_id       BIGSERIAL;"
-         "DROP INDEX IF EXISTS installed_software_name_idx;"
          "CREATE INDEX IF NOT EXISTS installed_software_name_idx "
          "ON installed_software (name, agent_id, install_id);"},
     };
@@ -532,9 +540,9 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
         if (del.status() != PGRES_COMMAND_OK)
             return false;
         // Batched insert (#1664): one statement carrying the per-row columns as
-        // four parallel text[] arrays — agent_id is the scalar $1, so the param
-        // count is a constant 5 regardless of row count. A multi-row VALUES would
-        // hit libpq's 65535-parameter ceiling at ~13k rows (5 params/row); up to
+        // sixteen parallel text[] arrays — agent_id is the scalar $1, so the param
+        // count is a constant 17 regardless of row count. A multi-row VALUES would
+        // hit libpq's 65535-parameter ceiling at ~3.8k rows (17 params/row); up to
         // kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
         // positionally and they are equal-length by construction. Collapsing up
         // to 20k single-row INSERTs into one statement shrinks the transaction's

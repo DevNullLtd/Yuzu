@@ -197,8 +197,8 @@ constexpr const char* kCrossPinHashExtended =
 
 // Ascending tail-order pin: full_extended_entry() and a copy whose source is
 // "installed_apps.list_apps" (sorts first), hashed as the two 16-field records in that
-// order. All four tail comparisons are the same std::string operator<, so this one
-// literal pins the direction of the whole tail chain. Recipe as above, two records:
+// order. This pins the source arm's direction; the order-independence and
+// distinctness checks in the hash test prove the other three arms. Recipe as above, two records:
 //   printf '<b: fields 1-15 as above>\037installed_apps.list_apps\036<a: as above>' | shasum -a 256
 constexpr const char* kTailOrderPinHash =
     "962f1746ef1e188a7a237b25c921475f85b6197946049082fb45bfd2fdafb33f";
@@ -777,6 +777,20 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
                                            std::vector<SoftwareEntry>{mk("bravo", "1")}, 1000) ==
             InventoryIngestOutcome::kStored);
 
+    // install_id is monotone with insertion above, so heap order would mask a missing
+    // install_id tiebreak. Push agent-a/bravo version '1' past version '2': the walk must
+    // then return '2' before '1'.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult upd = pg::exec_params(
+            lease.get(),
+            "UPDATE software_inventory_store.installed_software SET install_id = "
+            "install_id + 1000000 WHERE agent_id = 'agent-a' AND name = 'bravo' AND version = '1'",
+            std::vector<std::string>{});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
     // Even row count (6): the last non-empty page is FULL, so only the EMPTY page ends the walk.
     auto walk = [&](const std::string& filter, std::size_t& pages) {
         std::vector<yuzu::server::SoftwareFleetRow> seen;
@@ -790,6 +804,7 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
             auto page = store.query_software(q);
             REQUIRE(page.has_value());
             ++pages;
+            REQUIRE(pages <= 8); // 6 rows / limit 2 = 4 pages; a non-advancing cursor must not hang
             if (page->empty())
                 break;
             for (auto& r : *page)
@@ -811,9 +826,11 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
         CHECK(seen[i].entry.name == expect[i].first);
         CHECK(seen[i].agent_id == expect[i].second);
     }
-    // The same-name pair within agent-a is ordered by install_id and both rows are seen.
+    // The same-name pair within agent-a is ordered by install_id (the reordered ids put
+    // version '2' first) and both rows are seen exactly once.
     CHECK(seen[2].install_id < seen[3].install_id);
-    CHECK(seen[2].entry.version != seen[3].entry.version);
+    CHECK(seen[2].entry.version == "2");
+    CHECK(seen[3].entry.version == "1");
 
     // Filtered walk yields the filtered set exactly once.
     auto bravo = walk("bravo", pages);

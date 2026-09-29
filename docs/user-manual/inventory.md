@@ -136,7 +136,9 @@ cadences.
   account's home directory (`/Users/<account>/...` on macOS,
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
-  `--inventory-disable`. (The only `HKCU` read is the agent's
+  `--inventory-disable`. (The synced `installed_software` table has had an
+  `install_location` column since schema v7; it stays `''` until an agent emits
+  it, which is a separate agent-side change.) (The only `HKCU` read is the agent's
   own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -175,8 +177,8 @@ The data lands in the Postgres schema **`software_inventory_store`**:
 - `installed_software(agent_id, name, version, publisher, install_date, kind,
   ecosystem, epoch, release, arch, signature_status, distro_id, distro_version,
   install_location, uninstall_string, package_id, source, install_id)`
-  — one row per installed package per device. Every column except `agent_id`
-  and `name` may be empty (`''`) per the honest-empty contract above; rows
+  — one row per installed package per device. Every column except `agent_id`,
+  `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
   agent's next full resend. Rows from agents that do not yet emit the extended
   tail carry `''` in `install_location`, `uninstall_string`, `package_id` and
@@ -187,6 +189,15 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
   `collected_at` — so the recency filters and freshness gauge below are immune to
   agent clock skew (#1685).
+
+**Upgrading.** The first server start after the release that added the extended
+columns (schema v7) rewrites `installed_software` once, under an exclusive lock,
+to add `install_id`: roughly 20 s at 4M rows (about 8 s rewrite plus 10 s index
+build; the pool's 30 s per-statement limit is lifted for that migration only).
+Start one server replica first and let the migration finish before starting the
+rest, since a second replica waits at most 10 s for the migration lock and then
+refuses to start. Avoid long-running `installed_software` readers during that
+first start. Deploy the server before any agent that emits the new fields.
 
 Today it is queried with **direct SQL**, e.g.:
 

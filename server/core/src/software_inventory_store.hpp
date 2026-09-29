@@ -55,7 +55,8 @@ namespace yuzu::server {
 /// installer placed it there.
 ///
 /// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
-/// the canonical hash and the agent's blob builder walk this exact sequence).
+/// the canonical hash walks this exact sequence; the agent's blob builder walks
+/// the first 12 today, the tail rule is the agent's to mirror).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
@@ -177,11 +178,12 @@ public:
     /// emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    /// Canonical content hash over a machine-scope software list — the SAME
-    /// algorithm the agent uses (sorted+deduplicated; fields unit-separated
-    /// 0x1F, entries record-separated 0x1E; SHA-256 hex), so the agent's
-    /// claimed hash and the server's recomputed/stored hash are comparable
-    /// (ADR-0016 §4). Pure/deterministic; takes its argument by value.
+    /// Canonical content hash over a machine-scope software list (sorted +
+    /// deduplicated; fields unit-separated 0x1F, entries record-separated 0x1E;
+    /// SHA-256 hex). The agent's builder walks the first 12 fields today; the
+    /// tail rule is the agent's to mirror, so the agent's claimed hash and the
+    /// server's recomputed/stored hash stay comparable (ADR-0016 §4).
+    /// Pure/deterministic; takes its argument by value.
     [[nodiscard]] static std::string canonical_hash(std::vector<SoftwareEntry> entries);
 
     /// Hash-skip ingest for the `installed_software` source (ADR-0016 §4).
