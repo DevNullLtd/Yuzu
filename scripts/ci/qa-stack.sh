@@ -17,6 +17,8 @@
 #                                   dispatch a command, print the agent's `<key>|` value
 #   qa-stack.sh agents              connected agents, one `<agent_id> <agent_version>` per line
 #   qa-stack.sh metric <server|gateway> <name>    print a metric's value (0 if absent)
+#   qa-stack.sh wait-metric <server|gateway> <name> <min> <seconds>
+#                                   poll until the metric is >= <min>; print it, or fail
 #   qa-stack.sh running             how many of the four services are in state "running"
 #   qa-stack.sh restarts            total restart count across the four services
 #   qa-stack.sh state               one line: <service>=<status>/<restarts> for each
@@ -270,6 +272,24 @@ metric() {  # metric server|gateway NAME
     END { if (f) printf "%d\n", s; else print 0 }'
 }
 
+# wait_metric SRC NAME MIN SECONDS: poll every 2s. The gateway's gauges are set
+# on a timer (yuzu_gw_gauge, telemetry_gauge_interval_ms, 10s by default), so a
+# single read straight after a change can still show the previous value.
+wait_metric() {
+  local src="$1" name="$2" min="$3" secs="$4" v=0 end
+  [[ "$min" =~ ^[0-9]+$ && "$secs" =~ ^[0-9]+$ ]] || die "wait-metric: bad arguments"
+  end=$((SECONDS + secs))
+  while :; do
+    v="$(metric "$src" "$name")"
+    [[ "$v" -ge "$min" ]] && { echo "$v"; return 0; }
+    [[ "$SECONDS" -ge "$end" ]] && break
+    sleep 2
+  done
+  log "$src $name = $v after ${secs}s, wanted >= $min"
+  echo "$v"
+  return 1
+}
+
 # The CONNECTED gauge, not yuzu_agents_registered_total: that counter never
 # goes down, so after the first registration it stays >= 1 through a
 # disconnect, a crash loop or an upgrade that never reconnects.
@@ -411,11 +431,12 @@ case "${1:-}" in
   roundtrip)  shift; roundtrip "$@" ;;
   agents)     cmd_agents ;;
   metric)     shift; metric "$@" ;;
+  wait-metric) shift; wait_metric "$@" ;;
   running)    cmd_running ;;
   restarts)   cmd_restarts ;;
   state)      cmd_state ;;
   stats)      cmd_stats ;;
   logs)       shift; { compose ps -a; compose logs --no-color; } > "${1:?file required}" 2>&1 || true ;;
   down)       compose down -v --remove-orphans || true ;;
-  *) echo "usage: $0 {up|upgrade|has-stack|wait-agent|login|api|roundtrip|agents|metric|running|restarts|state|stats|logs|down}" >&2; exit 2 ;;
+  *) echo "usage: $0 {up|upgrade|has-stack|wait-agent|login|api|roundtrip|agents|metric|wait-metric|running|restarts|state|stats|logs|down}" >&2; exit 2 ;;
 esac

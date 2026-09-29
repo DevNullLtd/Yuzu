@@ -218,10 +218,15 @@ jobs:
           COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_connected)
           [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) connected" || { echo "FAIL: 0 agents connected"; exit 1; }
 
+      # The gateway sets this gauge on a 10s timer, so it is polled, not read once.
       - name: Test — Agent connected (gateway)
         run: |
-          COUNT=$(bash scripts/ci/qa-stack.sh metric gateway yuzu_gw_agents_current)
-          [ "$COUNT" -ge 1 ] && echo "PASS: Gateway holds $COUNT agent stream(s)" || { echo "FAIL: gateway holds 0 agent streams"; exit 1; }
+          if COUNT=$(bash scripts/ci/qa-stack.sh wait-metric gateway yuzu_gw_agents_current 1 30); then
+            echo "PASS: Gateway holds $COUNT agent stream(s)"
+          else
+            echo "FAIL: gateway reports $COUNT agent streams after 30s"
+            exit 1
+          fi
 
       - name: Test — Command round-trip (os_info)
         run: |
