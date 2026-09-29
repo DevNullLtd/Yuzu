@@ -1,12 +1,12 @@
 /**
  * test_capability_catalogue.cpp — PR1.9's cross-cutting invariant gate over
- * the WHOLE capability catalogue: the twenty-one independently-authored
- * sources (the twenty per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
+ * the WHOLE capability catalogue: the independently-authored sources
+ * (the per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
  * fragments plus the core-owned `capability_decls/core_dispatch_capabilities
  * .hpp`) composed into one `CommandCapabilityRegistry`, exactly as a real
  * dispatch chokepoint eventually will.
  *
- * Nobody who authors a single fragment can see the other twenty, so nobody is
+ * Nobody who authors a single fragment can see the others, so nobody is
  * positioned to catch a row that under-declares risk for its operation, uses
  * a securable or operation that was never seeded, calls itself Destructive
  * without being Irreversible, or falsely claims `system_reserved`. This file
@@ -370,8 +370,8 @@ TEST_CASE("capability catalogue: update_source_trust.sources pins its exact clas
     CHECK(row.execute_gate == ExecuteGate::None);
 }
 
-TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all "
-          "twenty-one sources",
+TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
+          "source",
           "[server][dispatch][capability]") {
     auto registry = build_registry(all_labeled_sources());
     for (const auto& source : all_labeled_sources()) {

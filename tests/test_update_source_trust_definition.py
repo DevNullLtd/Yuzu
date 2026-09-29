@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""test_update_source_trust_definition.py -- ties the C++ row-format contract
-(`format_status_row`/`format_apt_source_row`/`format_apt_keyring_row` in
-tests/unit/test_update_source_trust_parsers.cpp) to the definition YAML that actually
-ships it, so a reordered or renamed result column fails here rather than only in a
-dashboard.
+"""test_update_source_trust_definition.py -- pins the definition YAML's result columns
+(the row_kind-first, field_1..field_10 name sequence and the row_kind enum) to the row
+layout update_source_trust_parsers.hpp emits (`format_status_row`/`format_apt_source_row`/
+`format_apt_keyring_row`), so a reordered or renamed result column fails here rather than
+only in a dashboard. It compares the YAML with the literals below; it does not read the C++.
 
 Runnable standalone: `python3 tests/test_update_source_trust_definition.py` (how meson runs
 it; a bare pytest-style file with no runner would execute zero assertions and always exit 0).

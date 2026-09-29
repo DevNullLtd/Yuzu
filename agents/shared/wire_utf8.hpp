@@ -26,6 +26,7 @@ namespace yuzu::shared {
 /// Length of the well-formed UTF-8 scalar starting at s[i] (1-4), or 0 when the
 /// byte there is NUL or does not start one (stray continuation byte, overlong
 /// form, surrogate, above U+10FFFF, truncated sequence).
+/// Precondition: i < s.size() (s[i] is read before any bounds check).
 [[nodiscard]] inline std::size_t utf8_scalar_len(std::string_view s, std::size_t i) noexcept {
     const auto at = [&](std::size_t k) { return static_cast<unsigned char>(s[k]); };
     const auto cont = [&](std::size_t k) { return k < s.size() && (at(k) & 0xC0u) == 0x80u; };

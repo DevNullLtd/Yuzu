@@ -254,6 +254,28 @@ TEST_CASE("parse_apt_one_line: an option VALUE is de-quoted and %XX-decoded, mat
     CHECK(r.sources[2].trusted == ust::Tri::yes);
 }
 
+TEST_CASE("percent_decoded: exactly two hex digits decode, anything else stays as written",
+          "[update_source_trust][parsers][apt]") {
+    // percent_decoded feeds signed-by / trusted / allow-insecure, so a divergence changes the
+    // reported trust posture. MUTATION: a signed from_chars accepts "%-1", one that skips
+    // whitespace or a "0x" prefix accepts "% 1" / "%0x", an off-by-one bound leaves a trailing
+    // "%41" undecoded.
+    CHECK(ust::percent_decoded("%41") == "A"); // at the very end of the string
+    CHECK(ust::percent_decoded("%6a%6A%2f") == "jj/"); // either case of hex digit
+    CHECK(ust::percent_decoded("%ff%FF") == "\xff\xff");
+    CHECK(ust::percent_decoded("%00") == std::string("\0", 1));
+    CHECK(ust::percent_decoded("%%41") == "%A");
+    CHECK(ust::percent_decoded("%4%41") == "%4A");
+    for (const char* literal : {"", "%", "a%", "%4", "%zz", "%4g", "%g4", "%+1", "%-1", "% 1", "%0x"})
+        CHECK(ust::percent_decoded(literal) == literal);
+    // The encoded value is decoded before the trust word is read, and a percent-encoded KEY is not.
+    const auto r = ust::parse_apt_one_line("deb [trusted=%79es] http://a.example/ s main\n"
+                                           "deb [trusted=%-1es] http://b.example/ s main\n");
+    REQUIRE(r.sources.size() == 2);
+    CHECK(r.sources[0].trusted == ust::Tri::yes);
+    CHECK(r.sources[1].trusted == ust::Tri::unmodelled);
+}
+
 // ── apt deb822 ───────────────────────────────────────────────────────────
 
 TEST_CASE("parse_apt_deb822: multi-stanza file with Signed-By (bookworm-shaped)",

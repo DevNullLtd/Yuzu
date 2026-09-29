@@ -24,10 +24,8 @@
  *   status|sources|<supported|constrained|unsupported>|<reason or ->
  *   apt_source|<file>|<format one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
  *   apt_keyring|<path>|<scope>|<format armored|binary|empty|unmodelled>|<size_bytes>
- *   rpm_repo|...   macos_swu|...   wsus|...
- *       PLANNED shapes, never emitted here (not read yet): the
- *       rpm/dnf .repo family, the macOS Software Update leg, the Windows WSUS
- *       leg) and is documented in content/definitions/update_source_trust.yaml.
+ * No other shape exists yet: the rpm/dnf, macOS and Windows legs are planned and
+ * report a status row only.
  *
  * TRISTATE. Every boolean-ish OS value maps to exactly one of
  * yes | no | unset | unmodelled. `unset` = the key is absent (a fact: the

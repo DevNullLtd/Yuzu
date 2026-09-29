@@ -30,6 +30,10 @@ TEST_CASE("scrub_wire_bytes: valid scalars survive, NUL and malformed bytes are 
         CHECK(t.front() == 'a');
         CHECK(t.size() == bad.size()); // replaced in place: the row keeps its shape
     }
+    // The replacement byte itself is the contract other code splits rows on: '?', never a control byte.
+    std::string t{"a\xff" "b\0c", 5};
+    CHECK(shared::scrub_wire_bytes(t) == 2);
+    CHECK(t == std::string{"a?b?c"});
 }
 
 TEST_CASE("scrub_wire_bytes accepts exactly RFC 3629 (boundaries of every lead-byte range)",

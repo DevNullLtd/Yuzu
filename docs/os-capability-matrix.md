@@ -8,7 +8,7 @@ whole agent surface, grouped into sections: **agent core**, **Guardian guards**,
 **Spark detection mechanisms**, **DEX**, **TAR warehouse capture sources**,
 **inventory / daily-sync sources**, **live device snapshot**, **security posture
 & file/certificate surfaces**, **network quality**, and every **agent plugin**
-(63).
+(68).
 
 **Read this first — accuracy & drift.** This is a *curated snapshot*, and a
 hand-maintained matrix drifts from code exactly the way the gap above happened.
@@ -181,7 +181,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 63 plugins the CI gate tracks populate
+Adoption is now **complete**: all 68 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing

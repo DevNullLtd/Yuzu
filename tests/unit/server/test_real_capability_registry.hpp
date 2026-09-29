@@ -1,7 +1,7 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same twenty-five capability-declaration spans the production site
+// composed from the same twenty-four capability-declaration spans the production site
 // composes, for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
@@ -9,7 +9,7 @@
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the twenty-five-span composition is the drift a shared seam exists to
+// copy of the twenty-four-span composition is the drift a shared seam exists to
 // remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.

@@ -84,9 +84,9 @@ spec:
     # field_1..field_10 carry the data fields of the widest shape (apt_source,
     # 10); narrower shapes leave the tail fields off the row.
     #
-    # A column's `platforms` lists the OSes whose declared leg (planned legs
-    # included) carries it; today only the status row's columns are populated on
-    # macOS and Windows.
+    # A column's `platforms` lists the OSes whose leg emits it; macOS and Windows
+    # read nothing today, so only the status row's columns (row_kind, field_1..
+    # field_3) are populated there.
     columns:
       - name: row_kind
         type: string
@@ -113,27 +113,27 @@ spec:
         type: string
         description: 'apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Not used by status.'
         example: https://deb.debian.org/debian
-        platforms: [linux, darwin]
+        platforms: [linux]
       - name: field_5
         type: string
         description: 'apt_source: suites, space-separated when several.'
         example: bookworm
-        platforms: [linux, darwin]
+        platforms: [linux]
       - name: field_6
         type: string
         description: 'apt_source: components.'
         example: main
-        platforms: [linux, darwin]
+        platforms: [linux]
       - name: field_7
         type: string
         description: 'apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), the literal unmodelled when a one-line signed-by uses += or -=, or "-" when absent (apt then uses its global trusted keyrings).'
         example: /usr/share/keyrings/debian-archive-keyring.gpg
-        platforms: [linux, darwin]
+        platforms: [linux]
       - name: field_8
         type: string
         description: 'apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source; only the apt boolean words are recognised and any other value is unmodelled; unset means the source does not say, not that signatures are enforced).'
         example: unset
-        platforms: [linux, darwin]
+        platforms: [linux]
       - name: field_9
         type: string
         description: 'apt_source: allow_insecure (yes, no, unset, unmodelled; read from the one-line [allow-insecure=...] option only: apt ignores it in deb822, so it is unset there).'
