@@ -533,10 +533,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp"
     ],
-    "changelog": [
-      "changelog.d/20260909-autoruns-plugin.added.md",
-      "changelog.d/20260915-autoruns-hardening.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/autoruns.yaml"
     ],

@@ -1,1 +1,0 @@
-- **New `printing` agent plugin — printer and print-queue inventory.** `printers` and `jobs` are read-only IPP reads over the CUPS Unix domain socket on macOS/Linux (no libcups — a from-scratch minimal IPP codec) and winspool on Windows. A focused follow-up PR adds `clear_queue`, a single narrowly-scoped job cancellation.

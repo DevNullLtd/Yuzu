@@ -507,10 +507,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/2215-wifi-connected-corewlan.added.md",
-      "changelog.d/wave4-pr41b-wifi-native-dbus.changed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/wifi.yaml"
     ],

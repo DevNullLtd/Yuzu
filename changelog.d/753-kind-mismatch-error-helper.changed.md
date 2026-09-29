@@ -1,1 +1,0 @@
-- Rejecting a YAML document whose `kind:` does not match the store it was submitted to now returns the same sentence whichever store rejected it, and a document with no `kind:` at all now says so in the same terms instead of a terser one-off message. Policy fragments, policies, workflows, and product-pack documents previously each phrased the same failure differently.
