@@ -2160,6 +2160,14 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 **What to do.** Nothing required for the common case. If a confined operator reports dashboard/workflow results that look "smaller than before," that is the fix working as intended — confirm their management-group membership matches the agents they expect to see. If a service-scoped integration's error handling is keyed on a `403` from `get_agent_details` specifically, update it the same way as the `query_installed_software` note above.
 
+### vNEXT — `GET /api/v1/dex/app` and `GET /api/v1/dex/overview` (REST + MCP) stop narrowing an elevated administrator's device list
+
+**What changed.** `GET /api/v1/dex/app`/`get_dex_app` and `GET /api/v1/dex/overview`/`get_dex_overview` carried a per-caller `visible`-set resolver whose confinement was already dormant for the operator class it was meant to protect — a management-group-confined-only operator has no global grant, so the routes' bare `GuaranteedState:Read` permission gate denied them (`403`) before that resolver ever ran — but the SAME resolver ran for a **JIT-elevated administrator** and wrongly narrowed their device list to the base identity's own (usually empty) management-group grant instead of the unfiltered view elevation earns. The dormant, never-narrowing-anyone-real resolver has been retired outright; every admitted caller (a global grant, RBAC disabled, or an elevated administrator) now sees the same unfiltered `devices[]`/`top_devices[]` list. `GET /api/v1/dex/signals/{obs_type}`/`get_dex_signal_detail` never carried this resolver and is unaffected.
+
+**Who this affects.** A JIT-elevated administrator who previously received a narrowed (often empty) result from `GET /api/v1/dex/app` or `GET /api/v1/dex/overview` will now correctly see the unfiltered fleet. No other caller class changes: a management-group-confined operator still receives `403` from the unchanged permission gate, and a service-scoped API token is still denied outright.
+
+**What to do.** Nothing required.
+
 ### v0.10.0 — API token revocation is owner-scoped
 
 Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).

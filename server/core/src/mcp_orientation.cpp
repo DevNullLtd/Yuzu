@@ -86,6 +86,7 @@ constexpr std::string_view kApprovals[] = {"list_pending_approvals",
 constexpr std::string_view kDexSignals[] = {
     "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
+    "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
     "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",

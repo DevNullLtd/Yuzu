@@ -45,13 +45,23 @@ public:
         return build_dex_observation_model(store_, agent_id, event_id);
     }
 
-    [[nodiscard]] DexAppModel app(const std::string& process_name, const std::string& window,
-                                  const std::set<std::string>* visible) const override {
-        return build_dex_app_model(store_, process_name, window, since_of(window), visible);
+    [[nodiscard]] DexAppModel app(const std::string& process_name,
+                                  const std::string& window) const override {
+        // `DexApi::app` has no `visible` parameter (WS-A4 PR-1 — see
+        // dex_api.hpp's own doc comment); the
+        // builder itself keeps its own `visible` parameter for the
+        // dashboard fragment rewire (PR-2) to decide the fate of, so this
+        // seam always passes `nullptr`.
+        return build_dex_app_model(store_, process_name, window, since_of(window), nullptr);
     }
 
     [[nodiscard]] DexAppsModel apps(const std::string& window) const override {
         return build_dex_apps_model(store_, window, since_of(window));
+    }
+
+    [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,
+                                              const std::string& window) const override {
+        return build_dex_catalogue_model(store_, fleet(), os_filter, window);
     }
 
     [[nodiscard]] std::optional<DexCatalogueGroupModel>
@@ -70,11 +80,11 @@ public:
         return build_dex_trends_model(store_, fleet(), window, since_of(window));
     }
 
-    [[nodiscard]] DexOverviewModel
-    overview(const std::string& window, const std::set<std::string>* visible) const override {
+    [[nodiscard]] DexOverviewModel overview(const std::string& window) const override {
+        // Same nullptr-always posture as `app` above — see its comment.
         const int window_days = dex_window_to_days(window);
         return build_dex_overview_model(store_, fleet(), window, window_days,
-                                        dex_iso_since(window_days), visible);
+                                        dex_iso_since(window_days), nullptr);
     }
 
     // ── Builder-less (raw store reads assembled inline in the handler today) ──
@@ -103,6 +113,10 @@ public:
         const std::string os_scope = dex_normalize_os_filter(os_filter);
         out.subjects = store_->dex_signal_subjects(obs_type, since, limit, os_scope);
         out.by_os = store_->dex_signal_by_os(obs_type, since);
+        // WS-A4 PR-1 Gate 7 fix round: no per-row `visible` filter here — see
+        // this method's own doc comment in dex_api.hpp for why a post-limit
+        // filter was removed rather than kept (it left the sibling
+        // aggregates fleet-wide for every caller regardless of confinement).
         out.devices = store_->dex_signal_devices(obs_type, since, limit, os_scope);
         out.by_day = store_->dex_signal_by_day(obs_type, since, os_scope);
         return out;
