@@ -660,11 +660,6 @@ private:
     }
 };
 
-inline bool is_option_name(std::string_view w) {
-    return std::find(std::begin(kSudoersOptions), std::end(kSudoersOptions), w) !=
-           std::end(kSudoersOptions);
-}
-
 /// True when `s` still carries an unescaped `NOPASSWD:` / `PASSWD:` tag (blanks
 /// allowed before the colon). A decoded tag is removed from the row's text, so
 /// one found here was NOT decoded into the `nopasswd` column.
@@ -762,7 +757,8 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
                     ++k;
                 } else if (is('w') && k + 2 < t.size() && t[k + 1].kind == '=' &&
                            (t[k + 2].kind == 'w' || t[k + 2].kind == 's') &&
-                           is_option_name(text.substr(t[k].b, t[k].e - t[k].b))) {
+                           std::ranges::find(kSudoersOptions, text.substr(t[k].b, t[k].e - t[k].b)) !=
+                               std::end(kSudoersOptions)) {
                     kept.append(span(t[k].b, t[k + 2].e)).append(" ");
                     k += 3;
                 } else {

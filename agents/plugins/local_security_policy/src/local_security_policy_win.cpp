@@ -56,28 +56,15 @@
  * writes what those return. The exception
  * boundary is the shared execute(); it is not repeated here.
  *
- * ---- RIG PROBE (the-rig session, 2026-09-21) ---------------------------------------
- * The exact argv (then with the literal C:\Windows\System32 argv[0], which is the
- * system directory on that host) was run as LocalSystem (scheduled task, RunLevel
- * Highest) on the-rig (Windows 11 Pro 10.0.26200 x64, standalone, not domain-joined):
- *   identity                    : nt authority\system
- *   whoami /priv (relevant)     : SeSecurityPrivilege present, state Disabled
- *   secedit exit code           : 0
- *   policy.inf size (bytes)     : 12828 (UTF-16LE with a BOM, CRLF)
- *   what this shows             : the export succeeds as LocalSystem, elevated, with
- *                                 SeSecurityPrivilege present but NOT enabled. It does not
- *                                 show which privilege is required, nor that the dedicated
- *                                 NT SERVICE\YuzuAgent account (#1442) succeeds -- neither
- *                                 was measured. A refusal would surface as a non-zero exit,
- *                                 `secedit:exit_<n>` (CONSTRAINED); also unmeasured.
- *   stale-sweep pre-seed removed: yes. Three directories were pre-seeded under data_dir: a
- *                                 SYSTEM-owned one aged 3 h (REMOVED), a same-named one owned by
- *                                 BUILTIN\Administrators aged 3 h (SKIPPED, foreign SID) and a
- *                                 fresh SYSTEM-owned one (kept); the log (the earlier
- *                                 removed/skipped format) read 1/2, then 0/2 on the next dispatches.
- *   export sections, in order   : [System Access] [Event Audit] [Registry Values] [Version];
- *                                 [Version] last, signature="$CHICAGO$", Revision=1 -- the shape
- *                                 secedit_export_complete requires (else export_incomplete).
+ * ---- RIG PROBE (the-rig, 2026-09-21; sweep contract re-run 2026-09-29) -------------
+ * The exact argv was run as LocalSystem (scheduled task, RunLevel Highest) on the-rig
+ * (Windows 11 Pro 10.0.26200 x64, standalone, not domain-joined): exit 0, `[System Access]
+ * [Event Audit] [Registry Values] [Version]` in that order, SeSecurityPrivilege present but
+ * Disabled. It does not show which privilege is required, nor that NT SERVICE\YuzuAgent
+ * (#1442) succeeds -- neither was measured; a refusal would surface as `secedit:exit_<n>`
+ * (CONSTRAINED), also unmeasured. Sweep, with a SYSTEM-owned stale directory, a
+ * BUILTIN\Administrators-owned one of the same shape and a fresh one under data_dir:
+ * the stale one was removed, the foreign-owned and fresh ones were left alone.
  * No fixture of the export is committed.
  */
 
