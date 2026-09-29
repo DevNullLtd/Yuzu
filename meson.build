@@ -6,7 +6,7 @@ project(
   # once generated `int kVersionPatch = 1-dev;` and red-lined the whole C++
   # matrix (fca69e34). The suffix-tolerant split below (search
   # PROJECT_VERSION_PATCH) stays as defense-in-depth, not as licence.
-  version: '0.13.1',
+  version: '0.14.0',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [

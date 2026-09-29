@@ -307,5 +307,4 @@ system_uuid|unknown
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: `tests/unit/server/test_hardware_list_model.cpp` · `tests/unit/server/test_hardware_routes.cpp` · `tests/unit/server/test_hardware_ui.cpp` · `tests/unit/test_hardware_device_identity_posix_actions.cpp` · `tests/unit/test_hardware_disks_macos.cpp` · `tests/unit/test_hardware_linux_parsers.cpp` · `tests/unit/test_hardware_macos_bios.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260916-hardware-ci-list-and-actions.added.md` · `changelog.d/20260916-hardware-devices-merge-bulk-tagging.added.md` · `changelog.d/20260916-hardware-live-info-cards.added.md` · `changelog.d/20260916-hardware-sync-now-performance.changed.md` · `changelog.d/20260916-hardware-sync-tags-actions-round2.added.md` · `changelog.d/20260916-hardware-ui-bugfixes.fixed.md` · `changelog.d/2380-hardware-device-identity-native-acquisition.changed.md` · `changelog.d/3404-hardware-wmi-bounded.fixed.md`
 <!-- END GENERATED -->

@@ -390,11 +390,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/2026-08-wmi-property-omission.changed.md",
-      "changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md",
-      "changelog.d/3404-hardware-wmi-bounded.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/wmi.yaml"
     ],

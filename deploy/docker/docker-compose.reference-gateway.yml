@@ -48,7 +48,7 @@
 
 services:
   server:
-    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
@@ -93,7 +93,7 @@ services:
       start_period: 10s
 
   gateway:
-    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-gateway
     restart: unless-stopped
     environment:
@@ -113,7 +113,7 @@ services:
     # agent in docker-publish-chisel only, never in the plain docker-publish
     # matrix, so `yuzu-agent` has never existed at any tag and this service
     # could never start. Same binary and entrypoint as the other images.
-    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.14.0}
     command:
       - "--server=gateway:50051"
       # No --ca-cert: the agent auto-discovers the install CA at
@@ -134,7 +134,7 @@ services:
   # An external/managed Postgres is first-class — point the server's
   # YUZU_POSTGRES_DSN at it and drop this service + the server depends_on.
   postgres:
-    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:
