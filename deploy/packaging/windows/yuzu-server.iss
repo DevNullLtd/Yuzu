@@ -802,12 +802,18 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Remove server data directory?' + #13#10 +
-              ExpandConstant('{commonappdata}\Yuzu Server') + #13#10#13#10 +
-              'This includes databases, configuration, certificates, and all server state.',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-    begin
-      DelTree(ExpandConstant('{commonappdata}\Yuzu Server'), True, True, True);
-    end;
+    { Ask about the data directory only when someone can answer. A plain MsgBox
+      is NOT suppressed by /SUPPRESSMSGBOXES (only SuppressibleMsgBox is), so a
+      silent uninstall (SCCM/Intune/GPO, /VERYSILENT) used to wait forever on an
+      invisible dialog (#5147). Silent uninstalls keep the data directory, the
+      same answer as the prompt's default button. }
+    if not UninstallSilent then
+      if MsgBox('Remove server data directory?' + #13#10 +
+                ExpandConstant('{commonappdata}\Yuzu Server') + #13#10#13#10 +
+                'This includes databases, configuration, certificates, and all server state.',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
+        DelTree(ExpandConstant('{commonappdata}\Yuzu Server'), True, True, True);
+      end;
   end;
 end;
