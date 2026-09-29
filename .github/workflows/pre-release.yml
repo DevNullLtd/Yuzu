@@ -21,11 +21,20 @@ permissions:
 # Docker rejects uppercase in a repository name outright ("repository name must
 # be lowercase"), so nothing could be pulled. GitHub expressions have no
 # lowercase function, so the owner must be folded in a shell step: the `resolve`
-# job does it once and publishes `needs.resolve.outputs.registry`. Every job that
-# touches an image sets `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`,
-# and steps that cannot read env (action `with:` inputs, e.g. trivy's image-ref)
-# reference the output directly. Defining a mixed-case default here again would
-# just re-arm the trap for the next job that forgets to override it.
+# job does it once and publishes `needs.resolve.outputs.registry`. The jobs that
+# pull images by name (artifact-verify, security-scan) set
+# `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`, and steps that cannot
+# read env (action `with:` inputs, e.g. trivy's image-ref) reference the output
+# directly. Defining a mixed-case default here again would just re-arm the trap
+# for the next job that forgets to override it.
+#
+# The stack jobs (integration, soak-test, upgrade-test) do NOT use REGISTRY:
+# scripts/ci/qa-stack.sh runs the shipped reference template, whose image names
+# are written in it already lowercased (ghcr.io/devnullltd/...), so they pull
+# exactly what an operator copying the template pulls. The version's gateway
+# sys.config and tagged template are fetched from QA_REPO below.
+env:
+  QA_REPO: ${{ github.repository }}
 
 jobs:
   # ── Resolve version and download release artifacts ──────────────────
@@ -194,56 +203,32 @@ jobs:
 
       - name: Test — Dashboard reachable
         run: |
-          CODE=$(curl -s --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE (verified against the install CA)" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
       - name: Test — Gateway health
         run: |
-          HEALTH=$(curl -sf http://127.0.0.1:8081/readyz)
+          HEALTH=$(curl -sf --max-time 10 http://127.0.0.1:8081/readyz)
           echo "$HEALTH" | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: $HEALTH"; exit 1; }
 
-      - name: Test — Agent registered
+      # Connected GAUGES, not the *_total counters: a counter stays >= 1 after
+      # the first registration however many times the agent drops since.
+      - name: Test — Agent connected (server)
         run: |
-          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
-          [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) registered" || { echo "FAIL: 0 agents"; exit 1; }
+          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_connected)
+          [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) connected" || { echo "FAIL: 0 agents connected"; exit 1; }
 
-      - name: Test — Gateway sees agent
+      - name: Test — Agent connected (gateway)
         run: |
-          COUNT=$(bash scripts/ci/qa-stack.sh metric gateway yuzu_gw_agents_connected_total)
-          [ "$COUNT" -ge 1 ] && echo "PASS: Gateway shows $COUNT agent(s)" || { echo "FAIL: 0 agents"; exit 1; }
+          COUNT=$(bash scripts/ci/qa-stack.sh metric gateway yuzu_gw_agents_current)
+          [ "$COUNT" -ge 1 ] && echo "PASS: Gateway holds $COUNT agent stream(s)" || { echo "FAIL: gateway holds 0 agent streams"; exit 1; }
 
       - name: Test — Command round-trip (os_info)
         run: |
-          RESP=$(bash scripts/ci/qa-stack.sh api POST /api/command '{"plugin":"os_info","action":"os_name"}')
-          CMD_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null)
-
-          if [ -z "$CMD_ID" ]; then
-            echo "FAIL: Command dispatch failed: $RESP"
-            exit 1
-          fi
-
-          echo "Command dispatched: $CMD_ID"
-
-          # Poll for response
-          for i in $(seq 1 20); do
-            sleep 2
-            RESULT=$(bash scripts/ci/qa-stack.sh api GET "/api/responses/$CMD_ID" | \
-              python3 -c "
-          import sys,json
-          d=json.load(sys.stdin)
-          for r in d.get('responses',[]):
-              o=r.get('output','')
-              if 'os_name|' in o:
-                  print(o.split('|',1)[1])
-                  break
-          " 2>/dev/null)
-            [ -n "$RESULT" ] && break
-          done
-
-          if [ -n "$RESULT" ]; then
-            echo "PASS: os_info returned '$RESULT' (${i}s)"
+          if OS=$(bash scripts/ci/qa-stack.sh roundtrip os_info os_name os_name 20); then
+            echo "PASS: os_info returned '$OS'"
           else
-            echo "FAIL: No response after polling"
+            echo "FAIL: no os_info.os_name answer within 40s"
             exit 1
           fi
 
@@ -469,26 +454,50 @@ jobs:
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
           $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
-          if (Test-Path $uninstaller) {
-            # Bounded, not Start-Process -Wait: -Wait also waits on the
-            # uninstaller's descendants, so one lingering child held this step
-            # (and, on the always() TLS pass, every later diagnostic step) until
-            # the job timeout (#5145).
-            $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
-            $deadline = (Get-Date).AddMinutes(3)
-            while ((Get-Date) -lt $deadline -and ((-not $p.HasExited) -or (Test-Path $bin))) {
-              Start-Sleep -Seconds 2
-            }
-            if (-not $p.HasExited) {
-              Write-Error "FAIL: uninstaller still running after 3 minutes"
+          $log = Join-Path $PWD 'uninstall-notls.log'
+          # AppId from deploy/packaging/windows/yuzu-agent.iss; Inno Setup names the key <AppId>_is1.
+          $keyName = '{B7F3A2E1-9C4D-4F6A-8E2B-1D3C5A7F9E0B}_is1'
+          $keys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$keyName",
+                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$keyName")
+          function Get-KeysLeft { @($keys | Where-Object { Test-Path $_ }) }
+          # unins000.exe copies itself to %TEMP%, starts the copy (_unins*.tmp /
+          # _iu*.tmp) and exits at once, so its own exit proves nothing: #5145's
+          # first fix PASSED here at 2.4s with the copy still running. Done means
+          # no uninstaller process of any of those names, the Uninstall key gone
+          # and the binary gone. Bounded rather than Start-Process -Wait, which
+          # also waits on descendants and held the job to its timeout.
+          function Get-Uninstallers {
+            @(Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'unins000' -or $_.Name -like '_unins*' -or $_.Name -like '_iu*' })
+          }
+          if (-not (Test-Path $uninstaller)) {
+            if ((Get-KeysLeft).Count -gt 0 -or (Test-Path $bin)) {
+              Write-Error "FAIL: the agent is installed but $uninstaller is missing"
               exit 1
             }
+            Write-Host "Nothing installed, nothing to uninstall"
+            exit 0
           }
-          if (Test-Path $bin) {
-            Write-Error "FAIL: binary still present after uninstall"
+          $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            Start-Sleep -Seconds 2
+            $procs = Get-Uninstallers
+            $keysLeft = Get-KeysLeft
+            $busy = (-not $p.HasExited) -or $procs.Count -gt 0 -or $keysLeft.Count -gt 0 -or (Test-Path $bin)
+          } while ($busy -and (Get-Date) -lt $deadline)
+          if ($busy) {
+            $why = @()
+            if ($procs.Count -gt 0) { $why += "uninstaller still running ($(($procs | ForEach-Object { $_.Name }) -join ', '))" }
+            if ($keysLeft.Count -gt 0) { $why += "Uninstall key still present ($($keysLeft -join ', '))" }
+            if (Test-Path $bin) { $why += "$bin still present" }
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            # Free the runner for the steps after this one.
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Error "FAIL: uninstall not complete after 3 minutes: $($why -join '; ')"
             exit 1
           }
-          Write-Host "PASS: uninstalled cleanly"
+          Write-Host "PASS: uninstalled cleanly (no uninstaller process, Uninstall key and binary gone)"
 
       # ── Pass 2: default TLS posture — must fail closed ────────────────
       - name: Silent install (default TLS posture)
@@ -550,26 +559,50 @@ jobs:
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
           $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
-          if (Test-Path $uninstaller) {
-            # Bounded, not Start-Process -Wait: -Wait also waits on the
-            # uninstaller's descendants, so one lingering child held this step
-            # (and, on the always() TLS pass, every later diagnostic step) until
-            # the job timeout (#5145).
-            $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
-            $deadline = (Get-Date).AddMinutes(3)
-            while ((Get-Date) -lt $deadline -and ((-not $p.HasExited) -or (Test-Path $bin))) {
-              Start-Sleep -Seconds 2
-            }
-            if (-not $p.HasExited) {
-              Write-Error "FAIL: uninstaller still running after 3 minutes"
+          $log = Join-Path $PWD 'uninstall-tls.log'
+          # AppId from deploy/packaging/windows/yuzu-agent.iss; Inno Setup names the key <AppId>_is1.
+          $keyName = '{B7F3A2E1-9C4D-4F6A-8E2B-1D3C5A7F9E0B}_is1'
+          $keys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$keyName",
+                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$keyName")
+          function Get-KeysLeft { @($keys | Where-Object { Test-Path $_ }) }
+          # unins000.exe copies itself to %TEMP%, starts the copy (_unins*.tmp /
+          # _iu*.tmp) and exits at once, so its own exit proves nothing: #5145's
+          # first fix PASSED here at 2.4s with the copy still running. Done means
+          # no uninstaller process of any of those names, the Uninstall key gone
+          # and the binary gone. Bounded rather than Start-Process -Wait, which
+          # also waits on descendants and held the job to its timeout.
+          function Get-Uninstallers {
+            @(Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'unins000' -or $_.Name -like '_unins*' -or $_.Name -like '_iu*' })
+          }
+          if (-not (Test-Path $uninstaller)) {
+            if ((Get-KeysLeft).Count -gt 0 -or (Test-Path $bin)) {
+              Write-Error "FAIL: the agent is installed but $uninstaller is missing"
               exit 1
             }
+            Write-Host "Nothing installed, nothing to uninstall"
+            exit 0
           }
-          if (Test-Path $bin) {
-            Write-Error "FAIL: binary still present after uninstall"
+          $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            Start-Sleep -Seconds 2
+            $procs = Get-Uninstallers
+            $keysLeft = Get-KeysLeft
+            $busy = (-not $p.HasExited) -or $procs.Count -gt 0 -or $keysLeft.Count -gt 0 -or (Test-Path $bin)
+          } while ($busy -and (Get-Date) -lt $deadline)
+          if ($busy) {
+            $why = @()
+            if ($procs.Count -gt 0) { $why += "uninstaller still running ($(($procs | ForEach-Object { $_.Name }) -join ', '))" }
+            if ($keysLeft.Count -gt 0) { $why += "Uninstall key still present ($($keysLeft -join ', '))" }
+            if (Test-Path $bin) { $why += "$bin still present" }
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            # Free the runner for the steps after this one.
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Error "FAIL: uninstall not complete after 3 minutes: $($why -join '; ')"
             exit 1
           }
-          Write-Host "PASS: uninstalled cleanly"
+          Write-Host "PASS: uninstalled cleanly (no uninstaller process, Uninstall key and binary gone)"
 
       - name: Collect failure diagnostics
         if: failure()
@@ -596,6 +629,8 @@ jobs:
             install-tls.log
             agent-notls.log
             agent-tls.log
+            uninstall-notls.log
+            uninstall-tls.log
             system-events.log
           if-no-files-found: ignore
           retention-days: 3
@@ -652,7 +687,9 @@ jobs:
           # Each check fails the step on its own: `check && echo PASS` under
           # bash -e only fails when it is the step's LAST command, so every
           # earlier miss used to pass silently.
-          has() { tar tzf "$1" | grep -q "$2" && echo "PASS: $3" || { echo "FAIL: $3 ($2 not in $1)"; exit 1; }; }
+          # The listing goes to a file first: `tar | grep -q` under pipefail
+          # can fail a present entry when grep exits early and tar takes SIGPIPE.
+          has() { tar tzf "$1" > "$1.list" && grep -q "$2" "$1.list" && echo "PASS: $3" || { echo "FAIL: $3 ($2 not in $1)"; exit 1; }; }
 
           echo "=== Linux x64 archive ==="
           has yuzu-linux-x64.tar.gz 'bin/yuzu-server' "server binary"
@@ -672,7 +709,8 @@ jobs:
             has yuzu-linux-arm64.tar.gz 'bin/yuzu-server' "ARM64 server"
             has yuzu-linux-arm64.tar.gz 'bin/yuzu-agent' "ARM64 agent"
           else
-            echo "SKIP: no yuzu-linux-arm64.tar.gz in this release"
+            echo "::warning::ARM64 archive NOT CHECKED: this release ships no yuzu-linux-arm64.tar.gz"
+            echo "- ARM64 archive: **not checked** (not in this release)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Inspect Linux binaries
@@ -839,44 +877,59 @@ jobs:
       - name: Run soak (10 minutes)
         run: |
           echo "Starting 10-minute soak test..."
-          echo "timestamp,memory,agents_registered" > /tmp/yuzu-soak/soak.csv
+          echo "timestamp,state,agents_connected,gw_ready,roundtrip,memory" > /tmp/yuzu-soak/soak.csv
+
+          # A container Docker restarted is a crash even when it is back up by
+          # the next sample, so restarts are compared with the count at the
+          # start of the soak rather than only checking "running".
+          BASE_RESTARTS=$(bash scripts/ci/qa-stack.sh restarts)
+          echo "Restart count at start: $BASE_RESTARTS  ($(bash scripts/ci/qa-stack.sh state))"
 
           FAILURES=0
+          RT_OK=0
+          RT_FAIL=0
           for i in $(seq 1 20); do
             TS=$(date +%H:%M:%S)
-
-            # All four services (server, gateway, agent, postgres) running
             RUNNING=$(bash scripts/ci/qa-stack.sh running)
-
-            # Agent count
-            AGENTS=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
-
-            # Gateway health
+            RESTARTS=$(bash scripts/ci/qa-stack.sh restarts)
+            STATE=$(bash scripts/ci/qa-stack.sh state)
+            AGENTS=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_connected)
             GW_OK="yes"
-            curl -sf http://127.0.0.1:8081/readyz &>/dev/null || GW_OK="no"
-
-            # Memory (container usage)
+            curl -sf --max-time 10 http://127.0.0.1:8081/readyz 2>/dev/null | grep -q '"ready"' || GW_OK="no"
             MEM=$(bash scripts/ci/qa-stack.sh stats)
 
-            echo "$TS  running=$RUNNING/4  agents=$AGENTS  gw=$GW_OK  mem=[$MEM]"
-            echo "$TS,$MEM,$AGENTS" >> /tmp/yuzu-soak/soak.csv
-
-            if [ "$RUNNING" -lt 4 ] || [ "$AGENTS" -lt 1 ] || [ "$GW_OK" = "no" ]; then
-              FAILURES=$((FAILURES + 1))
-              echo "WARNING: degraded state at $TS"
+            # Every other sample (~once a minute) a real command round-trip
+            # through server -> gateway -> agent -> plugin and back, bounded
+            # at 20s. `status.health` answers `uptime_seconds|<n>`.
+            RT="-"
+            if [ $((i % 2)) -eq 0 ]; then
+              if UP=$(bash scripts/ci/qa-stack.sh roundtrip status health uptime_seconds 10); then
+                RT="ok(uptime=${UP}s)"; RT_OK=$((RT_OK + 1))
+              else
+                RT="FAIL"; RT_FAIL=$((RT_FAIL + 1))
+              fi
             fi
 
-            # Send a command every 30s to exercise the data path
-            if [ $((i % 2)) -eq 0 ]; then
-              bash scripts/ci/qa-stack.sh api POST /api/command '{"plugin":"status","action":"ping"}' > /dev/null 2>&1 || true
+            echo "$TS  running=$RUNNING/4  restarts=$RESTARTS  agents=$AGENTS  gw=$GW_OK  cmd=$RT  mem=[$MEM]"
+            echo "$TS,$STATE,$AGENTS,$GW_OK,$RT,$MEM" >> /tmp/yuzu-soak/soak.csv
+
+            if [ "$RUNNING" -lt 4 ] || [ "$RESTARTS" -gt "$BASE_RESTARTS" ] || [ "$AGENTS" -lt 1 ] \
+               || [ "$GW_OK" = "no" ] || [ "$RT" = "FAIL" ]; then
+              FAILURES=$((FAILURES + 1))
+              echo "WARNING: degraded state at $TS ($STATE)"
             fi
 
             sleep 30
           done
 
           echo ""
+          echo "Command round-trips: $RT_OK ok, $RT_FAIL failed"
+          if [ "$RT_OK" -eq 0 ]; then
+            echo "FAIL: no command round-trip succeeded during the soak"
+            exit 1
+          fi
           if [ "$FAILURES" -eq 0 ]; then
-            echo "PASS: Soak test completed — 10 minutes, 0 failures"
+            echo "PASS: Soak test completed — 10 minutes, 0 degraded samples, no container restarts"
           else
             echo "FAIL: $FAILURES degraded samples during soak"
             exit 1
@@ -913,7 +966,11 @@ jobs:
     needs: [resolve, integration]
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Two full stack bring-ups (each up to 3 x 180s waits plus pulls) and a
+    # post-upgrade round-trip.
+    timeout-minutes: 30
+    outputs:
+      tested: ${{ steps.prevstack.outputs.tested }}
     env:
       QA_STATE_DIR: /tmp/yuzu-upgrade
       QA_PROJECT: yuzu-upgrade
@@ -934,18 +991,44 @@ jobs:
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       # Same reference stack, started at the previous stable release, then
-      # every service moved to the new version with the Postgres volume, the
-      # install CA and the agent's issued leaf kept — i.e. a real in-place
-      # upgrade of the shipped template, including the schema migrations.
+      # every service moved to the new version at once with the Postgres
+      # volume, the install CA and the agent's data dir (its identity and
+      # issued leaf) kept: the in-place upgrade of all four images an operator
+      # of the template performs, including the schema migrations. It is NOT a
+      # mixed-version test (new server with a not-yet-upgraded agent), and both
+      # halves run THIS checkout's template with each version's images; drift
+      # from each tagged template is printed as a warning and in the summary.
+      #
+      # A previous release that predates the reference template cannot be
+      # started this way. That is reported as "not tested" (job output
+      # `tested=false`, shown in the QA report), never as a pass.
+      - name: Check the previous release ships the reference stack
+        id: prevstack
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+        run: |
+          PREV_VER="${PREV_TAG#v}"
+          if bash scripts/ci/qa-stack.sh has-stack "$PREV_VER"; then
+            echo "tested=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tested=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Upgrade NOT TESTED: $PREV_TAG predates deploy/docker/docker-compose.reference-gateway.yml, so there is no shipped stack to upgrade from."
+            echo "**Upgrade test: NOT TESTED** — $PREV_TAG predates the reference stack." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Start previous release
+        if: steps.prevstack.outputs.tested == 'true'
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
         run: |
           PREV_VER="${PREV_TAG#v}"
           echo "Starting previous release: $PREV_VER"
           bash scripts/ci/qa-stack.sh up "$PREV_VER"
+          bash scripts/ci/qa-stack.sh agents | tee /tmp/yuzu-upgrade/agents-before.txt
+          [ -s /tmp/yuzu-upgrade/agents-before.txt ] || { echo "FAIL: no connected agent before the upgrade"; exit 1; }
 
       - name: Upgrade to new release
+        if: steps.prevstack.outputs.tested == 'true'
         env:
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
@@ -953,20 +1036,41 @@ jobs:
           bash scripts/ci/qa-stack.sh upgrade "$NEW_VER"
 
       - name: Verify post-upgrade
+        if: steps.prevstack.outputs.tested == 'true'
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          # Dashboard reachable
-          CODE=$(curl -s --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
-          # Agent reconnected
-          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_registered_total)
-          [ "$COUNT" -ge 1 ] && echo "PASS: Agent reconnected ($COUNT)" || { echo "FAIL: Agent not reconnected"; exit 1; }
+          curl -sf --max-time 10 http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
 
-          # Gateway healthy
-          curl -sf http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
+          # The SAME agent is back (its data dir survived, so no re-enrolment
+          # and no fresh identity), and it is running the new release. The
+          # agent reports <project version>+<build>, and an -rcN tag builds
+          # the plain project version, so compare the part before any '-'.
+          bash scripts/ci/qa-stack.sh agents | tee /tmp/yuzu-upgrade/agents-after.txt
+          BEFORE_ID=$(awk 'NR==1{print $1}' /tmp/yuzu-upgrade/agents-before.txt)
+          AFTER_VER=$(awk -v id="$BEFORE_ID" '$1==id{print $2}' /tmp/yuzu-upgrade/agents-after.txt)
+          if [ -z "$AFTER_VER" ]; then
+            echo "FAIL: agent $BEFORE_ID did not reconnect (connected now: $(tr '\n' ' ' < /tmp/yuzu-upgrade/agents-after.txt))"
+            exit 1
+          fi
+          echo "PASS: agent $BEFORE_ID reconnected with the same identity"
+          WANT="${NEW_VER%%-*}"
+          if [ "${AFTER_VER%%+*}" != "$WANT" ]; then
+            echo "FAIL: agent reports $AFTER_VER, expected $WANT"
+            exit 1
+          fi
+          echo "PASS: agent runs $AFTER_VER"
+
+          if OS=$(bash scripts/ci/qa-stack.sh roundtrip os_info os_name os_name 20); then
+            echo "PASS: post-upgrade os_info round-trip returned '$OS'"
+          else
+            echo "FAIL: no os_info answer after the upgrade"
+            exit 1
+          fi
 
           echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
@@ -1005,6 +1109,7 @@ jobs:
           R_SECURITY: ${{ needs.security-scan.result }}
           R_SOAK: ${{ needs.soak-test.result }}
           R_UPGRADE: ${{ needs.upgrade-test.result }}
+          UPGRADE_TESTED: ${{ needs.upgrade-test.outputs.tested }}
           # Bind tag/version to env to avoid code-injection via crafted ref name.
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -1019,6 +1124,13 @@ jobs:
             esac
           }
 
+          UPGRADE_CELL=$(status_icon "$R_UPGRADE")
+          if [ "$R_UPGRADE" = "success" ] && [ "$UPGRADE_TESTED" != "true" ]; then
+            UPGRADE_CELL="NOT TESTED (previous release predates the reference stack)"
+          elif [ "$R_UPGRADE" = "skipped" ]; then
+            UPGRADE_CELL="SKIP (no previous stable release)"
+          fi
+
           cat >> "$GITHUB_STEP_SUMMARY" <<REPORT
           ## Pre-release QA Report: ${TAG}
 
@@ -1032,7 +1144,7 @@ jobs:
           | Artifact verification | $(status_icon "$R_ARTIFACT") |
           | Security scan (Trivy) | $(status_icon "$R_SECURITY") |
           | Soak test (10 min) | $(status_icon "$R_SOAK") |
-          | Upgrade test | $(status_icon "$R_UPGRADE") |
+          | Upgrade test | ${UPGRADE_CELL} |
 
           REPORT
 
