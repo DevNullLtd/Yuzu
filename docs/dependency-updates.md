@@ -65,9 +65,15 @@ is stored in two files at the repo root:
 
 These are consumed by:
 
-- `.github/workflows/ci.yml` — all six jobs `pip3/pip/pipx install` from it
-  (with `--require-hashes` so a tampered package breaks the install).
-- `.github/workflows/release.yml` — Windows and macOS release builds.
+- `.github/workflows/ci.yml` — the Linux and macOS jobs `pip3/pip/pipx install`
+  from it (with `--require-hashes` so a tampered package breaks the install).
+- `.github/workflows/release.yml` — the Linux and macOS release builds.
+
+The Windows jobs in both workflows install nothing from it: they use the
+runner's pre-provisioned toolchain, whose meson is pinned separately by
+`deploy/windows/toolchain-contract.json` (see `docs/windows-build.md`). A
+meson bump here therefore does not reach Windows until the contract and the
+runner are updated to match.
 
 `scripts/setup.sh` assumes a `meson` binary is already on PATH and does
 not install one — local developers are responsible for matching the
