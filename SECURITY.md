@@ -11,7 +11,7 @@
 If you discover a security vulnerability in Yuzu, please report it responsibly:
 
 1. **Do not** open a public GitHub issue for security vulnerabilities
-2. Use [GitHub's private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new) to submit a report
+2. Use [GitHub's private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new) to submit a report
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce

@@ -92,7 +92,7 @@ ARG BUNDLE_SOURCE_RELEASE=unknown
 LABEL org.opencontainers.image.title="yuzu-agent-bundle" \
       org.opencontainers.image.description="Yuzu agent for linux-x64, windows-x64, macos-arm64 (delivery image; not a runtime)" \
       org.opencontainers.image.version="${BUNDLE_VERSION}" \
-      org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu" \
+      org.opencontainers.image.source="https://github.com/DevNullLtd/Yuzu" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       com.yuzu.agent.source-release="${BUNDLE_SOURCE_RELEASE}"
 

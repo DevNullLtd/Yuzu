@@ -188,7 +188,7 @@ configs:
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-server
     restart: unless-stopped
     ports:
@@ -268,7 +268,7 @@ services:
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
   postgres:
-    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:
@@ -299,7 +299,7 @@ services:
 
   # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-gateway
     restart: unless-stopped
     ports:

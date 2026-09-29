@@ -1,8 +1,8 @@
 # Yuzu
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Tr3kkR/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/Tr3kkR/Yuzu)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/DevNullLtd/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/DevNullLtd/Yuzu)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12582/badge)](https://www.bestpractices.dev/projects/12582)
-[![Zizmor](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml)
+[![Zizmor](https://github.com/DevNullLtd/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/DevNullLtd/Yuzu/actions/workflows/zizmor.yml)
 
 **Enterprise endpoint management platform.** Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.
 
@@ -144,16 +144,16 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.12.0.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.12.0.
 - **Container images** (published to GHCR on every tag):
-  - `ghcr.io/tr3kkr/yuzu-server:<version>`
-  - `ghcr.io/tr3kkr/yuzu-agent:<version>`
-  - `ghcr.io/tr3kkr/yuzu-gateway:<version>`
+  - `ghcr.io/devnullltd/yuzu-server:<version>`
+  - `ghcr.io/devnullltd/yuzu-agent-chisel:<version>`
+  - `ghcr.io/devnullltd/yuzu-gateway:<version>`
 - **Docker Compose** quickstart: [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) stands up the full server + gateway + agent stack. Reference wiring for UAT is [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml).
 
 ```bash
 # Pull and run the latest stable release via compose
-curl -fsSL https://raw.githubusercontent.com/Tr3kkR/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/DevNullLtd/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
 YUZU_VERSION=0.12.0 docker compose up -d
 ```
 
@@ -254,14 +254,14 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the live capability i
 
 Pull requests welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it covers the build, branch naming (`feature/*`, `fix/*`), the governance-gated PR workflow, C++23 coding standards, observability conventions, and the plugin SDK. Architectural and release context lives in [CLAUDE.md](CLAUDE.md). All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
-Good first issues are labelled [`good first issue`](https://github.com/Tr3kkR/Yuzu/labels/good%20first%20issue); broader backlogs are grouped by area (`enterprise-readiness`, `security`, `docs`, `compliance`).
+Good first issues are labelled [`good first issue`](https://github.com/DevNullLtd/Yuzu/labels/good%20first%20issue); broader backlogs are grouped by area (`enterprise-readiness`, `security`, `docs`, `compliance`).
 
 ## Reporting Issues
 
-- **Bugs** — open a [bug report](https://github.com/Tr3kkR/Yuzu/issues/new?template=bug_report.md). Include version (`yuzu-server --version`), OS, and reproduction steps.
-- **Feature requests** — open a [feature request](https://github.com/Tr3kkR/Yuzu/issues/new?template=feature_request.md). Tie it to a use case so scope stays concrete.
-- **Security vulnerabilities** — do **not** file a public issue. Follow [SECURITY.md](SECURITY.md) and submit via [GitHub's private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new). Acknowledgement within 48 hours.
-- **Questions & discussion** — [GitHub Discussions](https://github.com/Tr3kkR/Yuzu/discussions) for usage questions; use issues for anything actionable.
+- **Bugs** — open a [bug report](https://github.com/DevNullLtd/Yuzu/issues/new?template=bug_report.md). Include version (`yuzu-server --version`), OS, and reproduction steps.
+- **Feature requests** — open a [feature request](https://github.com/DevNullLtd/Yuzu/issues/new?template=feature_request.md). Tie it to a use case so scope stays concrete.
+- **Security vulnerabilities** — do **not** file a public issue. Follow [SECURITY.md](SECURITY.md) and submit via [GitHub's private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new). Acknowledgement within 48 hours.
+- **Questions & discussion** — [GitHub Discussions](https://github.com/DevNullLtd/Yuzu/discussions) for usage questions; use issues for anything actionable.
 
 ## License
 
