@@ -3,13 +3,13 @@
 # Based on official erlang:28 with rebar3 and CI tooling pre-installed.
 # Eliminates the 2-5 min erlef/setup-beam install step.
 #
-# Push to ghcr.io/tr3kkr/yuzu-ci-gateway:latest
+# Push to ghcr.io/devnullltd/yuzu-ci-gateway:latest
 #
 # Usage in workflows:
 #   jobs:
 #     build-gateway:
 #       runs-on: ubuntu-24.04
-#       container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
+#       container: ghcr.io/devnullltd/yuzu-ci-gateway:latest
 
 FROM erlang:28@sha256:c6d4a83d65ac2ac813988bd6da36a6a78c3b155eb017f6f06f52168b0d0024a0
 

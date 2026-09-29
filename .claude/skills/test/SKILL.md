@@ -222,7 +222,7 @@ if [[ "$MODE" != "quick" ]]; then
         elif docker build \
             --platform "linux/${HOST_DOCKER_ARCH}" \
             --build-arg "TRIPLET=${HOST_VCPKG_TRIPLET}" \
-            -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
+            -t "ghcr.io/devnullltd/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \
             > "$LOG_DIR/build-images.log" 2>&1; then

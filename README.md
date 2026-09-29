@@ -146,9 +146,9 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
 
 - **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.12.0.
 - **Container images** (published to GHCR on every tag):
-  - `ghcr.io/tr3kkr/yuzu-server:<version>`
-  - `ghcr.io/tr3kkr/yuzu-agent:<version>`
-  - `ghcr.io/tr3kkr/yuzu-gateway:<version>`
+  - `ghcr.io/devnullltd/yuzu-server:<version>`
+  - `ghcr.io/devnullltd/yuzu-agent:<version>`
+  - `ghcr.io/devnullltd/yuzu-gateway:<version>`
 - **Docker Compose** quickstart: [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) stands up the full server + gateway + agent stack. Reference wiring for UAT is [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml).
 
 ```bash

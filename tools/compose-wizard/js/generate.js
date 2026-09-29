@@ -478,7 +478,7 @@ ${c.tlsMode === 'plaintext'
   // Yuzu Server
   y += `  # ── Yuzu Server ──────────────────────────────────────────────────────\n`;
   y += `  server:\n`;
-  y += `    image: ghcr.io/tr3kkr/yuzu-server:\${YUZU_VERSION:-${c.version}}\n`;
+  y += `    image: ghcr.io/devnullltd/yuzu-server:\${YUZU_VERSION:-${c.version}}\n`;
   y += `    container_name: yuzu-server\n`;
   y += `    restart: unless-stopped\n`;
   y += `    ports:\n`;
@@ -628,7 +628,7 @@ ${c.tlsMode === 'plaintext'
     y += `  # external/managed Postgres instead is first-class — re-run the wizard\n`;
     y += `  # and pick "External / managed".\n`;
     y += `  postgres:\n`;
-    y += `    image: ghcr.io/tr3kkr/yuzu-postgres:\${YUZU_VERSION:-${c.version}}\n`;
+    y += `    image: ghcr.io/devnullltd/yuzu-postgres:\${YUZU_VERSION:-${c.version}}\n`;
     y += `    container_name: yuzu-postgres\n`;
     y += `    restart: unless-stopped\n`;
     y += `    environment:\n`;
@@ -669,7 +669,7 @@ ${c.tlsMode === 'plaintext'
   if (c.gateway) {
     y += `\n  # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────\n`;
     y += `  gateway:\n`;
-    y += `    image: ghcr.io/tr3kkr/yuzu-gateway:\${YUZU_VERSION:-${c.version}}\n`;
+    y += `    image: ghcr.io/devnullltd/yuzu-gateway:\${YUZU_VERSION:-${c.version}}\n`;
     y += `    container_name: yuzu-gateway\n`;
     y += `    restart: unless-stopped\n`;
     y += `    ports:\n`;

@@ -20,7 +20,7 @@ that the tag under verification is `v0.11.0`. Substitute as needed.
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, `yuzu-{server,gateway}-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, `yuzu-{server,gateway}-image.spdx.json` | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
-| Docker images | `ghcr.io/tr3kkr/yuzu-{server,gateway}:<tag>` | `cosign verify` |
+| Docker images | `ghcr.io/devnullltd/yuzu-{server,gateway}:<tag>` | `cosign verify` |
 
 ## Prerequisites
 
@@ -84,12 +84,12 @@ regex for a literal match:
 cosign verify \
   --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tr3kkr/yuzu-server:0.11.0
+  ghcr.io/devnullltd/yuzu-server:0.11.0
 
 cosign verify \
   --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tr3kkr/yuzu-gateway:0.11.0
+  ghcr.io/devnullltd/yuzu-gateway:0.11.0
 ```
 
 Output includes the signing certificate's SAN
@@ -98,9 +98,9 @@ the Rekor log entry, and the image digest. Pin by digest for production
 deployments:
 
 ```bash
-docker pull ghcr.io/tr3kkr/yuzu-server:0.11.0
-docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/tr3kkr/yuzu-server:0.11.0
-# → ghcr.io/tr3kkr/yuzu-server@sha256:...
+docker pull ghcr.io/devnullltd/yuzu-server:0.11.0
+docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/devnullltd/yuzu-server:0.11.0
+# → ghcr.io/devnullltd/yuzu-server@sha256:...
 ```
 
 ## 4. Verify SLSA build provenance (GitHub attestations)
@@ -118,7 +118,7 @@ gh attestation verify yuzu-macos-arm64.tar.gz --repo Tr3kkR/Yuzu
 
 # Docker images (by digest)
 gh attestation verify \
-  oci://ghcr.io/tr3kkr/yuzu-server@sha256:<digest> \
+  oci://ghcr.io/devnullltd/yuzu-server@sha256:<digest> \
   --repo Tr3kkR/Yuzu
 ```
 
@@ -192,8 +192,8 @@ for img in server gateway; do
   cosign verify \
     --certificate-identity-regexp "$IDENTITY_RE" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
-    "ghcr.io/tr3kkr/yuzu-${img}:${VERSION}" >/dev/null
-  echo "  ghcr.io/tr3kkr/yuzu-${img}:${VERSION} OK"
+    "ghcr.io/devnullltd/yuzu-${img}:${VERSION}" >/dev/null
+  echo "  ghcr.io/devnullltd/yuzu-${img}:${VERSION} OK"
 done
 
 echo "→ gh attestation verify (binary archives)"

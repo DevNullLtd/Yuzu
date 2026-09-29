@@ -3,13 +3,13 @@
 # Covers both Linux x64 and ARM64 cross-compile jobs.
 # Pre-bakes vcpkg packages for both triplets so CI skips compilation.
 #
-# Push to ghcr.io/tr3kkr/yuzu-ci-linux:latest
+# Push to ghcr.io/devnullltd/yuzu-ci-linux:latest
 #
 # Usage in workflows:
 #   jobs:
 #     build-linux:
 #       runs-on: ubuntu-24.04
-#       container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
+#       container: ghcr.io/devnullltd/yuzu-ci-linux:latest
 
 # Ubuntu 26.04 (Resolute) — matches the native OS of the Big Tam self-hosted
 # Linux runner pool (yuzu-bigtam-linux). GCC 15 / Clang 21 are 26.04 defaults;

@@ -30,7 +30,7 @@
 services:
   # ── Tier 1: Yuzu Server (chiselled Ubuntu 26.04) ───────────────────────
   server:
-    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-server-chisel:${YUZU_VERSION:-0.13.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-server-chisel:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-demo-server
     command:
       - "--listen"
@@ -98,7 +98,7 @@ services:
   # by docker-publish-postgres in release.yml; start-demo.sh --build builds
   # it locally during pre-release bootstrap.
   postgres:
-    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-postgres:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-demo-postgres
     environment:
       NO_PROXY: "*"
@@ -131,7 +131,7 @@ services:
 
   # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
   gateway:
-    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-gateway-chisel:${YUZU_VERSION:-0.13.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-gateway-chisel:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-demo-gateway
     environment:
       NO_PROXY: "*"
@@ -166,7 +166,7 @@ services:
   # container and the fleet shows N distinct agents, not one. tmpfs also makes
   # every agent ephemeral — a restart yields a clean, identical fleet.
   agent:
-    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-agent-chisel:${YUZU_VERSION:-0.13.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-agent-chisel:${YUZU_VERSION:-0.13.0}
     command:
       - "--server"
       - "gateway:50051"
