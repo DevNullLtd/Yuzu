@@ -1459,6 +1459,40 @@ below)*:
 - **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
   `pending-agents.cfg` once at first boot rather than starting fresh.
 
+**Update (2026-09-29, slice 6.2 done — commits 97e24ec6e..a81938ada; no PR number yet).** Enrollment
+tokens and pending-agent approvals are now PG-authoritative, mirroring 6.1's shape:
+- **`AuthDB` migration v2** replaces the dead v1 `enrollment_tokens`/`pending_agents` tables with the
+  live shape (`token_id`/`token_hash` UNIQUE, `max_uses`/`use_count` CHECK, `revoked`, `expires_at`
+  NULL=never; `agent_id` UNIQUE, five-state-ready `status` CHECK) plus `auth.import_meta`. The v1 step
+  is untouched — those tables never had a production writer, so there was nothing to carry.
+- **File mode is deleted, not deprecated.** `AuthManager`'s `save_/load_tokens`, `save_/load_pending`,
+  `reload_state` and the two in-memory maps are gone; every enrollment/pending call routes to
+  `AuthDB` and fails CLOSED (a typed `StoreError`, never `accepted=false`) with no store attached —
+  the case `server.cpp`'s `set_auth_db(nullptr)` at shutdown creates for an in-flight `Register`,
+  mirroring the existing #3401 fail-closed-on-a-failed-dependency-call precedent (`register_agent`'s
+  own fail-closed behaviour on a failed device-token revoke sweep), not a scenario #3401 itself
+  tracks.
+- **`consume_and_enroll` is one guarded-UPDATE transaction**: the token-use count and the
+  admin-denial check happen in the SAME transaction, so a denied agent's use is rolled back rather
+  than refunded (closing #1135) — the exact shape §8's original slice-6.1-era design note anticipated
+  for enrollment, one transaction rather than a check-then-act pair.
+- **One-time `.cfg` import**, structurally identical to 6.1's shared-custody stance: a pre-6.2
+  install's `enrollment-tokens.cfg`/`pending-agents.cfg` are imported exactly once, under a dedicated
+  advisory-lock key, with a per-file content-fingerprint marker stamped in the SAME transaction as the
+  imported rows — never on file absence. A marker whose fingerprint matches skips (idempotent,
+  including after a same-bytes restore of an already-removed/denied/revoked row — nothing is
+  resurrected); a mismatched fingerprint is REFUSED, not merged (the restored-old-backup case),
+  logged CRITICAL and counted, never failing boot; a genuine store error with the file present DOES
+  fail boot closed. Runs from `Server::create` right after `set_auth_db`, before any listener binds —
+  never from a main.cpp one-shot.
+- **WS-9 evidence**: `scripts/ha/ha-enrollment-concurrent-register.sh` races concurrent Register RPCs
+  from two real, separate `yuzu-server` processes against one shared max_uses=1 token — exactly one
+  accepted, Postgres itself settling at `use_count=1` — the first WS-9 proof this posture holds
+  across processes, not just pooled connections in one (see `docs/ha-delivery-matrix.md`'s WS-9 row).
+- **Rolling-upgrade note**: stop every old-version server before starting the first 6.2 replica (a
+  running old-version replica would keep writing the `.cfg` files the importer has already renamed
+  aside, and its own writes would never be seen by the PG-authoritative new replicas).
+
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail
 mandatory and reprioritized. Rule: runtime-mutable state → Postgres; only idempotent external caches

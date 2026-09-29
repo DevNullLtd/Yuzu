@@ -116,7 +116,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
