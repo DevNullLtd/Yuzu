@@ -70,13 +70,17 @@ Structured categories are enforced at the API layer:
 > single source of truth for scope-DSL reads, and the row self-heals automatically. See
 > `docs/adr/0050-tag-store-postgres-migration.md`'s 2026-08-20 amendment for the full rationale.
 >
-> **Two "preview" surfaces resolve `tag:<key>` differently.** MCP `preview_scope_targets`
-> resolves `tag:<key>` from the TagStore ONLY, with no live-agent fallback — for a
-> gateway-proxied or not-yet-synced agent it can under-report relative to what an actual
-> dispatch will match. REST `POST /api/scope/estimate` has no such gap: it resolves through
-> the same store-first-with-fallback path real dispatch uses, so it matches dispatch exactly.
-> Prefer `/api/scope/estimate` when previewing a scope for a fleet that may include
-> gateway-proxied or not-yet-synced agents.
+> **`preview_scope_targets` resolves `tag:<key>` identically to a real dispatch (#4981).**
+> Both MCP `preview_scope_targets` and its REST v1 twin `POST /api/v1/scope/preview` now
+> route through the SAME evaluation ladder a real dispatch uses (`AgentRegistry::evaluate_scope`),
+> so `tag:<key>` resolves store-first, falling back to a locally-connected agent's own live
+> self-report only when the store has no row for that agent — exactly like a real dispatch. A
+> presence-only cross-replica agent has no live session to read `scopable_tags` from, so it
+> still resolves store-only for such agents, same as real dispatch (this is not a preview-only
+> limitation). REST `POST /api/scope/estimate` also resolves `from_result_set:` against the
+> owner, but a failed owner-check there degrades to "zero members" rather than aborting the
+> whole evaluation like `preview_scope_targets`'s ladder does — a separate, still-open
+> fail-open gap, tracked `#5003`, not fixed by `#4981`.
 
 ### Via the REST API
 

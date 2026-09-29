@@ -12,21 +12,57 @@
  * #2146 B2 review fix — a bare perm_fn would disclose the whole fleet to a
  * management-group-confined caller), and the fail-closed-when-unwired
  * postures.
+ *
+ * #4981 PR-2: `POST /api/v1/scope/preview` now routes through the SAME
+ * `resolve_scope_targets` ladder a real dispatch uses (via
+ * `set_scope_evaluate_fn`, a closure over a REAL `AgentRegistry`), so this
+ * harness wires a real registry too — a bare attribute-JSON stub can no
+ * longer stand in for it.
  */
 
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
+#include "agent_registry.hpp"
+#include "event_bus.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "result_set_store.hpp"
+
+#include <libpq-fe.h>
+
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
+
+#include "../test_helpers.hpp"
+
+#include "agent.pb.h"
 
 #include <nlohmann/json.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
 using namespace yuzu::server;
+using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::EventBus;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
+namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
+
+// Shares the "resultset" template key with test_scope_walking_authz.cpp /
+// test_rest_result_sets_async.cpp (identical setup).
+yuzu::test::PgTestTemplate result_set_tpl{"resultset", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("resultset template: store failed to migrate");
+}};
 
 struct ScopeV1Harness {
     yuzu::server::test::TestRouteSink sink;
@@ -40,8 +76,28 @@ struct ScopeV1Harness {
     // here cannot model an actually-empty std::function.
     authz::FleetReadGate fleet_gate{.admitted = true};
 
-    // The raw agent snapshot GET /api/v1/devices and this preview route both
-    // read — same shape as MCP's agents_fn() stub.
+    // #4981 adversarial-review finding 1: empty ⇒ an ordinary session; a
+    // test sets this to prove a service-scoped token is denied outright on
+    // POST /api/v1/scope/preview (same idiom as AsyncHarness's
+    // mock_token_scope_service in test_rest_result_sets_async.cpp — read
+    // LIVE by auth_fn below, so a test may set it either before or after
+    // construction).
+    std::string mock_token_scope_service;
+
+    // #4981 adversarial-review round 2 finding 2: proves a deny fired BEFORE
+    // either downstream callback ran — the absence of a "result_set.access"
+    // audit row alone doesn't distinguish "denied before the ladder ran"
+    // from "the ladder ran and matched (an owner-check success never audits
+    // a denial either) but something else produced the response
+    // afterward". Same idiom as McpTestServer's fleet_read_fn_for_test /
+    // fleet_read_fn_reached in test_mcp_server.cpp (#4980).
+    bool fleet_read_fn_reached = false;
+    bool scope_evaluate_fn_reached = false;
+
+    // Kept for source-stability of the register_routes call (still consumed
+    // by other agents_fn-driven routes in this harness's registration list,
+    // e.g. GET /api/v1/devices if a future test exercises it) — #4981 PR-2:
+    // no longer read by POST /api/v1/scope/preview itself.
     nlohmann::json agents = nlohmann::json::array({
         {{"agent_id", "agent-001"}, {"hostname", "h1"}, {"os", "linux"}, {"arch", "x64"},
          {"agent_version", "1.0"}},
@@ -49,12 +105,54 @@ struct ScopeV1Harness {
          {"agent_version", "1.0"}},
     });
 
+    // #4981 PR-2 — a REAL AgentRegistry, populated to match `agents` above
+    // exactly (agent-001 linux/x64, agent-002 windows/x64) so every
+    // pre-#4981 ostype/arch-only test keeps its original expectation.
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+
+    // Records every result_set.access audit call (#4981 PR-2's 404 case) so
+    // a test can assert the forensic row without a real AuditStore.
+    struct AuditCall {
+        std::string action, result, target_type, target_id, detail;
+    };
+    std::vector<AuditCall> audit_calls;
+
     /// `wire_fleet_read=false` passes a genuinely EMPTY std::function to
     /// register_routes, exercising the ROUTE's OWN "if (!fleet_read_fn)"
     /// unwired-misconfiguration branch — a live-mutable `fleet_gate` (see
     /// below) cannot model that case, since the route only checks
     /// truthiness of the std::function itself, never calls it to find out.
-    explicit ScopeV1Harness(bool wire_fleet_read = true) {
+    ///
+    /// #4981 PR-2: `wire_scope_evaluate=false` is the identical pattern for
+    /// `set_scope_evaluate_fn` — the setter is simply never called, leaving
+    /// the route's own unwired branch live. `result_set_store` (nullable) is
+    /// bound into BOTH `register_routes`'s own `result_set_store` param
+    /// (feeds the ladder's alias-resolution/owner-check-gate steps) AND the
+    /// `scope_evaluate_fn` closure (feeds `AgentRegistry::evaluate_scope`'s
+    /// own preload) — a [pg] test constructs a real store BEFORE building
+    /// this harness and passes the SAME pointer here, so the two can never
+    /// disagree about which store is live (the concrete failure mode: a
+    /// mismatch doesn't fail loudly, it just skips the gate's forensic row
+    /// or returns `unresolvable` where a test expects `owner_check_failed`).
+    explicit ScopeV1Harness(bool wire_fleet_read = true, bool wire_scope_evaluate = true,
+                            ResultSetStore* result_set_store = nullptr) {
+        agent_pb::AgentInfo a1;
+        a1.set_agent_id("agent-001");
+        a1.set_hostname("h1");
+        a1.mutable_platform()->set_os("linux");
+        a1.mutable_platform()->set_arch("x64");
+        a1.set_agent_version("1.0");
+        (void)registry.register_agent(a1);
+        agent_pb::AgentInfo a2;
+        a2.set_agent_id("agent-002");
+        a2.set_hostname("h2");
+        a2.mutable_platform()->set_os("windows");
+        a2.mutable_platform()->set_arch("x64");
+        a2.set_agent_version("1.0");
+        (void)registry.register_agent(a2);
+
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!authenticated) {
@@ -65,14 +163,17 @@ struct ScopeV1Harness {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::user;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool {
             return true; // validate has no perm_fn gate; unused by preview post-fix
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
             return true;
         };
         // Checked LIVE (at call time, via captured `this`) rather than baked
@@ -86,6 +187,7 @@ struct ScopeV1Harness {
         if (wire_fleet_read) {
             fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
                                    const std::string&, const std::string&) -> authz::FleetReadGate {
+                fleet_read_fn_reached = true;
                 if (!fleet_gate.admitted) {
                     res.status = 403;
                     res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -94,6 +196,17 @@ struct ScopeV1Harness {
             };
         }
         RestApiV1::AgentsJsonFn agents_fn = [this]() -> nlohmann::json { return agents; };
+
+        if (wire_scope_evaluate) {
+            api.set_scope_evaluate_fn(
+                [this, result_set_store](const yuzu::scope::Expression& expr,
+                                         const std::string& principal) {
+                    scope_evaluate_fn_reached = true;
+                    return registry.evaluate_scope(expr, /*tag_store=*/nullptr,
+                                                   /*props_store=*/nullptr, result_set_store,
+                                                   principal);
+                });
+        }
 
         api.register_routes(
             sink, auth_fn, perm_fn, audit_fn,
@@ -105,8 +218,12 @@ struct ScopeV1Harness {
             /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
             /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr,
             /*license_store=*/nullptr, /*guaranteed_state_store=*/nullptr,
-            /*metrics_registry=*/nullptr, /*session_revoke_fn=*/{},
-            /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
+            // #4981 fix-round: wired to the harness's own `metrics` member
+            // (already live for `registry` above) rather than nullptr, so a
+            // test can assert deny_fleet_wide_service_scoped's
+            // yuzu_auth_service_scope_default_denied_total increment.
+            /*metrics_registry=*/&metrics, /*session_revoke_fn=*/{},
+            /*execution_event_bus=*/nullptr, /*result_set_store=*/result_set_store,
             /*command_dispatch_fn=*/{}, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
             /*dex_perf_fn=*/{}, /*network_api=*/nullptr, /*lockout_clear_fn=*/{},
             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
@@ -180,12 +297,134 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview denies when fleet_read_fn does n
     CHECK(r->status == 403);
 }
 
+// #4981 adversarial-review finding 1: a service-scoped token must be denied
+// OUTRIGHT — never admitted-and-narrowed via fleet_read_fn — because a
+// `from_result_set:`/`props.` atom resolves against session->username (the
+// MINTING OPERATOR's identity for a service-scoped token, per
+// auth_routes.cpp's `synth.username = api_token.principal_id`), not the
+// token's own restricted scope. Mirrors #4980's identical fix on the sibling
+// POST /api/v1/result-sets/from-inventory-query (see that route's own test,
+// "owner-scoped result-set routes: a service-scoped token is denied on all
+// 9" in test_rest_result_sets_async.cpp) — same
+// deny_fleet_wide_service_scoped chokepoint, called BEFORE fleet_read_fn.
+TEST_CASE("scope v1: POST /api/v1/scope/preview denies a service-scoped token outright, "
+          "unconditionally on the token class — never dependent on the ladder's own "
+          "owner-check outcome",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    // A REAL, owned, materialized result set — owner "tester" matches the
+    // harness's fixed auth_fn username, so an ordinary session's ladder call
+    // would resolve this reference successfully. The service-scoped deny
+    // below must still fire BEFORE that ladder ever runs.
+    CreateRequest cr;
+    cr.owner_principal = "tester";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    h.mock_token_scope_service = "printers";
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
+    REQUIRE(r);
+    CHECK(r->status == 403);
+
+    // The deny fired BEFORE the ladder/owner-check ever ran: no
+    // "result_set.access" row (the 404/owner-check-failed audit path) was
+    // ever written, only the service-scope deny itself.
+    bool saw_scope_preview_denied = false;
+    bool saw_ladder_audit = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "scope.preview.access_denied" && c.result == "denied")
+            saw_scope_preview_denied = true;
+        if (c.action == "result_set.access")
+            saw_ladder_audit = true;
+    }
+    CHECK(saw_scope_preview_denied);
+    CHECK_FALSE(saw_ladder_audit);
+
+    // #4981 adversarial-review round 2 finding 2: the result set here is
+    // owned by "tester" — the SAME username the harness's auth_fn always
+    // returns — so even a SUCCESSFUL ladder evaluation would never write a
+    // "result_set.access" denial row either (a matching owner-check doesn't
+    // audit-deny anything). The audit-absence check above therefore can't
+    // by itself distinguish "denied before the ladder ran" from "the ladder
+    // ran, matched, and something else produced the 403 afterward". These
+    // two flags prove non-reachability of BOTH downstream callbacks
+    // directly, closing that gap.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+    CHECK_FALSE(h.scope_evaluate_fn_reached);
+
+    // Clause (5), routed-concerns-access-control.md "Service-scoped API
+    // token confinement": no `.permission` label — a service-scoped caller
+    // holding Infrastructure:Read is STILL denied outright, so naming it
+    // would be a false self-remediation claim (same idiom as
+    // test_rest_result_sets_async.cpp's identical from-inventory-query
+    // assertion).
+    auto body = nlohmann::json::parse(r->body);
+    CHECK_FALSE(body["error"].contains("permission"));
+}
+
+// #4981 fix-round (sre finding): deny_fleet_wide_service_scoped — the shared
+// chokepoint the test above exercises — emitted no metric at all on the REST
+// 403 path, unlike MCP's structural C8 default-deny gate, which denies the
+// SAME preview_scope_targets tool to a service-scoped token via a completely
+// different code path and DOES increment
+// yuzu_auth_service_scope_default_denied_total (mcp_server.cpp, see
+// test_mcp_server.cpp's "MCP C8: a service-scoped token is denied by the
+// default-deny classification" test for its twin assertion). This route's
+// own call passes permission="" (a blanket deny with no single named
+// securable — see the "no `.permission` label" assertion above), so the
+// label falls back to the fixed literal "unspecified" rather than shipping
+// an empty Prometheus label value.
+TEST_CASE("scope v1: POST /api/v1/scope/preview's service-scoped 403 increments "
+          "yuzu_auth_service_scope_default_denied_total{path_class=\"rest\"}",
+          "[rest][scope][v1]") {
+    ScopeV1Harness h;
+    h.mock_token_scope_service = "printers";
+    auto r = h.sink.Post("/api/v1/scope/preview", R"({"expression":"arch == \"x64\""})");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+
+    CHECK(h.metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "unspecified"}, {"path_class", "rest"}})
+              .value() == 1.0);
+}
+
 TEST_CASE("scope v1: POST /api/v1/scope/preview requires a non-empty expression",
           "[rest][scope][v1]") {
     ScopeV1Harness h;
     auto r = h.sink.Post("/api/v1/scope/preview", R"({})");
     REQUIRE(r);
     CHECK(r->status == 400);
+}
+
+// #4981 PR-2: the expression-shape check runs BEFORE the scope_evaluate_fn
+// unwired check (mirrors GET /api/v1/events' own 400-before-503 ordering) —
+// an empty expression still 400s even with no evaluator wired at all.
+TEST_CASE("scope v1: POST /api/v1/scope/preview still 400s on an empty expression when "
+          "scope_evaluate_fn is ALSO unwired (input-shape checked first)",
+          "[rest][scope][v1]") {
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/false};
+    auto r = h.sink.Post("/api/v1/scope/preview", R"({})");
+    REQUIRE(r);
+    CHECK(r->status == 400);
+}
+
+// #4981 PR-2: the new evaluator seam's own fail-closed-when-unwired posture.
+TEST_CASE("scope v1: POST /api/v1/scope/preview fails closed when scope_evaluate_fn is unwired",
+          "[rest][scope][v1]") {
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/false};
+    auto r = h.sink.Post("/api/v1/scope/preview", R"({"expression":"arch == \"x64\""})");
+    REQUIRE(r);
+    CHECK(r->status == 503);
 }
 
 TEST_CASE("scope v1: POST /api/v1/scope/preview matches both agents when unconfined "
@@ -208,7 +447,9 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview matches both agents when unconfi
 // ── #2146 B2 review fix regression: a management-group-confined caller must
 // see ONLY their own visible agents on this fan-out read, never the whole
 // fleet — mirrors the MCP preview_scope_targets regression test exactly
-// (routed-concerns.md's authorize_list_read row).
+// (routed-concerns.md's authorize_list_read row). #4981 PR-2: now the exact
+// -send-set assertion against a REAL ladder-produced match, not a bespoke
+// resolver.
 TEST_CASE("scope v1: POST /api/v1/scope/preview confines matched_agents to the caller's "
           "fleet_read_fn scope, never the whole fleet",
           "[rest][scope][v1]") {
@@ -222,4 +463,134 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview confines matched_agents to the c
     CHECK(body["data"]["matched_count"] == 1);
     REQUIRE(body["data"]["matched_agents"].size() == 1);
     CHECK(body["data"]["matched_agents"][0] == "agent-001");
+}
+
+// #4981 regression: NOT from_result_set:<id> with a null ResultSetStore*
+// aborts (503), never silently matches the whole fleet.
+TEST_CASE("scope v1: POST /api/v1/scope/preview with a null ResultSetStore* aborts a "
+          "from_result_set: atom, never a silent fleet-wide match",
+          "[rest][scope][v1]") {
+    ScopeV1Harness h; // default result_set_store = nullptr
+    auto r =
+        h.sink.Post("/api/v1/scope/preview", R"({"expression":"NOT from_result_set:rs_anything"})");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    // #4981 adversarial-review finding 4: `unresolvable` is a PERMANENT
+    // condition (scope_eval_error.hpp's own doc comment — a required store
+    // isn't wired, a configuration error a retry cannot fix) — retry_after_ms
+    // must be null, not the same 5000ms hint a genuine transient degrade
+    // carries (see the db_degraded 503 test below).
+    auto body = nlohmann::json::parse(r->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+}
+
+// ── [pg] — a real ResultSetStore, exercising the owner-check gate end-to-end ─
+
+TEST_CASE("scope v1: POST /api/v1/scope/preview resolves from_result_set: against a real, "
+          "owned result set",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "tester"; // matches ScopeV1Harness's fixed auth_fn username
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    // FleetReadGate{.admitted=true} alone defaults .scope to deny_all() —
+    // see the harness's own unconfined-match test above for the same note.
+    h.fleet_gate = authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    auto body = nlohmann::json::parse(r->body);
+    CHECK(body["data"]["matched_count"] == 1);
+    CHECK(body["data"]["matched_agents"][0] == "agent-001");
+}
+
+TEST_CASE("scope v1: POST /api/v1/scope/preview 404s on a foreign result set, existence-"
+          "oracle-safe, and audits the forensic row",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "someone-else"; // NOT "tester" — the harness's fixed username
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
+    REQUIRE(r);
+    CHECK(r->status == 404);
+
+    bool found = false;
+    for (const auto& c : h.audit_calls)
+        if (c.action == "result_set.access" && c.result == "denied" && c.target_id == set->id)
+            found = true;
+    CHECK(found);
+}
+
+TEST_CASE("scope v1: POST /api/v1/scope/preview 404s on an absent result set",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         R"({"expression":"from_result_set:rs_does_not_exist"})");
+    REQUIRE(r);
+    CHECK(r->status == 404);
+}
+
+TEST_CASE("scope v1: POST /api/v1/scope/preview 503s on a degraded result-set store, never a "
+          "silent 0-match",
+          "[pg][rest][scope][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "tester";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-001"});
+    REQUIRE(set.has_value());
+
+    // Simulate a Postgres-side degrade — same technique
+    // test_scope_walking_authz.cpp uses.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE result_set_store.result_set_members CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    auto r = h.sink.Post("/api/v1/scope/preview",
+                         nlohmann::json({{"expression", "from_result_set:" + set->id}}).dump());
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    // #4981 adversarial-review finding 4: `db_degraded` is TRANSIENT — unlike
+    // the `unresolvable` case above, this one keeps the concrete 5000ms hint.
+    auto body = nlohmann::json::parse(r->body);
+    CHECK(body["error"]["retry_after_ms"] == 5000);
 }
