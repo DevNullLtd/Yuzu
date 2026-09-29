@@ -25,8 +25,10 @@ permissions:
   contents: read
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS legs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows leg uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -507,23 +509,27 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Check Meson, PyYAML and ccache (pre-provisioned)
+      - name: Verify Meson, PyYAML and ccache (pre-provisioned)
+        shell: pwsh
         run: |
-          # Never pip-install into the runner's machine-wide Python here. Wee
-          # Tam's toolchain (incl. meson) is pinned by
-          # deploy/windows/toolchain-contract.json and checked by the next
-          # step; a bare `pip install -r requirements-ci.txt` upgraded the
-          # shared C:\Python314 meson to requirements-ci.txt's newer pin,
-          # failed that check, and left every ci.yml Windows job on the box
-          # failing it too. Same guard as ci.yml's Windows job: only an
-          # absent PyYAML (needed by embed_content.py at meson setup) triggers
-          # a --user install.
+          # Never install Python packages here. Wee Tam's toolchain is set up
+          # by deploy/windows/Provision-Windows-Runner.ps1 and pinned by
+          # deploy/windows/toolchain-contract.json (checked by the next step).
+          # All runner slots share one OS identity, so a machine-wide OR a
+          # --user install changes what every later job's C:\Python314
+          # imports: requirements-ci.txt pins a newer meson than the contract,
+          # and installing it (machine-wide, in the v0.14.0-rc1 release run)
+          # failed the contract check for every Windows job on the box.
+          # A missing PyYAML (embed_content.py needs it at meson setup) is a
+          # provisioning fault, so fail with the fix instead of installing.
+          $PSNativeCommandUseErrorActionPreference = $false
           python -c "import yaml" 2>$null
           if ($LASTEXITCODE -ne 0) {
-            python -m pip install --user --require-hashes -r requirements-ci.txt
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "::error::PyYAML is not importable by the runner's Python. Re-run deploy/windows/Provision-Windows-Runner.ps1 on this runner; CI never installs packages into the shared host Python."
+            exit 1
           }
           meson --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
           # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
           # installed there, so the old `choco install ccache` aborted the
