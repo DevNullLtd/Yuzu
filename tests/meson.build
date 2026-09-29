@@ -2767,6 +2767,19 @@ test('spark evidence format lockstep (#4665)',
   timeout: 30,
 )
 
+# #5047: static lexical gate over server.cpp's two TierPolicyFn wiring sites -- both
+# must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
+# the script's own header for the clause-5 rationale). No build required, same class as
+# the RBAC cross-schema query-owner seam check above.
+if _bash_test.found()
+  test('tier policy wiring lexical gate (#5047)',
+    _bash_test,
+    args: [files('shell/test_tier_policy_wiring_lexical.sh')],
+    suite: 'docs',
+    timeout: 30,
+  )
+endif
+
 # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
 # subsystem (agents/core/src + server/core/src + common/include, filtered to the
 # guardian_*/guard_*/spark_*/guaranteed_state* basename glob) that fails the moment
