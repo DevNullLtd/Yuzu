@@ -1,6 +1,6 @@
 ; Yuzu Agent — Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-agent.iss
-; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SERVER=myserver:50051 /TOKEN=abc123
+; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=abc123
 
 #ifndef AppVersion
   #define AppVersion "0.7.0"
@@ -625,13 +625,18 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    { Ask about data directory }
-    if MsgBox('Remove agent data directory?' + #13#10 +
-              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
-              'This includes agent identity, local storage, and cached state.',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-    begin
-      DelTree(ExpandConstant('{commonappdata}\Yuzu'), True, True, True);
-    end;
+    { Ask about the data directory only when someone can answer. A plain MsgBox
+      is NOT suppressed by /SUPPRESSMSGBOXES (only SuppressibleMsgBox is), so a
+      silent uninstall (SCCM/Intune/GPO, /VERYSILENT) used to wait forever on an
+      invisible dialog (#5147). Silent uninstalls keep the data directory, the
+      same answer as the prompt's default button. }
+    if not UninstallSilent then
+      if MsgBox('Remove agent data directory?' + #13#10 +
+                ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
+                'This includes agent identity, local storage, and cached state.',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
+        DelTree(ExpandConstant('{commonappdata}\Yuzu'), True, True, True);
+      end;
   end;
 end;
