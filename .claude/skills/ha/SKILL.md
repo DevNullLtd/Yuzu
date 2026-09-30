@@ -187,6 +187,24 @@ cascade, plugin-capability visibility, fleet gauge and its WS-9 scenario remain.
 split; the BYO-LB doc (P2) is open and not in the gate.
 **Remaining gate items: the rest of WS-5, the rest of WS-6, and WS-13 for
 gateway-fronted fleets.**
+
+**Re-verified 2026-09-29 (against `origin/dev` + `gh`; no PR number yet — commits
+97e24ec6e..a81938ada on a feature branch): WS-6 slice 6.2 DONE** (enrollment tokens
++ pending-agent approvals → Postgres, closing ADR-2002 §8's "Enrollment tokens +
+pending-agents → Postgres" bullet): `AuthDB` migration v2 (live `enrollment_tokens`/
+`pending_agents` shape + `auth.import_meta`), `AuthManager`'s per-replica file mode
+deleted outright (not deprecated), `consume_and_enroll` a single guarded-UPDATE
+transaction (exactly-N winners across processes — proven by this slice's own WS-9
+scenario, not just connections in one process), a one-time marker+fingerprint `.cfg`
+importer (never resurrects an already-removed/denied/revoked row; a fingerprint
+mismatch is refused, not merged; a genuine store error with the file present fails
+boot closed). **WS-6's WS-9 scenario for 6.2 also DONE**:
+`scripts/ha/ha-enrollment-concurrent-register.sh` — see the WS-9 row and
+`docs/ha-delivery-matrix.md`'s WS-6 row for the full mechanism. **WS-6 is now
+6.1 + 6.2 done; 6.1b (shared KEK custody/versioning polish) and 6.3 (node-admission
+readyz proof) remain — see `docs/ha-delivery-matrix.md`.**
+**Remaining gate items: the rest of WS-5, WS-6's 6.1b/6.3, and WS-13 for
+gateway-fronted fleets.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -365,7 +383,7 @@ gateway-fronted fleets.**
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
 | **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence + `#4555` cluster formation + 4.3a intra-cluster lookup + 4.4 (`gateway_node` convergence + `#4246` #6 writeback) all MERGED to `origin/dev`; rest of 4.3 (cross-cluster fan-out) / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | **slice 1 MERGED (#4745); decommission cascade / capability visibility / fleet gauge / WS-9 scenario remain** |
-| **WS-6** | PKI/CA HA: shared CA key custody + node admission (**NOT** a `SecretCodec` blob — ADR-2002 §8 Update 2026-09-23, keeps ADR-0010 Decision 6), `CaStore` → PG (**already done**, ADR-0053), **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG (one-time `.cfg` import) | WS-3 (freshness pass); `ca_store` migration done | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` (+`authdb` on 6.2) | P1 | **6.1 CRL publication (#4126, PR #4833); 6.1b / 6.2 / 6.3 planned** — see `docs/ha-delivery-matrix.md` |
+| **WS-6** | PKI/CA HA: shared CA key custody + node admission (**NOT** a `SecretCodec` blob — ADR-2002 §8 Update 2026-09-23, keeps ADR-0010 Decision 6), `CaStore` → PG (**already done**, ADR-0053), **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG (one-time `.cfg` import) | WS-3 (freshness pass); `ca_store` migration done | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` (+`authdb` on 6.2) | P1 | **6.1 CRL publication (#4126, PR #4833) + WS-9 #4832 done; 6.2 enrollment/pending → PG done (97e24ec6e..a81938ada) incl. its own WS-9 scenario; 6.1b / 6.3 planned** — see `docs/ha-delivery-matrix.md` |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
 | **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | **readyz DONE (monolith, 2026-09-24): `pg_reachable` probe + drain grace; tier-split with the split; BYO-LB doc (P2) planned** |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | planned |
@@ -418,7 +436,7 @@ constraint. Delivery phases (dependency-ordered):
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
-**Suggested next slices** (as of 2026-09-24 — `docs/ha-delivery-matrix.md` row
+**Suggested next slices** (as of 2026-09-29 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
 - **Done (dial-selection, the safe-to-scale gate's WS-4 item):** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a
   (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4, #4011/#4134/#4169/#4194), **WS-4's
@@ -439,7 +457,9 @@ cites are authoritative):
 - The **highest-leverage next** is now the remaining gate set directly:
   the rest of **WS-5** (slice 1 merged, #4745 — decommission cascade,
   capability visibility, fleet gauge, WS-9 scenario) and the rest of **WS-6**
-  (6.1 merged, #4833 — 6.1b / 6.2 / 6.3, WS-9 scenario #4832). **WS-8**-readyz
+  (6.1 merged #4833 + its WS-9 scenario #4832 done; **6.2 done** — enrollment/
+  pending → Postgres, commits 97e24ec6e..a81938ada, incl. its own WS-9 scenario
+  `ha-enrollment-concurrent-register.sh` — 6.1b / 6.3 remain). **WS-8**-readyz
   is DONE for the monolith (2026-09-24). A loss-free cross-replica reconnect
   (durable outbox replay) is the open 2a-2 follow-up.
 

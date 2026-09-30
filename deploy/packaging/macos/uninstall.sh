@@ -14,7 +14,8 @@ fi
 
 # Remove files
 rm -f /usr/local/bin/yuzu-agent
-rm -f /usr/local/lib/libyuzu_agent_core.dylib
+rm -f /usr/local/bin/libyuzu_agent_core.dylib
+rm -f /usr/local/lib/libyuzu_agent_core.dylib   # location used by packages before #5144
 rm -rf /usr/local/lib/yuzu/
 rm -f /Library/LaunchDaemons/com.yuzu.agent.plist
 

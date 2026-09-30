@@ -1,6 +1,6 @@
 ; Yuzu Server - Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-server.iss
-; Silent: YuzuServerSetup.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=Password123!
+; Silent: YuzuServerSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=Password123!
 ;
 ; Silent parameters:
 ;   /ADMIN_USER=name       Admin username (required)
@@ -764,10 +764,19 @@ begin
   begin
     // 1. Generate yuzu-server.cfg with PBKDF2 hashed credentials
     Exec('powershell.exe', GetConfigGenArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Never show this box on a silent install: a plain MsgBox is not
+    // suppressed by /SUPPRESSMSGBOXES, and even SuppressibleMsgBox still
+    // shows (and waits forever) when /VERYSILENT is given without that flag
+    // (#5147). The Log line records the failure in the /LOG= setup log.
     if ResultCode <> 0 then
-      MsgBox('Warning: Failed to generate server configuration (exit code ' +
-             IntToStr(ResultCode) + '). You may need to run first-time setup manually.',
-             mbError, MB_OK);
+    begin
+      Log('Failed to generate server configuration (exit code ' +
+          IntToStr(ResultCode) + ').');
+      if not WizardSilent then
+        MsgBox('Warning: Failed to generate server configuration (exit code ' +
+               IntToStr(ResultCode) + '). You may need to run first-time setup manually.',
+               mbError, MB_OK);
+    end;
 
     // 2. Copy certificate files
     CopyCertificates;
@@ -802,12 +811,18 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    if MsgBox('Remove server data directory?' + #13#10 +
-              ExpandConstant('{commonappdata}\Yuzu Server') + #13#10#13#10 +
-              'This includes databases, configuration, certificates, and all server state.',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-    begin
-      DelTree(ExpandConstant('{commonappdata}\Yuzu Server'), True, True, True);
-    end;
+    { Ask about the data directory only when someone can answer. A plain MsgBox
+      is NOT suppressed by /SUPPRESSMSGBOXES (only SuppressibleMsgBox is), so a
+      silent uninstall (SCCM/Intune/GPO, /VERYSILENT) used to wait forever on an
+      invisible dialog (#5147). Silent uninstalls keep the data directory, the
+      same answer as the prompt's default button. }
+    if not UninstallSilent then
+      if MsgBox('Remove server data directory?' + #13#10 +
+                ExpandConstant('{commonappdata}\Yuzu Server') + #13#10#13#10 +
+                'This includes databases, configuration, certificates, and all server state.',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+      begin
+        DelTree(ExpandConstant('{commonappdata}\Yuzu Server'), True, True, True);
+      end;
   end;
 end;

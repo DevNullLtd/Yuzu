@@ -74,8 +74,13 @@ for candidate in \
     fi
 done
 if [[ -n "$CORE_DYLIB" ]]; then
-    install -d "${STAGING}/usr/local/lib"
-    install -m 755 "$CORE_DYLIB" "${STAGING}/usr/local/lib/"
+    # Next to the binary, not in /usr/local/lib (#5144): yuzu-agent loads
+    # @rpath/libyuzu_agent_core.dylib and its only LC_RPATH is @loader_path/
+    # (the build-tree rpath; release.yml ships build-dir binaries without
+    # `meson install`), so dyld looks only in /usr/local/bin. This matches the
+    # tarball, which also ships the dylib beside the binary, and leaves the
+    # signed/notarized binary untouched (adding an rpath would invalidate it).
+    install -m 755 "$CORE_DYLIB" "${STAGING}/usr/local/bin/"
 fi
 
 # Plugins
