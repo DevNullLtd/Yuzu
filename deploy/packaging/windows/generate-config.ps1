@@ -1,7 +1,7 @@
 # generate-config.ps1 — Generate yuzu-server.cfg with PBKDF2-SHA256 hashed credentials
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File generate-config.ps1 `
+#   powershell -NoProfile -ExecutionPolicy Bypass -File generate-config.ps1 `
 #     -ConfigPath "C:\ProgramData\Yuzu Server\yuzu-server.cfg" `
 #     -AdminUser admin -AdminPass "MyPassword123" `
 #     [-OperatorUser operator -OperatorPass "OpPassword123"]
@@ -15,6 +15,14 @@ param(
     [string]$OperatorUser = "",
     [string]$OperatorPass = ""
 )
+
+# Use Windows PowerShell's own modules. PSModulePath is inherited from whatever
+# started the installer; started (via any intermediate process) from
+# PowerShell 7, it leads 5.1 to PowerShell 7's copy of
+# Microsoft.PowerShell.Security, which it cannot load, so Set-Acl below failed
+# and the config file kept ProgramData's inherited permissions (#5176). Built
+# without any cmdlet, so nothing here depends on the path it is fixing.
+$env:PSModulePath = $PSHOME + '\Modules;' + [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
 
 function New-PBKDF2Entry {
     param(
