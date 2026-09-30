@@ -3219,6 +3219,14 @@ TEST_CASE("POST /api/v1/result-sets: a device_ids entry over 256 bytes is "
     CHECK_FALSE(h.fleet_read_fn_reached);
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 1 (BLOCKING, #4983 Gate 4 fix round): the very next fix-round
+    // commit after the sibling unknown_device_id rejection was audited
+    // reproduced the identical unaudited-rejection defect for this new
+    // length-cap branch -- fixed here.
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=device_id_too_long");
 }
 
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",

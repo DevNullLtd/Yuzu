@@ -2539,7 +2539,9 @@ the admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-001
 that every entry both exists and is visible to the caller's own scope — a nonexistent or
 out-of-scope id now rejects the whole request (`400 RESULT_SET_UNKNOWN_DEVICE_ID` on REST, the
 JSON-RPC equivalent on MCP, an error toast on the dashboard fragment) instead of being silently
-accepted as a member.
+accepted as a member. Each entry is also now capped at 256 bytes (`400
+RESULT_SET_DEVICE_ID_TOO_LONG` on REST, the JSON-RPC equivalent on MCP, an error toast on the
+dashboard fragment) — a separate, additional new rejection path on all three surfaces.
 
 **Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
 result set by supplying `device_ids` directly. Checked against this repository's actual seed

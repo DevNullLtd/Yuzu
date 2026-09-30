@@ -9,10 +9,12 @@
   WHOLE request with `400 RESULT_SET_UNKNOWN_DEVICE_ID` (REST) / the JSON-RPC equivalent (MCP) /
   an error toast (the dashboard fragment) — never a silent drop and never a partial create — with
   the offending id(s) named in the error (the caller's own submitted list, so this is not a
-  disclosure of someone else's device existence). **Breaking change:** the new gate is a mandatory
-  admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017), checked whenever
-  `device_ids` is non-empty. Under an RBAC-**enabled** deployment, of the six built-in roles only
-  `Administrator` and `ITServiceOwner` hold `Infrastructure:Read` — `Viewer`, `Operator`,
+  disclosure of someone else's device existence). Each `device_ids` entry is also now capped at
+  256 bytes (`400 RESULT_SET_DEVICE_ID_TOO_LONG` / the JSON-RPC equivalent / an error toast) — a
+  separate, additional new rejection path on all three surfaces. **Breaking change:** the new gate
+  is a mandatory admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017),
+  checked whenever `device_ids` is non-empty. Under an RBAC-**enabled** deployment, of the six
+  built-in roles only `Administrator` and `ITServiceOwner` hold `Infrastructure:Read` — `Viewer`, `Operator`,
   `PlatformEngineer`, `ApiTokenManager`, and `Reviewer` do **not** — so a principal holding one of
   those five roles who could previously create a result set with `device_ids` now receives a new
   `403`. This only bites RBAC-**enabled** deployments; the default RBAC-**off** configuration is
