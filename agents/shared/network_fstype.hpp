@@ -5,9 +5,10 @@
 // uninterruptible open/getdents/read/statvfs pins a worker of the agent's ONE bounded command
 // pool (shared with every plugin, quarantine dispatch included) until the server returns, and a
 // hard mount can hold it for minutes to forever. Callers read /proc/self/mountinfo, pass each
-// entry's filesystem type here, and skip the paths under a match. Consumers: the runtimes walk
-// and filesystem_posture's `mounts` leg (governance G4-04: a name this list misses is an
-// availability risk, not a missing number).
+// entry's filesystem type here, and skip the paths under a match. Consumers: the runtimes walk,
+// filesystem_posture's `mounts` leg (governance G4-04: a name this list misses is an
+// availability risk, not a missing number) and privacy_permissions' macOS leg, which adds the
+// macOS-only names (webdav, afpfs, macfuse, osxfuse) locally.
 //
 // This is a DENY-list by name and is inherently incomplete -- the durable fix is a known-local
 // allowlist, which needs its own review. It covers the network, cluster and paravirtualised types
