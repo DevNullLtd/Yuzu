@@ -11,6 +11,7 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
+-export([mgmt_auth_reject_reasons/0]).
 
 %% All telemetry event names used by the gateway.
 -define(EVENTS, [
@@ -250,6 +251,13 @@ handle_event(_Event, _Measurements, _Meta, _Config) ->
 %%% Internal
 %%%===================================================================
 
+%% The closed set of reasons yuzu_gw_authz:reject/1 is called with.
+%% yuzu_gw_telemetry_tests checks it against yuzu_gw_authz's source.
+-spec mgmt_auth_reject_reasons() -> [atom()].
+mgmt_auth_reject_reasons() ->
+    [internal_error, no_pins_configured, no_pins_resolved, pin_mismatch,
+     missing_server_auth_eku, bad_peer_cert, bad_pin_config].
+
 declare_metrics() ->
     %% Counters
     prometheus_counter:declare([
@@ -346,6 +354,14 @@ declare_metrics() ->
                "by reason atom (closed set; no certificate contents). Sustained "
                "non-zero = probing by a CA-cert holder, or a misrotated pin "
                "killing server command forwarding"}]),
+    %% Create every rejection-reason series at 0 now. A series that first
+    %% appears already at 1 is invisible to increase(), so without this the
+    %% FIRST rejection per reason after a gateway start never raised the
+    %% YuzuGatewayMgmtAuthRejected alert (#5177 review). The list is the closed
+    %% set of reject/1 reasons in yuzu_gw_authz; a test keeps the two in step.
+    [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- mgmt_auth_reject_reasons()],
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},

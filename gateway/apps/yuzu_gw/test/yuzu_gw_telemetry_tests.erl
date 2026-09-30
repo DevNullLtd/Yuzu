@@ -102,3 +102,51 @@ metrics_scrape_renders_test_() ->
            ?assertEqual([], NonAscii)
        end}
      ]}.
+
+%% #5177 review: yuzu_gw_mgmt_auth_rejected_total's series used to appear only
+%% at the first rejection, already at 1, which increase() cannot see, so the
+%% first probe per reason never alerted. Every reason must exist at 0 after
+%% setup(), and the list must match the reject/1 calls in yuzu_gw_authz.
+mgmt_auth_reasons_precreated_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every rejection reason has a series from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_mgmt_auth_rejected_total{reason=\"",
+                               atom_to_binary(R, utf8), "\"}"])))
+            || R <- yuzu_gw_telemetry:mgmt_auth_reject_reasons()]
+       end},
+      {"the reason list matches every reject/1 call in yuzu_gw_authz",
+       fun() ->
+           %% Parse the source, not the .beam: under rebar3's cover
+           %% compilation the loaded module has no readable beam file.
+           Src = filename:join([code:lib_dir(yuzu_gw), "src", "yuzu_gw_authz.erl"]),
+           {ok, Forms} = epp:parse_file(Src, []),
+           Called = lists:usort(reject_atoms(Forms)),
+           ?assertNotEqual([], Called),
+           ?assertEqual(Called,
+                        lists:usort(yuzu_gw_telemetry:mgmt_auth_reject_reasons()))
+       end}
+     ]}.
+
+%% Every literal atom passed to a local reject/1 call, found in the module's
+%% parsed source.
+reject_atoms(Term) when is_tuple(Term) ->
+    case Term of
+        {call, _, {atom, _, reject}, [{atom, _, A}]} -> [A];
+        _ -> reject_atoms(tuple_to_list(Term))
+    end;
+reject_atoms(Term) when is_list(Term) ->
+    lists:append([reject_atoms(E) || E <- Term]);
+reject_atoms(_) -> [].
