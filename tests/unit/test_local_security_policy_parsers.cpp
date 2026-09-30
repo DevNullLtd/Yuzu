@@ -17,8 +17,13 @@
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_parsers.hpp"
 
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_scratch_sweep.hpp"
-#if defined(__APPLE__)
+#if !defined(_WIN32)
 #include "../../agents/plugins/local_security_policy/src/local_security_policy_legs.hpp"
+#include "test_helpers.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -1040,6 +1045,89 @@ TEST_CASE("local_security_policy collect_file_policy: a truncated sudoers.d list
     CHECK(saw_marker);
     CHECK(saw_real); // the names that WERE listed are still read
 }
+
+TEST_CASE("local_security_policy sudoers: a refused source is an unreadable row, never policy content",
+          "[local_security_policy][parsers][sudoers]") {
+    CHECK(is_sudoers_source("/etc/sudoers"));
+    CHECK(is_sudoers_source("/etc/sudoers.d/90-cloud-init-users"));
+    CHECK_FALSE(is_sudoers_source("/etc/sudoers.d")); // the directory is listed, not read
+    CHECK_FALSE(is_sudoers_source("/etc/pam.d/system-auth")); // PAM symlinks are real and followed
+    CHECK(classify_read_errno(kReadSymlink).token == "symlink_refused");
+    CHECK(classify_read_errno(kReadInsecure).token == "insecure_owner_or_mode");
+    CHECK(classify_read_errno(kReadSymlink).cls == ReadClass::Failed); // never absent, never denied
+
+    const auto rd = [](const std::string& path) -> FileRead {
+        if (path == "/etc/sudoers") return {0, "alice ALL = /bin/ls\n"};
+        if (path == "/etc/sudoers.d/link") return {kReadSymlink, {}};
+        if (path == "/etc/sudoers.d/loose") return {kReadInsecure, {}};
+        return {ENOENT, {}};
+    };
+    const auto dl = [](const std::string& path) -> DirList {
+        if (path == "/etc/sudoers.d") return {0, {"link", "loose"}, false};
+        return {};
+    };
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, dl);
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("/etc/sudoers.d/link:symlink_refused") != std::string::npos);
+    CHECK(c.reason.find("/etc/sudoers.d/loose:insecure_owner_or_mode") != std::string::npos);
+    bool link_row = false, loose_row = false;
+    for (const auto& r : c.rows) {
+        if (r == "sudoers|/etc/sudoers.d/link|unreadable|-|-|-|symlink_refused") link_row = true;
+        if (r == "sudoers|/etc/sudoers.d/loose|unreadable|-|-|-|insecure_owner_or_mode") loose_row = true;
+    }
+    CHECK(link_row);
+    CHECK(loose_row);
+}
+
+#if !defined(_WIN32)
+// The real reader, on a real filesystem: the planted-link case that motivated the strict rule.
+TEST_CASE("local_security_policy posix_read_file_at: strict refuses a symlink, a loose file; lenient follows",
+          "[local_security_policy][parsers][sudoers]") {
+    yuzu::test::TempDir dir{"yuzu_test_lsp_"};
+    std::filesystem::create_directories(dir.path);
+    const auto secret = dir.path / "secret";
+    {
+        std::ofstream(secret) << "TOP-SECRET-KEY-MATERIAL\n";
+    }
+    const auto link = dir.path / "leak";
+    std::filesystem::create_symlink(secret, link);
+
+    // Strict (sudoers): the link is refused before a single byte is read.
+    const auto refused = posix_read_file_at(link.string(), true);
+    CHECK(refused.err == kReadSymlink);
+    CHECK(refused.data.empty());
+    // Lenient (PAM): the same link is followed -- /etc/pam.d/system-auth is one on RHEL hosts.
+    const auto followed = posix_read_file_at(link.string(), false);
+    CHECK(followed.err == 0);
+    CHECK(followed.data == "TOP-SECRET-KEY-MATERIAL\n");
+
+    // Strict also refuses a group/other-writable file: sudo would not honour it either.
+    const auto loose = dir.path / "loose";
+    {
+        std::ofstream(loose) << "alice ALL = /bin/ls\n";
+    }
+    std::filesystem::permissions(loose, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                                            std::filesystem::perms::group_write);
+    CHECK(posix_read_file_at(loose.string(), true).err == kReadInsecure);
+
+    // A 0444 file is accepted only when its owner is uid 0 (the same rule sudo applies).
+    const auto tight = dir.path / "tight";
+    {
+        std::ofstream(tight) << "alice ALL = /bin/ls\n";
+    }
+    std::filesystem::permissions(tight, std::filesystem::perms::owner_read | std::filesystem::perms::group_read |
+                                            std::filesystem::perms::others_read);
+    const auto tight_read = posix_read_file_at(tight.string(), true);
+    if (::geteuid() == 0) {
+        CHECK(tight_read.err == 0);
+        CHECK(tight_read.data == "alice ALL = /bin/ls\n");
+    } else {
+        CHECK(tight_read.err == kReadInsecure); // owned by the test user, not root
+    }
+    // A missing source is still absent, not a refusal.
+    CHECK(posix_read_file_at((dir.path / "nope").string(), true).err == ENOENT);
+}
+#endif // !_WIN32
 
 // sudo's lexer: an escaped separator inside a command never splits the clause, and a `#`
 // comment -- glued to the previous word or not -- ends the line even when it ends in a

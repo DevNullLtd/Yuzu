@@ -850,6 +850,19 @@ inline constexpr int kReadNotRegular = -2;
 /// shadow's getdef) stops or diverges at it, so no value read past it can be reported
 /// as the one in force, and a NUL crossing write_output's C string would cut the row.
 inline constexpr int kReadEmbeddedNul = -3;
+/// A sudoers source is a symlink. The sudoers reader opens O_NOFOLLOW: the action returns
+/// file CONTENT (unparsable lines verbatim), so a planted link would turn it into a read
+/// primitive for any file the agent can read. Never followed, never treated as absent.
+inline constexpr int kReadSymlink = -4;
+/// A sudoers source is not owned by uid 0 or is group/other-writable -- the check sudo itself
+/// makes before it will honour a file, so content sudo would refuse is not reported as policy.
+inline constexpr int kReadInsecure = -5;
+
+/// The sources read under the strict (no-follow, root-owned) rule. Every other source keeps
+/// the following reader: /etc/pam.d/system-auth is a real symlink into /etc/authselect.
+inline bool is_sudoers_source(std::string_view path) {
+    return path == "/etc/sudoers" || path.starts_with("/etc/sudoers.d/");
+}
 
 enum class ReadClass { Absent, Denied, Failed };
 struct ReadOutcome {
@@ -868,6 +881,8 @@ inline ReadOutcome classify_read_errno(int err) {
     case kReadOversized: return {ReadClass::Failed, "oversized"};
     case kReadNotRegular: return {ReadClass::Failed, "not_regular"};
     case kReadEmbeddedNul: return {ReadClass::Failed, "embedded_nul"};
+    case kReadSymlink: return {ReadClass::Failed, "symlink_refused"};
+    case kReadInsecure: return {ReadClass::Failed, "insecure_owner_or_mode"};
     default: return {ReadClass::Failed, "errno_" + std::to_string(err)};
     }
 }
@@ -920,7 +935,7 @@ inline std::string format_sudoers_row(std::string_view file, const SudoersEntry&
 // ---- file-source collector (Linux and macOS file legs; reader injected) --------------------
 
 struct FileRead {
-    int err = 0; // 0 = ok; errno, or kReadOversized / kReadNotRegular / kReadEmbeddedNul
+    int err = 0; // 0 = ok; errno, or a kRead* code above
     std::string data;
 };
 struct DirList {

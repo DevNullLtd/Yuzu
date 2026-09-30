@@ -134,8 +134,12 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 
 #if !defined(_WIN32)
 
-/// Bounded regular-file read. Symlinks ARE followed: /etc/pam.d/system-auth is a symlink
-/// into /etc/authselect on RHEL-family hosts (real capture, fedora:40); all paths are under /etc.
+/// Bounded regular-file read. By default symlinks ARE followed: /etc/pam.d/system-auth is a
+/// symlink into /etc/authselect on RHEL-family hosts (real capture, fedora:40); all paths are
+/// under /etc. `strict` (the sudoers sources, see is_sudoers_source) is the opposite: the leaf is
+/// opened O_NOFOLLOW (a link is kReadSymlink) and the opened object must be owned by uid 0 and
+/// not group/other-writable (kReadInsecure), so a planted link or a file sudo would refuse can
+/// never be read back to a Security:Read caller as policy content.
 ///
 /// O_NONBLOCK is LOAD-BEARING, the same way certificates_linux_store.hpp's
 /// read_cert_entry and guardian_state_reader.cpp's state read say it is: open(2)
@@ -145,12 +149,15 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 /// here by design, so the node need not sit under /etc itself. Once fstat proves
 /// S_ISREG the flag is inert (POSIX: reads of a regular file never block), so
 /// nothing clears it afterwards and no real host behaves differently.
-inline FileRead posix_read_file(const std::string& path) {
-    yuzu::agent::ScopedFd fd(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
-    if (!fd) return {errno, {}};
+inline FileRead posix_read_file_at(const std::string& path, bool strict) {
+    yuzu::agent::ScopedFd fd(
+        ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | (strict ? O_NOFOLLOW : 0)));
+    if (!fd) return {strict && errno == ELOOP ? kReadSymlink : errno, {}};
     struct stat st{};
     if (::fstat(fd.get(), &st) != 0) return {errno, {}};
     if (!S_ISREG(st.st_mode)) return {kReadNotRegular, {}};
+    if (strict && (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+        return {kReadInsecure, {}};
     FileRead out;
     char buf[8192];
     for (;;) {
@@ -164,6 +171,10 @@ inline FileRead posix_read_file(const std::string& path) {
         if (out.data.size() > kMaxFileBytes) return {kReadOversized, {}};
     }
     return out;
+}
+
+inline FileRead posix_read_file(const std::string& path) {
+    return posix_read_file_at(path, is_sudoers_source(path));
 }
 
 inline DirList posix_list_dir(const std::string& path) {
