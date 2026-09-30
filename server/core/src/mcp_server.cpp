@@ -12162,6 +12162,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                         if (bad_ids.size() > kMaxCitedBadIds)
                             cited += std::format(" (+{} more)", bad_ids.size() - kMaxCitedBadIds);
+                        // Audited on the same action/outcome as the parent_id
+                        // shape-check guard above (governance #4307/#4734/
+                        // #4983 round) -- the sibling denial a few lines above
+                        // this one (the parent_id ownership/shape checks) is
+                        // audited; this rejection was not, until this fix
+                        // round.
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=unknown_device_id");
                         // retry-hint-exempt: caller-input rejection (unknown/
                         // out-of-scope device id), not a transient fault.
                         res.set_content(

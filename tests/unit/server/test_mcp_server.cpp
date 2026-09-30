@@ -29964,6 +29964,11 @@ TEST_CASE("MCP create_result_set: a device_ids list containing one nonexistent i
 
     std::string next;
     CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+    // Fix 7 (governance round): the sibling parent_id denial audits -- this
+    // rejection now does too.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "result_set.create|denied");
+    CHECK(ts.audit_details.back() == "reason=unknown_device_id");
 }
 
 TEST_CASE("MCP create_result_set: a device_ids list containing one real but "
@@ -30048,6 +30053,92 @@ TEST_CASE("MCP create_result_set: the device_ids gate never fires when device_id
         REQUIRE(body.contains("result"));
         CHECK_FALSE(fleet_read_fn_reached);
     }
+}
+
+TEST_CASE("MCP create_result_set: a non-empty device_ids with an unwired "
+          "fleet_read_fn_ fails closed kInternalError, and no result set is "
+          "created (#4983 Fix 10)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.fleet_read_fn_for_test = {}; // genuinely empty, matches production's unwired state
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+TEST_CASE("MCP create_result_set: a non-empty device_ids with an admitted "
+          "fleet_read_fn_ but an unwired agent_registry fails closed "
+          "kInternalError, and no result set is created (#4983 Fix 10)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    // ts.agent_registry_for_test is left at its fixture default (nullptr) --
+    // the fixture's default fleet_read_fn_for_test admits unfiltered, so this
+    // isolates the agent_registry-unwired branch specifically.
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+TEST_CASE("MCP create_result_set: more than kMaxCitedBadIds=20 bad ids are "
+          "truncated in the error message with a '(+N more)' suffix (#4983 Fix 10)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    // No agents registered -- every submitted id is "bad".
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
+    ts.start();
+
+    nlohmann::json ids = nlohmann::json::array();
+    for (int i = 0; i < 25; ++i)
+        ids.push_back("ghost-" + std::to_string(i));
+    nlohmann::json req = {{"jsonrpc", "2.0"},
+                          {"method", "tools/call"},
+                          {"id", 8},
+                          {"params",
+                           {{"name", "create_result_set"},
+                            {"arguments", {{"name", "x"}, {"device_ids", ids}}}}}};
+    auto res = ts.call(req.dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_UNKNOWN_DEVICE_ID") != std::string::npos);
+    CHECK(msg.find("ghost-0") != std::string::npos);
+    CHECK(msg.find("ghost-19") != std::string::npos); // the 20th cited id (0-indexed)
+    CHECK(msg.find("ghost-20") == std::string::npos); // the 21st is past the cap
+    CHECK(msg.find("(+5 more)") != std::string::npos);
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
 }
 
 TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-scoped tools "

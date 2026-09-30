@@ -11374,6 +11374,13 @@ void RestApiV1::register_routes(
                     }
                     if (bad_ids.size() > kMaxCitedBadIds)
                         cited += std::format(" (+{} more)", bad_ids.size() - kMaxCitedBadIds);
+                    // Audited on the same action/outcome as the parent_id
+                    // shape-check guards above (governance #4307/#4734/#4983
+                    // round) -- the sibling denial a few lines above this one
+                    // (the parent_id ownership/shape checks) is audited; this
+                    // rejection was not, until this fix round.
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=unknown_device_id");
                     rs_err(res, 400,
                            "RESULT_SET_UNKNOWN_DEVICE_ID: device_ids contains an id that does "
                            "not exist or is not visible to the caller: " +
