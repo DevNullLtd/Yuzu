@@ -486,3 +486,105 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
     REQUIRE(after.has_value());
     CHECK(after->status == "running");
 }
+
+// #4982 round 5 (both round-4 adversarial reviewers, SHOULD): no test in this
+// file previously drove `deliver()`'s `bookkeep_target && outcome.sent > 0`
+// branch end-to-end. Every `fx.make_delivery(...)` call above leaves
+// `d.execution_tracker` null, so `bookkeep_target` is always false and the
+// plain `mark_sent` branch is all any of those tests exercise; the round-2
+// Fix-5 test just above wires a real `ExecutionTracker` but only for the
+// DENIED branch (arming_check returns false — dispatch_fn is never called,
+// so `outcome.sent` never matters). `test_command_outbox_store.cpp` tests
+// `CommandOutboxStore::mark_sent_with_target` directly, and
+// `test_execution_tracker.cpp`'s #4982 round 3 test manually replicates its
+// two statements via raw SQL on a second connection — neither proves
+// `command_outbox_delivery.cpp`'s own call site actually calls the atomic
+// method for a genuine dispatch. A regression reverting that call site back
+// to a plain `mark_sent` + a separate `set_agents_targeted` (leaving the new
+// `CommandDeliveryFinalizationOwner::mark_sent_with_target` itself intact but
+// unused) would leave every test in this file green before this one.
+//
+// This test wires a REAL `ExecutionTracker` (a second `PgPool` over the SAME
+// already-migrated database, mirroring the Fix-5 test's own technique),
+// creates a REAL running execution row, and drives an actual successful
+// dispatch (`sent > 0`) through `CommandOutboxDelivery::deliver()`/`tick()`,
+// asserting BOTH halves of the atomic write land together: the outbox row
+// reaches `state='sent'` AND `agents_targeted` reflects the real dispatched
+// count. Empirically verified (per this round's own required before/after
+// discipline) to FAIL — `agents_targeted` observed still 0 while
+// `state='sent'` — when the call site is temporarily reverted to the old
+// two-call split, and to PASS with the call site as committed.
+TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) commits the outbox "
+          "sent-transition AND the execution's real agents_targeted atomically, via the actual "
+          "delivery call site (#4982 round 5)",
+          "[command_outbox][pg][delivery][4982]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    auto req = fx.req("occ-target-live", "cmd-target-live");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.sent = 4;
+
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller& caller,
+                             const std::string& command_id) {
+        probe.calls++;
+        probe.last_command_id = command_id;
+        probe.last_plugin = plugin;
+        probe.last_action = action;
+        probe.last_provenance = caller.approval_provenance;
+        auto out = probe.next;
+        out.command_id = command_id;
+        return out;
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return true; // re-authorization passes — the dispatch proceeds
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-target-live") == "sent");
+
+    // Both halves landed together: the outbox row is 'sent' AND the
+    // execution's real target count is set — the exact atomicity guarantee
+    // this test exists to pin at the call-site level.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->agents_targeted == 4);
+    CHECK(after->status == "running"); // untouched — a successful dispatch, not a cancel
+
+    // A second tick finds nothing pending — no double dispatch, no re-write
+    // of the target count.
+    loop.tick();
+    CHECK(probe.calls == 1);
+    auto still = tracker.get_execution(*exec_id);
+    REQUIRE(still.has_value());
+    CHECK(still->agents_targeted == 4);
+}

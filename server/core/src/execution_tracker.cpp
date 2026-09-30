@@ -1,5 +1,6 @@
 #include "execution_tracker.hpp"
 
+#include "command_delivery_finalization_owner.hpp" // #4982 round 5: ADR-0012 §3 shared cross-schema predicate
 #include "execution_event_bus.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
@@ -2787,6 +2788,22 @@ ExecutionTracker::reap_stuck_running_executions() {
     // a small population under a TRUSTED clock) must not shield it; see the
     // would-wipe check below and the `DELIBERATELY OMITTED` comment above
     // `StuckExecDeclinedMarker`.
+    //
+    // #4982 round 5 — known, accepted, documented residual (both round-4
+    // adversarial reviewers, graded MEDIUM/non-blocking, a pre-existing gap
+    // this branch narrows rather than introduces): this flag's floor-bypass
+    // is scoped to ONLY the recovery pass itself, i.e. the ONE pass where it
+    // is set `true`. A persistent, multi-pass corrupt clock on a
+    // below-floor fleet re-enters the floor's ordinary ratio-skip on the
+    // very NEXT pass after recovery (that pass reads `recovering_from_clock_
+    // anomaly == false` again, since the marker was already cleared), so a
+    // second bad reading immediately following a recovered one is not
+    // covered by this bypass. The fully-robust fix — a `GatewayRouteStore`-
+    // style persisted `first_now_ms` distrust window spanning MULTIPLE
+    // passes, not just the one that recovers — is a larger, separate piece
+    // of work; worth a dedicated follow-up issue, not a silent gap. See
+    // `docs/clock-guarded-retention.md`'s own entry for this sweep for the
+    // matching note.
     bool recovering_from_clock_anomaly = false;
     std::vector<std::string> candidate_ids;
     std::vector<std::string> confirmed_ids; // #4982 fix round 2: RETURNING-confirmed cancels
@@ -3002,23 +3019,36 @@ ExecutionTracker::reap_stuck_running_executions() {
         // claimed state: a row stays 'pending' for its whole in-tick
         // processing and only ever leaves it via mark_sent/mark_failed, or is
         // rescheduled back to 'pending' with backoff. 'pending' is therefore
-        // the sole "still owned by the delivery loop" value. This is a
-        // cross-schema reference to a sibling store's table — normal in this
-        // codebase (many stores already reference each other this way), and
-        // safe here because CommandOutboxStore's own construction is
-        // fail-closed at boot (server.cpp refuses to start if its schema
-        // migration fails), so the schema is guaranteed present whenever this
-        // sweep runs. A query failure against it (permissions, a dropped
-        // schema, any other fault) flows through the SAME degrade path as
-        // every other query failure in this transaction — no special case.
+        // the sole "still owned by the delivery loop" value.
+        //
+        // #4982 round 5: this predicate is a cross-schema reference to a
+        // sibling store's table, so per ADR-0012 §3 the SCHEMA-QUALIFIED
+        // fragment itself is owned by `CommandDeliveryFinalizationOwner`
+        // (command_delivery_finalization_owner.hpp), not hand-written here —
+        // this file no longer spells out `command_outbox_store.outbox`
+        // directly, and the three call sites in this function that need this
+        // predicate share ONE symbol instead of three copies that had to stay
+        // byte-identical by hand. This query still issues the SQL on ITS OWN
+        // connection/transaction (never the owner's) — see that header's own
+        // doc comment on `kPendingOutboxNotExistsClause` for why an
+        // owner-executed read is not safe to substitute here: this predicate
+        // must be evaluated inside THIS sweep's own single transaction,
+        // atomically with its advisory lock and (further down) its own
+        // atomic recheck-and-cancel UPDATE. Safe to reference cross-schema
+        // because CommandOutboxStore's own construction is fail-closed at
+        // boot (server.cpp refuses to start if its schema migration fails),
+        // so the schema is guaranteed present whenever this sweep runs. A
+        // query failure against it (permissions, a dropped schema, any other
+        // fault) flows through the SAME degrade path as every other query
+        // failure in this transaction — no special case.
         const std::string cutoff = std::to_string(now_s - kStuckExecWindowSecs);
-        pg::PgResult cr = pg::exec_params(
-            c,
+        const std::string candidate_count_sql =
             "SELECT count(*) FROM execution_tracker.executions "
             "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
-            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
-            "                WHERE execution_id = executions.id AND state = 'pending')",
-            std::vector<std::string>{cutoff});
+            "AND " +
+            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause);
+        pg::PgResult cr =
+            pg::exec_params(c, candidate_count_sql.c_str(), std::vector<std::string>{cutoff});
         if (cr.status() != PGRES_TUPLES_OK || PQntuples(cr.get()) == 0) {
             err = "stuck-exec reap candidate-count read failed";
             return false;
@@ -3053,14 +3083,17 @@ ExecutionTracker::reap_stuck_running_executions() {
             return true; // decline to act; anchor already advanced above
         }
 
-        pg::PgResult ids = pg::exec_params(
-            c,
+        // #4982 round 5: same shared owner-defined predicate as the candidate
+        // count above — see that call site's comment.
+        const std::string candidate_select_sql =
             "SELECT id FROM execution_tracker.executions "
             "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
-            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
-            "                WHERE execution_id = executions.id AND state = 'pending') "
-            "ORDER BY dispatched_at ASC LIMIT $2::bigint",
-            std::vector<std::string>{cutoff, std::to_string(kStuckExecReapCap)});
+            "AND " +
+            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
+            " ORDER BY dispatched_at ASC LIMIT $2::bigint";
+        pg::PgResult ids =
+            pg::exec_params(c, candidate_select_sql.c_str(),
+                            std::vector<std::string>{cutoff, std::to_string(kStuckExecReapCap)});
         if (ids.status() != PGRES_TUPLES_OK) {
             err = "stuck-exec reap candidate-select failed";
             return false;
@@ -3120,20 +3153,30 @@ ExecutionTracker::reap_stuck_running_executions() {
         // `state='sent'` (excluded by the outbox NOT EXISTS clause) with
         // `agents_targeted` still 0 (matching this predicate), i.e. a false
         // candidate for a command that was, in truth, still being delivered.
-        // `CommandOutboxStore::mark_sent_with_target` closes that upstream
-        // race by committing both writes atomically — see its own doc
-        // comment in command_outbox_store.hpp. Do not reintroduce a call site
-        // that writes the outbox `sent` transition and `agents_targeted`
+        // `CommandOutboxStore::mark_sent_with_target` (now delegating to
+        // `CommandDeliveryFinalizationOwner::mark_sent_with_target`, #4982
+        // round 5) closes that upstream race by committing both writes
+        // atomically — see its own doc comment. Do not reintroduce a call
+        // site that writes the outbox `sent` transition and `agents_targeted`
         // as two separate statements; this predicate's completeness depends
         // on there being no such window.
+        //
+        // #4982 round 5: same shared owner-defined predicate as the two call
+        // sites above — this occurrence is the MOST load-bearing of the
+        // three, since it is re-evaluated ATOMICALLY, in this same UPDATE,
+        // at cancel time (round 2/3's TOCTOU close) — see
+        // `kPendingOutboxNotExistsClause`'s own doc comment for why that
+        // requires this query to keep issuing the SQL on THIS transaction's
+        // own connection rather than delegating execution to the owner.
         std::vector<std::string_view> sv(candidate_ids.begin(), candidate_ids.end());
-        pg::PgResult upd = pg::exec_params(
-            c,
+        const std::string atomic_cancel_sql =
             "UPDATE execution_tracker.executions SET status = 'cancelled', completed_at = $1 "
             "WHERE id = ANY($2::text[]) AND status = 'running' AND agents_targeted = 0 "
-            "AND NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
-            "                WHERE execution_id = executions.id AND state = 'pending') "
-            "RETURNING id",
+            "AND " +
+            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
+            " RETURNING id";
+        pg::PgResult upd = pg::exec_params(
+            c, atomic_cancel_sql.c_str(),
             std::vector<std::string>{std::to_string(now_epoch()), pg::to_text_array(sv)});
         if (upd.status() != PGRES_TUPLES_OK) {
             err = "stuck-exec reap atomic cancel failed";

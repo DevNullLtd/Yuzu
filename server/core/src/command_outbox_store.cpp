@@ -1,5 +1,6 @@
 #include "command_outbox_store.hpp"
 
+#include "command_delivery_finalization_owner.hpp" // #4982 round 5: ADR-0012 §3 cross-schema owner
 #include "leader_elector.hpp" // LeaderElector::epoch_fence_sql — the embeddable epoch predicate
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -311,6 +312,16 @@ CommandOutboxStore::mark_sent(const std::string& occurrence_id, const std::strin
     return fenced_transition(sql.c_str(), std::vector<std::string>{occurrence_id}, "mark_sent");
 }
 
+// #4982 round 5: the guarded transaction lives in
+// `CommandDeliveryFinalizationOwner::mark_sent_with_target`
+// (command_delivery_finalization_owner.cpp) — the ADR-0012 §3 cross-schema
+// query owner, so this single-schema store no longer issues SQL against
+// `execution_tracker.executions` itself. Thin delegation, mirroring
+// `RbacStore::unassign_role`'s own delegation to `RbacAdminAuthorityOwner`:
+// construct the owner per call (never cache one), translate its typed
+// outcome back into this store's own `std::expected`/`count_degrade` shape.
+// The SQL/fencing/rollback/error-handling are byte-identical to round 3 —
+// only the location moved.
 std::expected<bool, CommandOutboxError>
 CommandOutboxStore::mark_sent_with_target(const std::string& occurrence_id,
                                           const std::string& leader_lock_name,
@@ -320,54 +331,14 @@ CommandOutboxStore::mark_sent_with_target(const std::string& occurrence_id,
         count_degrade("mark_sent_with_target", "not_open");
         return std::unexpected(CommandOutboxError::store_unavailable);
     }
-    const std::string fence = LeaderElector::epoch_fence_sql(leader_lock_name, leader_epoch);
-    const std::string sent_sql =
-        "UPDATE command_outbox_store.outbox SET state='sent', updated_at=now() "
-        "WHERE occurrence_id=$1 AND state='pending' AND " + fence + " RETURNING occurrence_id";
-
-    bool matched = false;
-    bool db_error = false;
-    // #4982 round 3: the sent-transition and the target-count write commit in
-    // ONE transaction — see the header doc comment for the race this closes.
-    // Cross-schema, single pool/database, same precedent as
-    // ExecutionTracker::reap_stuck_running_executions's own cross-schema read
-    // against this store's `outbox` table.
-    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult sent_res =
-            pg::exec_params(c, sent_sql.c_str(), std::vector<std::string>{occurrence_id});
-        if (sent_res.status() != PGRES_TUPLES_OK) {
-            spdlog::error("CommandOutboxStore::mark_sent_with_target: sent-transition failed "
-                         "for occurrence '{}': {}",
-                         occurrence_id, PQresultErrorMessage(sent_res.get()));
-            db_error = true;
-            return false; // roll back
-        }
-        if (PQntuples(sent_res.get()) == 0)
-            return true; // not ours (fenced out / already terminal) — commit the no-op
-
-        matched = true;
-        pg::PgResult tgt_res = pg::exec_params(
-            c, "UPDATE execution_tracker.executions SET agents_targeted=$1 WHERE id=$2",
-            std::vector<std::string>{std::to_string(agents_targeted), execution_id});
-        if (tgt_res.status() != PGRES_COMMAND_OK) {
-            spdlog::error(
-                "CommandOutboxStore::mark_sent_with_target: agents_targeted update failed "
-                "for execution_id={} occurrence='{}': {} — rolling back the sent-transition "
-                "too, so the occurrence stays 'pending' and is re-driven next tick (the "
-                "wire send already happened; the agent's command_id dedup absorbs the "
-                "harmless re-send)",
-                execution_id, occurrence_id, PQresultErrorMessage(tgt_res.get()));
-            db_error = true;
-            matched = false;
-            return false; // roll back BOTH writes
-        }
-        return true;
-    });
-    if (!committed) {
-        count_degrade("mark_sent_with_target", db_error ? "db_error" : "commit_failed");
+    const CommandDeliveryFinalizationOwner::MarkSentWithTargetOutcome outcome =
+        CommandDeliveryFinalizationOwner{pool_}.mark_sent_with_target(
+            occurrence_id, leader_lock_name, leader_epoch, execution_id, agents_targeted);
+    if (!outcome.committed) {
+        count_degrade("mark_sent_with_target", outcome.db_error ? "db_error" : "commit_failed");
         return std::unexpected(CommandOutboxError::db_error);
     }
-    return matched;
+    return outcome.matched;
 }
 
 std::expected<bool, CommandOutboxError>

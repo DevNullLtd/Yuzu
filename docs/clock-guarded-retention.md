@@ -457,6 +457,16 @@ invert theirs:
    bound this omission now rests on is "at most a minority of the running population, of any size,
    per recovery pass" — the same bound an above-floor ordinary pass already carries.
 
+   **Round 4/5 note — the floor-bypass residual is scoped to ONLY the recovery pass itself, recorded
+   as an accepted trade-off, not fixed.** Both round-4 adversarial reviewers (graded MEDIUM,
+   non-blocking) flagged that a PERSISTENT, multi-pass corrupt clock on a below-floor fleet re-enters
+   the floor's ordinary ratio-skip on the pass immediately AFTER recovery (the marker is cleared once
+   recovery fires, so a second bad reading right behind the first is not itself covered) — a residual
+   this branch narrows relative to the pre-fix permanent wedge, not one it introduces. The
+   fully-robust fix is the same GatewayRouteStore-style persisted `first_now_ms` distrust window
+   `DELIBERATELY OMITTED` above, spanning multiple passes rather than one; it remains future,
+   separately-scoped work rather than part of this round.
+
 **Claim+mutate atomicity (fix round 2, not a clock-guard part but load-bearing for the SINGLE-WRITER
 rule above).** The original Part B design selected candidates under the advisory lock, then cancelled
 each one via a separate post-commit `mark_cancelled()` call after the lock released — a TOCTOU window

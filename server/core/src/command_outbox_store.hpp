@@ -245,6 +245,13 @@ public:
     /// own cross-schema `NOT EXISTS command_outbox_store.outbox` read already
     /// relies on — see that method's candidate predicate).
     ///
+    /// #4982 round 5: the guarded transaction itself now lives in
+    /// `CommandDeliveryFinalizationOwner::mark_sent_with_target`
+    /// (command_delivery_finalization_owner.{hpp,cpp}) — the ADR-0012 §3
+    /// cross-schema query owner, following `RbacAdminAuthorityOwner`'s own
+    /// established shape. This method is now a THIN delegating forward (see
+    /// the .cpp); the behavioral contract documented below is unchanged.
+    ///
     /// CLOSES a real, empirically-reproduced race: calling `mark_sent` and
     /// `ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit
     /// statements left a window, between the two commits, where the outbox row
