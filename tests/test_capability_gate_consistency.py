@@ -97,6 +97,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
@@ -157,7 +158,10 @@ FRAGMENT_FILES = [
 # present, not by hand arithmetic -- see the merge-arithmetic trap this comment exists
 # to name (adding this branch's own delta to a stale baseline undercounts by the other
 # side's own delta).
-EXPECTED_TOTAL_ROWS = 227
+# Wave 10 PR10.1-d: +1 update_source_trust (sources) on top of dev's 227 = 228, verified by
+# running parse_fragment_gate_rows over all 26 FRAGMENT_FILES and by a `grep -c` sum
+# (both 228), not by adding to a possibly-stale baseline.
+EXPECTED_TOTAL_ROWS = 228
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

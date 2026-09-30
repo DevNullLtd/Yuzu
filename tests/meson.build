@@ -534,10 +534,14 @@ agent_test_exe = executable(
     'unit/test_privacy_permissions_local_dispatcher.cpp', # Wave 8 PR8.5: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
+    'unit/test_wire_utf8.cpp',          # shared strict-UTF-8 scrubber (agents/shared/wire_utf8.hpp), portable
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
     'unit/test_browser_policy_local_dispatcher.cpp',  # Wave 10 PR10.2-b: real browser_policy dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_update_source_trust_parsers.cpp',        # Wave 10 PR10.1-d: pure apt/deb822 row parsers, portable
+    'unit/test_update_source_trust_linux_parsers.cpp',  # Wave 10 PR10.1-d: injected-root apt walk + rpm-planned tripwire over committed fixture trees (bodies POSIX-only)
+    'unit/test_update_source_trust_local_dispatcher.cpp',  # Wave 10 PR10.1-d: real update_source_trust dylib/.so/.dll via LocalDispatcher, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures
     'unit/test_firmware_posture_local_dispatcher.cpp',  # Wave 8 PR8.4: real firmware_posture plugin via LocalDispatcher, unguarded on every OS
     'unit/test_platform_security_parsers.cpp',            # Wave 8 PR8.1-a1: pure decoders/classifiers/status over REAL CAPTURE fixtures
@@ -578,6 +582,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/update_source_trust/src'),  # update_source_trust_*.hpp (Wave 10 PR10.1-d)
     include_directories('../agents/plugins/firmware_posture/src'),  # firmware_posture_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/platform_security/src'),  # platform_security_*parsers.hpp / _legs.hpp (pure helpers), Wave 8 PR8.1-a1
     include_directories('../agents/plugins/system_hardening/src'),  # system_hardening_*parsers.hpp (pure helpers), Wave 8 PR8.1-b
@@ -750,6 +755,7 @@ agent_test_exe = executable(
                 windows_updates_plugin_lib,
                 printing_plugin_lib,  # Wave 9 PR9.1b
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
+                update_source_trust_plugin_lib,  # Wave 10 PR10.1-d
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
@@ -2490,6 +2496,18 @@ test('runtimes definition columns',
 test('browser_policy definition columns',
   _python3_test,
   args: [files('test_browser_policy_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# update_source_trust's definition-column contract (content/definitions/update_source_trust.yaml):
+# row_kind must be the first result column and the generic field_1..field_10 sequence is pinned to
+# the wire row update_source_trust_parsers.hpp emits across its three row shapes (the test holds the
+# expected literals; it does not read the C++). Parses the YAML directly -- catches a reordered or
+# renamed column the C++ test's hard-coded literal cannot.
+test('update_source_trust definition columns',
+  _python3_test,
+  args: [files('test_update_source_trust_definition.py')],
   suite: 'docs',
   timeout: 30,
 )

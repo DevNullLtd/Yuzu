@@ -1,0 +1,170 @@
+## Update Source Trust Definitions
+## Reports how a device's package/update sources are configured to trust their
+## signing authorities. Read-only, facts only: an unsigned or rogue source is a
+## row, never a verdict, and nothing is enforced, fetched or changed.
+## Plugin: update_source_trust | Actions: sources
+##
+## Sources by platform:
+##   Linux:   file reads of /etc/apt/sources.list{,.d/*} (one-line and deb822
+##            formats: signed-by, trusted, allow-insecure) and the apt keyrings
+##            /etc/apt/trusted.gpg{,.d/*} and /etc/apt/keyrings/*.
+##            The yum/dnf /etc/yum.repos.d/*.repo family (gpgcheck,
+##            repo_gpgcheck, gpgkey, sslverify) is PLANNED and not read yet:
+##            a host whose /etc/yum.repos.d has entries reports
+##            CONSTRAINED with linux:rpm_repo:planned and no rpm_repo rows.
+##   macOS:   PLANNED, not read yet (CFPropertyListCreateWithData over
+##            the local /Library/Preferences/com.apple.SoftwareUpdate.plist and
+##            the MDM-delivered /Library/Managed Preferences/com.apple.SoftwareUpdate.plist).
+##            Today `sources` on macOS answers with exactly one row,
+##            `status|sources|unsupported|macos:planned`.
+##   Windows: PLANNED, not read yet (WSUS / Automatic Updates policy
+##            under HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate{,\AU}).
+##            Today `sources` on Windows answers with exactly one row,
+##            `status|sources|unsupported|windows:planned`.
+##
+## WHY: there is no documented customer driver for this plugin. Capability-map
+## section 8.8 tests reachability to update sources, never their trust, and the
+## SOC 2 supply-chain material covers Yuzu's own build pipeline, not a customer
+## endpoint's package-source configuration. This is a capability-gap addition:
+## an unsigned or rogue third-party repository is a common compromise vector.
+##
+## Absent versus constrained: a host that simply has no apt tree reports ZERO
+## rows for that family and stays `supported` (a genuinely absent thing). A
+## source that exists but cannot be read reports `constrained` with a reason
+## token, never an empty success; the deferred rpm/dnf family is reported the
+## same honest way (`constrained` with linux:rpm_repo:planned), never as absent.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.security.update_source_trust
+  displayName: Update Source Trust
+  version: 1.0.0
+  description: >
+    Reports how the device's package and update sources are configured to
+    trust their signing authorities, as facts only. On Linux, one row per apt
+    source (one-line and deb822, with signed-by, trusted and, for one-line
+    entries only, allow-insecure) and one row per apt keyring file. The yum/dnf repository family is planned
+    and not yet read; a Linux host whose /etc/yum.repos.d has entries
+    reports a constrained status with linux:rpm_repo:planned instead of rows.
+    The macOS Software Update and Windows WSUS legs are planned and not yet
+    read. Only the apt family is read: on a Linux host whose sources live
+    elsewhere (zypper, pacman, apk) zero rows is not evidence that no
+    sources exist. Global apt configuration (apt.conf, apt.conf.d) is not
+    read, so an unset trust field is not evidence that signatures are
+    enforced. A leading status row states whether the read was
+    complete. The plugin never enforces, fetches or changes anything.
+  tags: [security, supply-chain, update-sources, packages]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: update_source_trust
+    action: sources
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Three row shapes are emitted on one stream, discriminated by field 0
+    # (row_kind). Every row of a kind carries the same field count; "-" is an
+    # absent value. A status row always comes first. Booleans are the
+    # four-value vocabulary yes | no | unset | unmodelled (unset = key absent;
+    # unmodelled = key present with a value the plugin does not recognise).
+    #
+    #   status|sources|<supported|constrained|unsupported>|<reason or ->
+    #   apt_source|<file>|<one_line|deb822>|<types>|<uris>|<suites>|<components>|<signed_by>|<trusted>|<allow_insecure>|<enabled>
+    #   apt_keyring|<path>|<scope>|<armored|binary|empty|unmodelled>|<size_bytes>
+    #
+    # field_1..field_10 carry the data fields of the widest shape (apt_source,
+    # 10); narrower shapes leave the tail fields off the row.
+    #
+    # A column's `platforms` lists the OSes whose leg emits it; macOS and Windows
+    # read nothing today, so only the status row's columns (row_kind, field_1..
+    # field_3) are populated there.
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, apt_source, apt_keyring]
+        description: 'Row shape discriminator (field 0). Values: status, apt_source, apt_keyring.'
+        example: apt_source
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'status: the literal "sources". apt_source: the logical absolute path of the source file. apt_keyring: the keyring file path.'
+        example: /etc/apt/sources.list.d/debian.sources
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (Windows and macOS, whose legs read nothing, and a leg that threw report unsupported). apt_source: format, one_line or deb822. apt_keyring: scope (legacy_trusted_gpg, trusted_gpg_d or etc_apt_keyrings).'
+        example: deb822
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a constrained or unsupported read, "-" when complete; a token has the form <os>:<source>:<detail> (linux:rpm_repo:planned on a Linux host whose /etc/yum.repos.d has entries) or <os>:<state> (windows:planned on Windows, macos:planned on macOS). apt_source: source types, space-separated when several (deb, deb-src or unmodelled). apt_keyring: key format (armored, binary, empty or unmodelled).'
+        example: deb
+        platforms: [windows, linux, darwin]
+      - name: field_4
+        type: string
+        description: 'apt_source: URIs (space-separated when the entry lists several), userinfo (user:pass@) redacted. apt_keyring: size in bytes. Not used by status.'
+        example: https://deb.debian.org/debian
+        platforms: [linux]
+      - name: field_5
+        type: string
+        description: 'apt_source: suites, space-separated when several.'
+        example: bookworm
+        platforms: [linux]
+      - name: field_6
+        type: string
+        description: 'apt_source: components.'
+        example: main
+        platforms: [linux]
+      - name: field_7
+        type: string
+        description: 'apt_source: signed_by, the Signed-By value (paths and/or fingerprints), the literal inline_key when a deb822 Signed-By embeds a key block (key material is never emitted), the literal unmodelled when a one-line signed-by uses += or -=, or "-" when absent (apt then uses its global trusted keyrings).'
+        example: /usr/share/keyrings/debian-archive-keyring.gpg
+        platforms: [linux]
+      - name: field_8
+        type: string
+        description: 'apt_source: trusted (yes, no, unset, unmodelled; yes disables signature checking for the source; only the apt boolean words are recognised and any other value is unmodelled; unset means the source does not say, not that signatures are enforced).'
+        example: unset
+        platforms: [linux]
+      - name: field_9
+        type: string
+        description: 'apt_source: allow_insecure (yes, no, unset, unmodelled; read from the one-line [allow-insecure=...] option only: apt ignores it in deb822, so it is unset there).'
+        example: unset
+        platforms: [linux]
+      - name: field_10
+        type: string
+        description: 'apt_source: enabled (yes, no, unmodelled; deb822 defaults to enabled).'
+        example: "yes"
+        platforms: [linux]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report update-source trust facts"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [update_source_trust]
+
+status:
+  phase: active

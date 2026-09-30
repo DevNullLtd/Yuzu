@@ -1,12 +1,12 @@
 /**
  * test_capability_catalogue.cpp — PR1.9's cross-cutting invariant gate over
- * the WHOLE capability catalogue: the eight independently-authored sources
- * (the seven per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
+ * the WHOLE capability catalogue: the independently-authored sources
+ * (the per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
  * fragments plus the core-owned `capability_decls/core_dispatch_capabilities
  * .hpp`) composed into one `CommandCapabilityRegistry`, exactly as a real
  * dispatch chokepoint eventually will.
  *
- * Nobody who authors a single fragment can see the other seven, so nobody is
+ * Nobody who authors a single fragment can see the others, so nobody is
  * positioned to catch a row that under-declares risk for its operation, uses
  * a securable or operation that was never seeded, calls itself Destructive
  * without being Irreversible, or falsely claims `system_reserved`. This file
@@ -33,6 +33,7 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
@@ -151,6 +152,7 @@ struct LabeledSpan {
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"browser_policy", capdecls::plugin_action_catalogue_browser_policy(), false},
+        {"update_source_trust", capdecls::plugin_action_catalogue_update_source_trust(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
@@ -168,7 +170,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-five sources exactly as a live composition site would use.
+    // literally, twenty-six sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -185,6 +187,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_browser_policy(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::plugin_action_catalogue_runtimes(),
@@ -347,8 +350,28 @@ TEST_CASE("capability catalogue: system_reserved is true only for core_dispatch_
     }
 }
 
-TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all eight "
-          "sources",
+/// Exact-row pin for `update_source_trust.sources` (Wave 10 PR10.1-d). The
+/// action is a read-only supply-chain-POSTURE fact under `Security`:Read with
+/// no execute gate. Pinning it directly means a silent drift to a mutating
+/// class, a different securable, or a gate on a facts-only read fails here.
+TEST_CASE("capability catalogue: update_source_trust.sources pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_update_source_trust();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "update_source_trust");
+    CHECK(row.action == "sources");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
+          "source",
           "[server][dispatch][capability]") {
     auto registry = build_registry(all_labeled_sources());
     for (const auto& source : all_labeled_sources()) {
