@@ -30084,10 +30084,25 @@ TEST_CASE("MCP create_result_set: a non-empty device_ids with an admitted "
           "[pg][mcp][integration][result-sets][security][4983]") {
     yuzu::test::ResultSetStorePg rs_bundle;
 
+    // Gate 3 SHOULD (quality-engineer, #4983 fix round): a bare final-outcome
+    // assertion (kInternalError + the RESULT_SET_STORE_UNAVAILABLE substring)
+    // cannot distinguish "the gate genuinely ran and admitted, THEN the
+    // agent_registry check tripped" from a regression to a combined
+    // `if (!fleet_read_fn_ || !agent_registry)` guard checked BEFORE
+    // fleet_read_fn_ is ever called -- both produce byte-identical output.
+    // Wire a capturing lambda (same idiom as the fleet_read_fn_reached test
+    // a couple thousand lines above, #4980) instead of relying on the
+    // fixture's stock default, and assert it actually ran.
+    bool fleet_read_fn_reached = false;
     McpTestServer ts;
     ts.result_set_store_for_test = rs_bundle.get();
+    ts.fleet_read_fn_for_test =
+        [&fleet_read_fn_reached](const httplib::Request&, httplib::Response&, const std::string&,
+                                 const std::string&) -> yuzu::server::authz::FleetReadGate {
+        fleet_read_fn_reached = true;
+        return {.admitted = true, .scope = std::nullopt};
+    };
     // ts.agent_registry_for_test is left at its fixture default (nullptr) --
-    // the fixture's default fleet_read_fn_for_test admits unfiltered, so this
     // isolates the agent_registry-unwired branch specifically.
     ts.start();
 
@@ -30099,6 +30114,7 @@ TEST_CASE("MCP create_result_set: a non-empty device_ids with an admitted "
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
           std::string::npos);
+    CHECK(fleet_read_fn_reached); // the gate itself ran and admitted before the 2nd check tripped
     std::string next;
     CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
 }

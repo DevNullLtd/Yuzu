@@ -823,6 +823,79 @@ TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
     CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
 }
 
+// Gate 3 SHOULD (cpp-expert, #4983 fix round): unlike REST's JSON body, this
+// fragment echoes up to kMaxCitedBadIds (20) caller-supplied device_ids
+// entries into an HX-Trigger response HEADER on a rejection -- header size is
+// a real protocol/proxy ceiling a JSON body doesn't share, so every entry
+// must be bounded to MCP's own kResultSetDeviceIdMaxLen (256 bytes) at the
+// root, mirroring REST's identical fix in the same PR.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry over 256 bytes "
+          "is rejected with an error toast, and no result set is created "
+          "(#4983 Gate 3 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string oversized_id(257, 'a');
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + oversized_id,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // this file's own idiom -- toast, not a real error status
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("256 bytes") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger") != "resultSetsChanged");
+    // Rejected before the existence/scope gate (a couple hundred lines below
+    // in result_set_routes.cpp) ever runs.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "RESULT_SET_DEVICE_ID_TOO_LONG");
+}
+
+// Gate 3 SHOULD (quality-engineer + cpp-safety, both independently found,
+// #4983 fix round): REST's and MCP's twins of this create route both already
+// have a dedicated test pinning the kMaxCitedBadIds=20 "(+N more)" truncation
+// boundary; this fragment carries a byte-identical copy of that logic but had
+// no equivalent test.
+TEST_CASE("result_set_routes: [pg] create: more than kMaxCitedBadIds=20 bad "
+          "ids are truncated in the toast with a '(+N more)' suffix (#4983 "
+          "Gate 3 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.all_agent_ids_override = {}; // nothing exists -- every submitted id is "bad"
+    h.wire();
+
+    std::string ids;
+    for (int i = 0; i < 25; ++i) {
+        if (i)
+            ids += ",";
+        ids += "ghost-" + std::to_string(i);
+    }
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + ids,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto trigger = r->get_header_value("HX-Trigger");
+    CHECK(trigger.find("RESULT_SET_UNKNOWN_DEVICE_ID") != std::string::npos);
+    CHECK(trigger.find("ghost-0") != std::string::npos);
+    CHECK(trigger.find("ghost-19") != std::string::npos); // the 20th cited id (0-indexed)
+    CHECK(trigger.find("ghost-20") == std::string::npos); // the 21st is past the cap
+    CHECK(trigger.find("(+5 more)") != std::string::npos);
+
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_result_set_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit
