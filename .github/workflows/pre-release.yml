@@ -264,11 +264,20 @@ jobs:
         run: bash scripts/ci/qa-stack.sh down
 
   # ── Installer smoke tests: .deb on multiple distros ─────────────────
+  #
+  # Every package the release ships (server, agent, gateway) must be present,
+  # install, leave its unit file, RUN, and remove. "Runs" is the binary's own
+  # --version for server and agent, and for the gateway (an OTP release with
+  # its own ERTS) that the node boots and answers `ping`. Installing is not
+  # enough: v0.13.0's packages install cleanly on debian:12 and then cannot
+  # start (GLIBC_2.38 not found). Legs whose libc/libstdc++ is older than the
+  # build's fail here, naming the glibc floor (#5143), until that is decided —
+  # that red is the honest result, not a flake to mask (#5151).
   install-deb:
     name: "Install .deb (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -280,41 +289,94 @@ jobs:
           name: release-artifacts
           path: artifacts
 
-      - name: Test .deb install and removal
+      - name: Test .deb install, run and removal
+        env:
+          DISTRO: ${{ matrix.distro }}
         run: |
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -euo pipefail
+          # runs LABEL CMD...: CMD must exit 0; a missing versioned
+          # glibc/libstdc++ symbol is named as the glibc floor (#5143).
+          runs() {
+            local label="$1" out rc=0; shift
+            out="$("$@" 2>&1)" || rc=$?
+            printf '%s\n' "$out"
+            [ "$rc" -eq 0 ] && { echo "PASS: $label (exit 0)"; return 0; }
+            # The loader's "version `GLIBC_2.38' not found", or dnf refusing
+            # an RPM whose auto-requires name one ("libstdc++.so.6(GLIBCXX_3.4.34)(64bit)").
+            if printf '%s' "$out" | grep -qE "(GLIBC|GLIBCXX|CXXABI)_[0-9.]+(' not found|\)\(64bit\))"; then
+              echo "FAIL: $label on $DISTRO: needs a newer glibc/libstdc++ than it ships (glibc floor, #5143)"
+            elif [ "$rc" -eq 124 ]; then
+              echo "FAIL: $label did not finish within its time bound"
+            else
+              echo "FAIL: $label exited $rc"
+            fi
+            return 1
+          }
+          apt-get update -qq
+          dpkg -i "/debs/$DEB_NAME" || apt-get install -f -y -qq
+          # `apt-get install -f` can "fix" a failed install by removing it.
+          dpkg -s "yuzu-$PKG" | grep -q '^Status: install ok installed' \
+            || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
+          echo 'PASS: installed'
+          test -f "/usr/lib/systemd/system/yuzu-$PKG.service" \
+            || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
+          echo 'PASS: systemd service file exists'
+          if [ "$PKG" = gateway ]; then
+            # `daemon` returns once the node is up — and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            if ! runs "yuzu_gw daemon" timeout 90 /opt/yuzu_gw/bin/yuzu_gw daemon; then
+              tail -n 30 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              echo "FAIL: the gateway release did not boot on $DISTRO (its log is above)"
+              exit 1
+            fi
+            timeout 30 /opt/yuzu_gw/bin/yuzu_gw ping \
+              || { echo "FAIL: the gateway node does not answer ping"; exit 1; }
+            echo 'PASS: the gateway release boots and answers ping'
+            timeout 60 /opt/yuzu_gw/bin/yuzu_gw stop
+          else
+            runs "yuzu-$PKG --version" "/usr/local/bin/yuzu-$PKG" --version
+          fi
+          dpkg -r "yuzu-$PKG"
+          echo 'PASS: removed cleanly'
+          SMOKE
+          shopt -s nullglob
+          FAIL=0
           for PKG in server agent gateway; do
-            DEB=$(ls artifacts/yuzu-${PKG}*.deb 2>/dev/null | head -1)
-            [ -z "$DEB" ] && { echo "SKIP: no yuzu-$PKG .deb found"; continue; }
-
-            echo "=== Testing $DEB on ${{ matrix.distro }} ==="
-
-            docker run --rm -v "$PWD/artifacts:/debs:ro" "${{ matrix.distro }}" bash -c "
-              set -e
-              apt-get update -qq
-              dpkg -i /debs/$(basename $DEB) 2>&1 || apt-get install -f -y -qq
-              echo 'PASS: installed'
-
-              # Verify service file
-              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
-                test -f /usr/lib/systemd/system/yuzu-gateway.service
-              echo 'PASS: systemd service file exists'
-
-              # Remove
-              dpkg -r yuzu-$PKG
-              echo 'PASS: removed cleanly'
-            "
+            # Exactly one per package: a missing package used to be a SKIP
+            # that passed, and with two, which one ships is a guess.
+            DEBS=(artifacts/yuzu-"$PKG"_*.deb)
+            if [ "${#DEBS[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one yuzu-${PKG}_*.deb in the release, found ${#DEBS[@]}: ${DEBS[*]}"
+              FAIL=1; continue
+            fi
+            echo "=== Testing ${DEBS[0]} on $DISTRO ==="
+            if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e DEB_NAME="$(basename "${DEBS[0]}")" \
+                 -v "$PWD/artifacts:/debs:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
+                 "$DISTRO" bash /smoke.sh; then
+              echo "::error::yuzu-$PKG failed the .deb smoke test on $DISTRO"
+              FAIL=1
+            fi
           done
+          exit "$FAIL"
 
   # ── Installer smoke tests: .rpm on Fedora/Rocky ─────────────────────
+  #
+  # Same contract as install-deb. fedora:42, not 40: the build's GCC 15
+  # libstdc++ (GLIBCXX_3.4.34) is not in fedora:40's, so that leg could never
+  # pass. `dnf install` of the file rather than `rpm -i`: fedora:42's base
+  # image has no useradd, so %pre fails under plain rpm, while dnf pulls
+  # shadow-utils in exactly as it does for an operator. rockylinux:9 stays and
+  # fails honestly on the glibc floor (#5143) until that is decided.
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        distro: ["fedora:40", "rockylinux:9"]
+        distro: ["fedora:42", "rockylinux:9"]
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -322,27 +384,70 @@ jobs:
           name: release-artifacts
           path: artifacts
 
-      - name: Test .rpm install and removal
+      - name: Test .rpm install, run and removal
+        env:
+          DISTRO: ${{ matrix.distro }}
         run: |
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -euo pipefail
+          # runs LABEL CMD...: as in install-deb.
+          runs() {
+            local label="$1" out rc=0; shift
+            out="$("$@" 2>&1)" || rc=$?
+            printf '%s\n' "$out"
+            [ "$rc" -eq 0 ] && { echo "PASS: $label (exit 0)"; return 0; }
+            # The loader's "version `GLIBC_2.38' not found", or dnf refusing
+            # an RPM whose auto-requires name one ("libstdc++.so.6(GLIBCXX_3.4.34)(64bit)").
+            if printf '%s' "$out" | grep -qE "(GLIBC|GLIBCXX|CXXABI)_[0-9.]+(' not found|\)\(64bit\))"; then
+              echo "FAIL: $label on $DISTRO: needs a newer glibc/libstdc++ than it ships (glibc floor, #5143)"
+            elif [ "$rc" -eq 124 ]; then
+              echo "FAIL: $label did not finish within its time bound"
+            else
+              echo "FAIL: $label exited $rc"
+            fi
+            return 1
+          }
+          runs "dnf install of yuzu-$PKG" dnf install -y -q "/rpms/$RPM_NAME"
+          rpm -q "yuzu-$PKG" >/dev/null || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
+          echo 'PASS: installed'
+          test -f "/usr/lib/systemd/system/yuzu-$PKG.service" \
+            || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
+          echo 'PASS: systemd service file exists'
+          if [ "$PKG" = gateway ]; then
+            # `daemon` returns once the node is up — and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            if ! runs "yuzu_gw daemon" timeout 90 /opt/yuzu_gw/bin/yuzu_gw daemon; then
+              tail -n 30 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              echo "FAIL: the gateway release did not boot on $DISTRO (its log is above)"
+              exit 1
+            fi
+            timeout 30 /opt/yuzu_gw/bin/yuzu_gw ping \
+              || { echo "FAIL: the gateway node does not answer ping"; exit 1; }
+            echo 'PASS: the gateway release boots and answers ping'
+            timeout 60 /opt/yuzu_gw/bin/yuzu_gw stop
+          else
+            runs "yuzu-$PKG --version" "/usr/bin/yuzu-$PKG" --version
+          fi
+          rpm -e "yuzu-$PKG"
+          echo 'PASS: removed cleanly'
+          SMOKE
+          shopt -s nullglob
+          FAIL=0
           for PKG in server agent gateway; do
-            RPM=$(ls artifacts/yuzu-${PKG}*.rpm 2>/dev/null | head -1)
-            [ -z "$RPM" ] && { echo "SKIP: no yuzu-$PKG .rpm found"; continue; }
-
-            echo "=== Testing $RPM on ${{ matrix.distro }} ==="
-
-            docker run --rm -v "$PWD/artifacts:/rpms:ro" "${{ matrix.distro }}" bash -c "
-              set -e
-              rpm -i /rpms/$(basename $RPM)
-              echo 'PASS: installed'
-
-              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
-                test -f /usr/lib/systemd/system/yuzu-gateway.service
-              echo 'PASS: systemd service file exists'
-
-              rpm -e yuzu-$PKG
-              echo 'PASS: removed cleanly'
-            "
+            RPMS=(artifacts/yuzu-"$PKG"-[0-9]*.rpm)
+            if [ "${#RPMS[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one yuzu-$PKG-<version>.rpm in the release, found ${#RPMS[@]}: ${RPMS[*]}"
+              FAIL=1; continue
+            fi
+            echo "=== Testing ${RPMS[0]} on $DISTRO ==="
+            if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e RPM_NAME="$(basename "${RPMS[0]}")" \
+                 -v "$PWD/artifacts:/rpms:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
+                 "$DISTRO" bash /smoke.sh; then
+              echo "::error::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
+              FAIL=1
+            fi
           done
+          exit "$FAIL"
 
   # ── Windows installer smoke test ────────────────────────────────────
   #
@@ -568,6 +673,17 @@ jobs:
           }
           Write-Host "PASS: fail-closed for the expected reason (no pinnable CA)"
 
+      # The assertion above copies the log only once the service has stopped;
+      # if WaitForStatus throws first, this is the only copy — and the
+      # uninstaller deletes {app}\logs. Mirrors the --no-tls pass.
+      - name: Collect agent log (TLS pass)
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "${env:ProgramFiles}\Yuzu\logs\yuzu-agent.log"
+          if (Test-Path $log) { Copy-Item $log agent-tls.log -Force; Get-Content $log -Tail 40 }
+          else { Write-Host "no agent log at $log" }
+
       - name: Silent uninstall (TLS pass)
         if: always()
         shell: pwsh
@@ -648,7 +764,7 @@ jobs:
             uninstall-tls.log
             system-events.log
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 30
 
   # ── macOS installer smoke test ──────────────────────────────────────
   install-macos:
@@ -665,17 +781,29 @@ jobs:
 
       - name: Install .pkg
         run: |
-          PKG=$(ls artifacts/YuzuAgent-*.pkg 2>/dev/null | head -1)
-          [ -z "$PKG" ] && { echo "SKIP: no .pkg found"; exit 0; }
-          echo "Installing: $PKG"
-          sudo installer -pkg "$PKG" -target / -verboseR
+          # The release ships a macOS agent .pkg; its absence is a failure,
+          # not a SKIP that passes while testing nothing (#5151).
+          shopt -s nullglob
+          PKGS=(artifacts/YuzuAgent-*.pkg)
+          if [ "${#PKGS[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one YuzuAgent-*.pkg in the release, found ${#PKGS[@]}: ${PKGS[*]}"
+            exit 1
+          fi
+          echo "Installing: ${PKGS[0]}"
+          sudo installer -pkg "${PKGS[0]}" -target / -verboseR
 
       - name: Verify installation
         run: |
           test -x /usr/local/bin/yuzu-agent && echo "PASS: binary installed" || { echo "FAIL: binary missing"; exit 1; }
-          /usr/local/bin/yuzu-agent --version
+          /usr/local/bin/yuzu-agent --version || { echo "FAIL: --version exited $?"; exit 1; }
           test -f /Library/LaunchDaemons/com.yuzu.agent.plist && echo "PASS: launchd plist installed" || { echo "FAIL: plist missing"; exit 1; }
-          PLUGINS=$(ls /usr/local/lib/yuzu/plugins/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+          # Same floor as the Windows job: an install with no plugins is an
+          # agent that can do nothing, and used to pass here.
+          PLUGINS=$(find /usr/local/lib/yuzu/plugins -maxdepth 1 -name '*.dylib' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$PLUGINS" -lt 5 ]; then
+            echo "FAIL: only $PLUGINS plugins in /usr/local/lib/yuzu/plugins"
+            exit 1
+          fi
           echo "PASS: $PLUGINS plugins installed"
 
   # ── Artifact deep inspection ────────────────────────────────────────
@@ -758,19 +886,27 @@ jobs:
         run: |
           cd artifacts
           # The control Version spells a pre-release with `~` (0.14.0~rc3) so dpkg
-          # orders it BEFORE 0.14.0; the tag and the .deb file name use `-`
-          # (0.14.0-rc3). Compare against the Debian spelling of the tag.
+          # orders it BEFORE 0.14.0, while the tag uses `-` (0.14.0-rc3) — and,
+          # from PR #5160 on, so does the .deb FILE name (yuzu-agent_0.14.0-rc3_amd64.deb).
+          # Compare the control field against the Debian spelling of the tag. A
+          # mismatch is a package that installs as the wrong version: it fails.
           WANT="${VERSION/-/\~}"
-          for deb in *.deb; do
+          shopt -s nullglob
+          DEBS=(*.deb)
+          [ "${#DEBS[@]}" -gt 0 ] || { echo "FAIL: no .deb in the release"; exit 1; }
+          FAIL=0
+          for deb in "${DEBS[@]}"; do
             echo "=== $deb ==="
             dpkg-deb --field "$deb" Package Version
             DEB_VER=$(dpkg-deb --field "$deb" Version)
             if [ "$DEB_VER" = "$WANT" ]; then
               echo "PASS: version $DEB_VER matches $VERSION"
             else
-              echo "WARN: version $DEB_VER != $WANT (tag $VERSION)"
+              echo "::error::$deb: control Version $DEB_VER != $WANT (tag $VERSION)"
+              FAIL=1
             fi
           done
+          exit "$FAIL"
 
       - name: Inspect RPM metadata
         run: |
@@ -865,7 +1001,7 @@ jobs:
           name: security-scan
           path: |
             trivy-*.txt
-          retention-days: 7
+          retention-days: 30
 
   # ── Soak test (10 min stability) ────────────────────────────────────
   soak-test:
