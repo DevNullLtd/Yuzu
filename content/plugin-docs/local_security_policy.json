@@ -109,7 +109,7 @@
     "**No documented business driver.** The priority for this plugin is asserted from a capability-gap reading, not evidenced by any tracked demand (see \"How it works\"); there is no capability-map requirement, named customer, SOC 2 control or CVE behind it.",
     "**Configuration, not evaluation; Windows `audit_policy` is the legacy categories only.** Files are reported as written, not as PAM, sudo or auditd would evaluate them (drop-ins, includes and `/etc/audit/rules.d` are not followed), and a Windows `none` means the legacy `[Event Audit]` category is unset, not that the host is not auditing — Advanced Audit Policy (`auditpol`) is not read. Some shapes produce no row at all (listed under \"How it works\"), so for them \"not set\" and \"not read\" look the same.",
     "**Windows is measured once, as LocalSystem on a standalone host with the default `agent.data_dir`, and stages a full policy export on disk.** Which privilege is required, whether `NT SERVICE\\YuzuAgent` succeeds, domain-joined behaviour (the export is the local security database, without `/mergedpolicy`) and a non-default `agent.data_dir` (an SMB share, a non-NTFS volume, a path over `MAX_PATH`, which may fail the leg as `dest_dir_acl` or `secedit:exit_<n>`) are unmeasured; the staged copy holds the whole `SECURITYPOLICY` area and outlives a crash until a later Windows dispatch sweeps it, indefinitely if none follows, and an uninstall that keeps the data directory keeps it too.",
-    "**Privileged files read `unreadable` for an unprivileged agent, and a container reports its own `/etc`.** `sudoers`, `sudoers.d` and `audit.rules` need root or a read-override capability, and are then an `unreadable` row, never an empty list. The shipped `Dockerfile.agent` image runs unprivileged with no host `/etc`, so it reports the image's files (the committed Linux sample is a root run in a hardened Debian 13 container, which likewise describes that container, not a host).",
+    "**Privileged files read `unreadable` for an unprivileged agent, and a container reports its own `/etc`.** `sudoers`, `sudoers.d` and `audit.rules` need root or a read-override capability, and are then an `unreadable` row, never an empty list. The sudoers sources are read without following symlinks and must be root-owned and not group/other-writable, so a symlinked `/etc/sudoers` (NixOS and some configuration-management layouts) or a loosely-permissioned entry reports `unreadable` with `symlink_refused` / `insecure_owner_or_mode` rather than being followed; PAM files, which are legitimately symlinked (authselect), are still followed. The shipped `Dockerfile.agent` image runs unprivileged with no host `/etc`, so it reports the image's files (the committed Linux sample is a root run in a hardened Debian 13 container, which likewise describes that container, not a host).",
     "**Global scope only, unmanaged captures, and no cross-OS normalisation.** macOS reports global (not per-user) policy from an unmanaged Mac, so on an MDM-managed device `policies|none` must not be read as \"no lockout enforced\". Keys stay in each OS's own vocabulary (`MinimumPasswordLength`, `PASS_MIN_LEN`/`minlen`, `minimum_length`), so fleet baselines branch per OS."
   ],
   "definitions": [
@@ -490,15 +490,15 @@
   "privileges": [
     {
       "grant": "`secedit /export` needs an elevated token. What was measured, and only that: on the-rig, run as LocalSystem from a scheduled task (RunLevel Highest), the export succeeded with `SeSecurityPrivilege` present but in its default **Disabled** state (the `RIG PROBE` banner in `local_security_policy_win.cpp`, `docs/samples/windows.txt`). Which privilege is actually required, and whether the dedicated `NT SERVICE\\YuzuAgent` account (which holds `SeSecurityPrivilege` via `scripts/install-agent-user.ps1`) succeeds, were **not** measured",
-      "if_refused": "A refused `secedit` run is expected to exit non-zero and report `CONSTRAINED` with `secedit:exit_<n>` (not measured). `PERMISSION_DENIED` with `secedit:access_denied` is reported only when the agent cannot open its own export file (`ERROR_ACCESS_DENIED`; never observed). Either way the action returns 1 with the row `constrained|<token>`",
-      "measured": "Yes, as LocalSystem on a standalone Windows 11 Pro host (rig probe 2026-09-21; committed sample re-captured 2026-09-23): a real 12,828-byte `secedit` export (UTF-16LE) and the committed sample. No fixture of the export is committed",
+      "if_refused": "A refused `secedit` run is expected to exit non-zero and report `CONSTRAINED` with `secedit:exit_<n>` (not measured). `PERMISSION_DENIED` with `secedit:access_denied` is reported only when the agent cannot open its own export file (`ERROR_ACCESS_DENIED`; never observed). Either way the action returns 0 with the row `constrained|<token>` (degradation is the typed status; rc is not a proxy for it)",
+      "measured": "Yes, as LocalSystem on a standalone Windows 11 Pro host (rig probe 2026-09-21; committed sample re-captured 2026-09-29): a real 12,828-byte `secedit` export (UTF-16LE) and the committed sample. No fixture of the export is committed",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "None for `pwpolicy -getaccountpolicies`; `/etc/sudoers` is `root:wheel` `0440`, so reading it needs root or group wheel",
       "if_refused": "`EACCES` on `/etc/sudoers` reports the row kind `unreadable` with `permission_denied` and the action reports `PERMISSION_DENIED`/`PARTIAL`; a failed `pwpolicy` run reports `CONSTRAINED` with `pwpolicy:<cause>`",
-      "measured": "Bare-metal, this Mac (`braga`), unprivileged (euid 501; probe 2026-09-21, committed sample re-captured 2026-09-23): real capture (`docs/samples/macos.txt`); no root-privileged run has been captured",
+      "measured": "Bare-metal, this Mac (`braga`), unprivileged (euid 501; probe 2026-09-21, committed sample re-captured 2026-09-29): real capture (`docs/samples/macos.txt`); no root-privileged run has been captured",
       "os": "macOS",
       "runs_as": "agent daemon, root today (LaunchDaemon carries no `UserName` key, `docs/agent-privilege-model.md` TL;DR)"
     },
@@ -520,9 +520,9 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`<path>:symlink_loop`, `<path>:io_error`, `<path>:oversized`, `<path>:not_regular`, `<path>:errno_<n>`, `<path>:embedded_nul`, `<path>:permission_denied`, `<path>:undecoded_passwd_tag`, `sudoers.d:<cause>`, `sudoers.d:truncated`, `row_cap`",
+      "provenance": "`<path>:symlink_loop`, `<path>:io_error`, `<path>:oversized`, `<path>:not_regular`, `<path>:errno_<n>`, `<path>:embedded_nul`, `<path>:symlink_refused`, `<path>:insecure_owner_or_mode`, `<path>:permission_denied`, `<path>:undecoded_passwd_tag`, `sudoers.d:<cause>`, `sudoers.d:truncated`, `row_cap`",
       "status": "`CONSTRAINED`",
-      "when": "Linux and macOS file reads: at least one source failed for a reason other than a refusal, or a refusal while something else was readable; the reason lists one token per failure. `<path>` is the full path, including `/etc/sudoers.d/<name>` for a file in that directory; a failure to list the directory itself is `sudoers.d:<cause>` (the bare name `sudoers.d`, not the path)."
+      "when": "Linux and macOS file reads: at least one source failed for a reason other than a refusal, or a refusal while something else was readable; the reason lists one token per failure. `<path>` is the full path, including `/etc/sudoers.d/<name>` for a file in that directory; a failure to list the directory itself is `sudoers.d:<cause>` (the bare name `sudoers.d`, not the path). `symlink_refused` and `insecure_owner_or_mode` are the sudoers-only checks: those sources are opened without following links and must be owned by uid 0 and not group/other-writable (what sudo itself requires), so a planted link never turns the action into a read of another file."
     },
     {
       "completeness": "`PARTIAL`",
@@ -540,7 +540,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`data_dir_unset`, `secedit:system_directory_unresolved`, `dest_dir_create_<n>`, `dest_dir_open_<n>`, `dest_dir_acl`, `secedit:spawn_error`, `secedit:deadline`, `secedit:cancelled`, `secedit:signaled`, `secedit:unexpected_termination`, `secedit:exit_<n>`, `secedit:output_missing`, `secedit:read_<n>`, `secedit:output_not_regular`, `secedit:output_oversized`, `secedit:output_short_read`, `secedit:decode_failed`, `secedit:export_incomplete`, `secedit:embedded_nul`, `secedit:section_missing_system_access`, `secedit:section_missing_event_audit`, `secedit:unsupported_action`",
       "status": "`CONSTRAINED`",
-      "when": "Windows: the scratch directory or the `secedit` run or export failed; the action returns 1 with the row `constrained|<token>`."
+      "when": "Windows: the scratch directory or the `secedit` run or export failed; the action returns 0 (degradation is carried by the typed status) with the row `constrained|<token>`."
     },
     {
       "completeness": "`PARTIAL`",
