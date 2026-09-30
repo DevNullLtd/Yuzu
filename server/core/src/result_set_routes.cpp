@@ -418,6 +418,24 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                     // to_string(error)-code convention, unchanged.
                     deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
                                   "reason=unknown_device_id");
+                    // Gate 4 SHOULD (real bug, #4983 fix round): a caller-
+                    // supplied (nonexistent) device_ids entry can carry
+                    // invalid raw UTF-8 bytes reached via URL-decoded form
+                    // data (httplib's query/form decoder does not validate
+                    // UTF-8, unlike REST/MCP's JSON-body parsing, which
+                    // structurally rejects invalid UTF-8 before device_ids is
+                    // ever inspected) -- `cited` echoes those bytes verbatim,
+                    // and nlohmann::json's default dump() throws
+                    // `type_error.316` on invalid UTF-8, which propagates
+                    // uncaught out of this handler (no exception_handler is
+                    // installed on web_server_) into an opaque 500 instead of
+                    // this route's own documented clean-400/toast contract.
+                    // `error_handler_t::replace` substitutes U+FFFD instead
+                    // of throwing -- the established idiom for exactly this
+                    // "caller-controlled bytes reach a JSON dump()" class
+                    // elsewhere in this codebase (`approval_routes.cpp`,
+                    // `api_token_model.cpp`, `management_group_model.cpp`,
+                    // `instruction_routes.cpp`, `bundle_service.cpp`).
                     res.set_header(
                         "HX-Trigger",
                         nlohmann::json{
@@ -427,7 +445,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                                "RESULT_SET_UNKNOWN_DEVICE_ID: device_ids contains an id "
                                "that does not exist or is not visible to you: " +
                                    cited}}}}
-                            .dump());
+                            .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
                     std::string next;
                     auto sets = deps.store->list_by_owner(session->username, "", 200, next);
                     res.set_content(render_result_sets_sidebar(sets, ""),

@@ -906,6 +906,44 @@ TEST_CASE("result_set_routes: [pg] create: more than kMaxCitedBadIds=20 bad "
     CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
 }
 
+// Gate 4 SHOULD (real bug, #4983 fix round): httplib's query/form decoder
+// URL-decodes %XX sequences into raw bytes with NO UTF-8 validation, unlike
+// REST's/MCP's JSON-body parsing, which structurally rejects invalid UTF-8
+// before device_ids is ever inspected -- this is the one place the three
+// surfaces genuinely diverge in robustness. A nonexistent device_ids entry
+// containing invalid raw UTF-8 bytes used to crash this handler: the
+// offending bytes flowed through the CSV tokenizer into `bad_ids`, then into
+// the RESULT_SET_UNKNOWN_DEVICE_ID toast's nlohmann::json{...}.dump() call,
+// which THREW json.exception.type_error.316 on the invalid byte -- no
+// exception_handler is installed on web_server_, so this propagated out as
+// an opaque 500 instead of this route's own documented clean-400/toast
+// contract. Empirically reproduced before this fix round's
+// error_handler_t::replace change.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry with invalid "
+          "UTF-8 bytes rejects cleanly with an error toast, not an uncaught "
+          "exception/500 (#4983 Gate 4 SHOULD)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // "ghost..." never exists in all_agent_ids_override, so this reaches the
+    // toast-building .dump() call with the raw invalid bytes still attached.
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=ghost%FF%FE",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200); // clean toast, not an uncaught-exception 500
+    CHECK(r->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    std::string next;
+    CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().detail == "reason=unknown_device_id");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Wiring tripwire: every case above proves register_result_set_routes' OWN
 // handlers are correct, but nothing above reads server.cpp — a future edit
