@@ -30076,6 +30076,11 @@ TEST_CASE("MCP create_result_set: a non-empty device_ids with an unwired "
           std::string::npos);
     std::string next;
     CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round): the fragment's twin of this
+    // misconfiguration branch already audited; MCP's didn't until now.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "result_set.create|denied");
+    CHECK(ts.audit_details.back() == "reason=fleet_read_fn_unwired");
 }
 
 TEST_CASE("MCP create_result_set: a non-empty device_ids with an admitted "
@@ -30117,6 +30122,10 @@ TEST_CASE("MCP create_result_set: a non-empty device_ids with an admitted "
     CHECK(fleet_read_fn_reached); // the gate itself ran and admitted before the 2nd check tripped
     std::string next;
     CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round).
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "result_set.create|denied");
+    CHECK(ts.audit_details.back() == "reason=agent_registry_unwired");
 }
 
 TEST_CASE("MCP create_result_set: more than kMaxCitedBadIds=20 bad ids are "

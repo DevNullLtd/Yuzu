@@ -722,7 +722,9 @@ TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
     REQUIRE_FALSE(h.audits.empty());
     CHECK(h.audits.back().action == "result_set.create");
     CHECK(h.audits.back().result == "denied");
-    CHECK(h.audits.back().detail == "RESULT_SET_UNKNOWN_DEVICE_ID");
+    // Gate 4 SHOULD (#4983 fix round): standardized onto REST/MCP's
+    // "reason=..." audit-detail convention for this same rejection.
+    CHECK(h.audits.back().detail == "reason=unknown_device_id");
 }
 
 TEST_CASE("result_set_routes: [pg] create: a device_ids list containing one "
@@ -799,6 +801,8 @@ TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
     CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
     REQUIRE_FALSE(h.audits.empty());
     CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized detail wording.
+    CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
 }
 
 TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
@@ -821,6 +825,10 @@ TEST_CASE("result_set_routes: [pg] create: a non-empty device_ids with an "
     CHECK(h.fleet_read_fn_reached); // gate itself ran and admitted before the 2nd check tripped
     std::string next;
     CHECK(w.store.list_by_owner("alice", "", 10, next).empty());
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+    // Gate 4 SHOULD (#4983 fix round): standardized detail wording.
+    CHECK(h.audits.back().detail == "reason=all_agent_ids_fn_unwired");
 }
 
 // Gate 3 SHOULD (cpp-expert, #4983 fix round): unlike REST's JSON body, this
@@ -856,7 +864,9 @@ TEST_CASE("result_set_routes: [pg] create: a device_ids entry over 256 bytes "
     REQUIRE_FALSE(h.audits.empty());
     CHECK(h.audits.back().action == "result_set.create");
     CHECK(h.audits.back().result == "denied");
-    CHECK(h.audits.back().detail == "RESULT_SET_DEVICE_ID_TOO_LONG");
+    // Gate 4 SHOULD (#4983 fix round): standardized onto REST/MCP's
+    // "reason=..." audit-detail convention for this same rejection.
+    CHECK(h.audits.back().detail == "reason=device_id_too_long");
 }
 
 // Gate 3 SHOULD (quality-engineer + cpp-safety, both independently found,

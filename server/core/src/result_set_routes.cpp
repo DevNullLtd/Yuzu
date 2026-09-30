@@ -267,8 +267,13 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 flush();
             }
             if (device_id_too_long) {
+                // Gate 4 SHOULD (#4983 fix round): standardized on REST/MCP's
+                // "reason=..." audit-detail convention rather than this
+                // fragment's own bare-error-code shape -- see the
+                // RESULT_SET_UNKNOWN_DEVICE_ID branch below for the full
+                // rationale (both denials moved together).
                 deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                              "RESULT_SET_DEVICE_ID_TOO_LONG");
+                              "reason=device_id_too_long");
                 res.set_header(
                     "HX-Trigger",
                     nlohmann::json{
@@ -306,8 +311,12 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 if (!deps.fleet_read_fn) {
                     spdlog::error("result_set.create (fragment): fleet_read_fn unwired -- "
                                   "misconfigured call site; failing closed");
+                    // Gate 4 SHOULD (#4983 fix round): standardized on
+                    // REST/MCP's "reason=..." audit-detail convention (see
+                    // the RESULT_SET_UNKNOWN_DEVICE_ID branch below for the
+                    // full rationale).
                     deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                                  "RESULT_SET_STORE_UNAVAILABLE");
+                                  "reason=fleet_read_fn_unwired");
                     res.set_header(
                         "HX-Trigger",
                         nlohmann::json{
@@ -332,7 +341,7 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                     spdlog::error("result_set.create (fragment): all_agent_ids_fn unwired -- "
                                   "misconfigured call site; failing closed");
                     deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                                  "RESULT_SET_STORE_UNAVAILABLE");
+                                  "reason=all_agent_ids_fn_unwired");
                     res.set_header(
                         "HX-Trigger",
                         nlohmann::json{
@@ -392,8 +401,23 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                     }
                     if (bad_id_count > kMaxCitedBadIds)
                         cited += std::format(" (+{} more)", bad_id_count - kMaxCitedBadIds);
+                    // Gate 4 SHOULD (#4983 fix round): standardized this
+                    // fragment's audit-detail shape onto REST/MCP's
+                    // "reason=..." convention (both already used it for this
+                    // SAME rejection) rather than the bare
+                    // RESULT_SET_UNKNOWN_DEVICE_ID this fragment used before
+                    // -- the identical logical event should read identically
+                    // in the audit log regardless of which of the three
+                    // surfaces produced it. Applied to every #4983-added
+                    // denial in this handler (device_id_too_long, both
+                    // unwired-dependency branches above, and this one) for
+                    // full consistency; this fragment's PRE-EXISTING
+                    // pin/unpin/delete/quota audit calls (which audit a real
+                    // ResultSetStore-level `ResultSetError`, a different kind
+                    // of event) are left as their own established
+                    // to_string(error)-code convention, unchanged.
                     deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                                  "RESULT_SET_UNKNOWN_DEVICE_ID");
+                                  "reason=unknown_device_id");
                     res.set_header(
                         "HX-Trigger",
                         nlohmann::json{

@@ -12110,6 +12110,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!fleet_read_fn_) {
                         spdlog::error("create_result_set: fleet_read_fn_ unwired — "
                                       "misconfigured call site; failing closed");
+                        // Gate 4 SHOULD (#4983 fix round): the fragment's twin
+                        // of this misconfiguration branch already audits;
+                        // this one didn't. "reason=" matches this handler's
+                        // own established convention (see the
+                        // parent_id/unknown_device_id guards above).
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=fleet_read_fn_unwired");
                         res.set_content(
                             a4_error(kInternalError,
                                      "RESULT_SET_STORE_UNAVAILABLE: device visibility check "
@@ -12124,6 +12131,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!agent_registry) {
                         spdlog::error("create_result_set: agent_registry unwired — "
                                       "misconfigured call site; failing closed");
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=agent_registry_unwired");
                         res.set_content(
                             a4_error(kInternalError,
                                      "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable"),

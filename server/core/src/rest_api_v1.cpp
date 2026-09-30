@@ -11358,6 +11358,12 @@ void RestApiV1::register_routes(
                 if (!fleet_read_fn) {
                     spdlog::error("result_set.create: fleet_read_fn unwired — misconfigured "
                                   "call site; failing closed");
+                    // Gate 4 SHOULD (#4983 fix round): the fragment's twin of
+                    // this misconfiguration branch already audits; this one
+                    // didn't. "reason=" matches this handler's own established
+                    // convention (see the length-cap/unknown_device_id guards).
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=fleet_read_fn_unwired");
                     rs_err(res, 503,
                            "RESULT_SET_STORE_UNAVAILABLE: device visibility check unavailable");
                     return;
@@ -11369,6 +11375,8 @@ void RestApiV1::register_routes(
                 if (!all_agent_ids_fn) {
                     spdlog::error("result_set.create: all_agent_ids_fn unwired — misconfigured "
                                   "call site; failing closed");
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=all_agent_ids_fn_unwired");
                     rs_err(res, 503,
                            "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable");
                     return;

@@ -3145,6 +3145,12 @@ TEST_CASE("POST /api/v1/result-sets: a non-empty device_ids with an unwired "
           std::string::npos);
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round): the fragment's twin of this
+    // misconfiguration branch already audited; REST's didn't until now.
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
 }
 
 TEST_CASE("POST /api/v1/result-sets: a non-empty device_ids with an admitted "
@@ -3164,6 +3170,11 @@ TEST_CASE("POST /api/v1/result-sets: a non-empty device_ids with an admitted "
     CHECK(h.fleet_read_fn_reached); // the gate itself ran and admitted before the 2nd check tripped
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round).
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=all_agent_ids_fn_unwired");
 }
 
 TEST_CASE("POST /api/v1/result-sets: more than kMaxCitedBadIds=20 bad ids are "
