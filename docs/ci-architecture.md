@@ -384,6 +384,80 @@ with no `cache-to`), so it never evicts release layers and adds no cache directo
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
 
+### Pre-release QA (`pre-release.yml`)
+
+**Trigger.** `workflow_run` on a completed `Release` run whose head is a `v*` tag
+and whose conclusion is `success`, or by hand: `gh workflow run pre-release.yml
+-f tag=v0.14.0-rc3`. A `workflow_run` trigger always runs the copy of this
+file on `main`, whatever branch the release was cut from.
+
+**Detective, not preventive.** It starts after the release is already
+published and never blocks one. A red run says the published release has a
+defect to fix in the next one.
+
+**Jobs.** `resolve` finds the tag, verifies `SHA256SUMS`, and picks the previous
+stable release: the highest non-draft, non-prerelease `vX.Y.Z` strictly lower
+than the tag under test (#5150). The other jobs check the following:
+
+- **integration**: the reference stack starts, the dashboard answers over
+  HTTPS against the install CA, the gateway is ready, the connected-agent
+  gauges (server and gateway) are at least 1, an `os_info` command
+  round-trips, and no service has restarted.
+- **install-deb / install-rpm**: for each of server, agent and gateway, exactly
+  one package is in the release. It installs, ships its systemd unit, and
+  removes cleanly. It must also run: `--version` for server and agent, and for
+  the gateway the OTP release boots and answers `ping`. The legs are
+  ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and fedora:42 and
+  rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc or libstdc++ is
+  older than the build's, the job fails and names the glibc floor (#5143). A
+  missing package fails; it is not skipped (#5151).
+- **install-windows**: two install/uninstall passes. With `/NOTLS` the service
+  must start and stay Running. With the default TLS posture the agent must
+  fail closed because no CA is pinned. The uninstall wait is bounded (#5145).
+- **install-macos**: the `.pkg` is present and installs, `--version` runs, the
+  launchd plist is in place, and at least 5 plugins are installed.
+- **artifact-verify**: checks the archive contents and ELF hardening, and that
+  each `.deb` control `Version` equals the tag's Debian spelling
+  (`0.14.0~rc3`). A mismatch fails. The ARM64 archive is checked only when the
+  release ships one (#5135).
+- **security-scan**: Trivy scans the server and gateway images. It is
+  informational and does not fail the run.
+- **soak-test**: ten minutes on the stack. Every 30s it checks that all four
+  services are running with 0 restarts, at least one agent is connected, and
+  the gateway is ready. About once a minute it also round-trips a command. At
+  the end the registration counters (`yuzu_agents_registered_total`,
+  `yuzu_gw_agents_connected_total`) must be unchanged: an agent that
+  reconnected between samples fails the soak. A failed metric fetch fails its
+  sample and is reported as a fetch failure, not as 0. Memory growth over 2x is
+  a warning only. Crash signatures in the server, agent and gateway logs fail
+  the job; for the gateway that includes OTP crash and supervisor reports.
+  Postgres logs are not checked.
+- **upgrade-test**: brings up the previous stable release and upgrades every
+  service in place, keeping the Postgres volume, CA and agent data dir. The
+  same agent must reconnect running the new version. All services must be
+  running with 0 restarts, and a command must round-trip.
+
+**What the stack jobs run.** Integration, soak and upgrade use
+`scripts/ci/qa-stack.sh` to run the **checkout's** reference template
+(`deploy/docker/docker-compose.reference-gateway.yml`, #5134). The images are
+the tag's own, pinned by `YUZU_VERSION`. The gateway `sys.config`, and the path
+it is mounted at, come from the tag. Any difference between the tag's template
+and the checkout's is printed as a warning and diffed in the job summary.
+
+**Reporting.** In the `QA Report` job, a cell reads PASS only when that suite
+ran and passed. The upgrade reads NOT TESTED when the previous release predates
+the reference template, or when there is no previous stable release. A suite
+that did not run reads NOT RUN, with the reason. With any such gap, the
+headline is `PASSED WITH GAPS (<n> not tested)` and the run still exits 0. Any
+failure or cancellation makes it `FAILED`. If no successful release triggered
+the run, it reads `NOT RUN`. `has-stack` separates "predates" (exit 3) from
+"could not reach GitHub" (exit 1), so an outage fails the upgrade job instead
+of reading as NOT TESTED.
+
+**Expected failures on old releases.** Artifacts from the v0.13.0 era fail the
+rpm install (#5142), the macOS install (#5144) and the Windows install
+(#5147, #1468). Those defects are fixed from 0.14.0-rc3 on.
+
 ## Self-hosted runner topology
 
 | Runner | Host | Jobs |
