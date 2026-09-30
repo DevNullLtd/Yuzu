@@ -8,7 +8,7 @@
  * empty success, so a host is never read as "no grants" from a leg that did not look.
  *
  * Deliberately bypasses the shared emit_rows()/select_status(): see
- * privacy_permissions_macos.cpp's banner for why (adversarial-review finding, round 3).
+ * privacy_permissions_legs.hpp's banner for why.
  */
 #include "privacy_permissions_legs.hpp"
 
