@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-25 · euid 0 · leg-hash 341fe04ec441
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-25 · euid 0 · leg-hash 9b1bec4e5ba4
 == action=permissions
 permissions|linux|org.example.CamApp|camera|allowed|yes|-|-
 permissions|linux|org.example.MicApp|microphone|denied|no|-|-
