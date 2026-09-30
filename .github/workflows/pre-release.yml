@@ -293,12 +293,16 @@ jobs:
   #
   # Every package the release ships (server, agent, gateway) must be present,
   # install, leave its unit file, RUN, and remove. "Runs" is the binary's own
-  # --version for server and agent, and for the gateway (an OTP release with
-  # its own ERTS) that the node boots and answers `ping`. Installing is not
-  # enough: v0.13.0's packages install cleanly on debian:12 and then cannot
-  # start (GLIBC_2.38 not found). Legs whose libc/libstdc++ is older than the
-  # build's fail here, naming the glibc floor (#5143), until that is decided —
-  # that red is the honest result, not a flake to mask (#5151).
+  # --version for server and agent. For the gateway (an OTP release with its
+  # own ERTS) it means started as its systemd unit starts it, with the
+  # yuzu_gw APPLICATION running and the node still up 10s later. A node that
+  # answers `ping` proves only that Erlang distribution is up. Installing is
+  # not enough: v0.13.0's packages install cleanly on debian:12 and then
+  # cannot start (GLIBC_2.38 not found).
+  #
+  # Intended reds, not flakes, until each is decided (#5151):
+  # - ubuntu:22.04 and debian:12, all three packages, and ubuntu:24.04 for
+  #   the server (GLIBCXX_3.4.34): the glibc/libstdc++ floor (#5143).
   install-deb:
     name: "Install .deb (${{ matrix.distro }})"
     needs: resolve
@@ -349,17 +353,60 @@ jobs:
             || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
           echo 'PASS: systemd service file exists'
           if [ "$PKG" = gateway ]; then
-            # `daemon` returns once the node is up — and waits FOREVER if the
-            # node dies while booting (relx polls is_alive), hence the bound.
-            if ! runs "yuzu_gw daemon" timeout 90 /opt/yuzu_gw/bin/yuzu_gw daemon; then
-              tail -n 30 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
-              echo "FAIL: the gateway release did not boot on $DISTRO (its log is above)"
+            # Start it the way the installed unit does, read from the unit
+            # itself: as its User=, in its WorkingDirectory=, with its
+            # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
+            # (/etc/yuzu/gateway.env, the per-install distribution cookie the
+            # postinst generates; yuzu_gw_app refuses to start without it).
+            UNIT=/usr/lib/systemd/system/yuzu-gateway.service
+            unit_val() { sed -n "s/^$1=//p" "$UNIT"; }
+            GW_USER=$(unit_val User); GW_DIR=$(unit_val WorkingDirectory)
+            ENV_FILE=$(unit_val EnvironmentFile); ENV_FILE=${ENV_FILE#-}
+            [ -n "$GW_USER" ] && [ -n "$GW_DIR" ] && [ -n "$ENV_FILE" ] \
+              || { echo "FAIL: $UNIT lacks User=, WorkingDirectory= or EnvironmentFile="; exit 1; }
+            test -f "$ENV_FILE" || { echo "FAIL: the package wrote no $ENV_FILE"; exit 1; }
+            GW_ENV=("HOME=$GW_DIR")
+            while IFS= read -r KV; do GW_ENV+=("$KV"); done < <(unit_val Environment)
+            while IFS= read -r KV; do
+              case "$KV" in ''|'#'*) ;; *) GW_ENV+=("$KV") ;; esac
+            done < "$ENV_FILE"
+            GW=(runuser -u "$GW_USER" -- env "${GW_ENV[@]}" /opt/yuzu_gw/bin/yuzu_gw)
+            cd "$GW_DIR"
+            gw_fail() {
+              tail -n 40 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
+                echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
+              else
+                echo "FAIL: $1 (the gateway log is above)"
+              fi
               exit 1
-            fi
-            timeout 30 /opt/yuzu_gw/bin/yuzu_gw ping \
-              || { echo "FAIL: the gateway node does not answer ping"; exit 1; }
-            echo 'PASS: the gateway release boots and answers ping'
-            timeout 60 /opt/yuzu_gw/bin/yuzu_gw stop
+            }
+            # `daemon` returns once the node is up, and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            runs "yuzu_gw daemon" timeout 90 "${GW[@]}" daemon \
+              || gw_fail "the gateway node did not come up on $DISTRO"
+            # `daemon` returning, and `ping` answering pong, prove only that
+            # Erlang distribution is up. That happens before the yuzu_gw
+            # application starts, and even when it never does. Poll the
+            # application itself, against a deadline.
+            UP=no; END=$((SECONDS + 30))
+            while [ "$SECONDS" -lt "$END" ]; do
+              if [ "$(timeout 10 "${GW[@]}" eval \
+                      'lists:keymember(yuzu_gw,1,application:which_applications()).' 2>/dev/null)" = true ]; then
+                UP=yes; break
+              fi
+              sleep 1
+            done
+            [ "$UP" = yes ] || gw_fail "the yuzu_gw application was not running 30s after the node came up on $DISTRO"
+            echo 'PASS: the yuzu_gw application is running'
+            # Still up 10s later: an application that starts and then crashes
+            # takes the node down with it (it is permanent).
+            sleep 10
+            timeout 10 "${GW[@]}" ping >/dev/null 2>&1 \
+              || gw_fail "the gateway node stopped within 10s of starting on $DISTRO"
+            echo 'PASS: the gateway node is still up 10s later'
+            timeout 60 "${GW[@]}" stop || { echo "FAIL: yuzu_gw stop exited $?"; exit 1; }
+            echo 'PASS: the gateway stopped cleanly'
           else
             runs "yuzu-$PKG --version" "/usr/local/bin/yuzu-$PKG" --version
           fi
@@ -390,10 +437,14 @@ jobs:
   #
   # Same contract as install-deb. fedora:42, not 40: the build's GCC 15
   # libstdc++ (GLIBCXX_3.4.34) is not in fedora:40's, so that leg could never
-  # pass. `dnf install` of the file rather than `rpm -i`: fedora:42's base
-  # image has no useradd, so %pre fails under plain rpm, while dnf pulls
-  # shadow-utils in exactly as it does for an operator. rockylinux:9 stays and
-  # fails honestly on the glibc floor (#5143) until that is decided.
+  # pass. `dnf install` of the file rather than `rpm -i`, because dnf resolves
+  # the package's dependencies the way an operator's install does.
+  #
+  # Intended reds, not flakes, until each is decided:
+  # - rockylinux:9, all three: the glibc/libstdc++ floor (#5143). The
+  #   gateway's bundled ERTS needs GLIBC_2.38 too, and #5171 is behind it.
+  # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
+  #   symbols Red Hat's OpenSSL lacks (#5171).
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
@@ -440,17 +491,63 @@ jobs:
             || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
           echo 'PASS: systemd service file exists'
           if [ "$PKG" = gateway ]; then
-            # `daemon` returns once the node is up — and waits FOREVER if the
-            # node dies while booting (relx polls is_alive), hence the bound.
-            if ! runs "yuzu_gw daemon" timeout 90 /opt/yuzu_gw/bin/yuzu_gw daemon; then
-              tail -n 30 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
-              echo "FAIL: the gateway release did not boot on $DISTRO (its log is above)"
+            # Start it the way the installed unit does, read from the unit
+            # itself: as its User=, in its WorkingDirectory=, with its
+            # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
+            # (/etc/yuzu/gateway.env, the per-install distribution cookie the
+            # postinst generates; yuzu_gw_app refuses to start without it).
+            UNIT=/usr/lib/systemd/system/yuzu-gateway.service
+            unit_val() { sed -n "s/^$1=//p" "$UNIT"; }
+            GW_USER=$(unit_val User); GW_DIR=$(unit_val WorkingDirectory)
+            ENV_FILE=$(unit_val EnvironmentFile); ENV_FILE=${ENV_FILE#-}
+            [ -n "$GW_USER" ] && [ -n "$GW_DIR" ] && [ -n "$ENV_FILE" ] \
+              || { echo "FAIL: $UNIT lacks User=, WorkingDirectory= or EnvironmentFile="; exit 1; }
+            test -f "$ENV_FILE" || { echo "FAIL: the package wrote no $ENV_FILE"; exit 1; }
+            GW_ENV=("HOME=$GW_DIR")
+            while IFS= read -r KV; do GW_ENV+=("$KV"); done < <(unit_val Environment)
+            while IFS= read -r KV; do
+              case "$KV" in ''|'#'*) ;; *) GW_ENV+=("$KV") ;; esac
+            done < "$ENV_FILE"
+            # fedora:42's base image has no runuser (util-linux): a test tool,
+            # not a dependency of the package under test.
+            command -v runuser >/dev/null || dnf install -y -q util-linux
+            GW=(runuser -u "$GW_USER" -- env "${GW_ENV[@]}" /opt/yuzu_gw/bin/yuzu_gw)
+            cd "$GW_DIR"
+            gw_fail() {
+              tail -n 40 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
+                echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
+              else
+                echo "FAIL: $1 (the gateway log is above)"
+              fi
               exit 1
-            fi
-            timeout 30 /opt/yuzu_gw/bin/yuzu_gw ping \
-              || { echo "FAIL: the gateway node does not answer ping"; exit 1; }
-            echo 'PASS: the gateway release boots and answers ping'
-            timeout 60 /opt/yuzu_gw/bin/yuzu_gw stop
+            }
+            # `daemon` returns once the node is up, and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            runs "yuzu_gw daemon" timeout 90 "${GW[@]}" daemon \
+              || gw_fail "the gateway node did not come up on $DISTRO"
+            # `daemon` returning, and `ping` answering pong, prove only that
+            # Erlang distribution is up. That happens before the yuzu_gw
+            # application starts, and even when it never does. Poll the
+            # application itself, against a deadline.
+            UP=no; END=$((SECONDS + 30))
+            while [ "$SECONDS" -lt "$END" ]; do
+              if [ "$(timeout 10 "${GW[@]}" eval \
+                      'lists:keymember(yuzu_gw,1,application:which_applications()).' 2>/dev/null)" = true ]; then
+                UP=yes; break
+              fi
+              sleep 1
+            done
+            [ "$UP" = yes ] || gw_fail "the yuzu_gw application was not running 30s after the node came up on $DISTRO"
+            echo 'PASS: the yuzu_gw application is running'
+            # Still up 10s later: an application that starts and then crashes
+            # takes the node down with it (it is permanent).
+            sleep 10
+            timeout 10 "${GW[@]}" ping >/dev/null 2>&1 \
+              || gw_fail "the gateway node stopped within 10s of starting on $DISTRO"
+            echo 'PASS: the gateway node is still up 10s later'
+            timeout 60 "${GW[@]}" stop || { echo "FAIL: yuzu_gw stop exited $?"; exit 1; }
+            echo 'PASS: the gateway stopped cleanly'
           else
             runs "yuzu-$PKG --version" "/usr/bin/yuzu-$PKG" --version
           fi
