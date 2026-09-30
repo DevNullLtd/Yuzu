@@ -356,7 +356,7 @@ declare_metrics() ->
                "killing server command forwarding"}]),
     %% Create every rejection-reason series at 0 now. A series that first
     %% appears already at 1 is invisible to increase(), so without this the
-    %% FIRST rejection per reason after a gateway start never raised the
+    %% FIRST rejection per reason (after the first scrape) never raised the
     %% YuzuGatewayMgmtAuthRejected alert (#5177 review). The list is the closed
     %% set of reject/1 reasons in yuzu_gw_authz; a test keeps the two in step.
     [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
