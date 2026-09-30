@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0fe9f183d5a9
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0168e9d5ae05
 == action=password_policy
 password_policy|policy_content|policyAttributePassword matches '.{4,}+'|pwpolicy:com.apple.defaultpasswordpolicy.fde
 password_policy|minimum_length|4|pwpolicy:com.apple.defaultpasswordpolicy.fde

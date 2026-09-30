@@ -44,11 +44,11 @@ flowchart LR
 | `audit_policy` | 🟡 constrained · rung 2 · secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY into an agent.data_dir scratch file | 🟡 constrained · rung 1 · /etc/security/audit_control (bounded file read) | 🟡 constrained · rung 1 · /etc/audit/audit.rules (bounded file read) |
 | `lockout_policy` | 🟡 constrained · rung 2 · secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY into an agent.data_dir scratch file | 🟡 constrained · rung 2 · pwpolicy -getaccountpolicies (CFPropertyList) | 🟡 constrained · rung 1 · /etc/login.defs + /etc/security/faillock.conf + /etc/pam.d/{common-auth,common-account,system-auth,password-auth} (bounded file reads) |
 | `password_policy` | 🟡 constrained · rung 2 · secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY into an agent.data_dir scratch file | 🟡 constrained · rung 2 · pwpolicy -getaccountpolicies (CFPropertyList) | 🟡 constrained · rung 1 · /etc/login.defs + /etc/security/pwquality.conf + /etc/pam.d/{common-password,system-auth,password-auth} (bounded file reads) |
-| `sudoers` | ⛔ unsupported · no sudoers on Windows | 🟡 constrained · rung 1 · /etc/sudoers + /etc/sudoers.d (bounded file reads) | 🟡 constrained · rung 1 · /etc/sudoers + /etc/sudoers.d (bounded file reads) |
+| `sudoers` | ⛔ unsupported | 🟡 constrained · rung 1 · /etc/sudoers + /etc/sudoers.d (bounded file reads) | 🟡 constrained · rung 1 · /etc/sudoers + /etc/sudoers.d (bounded file reads) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`audit_policy` / Windows** — the LEGACY [Event Audit] categories only. Where Advanced Audit Policy subcategories are in force -- the Windows 10/11 default and the norm under GPO -- these are NOT the effective audit state: a category reading none means the legacy category is unset, not that the host is not auditing. auditpol subcategories are not read. It is the local security database (secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. The export (the whole SECURITYPOLICY area) is staged as agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only directory removed on return; each policy dispatch first sweeps such directories older than one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, elevated, on a standalone host; see the Windows leg banner
+- **`audit_policy` / Windows** — the LEGACY [Event Audit] categories only. Where Advanced Audit Policy subcategories are in force -- the Windows 10/11 default and the norm under GPO -- these are NOT the effective audit state: a category reading none means the legacy category is unset, not that the host is not auditing, and a legacy success_failure may be ignored by the OS when the "Force audit policy subcategory settings" override (SCENoApplyLegacyAuditPolicy) is set. auditpol subcategories are not read. It is the local security database (secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. The export (the whole SECURITYPOLICY area) is staged as agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only directory removed on return; each policy dispatch first sweeps such directories older than one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, elevated, on a standalone host; see the Windows leg banner
 - **`audit_policy` / macOS** — absent by default on current macOS (only audit_control.example ships), reported as absent; a present file is root-readable only
 - **`audit_policy` / Linux** — rule counts and -e state of the rule file only, not the live kernel rules (auditctl -l) and not /etc/audit/rules.d; the file is 0640 root, so an unprivileged agent reports permission_denied; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not the host's
 - **`lockout_policy` / Windows** — argv leaf parsed from the exported UTF-16LE INI: the local security database (secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. The export (the whole SECURITYPOLICY area) is staged as agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only directory removed on return; each policy dispatch first sweeps such directories older than one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, elevated, on a standalone host; see the Windows leg banner
@@ -57,6 +57,7 @@ flowchart LR
 - **`password_policy` / Windows** — argv leaf parsed from the exported UTF-16LE INI: the local security database (secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. The export (the whole SECURITYPOLICY area) is staged as agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only directory removed on return; each policy dispatch first sweeps such directories older than one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, elevated, on a standalone host; see the Windows leg banner
 - **`password_policy` / macOS** — global account policies only; rung 2 because no public OpenDirectory global-policy API exists; policy expressions are verbatim; a policyAttribute* parameter is its own key and any other is unmodelled_parameter <name>=<value>; a plist item not in the documented shape is an unreadable row and constrained. Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload surfaces here is unverified
 - **`password_policy` / Linux** — reports what the config files state, not the live PAM decision; pwquality.conf.d fragments and PAM include/substack targets are not read; a missing file is reported as absent, an unreadable one as unreadable (permission_denied/constrained); in a container (deploy/docker/Dockerfile.agent) these are the image's files, not the host's
+- **`sudoers` / Windows** — no sudoers on Windows
 - **`sudoers` / macOS** — /etc/sudoers is root:wheel 0440: reading it needs root or group wheel, otherwise permission_denied (kind unreadable)
 - **`sudoers` / Linux** — parsed content, not sudo's evaluation: include directives are listed, not followed; unrecognised lines are kind unmodelled; needs read access to the 0440 root files; in a container (deploy/docker/Dockerfile.agent) these are the image's files, not the host's
 <!-- END GENERATED -->
@@ -121,7 +122,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 |---|---|---|---|---|---|
 | `row_kind` | string | `sudoers` `constrained` | Linux, macOS | `sudoers` | Fixed row tag, always sudoers. Read failures stay in this seven-field shape (kind absent or unreadable); only an exception contained in the plugin writes a two-field constrained\|internal_error row instead. |
 | `file` | string | - | Linux, macOS | `/etc/sudoers` | The file the entry was read from; /etc/sudoers.d on a row about the directory listing itself; a dash on the row-cap marker. |
-| `kind` | string | `defaults` `alias` `include` `includedir` `user_spec` `unmodelled` `ignored` `absent` `unreadable` | Linux, macOS | `user_spec` | Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands); one that still carries a NOPASSWD: or PASSWD: tag the parser could not decode also adds the failure token <file>:undecoded_passwd_tag (CONSTRAINED). Lines are lexed as sudo 1.9.16 lexes them (checked against sudo -ll), so a colon in a quoted value, an IPv6 host or a digest never splits a clause; the nopasswd column is the tag alone, and a line sudo itself rejects is best-effort. ignored: a sudoers.d file sudo skips by name (commands name_ignored_by_sudo). absent: the file or the /etc/sudoers.d directory does not exist. unreadable: the read failed (bare reason token in commands, e.g. permission_denied; truncated on the /etc/sudoers.d row when the listing hit its 256-entry cap; row_cap, with file -, on the marker row once output reaches 4096 rows). The plugin also emits kind unsupported on Windows (reason windows_has_no_sudoers in commands), which this definition cannot surface because it does not run there. |
+| `kind` | string | `defaults` `alias` `include` `includedir` `user_spec` `unmodelled` `ignored` `absent` `unreadable` | Linux, macOS | `user_spec` | Entry kind. defaults, alias, include, includedir, user_spec: a recognised line. unmodelled: a line the parser has no interpretation for (raw line in commands); one that still carries a NOPASSWD: or PASSWD: tag the parser could not decode also adds the failure token <file>:undecoded_passwd_tag (CONSTRAINED). A user spec becomes one row per clause AND per change of run-as or NOPASSWD tag within a clause. Lines are lexed as sudo 1.9.16 lexes them (checked against sudo -ll), so a colon in a quoted value, an IPv6 host or a digest never splits a clause; the nopasswd column is the tag alone, and a line sudo itself rejects is best-effort. ignored: a sudoers.d file sudo skips by name (commands name_ignored_by_sudo). absent: the file or the /etc/sudoers.d directory does not exist. unreadable: the read failed (bare reason token in commands, e.g. permission_denied; truncated on the /etc/sudoers.d row when the listing hit its 256-entry cap; row_cap, with file -, on the marker row once output reaches 4096 rows). The plugin also emits kind unsupported on Windows (reason windows_has_no_sudoers in commands), which this definition cannot surface because it does not run there. |
 | `subject` | string | - | Linux, macOS | `%sudo@ALL` | Who the entry applies to. A user spec carries <user>@<host> -- the user, group or alias joined to the host list the spec applies on; each colon-separated Host_List clause of one line is its own row. An alias row carries <Alias_Type>:<name>. A scoped Defaults line carries its scope (user:, host:, cmnd:, runas:). A dash when not applicable. |
 | `runas` | string | - | Linux, macOS | `ALL` | Run-as user/group of a user spec; a dash when not applicable. |
 | `nopasswd` | string | `true` `false` `-` | Linux, macOS | `false` | Whether a user spec carries the NOPASSWD tag: true or false; a dash on a row that is not a user spec. It reflects the tag only: a Defaults row with !authenticate (kind defaults) also makes matching grants passwordless and must be read alongside it. |
@@ -151,7 +152,7 @@ Pipe-delimited rows via `write_output()`. The first field is the fixed literal a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-29 · LocalSystem (elevated) · leg-hash 0fe9f183d5a9
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-30 · LocalSystem (elevated) · leg-hash 0168e9d5ae05
 
 ```
 == action=password_policy
@@ -187,7 +188,7 @@ sudoers|-|unsupported|-|-|-|windows_has_no_sudoers
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0fe9f183d5a9
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 · leg-hash 0168e9d5ae05
 
 ```
 == action=password_policy
@@ -208,7 +209,7 @@ sudoers|/etc/sudoers|unreadable|-|-|-|permission_denied
 [result_status] PERMISSION_DENIED / PARTIAL / /etc/sudoers:permission_denied
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-29 · euid 0 · leg-hash 0fe9f183d5a9
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-30 · euid 0 · leg-hash 0168e9d5ae05
 
 ```
 == action=password_policy
@@ -216,17 +217,25 @@ password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
 password_policy|PASS_MIN_DAYS|0|/etc/login.defs
 password_policy|PASS_WARN_AGE|7|/etc/login.defs
 password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
-password_policy|source_state|absent|/etc/security/pwquality.conf
+password_policy|minlen|14|/etc/security/pwquality.conf
+password_policy|dcredit|-1|/etc/security/pwquality.conf
 password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
 [result_status] OK / FULL
 
 == action=lockout_policy
 lockout_policy|LOGIN_RETRIES|5|/etc/login.defs
 lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs
+lockout_policy|deny|5|/etc/security/faillock.conf
+lockout_policy|unlock_time|900|/etc/security/faillock.conf
 [result_status] OK / FULL
 
 == action=audit_policy
-audit_policy|source_state|absent|/etc/audit/audit.rules
+audit_policy|rules|2|/etc/audit/audit.rules
+audit_policy|watch_rules|1|/etc/audit/audit.rules
+audit_policy|syscall_rules|1|/etc/audit/audit.rules
+audit_policy|unmodelled_lines|0|/etc/audit/audit.rules
+audit_policy|control_lines|3|/etc/audit/audit.rules
+audit_policy|enabled|immutable|/etc/audit/audit.rules
 [result_status] OK / FULL
 
 == action=sudoers
@@ -237,6 +246,8 @@ sudoers|/etc/sudoers|defaults|-|-|-|use_pty
 sudoers|/etc/sudoers|user_spec|root@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|user_spec|%sudo@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|includedir|-|-|-|/etc/sudoers.d
+sudoers|/etc/sudoers.d/90-ops|user_spec|%ops@ALL|ALL|true|/usr/bin/systemctl
+sudoers|/etc/sudoers.d/90-ops|defaults|user:ops|-|-|!authenticate
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->

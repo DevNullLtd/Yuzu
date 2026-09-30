@@ -1,20 +1,28 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-29 · euid 0 · leg-hash 0fe9f183d5a9
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-30 · euid 0 · leg-hash 0168e9d5ae05
 == action=password_policy
 password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
 password_policy|PASS_MIN_DAYS|0|/etc/login.defs
 password_policy|PASS_WARN_AGE|7|/etc/login.defs
 password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
-password_policy|source_state|absent|/etc/security/pwquality.conf
+password_policy|minlen|14|/etc/security/pwquality.conf
+password_policy|dcredit|-1|/etc/security/pwquality.conf
 password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
 [result_status] OK / FULL /
 
 == action=lockout_policy
 lockout_policy|LOGIN_RETRIES|5|/etc/login.defs
 lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs
+lockout_policy|deny|5|/etc/security/faillock.conf
+lockout_policy|unlock_time|900|/etc/security/faillock.conf
 [result_status] OK / FULL /
 
 == action=audit_policy
-audit_policy|source_state|absent|/etc/audit/audit.rules
+audit_policy|rules|2|/etc/audit/audit.rules
+audit_policy|watch_rules|1|/etc/audit/audit.rules
+audit_policy|syscall_rules|1|/etc/audit/audit.rules
+audit_policy|unmodelled_lines|0|/etc/audit/audit.rules
+audit_policy|control_lines|3|/etc/audit/audit.rules
+audit_policy|enabled|immutable|/etc/audit/audit.rules
 [result_status] OK / FULL /
 
 == action=sudoers
@@ -25,4 +33,6 @@ sudoers|/etc/sudoers|defaults|-|-|-|use_pty
 sudoers|/etc/sudoers|user_spec|root@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|user_spec|%sudo@ALL|ALL:ALL|false|ALL
 sudoers|/etc/sudoers|includedir|-|-|-|/etc/sudoers.d
+sudoers|/etc/sudoers.d/90-ops|user_spec|%ops@ALL|ALL|true|/usr/bin/systemctl
+sudoers|/etc/sudoers.d/90-ops|defaults|user:ops|-|-|!authenticate
 [result_status] OK / FULL /
