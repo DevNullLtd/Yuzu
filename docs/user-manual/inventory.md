@@ -192,12 +192,28 @@ The data lands in the Postgres schema **`software_inventory_store`**:
 
 **Upgrading.** The first server start after the release that added the extended
 columns (schema v7) rewrites `installed_software` once, under an exclusive lock,
-to add `install_id`: roughly 20 s at 4M rows (about 8 s rewrite plus 10 s index
-build; the pool's 30 s per-statement limit is lifted for that migration only).
-Start one server replica first and let the migration finish before starting the
-rest, since a second replica waits at most 10 s for the migration lock and then
-refuses to start. Avoid long-running `installed_software` readers during that
-first start. Deploy the server before any agent that emits the new fields.
+to add `install_id`, then rebuilds the name index. Time grows with row count:
+about 10-20 s at 4M rows (roughly 13,000 machines at 300 rows each), and longer
+beyond that. The pool's 30 s per-statement limit is lifted for that migration
+only. Count the rows first (`SELECT count(*) FROM
+software_inventory_store.installed_software`). Below about 2 million rows the
+lock is held for under 10 s: start one server replica first and let the
+migration finish before starting the rest, since a second replica waits at most
+10 s for the migration lock and then refuses to start, and avoid long-running
+`installed_software` readers during that first start. Above that, stop every
+replica and start one, because a replica still running the old version queues
+its `installed_software` reads and writes behind the lock, holding a pooled
+connection for up to 10 s each before erroring. The migration logs nothing until
+`migrated to v7`; watch it in `pg_stat_activity`. It is one transaction: if a
+supervisor or health check kills the server first, the work is rolled back and
+the next start begins again, so size start deadlines to the row count (the
+reference Compose health check reports unhealthy after about two minutes). A
+start refused with `post-migration schema projection check failed` means a
+column the queries need is missing although the recorded version is current (for
+example a database restored from an older dump); the log names the first missing
+column, and `SELECT version FROM public.schema_meta WHERE store =
+'software_inventory_store'` shows the recorded version. Deploy the server before
+any agent that emits the new fields.
 
 Today it is queried with **direct SQL**, e.g.:
 

@@ -18,12 +18,14 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::InventoryIngestOutcome;
@@ -925,37 +927,65 @@ TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-
 }
 
 // Post-migration projection check (postgres-store-playbook "Runner guards"). schema_meta stays
-// current while a column a runtime query selects is missing, which models a version stamped by a
+// current while a column a runtime query uses is missing, which models a version stamped by a
 // different binary: PgMigrationRunner::run() sees nothing pending and returns true, so only the
-// constructor's LIMIT 0 projection can refuse to open.
-TEST_CASE("SoftwareInventoryStore reports !is_open when a column its queries select is missing "
+// constructor's LIMIT 0 projection can refuse to open. Every column of every table in the store
+// schema is renamed away in turn. The columns come from the live catalog, so a column added by a
+// later migration but not to the guard fails here instead of silently weakening it. Renaming it
+// back must reopen the store, which pins the closure on that column and not on some other failure.
+TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries use is missing "
           "although schema_meta is current",
           "[pg][software_inventory][extended_row]") {
-    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
         SoftwareInventoryStore intact{pool};
         REQUIRE(intact.is_open()); // control: the guard must not refuse a healthy schema
     }
-    auto drop_column = [&](const char* table, const char* column) {
+
+    std::vector<std::pair<std::string, std::string>> columns; // (table, column)
+    {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        const std::string sql = std::string("ALTER TABLE software_inventory_store.") + table +
-                                " DROP COLUMN " + column;
+        pg::PgResult r =
+            pg::exec_params(lease.get(),
+                            "SELECT table_name, column_name FROM information_schema.columns "
+                            "WHERE table_schema = 'software_inventory_store' "
+                            "ORDER BY table_name, ordinal_position",
+                            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i)
+            columns.emplace_back(PQgetvalue(r.get(), i, 0), PQgetvalue(r.get(), i, 1));
+    }
+    // A catalog read that returned only part of the schema would pass vacuously; name the tables.
+    for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
+                              "version_rollup", "catalog_rollup_meta"}) {
+        REQUIRE(std::any_of(columns.begin(), columns.end(),
+                            [&](const auto& c) { return c.first == table; }));
+    }
+
+    auto alter = [&](const std::string& sql) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
         pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     };
 
-    SECTION("a column v7 added to installed_software") {
-        drop_column("installed_software", "source");
-        SoftwareInventoryStore store{pool};
-        CHECK_FALSE(store.is_open());
-    }
-    SECTION("a column of a table other than installed_software") {
-        drop_column("catalog_rollup_meta", "total_devices");
-        SoftwareInventoryStore store{pool};
-        CHECK_FALSE(store.is_open());
+    for (const auto& [table, column] : columns) {
+        CAPTURE(table, column);
+        const std::string rename =
+            "ALTER TABLE software_inventory_store.\"" + table + "\" RENAME COLUMN \"";
+        alter(rename + column + "\" TO \"" + column + "_gone\"");
+        {
+            SoftwareInventoryStore broken{pool};
+            CHECK_FALSE(broken.is_open());
+        }
+        alter(rename + column + "_gone\" TO \"" + column + "\"");
+        {
+            SoftwareInventoryStore restored{pool};
+            CHECK(restored.is_open());
+        }
     }
 }
 

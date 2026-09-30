@@ -160,8 +160,10 @@ struct SoftwareFleetQuery {
 class SoftwareInventoryStore {
 public:
     /// Borrows the shared pool and runs the `software_inventory_store` schema
-    /// migration on a pinned lease. `is_open()` is false if the lease was empty
-    /// or the migration failed (the server fails closed before reaching here).
+    /// migration on a pinned lease. `is_open()` is false if the lease was empty,
+    /// the migration failed, or the post-migration LIMIT 0 projection failed (a
+    /// column the queries use is missing although schema_meta is current); the
+    /// server fails closed before reaching here.
     explicit SoftwareInventoryStore(pg::PgPool& pool);
 
     SoftwareInventoryStore(const SoftwareInventoryStore&) = delete;

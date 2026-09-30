@@ -213,20 +213,23 @@ const std::vector<pg::PgMigration>& migrations() {
          // sequential pass at server start over a table bounded at agents x kMaxEntries
          // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds every existing
          // index, so the old name index is DROPPED FIRST (measured at 4M rows: rewrite
-         // 32 s with it, ~8 s without; the re-create is ~10 s) and re-created as
-         // (name, agent_id, install_id) at the end. The pool injects a 30 s
-         // statement_timeout on every connection and this migration runs inside the
-         // runner's txn, so SET LOCAL lifts it for this txn only (it cannot leak to the
-         // pool). lock_timeout (10 s) still bounds lock acquisition; only the finite
-         // rewrite work is uncapped, because at fleet scale a cancelled boot migration
-         // is a permanently fail-closed server, not a protection. Accepted risk: at very
-         // large fleets this is a lock of tens of minutes; tolerated only while no
-         // production fleet exists, and every later change to this table must be online
-         // (docs/postgres-migration-ladder.md, SoftwareInventoryStore row). IF [NOT] EXISTS keeps
+         // 32 s with it, 4-8 s without; the re-create is 6.5-10 s; two runs) and
+         // re-created as (name, agent_id, install_id) at the end. IF [NOT] EXISTS keeps
          // a white-box schema_meta rewind idempotent (a re-run adds no second sequence;
          // the column drop cascades the index, so DROP IF EXISTS no-ops). install_id
          // churns on every full replace (DELETE + INSERT) — it is a TIEBREAK inside
          // (name, agent_id), never the page order on its own.
+         // The pool injects a 30 s statement_timeout on every connection and this
+         // migration runs inside the runner's txn, so SET LOCAL lifts it for this txn
+         // only (it cannot leak to the pool). lock_timeout (10 s) still bounds lock
+         // acquisition; only the finite rewrite work is uncapped, because a cancelled
+         // boot migration is a permanently fail-closed server, not a protection.
+         // Accepted risk (docs/postgres-migration-ladder.md, SoftwareInventoryStore row):
+         // the ACCESS EXCLUSIVE lock is held for the whole rewrite plus index build,
+         // extrapolated at 2.6-4.5 us/row: past lock_timeout (10 s) from about 2-4M
+         // rows, about 10 minutes near 130-230M. Tolerated only while no deployment
+         // holds a table that large; any later change here that rewrites the table or
+         // builds an index must be online.
          "SET LOCAL statement_timeout = 0;"
          "DROP INDEX IF EXISTS installed_software_name_idx;"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '';"
@@ -452,9 +455,12 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
     // Post-migration projection check (postgres-store-playbook "Runner guards"; ApiTokenStore
     // is the reference shape). run() skips any migration whose id is at or below the stored
     // high-water mark, so a schema_meta stamped by a different binary can leave a column
-    // missing while run() still reports success. A LIMIT 0 SELECT of every column the runtime
-    // queries read touches no rows and fails the store closed here, not as `undefined column`
-    // on whichever request runs first. Keep in step with the SELECTs in this file.
+    // missing while run() still reports success. One LIMIT 0 SELECT per table, over every
+    // column the runtime uses, touches no rows and fails the store closed here, not as
+    // `undefined column` on whichever request runs first. Keep each list equal to its
+    // table's columns: the projection test renames every column away in turn and fails if
+    // one is missing here. Column presence only: types, defaults and the keys ON CONFLICT
+    // relies on are invisible to a projection.
     struct Projection {
         const char* table;
         const char* columns;
