@@ -737,7 +737,7 @@ begin
     OpPass := OperatorPage.Values[1];
   end;
 
-  Result := '-ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}') + '\generate-config.ps1"' +
+  Result := '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}') + '\generate-config.ps1"' +
             ' -ConfigPath "' + DataDir + '\yuzu-server.cfg"' +
             ' -AdminUser "' + AdminUser + '"' +
             ' -AdminPass "' + AdminPass + '"';
