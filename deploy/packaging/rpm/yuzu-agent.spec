@@ -1,3 +1,4 @@
+%{!?_sysusersdir:%global _sysusersdir /usr/lib/sysusers.d}
 Name:           yuzu-agent
 Version:        0.1.0
 Release:        1%{?dist}
@@ -36,6 +37,13 @@ if ls %{_sourcedir}/plugins/*.so 1>/dev/null 2>&1; then
     install -m 0755 %{_sourcedir}/plugins/*.so %{buildroot}%{_libdir}/yuzu/plugins/
 fi
 
+# Service account as a sysusers.d entry (#5142). rpm >= 4.19 turns the
+# yuzu-agent-owned paths in %files into Requires: user(yuzu-agent) and
+# group(yuzu-agent), and this file into the matching Provides, so the package
+# satisfies its own requirement. %pre still creates the account.
+install -d -m 0755 %{buildroot}%{_sysusersdir}
+printf 'u yuzu-agent - "Yuzu agent" /var/lib/yuzu-agent /sbin/nologin\n' > %{buildroot}%{_sysusersdir}/yuzu-agent.conf
+
 %pre
 getent group yuzu-agent >/dev/null 2>&1 || groupadd -r yuzu-agent
 getent passwd yuzu-agent >/dev/null 2>&1 || useradd -r -g yuzu-agent -d /var/lib/yuzu-agent -s /sbin/nologin yuzu-agent
@@ -62,3 +70,4 @@ ldconfig
 %dir %attr(0750,yuzu-agent,yuzu-agent) /var/lib/yuzu-agent
 %dir %attr(0755,root,root) /etc/yuzu-agent
 %dir %attr(0755,root,root) /etc/yuzu-agent/certs
+%{_sysusersdir}/yuzu-agent.conf
