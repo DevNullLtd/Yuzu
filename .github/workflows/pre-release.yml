@@ -129,9 +129,29 @@ jobs:
           # interpolated into the script body (CodeQL
           # actions/code-injection/critical).
           CURRENT: ${{ steps.ver.outputs.tag }}
+        # The highest published (non-draft, non-prerelease) vX.Y.Z strictly
+        # LOWER than the tag under test (#5150) — not "the newest that isn't
+        # this tag", which picks a later stable when an older tag is re-tested
+        # (re-running v0.14.0-rc3 after v0.14.0 ships would "upgrade" down).
+        # A pre-release X.Y.Z-rcN orders below X.Y.Z, so for any tag the bound
+        # is its X.Y.Z base: a stable S is older than X.Y.Z-rcN iff S < X.Y.Z.
+        # A failed `gh` fails this step (and so the run): a listing error must
+        # never read as "no previous stable release".
         run: |
-          PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
-            -q "[.[] | select(.tagName != \"$CURRENT\" and .isPrerelease == false)] | .[0].tagName // empty")
+          BASE="${CURRENT#v}"; BASE="${BASE%%-*}"
+          [[ "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::cannot order tag '$CURRENT'"; exit 1; }
+          RELEASES=$(gh release list --limit 100 --json tagName,isPrerelease,isDraft)
+          PREV=$(printf '%s' "$RELEASES" \
+            | jq -r '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | while read -r T; do
+                V="${T#v}"
+                if [[ "$V" != "$BASE" && "$(printf '%s\n%s\n' "$V" "$BASE" | sort -V | head -1)" == "$V" ]]; then
+                  echo "$V"
+                fi
+              done \
+            | sort -V | tail -1)
+          PREV="${PREV:+v$PREV}"
           if [[ -n "$PREV" ]]; then
             echo "has_prev=true" >> "$GITHUB_OUTPUT"
             echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
@@ -1366,52 +1386,90 @@ jobs:
           R_SOAK: ${{ needs.soak-test.result }}
           R_UPGRADE: ${{ needs.upgrade-test.result }}
           UPGRADE_TESTED: ${{ needs.upgrade-test.outputs.tested }}
+          HAS_PREV: ${{ needs.resolve.outputs.has_prev }}
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
           # Bind tag/version to env to avoid code-injection via crafted ref name.
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-
-          status_icon() {
+          # Each cell is PASS only for a suite that ran and passed. A suite
+          # that did not run, or ran without testing (the upgrade from a
+          # release predating the reference stack), is a GAP: the headline
+          # then says PASSED WITH GAPS, never a bare PASSED.
+          FAILED=0; GAPS=0
+          # Two functions, because a cell is read through $(...) — a subshell,
+          # where a counter would be lost.
+          cell() {
             case "$1" in
-              success)  echo "PASS" ;;
-              failure)  echo "FAIL" ;;
-              skipped)  echo "SKIP" ;;
-              *)        echo "????" ;;
+              success)   echo "PASS" ;;
+              failure)   echo "FAIL" ;;
+              cancelled) echo "CANCELLED" ;;
+              skipped)   echo "NOT RUN (skipped)" ;;
+              *)         echo "UNKNOWN ($1)" ;;
             esac
           }
+          tally() {  # `cancelled` and anything unknown count as failures: they verified nothing.
+            case "$1" in
+              success) ;;
+              skipped) GAPS=$((GAPS + 1)) ;;
+              *)       FAILED=$((FAILED + 1)) ;;
+            esac
+          }
+          for R in "$R_INTEGRATION" "$R_DEB" "$R_RPM" "$R_WINDOWS" "$R_MACOS" \
+                   "$R_ARTIFACT" "$R_SECURITY" "$R_SOAK"; do
+            tally "$R"
+          done
 
-          UPGRADE_CELL=$(status_icon "$R_UPGRADE")
-          if [ "$R_UPGRADE" = "success" ] && [ "$UPGRADE_TESTED" != "true" ]; then
-            UPGRADE_CELL="NOT TESTED (previous release predates the reference stack)"
-          elif [ "$R_UPGRADE" = "skipped" ]; then
-            UPGRADE_CELL="SKIP (no previous stable release)"
-          fi
+          # The upgrade cell names the actual cause of a gap.
+          case "$R_UPGRADE" in
+            success)
+              if [ "$UPGRADE_TESTED" = "true" ]; then
+                UPGRADE_CELL="PASS"
+              elif [ "$UPGRADE_TESTED" = "false" ]; then
+                GAPS=$((GAPS + 1)); UPGRADE_CELL="NOT TESTED ($PREV_TAG predates the reference stack)"
+              else
+                GAPS=$((GAPS + 1)); UPGRADE_CELL="NOT TESTED (the upgrade job reported no result)"
+              fi
+              ;;
+            skipped)
+              GAPS=$((GAPS + 1))
+              if [ "$HAS_PREV" != "true" ]; then
+                UPGRADE_CELL="NOT TESTED (no previous stable release)"
+              elif [ "$R_INTEGRATION" != "success" ]; then
+                UPGRADE_CELL="NOT RUN (the integration job it needs: $R_INTEGRATION)"
+              else
+                UPGRADE_CELL="NOT RUN (skipped)"
+              fi
+              ;;
+            *)
+              tally "$R_UPGRADE"; UPGRADE_CELL=$(cell "$R_UPGRADE")
+              ;;
+          esac
 
           cat >> "$GITHUB_STEP_SUMMARY" <<REPORT
           ## Pre-release QA Report: ${TAG}
 
           | Test Suite | Result |
           |---|---|
-          | Integration (full stack round-trip) | $(status_icon "$R_INTEGRATION") |
-          | .deb install (Ubuntu 22/24, Debian 12) | $(status_icon "$R_DEB") |
-          | .rpm install (Fedora 40, Rocky 9) | $(status_icon "$R_RPM") |
-          | Windows installer (silent) | $(status_icon "$R_WINDOWS") |
-          | macOS .pkg install | $(status_icon "$R_MACOS") |
-          | Artifact verification | $(status_icon "$R_ARTIFACT") |
-          | Security scan (Trivy) | $(status_icon "$R_SECURITY") |
-          | Soak test (10 min) | $(status_icon "$R_SOAK") |
+          | Integration (full stack round-trip) | $(cell "$R_INTEGRATION") |
+          | .deb install + run (Ubuntu 22.04/24.04/26.04, Debian 12) | $(cell "$R_DEB") |
+          | .rpm install + run (Fedora 42, Rocky 9) | $(cell "$R_RPM") |
+          | Windows installer (silent) | $(cell "$R_WINDOWS") |
+          | macOS .pkg install | $(cell "$R_MACOS") |
+          | Artifact verification | $(cell "$R_ARTIFACT") |
+          | Security scan (Trivy) | $(cell "$R_SECURITY") |
+          | Soak test (10 min) | $(cell "$R_SOAK") |
           | Upgrade test | ${UPGRADE_CELL} |
 
           REPORT
 
-          # `resolve` is deliberately NOT in ALL_RESULTS below, because a skipped
-          # resolve must not be reported as a pass. This job is `if: always()`,
-          # so when `resolve` skips (the triggering Release failed or was
-          # cancelled — 94 of the last 100 Release runs) every one of the nine
-          # test jobs is `skipped`, nothing matches "failure", and this step used
-          # to print `### Result: PASSED` and exit 0. THAT is why Pre-release QA
-          # has looked permanently green while testing nothing: not a dead
-          # trigger, but a report that treats "never ran" as "passed".
+          # A skipped `resolve` must not be reported as a pass. This job is
+          # `if: always()`, so when `resolve` skips (the triggering Release
+          # failed or was cancelled — 94 of the last 100 Release runs) every
+          # test job is `skipped`, and this step used to print
+          # `### Result: PASSED` and exit 0. THAT is why Pre-release QA looked
+          # permanently green while testing nothing: not a dead trigger, but a
+          # report that treated "never ran" as "passed".
           if [ "$R_RESOLVE" = "skipped" ]; then
             echo "### Result: NOT RUN" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -1427,16 +1485,19 @@ jobs:
             exit 1
           fi
 
-          # Determine overall result. `cancelled` counts as a failure: a cancelled
-          # suite has verified nothing, and must never read as a pass either.
-          ALL_RESULTS="$R_INTEGRATION $R_DEB $R_RPM $R_WINDOWS $R_MACOS $R_ARTIFACT $R_SECURITY $R_SOAK $R_UPGRADE"
-          if echo "$ALL_RESULTS" | grep -qE "failure|cancelled"; then
+          # `cancelled` counts as a failure: a cancelled suite verified nothing.
+          if [ "$FAILED" -gt 0 ]; then
             echo "### Result: FAILED" >> "$GITHUB_STEP_SUMMARY"
-            echo ""
-            echo "QA FAILED for $TAG"
+            echo "QA FAILED for $TAG ($FAILED suite(s) failed or were cancelled, $GAPS not tested)"
             exit 1
+          elif [ "$GAPS" -gt 0 ]; then
+            {
+              echo "### Result: PASSED WITH GAPS ($GAPS not tested)"
+              echo ""
+              echo "Every suite that ran passed, but $GAPS did not test anything — see the NOT TESTED / NOT RUN cells above."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "QA PASSED WITH GAPS for $TAG ($GAPS not tested)"
           else
             echo "### Result: PASSED" >> "$GITHUB_STEP_SUMMARY"
-            echo ""
             echo "QA PASSED for $TAG"
           fi
