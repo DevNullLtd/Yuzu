@@ -2,6 +2,7 @@
 
 #include "authz_model.hpp" // #4983 -- authz::in_scope
 #include "http_route_sink.hpp"
+#include "mcp_input_bounds.hpp" // #4983 Gate 3 SHOULD -- kResultSetDeviceIdMaxLen
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 
@@ -228,6 +229,18 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
             cr.source_payload = R"({"note":"dashboard CSV import"})";
 
             std::vector<std::string> members;
+            // Gate 3 SHOULD (cpp-expert, #4983 fix round): bound each pasted
+            // entry to MCP's own kResultSetDeviceIdMaxLen. Unlike REST's JSON
+            // body (harmless either way), up to kMaxCitedBadIds (20) of these
+            // caller-supplied strings get echoed back into an HX-Trigger
+            // response HEADER below on an unknown-device rejection -- header
+            // size is a real protocol/proxy ceiling (most reverse proxies cap
+            // a header line around 8-16 KB) that a JSON body doesn't share,
+            // so an unbounded pasted entry is a header-size DoS specific to
+            // this fragment. `device_id_too_long` rejects the WHOLE request
+            // once tokenizing finishes, same shape as the kMaxMembersPerSet
+            // array-size cap the store enforces below.
+            bool device_id_too_long = false;
             if (req.has_param("device_ids")) {
                 std::string raw = req.get_param_value("device_ids");
                 std::string cur;
@@ -235,8 +248,13 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                     // trim whitespace
                     std::size_t a = cur.find_first_not_of(" \t\r\n");
                     std::size_t b = cur.find_last_not_of(" \t\r\n");
-                    if (a != std::string::npos)
-                        members.push_back(cur.substr(a, b - a + 1));
+                    if (a != std::string::npos) {
+                        std::string token = cur.substr(a, b - a + 1);
+                        if (token.size() > yuzu::server::mcp::kResultSetDeviceIdMaxLen)
+                            device_id_too_long = true;
+                        else
+                            members.push_back(std::move(token));
+                    }
                     cur.clear();
                 };
                 for (char c : raw) {
@@ -246,6 +264,24 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                         cur += c;
                 }
                 flush();
+            }
+            if (device_id_too_long) {
+                deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                              "RESULT_SET_DEVICE_ID_TOO_LONG");
+                res.set_header(
+                    "HX-Trigger",
+                    nlohmann::json{
+                        {"showToast",
+                         {{"level", "error"},
+                          {"message",
+                           std::format("a device_ids entry exceeds {} bytes",
+                                       yuzu::server::mcp::kResultSetDeviceIdMaxLen)}}}}
+                        .dump());
+                std::string next;
+                auto sets = deps.store->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, ""),
+                                "text/html; charset=utf-8");
+                return;
             }
 
             // #4983: full existence + scope check on a non-empty device_ids,

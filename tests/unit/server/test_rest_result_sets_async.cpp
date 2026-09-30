@@ -3191,6 +3191,36 @@ TEST_CASE("POST /api/v1/result-sets: more than kMaxCitedBadIds=20 bad ids are "
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
+// Gate 3 SHOULD (cpp-expert, #4983 fix round): MCP's create_result_set twin
+// already enforces this same kResultSetDeviceIdMaxLen (256 bytes) per entry;
+// this REST route's identical device_ids array-parse loop had no such bound
+// -- up to kMaxCitedBadIds (20) of these caller-supplied strings get echoed
+// back into the RESULT_SET_UNKNOWN_DEVICE_ID body/toast on the sibling
+// dashboard-fragment route, where the echo lands in an HTTP response HEADER
+// (a real protocol/proxy size ceiling a JSON body doesn't share) -- apply the
+// same cap here for consistency with that fix.
+TEST_CASE("POST /api/v1/result-sets: a device_ids entry over 256 bytes is "
+          "rejected 400, and no result set is created (#4983 Gate 3 SHOULD)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string oversized_id(257, 'a');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    nlohmann::json{{"name", "x"},
+                                  {"device_ids", nlohmann::json::array({oversized_id})}}
+                        .dump(),
+                    status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("256 bytes") != std::string::npos);
+    // Rejected before the existence/scope gate ever runs.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

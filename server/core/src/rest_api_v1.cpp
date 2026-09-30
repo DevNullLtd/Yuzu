@@ -11306,9 +11306,29 @@ void RestApiV1::register_routes(
 
             std::vector<std::string> members;
             if (body.contains("device_ids") && body["device_ids"].is_array()) {
-                for (const auto& d : body["device_ids"])
-                    if (d.is_string())
-                        members.push_back(d.get<std::string>());
+                for (const auto& d : body["device_ids"]) {
+                    if (!d.is_string())
+                        continue;
+                    auto member = d.get<std::string>();
+                    // Gate 3 SHOULD (cpp-expert, #4983 fix round): bound each
+                    // entry to MCP's own kResultSetDeviceIdMaxLen -- up to
+                    // kMaxCitedBadIds (20) of these caller-supplied strings
+                    // get echoed back into the RESULT_SET_UNKNOWN_DEVICE_ID
+                    // body below. Harmless for REST's JSON body, but the
+                    // dashboard fragment's identical echo lands in an
+                    // HX-Trigger response HEADER (see result_set_routes.cpp),
+                    // where header size is a real protocol/proxy ceiling --
+                    // apply the same cap here too for consistency. Reject
+                    // early rather than truncate the echo, matching how this
+                    // route already bounds name/source_kind/parent_id above.
+                    if (member.size() > yuzu::server::mcp::kResultSetDeviceIdMaxLen) {
+                        rs_err(res, 400,
+                               std::format("a device_ids entry exceeds {} bytes",
+                                           yuzu::server::mcp::kResultSetDeviceIdMaxLen));
+                        return;
+                    }
+                    members.push_back(std::move(member));
+                }
             }
             // Reject an oversized array before the store dedups it under its
             // write lock — bounds the DoS from a giant device_ids body (B4).
