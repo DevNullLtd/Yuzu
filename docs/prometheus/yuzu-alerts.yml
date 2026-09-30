@@ -4174,6 +4174,24 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+      - alert: YuzuEnrollmentStoreDegraded
+        expr: |
+          increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable enrollment store degraded on the auth hot path (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            An enrollment/pending-agent store operation ({{ $labels.op }}) hit a
+            degraded PostgreSQL read/write for 10m (WS-6 6.2). Every enrollment/
+            pending call fails CLOSED on a degrade — agent `Register` returns
+            gRPC `UNAVAILABLE` instead of silently enrolling/denying, and the
+            admin dashboard/REST surface returns 503 rather than an empty or
+            stale list. Caller-input rejections are not counted here (`reason`
+            is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
+            case). Usually PostgreSQL pool saturation / failover — correlate
+            with the pool metrics.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416

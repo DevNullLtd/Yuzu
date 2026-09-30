@@ -29,6 +29,7 @@
 // the existing ProxyRegister suite in test_agent_service_impl.cpp.
 
 #include "gateway_service_impl.hpp"
+#include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -81,6 +82,18 @@ yuzu::test::PgTestTemplate gwroutewiring_tpl{"gwroutewiring", [](const std::stri
         throw std::runtime_error("gwroutewiring template: store failed to migrate");
 }};
 
+/// An AuthManager wired to a PG-backed AuthDB (WS-6 6.2: enrollment/pending state
+/// lives only in Postgres, so ProxyRegister needs one). The DB member is
+/// destroyed BEFORE the AuthManager base, which only holds a non-owning pointer
+/// it never dereferences in its destructor.
+class PgAuthManager : public yuzu::server::auth::AuthManager {
+public:
+    PgAuthManager() { set_auth_db(db_.get()); }
+
+private:
+    yuzu::test::AuthDbPgShared db_;
+};
+
 // A minimal-but-valid gateway-proxied RegisterRequest, carrying a fresh
 // unlimited-use enrollment token so ProxyRegister accepts it outright. Mirrors
 // make_gw_register in test_agent_service_impl.cpp (PR5d).
@@ -91,7 +104,12 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
     req.mutable_info()->set_hostname("gw-wiring-host");
     req.mutable_info()->mutable_platform()->set_os("linux");
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
-    req.set_enrollment_token(auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    {
+        // WS-6 6.2: enrollment tokens are minted through the PG-backed AuthDB.
+        auto created = auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1), "test-admin");
+        REQUIRE(created.has_value());
+        req.set_enrollment_token(created->raw_token);
+    }
     return req;
 }
 
@@ -149,7 +167,7 @@ struct LiveGatewayWiringHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
 
@@ -223,7 +241,7 @@ TEST_CASE("ProxyRegister: fresh register mints a route row; a second fresh regis
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -734,7 +752,7 @@ TEST_CASE("NotifyStreamStatus: a STALE CONNECTED for a session already supersede
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -827,7 +845,7 @@ TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race doe
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -926,7 +944,7 @@ TEST_CASE("NotifyStreamStatus: CONNECTED fills cluster_id/gateway_node for the m
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -969,7 +987,7 @@ TEST_CASE("NotifyStreamStatus: a CONNECTED claiming a DIFFERENT cluster than the
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1087,7 +1105,7 @@ TEST_CASE("a rogue's ORIGINAL still-live session resending CONNECTED after the r
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1240,7 +1258,7 @@ TEST_CASE("AgentRegistry::unpublish_gateway_route reverts exactly what set_gatew
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1312,7 +1330,7 @@ TEST_CASE("#4669: a refused cross-cluster claim emits an audited gateway.cluster
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1378,7 +1396,7 @@ TEST_CASE("NotifyStreamStatus: single-gateway/non-multi-cluster deployments are 
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1435,7 +1453,7 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1514,7 +1532,7 @@ TEST_CASE("NotifyStreamStatus #4324: a fresh session's OWN DISCONNECTED reaching
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1736,7 +1754,7 @@ TEST_CASE("NotifyStreamStatus #4324: a legacy (empty stream_home_id) DISCONNECTE
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1796,7 +1814,7 @@ TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id is treated as m
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1853,7 +1871,7 @@ TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id on DISCONNECTED
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1923,7 +1941,7 @@ TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1972,7 +1990,7 @@ TEST_CASE("BatchHeartbeat: a duplicate session id in one batch and a lost-epoch-
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2053,7 +2071,7 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2121,7 +2139,7 @@ TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAIL
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&broken_store);
@@ -2268,7 +2286,7 @@ TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race sti
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2316,7 +2334,7 @@ TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore announce_connected w
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);

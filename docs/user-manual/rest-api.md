@@ -5462,6 +5462,10 @@ Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, w
 
 **Confinement (ADR-0017):** unlike every other route in this section, each row here carries genuine per-agent identity (`agent_id` plus hostname/os/arch/agent_version), so this route gates on the admit-then-filter chokepoint (`AuthRoutes::require_fleet_read`), not a bare permission check. A holder of a management-group-scoped `Enrollment:Read` grant (rather than a global one) is admitted and gets the real visible-agent intersection — typically the empty list, since a pending (not-yet-approved) agent normally has no management-group membership yet, but this is a workflow expectation, not a data-model guarantee: an agent pre-assigned to a group before approval yields a non-empty, correctly-confined result instead. This closes a defect where such a grant was previously denied outright (403) instead of admitted with its correct, confined result — see `docs/auth-architecture.md`'s ADR-0017 migration list.
 
+Returns `503` if the Postgres enrollment store (`auth.pending_agents`) is degraded, rather than an empty list or a `200` — a degraded read is never laundered into "no pending agents" (WS-6 6.2).
+
+`DELETE /api/settings/pending-agents/{id}` (documented in `server-admin.md`'s [Settings API Reference](server-admin.md#settings-api-reference)) now returns `409` if the target row is no longer `pending` — removal only succeeds against a genuinely pending row; an `approved` or `denied` row is refused rather than silently reversed (WS-6 6.2 governance hardening).
+
 **Response:**
 
 ```json
