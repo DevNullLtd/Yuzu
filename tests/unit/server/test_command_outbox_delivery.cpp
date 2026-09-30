@@ -63,12 +63,19 @@ struct DispatchProbe {
 
 class DeliveryPg {
 public:
-    DeliveryPg() {
+    // #4982 round 6: `lock_timeout_ms` defaults to the pool's own normal
+    // 10000ms; a round-6 fault-injection test (below) passes a short value so
+    // a row lock it deliberately holds open makes the outbox store's own
+    // write fail FAST (a `55P03 lock_timeout` query error) rather than
+    // hanging for the default 10s — the same technique the round-2 Fix-5
+    // test above already uses for `ExecutionTracker`'s own pool.
+    explicit DeliveryPg(int lock_timeout_ms = 10000) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr)
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         db_.emplace(delivery_tpl);
         REQUIRE(db_->available());
-        pool_.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db_->dsn(), .size = 4});
+        pool_.emplace(yuzu::server::pg::PgPool::Options{
+            .conninfo = db_->dsn(), .size = 4, .lock_timeout_ms = lock_timeout_ms});
         REQUIRE(pool_->valid());
         store_ = std::make_unique<CommandOutboxStore>(*pool_);
         REQUIRE(store_->is_open());
@@ -510,10 +517,26 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
 // dispatch (`sent > 0`) through `CommandOutboxDelivery::deliver()`/`tick()`,
 // asserting BOTH halves of the atomic write land together: the outbox row
 // reaches `state='sent'` AND `agents_targeted` reflects the real dispatched
-// count. Empirically verified (per this round's own required before/after
-// discipline) to FAIL — `agents_targeted` observed still 0 while
-// `state='sent'` — when the call site is temporarily reverted to the old
-// two-call split, and to PASS with the call site as committed.
+// count. This DOES pin the call site to the atomic method's correct FINAL
+// output, and does catch a regression that drops the target-count write
+// entirely (that leaves `agents_targeted` at 0, which this test would catch).
+//
+// #4982 round 6 correction (Kimi, round-6 adversarial review — a real,
+// confirmed defect in the ORIGINAL round-5 text this comment used to carry):
+// this test does NOT, on its own, prove atomicity, and the round-5 commit
+// message's claim that it was "empirically verified to FAIL ... when the
+// call site is temporarily reverted to the old two-call split" was checked
+// and is FALSE. This test is single-threaded with nothing creating a window
+// for a third party to observe an intermediate state, so a sequential
+// `mark_sent()` then `ExecutionTracker::set_agents_targeted()` — with NO
+// atomic wrapping at all — produces the exact same final row this test
+// checks (`state='sent'`, `agents_targeted=4`) as the real atomic call. The
+// round-6 test immediately below this one closes that gap: it forces the
+// SECOND write inside `mark_sent_with_target`'s transaction to fail and
+// asserts the FIRST write (the sent-transition) rolls back WITH it — a
+// real-call-site proof of atomicity a happy-path final-state check like this
+// one cannot provide. See that test's own comment for what was actually
+// verified, and how.
 TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) commits the outbox "
           "sent-transition AND the execution's real agents_targeted atomically, via the actual "
           "delivery call site (#4982 round 5)",
@@ -572,9 +595,11 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
     CHECK(probe.calls == 1);
     CHECK(fx.raw_state("occ-target-live") == "sent");
 
-    // Both halves landed together: the outbox row is 'sent' AND the
-    // execution's real target count is set — the exact atomicity guarantee
-    // this test exists to pin at the call-site level.
+    // Both halves landed in the row's final state: the outbox row is 'sent'
+    // AND the execution's real target count is set. This is the correct
+    // happy-path OUTPUT of the atomic call site — see the #4982 round-6
+    // correction above this test for what it does NOT prove (call-site
+    // atomicity under a failure) and where that proof actually lives.
     auto after = tracker.get_execution(*exec_id);
     REQUIRE(after.has_value());
     CHECK(after->agents_targeted == 4);
@@ -587,4 +612,129 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
     auto still = tracker.get_execution(*exec_id);
     REQUIRE(still.has_value());
     CHECK(still->agents_targeted == 4);
+}
+
+// #4982 round 6 (Kimi K1/Codex C2, round-6 adversarial review): the real
+// call-site atomicity proof the test above cannot provide (see the #4982
+// round-6 correction on its own comment). This forces the SECOND statement
+// inside `mark_sent_with_target`'s transaction — `UPDATE
+// execution_tracker.executions SET agents_targeted=... WHERE id=...` — to
+// fail, and asserts the FIRST statement (the outbox `pending -> sent`
+// transition) rolls back WITH it.
+//
+// Fault-injection technique: a raw connection takes a row-level `SELECT ...
+// FOR UPDATE` lock on the execution row and holds it open (no COMMIT) across
+// `loop.tick()`. `fx`'s own pool (where `mark_sent_with_target`'s write
+// actually runs, via `CommandDeliveryFinalizationOwner{pool_}` sharing
+// `CommandOutboxStore`'s pool) carries a short `lock_timeout_ms` so the
+// blocked `UPDATE` fails fast (`55P03 lock_timeout`) instead of hanging —
+// the SAME technique the round-2 Fix-5 test above already established for
+// `ExecutionTracker`'s own pool. `tracker_pool` here also carries a short
+// `lock_timeout_ms`, for the same reason: it is what a HYPOTHETICAL reverted
+// two-call split would issue the second write through instead (see below).
+//
+// This is a genuine, real-call-site distinguishing test: it is only possible
+// for the sent-transition to revert together with the failed target write if
+// BOTH statements commit or roll back as ONE transaction. Under the old
+// (pre-round-3) two-call split — `CommandOutboxStore::mark_sent()` as its own
+// independent autocommit statement, followed by a SEPARATE
+// `ExecutionTracker::set_agents_targeted()` call — `mark_sent()` commits on
+// its own, unconditionally, before the second call even starts; a failure in
+// the second call cannot un-commit the first. So under that split this test
+// would observe the outbox row already `state='sent'` with `agents_targeted`
+// still 0 — precisely the swallowed-bookkeeping race #4982 round 3 closed.
+//
+// Verified empirically, per this round's own required before/after
+// discipline (not merely asserted): temporarily reverting
+// `command_outbox_delivery.cpp`'s `deliver()` call site to that exact
+// two-call split and rebuilding makes THIS test fail —
+// `fx.raw_state("occ-target-race")` observed `"sent"` instead of the expected
+// `"pending"` — while the test above it (checked at the same time) stays
+// green under the same revert, exactly reproducing the round-5 false-claim
+// gap this test exists to close. Reverting the temporary change back to the
+// committed atomic call site makes this test pass again.
+TEST_CASE("CommandOutboxDelivery[pg]: a genuine dispatch whose target-count write is forced to "
+          "fail rolls the outbox sent-transition back WITH it, proving mark_sent_with_target's "
+          "atomicity through the real delivery call site (#4982 round 6)",
+          "[command_outbox][pg][delivery][4982]") {
+    DeliveryPg fx{200}; // short lock_timeout_ms — see comment above
+
+    yuzu::server::pg::PgPool tracker_pool{
+        {.conninfo = fx.dsn(), .size = 2, .lock_timeout_ms = 200}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    auto req = fx.req("occ-target-race", "cmd-target-race");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // Take and hold the row lock BEFORE ticking, on a dedicated connection —
+    // the second write inside `mark_sent_with_target`'s transaction will
+    // block on this and time out.
+    yuzu::server::pg::PgConn locker{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "SELECT id FROM execution_tracker.executions WHERE id=$1 FOR UPDATE",
+                std::vector<std::string>{*exec_id})
+                .status() == PGRES_TUPLES_OK);
+
+    DispatchProbe probe;
+    probe.next.sent = 4;
+
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller& caller,
+                             const std::string& command_id) {
+        probe.calls++;
+        probe.last_command_id = command_id;
+        probe.last_plugin = plugin;
+        probe.last_action = action;
+        probe.last_provenance = caller.approval_provenance;
+        auto out = probe.next;
+        out.command_id = command_id;
+        return out;
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return true; // re-authorization passes — the dispatch proceeds
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    // The wire send already happened (dispatch_fn was called) — harmless,
+    // the agent's command_id dedup absorbs a re-drive next tick.
+    CHECK(probe.calls == 1);
+
+    // THE assertion: the sent-transition did NOT survive on its own — it
+    // rolled back together with the failed target-count write, because both
+    // are one transaction. A two-call split would leave this "sent".
+    CHECK(fx.raw_state("occ-target-race") == "pending");
+
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->agents_targeted == 0); // never written — rolled back with the sent-transition
+    CHECK(after->status == "running");
 }
