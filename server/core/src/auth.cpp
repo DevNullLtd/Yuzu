@@ -282,10 +282,9 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
         spdlog::info("Loaded {} user(s) from {}", users_.size(), cfg_path.string());
     }
 
-    // Load enrollment tokens and pending agents (each acquires mu_ internally)
-    load_tokens();
-    load_pending();
-
+    // Enrollment tokens + pending agents are NOT loaded here: since WS-6 6.2 they
+    // live only in AuthDB (Postgres). The legacy enrollment-tokens.cfg /
+    // pending-agents.cfg files are read exactly once by the boot importer.
     return has_users;
 }
 
@@ -2319,374 +2318,62 @@ std::string AuthManager::sha256_hex(const std::string& input) {
     return bytes_to_hex(derived);
 }
 
-std::string AuthManager::create_enrollment_token(const std::string& label, int max_uses,
-                                                 std::chrono::seconds ttl) {
-    // Generate a high-entropy raw token
-    auto raw_bytes = random_bytes(32);
-    auto raw_token = bytes_to_hex(raw_bytes);
+// ── Enrollment tokens + pending agents (WS-6 6.2): AuthDB-only, fail-closed ──
 
-    // Hash it for storage (we never store the raw token)
-    auto hash = sha256_hex(raw_token);
-
-    // Token ID = first 8 hex chars of the hash (for display/admin reference)
-    auto token_id = hash.substr(0, 8);
-
-    auto now = std::chrono::system_clock::now();
-
-    EnrollmentToken et;
-    et.token_id = token_id;
-    et.token_hash = hash;
-    et.label = label;
-    et.max_uses = max_uses;
-    et.use_count = 0;
-    et.created_at = now;
-    et.expires_at = (ttl.count() == 0) ? (std::chrono::system_clock::time_point::max)() : now + ttl;
-    et.revoked = false;
-
-    {
-        std::unique_lock lock(mu_);
-        enrollment_tokens_[token_id] = std::move(et);
-    }
-
-    save_tokens();
-
-    spdlog::info("Enrollment token created: id={}, label='{}', max_uses={}, ttl={}s", token_id,
-                 label, max_uses, ttl.count());
-    return raw_token;
+void AuthManager::note_enrollment_store_degrade(const char* op, const char* reason) const {
+    if (metrics_)
+        metrics_->counter("yuzu_auth_enrollment_store_degrade_total",
+                          {{"op", op}, {"reason", reason}})
+            .increment();
 }
 
-std::vector<std::string>
-AuthManager::create_enrollment_tokens_batch(const std::string& label_prefix, int count,
-                                            int max_uses_each, std::chrono::seconds ttl) {
-    std::vector<std::string> tokens;
-    tokens.reserve(static_cast<size_t>(count));
-    for (int i = 0; i < count; ++i) {
-        auto label = label_prefix.empty() ? std::format("batch-{}", i + 1)
-                                          : std::format("{}-{}", label_prefix, i + 1);
-        tokens.push_back(create_enrollment_token(label, max_uses_each, ttl));
+template <typename R, typename Fn>
+std::expected<R, StoreError> AuthManager::enrollment_store_call(const char* op, Fn&& fn) {
+    yuzu::server::AuthDB* db = auth_db_;
+    if (db == nullptr) {
+        // No store attached (shutdown's set_auth_db(nullptr), or never wired):
+        // fail CLOSED with the same typed outage a PG failure yields — never an
+        // empty/absent/rejected value, never a memory fallback.
+        note_enrollment_store_degrade(op, "no_store");
+        return std::unexpected(StoreError::Unavailable);
     }
-    spdlog::info("Batch created {} enrollment tokens (prefix='{}')", count, label_prefix);
-    return tokens;
+    std::expected<R, StoreError> r = std::forward<Fn>(fn)(*db);
+    if (!r && r.error() != StoreError::InvalidInput) {
+        note_enrollment_store_degrade(op, r.error() == StoreError::Unavailable
+                                              ? "pool_acquire_timeout"
+                                              : "query_error");
+    }
+    return r;
 }
 
-bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
-    // W1.4 R2 / UP-H2: read-only observability check. The W1.4 PR1 pass
-    // of this wrapper silently delegated to consume_enrollment_token,
-    // which burned a use on every call — a semantic break with the
-    // function name and the doc comment ("validate, not consume"). A
-    // caller checking "is this token still usable?" would unintentionally
-    // exhaust a max_uses=1 token. The behaviour was acceptable in PR1
-    // because the only callers were tests asserting the exhaustion
-    // behaviour, but a future caller would not know to expect the
-    // mutation. Restored to true read-only.
-    //
-    // Length-bound applied here as well (defence-in-depth) so a caller
-    // of validate can't bypass the consume-path length check.
-    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
-        return false;
-    }
-    auto hash = sha256_hex(raw_token);
-    auto now = std::chrono::system_clock::now();
-    std::shared_lock lock(mu_);
-    for (const auto& [_, et] : enrollment_tokens_) {
-        if (!constant_time_compare(et.token_hash, hash))
-            continue;
-        if (et.revoked)
-            return false;
-        if (now > et.expires_at)
-            return false;
-        if (et.max_uses > 0 && et.use_count >= et.max_uses)
-            return false;
-        return true;
-    }
-    return false;
+std::expected<CreatedEnrollmentToken, StoreError>
+AuthManager::create_enrollment_token(const std::string& label, int max_uses,
+                                     std::chrono::seconds ttl, const std::string& created_by) {
+    return enrollment_store_call<CreatedEnrollmentToken>(
+        "create_token", [&](yuzu::server::AuthDB& db) {
+            return db.create_token(label, max_uses, ttl, created_by);
+        });
 }
 
-std::expected<EnrollmentClaim, EnrollmentTokenError>
-AuthManager::consume_enrollment_token(std::string_view raw_token,
-                                      std::string_view consuming_agent_id) {
-    // W1.1 UP-H2: length-bound at the API entry. The same kMaxEnrollment
-    // TokenLength constant guards the handlers (where it converts to a 400/
-    // gRPC INVALID_ARGUMENT) AND this consume function (defence-in-depth,
-    // so an in-process caller can't bypass the handler check and force the
-    // store to SHA-256 a 1 MiB blob). Empty token is also rejected here —
-    // the handler should never call us with an empty token, but it makes
-    // the consume contract self-describing.
-    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
-        return std::unexpected(EnrollmentTokenError::invalid_input);
-    }
-
-    auto hash = sha256_hex(std::string{raw_token});
-    auto now = std::chrono::system_clock::now();
-
-    EnrollmentClaim claim;
-    bool consumed = false;
-
-    {
-        // The atomic-claim critical section. Everything from validity check
-        // through ++use_count and last_consumed_by_agent_id write happens
-        // under one unique_lock so no second consumer can interleave between
-        // "this token is valid" and "this token's use_count is now N+1".
-        // Loosening this lock is the bug #827 closes; do not split into a
-        // shared_lock for the SELECT + unique_lock for the UPDATE without
-        // re-reading the issue's race scenario.
-        std::unique_lock lock(mu_);
-
-        for (auto& [id, et] : enrollment_tokens_) {
-            if (!constant_time_compare(et.token_hash, hash))
-                continue;
-
-            if (et.revoked) {
-                spdlog::warn("Enrollment token {} is revoked", id);
-                return std::unexpected(EnrollmentTokenError::revoked);
-            }
-            if (now > et.expires_at) {
-                spdlog::warn("Enrollment token {} has expired", id);
-                return std::unexpected(EnrollmentTokenError::expired);
-            }
-            if (et.max_uses > 0 && et.use_count >= et.max_uses) {
-                // The race-lost case is structurally indistinguishable from a
-                // "stale exhausted" case at this point — both look like
-                // use_count >= max_uses. The handler discriminates via the
-                // `last_consumed_by_agent_id` value (already set by the prior
-                // winner) and emits an audit row naming the winner so the
-                // operator can see the contention. We just classify as
-                // already_consumed and let the handler do the attribution.
-                spdlog::warn("Enrollment token {} exhausted ({}/{}) — race lost or stale", id,
-                             et.use_count, et.max_uses);
-                return std::unexpected(EnrollmentTokenError::already_consumed);
-            }
-
-            // The atomic claim. ++use_count and the agent_id stamp happen
-            // before we drop the lock. The use_count value we return to the
-            // caller is the POST-increment value, so a successful single-use
-            // consume returns use_count_after == 1.
-            ++et.use_count;
-            if (!consuming_agent_id.empty()) {
-                et.last_consumed_by_agent_id.assign(consuming_agent_id.data(),
-                                                    consuming_agent_id.size());
-            }
-
-            claim.token_id = id;
-            claim.max_uses = et.max_uses;
-            claim.use_count_after = et.use_count;
-            claim.single_use = (et.max_uses == 1);
-            consumed = true;
-
-            spdlog::info("Enrollment token {} consumed by '{}' ({}/{})", id,
-                         consuming_agent_id.empty() ? std::string_view{"<unknown>"}
-                                                    : consuming_agent_id,
-                         et.use_count, et.max_uses == 0 ? -1 : et.max_uses);
-            break;
-        }
-    }
-
-    if (!consumed) {
-        spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
-        return std::unexpected(EnrollmentTokenError::not_found);
-    }
-
-    // W1.4 R2 / UP-C1: persist immediately after the in-memory claim.
-    // The PR1 implementation left persistence to whatever next mutation
-    // (revoke, create, manager destruction) happened to call save_tokens(),
-    // which left a crash-replay window: a server SIGKILL between the
-    // in-memory ++use_count and any disk write meant the next boot's
-    // load_tokens() read use_count=0 and the consumed token would
-    // re-enroll. Now save_tokens() lands before we return, closing the
-    // window to "crash inside save_tokens() itself" (atomic file write
-    // via ofstream::trunc + close, so the on-disk file is either the
-    // pre-consume or post-consume snapshot, never a torn intermediate).
-    //
-    // Lock-release first because save_tokens() acquires shared_lock(mu_)
-    // itself — holding unique_lock across the call would deadlock. Once
-    // the in-memory claim has landed, releasing the unique_lock is safe:
-    // parallel consumers see exhausted, parallel saves serialise via
-    // their own shared_lock so the on-disk snapshot only ever advances.
-    //
-    // Failure handling: do NOT roll back the in-memory consume on save
-    // failure. The agent will be told their token is consumed (success
-    // response in flight) and rolling back would create a different
-    // bug (token reuse under disk-failure injection). Log loudly so SRE
-    // sees it; the prior best-effort behaviour for non-consume paths
-    // (revoke, create) is preserved by the existing save_tokens callers.
-    //
-    // Note on AuthDB: AuthManager has an `auth_db_` member, but
-    // create_enrollment_token never inserts into the AuthDB enrollment
-    // _tokens table — that table is dead. Wiring AuthDB as the source
-    // of truth would require reconciling the AuthDB schema (single-use
-    // only) against the in-memory schema (max_uses, label, revoked)
-    // and porting create_enrollment_token. Out of scope for R2; the
-    // in-memory + file-snapshot path is the production-correct one.
-    if (!save_tokens()) {
-        spdlog::error("Enrollment token {} consume succeeded in-memory but save_tokens "
-                      "failed — on a crash before the next save, the consumed state will "
-                      "be lost and the token may replay",
-                      claim.token_id);
-    }
-    return claim;
+std::expected<ConsumeEnrollResult, StoreError>
+AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                                const std::string& hostname, const std::string& os,
+                                const std::string& arch, const std::string& agent_version) {
+    return enrollment_store_call<ConsumeEnrollResult>(
+        "consume", [&](yuzu::server::AuthDB& db) {
+            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version);
+        });
 }
 
-std::string AuthManager::last_consumer_for_token_hash(std::string_view token_hash) const {
-    std::shared_lock lock(mu_);
-    for (const auto& [_, et] : enrollment_tokens_) {
-        if (constant_time_compare(et.token_hash, std::string{token_hash})) {
-            return et.last_consumed_by_agent_id;
-        }
-    }
-    return {};
+std::expected<std::vector<EnrollmentToken>, StoreError> AuthManager::list_enrollment_tokens() {
+    return enrollment_store_call<std::vector<EnrollmentToken>>(
+        "list_tokens", [](yuzu::server::AuthDB& db) { return db.list_tokens(); });
 }
 
-std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
-    std::shared_lock lock(mu_);
-    std::vector<EnrollmentToken> out;
-    out.reserve(enrollment_tokens_.size());
-    for (const auto& [_, et] : enrollment_tokens_) {
-        out.push_back(et);
-    }
-    return out;
+std::expected<bool, StoreError> AuthManager::revoke_enrollment_token(const std::string& token_id) {
+    return enrollment_store_call<bool>(
+        "revoke_token", [&](yuzu::server::AuthDB& db) { return db.revoke_token(token_id); });
 }
-
-bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = enrollment_tokens_.find(token_id);
-        if (it == enrollment_tokens_.end())
-            return false;
-        it->second.revoked = true;
-    }
-    save_tokens();
-    spdlog::info("Enrollment token {} revoked", token_id);
-    return true;
-}
-
-// ── Enrollment token persistence ────────────────────────────────────────────
-
-bool AuthManager::save_tokens() const {
-    auto path = state_dir() / "enrollment-tokens.cfg";
-
-    std::shared_lock lock(mu_);
-
-#ifndef _WIN32
-    mode_t old_mask = umask(0077);
-#endif
-    std::ofstream f(path, std::ios::trunc);
-#ifndef _WIN32
-    umask(old_mask);
-#endif
-    if (!f.is_open()) {
-        spdlog::error("Cannot write enrollment tokens to {}", path.string());
-        return false;
-    }
-
-    f << "# Yuzu Enrollment Tokens\n";
-    f << "# Version: 1\n";
-    f << "# Format: "
-         "token_id:token_hash:label:max_uses:use_count:created_epoch:expires_epoch:revoked\n\n";
-
-    for (const auto& [id, et] : enrollment_tokens_) {
-        auto created_epoch =
-            std::chrono::duration_cast<std::chrono::seconds>(et.created_at.time_since_epoch())
-                .count();
-        auto expires_epoch =
-            (et.expires_at == (std::chrono::system_clock::time_point::max)())
-                ? int64_t{0}
-                : std::chrono::duration_cast<std::chrono::seconds>(et.expires_at.time_since_epoch())
-                      .count();
-
-        f << et.token_id << ':' << et.token_hash << ':' << et.label << ':' << et.max_uses << ':'
-          << et.use_count << ':' << created_epoch << ':' << expires_epoch << ':'
-          << (et.revoked ? '1' : '0') << '\n';
-    }
-    f.close();
-
-#ifndef _WIN32
-    // Restrict token file to owner-only (0600) — contains token hashes.
-    std::error_code perm_ec;
-    std::filesystem::permissions(
-        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, perm_ec);
-    if (perm_ec) {
-        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
-    }
-#endif
-
-    return true;
-}
-
-bool AuthManager::load_tokens() {
-    auto path = state_dir() / "enrollment-tokens.cfg";
-
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::unique_lock lock(mu_);
-    enrollment_tokens_.clear();
-
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (line.starts_with("# Version: ")) {
-            try {
-                int ver = std::stoi(line.substr(11));
-                if (ver != 1) {
-                    spdlog::error("Unsupported enrollment-tokens.cfg version {}", ver);
-                    return false;
-                }
-            } catch (const std::exception& e) {
-                spdlog::error("Malformed version line in enrollment-tokens.cfg: {}", e.what());
-                return false;
-            }
-            continue;
-        }
-        if (line[0] == '#')
-            continue;
-
-        std::istringstream ss(line);
-        std::string token_id, token_hash, label, max_uses_s, use_count_s, created_s, expires_s,
-            revoked_s;
-
-        if (!std::getline(ss, token_id, ':'))
-            continue;
-        if (!std::getline(ss, token_hash, ':'))
-            continue;
-        if (!std::getline(ss, label, ':'))
-            continue;
-        if (!std::getline(ss, max_uses_s, ':'))
-            continue;
-        if (!std::getline(ss, use_count_s, ':'))
-            continue;
-        if (!std::getline(ss, created_s, ':'))
-            continue;
-        if (!std::getline(ss, expires_s, ':'))
-            continue;
-        if (!std::getline(ss, revoked_s, ':'))
-            continue;
-
-        EnrollmentToken et;
-        et.token_id = token_id;
-        et.token_hash = token_hash;
-        et.label = label;
-        et.max_uses = std::stoi(max_uses_s);
-        et.use_count = std::stoi(use_count_s);
-        et.created_at =
-            std::chrono::system_clock::time_point(std::chrono::seconds(std::stoll(created_s)));
-        et.expires_at = (expires_s == "0") ? (std::chrono::system_clock::time_point::max)()
-                                           : std::chrono::system_clock::time_point(
-                                                 std::chrono::seconds(std::stoll(expires_s)));
-        et.revoked = (revoked_s == "1");
-
-        enrollment_tokens_[token_id] = std::move(et);
-    }
-
-    spdlog::info("Loaded {} enrollment token(s)", enrollment_tokens_.size());
-    return true;
-}
-
-// ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 std::string pending_status_to_string(PendingStatus s) {
     switch (s) {
@@ -2700,231 +2387,81 @@ std::string pending_status_to_string(PendingStatus s) {
     return "unknown";
 }
 
-void AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
-                                    const std::string& os, const std::string& arch,
-                                    const std::string& agent_version) {
-    {
-        std::unique_lock lock(mu_);
-        // Don't overwrite if already exists
-        if (pending_agents_.contains(agent_id))
-            return;
+namespace {
+PendingAgent make_pending(const std::string& agent_id, const std::string& hostname,
+                          const std::string& os, const std::string& arch,
+                          const std::string& agent_version) {
+    PendingAgent pa;
+    pa.agent_id = agent_id;
+    pa.hostname = hostname;
+    pa.os = os;
+    pa.arch = arch;
+    pa.agent_version = agent_version;
+    pa.status = PendingStatus::pending;
+    return pa;
+}
+} // namespace
 
-        PendingAgent pa;
-        pa.agent_id = agent_id;
-        pa.hostname = hostname;
-        pa.os = os;
-        pa.arch = arch;
-        pa.agent_version = agent_version;
-        pa.requested_at = std::chrono::system_clock::now();
-        pa.status = PendingStatus::pending;
-        pending_agents_[agent_id] = std::move(pa);
-    }
-    save_pending();
-    spdlog::info("Agent {} added to pending approval queue", agent_id);
+std::expected<bool, StoreError>
+AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
+                               const std::string& os, const std::string& arch,
+                               const std::string& agent_version) {
+    return enrollment_store_call<bool>("add_pending", [&](yuzu::server::AuthDB& db) {
+        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version));
+    });
 }
 
-std::optional<PendingStatus> AuthManager::get_pending_status(const std::string& agent_id) const {
-    std::shared_lock lock(mu_);
-    auto it = pending_agents_.find(agent_id);
-    if (it == pending_agents_.end())
-        return std::nullopt;
-    return it->second.status;
+std::expected<bool, StoreError>
+AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                             const std::string& os, const std::string& arch,
+                             const std::string& agent_version, const std::string& by) {
+    return enrollment_store_call<bool>("ensure_enrolled", [&](yuzu::server::AuthDB& db) {
+        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by);
+    });
 }
 
-std::vector<PendingAgent> AuthManager::list_pending_agents() const {
-    std::shared_lock lock(mu_);
-    std::vector<PendingAgent> out;
-    out.reserve(pending_agents_.size());
-    for (const auto& [_, pa] : pending_agents_) {
-        out.push_back(pa);
-    }
-    return out;
+std::expected<std::optional<PendingStatus>, StoreError>
+AuthManager::get_pending_status(const std::string& agent_id) {
+    return enrollment_store_call<std::optional<PendingStatus>>(
+        "pending_status", [&](yuzu::server::AuthDB& db) { return db.pending_status(agent_id); });
 }
 
-bool AuthManager::approve_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it == pending_agents_.end())
-            return false;
-        it->second.status = PendingStatus::approved;
-    }
-    save_pending();
-    spdlog::info("Agent {} approved for enrollment", agent_id);
-    return true;
+std::expected<std::vector<PendingAgent>, StoreError> AuthManager::list_pending_agents() {
+    return enrollment_store_call<std::vector<PendingAgent>>(
+        "list_pending", [](yuzu::server::AuthDB& db) { return db.list_pending(); });
 }
 
-bool AuthManager::deny_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it == pending_agents_.end())
-            return false;
-        it->second.status = PendingStatus::denied;
-    }
-    save_pending();
-    spdlog::info("Agent {} denied enrollment", agent_id);
-    return true;
+std::expected<bool, StoreError> AuthManager::approve_pending_agent(const std::string& agent_id,
+                                                                   const std::string& principal) {
+    return enrollment_store_call<bool>("approve", [&](yuzu::server::AuthDB& db) {
+        return db.approve_pending(agent_id, principal);
+    });
 }
 
-bool AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
-                                  const std::string& os, const std::string& arch,
-                                  const std::string& agent_version) {
-    {
-        std::unique_lock lock(mu_);
-        auto it = pending_agents_.find(agent_id);
-        if (it != pending_agents_.end()) {
-            // Never override an explicit admin denial — tokens don't outrank admins
-            if (it->second.status == PendingStatus::denied) {
-                spdlog::warn("ensure_enrolled: agent {} is admin-denied, refusing to override",
-                             agent_id);
-                return false;
-            }
-            it->second.status = PendingStatus::approved;
-        } else {
-            PendingAgent pa;
-            pa.agent_id = agent_id;
-            pa.hostname = hostname;
-            pa.os = os;
-            pa.arch = arch;
-            pa.agent_version = agent_version;
-            pa.requested_at = std::chrono::system_clock::now();
-            pa.status = PendingStatus::approved;
-            pending_agents_[agent_id] = std::move(pa);
-        }
-    }
-    save_pending();
-    return true;
+std::expected<bool, StoreError> AuthManager::deny_pending_agent(const std::string& agent_id,
+                                                                const std::string& principal) {
+    return enrollment_store_call<bool>("deny", [&](yuzu::server::AuthDB& db) {
+        return db.deny_pending(agent_id, principal);
+    });
 }
 
-bool AuthManager::remove_pending_agent(const std::string& agent_id) {
-    {
-        std::unique_lock lock(mu_);
-        if (pending_agents_.erase(agent_id) == 0)
-            return false;
-    }
-    save_pending();
-    return true;
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::approve_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_approve",
+        [&](yuzu::server::AuthDB& db) { return db.approve_all_pending(principal); });
 }
 
-// ── Pending agent persistence ───────────────────────────────────────────────
-
-bool AuthManager::save_pending() const {
-    auto path = state_dir() / "pending-agents.cfg";
-
-    std::shared_lock lock(mu_);
-
-#ifndef _WIN32
-    mode_t old_mask = umask(0077);
-#endif
-    std::ofstream f(path, std::ios::trunc);
-#ifndef _WIN32
-    umask(old_mask);
-#endif
-    if (!f.is_open()) {
-        spdlog::error("Cannot write pending agents to {}", path.string());
-        return false;
-    }
-
-    f << "# Yuzu Pending Agents\n";
-    f << "# Version: 1\n";
-    f << "# Format: agent_id:hostname:os:arch:version:requested_epoch:status\n\n";
-
-    for (const auto& [id, pa] : pending_agents_) {
-        auto epoch =
-            std::chrono::duration_cast<std::chrono::seconds>(pa.requested_at.time_since_epoch())
-                .count();
-
-        f << pa.agent_id << ':' << pa.hostname << ':' << pa.os << ':' << pa.arch << ':'
-          << pa.agent_version << ':' << epoch << ':' << pending_status_to_string(pa.status) << '\n';
-    }
-    f.close();
-
-#ifndef _WIN32
-    // Restrict pending-agents file to owner-only (0600).
-    std::error_code perm_ec;
-    std::filesystem::permissions(
-        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, perm_ec);
-    if (perm_ec) {
-        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
-    }
-#endif
-
-    return true;
+std::expected<std::vector<std::string>, StoreError>
+AuthManager::deny_all_pending_agents(const std::string& principal) {
+    return enrollment_store_call<std::vector<std::string>>(
+        "bulk_deny", [&](yuzu::server::AuthDB& db) { return db.deny_all_pending(principal); });
 }
 
-bool AuthManager::load_pending() {
-    auto path = state_dir() / "pending-agents.cfg";
-
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::unique_lock lock(mu_);
-    pending_agents_.clear();
-
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-        if (line.starts_with("# Version: ")) {
-            try {
-                int ver = std::stoi(line.substr(11));
-                if (ver != 1) {
-                    spdlog::error("Unsupported pending-agents.cfg version {}", ver);
-                    return false;
-                }
-            } catch (const std::exception& e) {
-                spdlog::error("Malformed version line in pending-agents.cfg: {}", e.what());
-                return false;
-            }
-            continue;
-        }
-        if (line[0] == '#')
-            continue;
-
-        std::istringstream ss(line);
-        std::string agent_id, hostname, os, arch, version, epoch_s, status_s;
-
-        if (!std::getline(ss, agent_id, ':'))
-            continue;
-        if (!std::getline(ss, hostname, ':'))
-            continue;
-        if (!std::getline(ss, os, ':'))
-            continue;
-        if (!std::getline(ss, arch, ':'))
-            continue;
-        if (!std::getline(ss, version, ':'))
-            continue;
-        if (!std::getline(ss, epoch_s, ':'))
-            continue;
-        if (!std::getline(ss, status_s, ':'))
-            continue;
-
-        PendingAgent pa;
-        pa.agent_id = agent_id;
-        pa.hostname = hostname;
-        pa.os = os;
-        pa.arch = arch;
-        pa.agent_version = version;
-        pa.requested_at =
-            std::chrono::system_clock::time_point(std::chrono::seconds(std::stoll(epoch_s)));
-
-        if (status_s == "approved")
-            pa.status = PendingStatus::approved;
-        else if (status_s == "denied")
-            pa.status = PendingStatus::denied;
-        else
-            pa.status = PendingStatus::pending;
-
-        pending_agents_[agent_id] = std::move(pa);
-    }
-
-    spdlog::info("Loaded {} pending agent(s)", pending_agents_.size());
-    return true;
+std::expected<RemovePendingOutcome, StoreError>
+AuthManager::remove_pending_agent(const std::string& agent_id) {
+    return enrollment_store_call<RemovePendingOutcome>(
+        "remove", [&](yuzu::server::AuthDB& db) { return db.remove_pending(agent_id); });
 }
 
 } // namespace yuzu::server::auth

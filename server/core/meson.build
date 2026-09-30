@@ -374,6 +374,7 @@ yuzu_server_core_lib = static_library(
     'src/gateway_service_impl.cpp',
     'src/auth.cpp',
     'src/auth_db.cpp',
+    'src/enrollment_cfg_import.cpp', # WS-6 6.2: one-time legacy enrollment .cfg -> Postgres import
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',

@@ -204,10 +204,30 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth
                     respond_service_unavailable(res, "auth manager");
                     return;
                 }
+                // Audited AFTER the read, by ACTUAL outcome (rest_audit.hpp's
+                // "bucket two" posture — Guardian's `rows ? "success" :
+                // "failure"`), not the file's usual audit-before-read constant
+                // "success". `list_pending_agents()` became a fallible PG read
+                // in WS-6 6.2 (it was in-memory and infallible pre-migration,
+                // which is why audit-before-read was harmless then); this route
+                // also fails CLOSED with a 503 on a store outage, so a
+                // durable "success" row for a read that never returned any
+                // data would misrepresent the evidence chain (PR #5107
+                // review, Should-fix).
+                auto agents_result = auth_mgr->list_pending_agents();
+                if (!agents_result) {
+                    (void)detail::try_persist_audit(audit_fn, req, "enrollment.pending_agents.view",
+                                                    "failure", "Enrollment", "",
+                                                    "REST v1 pending-agents read - store degraded");
+                    // Fail closed (WS-6 6.2): a store outage is a 503, never an
+                    // empty `data: []` that reads as "nothing pending".
+                    respond_service_unavailable(res, "enrollment store");
+                    return;
+                }
                 (void)detail::try_persist_audit(audit_fn, req, "enrollment.pending_agents.view",
                                                 "success", "Enrollment", "",
                                                 "REST v1 pending-agents read");
-                auto agents = auth_mgr->list_pending_agents();
+                const auto& agents = *agents_result;
                 // Filter out already-approved agents — they don't need admin
                 // attention, matching SettingsRoutes::render_pending_fragment()'s
                 // identical filter (settings_routes.cpp) so this route genuinely
