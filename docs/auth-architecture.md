@@ -3041,7 +3041,15 @@ unfiltered.**
    its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
    unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
    the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
-   `tar_tree_routes.cpp` (×2).
+   `tar_tree_routes.cpp` (×2). #5047 added `AuthRoutes::require_tier_policy`'s
+   `actionable_permission` parameter — a THIRD shape, not a fourth call-site-by-call-site migration:
+   a single production factory, `AuthRoutes::gateless_tier_policy_fn()`, is the ONE place all 8
+   gate-less-route call sites (the 4 result-set REST write routes plus their 4 dashboard-fragment
+   twins) source their `TierPolicyFn` from, with `actionable_permission=false` baked in there once —
+   `require_permission`'s own call (RBAC-gated, the grant WOULD admit the caller) passes `true`
+   explicitly at its one call site. `actionable_permission` deliberately carries no default value,
+   so a future 9th gate-less caller cannot inherit `true` by omission the way the original violation
+   this clause exists to prevent did.
 
    **One known, tracked exception, not retroactively bound:** pre-existing
    `deny_fleet_wide_service_scoped` call sites that fire AFTER the route's own `perm_fn` already

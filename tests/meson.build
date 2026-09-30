@@ -546,6 +546,8 @@ agent_test_exe = executable(
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure PAM/login.defs/auditd/pwpolicy parsers, no OS call (Linux+macOS legs; sudoers/secedit follow in their own PR's test file)
+    'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
@@ -572,6 +574,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
@@ -749,6 +752,7 @@ agent_test_exe = executable(
                 browser_policy_plugin_lib,  # Wave 10 PR10.2-b
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
+                local_security_policy_plugin_lib,  # Wave 8 PR8.3
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
@@ -1249,6 +1253,7 @@ if build_server
       'unit/server/test_result_set_store.cpp',
       'unit/server/test_result_set_matcher.cpp',
       'unit/server/test_rest_result_sets_async.cpp',
+      'unit/server/test_rest_result_sets_tier_policy.cpp', # #5047: cross-transport MCP-tier belt on the 4 /api/v1/result-sets write routes
       'unit/server/test_chrome_ir_chain.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',
@@ -2846,6 +2851,19 @@ test('spark evidence format lockstep (#4665)',
   suite: 'docs',
   timeout: 30,
 )
+
+# #5047: static lexical gate over server.cpp's two TierPolicyFn wiring sites -- both
+# must call AuthRoutes::gateless_tier_policy_fn(), never a re-inlined local lambda (see
+# the script's own header for the clause-5 rationale). No build required, same class as
+# the RBAC cross-schema query-owner seam check above.
+if _bash_test.found()
+  test('tier policy wiring lexical gate (#5047)',
+    _bash_test,
+    args: [files('shell/test_tier_policy_wiring_lexical.sh')],
+    suite: 'docs',
+    timeout: 30,
+  )
+endif
 
 # #4665 regression net: a position-aware lexical scanner over the Guardian/Spark
 # subsystem (agents/core/src + server/core/src + common/include, filtered to the

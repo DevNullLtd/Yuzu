@@ -251,5 +251,4 @@ count|0
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: none found by name
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/20260916-hardware-sync-tags-actions-round2.added.md` · `changelog.d/3216-svc-scope-gate-primitives-tagstore.fixed.md`
 <!-- END GENERATED -->

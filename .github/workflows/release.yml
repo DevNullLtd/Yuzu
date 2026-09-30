@@ -25,8 +25,10 @@ permissions:
   contents: read
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS legs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows leg uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -507,9 +509,27 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Install Meson and ccache
+      - name: Verify Meson, PyYAML and ccache (pre-provisioned)
+        shell: pwsh
         run: |
-          pip install --require-hashes -r requirements-ci.txt
+          # Never install Python packages here. Wee Tam's toolchain is set up
+          # by deploy/windows/Provision-Windows-Runner.ps1 and pinned by
+          # deploy/windows/toolchain-contract.json (checked by the next step).
+          # All runner slots share one OS identity, so a machine-wide OR a
+          # --user install changes what every later job's C:\Python314
+          # imports: requirements-ci.txt pins a newer meson than the contract,
+          # and installing it (machine-wide, in the v0.14.0-rc1 release run)
+          # failed the contract check for every Windows job on the box.
+          # A missing PyYAML (embed_content.py needs it at meson setup) is a
+          # provisioning fault, so fail with the fix instead of installing.
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -c "import yaml" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
+            exit 1
+          }
+          meson --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
           # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
           # installed there, so the old `choco install ccache` aborted the

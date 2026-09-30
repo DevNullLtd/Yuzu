@@ -93,8 +93,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS jobs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows job uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -1595,15 +1597,17 @@ jobs:
           done
           meson --version
           ccache --version | head -1
-          # Governance UAT 2026-05-06 build-ci B-2: PyYAML must be
-          # importable for `meson setup` to pass — embed_content.py
-          # hard-fails without it. The runner image should provision
-          # python-yaml via MSYS2 pacman, but ensure idempotently here
-          # so a re-baked runner doesn't silently break release. Use
-          # the hash-pinned requirements file so a compromised PyPI
-          # cannot inject a malicious wheel (Gate 7 re-review LOW).
-          python -c "import yaml" >/dev/null 2>&1 || \
-            python -m pip install --user --require-hashes -r requirements-ci.txt
+          # PyYAML must be importable for `meson setup` (embed_content.py
+          # hard-fails without it; governance UAT 2026-05-06 build-ci B-2).
+          # It is provisioned by deploy/windows/Provision-Windows-Runner.ps1.
+          # Never install it here: all runner slots share one OS identity,
+          # and a --user install of requirements-ci.txt also puts its newer
+          # meson in the user site, which C:\Python314's meson then imports,
+          # failing the toolchain contract for every job on the box.
+          if ! python -c "import yaml" >/dev/null 2>&1; then
+            echo "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
+            exit 1
+          fi
 
       - name: Assert toolchain manifest (self-hosted)
         shell: pwsh

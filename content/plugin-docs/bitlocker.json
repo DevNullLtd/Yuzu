@@ -290,9 +290,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/20260818-wave3-bitlocker-native-acquisition.changed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/bitlocker.yaml"
     ],
