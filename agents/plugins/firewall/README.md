@@ -192,5 +192,4 @@ rule|nftables|ip|filter|DOCKER-USER|handle|2
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_firewall_local_dispatcher.cpp` · `tests/unit/test_firewall_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260716-macos-firewall-alf-primary.fixed.md` · `changelog.d/20260818-wave3-firewall-native-acquisition.changed.md` · `changelog.d/20260818-wave3-firewall-ufw-inactive-misreport.fixed.md` · `changelog.d/20260823-firewall-nftables-netlink.added.md` · `changelog.d/2237-guardian-reconcile-exception-firewall.fixed.md` · `changelog.d/2298-guardian-convergence-lane-firewall.fixed.md` · `changelog.d/3461-firewall-nftables-sender-verify.security.md` · `changelog.d/3462-firewall-nftables-dump-hardening.changed.md` · `changelog.d/4387-firewall-ufw-iptables-state-completeness.security.md` · `changelog.d/979-firewall-parity-residual.added.md`
 <!-- END GENERATED -->

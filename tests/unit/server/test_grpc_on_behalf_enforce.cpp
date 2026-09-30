@@ -172,8 +172,14 @@ TEST_CASE("Register with no reserved key proceeds normally through the same inte
     auto status = h.stub_->Register(&ctx, req, &resp);
 
     // A clean call is unaffected by the interceptor — proves the guard is
-    // discriminating (reserved keys only), not blocking everything.
-    CHECK(status.ok());
+    // discriminating (reserved keys only), not blocking everything. This
+    // harness wires NO AuthDB, so since WS-6 6.2 (enrollment state is
+    // AuthDB-only and fails CLOSED) the handler that the interceptor let through
+    // answers UNAVAILABLE at the enrollment-status read — proof the handler RAN
+    // (a blocked call would be CANCELLED), and that a missing store never reads
+    // as "accepted=false".
+    CHECK(status.error_code() == grpc::StatusCode::UNAVAILABLE);
+    CHECK(status.error_code() != grpc::StatusCode::CANCELLED);
 }
 
 TEST_CASE("Subscribe (bidi stream) carrying a reserved on-behalf-of key is rejected at stream-open",

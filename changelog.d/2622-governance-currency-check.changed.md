@@ -1,1 +1,0 @@
-- `/governance` now opens with a currency check: the skill, `.claude/routed-concerns.md` and `CLAUDE.md` are read from your working tree, so a branch predating a change to any of them silently ran the old pipeline. CLAUDE.md's governance summary now states the four standing rules #2604 introduced rather than the pipeline that preceded them.

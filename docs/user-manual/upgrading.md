@@ -2976,6 +2976,41 @@ validation before the handler's own logic ever runs. A `rule_id` that violates B
 AND over-length) is reachable by neither REST nor MCP; fall back to a direct database delete
 (`guaranteed_state_store.guaranteed_state_rules`) for that case.
 
+## Behaviour change: `preview_scope_targets` / `scope/preview` now resolve `from_result_set:`/`props.` atoms correctly (#4981)
+
+`POST /api/v1/scope/preview` and MCP `preview_scope_targets` previously evaluated a scope
+expression against a bespoke attribute resolver that only understood
+`ostype`/`arch`/`hostname`/`agent_version`/`tag:<key>` — a `from_result_set:<id>` or
+`props.<key>` atom silently resolved to unset, so the atom's comparison was always false, and
+`NOT from_result_set:<id>` inverted that to match every agent the caller could see regardless
+of the referenced set's real membership. Both surfaces now route through the same
+fail-closed evaluation ladder a real dispatch uses.
+
+**Who this affects:** anyone who has called either surface with an expression containing
+`from_result_set:` or `props.`. If you relied on the old (incorrect) match set for either atom
+kind, re-check any automation built on that response before upgrading — the direction of the
+correction depends on how the atom was used: a negated `NOT from_result_set:<id>` was, in
+practice, matching your whole visible fleet, and the corrected match set will generally be
+narrower and more accurate to what a real dispatch of the same expression would actually
+target; a plain (non-negated) `from_result_set:`/`props.<key>` atom always evaluated false under
+the old resolver, so its match set was previously stuck at 0 and the corrected set will
+generally be broader, now actually populated with real members.
+
+**New error responses a strict client should handle:**
+- **403 (REST only)** — a service-scoped API token calling `POST /api/v1/scope/preview` now gets
+  denied outright, rather than admitted with a silently narrowed match set (closing the same
+  cross-service-reach gap #4980 closed on a sibling result-set route). MCP `preview_scope_targets`
+  is unaffected by this change — it already denied a service-scoped token outright before this
+  release.
+- **404** `RESULT_SET_NOT_FOUND` (REST) / `kInvalidParams` (MCP) — a `from_result_set:<id>`
+  referencing a result set that is absent, expired, or not owned by the caller now aborts,
+  instead of silently matching nothing (or, negated, everything).
+- **503**, with a `retry_after_ms` hint — a degraded backend store or presence read now aborts
+  instead of under- or over-reporting the match set.
+
+A preview call no longer extends a referenced result set's TTL as a side effect — it is now a
+genuine read-only dry run, matching its documented `readOnlyHint: true`.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -2991,10 +3026,29 @@ Never upgrade agents before the server -- the server must understand the agent's
 Before upgrading any component:
 
 - [ ] Back up all data (see [Server Administration](server-admin.md))
-  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`
+  - `yuzu-server.cfg`, `auto-approve.cfg` — enrollment tokens and pending agents are PostgreSQL-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`); back them up as part of the `pg_dump` below, not as local files. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are still worth including in a manual backup **taken before that upgrade** — they are the one-time import source at the first 6.2 boot (see the rolling-upgrade note below)
   - The NVD cache `nvd_cves.db` in `--data-dir` (the one remaining server SQLite store) — use `sqlite3 <path> ".backup ..."` rather than `cp` against a live database
   - The blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` in `--data-dir` — the database holds only the OTA-package and completed-upload records that point into them, so a restored dump without these directories leaves records with no files
   - The **PostgreSQL database** (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) **and the whole `--ca-dir`**, taken at the same point in time — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Upgrading to HA WS-6 6.2 or later, running more than one server replica?** Stop
+  every pre-6.2 replica before starting the first 6.2+ one. The one-time `enrollment-tokens.cfg`
+  / `pending-agents.cfg` import runs at boot on whichever replica starts first and stamps a
+  content-fingerprint marker in `auth.import_meta`; a second pre-6.2 replica started afterwards
+  against the same `--data-dir` files would only ever match or mismatch that already-consumed
+  marker, never contribute new state — its own `.cfg` files are simply skipped or, if they differ,
+  refused (never merged). A restored pre-6.2 backup with a fingerprint that no longer matches the
+  live `auth.import_meta` row is likewise **refused, not merged** — look for a `CRITICAL` log line
+  naming the mismatched file and the `yuzu_server_enrollment_import_total{outcome="fingerprint_mismatch"}`
+  metric; see [ADR-2002 §8](../adr/2002-high-availability-architecture.md#8-pki--ca-high-availability-q8) for the marker/fingerprint mechanics.
+  **A fingerprint mismatch does NOT block boot** — unlike a PG error or read failure with the file
+  present (which refuses to start, the same posture as the first-boot admin seed), a mismatch is
+  logged and the server starts normally with whatever enrollment state is already in Postgres; the
+  stale `.cfg` file's rows are simply never imported, and the file itself is left in place under its
+  original name (not renamed to `.imported`, since nothing was imported). Recover by comparing the
+  stale file's rows against the current `auth.enrollment_tokens`/`auth.pending_agents` (dashboard, or
+  `psql`), manually recreating anything genuinely missing (mint a new token / re-add the pending
+  agent), then archiving or deleting the leftover `enrollment-tokens.cfg` / `pending-agents.cfg` once
+  you've confirmed nothing in it is needed.
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server
@@ -3185,7 +3239,7 @@ curl -s http://localhost:8080/livez
 
 ### Docker
 
-The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds every piece of mutable state: `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries.
+The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds the remaining piece of mutable state kept on disk: `yuzu-server.cfg`, `auto-approve.cfg`, the NVD cache SQLite database, and OTA binaries. Enrollment tokens and pending agents are PostgreSQL-authoritative (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — a pre-6.2 volume's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported once, automatically, at the first 6.2+ container's boot, then renamed to `<name>.cfg.imported`.
 
 An upgrade is a pull-and-restart:
 

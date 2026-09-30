@@ -1,1 +1,0 @@
-- **Fixed an information disclosure in the dashboard approvals fragment.** `GET /fragments/approvals` rendered the full approvals population (`submitted_by`, `status`, `scope_expression`) to any authenticated session; it now requires `Approval:Read`, matching its REST sibling `GET /api/approvals`. (#3040)

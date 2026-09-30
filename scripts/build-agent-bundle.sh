@@ -126,8 +126,9 @@ info "image=$IMAGE_REF  push=$PUSH  multiarch=$MULTIARCH"
 # ── 1. Download + verify release assets ────────────────────────────────────
 # Download by glob so we match GitHub's *canonical* asset names: GitHub
 # sanitises some characters on upload (e.g. the Debian '~' in 0.12.0~rc0 is
-# served as '.', so the name in SHA256SUMS != the downloadable name). We
-# therefore verify by HASH presence in the signed manifest, never by filename.
+# served as '.', so for releases before 0.14.0-rc3 the name in SHA256SUMS !=
+# the downloadable name; #5141 fixed that). We therefore verify by HASH
+# presence in the signed manifest, never by filename.
 DL="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-agent-bundle.XXXXXX")"
 ARCHIVES="yuzu-linux-x64.tar.gz yuzu-windows-x64.zip yuzu-macos-arm64.tar.gz"
 

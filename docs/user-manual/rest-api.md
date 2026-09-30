@@ -5462,6 +5462,10 @@ Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, w
 
 **Confinement (ADR-0017):** unlike every other route in this section, each row here carries genuine per-agent identity (`agent_id` plus hostname/os/arch/agent_version), so this route gates on the admit-then-filter chokepoint (`AuthRoutes::require_fleet_read`), not a bare permission check. A holder of a management-group-scoped `Enrollment:Read` grant (rather than a global one) is admitted and gets the real visible-agent intersection — typically the empty list, since a pending (not-yet-approved) agent normally has no management-group membership yet, but this is a workflow expectation, not a data-model guarantee: an agent pre-assigned to a group before approval yields a non-empty, correctly-confined result instead. This closes a defect where such a grant was previously denied outright (403) instead of admitted with its correct, confined result — see `docs/auth-architecture.md`'s ADR-0017 migration list.
 
+Returns `503` if the Postgres enrollment store (`auth.pending_agents`) is degraded, rather than an empty list or a `200` — a degraded read is never laundered into "no pending agents" (WS-6 6.2).
+
+`DELETE /api/settings/pending-agents/{id}` (documented in `server-admin.md`'s [Settings API Reference](server-admin.md#settings-api-reference)) now returns `409` if the target row is no longer `pending` — removal only succeeds against a genuinely pending row; an `approved` or `denied` row is refused rather than silently reversed (WS-6 6.2 governance hardening).
+
 **Response:**
 
 ```json
@@ -6656,7 +6660,7 @@ A store-level read failure now answers `503 RESULT_SET_STORE_UNAVAILABLE` (fail-
 
 Create a result set directly from a pre-computed device-id list (e.g. an operator with a CSV of device ids). Synchronous — lands `materialized` immediately, no dispatch involved.
 
-**Permission:** Session-authenticated (owner-scoped).
+**Permission:** Session-authenticated (owner-scoped). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets) for what that does and doesn't mean. An MCP-tiered bearer token additionally passes through the same tier/approval belt its `create_result_set` MCP twin enforces (#5047) — this is the cross-transport parity check, not an RBAC grant.
 
 **Request body:**
 
@@ -6678,8 +6682,10 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
+| 503 | `RESULT_SET_TIER_POLICY_UNAVAILABLE` — the tier/approval check is misconfigured (server-side wiring fault, not a caller error; unreachable in a correctly-configured deployment) |
 
 #### `GET /api/v1/result-sets/{id}`
 
@@ -6701,7 +6707,7 @@ Fetch one result set by id.
 
 Delete a result set.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets). An MCP-tiered bearer additionally passes through the same tier/approval belt its `delete_result_set` MCP twin enforces (#5047); `Infrastructure:Delete` is approval-gated for the supervised tier on every transport except `/mcp/v1/` itself, so a supervised-tier bearer must use the MCP ticket-then-recall flow to delete — this REST route cannot approve one.
 
 **Response:** `{"data": {"deleted": true}, "meta": {"api_version": "v1"}}`
 
@@ -6710,9 +6716,11 @@ Delete a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Delete` — an MCP-tiered bearer whose tier disallows delete outright (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
+| 403 | Supervised-tier bearer, approval required — `"operation requires approval for this MCP tier on this transport"`, with a `remediation` pointing at the MCP ticket-then-recall flow (#5047) |
 | 404 | No such set, or not owned by the caller. Also returned if the delete itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `RESULT_SET_PINNED` — unpin the set before deleting it |
-| 503 | Result-set store unavailable (ownership lookup only) |
+| 503 | Result-set store unavailable (ownership lookup only), or `RESULT_SET_TIER_POLICY_UNAVAILABLE` (tier/approval check misconfigured; server-side wiring fault, unreachable in a correctly-configured deployment) |
 
 #### `GET /api/v1/result-sets/{id}/members`
 
@@ -6757,7 +6765,7 @@ Read a result set's ancestor chain (walks `parent_id` links up to the root).
 
 Pin (exempt from TTL expiry) or unpin a result set.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets). An MCP-tiered bearer additionally passes through the same tier/approval belt its `pin_result_set`/`unpin_result_set` MCP twins enforce (#5047) — this is the cross-transport parity check, not an RBAC grant.
 
 **Response (200):** The updated `ResultSet` object (`pinned` flipped).
 
@@ -6766,9 +6774,10 @@ Pin (exempt from TTL expiry) or unpin a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
 | 404 | No such set, or not owned by the caller. Also returned if the pin/unpin write itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `PIN_LIMIT` — owner is at the per-owner pin cap (pin only) |
-| 503 | Result-set store unavailable (ownership lookup only) |
+| 503 | Result-set store unavailable (ownership lookup only), or `RESULT_SET_TIER_POLICY_UNAVAILABLE` (tier/approval check misconfigured; server-side wiring fault, unreachable in a correctly-configured deployment) |
 
 ---
 
@@ -9697,24 +9706,45 @@ legacy unversioned twin exists (`POST /api/scope/estimate` below is a
 *different* capability: a matched/total **count** only, for the workflow
 builder's own confined `scope_fn`). Both this route and `preview_scope_targets`
 call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
-matched-agent set cannot drift between transports. A `tag:<key>` atom in the
-expression resolves from the persistent tag store **only** — unlike a real
-dispatch, which also falls back to a connected agent's own live self-report —
-see [Tag source precedence](../asset-tagging-guide.md). **`from_result_set:<id>`
-and `props.*` atoms are not resolved by this preview** - the resolver only
-populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
-(including `from_result_set:`, this feature's own headline scope-walking
-primitive) is treated as unset and never matches, silently returning
-`matched_count: 0` for a composed expression that uses one - a genuine
-dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
-rely on this preview for an expression containing `from_result_set:` or
-`props.`; tracked in `#4307`.
+matched-agent set cannot drift between transports.
+
+**#4981: this route now runs the SAME evaluation ladder a real dispatch uses**
+(`resolve_scope_targets`, `dispatch_scope_ladder.hpp`) — alias resolution,
+owner-check gate, parse, then registry evaluation, each step fail-closed.
+`tag:<key>`, `props.<key>`, and `from_result_set:<id>` atoms all resolve
+identically to a real dispatch; this closes the pre-#4981 fleet-wide
+over-disclosure bug where `from_result_set:`/`props.*` were silently
+unresolved (always "" — unset) and a `NOT`-negated reference to either
+matched the WHOLE FLEET regardless of the referenced set's real membership.
+The ladder's own evaluation runs unfiltered against the whole fleet; the
+caller's confinement (see **Permission** below) is intersected in
+AFTERWARD, mirroring how a real dispatch intersects against the operator's
+`Execution:Execute` visible set before sending.
+
+A `tag:<key>` atom in the expression now resolves **identically** to a real
+dispatch (#4981): the persistent tag store first, falling back to a
+locally-connected agent's own live self-report only when the store has no
+row for that agent — a presence-only cross-replica agent has no live
+session to fall back to, so it still resolves store-only for such agents,
+same as real dispatch. See
+[Tag source precedence](../asset-tagging-guide.md). `POST /api/scope/estimate`
+below also resolves `from_result_set:` against the owner, but a failed
+owner-check there degrades to "zero members" rather than aborting the whole
+evaluation like this route's ladder does — a separate, still-open fail-open
+gap, tracked `#5003`, not fixed by `#4981`.
 
 **Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the
 syntax-only validate route above, so a management-group-confined caller's
 `matched_agents`/`matched_count` are narrowed to their own visible devices
-before the preview builder runs, never the whole fleet.
+after the ladder evaluates, never the whole fleet. **A service-scoped API
+token is denied outright (403)** before the fleet-read gate or the
+evaluation ladder ever run — same cross-service-reach reasoning as `POST
+/api/v1/result-sets/from-inventory-query` (#4980): a `from_result_set:<id>`/
+`props.<key>` atom resolves against the *minting operator's* identity
+(`session->username`), not the token's own restricted scope, so admitting
+and merely narrowing the output (what `fleet_read_fn` alone would do) would
+let a service token probe or own-check a result set it never minted.
 
 **Request body:** `{"expression": "..."}`
 
@@ -9739,7 +9769,9 @@ before the preview builder runs, never the whole fleet.
 | Status | Reason |
 |---|---|
 | 400 | `expression` missing/empty, or fails to parse/validate |
-| 503 | The expression references a `tag:<key>` atom and the bulk tag-store preload degraded (`retry_after_ms: 5000`) — never silently under-reports the match set |
+| 403 | Service-scoped API token — denied outright, before the fleet-read gate or evaluation ladder ever run (#4980-class cross-service-reach fix). No `.permission` field in the error body: a service-scoped caller holding `Infrastructure:Read` is still denied, so naming it would be a false self-remediation claim |
+| 404 | A `from_result_set:<id>` atom references a result set that is absent, expired, or not owned by the caller (`RESULT_SET_NOT_FOUND`) — existence-oracle-safe, same body shape as the result-set routes' own `load_owned` 404; a server-side audit row is still written |
+| 503 | Scope evaluation aborted — never silently under-reports the match set. A store preload (tag/props/result-set) failed or the cross-replica presence read failed is TRANSIENT (`db_degraded`/`presence_degraded`, `retry_after_ms: 5000`); no dispatching principal was available or a required store isn't wired is PERMANENT (`principal_unresolved`/`unresolvable`, `retry_after_ms: null` — a retry cannot fix either); the evaluator itself being unwired (misconfiguration) also carries `retry_after_ms: null` |
 
 #### `POST /api/scope/estimate`
 

@@ -1,1 +1,0 @@
-- **Breaking:** `GET /api/v1/openapi.json` now requires an authenticated session or API token with `Infrastructure:Read` (#2057); pre-auth tooling must log in first. Error responses from the workflow, webhook, settings, auth, file-retrieval, viz, offload and SLE routes now use the A4 envelope with a `correlation_id` (#1552, PR-1). (#4201)

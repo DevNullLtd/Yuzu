@@ -30,6 +30,7 @@
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/enrollment_cfg_import.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -187,11 +188,13 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
@@ -479,6 +482,45 @@ std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path&
     if (sqlite3_step(stmt.get()) != SQLITE_ROW)
         return std::nullopt;
     return sqlite3_column_int64(stmt.get(), 0);
+}
+
+// WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg import
+// (system principal, like the other boot-time posture rows). One row per file
+// kind that did something noteworthy: `imported` (result=success),
+// `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
+// or `error` (result=failure). `absent` / `already_imported` are the steady
+// state and deliberately write no row. Shared by the normal successful-boot
+// drain AND the fatal-import one-shot write (PR #5107 review, Should-fix) —
+// EXTEND this, never fork a second copy of the event shape.
+void write_enrollment_import_audit_rows(
+    yuzu::server::AuditStore& audit_store,
+    const std::vector<yuzu::server::enrollment_import::KindReport>& reports) {
+    using yuzu::server::enrollment_import::Outcome;
+    for (const auto& r : reports) {
+        if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
+            continue;
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "system";
+        ev.principal_role = "system";
+        ev.action = "enrollment.import";
+        ev.target_type = "Enrollment";
+        ev.target_id = r.kind;
+        ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
+                    " imported=" + std::to_string(r.counts.imported) +
+                    " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
+                    " skipped_garbled=" + std::to_string(r.parse.garbled) +
+                    " recovered_colon=" + std::to_string(r.parse.recovered) +
+                    " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
+                    " renamed=" + (r.renamed ? "true" : "false") +
+                    (r.detail.empty() ? "" : " reason=" + r.detail);
+        ev.result = r.outcome == Outcome::imported
+                        ? "success"
+                        : (r.outcome == Outcome::fingerprint_mismatch ? "warning" : "failure");
+        (void)audit_store.log(ev);
+    }
 }
 } // namespace
 } // namespace yuzu::server
@@ -3003,6 +3045,51 @@ public:
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
+        // shared by every replica) and fail CLOSED on any store failure. This
+        // counts each degrade so an operator can tell "agents cannot enroll /
+        // the approval queue is unreadable" from a quiet fleet. `op` = the
+        // AuthManager call; `reason` = no_store (no AuthDB attached: shutdown /
+        // never wired) | pool_acquire_timeout (no PG lease) | query_error (a
+        // statement/txn ran and failed). Bad caller input is NOT a degrade.
+        metrics_.describe("yuzu_auth_enrollment_store_degrade_total",
+                          "Enrollment-token / pending-agent store calls that failed closed "
+                          "(labelled by op and reason: no_store / pool_acquire_timeout / "
+                          "query_error); Register returns UNAVAILABLE and the admin views "
+                          "return 503 or an unknown state, never an empty or zero result",
+                          "counter");
+        for (auto op : {"create_token", "consume", "list_tokens", "revoke_token", "add_pending",
+                        "ensure_enrolled", "pending_status", "list_pending", "approve", "deny",
+                        "bulk_approve", "bulk_deny", "remove"})
+            for (auto reason : {"no_store", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_auth_enrollment_store_degrade_total",
+                                 {{"op", op}, {"reason", reason}});
+        // WS-6 6.2: the one-time legacy enrollment .cfg import. `kind` = tokens |
+        // pending; `outcome` = imported | already_imported | fingerprint_mismatch |
+        // absent | error. A steady-state boot is `absent` (nothing to import) or
+        // `already_imported` (file survived a failed rename). fingerprint_mismatch means
+        // a restored old backup / edited file was REFUSED (Postgres state stands); error
+        // means the server refused to start.
+        metrics_.describe("yuzu_server_enrollment_import_total",
+                          "One-time legacy enrollment .cfg import outcomes per file kind "
+                          "(kind: tokens / pending; outcome: imported / already_imported / "
+                          "fingerprint_mismatch / absent / error)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto outcome : {"imported", "already_imported", "fingerprint_mismatch",
+                                 "absent", "error"})
+                metrics_.counter("yuzu_server_enrollment_import_total",
+                                 {{"kind", kind}, {"outcome", outcome}});
+        metrics_.describe("yuzu_server_enrollment_import_rows_total",
+                          "Rows handled by the one-time legacy enrollment .cfg import "
+                          "(result: imported / skipped_existing / skipped_garbled / "
+                          "recovered_colon / id_disambiguated / unplaceable)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto result : {"imported", "skipped_existing", "skipped_garbled",
+                                "recovered_colon", "id_disambiguated", "unplaceable"})
+                metrics_.counter("yuzu_server_enrollment_import_rows_total",
+                                 {{"kind", kind}, {"result", result}});
         metrics_.describe("yuzu_auth_session_reap_total",
                           "Expired durable operator-session rows deleted by the clock-guarded "
                           "retention sweep",
@@ -4697,6 +4784,49 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+
+                        // WS-6 6.2: one-time import of the legacy per-replica
+                        // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
+                        // Runs HERE - right after the auth store is wired and
+                        // before any listener binds, so no Register can be served
+                        // against a half-imported enrollment set - and never from a
+                        // main.cpp one-shot (--mfa-reset / --generate-tokens must
+                        // not import or rename). A missing file is a no-op; a PG
+                        // error with a file present refuses to start (like the
+                        // first-boot admin seed): a half-known enrollment set is
+                        // worse than no boot. On a normal boot the reports are
+                        // kept and drained into the audit store once it's built
+                        // below (audit_store_ isn't constructed yet at this point
+                        // in the boot sequence).
+                        auto imported = enrollment_import::run_legacy_enrollment_import(
+                            *auth_db_,
+                            enrollment_import::Locations{cfg_.data_dir,
+                                                         cfg_.auth_config_path.parent_path()},
+                            &metrics_);
+                        if (imported.fatal) {
+                            spdlog::error("[PG] Refusing to start: the one-time legacy enrollment "
+                                          ".cfg import failed with a file present (see the "
+                                          "[enrollment-import] lines above)");
+                            startup_failed_ = true;
+                            // The refusal above means `audit_store_` (below) is
+                            // never constructed on THIS boot, and a later boot's
+                            // reports are a fresh, unrelated import attempt — so
+                            // the documented enrollment.import failure row
+                            // (docs/observability-conventions.md) would otherwise
+                            // never be written for the failure that actually
+                            // caused this refusal (PR #5107 review, Should-fix).
+                            // A one-shot AuditStore over the same still-open
+                            // pg_pool_ writes it here, best-effort (a dead audit
+                            // store is exactly the kind of failure this row would
+                            // have described anyway; the loud spdlog::error above
+                            // is the primary signal either way).
+                            AuditStore one_shot_audit(*pg_pool_, cfg_.audit_retention_days);
+                            if (one_shot_audit.is_open())
+                                write_enrollment_import_audit_rows(one_shot_audit,
+                                                                   imported.reports);
+                        } else {
+                            enrollment_import_reports_ = std::move(imported.reports);
+                        }
                     }
                 }
             }
@@ -5247,6 +5377,18 @@ public:
                              .detail = detail_json,
                              .result = failure ? "failure" : "success"});
                     });
+            }
+
+            // WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg
+            // import (system principal, like the other boot-time posture rows).
+            // Shared with the fatal-import one-shot write above
+            // (write_enrollment_import_audit_rows) — a `startup_failed_` boot
+            // never reaches here (audit_store_ isn't built), which is exactly
+            // why that path writes its own row via a throwaway AuditStore
+            // instead of relying on this drain.
+            if (audit_store_ && audit_store_->is_open()) {
+                write_enrollment_import_audit_rows(*audit_store_, enrollment_import_reports_);
+                enrollment_import_reports_.clear();
             }
 
             // Gate 7 compliance F-1 — durable evidence that the viz
@@ -14768,6 +14910,16 @@ private:
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             // #5047: same belt as the /api/v1/result-sets JSON
+                             // write routes — these fragments are plain HTTP
+                             // endpoints too, not cookie-session-only. The
+                             // SOLE production factory (see its own doc
+                             // comment, auth_routes.hpp) — never re-inline
+                             // this as a local lambda; a second copy is
+                             // exactly how the original clause-5 violation
+                             // this belt exists to prevent could recur
+                             // unreviewed at a 9th call site.
+                             .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),
                              .store = result_set_store_.get(),
                              .metrics = &metrics_,
                          });
@@ -18728,6 +18880,35 @@ private:
             return exists.has_value() && *exists;
         };
 
+        // #4981 PR-2: the SOLE scope-evaluation closure `POST
+        // /api/v1/scope/preview` and MCP `preview_scope_targets` both bind —
+        // byte-for-byte the same binding shape `command_routes.cpp`'s Scope
+        // arm and `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp)
+        // already use for a real dispatch, so a scope preview now resolves
+        // `tag:`/`props.`/`from_result_set:` atoms identically to a real
+        // dispatch instead of the old bespoke per-agent resolver that never
+        // populated the latter two (#4981's fleet-wide over-disclosure bug —
+        // see scope_preview.hpp's file header). Defined ONCE as a plain `auto`
+        // closure (RestApiV1::ScopeEvaluateFn and McpServer::ScopeEvaluateFn
+        // are independently-declared class-scoped std::function aliases with
+        // the identical signature — this codebase's convention, see
+        // ExecVisibleFn — so the SAME closure converts cleanly into either
+        // one) and passed to both RestApiV1::set_scope_evaluate_fn and
+        // McpServer::set_scope_evaluate_fn below, so REST and MCP cannot
+        // silently diverge in which agents a preview matches.
+        // #4981 PR-3: `touch_referenced_result_sets = false` — a preview is a
+        // read-only dry run; it must resolve `from_result_set:` membership
+        // identically to a real dispatch WITHOUT extending a referenced
+        // owned set's TTL merely for being named in the check (real dispatch,
+        // via command_routes.cpp's Scope arm and wire_and_dispatch_confined,
+        // is unaffected and keeps the touch at its default `true`).
+        auto scope_evaluate_fn = [this](const yuzu::scope::Expression& parsed,
+                                        const std::string& principal) {
+            return registry_.evaluate_scope(parsed, tag_store_.get(), custom_properties_store_.get(),
+                                            result_set_store_.get(), principal,
+                                            /*touch_referenced_result_sets=*/false);
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
         // Both setters MUST run BEFORE register_routes() (captured by value
         // at registration time, not `this`) — see set_engine_principal_store/
@@ -18739,6 +18920,10 @@ private:
             rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
             rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
         }
+        // #4981 PR-2 — see scope_evaluate_fn's own comment above. MUST run
+        // BEFORE register_routes(), same timing contract as the two setters
+        // immediately above.
+        rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -19136,7 +19321,17 @@ private:
             // degrades when its own backing store is absent, the exact same
             // per-route degrade the old `!guaranteed_state_store`/
             // `!baseline_store` guards produced.
-            guardian_api);
+            guardian_api,
+            // #5047: closes the cross-transport MCP-tier bypass on the 4
+            // result-set write routes — the SAME belt `require_permission`
+            // applies to every RBAC-gated route, threaded here because this
+            // family has no `perm_fn` call at all (ownership-only by
+            // design). The SOLE production factory (see its own doc
+            // comment, auth_routes.hpp) — never re-inline this as a local
+            // lambda; a second copy is exactly how the original clause-5
+            // violation this belt exists to prevent could recur unreviewed
+            // at a 9th call site.
+            auth_routes_->gateless_tier_policy_fn());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -19407,6 +19602,10 @@ private:
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #4981 PR-2 — see scope_evaluate_fn's own comment above (defined
+            // once, shared with rest_api_v1_->set_scope_evaluate_fn above).
+            // MUST run BEFORE register_routes()/build_handler() below.
+            mcp_server_->set_scope_evaluate_fn(scope_evaluate_fn);
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so
@@ -20010,11 +20209,13 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
+        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
         yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
         yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
@@ -20467,6 +20668,10 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // WS-6 6.2: outcome of the one-time legacy enrollment .cfg import (see the
+    // boot block after set_auth_db). Held until audit_store_ is constructed, then
+    // emitted as `enrollment.import` rows.
+    std::vector<enrollment_import::KindReport> enrollment_import_reports_;
     // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
     // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
     // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via

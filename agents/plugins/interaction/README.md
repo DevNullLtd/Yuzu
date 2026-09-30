@@ -256,5 +256,4 @@ status|ok
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_interaction_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/20260716-macos-interaction-not-reachable.fixed.md` · `changelog.d/20260818-wave2-interaction-native-argv.changed.md`
 <!-- END GENERATED -->

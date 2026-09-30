@@ -36,10 +36,13 @@ Group=yuzu
 # external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
 # (the DSN embeds a credential).
 EnvironmentFile=-/etc/yuzu/yuzu-server.env
-# --data-dir holds the server's runtime state files (enrollment-tokens.cfg,
-# pending-agents.cfg, auto-approve.cfg), agent-updates/ (when --update-dir
-# is unset), upload-blobs/, and the NVD cache nvd_cves.db — the one
-# remaining server SQLite store, a recorded deferral on ADR-0006's ladder
+# --data-dir holds the server's runtime state files (auto-approve.cfg — still
+# per-replica; a pre-6.2 install's enrollment-tokens.cfg/pending-agents.cfg are
+# read here exactly ONCE by the HA WS-6 6.2 importer, then renamed aside and
+# never read again — enrollment/pending state itself is Postgres-authoritative,
+# see docs/adr/2002-high-availability-architecture.md §8), agent-updates/ (when
+# --update-dir is unset), upload-blobs/, and the NVD cache nvd_cves.db — the
+# one remaining server SQLite store, a recorded deferral on ADR-0006's ladder
 # (docs/postgres-migration-ladder.md). Every other server store, including
 # auth, sessions and account lockout, lives in the Postgres substrate
 # (YUZU_POSTGRES_DSN / EnvironmentFile above); legacy *.db files left here

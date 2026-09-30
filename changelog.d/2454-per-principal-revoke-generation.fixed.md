@@ -1,1 +1,0 @@
-- **A burst of engine-principal writes no longer silently disables the whole liveness cache.** Bulk revoke, an access-review remediation sweep, or a credential-rotation loop used to defeat every OTHER principal's concurrent cache-insert process-wide for its duration. The cache-poisoning guard now tracks a per-principal generation instead of a single global counter.

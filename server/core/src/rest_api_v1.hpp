@@ -34,6 +34,8 @@
 #include "response_store.hpp"
 #include "result_set_store.hpp"
 #include "schedule_engine.hpp"
+#include "scope_eval_error.hpp" // #4981 PR-2: ScopeEvalError — ScopeEvaluateFn's typed failure surface
+#include "scope_engine.hpp"     // #4981 PR-2: yuzu::scope::Expression — ScopeEvaluateFn's parsed-expr param
 #include "software_deployment_store.hpp"
 #include "mfa_step_up.hpp"
 #include "tag_store.hpp"
@@ -90,6 +92,7 @@ class DirectorySync;
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <set>
@@ -176,6 +179,22 @@ public:
     /// class branches (see the route's own comment in rest_api_v1.cpp).
     /// Empty/default `{}` = the two routes answer 503 (misconfiguration).
     using AgentsJsonFn = std::function<nlohmann::json()>;
+    /// #4981 PR-2 — `POST /api/v1/scope/preview`'s SOLE scope-evaluation
+    /// callback: a thin closure over `AgentRegistry::evaluate_scope` with the
+    /// caller's tag/custom-properties/result-set stores already bound (see
+    /// `scope_preview.hpp`'s own `ScopeEvaluateFn` doc comment — the SAME
+    /// binding shape `command_routes.cpp`'s Scope arm and
+    /// `wire_and_dispatch_confined` (dispatch_scope_ladder.hpp) already use).
+    /// Injected rather than threading `AgentRegistry*`/`ResultSetStore*`/
+    /// `CustomPropertiesStore*` raw pointers into this route class, matching
+    /// the codebase convention of injecting `Fn`-typed closures over stores
+    /// rather than the stores themselves (keeps `AgentRegistry`/
+    /// `CustomPropertiesStore` out of this class entirely). Set via
+    /// `set_scope_evaluate_fn` (below), BEFORE `register_routes()`. Unset
+    /// (`{}`, the default) makes the route FAIL CLOSED (503), same contract
+    /// as `FleetReadFn`/`ListReadFn` above.
+    using ScopeEvaluateFn = std::function<std::expected<std::vector<std::string>, ScopeEvalError>(
+        const yuzu::scope::Expression&, const std::string& principal)>;
     /// #4033 — D3 Response:Read-visible agent SET resolver for the create-
     /// group agent-count preview (`GET /api/v1/management-groups/agent-count-
     /// preview` + its MCP twin), mirroring `DashboardRoutes::VisibleSetFn`
@@ -484,10 +503,13 @@ public:
         std::shared_ptr<const VerifyApi> verify_api = nullptr,
         // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam — backs
         // GET /api/v1/devices[/{id}] (replaces the raw `agents_fn` read on
-        // this pair only; `agents_fn` itself stays wired for
-        // POST /api/v1/scope/preview, its other live consumer). The SAME
-        // instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details` use, so
-        // REST/dashboard/MCP can never disagree on device identity data.
+        // this pair only). #4981 PR-2: `agents_fn` no longer has a live
+        // consumer in this file — `POST /api/v1/scope/preview` now sources
+        // matches from `scope_evaluate_fn_` (a real `AgentRegistry::evaluate_scope`
+        // closure) rather than a locally pre-filtered agent snapshot; the
+        // parameter stays for source-stability of existing callers/tests. The
+        // SAME instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details`
+        // use, so REST/dashboard/MCP can never disagree on device identity data.
         // nullptr = both routes answer 503 (provider unwired).
         std::shared_ptr<const DeviceApi> device_api = nullptr,
         // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API
@@ -524,7 +546,14 @@ public:
         // `!guaranteed_state_store` guard's practical behaviour.
         // `guaranteed_state_store` above stays wired too, for the
         // rule/baseline MUTATORS this seam does not cover.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: closes the cross-transport MCP-tier bypass on the 4
+        // result-set write routes (create/pin/unpin/delete), which have no
+        // `perm_fn`/RBAC gate at all (ownership-only by design — see
+        // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
+        // dep; `{}` fails closed (503) for a TIERED caller and passes
+        // through for an untiered one — see TierPolicyFn's own contract.
+        TierPolicyFn tier_policy_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -615,7 +644,11 @@ public:
         std::shared_ptr<const DexPerfApi> dex_perf_api = nullptr,
         // ADR-0031 WS-A4 (ninth family): see the production overload's doc
         // comment above; identical trailing-optional-dep, required-or-503.
-        std::shared_ptr<const GuardianApi> guardian_api = nullptr);
+        std::shared_ptr<const GuardianApi> guardian_api = nullptr,
+        // #5047: see the production overload's doc comment above; identical
+        // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
+        // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
+        TierPolicyFn tier_policy_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
@@ -631,9 +664,16 @@ public:
     /// `set_engine_principal_store`.
     void set_user_exists_fn(UserExistsFn fn) { user_exists_fn_ = std::move(fn); }
 
+    /// #4981 PR-2 — see `ScopeEvaluateFn`'s doc comment above. MUST be called
+    /// BEFORE `register_routes()`, same timing contract as
+    /// `set_engine_principal_store`. Unset (`{}`, the default) makes
+    /// `POST /api/v1/scope/preview` answer 503 (misconfiguration).
+    void set_scope_evaluate_fn(ScopeEvaluateFn fn) { scope_evaluate_fn_ = std::move(fn); }
+
 private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     UserExistsFn user_exists_fn_;
+    ScopeEvaluateFn scope_evaluate_fn_;
 };
 
 } // namespace yuzu::server

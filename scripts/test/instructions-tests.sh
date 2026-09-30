@@ -105,8 +105,9 @@ fi
 # PyYAML is a hard requirement — embed_content.py also depends on it, so
 # the project's existing build prereqs already cover it.
 if ! python3 -c "import yaml" 2>/dev/null; then
-    echo "error: PyYAML missing. install with 'pip install pyyaml' "\
-"(or 'pacman -S python-yaml' on MSYS2)." >&2
+    echo "error: PyYAML missing for 'python3'. On a developer machine, install it "\
+"with 'pip install pyyaml' (or 'pacman -S python-yaml' on MSYS2). On a shared "\
+"self-hosted CI runner, do not install it here: fix the runner's provisioning." >&2
     exit 2
 fi
 

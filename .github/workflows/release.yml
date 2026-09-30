@@ -25,8 +25,10 @@ permissions:
   contents: read
 
 env:
-  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
-  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # meson pin for the Linux and macOS legs lives in requirements-ci.txt (pip
+  # ecosystem tracked by Dependabot); the Windows leg uses the runner's
+  # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
+  # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
@@ -214,10 +216,29 @@ jobs:
 
       - name: Build .deb packages
         run: |
+          # This job runs in a reused self-hosted workspace (clean: false). Clear
+          # packages left by an earlier release first, or the "*.deb"/"*.rpm"
+          # attest and upload globs ship them as this release's output (v0.13.0-rc6
+          # published rc4 packages with rc6 provenance). This rm is the primary
+          # control; scripts/check-release-artifacts.sh catches only leftovers
+          # from a different version.
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
             --bin-dir build-linux --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm packages
         run: |
@@ -396,11 +417,28 @@ jobs:
 
       - name: Build .deb package
         run: |
+          # Defensive: this job's checkout cleans the workspace, but build-linux's
+          # does not (clean: false) and there old packages were shipped as this
+          # release's output (#5141). Never let the "*.deb"/"*.rpm" attest and
+          # upload globs below see a package this step did not build.
+          rm -f -- ./*.deb ./*.rpm
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-gateway-deb.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$DEB_VERSION" --output .
+          # Pre-release FILE names use the tag's version, not DEB_VERSION (#5141).
+          # The control Version keeps Debian's "~" so 0.14.0~rc3 sorts before
+          # 0.14.0, but GitHub rewrites "~" to "." in asset names, so a "~"
+          # file name never matched SHA256SUMS or the provenance subjects.
+          # Renaming here, before attestation and upload, keeps every
+          # downstream name (attestations, SHA256SUMS, .intoto.jsonl) equal
+          # to the stored asset name.
+          if [ "$DEB_VERSION" != "$VERSION" ]; then
+            for f in *_"${DEB_VERSION}"_*.deb; do
+              mv -v -- "$f" "${f/_${DEB_VERSION}_/_${VERSION}_}"
+            done
+          fi
 
       - name: Build .rpm package
         run: |
@@ -507,9 +545,27 @@ jobs:
         with:
           sdk: 10.0.26100.0
 
-      - name: Install Meson and ccache
+      - name: Verify Meson, PyYAML and ccache (pre-provisioned)
+        shell: pwsh
         run: |
-          pip install --require-hashes -r requirements-ci.txt
+          # Never install Python packages here. Wee Tam's toolchain is set up
+          # by deploy/windows/Provision-Windows-Runner.ps1 and pinned by
+          # deploy/windows/toolchain-contract.json (checked by the next step).
+          # All runner slots share one OS identity, so a machine-wide OR a
+          # --user install changes what every later job's C:\Python314
+          # imports: requirements-ci.txt pins a newer meson than the contract,
+          # and installing it (machine-wide, in the v0.14.0-rc1 release run)
+          # failed the contract check for every Windows job on the box.
+          # A missing PyYAML (embed_content.py needs it at meson setup) is a
+          # provisioning fault, so fail with the fix instead of installing.
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -c "import yaml" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::PyYAML is not importable by the runner's Python (C:\Python314). This job does not install packages into the shared host Python: drain every runner slot on this host, then re-run deploy/windows/Provision-Windows-Runner.ps1 from an elevated pwsh session (do not pass -AllowActiveRunners)."
+            exit 1
+          }
+          meson --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # ccache is pre-provisioned on the Wee Tam (yuzu-weetam-windows)
           # runner — C:\tools\ccache is already on PATH. Chocolatey is NOT
           # installed there, so the old `choco install ccache` aborted the
@@ -2086,7 +2142,9 @@ jobs:
           # SPDX SBOM, and both image SBOMs must be present. Missing any
           # of the above fails the release before we publish anything
           # customers will have to unwind. Tracked as #362 / #408.
-          bash scripts/check-release-artifacts.sh artifacts
+          # With the version it also checks every asset name is one GitHub
+          # stores unchanged and every package is from this release (#5141).
+          bash scripts/check-release-artifacts.sh artifacts "${GITHUB_REF_NAME#v}"
 
       - name: Generate SHA256SUMS
         run: |
@@ -2225,12 +2283,14 @@ jobs:
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
           # Agent
-          YuzuAgentSetup-*.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+          YuzuAgentSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
 
           # Server
-          YuzuServerSetup-*.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=<password> \`
+          YuzuServerSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=<password> \`
             /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
+
+          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash

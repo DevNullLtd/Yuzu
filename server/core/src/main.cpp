@@ -1331,6 +1331,30 @@ int main(int argc, char* argv[]) {
     auto cfg_path =
         config_file.empty() ? auth::default_config_path() : std::filesystem::path(config_file);
 
+    // Canonicalize to an absolute path up front (PR #5107 review finding). A
+    // bare relative `--config yuzu-server.cfg` left `cfg_path.parent_path()`
+    // empty; `Locations{data_dir, auth_config_path.parent_path()}` (server.cpp)
+    // then skipped the config-dir probe for the one-time legacy enrollment
+    // import entirely (WS-6 6.2) — the pre-6.2 code implicitly resolved that
+    // same empty parent against the CWD via plain path concatenation
+    // (`"" / "enrollment-tokens.cfg"`), so this is a silent regression, not a
+    // pre-existing gap: an operator's earlier approve/deny decisions could be
+    // dropped on upgrade with no import ever attempted, no error, and no
+    // log line. `default_config_path()` is always absolute; only an explicit
+    // relative `--config` can hit this. Absolutize before anything derives a
+    // directory from it (`load_config`, `first_run_setup`, `state_dir()`-style
+    // callers, the importer) rather than patching one consumer.
+    {
+        std::error_code ec;
+        auto absolute = std::filesystem::absolute(cfg_path, ec);
+        if (ec) {
+            spdlog::warn("Could not absolutize --config path '{}' ({}); using it as given",
+                         cfg_path.string(), ec.message());
+        } else {
+            cfg_path = std::move(absolute);
+        }
+    }
+
     auth::AuthManager auth_mgr;
     // Idle (inactivity) session timeout — SOC 2 CC6.3. In-memory feature, set
     // unconditionally (works with or without auth.db). 0 = disabled.
@@ -1653,12 +1677,6 @@ int main(int argc, char* argv[]) {
         }
         std::filesystem::remove(probe, ec); // best-effort cleanup
 
-        auth_mgr.set_data_dir(cfg.data_dir);
-        // Re-load tokens and pending agents from the new data directory.
-        // The initial load_config() loaded them from cfg_path_ parent (the old
-        // location) because set_data_dir() hadn't been called yet.
-        auth_mgr.reload_state();
-
         spdlog::info("Data directory: {}", cfg.data_dir.string());
     }
 
@@ -1871,11 +1889,104 @@ int main(int argc, char* argv[]) {
     // -- Batch token generation mode (exits without starting server) ----------
 
     if (generate_tokens > 0) {
-        auto ttl = gen_ttl_hours > 0 ? std::chrono::seconds(gen_ttl_hours * 3600)
-                                     : std::chrono::seconds(0);
+        // int64 cast: gen_ttl_hours * 3600 can overflow a 32-bit int for a
+        // maliciously/accidentally huge --token-ttl-hours (signed overflow is UB,
+        // not just wrong) — same class of fix as settings_routes.cpp's enrollment
+        // handlers (WS-6 6.2 commit 4). AuthDB::create_token rejects an
+        // out-of-bounds ttl regardless (kMaxEnrollmentTtlSeconds), so this is
+        // belt-and-braces, not a behaviour change for any realistic value.
+        auto ttl = gen_ttl_hours > 0
+                       ? std::chrono::seconds(static_cast<std::int64_t>(gen_ttl_hours) * 3600)
+                       : std::chrono::seconds(0);
 
-        auto tokens =
-            auth_mgr.create_enrollment_tokens_batch(gen_label, generate_tokens, gen_max_uses, ttl);
+        // WS-6 6.2: tokens live in Postgres (shared by every replica), so mint
+        // through the same auth store the server uses. No auth store => fail
+        // closed, like --mfa-reset (a token minted to a per-host file would be
+        // invisible to the running server).
+        if (!auth_db) {
+            spdlog::error("--generate-tokens requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        // A privileged mint with no audit trail (PR #5107 review, Should-fix):
+        // the merge-base --generate-tokens path was equally unaudited, so this
+        // doesn't regress prior behaviour, but this block was rewritten in this
+        // PR and open_one_shot_audit is 200 lines away, so fix it here rather
+        // than file a follow-up. Verify the audit store is WRITABLE before
+        // minting anything — same fail-closed posture as --mfa-reset — rather
+        // than minting first and discovering the store is dead afterward.
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.audit_retention_days,
+                                         "--generate-tokens", "mint enrollment tokens");
+        if (!audit)
+            return EXIT_FAILURE;
+        const std::string created_by = "cli:" + resolve_os_principal();
+        std::vector<std::string> tokens;
+        std::vector<std::string> token_ids;
+        tokens.reserve(static_cast<size_t>(generate_tokens));
+        token_ids.reserve(static_cast<size_t>(generate_tokens));
+        for (int i = 0; i < generate_tokens; ++i) {
+            const auto label = gen_label.empty() ? std::format("batch-{}", i + 1)
+                                                 : std::format("{}-{}", gen_label, i + 1);
+            auto created = auth_db->create_token(label, gen_max_uses, ttl, created_by);
+            if (!created) {
+                spdlog::error("--generate-tokens: token {} of {} failed to persist ({} minted "
+                              "before the failure remain valid; revoke via the dashboard)",
+                              i + 1, generate_tokens, tokens.size());
+                std::cerr << "error: enrollment token could not be persisted\n";
+                return EXIT_FAILURE;
+            }
+            token_ids.push_back(created->token_id);
+            tokens.push_back(std::move(created->raw_token));
+        }
+        spdlog::info("Batch created {} enrollment tokens (prefix='{}')", tokens.size(), gen_label);
+
+        // One batch audit event, never the raw tokens — only the 8-hex ids
+        // (same `count=N ids=<first 20>` shape settings_routes.cpp's REST twin
+        // uses; capped so a huge --generate-tokens count can't bloat one row).
+        // Same action name as the REST/dashboard batch-create path
+        // (enrollment.bulk_token_create) — one action per semantic operation,
+        // regardless of which entry point minted it.
+        {
+            constexpr std::size_t kMaxListed = 20;
+            std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+                                 " count=" + std::to_string(token_ids.size());
+            if (!token_ids.empty()) {
+                detail += " ids=";
+                for (std::size_t i = 0; i < token_ids.size() && i < kMaxListed; ++i) {
+                    if (i)
+                        detail += ',';
+                    detail += token_ids[i];
+                }
+                if (token_ids.size() > kMaxListed)
+                    detail += ",...";
+            }
+            yuzu::server::AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = created_by;
+            ev.principal_role = "cli";
+            ev.action = "enrollment.bulk_token_create";
+            ev.target_type = "EnrollmentToken";
+            ev.target_id = "";
+            ev.result = "success";
+            ev.detail = detail;
+            if (!audit->log(ev)) {
+                // The tokens already persisted and their raw values may already
+                // be about to reach stdout — matching --mfa-reset's H-1
+                // posture, fail loudly and non-zero so the operator/automation
+                // knows the evidence row is missing, rather than silently
+                // shipping unaudited credentials.
+                spdlog::error("--generate-tokens: {} token(s) minted but the audit row failed to "
+                              "persist — record this batch manually in your change-management "
+                              "system NOW",
+                              tokens.size());
+                std::cerr << "error: tokens minted but audit row failed to persist; record this "
+                             "batch manually\n";
+                return EXIT_FAILURE;
+            }
+        }
 
         // Output JSON to stdout for scripting (Ansible, etc.)
         std::cout << "{\"count\":" << tokens.size() << ",\"tokens\":[\n";
