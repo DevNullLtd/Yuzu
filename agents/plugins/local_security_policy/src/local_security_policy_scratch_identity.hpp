@@ -78,6 +78,7 @@ inline bool scratch_dir_is_ours(HANDLE dir_handle) {
         return false;
     struct SdGuard { // owns the GetSecurityInfo-allocated descriptor (LocalFree); never copied
         PSECURITY_DESCRIPTOR p;
+        explicit SdGuard(PSECURITY_DESCRIPTOR d) : p(d) {}
         SdGuard(const SdGuard&) = delete;
         SdGuard& operator=(const SdGuard&) = delete;
         ~SdGuard() {
