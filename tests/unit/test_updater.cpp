@@ -7,10 +7,13 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include "ota_update_thread.hpp"
+
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -267,4 +270,48 @@ TEST_CASE("Updater::stop ends run_check_loop for extreme intervals",
         REQUIRE(fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
         CHECK_FALSE(fut.get());
     }
+}
+
+// ── OTA update thread lifecycle (#2182) ─────────────────────────────────────
+// OtaUpdateThread is what agent.cpp's spawn, reconnect teardown and quiesce all go through, so
+// this exercises the real stop-THEN-join ordering rather than a copy of it.
+
+TEST_CASE("OtaUpdateThread::stop_and_join ends a thread parked in the check interval",
+          "[updater][stop][2182]") {
+    UpdateConfig config;
+    auto updater = std::make_shared<Updater>(config, "agent-2182", "0.1.0", "linux", "x86_64",
+                                             current_executable_path());
+    struct State {
+        OtaUpdateThread thread;
+        std::atomic<bool> started{false};
+        std::atomic<bool> applied{false};
+        std::promise<void> joined;
+    };
+    // Owned by the detached driver so a regression (join without stop) fails the bound below
+    // instead of hanging the suite or terminating in ~thread.
+    auto st = std::make_shared<State>();
+    auto fut = st->joined.get_future();
+    // Null stub: check_and_apply fails fast, the loop parks in an hour-long wait.
+    st->thread.start(updater, nullptr, std::chrono::hours{1}, [st] { st->started = true; },
+                     [st] { st->applied = true; });
+    REQUIRE(st->thread.joinable());
+
+    std::thread([st, updater] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        st->thread.stop_and_join(updater);
+        st->joined.set_value();
+    }).detach();
+
+    REQUIRE(fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+    CHECK(st->started.load());
+    CHECK_FALSE(st->applied.load()); // stopped, not applied
+    CHECK_FALSE(st->thread.joinable());
+}
+
+TEST_CASE("OtaUpdateThread::join and stop tolerate an unstarted thread and a null updater",
+          "[updater][stop][2182]") {
+    OtaUpdateThread thread;
+    CHECK_FALSE(thread.joinable());
+    thread.stop_and_join(nullptr); // reconnect teardown with auto_update off / no updater
+    thread.join();
 }

@@ -40,6 +40,8 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
+#include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
+#include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -2114,17 +2116,18 @@ public:
                     // every iteration: run() may publish a new Updater on the next reconnect,
                     // and this thread would then be using a different object mid-flight (and,
                     // with a unique_ptr, a freed one).
-                    update_thread_ = std::thread([this, raw_stub,
-                                                  updater = updater()]() {
-                        spdlog::info("OTA update checker started (interval={}s)",
-                                     cfg_.update_check_interval.count());
-                        // Waits on the UPDATER's stop state, not AgentImpl::stop_requested_:
-                        // the reconnect teardown calls only Updater::stop() (#2182).
-                        if (updater->run_check_loop(raw_stub, cfg_.update_check_interval)) {
+                    // Waits on the UPDATER's stop state, not AgentImpl::stop_requested_:
+                    // the reconnect teardown calls only Updater::stop() (#2182).
+                    update_thread_.start(
+                        updater(), raw_stub, cfg_.update_check_interval,
+                        [this]() {
+                            spdlog::info("OTA update checker started (interval={}s)",
+                                         cfg_.update_check_interval.count());
+                        },
+                        [this]() {
                             spdlog::info("OTA update applied - agent will restart");
                             stop();
-                        }
-                    });
+                        });
                 }
 
                 // 4b-sync. Spawn the daily-sync thread (ADR-0016). Per-connection,
@@ -2377,7 +2380,8 @@ public:
                             grpc::ClientContext ctx;
                             // Per-iteration: the dtor retracts it under ctx_mu_ at the end of
                             // this loop body, before `ctx` is destroyed.
-                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx};
+                            CtxSlot hb_slot{ctx_mu_, heartbeat_ctx_, &ctx,
+                                            [&should_stop] { return should_stop(); }};
                             // Re-check after publishing. cancel_ctx() takes the same ctx_mu_ the
                             // CtxSlot ctor publishes under, and teardown sets heartbeat_stop_ /
                             // stop_requested_ BEFORE calling it, so either cancel_ctx() saw the
@@ -2385,7 +2389,7 @@ public:
                             // it a teardown landing between the check above and the publish cancels
                             // nothing, and the deadline-less Heartbeat RPC (#3989) wedges the join.
                             // The break leaves the loop; ~CtxSlot retracts the slot (ctx dies after).
-                            if (should_stop())
+                            if (hb_slot.stop_seen())
                                 break;
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
@@ -3341,12 +3345,9 @@ public:
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
-                if (auto u = updater()) {
-                    u->stop(); // local copy keeps it alive even if run() swaps the slot
-                }
-                if (update_thread_.joinable()) {
-                    update_thread_.join();
-                }
+                // stop() THEN join, in one tested place (#2182); the local copy keeps the
+                // Updater alive even if run() swaps the slot.
+                update_thread_.stop_and_join(updater());
 
                 // Signal heartbeat thread to exit and cancel any in-flight RPC.
                 // cancel_ctx() holds ctx_mu_ across the load+TryCancel, so the heartbeat
@@ -4085,8 +4086,7 @@ private:
         cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
             sync_thread_.join();
-        if (update_thread_.joinable())
-            update_thread_.join();
+        update_thread_.join();
     }
 
     Config cfg_;
@@ -4220,33 +4220,13 @@ private:
     /// heartbeat thread's own ~CtxSlot needs ctx_mu_ to exit. Hold the lock for the slot's
     /// lifetime (e.g. "optimise" these lock_guards into a unique_lock member) and run() would
     /// deadlock against the very thread it is joining, on every reconnect. Do not.
-    class CtxSlot {
-    public:
-        CtxSlot(std::mutex& mu, std::atomic<grpc::ClientContext*>& slot,
-                grpc::ClientContext* ctx) noexcept
-            : mu_{mu}, slot_{slot} {
-            std::lock_guard lk(mu_);
-            slot_.store(ctx, std::memory_order_release);
-        }
-        ~CtxSlot() {
-            std::lock_guard lk(mu_);
-            slot_.store(nullptr, std::memory_order_release);
-        }
-        CtxSlot(const CtxSlot&) = delete;
-        CtxSlot& operator=(const CtxSlot&) = delete;
-
-    private:
-        std::mutex& mu_;
-        std::atomic<grpc::ClientContext*>& slot_;
-    };
+    using CtxSlot = ::yuzu::agent::CtxSlot;
 
     /// The ONLY way to cancel one of the three contexts. Loads AND TryCancel()s under ctx_mu_
     /// so the owning frame's ~CtxSlot cannot retire the context in between. Safe on a slot
     /// that is already null (the common case — the RPC has finished).
     void cancel_ctx(std::atomic<grpc::ClientContext*>& slot) noexcept {
-        std::lock_guard lk(ctx_mu_);
-        if (auto* c = slot.load(std::memory_order_acquire))
-            c->TryCancel();
+        cancel_ctx_slot(ctx_mu_, slot);
     }
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
@@ -4410,7 +4390,7 @@ private:
             updater_ = std::move(u);
         }
     }
-    std::thread update_thread_;
+    OtaUpdateThread update_thread_;
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
 

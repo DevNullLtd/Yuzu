@@ -21,6 +21,7 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include "ctx_slot.hpp"
 #include "updater_rpc_guard.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -491,6 +492,64 @@ TEST_CASE("ActiveRpcCtxGuard cancels an RPC published after stop was requested",
     REQUIRE(returned);
     CHECK(fut.get() == grpc::StatusCode::CANCELLED);
     // CANCELLED (not UNAVAILABLE) shows the cancel, not a failed connect, ended the call.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds{2});
+}
+
+// #2182 heartbeat/Register/Subscribe/sync sites: AgentImpl publishes each in-flight context
+// through CtxSlot and cancels it through cancel_ctx_slot (the primitives agent.cpp uses).
+// (a) a slot published AFTER stop must report stop_seen() so the caller skips the RPC;
+// (b) a slot published BEFORE the cancel must be cancelled, unblocking the parked RPC.
+TEST_CASE("CtxSlot reports a stop that landed before publish", "[updater][stop][2182]") {
+    std::mutex mu;
+    std::atomic<grpc::ClientContext*> slot{nullptr};
+    std::atomic<bool> stop{true};
+    grpc::ClientContext ctx;
+    {
+        yuzu::agent::CtxSlot s{mu, slot, &ctx, [&] { return stop.load(); }};
+        CHECK(s.stop_seen());
+        CHECK(slot.load() == &ctx); // still published: ~CtxSlot retracts it
+    }
+    CHECK(slot.load() == nullptr);
+    stop = false;
+    yuzu::agent::CtxSlot s2{mu, slot, &ctx, [&] { return stop.load(); }};
+    CHECK_FALSE(s2.stop_seen());
+}
+
+TEST_CASE("cancel_ctx_slot cancels an RPC published through CtxSlot", "[updater][stop][2182]") {
+    BlockingCheckService svc;
+    grpc::ServerBuilder builder;
+    builder.RegisterService(&svc);
+    auto server = builder.BuildAndStart();
+    REQUIRE(server != nullptr);
+
+    struct State {
+        std::mutex mu;
+        std::atomic<grpc::ClientContext*> slot{nullptr};
+        std::atomic<bool> published{false};
+        std::promise<grpc::StatusCode> code;
+        std::unique_ptr<apb::AgentService::Stub> stub;
+    };
+    auto st = std::make_shared<State>();
+    st->stub = apb::AgentService::NewStub(server->InProcessChannel(grpc::ChannelArguments()));
+    auto fut = st->code.get_future();
+    std::thread([st] {
+        grpc::ClientContext ctx;
+        yuzu::agent::CtxSlot slot{st->mu, st->slot, &ctx};
+        st->published = true;
+        apb::CheckForUpdateRequest req;
+        apb::CheckForUpdateResponse resp;
+        st->code.set_value(st->stub->CheckForUpdate(&ctx, req, &resp).error_code());
+    }).detach();
+
+    while (!st->published.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    std::this_thread::sleep_for(std::chrono::milliseconds{100}); // let the RPC reach the handler
+    yuzu::agent::cancel_ctx_slot(st->mu, st->slot);
+
+    const bool returned = fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    svc.release_p.set_value();
+    REQUIRE(returned);
+    CHECK(fut.get() == grpc::StatusCode::CANCELLED);
     server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds{2});
 }
 
