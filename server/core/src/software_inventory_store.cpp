@@ -226,10 +226,10 @@ const std::vector<pg::PgMigration>& migrations() {
          // boot migration is a permanently fail-closed server, not a protection.
          // Accepted risk (docs/postgres-migration-ladder.md, SoftwareInventoryStore row):
          // the ACCESS EXCLUSIVE lock is held for the whole rewrite plus index build,
-         // extrapolated at 2.6-4.5 us/row: past lock_timeout (10 s) from about 2-4M
-         // rows, about 10 minutes near 130-230M. Tolerated only while no deployment
-         // holds a table that large; any later change here that rewrites the table or
-         // builds an index must be online.
+         // extrapolated at 2.6-4.5 us/row: once the hold passes lock_timeout (10 s), from
+         // about 2-4M rows, statements queued behind it time out; about 10 minutes near
+         // 130-230M rows. Tolerated only while no deployment holds a table of that size;
+         // any later change here that rewrites the table or builds an index must be online.
          "SET LOCAL statement_timeout = 0;"
          "DROP INDEX IF EXISTS installed_software_name_idx;"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '';"

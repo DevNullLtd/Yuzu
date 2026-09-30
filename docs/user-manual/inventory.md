@@ -192,28 +192,56 @@ The data lands in the Postgres schema **`software_inventory_store`**:
 
 **Upgrading.** The first server start after the release that added the extended
 columns (schema v7) rewrites `installed_software` once, under an exclusive lock,
-to add `install_id`, then rebuilds the name index. Time grows with row count:
-about 10-20 s at 4M rows (roughly 13,000 machines at 300 rows each), and longer
-beyond that. The pool's 30 s per-statement limit is lifted for that migration
-only. Count the rows first (`SELECT count(*) FROM
-software_inventory_store.installed_software`). Below about 2 million rows the
-lock is held for under 10 s: start one server replica first and let the
-migration finish before starting the rest, since a second replica waits at most
-10 s for the migration lock and then refuses to start, and avoid long-running
-`installed_software` readers during that first start. Above that, stop every
-replica and start one, because a replica still running the old version queues
-its `installed_software` reads and writes behind the lock, holding a pooled
-connection for up to 10 s each before erroring. The migration logs nothing until
-`migrated to v7`; watch it in `pg_stat_activity`. It is one transaction: if a
-supervisor or health check kills the server first, the work is rolled back and
-the next start begins again, so size start deadlines to the row count (the
-reference Compose health check reports unhealthy after about two minutes). A
-start refused with `post-migration schema projection check failed` means a
-column the queries need is missing although the recorded version is current (for
-example a database restored from an older dump); the log names the first missing
-column, and `SELECT version FROM public.schema_meta WHERE store =
-'software_inventory_store'` shows the recorded version. Deploy the server before
-any agent that emits the new fields.
+to add `install_id`, then rebuilds the name index. The time grows with the row
+count: about 10-20 s at 4M rows (roughly 13,000 machines, assuming about 300
+installed items each), measured on one development host with a single-node
+Postgres, and longer beyond that. The pool's 30 s per-statement limit is lifted
+for that migration only. Before upgrading, count the rows:
+
+```sql
+SELECT count(*) FROM software_inventory_store.installed_software;
+```
+
+and check free space: the rewrite needs room for a second copy of the table and
+the rebuilt index and writes about as much WAL; with a synchronous standby,
+expect the lock to be held until the standby confirms the commit.
+
+Start one server replica first and let the migration finish (`migrated to v7` in
+its log) before starting the rest: a second replica waits at most 10 s for the
+migration lock and then refuses to start. Avoid long-running
+`installed_software` readers during that first start. Above about 2 million rows
+(when the lock is held for more than 10 s), also stop every replica before
+starting that one: a replica still running the old version queues its
+`installed_software` reads and writes behind the lock, holding a pooled
+connection for up to 10 s each before erroring, and a custom `options` in the
+database connection string turns off the pool's timeouts, so they then wait for
+the whole migration. If you are unsure of the row count, stop every replica
+first.
+
+The migration is one transaction and logs nothing until `migrated to v7`; watch
+it in `pg_stat_activity`. If a supervisor or health check kills the server before
+it finishes, Postgres rolls the work back only once it notices the lost
+connection, which is when the running statement returns, so the backend can keep
+the lock for the rest of the rewrite. Find it in `pg_stat_activity` and
+`pg_terminate_backend` it before restarting, or the restart waits 10 s at the
+lock and refuses to start. Size start deadlines to the row count: the health
+check in `docker-compose.reference.yml` reports unhealthy after about two
+minutes, and under the shipped systemd unit a replica refused at the lock can
+reach `failed` within a minute and needs `systemctl reset-failed`.
+
+A start refused with `post-migration schema projection check failed` usually
+means a column the software queries need is missing although the recorded schema
+version is current, for example after restoring only the
+`software_inventory_store` schema from an older dump while `public.schema_meta`
+kept its newer version. The log ends with the PostgreSQL error, which names the
+first missing column; a connection, permission or lock-timeout error there is
+not a schema mismatch, so restart. The recorded version is:
+
+```sql
+SELECT version FROM public.schema_meta WHERE store = 'software_inventory_store';
+```
+
+Deploy the server before any agent that emits the new fields.
 
 Today it is queried with **direct SQL**, e.g.:
 

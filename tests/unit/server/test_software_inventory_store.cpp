@@ -961,6 +961,7 @@ TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries u
     // A catalog read that returned only part of the schema would pass vacuously; name the tables.
     for (const char* table : {"installed_software", "inventory_state", "catalog_rollup",
                               "version_rollup", "catalog_rollup_meta"}) {
+        CAPTURE(table);
         REQUIRE(std::any_of(columns.begin(), columns.end(),
                             [&](const auto& c) { return c.first == table; }));
     }
@@ -974,14 +975,14 @@ TEST_CASE("SoftwareInventoryStore reports !is_open when any column its queries u
 
     for (const auto& [table, column] : columns) {
         CAPTURE(table, column);
-        const std::string rename =
+        const std::string rename_prefix =
             "ALTER TABLE software_inventory_store.\"" + table + "\" RENAME COLUMN \"";
-        alter(rename + column + "\" TO \"" + column + "_gone\"");
+        alter(rename_prefix + column + "\" TO \"" + column + "_gone\"");
         {
             SoftwareInventoryStore broken{pool};
             CHECK_FALSE(broken.is_open());
         }
-        alter(rename + column + "_gone\" TO \"" + column + "\"");
+        alter(rename_prefix + column + "_gone\" TO \"" + column + "\"");
         {
             SoftwareInventoryStore restored{pool};
             CHECK(restored.is_open());
