@@ -9,20 +9,31 @@
 #   qa-stack.sh up <version>        start server+gateway (+postgres), enrol an agent
 #   qa-stack.sh upgrade <version>   move every service to <version>, wait for recovery
 #   qa-stack.sh has-stack <version> exit 0 if release <version> ships the reference
-#                                   template, 1 if it predates it
+#                                   template, 3 if it predates it (the file is absent
+#                                   at the tag); 1 for anything else, e.g. GitHub
+#                                   unreachable — never read that as "predates"
 #   qa-stack.sh wait-agent          wait until the server reports >= 1 connected agent
 #   qa-stack.sh login               (re)create the admin session cookie
 #   qa-stack.sh api <METHOD> <path> [json-body]   authenticated HTTPS call, body to stdout
 #   qa-stack.sh roundtrip <plugin> <action> <key> [polls]
 #                                   dispatch a command, print the agent's `<key>|` value
 #   qa-stack.sh agents              connected agents, one `<agent_id> <agent_version>` per line
-#   qa-stack.sh metric <server|gateway> <name>    print a metric's value (0 if absent)
+#   qa-stack.sh metric <server|gateway> <name>    print a metric's value (0 if the
+#                                   family is absent); exit 1, printing nothing, if
+#                                   /metrics cannot be fetched after one retry
 #   qa-stack.sh wait-metric <server|gateway> <name> <min> <seconds>
 #                                   poll until the metric is >= <min>; print it, or fail
 #   qa-stack.sh running             how many of the four services are in state "running"
 #   qa-stack.sh restarts            total restart count across the four services
 #   qa-stack.sh state               one line: <service>=<status>/<restarts> for each
+#   qa-stack.sh check-stable        print `state`; fail, naming the service, unless all
+#                                   four are running with a restart count of 0
+#   qa-stack.sh crash-check         grep each service's log for crash signatures
+#                                   (not postgres'); fail naming the service
 #   qa-stack.sh stats               one line of per-service memory usage
+#   qa-stack.sh mem-growth <first> <last>
+#                                   given two `stats` lines, print each service whose
+#                                   memory more than doubled (always exits 0)
 #   qa-stack.sh logs <file>         write all service logs to <file>
 #   qa-stack.sh down                stop and delete the stack and its volumes
 #
@@ -40,6 +51,21 @@
 # the server's cert volume); its HTTPS leaf carries SANs localhost/127.0.0.1.
 # Gateway health (:8081) and metrics (:9568) are plain HTTP and are published
 # on 127.0.0.1 only by the QA override below.
+#
+# Time budget. Every wait is driven by a $SECONDS deadline, so it ends within
+# its budget plus ONE probe (an iteration that started just before the
+# deadline), never "N iterations x however long each probe took". Ceilings,
+# which the job timeouts in .github/workflows/pre-release.yml are sized from:
+#   fetch one tagged file   <= 3 x 20s (--retry 2) + backoff        ~ 65s
+#   pull                    <= 3 x 120s + 10s + 20s sleeps          = 390s
+#   compose up -d           <= 120s per call (it waits on Postgres' healthcheck)
+#   wait_server             <= 180s + one probe (cp + 10s curl + 3s) ~ 195s
+#   wait_gateway            <= 180s + one probe (5s curl + 3s)      ~ 190s
+#   wait_agent              <= 180s + one metric read (<= 3 x 30s)  = 270s
+#   login / one api call    <= 30s
+#   `up`      = 2 fetches + pull + 2 x up -d + the three waits + login
+#               + token                                             ~ 1470s (24.5 min)
+#   `upgrade` = the same without the agent's up -d and the token    ~ 1320s (22 min)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -53,14 +79,13 @@ BASE_URL="https://localhost:8443"
 ENV_FILE="$STATE/qa.env"
 OVERRIDE="$STATE/qa.override.yml"
 SERVICES=(server gateway agent postgres)
+WAIT_SECS=180
+COMPOSE=(docker compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE")
 
 log() { printf '[qa-stack] %s\n' "$*" >&2; }
 die() { printf '::error::qa-stack: %s\n' "$*" >&2; exit 1; }
 
-compose() {
-  docker compose -p "$PROJECT" --env-file "$ENV_FILE" \
-    -f "$COMPOSE_FILE" -f "$OVERRIDE" "$@"
-}
+compose() { "${COMPOSE[@]}" "$@"; }
 
 # A version reaches a sed replacement, a URL and an image tag, so it is checked
 # against the release-tag shape before any of them.
@@ -105,14 +130,14 @@ PY
 
 # fetch_tag_file VERSION REPO_PATH OUT
 #   0 = fetched to OUT; 3 = the file does not exist at that tag (HTTP 404).
-#   Anything else (network, TLS, 5xx after retries) is fatal: an unreachable
-#   GitHub must never read as "this release has no such file".
+#   Anything else (DNS, network, TLS, 5xx after retries) DIES with exit 1: an
+#   unreachable GitHub must never read as "this release has no such file".
 fetch_tag_file() {
-  local ver="$1" path="$2" out="$3" url code
+  local ver="$1" path="$2" out="$3" url code rc=0
   url="https://raw.githubusercontent.com/${QA_REPO}/v${ver}/${path}"
-  code="$(curl -sSL --proto '=https' --max-time 30 --retry 3 \
-            -o "$out.part" -w '%{http_code}' "$url")" \
-    || die "could not fetch $url"
+  code="$(curl -sSL --proto '=https' --max-time 20 --retry 2 \
+            -o "$out.part" -w '%{http_code}' "$url")" || rc=$?
+  [[ "$rc" -eq 0 ]] || { rm -f "$out.part"; die "could not fetch $url (curl exit $rc)"; }
   case "$code" in
     200) mv "$out.part" "$out" ;;
     404) rm -f "$out.part"; return 3 ;;
@@ -120,6 +145,9 @@ fetch_tag_file() {
   esac
 }
 
+# Exit 3 — not 1 — for "predates": 1 is what `die` (and so every fetch
+# failure) exits with, and the upgrade job turns "predates" into a NOT TESTED
+# that still passes. Sharing a code let a GitHub outage report green.
 cmd_has_stack() {
   local ver="${1:?version required}" rc=0
   check_version "$ver"
@@ -128,8 +156,8 @@ cmd_has_stack() {
   rm -f "$STATE/probe-template.yml"
   case "$rc" in
     0) log "v${ver} ships $TEMPLATE_PATH"; return 0 ;;
-    3) log "v${ver} predates $TEMPLATE_PATH"; return 1 ;;
-    *) return "$rc" ;;
+    3) log "v${ver} predates $TEMPLATE_PATH"; exit 3 ;;
+    *) die "has-stack: unexpected status $rc probing v${ver}" ;;
   esac
 }
 
@@ -144,8 +172,13 @@ stage_version() {
   fetch_tag_file "$ver" "$SYS_CONFIG_PATH" "$STATE/gateway-sys.config" || rc=$?
   [[ "$rc" -eq 0 ]] || die "v${ver} has no $SYS_CONFIG_PATH"
 
-  target="$(grep -oE '/opt/yuzu_gw/releases/[^/:[:space:]]+/sys\.config' "$tagged" | head -1 || true)"
-  [[ -n "$target" ]] || die "v${ver}'s template mounts no /opt/yuzu_gw/releases/<vsn>/sys.config"
+  # Exactly one: with two, which one the gateway reads is not ours to guess.
+  local targets n
+  targets="$(grep -oE '/opt/yuzu_gw/releases/[^/:[:space:]]+/sys\.config' "$tagged" || true)"
+  n="$(printf '%s' "$targets" | grep -c . || true)"
+  [[ "$n" -eq 1 ]] \
+    || die "v${ver}'s template names $n /opt/yuzu_gw/releases/<vsn>/sys.config paths, expected exactly one: $(printf '%s' "$targets" | tr '\n' ' ')"
+  target="$targets"
   log "gateway sys.config: v${ver}, mounted at $target"
 
   drift="$STATE/template-drift-v${ver}.diff"
@@ -155,7 +188,9 @@ stage_version() {
   [[ "$rc" -le 1 ]] || die "could not compare v${ver}'s template with $COMPOSE_FILE"
   if [[ "$rc" -eq 1 ]]; then
     local n
-    n="$(grep -cE '^[-+][^-+]' "$drift" || true)"
+    # Every +/- line after the two ---/+++ header lines (a changed line may
+    # itself start with - or +, so a pattern excluding those would undercount).
+    n="$(tail -n +3 "$drift" | grep -c '^[-+]' || true)"
     echo "::warning::QA runs this checkout's $TEMPLATE_PATH, which differs from the one tagged v${ver} ($n changed lines). Images are v${ver}'s; the service definitions are the checkout's. Diff in the job summary."
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
       {
@@ -198,43 +233,50 @@ dump_stack() {
 pull() {
   local n
   for n in 1 2 3; do
-    compose pull -q && return 0
-    log "compose pull failed (attempt $n/3)"
-    sleep $((n * 10))
+    timeout 120 "${COMPOSE[@]}" pull -q && return 0
+    log "compose pull failed or took over 120s (attempt $n/3)"
+    [[ "$n" -lt 3 ]] && sleep $((n * 10))
   done
   die "compose pull failed 3 times"
 }
 
 up() {  # up [SERVICE...]
-  compose up -d "$@" || { dump_stack; die "compose up -d $* failed"; }
+  timeout 120 "${COMPOSE[@]}" up -d "$@" || { dump_stack; die "compose up -d $* failed or took over 120s"; }
 }
 
 # Origin is the stack's own origin: cookie-authenticated mutations are
 # same-site-checked (Origin/Referer vs Host), and a script sends neither.
 curl_tls() { curl -sS --max-time 30 --cacert "$STATE/ca.pem" -H "Origin: $BASE_URL" "$@"; }
 
+# The waits below loop until a $SECONDS deadline (see "Time budget" above).
+# The probe's own curl is capped at 10s (a later --max-time overrides
+# curl_tls's 30s), so one probe cannot eat the budget.
 wait_server() {
+  local end=$((SECONDS + WAIT_SECS))
   log "waiting for the server (HTTPS /livez, verified against the install CA)"
-  for _ in $(seq 1 60); do
+  while :; do
     if compose cp server:/etc/yuzu/certs/default-ca.pem "$STATE/ca.pem" >/dev/null 2>&1 \
-       && [[ "$(curl_tls -o /dev/null -w '%{http_code}' "$BASE_URL/livez" 2>/dev/null)" == "200" ]]; then
+       && [[ "$(curl_tls --max-time 10 -o /dev/null -w '%{http_code}' "$BASE_URL/livez" 2>/dev/null)" == "200" ]]; then
       log "server is live"; return 0
     fi
+    [[ "$SECONDS" -lt "$end" ]] || break
     sleep 3
   done
   dump_stack
-  die "server did not become live over HTTPS within 180s"
+  die "server did not become live over HTTPS within ${WAIT_SECS}s"
 }
 
 wait_gateway() {
+  local end=$((SECONDS + WAIT_SECS))
   log "waiting for the gateway (/readyz)"
-  for _ in $(seq 1 60); do
+  while :; do
     curl -sf --max-time 5 http://127.0.0.1:8081/readyz 2>/dev/null | grep -q '"ready"' \
       && { log "gateway is ready"; return 0; }
+    [[ "$SECONDS" -lt "$end" ]] || break
     sleep 3
   done
   dump_stack
-  die "gateway did not report ready within 180s"
+  die "gateway did not report ready within ${WAIT_SECS}s"
 }
 
 login() {
@@ -259,12 +301,38 @@ api() {  # api METHOD PATH [JSON]
   fi
 }
 
+# fetch_metrics SRC: print SRC's /metrics text; non-zero (with the reason on
+# stderr) unless it answered HTTP 200.
+fetch_metrics() {
+  local src="$1" body code
+  body="$(mktemp)"
+  if [[ "$src" == server ]]; then
+    code="$(curl_tls -b "$STATE/cookies.txt" -o "$body" -w '%{http_code}' "$BASE_URL/metrics" 2>/dev/null)" \
+      || code="curl exit $?"
+  else
+    code="$(curl -s --max-time 10 -o "$body" -w '%{http_code}' http://127.0.0.1:9568/metrics 2>/dev/null)" \
+      || code="curl exit $?"
+  fi
+  if [[ "$code" == 200 ]]; then
+    cat "$body"; rm -f "$body"; return 0
+  fi
+  rm -f "$body"
+  log "GET $src /metrics: ${code}"
+  return 1
+}
+
+# A failed fetch (timeout, 5xx, or a 401/redirect once the session cookie has
+# expired) is NOT a zero: that turned one slow scrape into "0 agents" and
+# failed a whole soak sample for the wrong reason. Re-login (server) and retry
+# once; if it still fails, say so and exit 1 with nothing on stdout.
 metric() {  # metric server|gateway NAME
   local src="$1" name="$2" text
-  if [[ "$src" == server ]]; then
-    text="$(api GET /metrics 2>/dev/null || true)"
-  else
-    text="$(curl -s --max-time 10 http://127.0.0.1:9568/metrics 2>/dev/null || true)"
+  [[ "$src" == server || "$src" == gateway ]] || die "metric: source must be server or gateway, not '$src'"
+  if ! text="$(fetch_metrics "$src")"; then
+    if [[ "$src" == server ]]; then
+      ( login ) >/dev/null 2>&1 || log "re-login before the retry failed"
+    fi
+    text="$(fetch_metrics "$src")" || { log "metric fetch failed: $src $name"; return 1; }
   fi
   # Sum every series of the family (labelled or not); 0 when absent.
   printf '%s\n' "$text" | awk -v n="$name" '
@@ -280,8 +348,11 @@ wait_metric() {
   [[ "$min" =~ ^[0-9]+$ && "$secs" =~ ^[0-9]+$ ]] || die "wait-metric: bad arguments"
   end=$((SECONDS + secs))
   while :; do
-    v="$(metric "$src" "$name")"
-    [[ "$v" -ge "$min" ]] && { echo "$v"; return 0; }
+    if v="$(metric "$src" "$name")"; then
+      [[ "$v" -ge "$min" ]] && { echo "$v"; return 0; }
+    else
+      v="(metric fetch failed)"
+    fi
     [[ "$SECONDS" -ge "$end" ]] && break
     sleep 2
   done
@@ -295,14 +366,18 @@ wait_metric() {
 # disconnect, a crash loop or an upgrade that never reconnects.
 wait_agent() {
   log "waiting for an agent to connect"
-  local c=0
-  for _ in $(seq 1 60); do
-    c="$(metric server yuzu_agents_connected)"
-    [[ "$c" -ge 1 ]] && { log "$c agent(s) connected"; return 0; }
+  local c=0 end=$((SECONDS + WAIT_SECS))
+  while :; do
+    if c="$(metric server yuzu_agents_connected)"; then
+      [[ "$c" -ge 1 ]] && { log "$c agent(s) connected"; return 0; }
+    else
+      c="(metric fetch failed)"
+    fi
+    [[ "$SECONDS" -lt "$end" ]] || break
     sleep 3
   done
   compose logs --no-color --tail 80 agent gateway >&2 || true
-  die "no agent connected within 180s"
+  die "no agent connected within ${WAIT_SECS}s (last reading: $c)"
 }
 
 cmd_agents() {
@@ -312,17 +387,19 @@ for a in json.load(sys.stdin):
     print(a.get("agent_id", ""), a.get("agent_version", ""))'
 }
 
-# roundtrip PLUGIN ACTION KEY [POLLS]: dispatch PLUGIN.ACTION and wait (POLLS x 2s)
-# for a response line `KEY|value`; print value. A rejection such as
-# `plugin not found: <name>` has no such line and fails.
+# roundtrip PLUGIN ACTION KEY [POLLS]: dispatch PLUGIN.ACTION and wait up to
+# POLLS x 2 seconds (a deadline, polling every 2s) for a response line
+# `KEY|value`; print value. A rejection such as `plugin not found: <name>` has
+# no such line and fails.
 roundtrip() {
-  local plugin="$1" action="$2" key="$3" polls="${4:-20}" resp id out
+  local plugin="$1" action="$2" key="$3" polls="${4:-20}" resp id out end
   [[ "$plugin" =~ ^[a-z_]+$ && "$action" =~ ^[a-z_]+$ && "$key" =~ ^[a-z_]+$ && "$polls" =~ ^[0-9]+$ ]] \
     || die "roundtrip: bad arguments"
   resp="$(api POST /api/command "{\"plugin\":\"$plugin\",\"action\":\"$action\"}" 2>&1)" || true
   id="$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("command_id",""))' 2>/dev/null || true)"
   [[ -n "$id" ]] || { log "dispatching $plugin.$action returned no command_id: $resp"; return 1; }
-  for _ in $(seq 1 "$polls"); do
+  end=$((SECONDS + polls * 2))
+  while :; do
     sleep 2
     out="$(api GET "/api/responses/$id" 2>/dev/null | KEY="$key" python3 -c '
 import os, sys, json
@@ -332,6 +409,7 @@ for r in json.load(sys.stdin).get("responses", []):
         if line.startswith(k):
             print(line[len(k):]); sys.exit(0)' 2>/dev/null || true)"
     [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+    [[ "$SECONDS" -lt "$end" ]] || break
   done
   log "no '$key|' line in any response to $plugin.$action ($id) after $((polls * 2))s"
   api GET "/api/responses/$id" >&2 2>/dev/null || true
@@ -412,6 +490,44 @@ cmd_state() {
   echo "${out% }"
 }
 
+# A restart before the check is a crash too: a baseline that absorbs earlier
+# restarts (the soak used to compare against whatever count it started with)
+# hides a crash loop during bring-up.
+cmd_check_stable() {
+  local s st out="" bad=()
+  for s in "${SERVICES[@]}"; do
+    st="$(svc_field "$s" '{{.State.Status}}/{{.RestartCount}}')"
+    out+="$s=$st "
+    [[ "$st" == running/0 ]] || bad+=("$s=$st")
+  done
+  echo "${out% }"
+  [[ "${#bad[@]}" -eq 0 ]] \
+    || die "not stable: ${bad[*]} (every service must be running with a restart count of 0)"
+}
+
+# Postgres is excluded: its own vocabulary (PANIC is a log level) is not ours
+# to police, and a Postgres crash already shows as a restart. The gateway is an
+# OTP release: a crashed process logs a CRASH REPORT, a restarted child a
+# SUPERVISOR REPORT, while the node itself stays up and never restarts.
+cmd_crash_check() {
+  local s pat log hits found=()
+  for s in "${SERVICES[@]}"; do
+    [[ "$s" == postgres ]] && continue
+    pat='segfault|ASAN|UBSAN|panic|SIGABRT|core dump'
+    [[ "$s" == gateway ]] && pat+='|CRASH REPORT|crash_report|SUPERVISOR REPORT|supervisor_report'
+    log="$STATE/crash-check-$s.log"
+    compose logs --no-color --no-log-prefix "$s" > "$log" 2>&1 \
+      || die "crash-check: could not read the $s logs"
+    hits="$(grep -iE "$pat" "$log" || true)"
+    if [[ -n "$hits" ]]; then
+      printf '%s\n' "$hits" | head -n 20 | sed "s/^/[$s] /" >&2
+      found+=("$s")
+    fi
+  done
+  [[ "${#found[@]}" -eq 0 ]] || die "crash signatures in the logs of: ${found[*]}"
+  log "no crash signatures in the server, gateway or agent logs"
+}
+
 cmd_stats() {
   local s id out=""
   for s in "${SERVICES[@]}"; do
@@ -419,6 +535,34 @@ cmd_stats() {
     out+="$s=$( [[ -n "$id" ]] && docker stats --no-stream --format '{{.MemUsage}}' "$id" 2>/dev/null | cut -d/ -f1 | tr -d ' ' || echo '?') "
   done
   echo "$out"
+}
+
+# mem-growth FIRST LAST: each is a `stats` line (svc=12.3MiB ...). Informational.
+cmd_mem_growth() {
+  awk -v a="${1:-}" -v b="${2:-}" '
+    function bytes(v,   n, u) {
+      if (!match(v, /^[0-9.]+/)) return -1
+      n = substr(v, 1, RLENGTH); u = substr(v, RLENGTH + 1)
+      if (u == "B") return n
+      if (u == "KiB") return n * 1024
+      if (u == "MiB") return n * 1048576
+      if (u == "GiB") return n * 1073741824
+      if (u == "kB") return n * 1000
+      if (u == "MB") return n * 1000000
+      if (u == "GB") return n * 1000000000
+      return -1
+    }
+    BEGIN {
+      na = split(a, A, " ")
+      for (i = 1; i <= na; i++) { split(A[i], kv, "="); first[kv[1]] = kv[2] }
+      nb = split(b, B, " ")
+      for (i = 1; i <= nb; i++) {
+        split(B[i], kv, "="); s = kv[1]
+        if (!(s in first)) continue
+        x = bytes(first[s]); y = bytes(kv[2])
+        if (x > 0 && y > 2 * x) printf "%s %s -> %s\n", s, first[s], kv[2]
+      }
+    }'
 }
 
 case "${1:-}" in
@@ -435,8 +579,11 @@ case "${1:-}" in
   running)    cmd_running ;;
   restarts)   cmd_restarts ;;
   state)      cmd_state ;;
+  check-stable) cmd_check_stable ;;
+  crash-check) cmd_crash_check ;;
   stats)      cmd_stats ;;
+  mem-growth) shift; cmd_mem_growth "$@" ;;
   logs)       shift; { compose ps -a; compose logs --no-color; } > "${1:?file required}" 2>&1 || true ;;
   down)       compose down -v --remove-orphans || true ;;
-  *) echo "usage: $0 {up|upgrade|has-stack|wait-agent|login|api|roundtrip|agents|metric|wait-metric|running|restarts|state|stats|logs|down}" >&2; exit 2 ;;
+  *) echo "usage: $0 {up|upgrade|has-stack|wait-agent|login|api|roundtrip|agents|metric|wait-metric|running|restarts|state|check-stable|crash-check|stats|mem-growth|logs|down}" >&2; exit 2 ;;
 esac

@@ -173,7 +173,12 @@ jobs:
     name: "Integration test (Docker)"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Sized from the ceilings in scripts/ci/qa-stack.sh's "Time budget" header,
+    # so a wait reports its own failure before the job is killed: setup ~1 min
+    # + `up` <= 24.5 min + the tests below <= 5.5 min (a metric read <= 90s,
+    # wait-metric 30s + one read, a round-trip 30s dispatch + 40s + one poll,
+    # check-stable) + logs/teardown ~2 min = ~33 min.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -237,6 +242,11 @@ jobs:
             exit 1
           fi
 
+      # Last, so it covers the whole job: a service that crashed and was
+      # restarted by Docker is running again by now, but its count is not 0.
+      - name: Test — No service restarted
+        run: bash scripts/ci/qa-stack.sh check-stable
+
       - name: Collect logs
         if: always()
         run: bash scripts/ci/qa-stack.sh logs /tmp/yuzu-qa/integration-logs.txt
@@ -247,7 +257,7 @@ jobs:
         with:
           name: integration-logs
           path: /tmp/yuzu-qa/integration-logs.txt
-          retention-days: 3
+          retention-days: 30
 
       - name: Teardown
         if: always()
@@ -862,7 +872,12 @@ jobs:
     name: "Soak test (10 min)"
     needs: [resolve, integration]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # From qa-stack.sh's "Time budget": setup ~1 min + `up` <= 24.5 min +
+    # baseline reads <= 3 min + the soak (600s + one sample in flight, a sample
+    # <= ~200s: three docker reads, a metric read <= 90s, readyz 10s, stats,
+    # a round-trip <= 80s) <= 13.5 min + end-of-soak reads, crash check,
+    # upload and teardown <= 6 min = ~48 min.
+    timeout-minutes: 50
     env:
       QA_STATE_DIR: /tmp/yuzu-soak
       QA_PROJECT: yuzu-soak
@@ -888,76 +903,149 @@ jobs:
         run: bash scripts/ci/qa-stack.sh up "$VERSION"
 
       - name: Run soak (10 minutes)
+        env:
+          SOAK_SECONDS: "600"
+          SOAK_INTERVAL: "30"
         run: |
-          echo "Starting 10-minute soak test..."
-          echo "timestamp,state,agents_connected,gw_ready,roundtrip,memory" > /tmp/yuzu-soak/soak.csv
+          QA=scripts/ci/qa-stack.sh
+          CSV="$QA_STATE_DIR/soak.csv"
+          echo "Starting a ${SOAK_SECONDS}s soak test, sampling every ${SOAK_INTERVAL}s..."
+          echo 'timestamp,state,agents_connected,gw_ready,roundtrip,memory,problems' > "$CSV"
 
-          # A container Docker restarted is a crash even when it is back up by
-          # the next sample, so restarts are compared with the count at the
-          # start of the soak rather than only checking "running".
-          BASE_RESTARTS=$(bash scripts/ci/qa-stack.sh restarts)
-          echo "Restart count at start: $BASE_RESTARTS  ($(bash scripts/ci/qa-stack.sh state))"
+          # Baseline 1: every service running with a restart count of 0. A
+          # restart during bring-up is a crash too; comparing later samples to
+          # whatever count the soak started with used to absorb it.
+          bash "$QA" check-stable || { echo "FAIL: the stack was not stable when the soak began"; exit 1; }
 
-          FAILURES=0
-          RT_OK=0
-          RT_FAIL=0
-          for i in $(seq 1 20); do
+          # Baseline 2: the registration counters. An agent that drops and
+          # reconnects BETWEEN two samples is back by the next one, so the
+          # connected gauge never sees it; each reconnect bumps these. Both
+          # must be >= 1 already (an agent connected during `up`): a 0 means the
+          # family is gone, and a delta of 0 - 0 would prove nothing.
+          REG0=$(bash "$QA" metric server yuzu_agents_registered_total) \
+            || { echo "FAIL: could not read yuzu_agents_registered_total at the start of the soak"; exit 1; }
+          GWC0=$(bash "$QA" metric gateway yuzu_gw_agents_connected_total) \
+            || { echo "FAIL: could not read yuzu_gw_agents_connected_total at the start of the soak"; exit 1; }
+          if [ "$REG0" -lt 1 ] || [ "$GWC0" -lt 1 ]; then
+            echo "FAIL: registration counters at start are yuzu_agents_registered_total=$REG0, yuzu_gw_agents_connected_total=$GWC0; both must be >= 1 once an agent has connected"
+            exit 1
+          fi
+          echo "Counters at start: yuzu_agents_registered_total=$REG0 yuzu_gw_agents_connected_total=$GWC0"
+
+          # A wall-clock loop: every sample starts SOAK_INTERVAL after the
+          # previous one started, until SOAK_SECONDS have passed.
+          FAILURES=0; SAMPLES=0; RT_OK=0; RT_FAIL=0
+          FIRST_MEM=""; LAST_MEM=""
+          END=$((SECONDS + SOAK_SECONDS))
+          while [ "$SECONDS" -lt "$END" ]; do
+            SAMPLES=$((SAMPLES + 1))
+            NEXT=$((SECONDS + SOAK_INTERVAL))
             TS=$(date +%H:%M:%S)
-            RUNNING=$(bash scripts/ci/qa-stack.sh running)
-            RESTARTS=$(bash scripts/ci/qa-stack.sh restarts)
-            STATE=$(bash scripts/ci/qa-stack.sh state)
-            AGENTS=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_connected)
+            PROBLEMS=""
+            RUNNING=$(bash "$QA" running)
+            RESTARTS=$(bash "$QA" restarts)
+            STATE=$(bash "$QA" state)
+            [ "$RUNNING" -eq 4 ] || PROBLEMS+="only $RUNNING/4 services running; "
+            [ "$RESTARTS" -eq 0 ] || PROBLEMS+="$RESTARTS container restart(s); "
+            if AGENTS=$(bash "$QA" metric server yuzu_agents_connected); then
+              [ "$AGENTS" -ge 1 ] || PROBLEMS+="no agent connected; "
+            else
+              AGENTS="?"; PROBLEMS+="metric fetch failed (yuzu_agents_connected); "
+            fi
             GW_OK="yes"
             curl -sf --max-time 10 http://127.0.0.1:8081/readyz 2>/dev/null | grep -q '"ready"' || GW_OK="no"
-            MEM=$(bash scripts/ci/qa-stack.sh stats)
+            [ "$GW_OK" = yes ] || PROBLEMS+="gateway not ready; "
+            MEM=$(bash "$QA" stats)
+            [ -n "$FIRST_MEM" ] || FIRST_MEM="$MEM"
+            LAST_MEM="$MEM"
 
             # Every other sample (~once a minute) a real command round-trip
             # through server -> gateway -> agent -> plugin and back, bounded
             # at 20s. `status.health` answers `uptime_seconds|<n>`.
             RT="-"
-            if [ $((i % 2)) -eq 0 ]; then
-              if UP=$(bash scripts/ci/qa-stack.sh roundtrip status health uptime_seconds 10); then
+            if [ $((SAMPLES % 2)) -eq 0 ]; then
+              if UP=$(bash "$QA" roundtrip status health uptime_seconds 10); then
                 RT="ok(uptime=${UP}s)"; RT_OK=$((RT_OK + 1))
               else
-                RT="FAIL"; RT_FAIL=$((RT_FAIL + 1))
+                RT="FAIL"; RT_FAIL=$((RT_FAIL + 1)); PROBLEMS+="command round-trip failed; "
               fi
             fi
 
             echo "$TS  running=$RUNNING/4  restarts=$RESTARTS  agents=$AGENTS  gw=$GW_OK  cmd=$RT  mem=[$MEM]"
-            echo "$TS,$STATE,$AGENTS,$GW_OK,$RT,$MEM" >> /tmp/yuzu-soak/soak.csv
-
-            if [ "$RUNNING" -lt 4 ] || [ "$RESTARTS" -gt "$BASE_RESTARTS" ] || [ "$AGENTS" -lt 1 ] \
-               || [ "$GW_OK" = "no" ] || [ "$RT" = "FAIL" ]; then
+            echo "$TS,$STATE,$AGENTS,$GW_OK,$RT,$MEM,\"${PROBLEMS%; }\"" >> "$CSV"
+            if [ -n "$PROBLEMS" ]; then
               FAILURES=$((FAILURES + 1))
-              echo "WARNING: degraded state at $TS ($STATE)"
+              echo "WARNING: degraded sample at $TS: ${PROBLEMS%; } ($STATE)"
             fi
 
-            sleep 30
+            WAIT=$((NEXT - SECONDS))
+            LEFT=$((END - SECONDS))
+            [ "$WAIT" -le "$LEFT" ] || WAIT=$LEFT
+            if [ "$WAIT" -gt 0 ]; then sleep "$WAIT"; fi
           done
 
           echo ""
+          VERDICT=0
           echo "Command round-trips: $RT_OK ok, $RT_FAIL failed"
           if [ "$RT_OK" -eq 0 ]; then
             echo "FAIL: no command round-trip succeeded during the soak"
-            exit 1
+            VERDICT=1
           fi
-          if [ "$FAILURES" -eq 0 ]; then
-            echo "PASS: Soak test completed — 10 minutes, 0 degraded samples, no container restarts"
-          else
-            echo "FAIL: $FAILURES degraded samples during soak"
-            exit 1
+          if [ "$FAILURES" -ne 0 ]; then
+            echo "FAIL: $FAILURES of $SAMPLES samples degraded"
+            VERDICT=1
           fi
 
+          # The counters again: any reconnect in between fails the soak.
+          if REG1=$(bash "$QA" metric server yuzu_agents_registered_total); then
+            if [ "$REG1" -ne "$REG0" ]; then
+              echo "FAIL: the server recorded $((REG1 - REG0)) agent registration(s) during the soak (yuzu_agents_registered_total $REG0 -> $REG1): an agent dropped and re-registered"
+              VERDICT=1
+            fi
+          else
+            REG1="?"; echo "FAIL: could not read yuzu_agents_registered_total at the end of the soak"; VERDICT=1
+          fi
+          if GWC1=$(bash "$QA" metric gateway yuzu_gw_agents_connected_total); then
+            if [ "$GWC1" -ne "$GWC0" ]; then
+              echo "FAIL: the gateway accepted $((GWC1 - GWC0)) agent connection(s) during the soak (yuzu_gw_agents_connected_total $GWC0 -> $GWC1): an agent dropped and reconnected"
+              VERDICT=1
+            fi
+          else
+            GWC1="?"; echo "FAIL: could not read yuzu_gw_agents_connected_total at the end of the soak"; VERDICT=1
+          fi
+
+          # Memory is informational — a soak this short cannot establish a
+          # leak — but a service that more than doubled is worth a look.
+          GROWTH=$(bash "$QA" mem-growth "$FIRST_MEM" "$LAST_MEM")
+          while IFS= read -r LINE; do
+            [ -n "$LINE" ] && echo "::warning::Soak memory more than doubled: $LINE"
+          done <<< "$GROWTH"
+
+          {
+            echo "### Soak test"
+            echo ""
+            echo "- Samples: $SAMPLES over ${SOAK_SECONDS}s, $FAILURES degraded"
+            echo "- Command round-trips: $RT_OK ok, $RT_FAIL failed"
+            echo "- yuzu_agents_registered_total: $REG0 -> $REG1; yuzu_gw_agents_connected_total: $GWC0 -> $GWC1 (a reconnect between samples shows here)"
+            echo "- Memory (informational, not a pass/fail criterion): first [$FIRST_MEM], last [$LAST_MEM]"
+            if [ -n "$GROWTH" ]; then
+              echo "- Memory more than doubled (warning only): $(printf '%s' "$GROWTH" | tr '\n' ';')"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$VERDICT" -eq 0 ]; then
+            echo "PASS: soak completed — $SAMPLES samples, none degraded, no container restarts, no agent reconnects"
+          fi
+          exit "$VERDICT"
+
+      # Per service (qa-stack.sh crash-check): Postgres' logs are not checked
+      # (PANIC is one of its log levels), and the gateway is also failed on an
+      # OTP CRASH REPORT / SUPERVISOR REPORT, which leaves the node running.
       - name: Check for crashes in logs
         if: always()
         run: |
-          bash scripts/ci/qa-stack.sh logs /tmp/yuzu-soak/soak-logs.txt
-          if grep -iE 'segfault|ASAN|UBSAN|panic|SIGABRT|core dump' /tmp/yuzu-soak/soak-logs.txt; then
-            echo "FAIL: crash detected in logs"
-            exit 1
-          else
-            echo "PASS: no crashes in logs"
-          fi
+          bash scripts/ci/qa-stack.sh logs "$QA_STATE_DIR/soak-logs.txt"
+          bash scripts/ci/qa-stack.sh crash-check
 
       - name: Upload soak data
         if: always()
@@ -967,7 +1055,7 @@ jobs:
           path: |
             /tmp/yuzu-soak/soak.csv
             /tmp/yuzu-soak/soak-logs.txt
-          retention-days: 3
+          retention-days: 30
 
       - name: Teardown
         if: always()
@@ -979,9 +1067,10 @@ jobs:
     needs: [resolve, integration]
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
-    # Two full stack bring-ups (each up to 3 x 180s waits plus pulls) and a
-    # post-upgrade round-trip.
-    timeout-minutes: 30
+    # From qa-stack.sh's "Time budget": setup ~1 min + `up` <= 24.5 min +
+    # `upgrade` <= 22 min + the post-upgrade checks <= 6 min + logs/teardown
+    # ~3 min = ~57 min. Both halves are bounded by their own waits first.
+    timeout-minutes: 60
     outputs:
       tested: ${{ steps.prevstack.outputs.tested }}
     env:
@@ -1019,15 +1108,25 @@ jobs:
         id: prevstack
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+        # has-stack: 0 = ships the template, 3 = predates it, anything else
+        # (GitHub unreachable, a 5xx) = unknown. Only 3 may become NOT TESTED;
+        # treating every non-zero as "predates" let an outage report green.
         run: |
           PREV_VER="${PREV_TAG#v}"
-          if bash scripts/ci/qa-stack.sh has-stack "$PREV_VER"; then
-            echo "tested=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tested=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Upgrade NOT TESTED: $PREV_TAG predates deploy/docker/docker-compose.reference-gateway.yml, so there is no shipped stack to upgrade from."
-            echo "**Upgrade test: NOT TESTED** — $PREV_TAG predates the reference stack." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          RC=0
+          bash scripts/ci/qa-stack.sh has-stack "$PREV_VER" || RC=$?
+          case "$RC" in
+            0) echo "tested=true" >> "$GITHUB_OUTPUT" ;;
+            3)
+              echo "tested=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::Upgrade NOT TESTED: $PREV_TAG predates deploy/docker/docker-compose.reference-gateway.yml, so there is no shipped stack to upgrade from."
+              echo "**Upgrade test: NOT TESTED** — $PREV_TAG predates the reference stack." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Could not tell whether $PREV_TAG ships the reference stack (qa-stack.sh has-stack exited $RC); refusing to report the upgrade as not tested."
+              exit 1
+              ;;
+          esac
 
       - name: Start previous release
         if: steps.prevstack.outputs.tested == 'true'
@@ -1054,6 +1153,11 @@ jobs:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
+          # All four services running (4/4) with a restart count of 0: the
+          # upgrade recreates the containers, so any restart is post-upgrade.
+          bash scripts/ci/qa-stack.sh check-stable
+          echo "PASS: 4/4 services running, none restarted"
+
           CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
           [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
@@ -1085,6 +1189,9 @@ jobs:
             exit 1
           fi
 
+          # Again at the end, covering the checks above.
+          bash scripts/ci/qa-stack.sh check-stable
+
           echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
       - name: Collect logs
@@ -1097,7 +1204,7 @@ jobs:
         with:
           name: upgrade-logs
           path: /tmp/yuzu-upgrade/upgrade-logs.txt
-          retention-days: 3
+          retention-days: 30
 
       - name: Teardown
         if: always()
