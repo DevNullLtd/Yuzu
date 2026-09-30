@@ -676,6 +676,17 @@ inline bool has_passwd_tag(std::string_view s) {
     return false;
 }
 
+/// Output bounds for one user spec. Every clause repeats the User_List in its subject
+/// and every run-as/NOPASSWD flip repeats both, so a single grammar-legal 256 KiB line
+/// could otherwise expand into gigabytes of rows. A User_List, Host_List or run-as longer
+/// than kMaxSudoersListBytes, or a line yielding more than kMaxSudoersLineEntries
+/// entries, is not decoded: the caller reports the line once as `unmodelled` with its
+/// raw text, and a NOPASSWD:/PASSWD: tag in it still trips the undecoded_passwd_tag
+/// failure. Together with parse_sudoers' per-file entry cap, output per file stays
+/// bounded by (entries x ~12 KiB), not by the line's repetition structure.
+inline constexpr std::size_t kMaxSudoersListBytes = 4096;
+inline constexpr std::size_t kMaxSudoersLineEntries = 256;
+
 /// One lexed user spec, parsed by the sudoers(5) grammar:
 /// `User_List Host_List = Cmnd_Spec_List (: Host_List = Cmnd_Spec_List)*`, each
 /// Cmnd_Spec `[(Runas)] Option_Spec* Tag_Spec* Digest_Spec* !* Cmnd`. One entry per
@@ -692,16 +703,6 @@ inline bool has_passwd_tag(std::string_view s) {
 /// lexing (checked against it differentially); the column is the tag alone (a Defaults
 /// `!authenticate` also removes the password prompt); aliases and includes are not
 /// resolved; and a line sudo itself rejects is reported best-effort.
-/// Output bounds for one user spec. Every clause repeats the User_List in its
-/// subject, so a single grammar-legal 256 KiB line could otherwise expand into
-/// gigabytes of rows (a 128 KiB User_List times ~18K ':'-joined clauses). A
-/// User_List or Host_List longer than kMaxSudoersListBytes, or a line yielding
-/// more than kMaxSudoersLineEntries entries, is not decoded: the caller reports
-/// the line once as `unmodelled` with its raw text, and a NOPASSWD:/PASSWD: tag in
-/// it still trips the undecoded_passwd_tag failure. Output per line stays O(line).
-inline constexpr std::size_t kMaxSudoersListBytes = 4096;
-inline constexpr std::size_t kMaxSudoersLineEntries = 4096;
-
 inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersStatement& st) {
     const auto& t = st.toks;
     const std::string_view text = st.text;
@@ -733,8 +734,14 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
         const std::string subject = *users + "@" + *host;
         std::string runas = "-", nopasswd = "false";
         std::vector<std::string> run;
+        bool overflow = false;
         const auto flush = [&] {
             if (run.empty()) return;
+            if (out.size() >= kMaxSudoersLineEntries) { // every flip repeats subject + runas
+                overflow = true;
+                run.clear();
+                return;
+            }
             std::string cmds;
             for (const auto& c : run) cmds += (cmds.empty() ? "" : ", ") + c;
             out.push_back({"user_spec", subject, runas, nopasswd, std::move(cmds)});
@@ -747,6 +754,7 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
                 while (is('w') || is('s') || is(',') || is(':') || is('!')) ++k;
                 if (!is(')')) return std::nullopt;
                 next_runas = std::string{trim_ws(text.substr(t[open].e, t[k].b - t[open].e))};
+                if (next_runas.size() > kMaxSudoersListBytes) return std::nullopt;
                 ++k;
             }
             for (;;) { // Option_Spec and Tag_Spec, accepted in any order
@@ -782,6 +790,7 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
             ++k;
         }
         flush();
+        if (overflow) return std::nullopt;
         if (k == t.size()) break;
         if (!is(':')) return std::nullopt;
         ++k;
@@ -799,11 +808,31 @@ inline std::optional<std::vector<SudoersEntry>> parse_user_spec(const SudoersSta
 /// Defaults / *_Alias / user spec is kind `unmodelled` with the statement text in
 /// `commands` -- never dropped. An `unmodelled` line that still carries a
 /// NOPASSWD:/PASSWD: tag is the collector's `undecoded_passwd_tag` failure.
-inline std::vector<SudoersEntry> parse_sudoers(std::string_view text) {
+inline std::vector<SudoersEntry> parse_sudoers(std::string_view text,
+                                               std::size_t max_entries = static_cast<std::size_t>(-1)) {
     std::vector<SudoersEntry> out;
     for (const auto& st : detail::SudoersLexer{text}.run()) {
+        if (out.size() >= max_entries) break; // the caller's own row cap: nothing past it is emitted
         const std::string_view line = st.text;
-        const auto word = line.substr(0, line.find_first_of(" \t"));
+        auto word = line.substr(0, line.find_first_of(" \t"));
+        // A Defaults scope is a list, and the grammar allows blanks around its commas
+        // (`Defaults:alice, bob !authenticate`): extend the scope word over them, or `bob`
+        // would land in the commands column and drop out of the subject.
+        if (word.substr(0, 8) == "Defaults" && word.size() > 8) {
+            std::size_t end = word.size();
+            for (;;) {
+                std::size_t p = end;
+                while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+                const bool comma_before = end > 0 && line[end - 1] == ',';
+                if (!comma_before && !(p < line.size() && line[p] == ',')) break;
+                if (p < line.size() && line[p] == ',') ++p;
+                while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+                const std::size_t q = std::min(line.find_first_of(" \t", p), line.size());
+                if (q == p) break;
+                end = q;
+            }
+            word = line.substr(0, end);
+        }
         const auto rest = trim_ws(line.substr(word.size()));
         if (word == "#include" || word == "@include")
             out.push_back({"include", "-", "-", "-", std::string{rest}});
@@ -1103,7 +1132,8 @@ inline void sudoers_file(const FileReader& rd, Tally& t, const std::string& path
         t.row(format_sudoers_row(path, {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
     });
     if (!text) return;
-    for (const auto& e : parse_sudoers(*text)) {
+    for (const auto& e : parse_sudoers(*text, kMaxRows)) {
+        if (t.capped) return; // rows past the cap are dropped: stop formatting (and parsing) here
         t.row(format_sudoers_row(path, e));
         // The fail-safe half of parse_user_spec: a NOPASSWD:/PASSWD: tag the parser could
         // not decode is an unmodelled row AND a failure, never a quiet `false`.
@@ -1199,6 +1229,7 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
             t.row(format_sudoers_row("/etc/sudoers.d", {"unreadable", "-", "-", "-", "truncated"}));
         }
         for (const auto& n : d.names) {
+            if (t.capped) break;
             const std::string path = "/etc/sudoers.d/" + n;
             if (sudoers_dir_entry_ignored(n))
                 t.row(format_sudoers_row(path, {"ignored", "-", "-", "-", "name_ignored_by_sudo"}));

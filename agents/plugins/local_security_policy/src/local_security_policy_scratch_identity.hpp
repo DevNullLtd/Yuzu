@@ -76,8 +76,10 @@ inline bool scratch_dir_is_ours(HANDLE dir_handle) {
                                      &dir_owner, nullptr, nullptr, nullptr, &sd);
     if (rc != ERROR_SUCCESS)
         return false;
-    struct SdGuard {
+    struct SdGuard { // owns the GetSecurityInfo-allocated descriptor (LocalFree); never copied
         PSECURITY_DESCRIPTOR p;
+        SdGuard(const SdGuard&) = delete;
+        SdGuard& operator=(const SdGuard&) = delete;
         ~SdGuard() {
             if (p)
                 LocalFree(p);

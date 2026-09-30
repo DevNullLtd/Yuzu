@@ -78,6 +78,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -133,11 +134,16 @@ struct ScratchSweepResult {
     return true;
 }
 
-/// True only when `now - mtime` is STRICTLY GREATER than `stale_after`: exact
-/// equality and a future-dated mtime (clock skew) are both FRESH.
+/// True only when `now - mtime` is STRICTLY GREATER than `stale_after`: exact equality is
+/// FRESH. A future-dated mtime more than `stale_after` ahead is stale too: a clock that ran
+/// ahead when a dispatch crashed and then stepped back would otherwise hide an orphan (a whole
+/// policy export) for as long as the skew, silently. That cannot expose a live directory --
+/// the dispatch's own open handle (no FILE_SHARE_DELETE) and the owner gate protect it, not
+/// the clock -- and a modest skew (within the threshold) still reads as fresh.
 [[nodiscard]] inline bool is_stale(std::int64_t mtime_unix_s, std::int64_t now_unix_s,
                                    std::int64_t stale_after_s) noexcept {
-    return (now_unix_s - mtime_unix_s) > stale_after_s;
+    const std::int64_t age = now_unix_s - mtime_unix_s;
+    return age > stale_after_s || -age > stale_after_s;
 }
 
 enum class SweepCandidate {
@@ -167,12 +173,10 @@ classify_sweep_candidate(std::string_view name, bool is_directory,
 
 /// Log-line only, never a row or a constraint token: the wire carries no
 /// provenance for a sweep, so the agent log is the ONLY surface a sweep's
-/// health has. Each outcome is therefore named rather than summed. An earlier
-/// shape collapsed fresh + foreign-SID + failed + deferred into one `skipped`
-/// number, which made "two concurrent dispatches" (healthy) and "two orphans
-/// that could not be removed" (disk accumulating) the same string. `failed`
-/// and `deferred` are the two that mean the sweep is not reclaiming; keep them
-/// separately visible. Same counter set execution_artifacts' own sweep logs.
+/// health has. Each outcome is therefore named rather than summed, so "two concurrent
+/// dispatches" (healthy) and "two orphans that could not be removed" (disk accumulating)
+/// never read as the same string. `failed` and `deferred` are the two that mean the sweep
+/// is not reclaiming; keep them separately visible. Same counter set execution_artifacts' own sweep logs.
 [[nodiscard]] inline std::string format_sweep_summary(const ScratchSweepResult& r) {
     return "scratch_sweep: removed " + std::to_string(r.removed) + " failed " +
            std::to_string(r.failed) + " fresh " + std::to_string(r.skipped_fresh) +
@@ -265,6 +269,27 @@ classify_export_object(bool reparse_or_directory, std::uint64_t size_bytes) {
 classify_decoded_export(const std::optional<std::string>& text) {
     if (!text || text->empty()) return "secedit:decode_failed";
     return text->find('\0') == std::string::npos ? std::string{} : "secedit:embedded_nul";
+}
+
+/// The pure tail of the Windows dispatch: the raw bytes of a finished `secedit /export` -> rows,
+/// or exactly one failure token (rows must then not be trusted). Kept here, OS-free, so the
+/// order of the checks -- decode, embedded NUL, the signed final [Version] section, then the
+/// per-action mapping -- is unit-tested on every OS rather than only on the rig.
+[[nodiscard]] inline SeceditRows secedit_export_to_rows(std::span<const std::uint8_t> bytes,
+                                                        std::string_view action) {
+    const auto text = decode_utf16le_bom(bytes);
+    SeceditRows r;
+    if (auto bad = classify_decoded_export(text); !bad.empty()) {
+        r.failure_token = std::move(bad);
+        return r;
+    }
+    // A truncated export can still decode and carry [System Access]: no row is presented as
+    // complete unless the file ends in the signed [Version] section.
+    if (!secedit_export_complete(*text)) {
+        r.failure_token = "secedit:export_incomplete";
+        return r;
+    }
+    return secedit_policy_rows(action, parse_inf_sections(*text));
 }
 
 } // namespace yuzu::local_security_policy

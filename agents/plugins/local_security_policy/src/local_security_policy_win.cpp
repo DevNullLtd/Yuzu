@@ -32,7 +32,7 @@
  * until a sweep reaches it (an uninstall that keeps the data directory keeps it too).
  * NO STARTUP SWEEP (declined, unlike execution_artifacts' init-time pass): the sweep
  * already runs before every export, and an orphan's directory is owner-only, so a
- * restart-time pass would only shorten that window; deferred.
+ * restart-time pass would only shorten that window.
  * kCaptureNamePrefix (confined_fs.hpp) orphans cannot exist under this root: that
  * name is produced only by confined_fs's POSIX rename-then-measure delete path, and
  * this Windows sweep deletes by handle disposition and never renames -- so there is
@@ -53,7 +53,7 @@
  * (secedit_policy_rows), the one mapper. Both pure layers are unit-tested in
  * test_local_security_policy_parsers.cpp; this TU (the Win32 calls) is covered only by the
  * rig probe below -- the unit suite's dispatcher never sets agent.data_dir, so on Windows it
- * stops at the fail-closed `data_dir_unset` row. It performs the Win32 calls and writes
+ * stops at the fail-closed `data_dir_unset` row. This TU performs the Win32 calls and writes
  * what those return. The exception
  * boundary is the shared execute(); it is not repeated here.
  *
@@ -121,7 +121,7 @@ static_assert(kWin32AccessDenied == ERROR_ACCESS_DENIED);
 /// of `status` -- a PERMISSION_DENIED result also writes `constrained|<token>`,
 /// with the typed status and the token (`secedit:access_denied`) carrying the
 /// distinction. That shape is the declared one (README "Outputs", and the
-/// `row_kind` enum in all four definitions). Built through join_row so the token
+/// `row_kind` enum of the three policy definitions). Built through join_row so the token
 /// passes the same escaper every other row in this plugin uses: today every token
 /// is a literal or a `std::to_string`d integer, and this keeps that a property of
 /// the code rather than of the current token list.
@@ -133,8 +133,7 @@ int emit_failure(yuzu::CommandContext& ctx, YuzuResultStatus status, const std::
     // legs always route through) is "a read returns 0, degradation is the status" --
     // rc is not a proxy for OK-vs-degraded here. This Windows-only helper bypasses
     // apply_collected entirely, so it must return 0 itself or the three secedit-backed
-    // actions silently diverge from the plugin's own documented, tested contract
-    // (caught 2026-09-27: this dispatcher test's first real run on Windows CI).
+    // actions silently diverge from the plugin's own documented, tested contract.
     return 0;
 }
 
@@ -333,7 +332,8 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
 /// A failed removal is logged (never thrown from a destructor) and left for
 /// the next dispatch's sweep. Removal is by path, unlike the handle-relative
 /// sweep: this directory was created by this dispatch with CREATE_NEW and an
-/// owner-only DACL, so no other principal can have swapped its contents; the
+/// owner-only DACL, so no other principal can have swapped the DIRECTORY (its entries: the
+/// export the child writes carries the child's default DACL, not an owner-only one); the
 /// sweep handles directories it did not create, which is why it is confined.
 class ScratchDirGuard {
 public:
@@ -342,17 +342,20 @@ public:
     ScratchDirGuard& operator=(const ScratchDirGuard&) = delete;
     const std::wstring& path() const { return path_; }
     ~ScratchDirGuard() {
-        std::error_code ec;
-        std::filesystem::remove_all(std::filesystem::path{path_}, ec);
-        if (ec) {
-            try {
+        // Nothing may escape a destructor that can run during unwinding (a second bad_alloc
+        // while another is in flight would terminate the agent), so the path construction is
+        // inside the same try as the log call.
+        try {
+            std::error_code ec;
+            std::filesystem::remove_all(std::filesystem::path{path_}, ec);
+            if (ec) {
                 // The error code matters: a sharing violation is transient, an
                 // access denial is not, and the next sweep's outcome depends on it.
                 spdlog::warn("local_security_policy: scratch directory cleanup failed ({}); the "
                              "next dispatch's sweep will retry",
                              ec.value());
-            } catch (...) {
             }
+        } catch (...) {
         }
     }
 
@@ -409,8 +412,9 @@ ExportBytes read_export(const std::wstring& file) {
         DWORD n = 0;
         if (!ReadFile(h.get(), out.bytes.data() + got, static_cast<DWORD>(out.bytes.size() - got),
                       &n, nullptr)) {
+            const DWORD err = GetLastError(); // before anything else can touch it
             out.bytes.clear();
-            out.failure = classify_export_read_error(GetLastError());
+            out.failure = classify_export_read_error(err);
             return out;
         }
         if (n == 0)
@@ -474,11 +478,15 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
         return emit_constrained(ctx, "dest_dir_acl");
 
     const std::string out_utf8 = std::string{scratch_utf8} + "\\policy.inf";
+    // Without /log, secedit appends every run to %windir%\security\logs\scesrv.log, a log the
+    // agent does not own and that would grow with every polled dispatch. Pointing it into the
+    // scratch directory keeps the side effect inside what the guard and the sweep remove.
+    const std::string log_utf8 = std::string{scratch_utf8} + "\\secedit.log";
 
     // sink: local_security_policy/do_export#1
     const yuzu::agent::SubprocessResult run = yuzu::agent::run_bounded_subprocess(
-        {sys_dir + "\\secedit.exe", "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY",
-         "/quiet"},
+        {sys_dir + "\\secedit.exe", "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY", "/log",
+         log_utf8, "/quiet"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::milliseconds{kExportDeadlineMs}});
     const std::string run_token = classify_export_run(to_run_end(run.termination_reason),
                                                       run.exit_code);
@@ -493,18 +501,10 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
                    : emit_constrained(ctx, exported.failure->token);
     }
 
-    const auto text = decode_utf16le_bom(
-        std::span<const std::uint8_t>{exported.bytes.data(), exported.bytes.size()});
-    if (const auto bad = classify_decoded_export(text); !bad.empty())
-        return emit_constrained(ctx, bad);
-    // A truncated export can still decode and carry [System Access]: no row is presented
-    // as complete unless the file ends in the signed [Version] section (see the parser).
-    if (!secedit_export_complete(*text))
-        return emit_constrained(ctx, "secedit:export_incomplete");
-
-    // The INI -> rows mapping is the parsers header's (the one mapper); never re-add a
-    // second mapper in this TU.
-    const SeceditRows built = secedit_policy_rows(action, parse_inf_sections(*text));
+    // decode -> completeness -> INI -> rows is one pure function (scratch_sweep.hpp, unit-tested
+    // on every OS); never re-add a second mapper or reorder its checks in this TU.
+    const SeceditRows built = secedit_export_to_rows(
+        std::span<const std::uint8_t>{exported.bytes.data(), exported.bytes.size()}, action);
     if (!built.failure_token.empty())
         return emit_constrained(ctx, built.failure_token);
 

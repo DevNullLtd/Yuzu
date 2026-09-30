@@ -96,7 +96,8 @@ TEST_CASE("local_security_policy: descriptor pins the four actions; sudoers is t
             CHECK(a.macos_leg.rung == 1);
             CHECK(a.windows_leg.support == YUZU_SUPPORT_UNSUPPORTED); // no sudoers on Windows
             CHECK(a.windows_leg.rung == 0);
-            CHECK(a.windows_leg.fallback == nullptr);
+            CHECK(a.windows_leg.mechanism == nullptr); // an unsupported leg names no mechanism
+            CHECK(a.windows_leg.fallback != nullptr);  // the reason lives in the fallback text
         } else {
             // macOS password/lockout come from pwpolicy (rung 2); audit_policy reads a file.
             CHECK(a.macos_leg.rung == (action == "audit_policy" ? 1 : 2));

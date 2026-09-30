@@ -26,6 +26,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -134,29 +135,31 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 
 #if !defined(_WIN32)
 
-/// Bounded regular-file read. By default symlinks ARE followed: /etc/pam.d/system-auth is a
-/// symlink into /etc/authselect on RHEL-family hosts (real capture, fedora:40); all paths are
-/// under /etc. `strict` (the sudoers sources, see is_sudoers_source) is the opposite: the leaf is
-/// opened O_NOFOLLOW (a link is kReadSymlink) and the opened object must be owned by uid 0 and
-/// not group/other-writable (kReadInsecure), so a planted link or a file sudo would refuse can
-/// never be read back to a Security:Read caller as policy content.
+/// Bounded regular-file read. On the non-strict path symlinks ARE followed:
+/// /etc/pam.d/system-auth is a symlink into /etc/authselect on RHEL-family hosts (real capture,
+/// fedora:40); all paths are under /etc. `strict` (the sudoers sources, see is_sudoers_source)
+/// is the opposite: the leaf is opened O_NOFOLLOW (a link is kReadSymlink) and the opened object
+/// must be owned by `owner_uid` (uid 0 in production) and not group/other-writable
+/// (kReadInsecure), so a planted link or a file sudo would refuse can never be read back to a
+/// Security:Read caller as policy content. Only the LEAF is checked: a symlinked parent
+/// directory is followed (root-owned /etc is the trust anchor).
 ///
 /// O_NONBLOCK is LOAD-BEARING, the same way certificates_linux_store.hpp's
 /// read_cert_entry and guardian_state_reader.cpp's state read say it is: open(2)
 /// on a FIFO with no writer blocks forever, and the S_ISREG check below cannot
 /// run until open returns, so a blocking open would wedge the dispatch thread
-/// before the type filter ever got to reject the node. Symlinks are followed
-/// here by design, so the node need not sit under /etc itself. Once fstat proves
+/// before the type filter ever got to reject the node. On the non-strict path a followed
+/// symlink means the node need not sit under /etc itself. Once fstat proves
 /// S_ISREG the flag is inert (POSIX: reads of a regular file never block), so
 /// nothing clears it afterwards and no real host behaves differently.
-inline FileRead posix_read_file_at(const std::string& path, bool strict) {
+inline FileRead posix_read_file_at(const std::string& path, bool strict, uid_t owner_uid = 0) {
     yuzu::agent::ScopedFd fd(
         ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | (strict ? O_NOFOLLOW : 0)));
     if (!fd) return {strict && errno == ELOOP ? kReadSymlink : errno, {}};
     struct stat st{};
     if (::fstat(fd.get(), &st) != 0) return {errno, {}};
     if (!S_ISREG(st.st_mode)) return {kReadNotRegular, {}};
-    if (strict && (st.st_uid != 0 || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+    if (strict && (st.st_uid != owner_uid || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0))
         return {kReadInsecure, {}};
     FileRead out;
     char buf[8192];
@@ -173,8 +176,13 @@ inline FileRead posix_read_file_at(const std::string& path, bool strict) {
     return out;
 }
 
-inline FileRead posix_read_file(const std::string& path) {
-    return posix_read_file_at(path, is_sudoers_source(path));
+/// The production reader: sudoers sources strict, everything else lenient. `root` and
+/// `sudoers_owner_uid` exist so a test can drive this exact routing over a temporary tree
+/// (`<root>/etc/sudoers.d/x`) as any user; production passes neither (real /etc, uid 0).
+inline FileReader make_posix_reader(std::string root = {}, uid_t sudoers_owner_uid = 0) {
+    return [root = std::move(root), sudoers_owner_uid](const std::string& path) {
+        return posix_read_file_at(root + path, is_sudoers_source(path), sudoers_owner_uid);
+    };
 }
 
 inline DirList posix_list_dir(const std::string& path) {

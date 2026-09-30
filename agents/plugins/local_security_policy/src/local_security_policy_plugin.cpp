@@ -121,7 +121,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/etc/sudoers is root:wheel 0440: reading it needs root or group wheel, otherwise "
          "permission_denied (kind unreadable)"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_UNSUPPORTED, 0, "no sudoers on Windows", nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "no sudoers on Windows"},
     },
 };
 

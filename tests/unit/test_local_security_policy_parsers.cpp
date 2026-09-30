@@ -23,6 +23,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -1081,10 +1083,14 @@ TEST_CASE("local_security_policy sudoers: a refused source is an unreadable row,
 
 #if !defined(_WIN32)
 // The real reader, on a real filesystem: the planted-link case that motivated the strict rule.
-TEST_CASE("local_security_policy posix_read_file_at: strict refuses a symlink, a loose file; lenient follows",
+TEST_CASE("local_security_policy posix reader: strict refuses a link, a loose and a foreign-owned "
+          "file; lenient follows",
           "[local_security_policy][parsers][sudoers]") {
     yuzu::test::TempDir dir{"yuzu_test_lsp_"};
     std::filesystem::create_directories(dir.path);
+    // The owner is passed explicitly, so the mode AND owner checks are both observable as ANY
+    // user (a CI runner, a developer Mac, root) -- never dependent on who runs the suite.
+    const uid_t me = ::geteuid();
     const auto secret = dir.path / "secret";
     {
         std::ofstream(secret) << "TOP-SECRET-KEY-MATERIAL\n";
@@ -1093,39 +1099,76 @@ TEST_CASE("local_security_policy posix_read_file_at: strict refuses a symlink, a
     std::filesystem::create_symlink(secret, link);
 
     // Strict (sudoers): the link is refused before a single byte is read.
-    const auto refused = posix_read_file_at(link.string(), true);
+    const auto refused = posix_read_file_at(link.string(), true, me);
     CHECK(refused.err == kReadSymlink);
     CHECK(refused.data.empty());
     // Lenient (PAM): the same link is followed -- /etc/pam.d/system-auth is one on RHEL hosts.
-    const auto followed = posix_read_file_at(link.string(), false);
+    const auto followed = posix_read_file_at(link.string(), false, me);
     CHECK(followed.err == 0);
     CHECK(followed.data == "TOP-SECRET-KEY-MATERIAL\n");
 
-    // Strict also refuses a group/other-writable file: sudo would not honour it either.
-    const auto loose = dir.path / "loose";
-    {
-        std::ofstream(loose) << "alice ALL = /bin/ls\n";
-    }
-    std::filesystem::permissions(loose, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
-                                            std::filesystem::perms::group_write);
-    CHECK(posix_read_file_at(loose.string(), true).err == kReadInsecure);
+    namespace fsp = std::filesystem;
+    const auto write_mode = [&](const char* name, fsp::perms mode) {
+        const auto path = dir.path / name;
+        {
+            std::ofstream(path) << "alice ALL = /bin/ls\n";
+        }
+        fsp::permissions(path, mode, fsp::perm_options::replace);
+        return path.string();
+    };
+    // Owner matches and the mode is tight: accepted (the accept path, observed on every identity).
+    const auto tight = write_mode("tight", fsp::perms::owner_read | fsp::perms::group_read |
+                                               fsp::perms::others_read);
+    const auto ok = posix_read_file_at(tight, true, me);
+    CHECK(ok.err == 0);
+    CHECK(ok.data == "alice ALL = /bin/ls\n");
+    // The same file for a different required owner: the OWNER check refuses it.
+    CHECK(posix_read_file_at(tight, true, me + 1).err == kReadInsecure);
+    // Owner matches but the file is group- or other-writable: the MODE check refuses it.
+    CHECK(posix_read_file_at(write_mode("gw", fsp::perms::owner_read | fsp::perms::owner_write |
+                                                  fsp::perms::group_write),
+                             true, me)
+              .err == kReadInsecure);
+    CHECK(posix_read_file_at(write_mode("ow", fsp::perms::owner_read | fsp::perms::owner_write |
+                                                  fsp::perms::others_write),
+                             true, me)
+              .err == kReadInsecure);
+    // A missing source is still absent, not a refusal; a FIFO is refused without blocking.
+    CHECK(posix_read_file_at((dir.path / "nope").string(), true, me).err == ENOENT);
+    const auto fifo = dir.path / "fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    CHECK(posix_read_file_at(fifo.string(), true, me).err == kReadNotRegular);
+}
 
-    // A 0444 file is accepted only when its owner is uid 0 (the same rule sudo applies).
-    const auto tight = dir.path / "tight";
+// The routing itself -- which sources are strict -- over a temporary tree, through the exact
+// reader the legs use. Without this a one-line change to `is_sudoers_source(path)` at the call
+// site would revert the symlink fix with every other test green.
+TEST_CASE("local_security_policy make_posix_reader: sudoers sources are strict, PAM sources are followed",
+          "[local_security_policy][parsers][sudoers]") {
+    yuzu::test::TempDir root{"yuzu_test_lsp_"};
+    namespace fsp = std::filesystem;
+    fsp::create_directories(root.path / "etc" / "sudoers.d");
+    fsp::create_directories(root.path / "etc" / "pam.d");
+    const auto secret = root.path / "secret";
     {
-        std::ofstream(tight) << "alice ALL = /bin/ls\n";
+        std::ofstream(secret) << "SECRET\n";
     }
-    std::filesystem::permissions(tight, std::filesystem::perms::owner_read | std::filesystem::perms::group_read |
-                                            std::filesystem::perms::others_read);
-    const auto tight_read = posix_read_file_at(tight.string(), true);
-    if (::geteuid() == 0) {
-        CHECK(tight_read.err == 0);
-        CHECK(tight_read.data == "alice ALL = /bin/ls\n");
-    } else {
-        CHECK(tight_read.err == kReadInsecure); // owned by the test user, not root
+    const auto readable = fsp::perms::owner_read | fsp::perms::group_read | fsp::perms::others_read;
+    fsp::create_symlink(secret, root.path / "etc" / "sudoers.d" / "leak");
+    fsp::create_symlink(secret, root.path / "etc" / "pam.d" / "system-auth");
+    fsp::create_symlink(secret, root.path / "etc" / "sudoers");
+    {
+        std::ofstream(root.path / "etc" / "sudoers.d" / "ok") << "bob ALL = /bin/cat\n";
     }
-    // A missing source is still absent, not a refusal.
-    CHECK(posix_read_file_at((dir.path / "nope").string(), true).err == ENOENT);
+    fsp::permissions(root.path / "etc" / "sudoers.d" / "ok", readable, fsp::perm_options::replace);
+
+    const auto rd = make_posix_reader(root.path.string(), ::geteuid());
+    CHECK(rd("/etc/sudoers.d/leak").err == kReadSymlink);  // the planted link, refused
+    CHECK(rd("/etc/sudoers").err == kReadSymlink);         // a symlinked sudoers file, refused
+    CHECK(rd("/etc/sudoers.d/ok").data == "bob ALL = /bin/cat\n");
+    const auto pam = rd("/etc/pam.d/system-auth");          // PAM: symlinks are real, followed
+    CHECK(pam.err == 0);
+    CHECK(pam.data == "SECRET\n");
 }
 #endif // !_WIN32
 
@@ -1160,6 +1203,166 @@ TEST_CASE("local_security_policy sudoers: escaped separators and comments before
     const auto hash = parse_sudoers("alice ALL=/bin/echo a\\#b\n");
     REQUIRE(hash.size() == 1); // an escaped '#' is not a comment
     CHECK(hash[0].commands == "/bin/echo a\\#b");
+}
+
+// ---- sudoers: bounds, scope lists, continuation, negation, the output convention ---------
+
+TEST_CASE("local_security_policy sudoers: amplification is bounded per line, per file and per row cap",
+          "[local_security_policy][parsers][sudoers]") {
+    // A run-as longer than kMaxSudoersListBytes is not decoded: one unmodelled row, raw text kept.
+    const auto big_runas = parse_sudoers("alice ALL=(" + std::string(detail::kMaxSudoersListBytes + 1, 'a') +
+                                         ") /bin/ls\n");
+    REQUIRE(big_runas.size() == 1);
+    CHECK(big_runas[0].kind == "unmodelled");
+
+    // Alternating run-as inside ONE clause starts a new entry every time (each repeats subject and
+    // run-as): past kMaxSudoersLineEntries the whole line is one unmodelled row, not 10^4 entries.
+    std::string flips = "alice ALL=";
+    for (std::size_t i = 0; i < detail::kMaxSudoersLineEntries + 44; ++i)
+        flips += std::string(i == 0 ? "" : ", ") + (i % 2 ? "(a) /x" : "(b) /x");
+    const auto capped_line = parse_sudoers(flips + "\n");
+    REQUIRE(capped_line.size() == 1);
+    CHECK(capped_line[0].kind == "unmodelled");
+    // Just under the cap is still decoded in full.
+    std::string fine = "alice ALL=";
+    for (std::size_t i = 0; i < 10; ++i) fine += std::string(i == 0 ? "" : ", ") + (i % 2 ? "(a) /x" : "(b) /x");
+    CHECK(parse_sudoers(fine + "\n").size() == 10);
+
+    // The caller's entry cap: nothing past it is parsed into the result.
+    std::string many;
+    for (int i = 0; i < 50; ++i) many += "u" + std::to_string(i) + " ALL = /bin/ls\n";
+    CHECK(parse_sudoers(many, 3).size() == 3);
+    CHECK(parse_sudoers(many).size() == 50);
+}
+
+TEST_CASE("local_security_policy sudoers: the row cap emits the 7-field marker through collect_file_policy",
+          "[local_security_policy][parsers][sudoers]") {
+    std::string text;
+    for (std::size_t i = 0; i < kMaxRows + 20; ++i) text += "u" + std::to_string(i) + " ALL = /bin/ls\n";
+    auto rd = reader_from({{"/etc/sudoers", text}});
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, empty_dir());
+    REQUIRE(c.rows.size() == kMaxRows);
+    // Wired through collect_file_policy (not just the Tally in isolation): the marker keeps the
+    // action's own 7-field shape, and the status says the output was cut.
+    CHECK(c.rows.back() == "sudoers|-|unreadable|-|-|-|row_cap");
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("row_cap") != std::string::npos);
+}
+
+TEST_CASE("local_security_policy sudoers: a Defaults scope list may carry blanks around its commas",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto rows = parse_sudoers(
+        "Defaults:alice, bob !authenticate\n"
+        "Defaults!/bin/a, /bin/b !log_output\n"
+        "Defaults@web1 ,web2 env_reset\n"
+        "Defaults:carol !authenticate\n"
+        "Defaults env_reset\n");
+    REQUIRE(rows.size() == 5);
+    CHECK(rows[0].subject == "user:alice, bob"); // `bob` stays in the scope, not in the settings
+    CHECK(rows[0].commands == "!authenticate");
+    CHECK(rows[1].subject == "cmnd:/bin/a, /bin/b");
+    CHECK(rows[1].commands == "!log_output");
+    CHECK(rows[2].subject == "host:web1 ,web2");
+    CHECK(rows[2].commands == "env_reset");
+    CHECK(rows[3].subject == "user:carol"); // the single-item form is unchanged
+    CHECK(rows[3].commands == "!authenticate");
+    CHECK(rows[4].subject == "-");
+    CHECK(rows[4].commands == "env_reset");
+}
+
+TEST_CASE("local_security_policy sudoers: continuation lines join, and a negated command keeps its `!`",
+          "[local_security_policy][parsers][sudoers]") {
+    const auto joined = parse_sudoers("alice ALL = /bin/ls, \\\n /bin/cat\n");
+    REQUIRE(joined.size() == 1);
+    CHECK(joined[0].commands == "/bin/ls, /bin/cat"); // one statement, one row, both commands
+    const auto negated = parse_sudoers("alice ALL = /bin/su\nbob ALL = !/bin/su\n");
+    REQUIRE(negated.size() == 2);
+    CHECK(negated[0].commands == "/bin/su");
+    CHECK(negated[1].commands == "!/bin/su"); // the negation is part of the reported grant
+}
+
+TEST_CASE("local_security_policy sudoers: a literal backslash is rendered as `/` by the shared row escaper",
+          "[local_security_policy][parsers][sudoers]") {
+    // The SDK's safe_output_field is deliberately lossy on `\` (the wire decoder only undoes
+    // `\|`); a sudoers value that carries a backslash therefore reads with `/` in its place.
+    // The README and the instruction definition say so -- this pins the behaviour they describe.
+    const auto rows = parse_sudoers("%domain\\ admins ALL = /usr/bin/foo\\ bar\n");
+    REQUIRE(rows.size() == 1);
+    auto rd = reader_from({{"/etc/sudoers", "%domain\\ admins ALL = /usr/bin/foo\\ bar\n"}});
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, empty_dir());
+    bool saw = false;
+    for (const auto& r : c.rows)
+        if (r == "sudoers|/etc/sudoers|user_spec|%domain/ admins@ALL|-|false|/usr/bin/foo/ bar") saw = true;
+    CHECK(saw);
+}
+
+// ---- secedit: the pure tail of the Windows dispatch ----------------------------------------
+
+namespace {
+std::vector<std::uint8_t> utf16le_with_bom(const std::string& ascii) {
+    std::vector<std::uint8_t> v{0xFF, 0xFE};
+    for (const char c : ascii) {
+        v.push_back(static_cast<std::uint8_t>(c));
+        v.push_back(0);
+    }
+    return v;
+}
+const char* const kGoodExport =
+    "[Unicode]\r\nUnicode=yes\r\n[System Access]\r\nMinimumPasswordAge = 1\r\nMaximumPasswordAge = 42\r\n"
+    "MinimumPasswordLength = 8\r\nPasswordComplexity = 1\r\nLockoutBadCount = 5\r\n"
+    "[Event Audit]\r\nAuditLogonEvents = 3\r\nAuditObjectAccess = 0\r\n"
+    "[Registry Values]\r\nMACHINE\\Foo=4,1\r\n[Version]\r\nsignature=\"$CHICAGO$\"\r\nRevision=1\r\n";
+} // namespace
+
+TEST_CASE("local_security_policy secedit_export_to_rows: rows only from a complete, decodable export",
+          "[local_security_policy][parsers][secedit]") {
+    const auto span_of = [](const std::vector<std::uint8_t>& v) {
+        return std::span<const std::uint8_t>{v.data(), v.size()};
+    };
+    const auto good = utf16le_with_bom(kGoodExport);
+    const auto pw = secedit_export_to_rows(span_of(good), "password_policy");
+    CHECK(pw.failure_token.empty());
+    bool saw_len = false;
+    for (const auto& r : pw.rows)
+        if (r == "password_policy|MinimumPasswordLength|8|secedit") saw_len = true;
+    CHECK(saw_len);
+    const auto audit = secedit_export_to_rows(span_of(good), "audit_policy");
+    CHECK(audit.rows == std::vector<std::string>{"audit_policy|AuditLogonEvents|success_failure|secedit",
+                                                  "audit_policy|AuditObjectAccess|none|secedit"});
+
+    // No BOM -> not decodable.
+    const std::vector<std::uint8_t> no_bom{0x41, 0x00, 0x42, 0x00};
+    CHECK(secedit_export_to_rows(span_of(no_bom), "password_policy").failure_token == "secedit:decode_failed");
+    // A truncated export (no signed final [Version]) is never rows, even though [System Access] decoded.
+    std::string cut = kGoodExport;
+    cut.erase(cut.find("[Version]"));
+    const auto truncated = utf16le_with_bom(cut);
+    const auto t = secedit_export_to_rows(span_of(truncated), "password_policy");
+    CHECK(t.failure_token == "secedit:export_incomplete");
+    CHECK(t.rows.empty());
+    // [Event Audit] present but [System Access] missing: incomplete for EVERY action.
+    std::string no_sys = kGoodExport;
+    const auto b = no_sys.find("[System Access]");
+    no_sys.erase(b, no_sys.find("[Event Audit]") - b);
+    const auto no_sys16 = utf16le_with_bom(no_sys);
+    CHECK(secedit_export_to_rows(span_of(no_sys16), "audit_policy").failure_token == "secedit:export_incomplete");
+    // A NUL anywhere is refused before any mapping.
+    std::string with_nul = kGoodExport;
+    with_nul.insert(with_nul.find("MinimumPasswordAge"), std::string(1, '\0'));
+    const auto nul16 = utf16le_with_bom(with_nul);
+    CHECK(secedit_export_to_rows(span_of(nul16), "password_policy").failure_token == "secedit:embedded_nul");
+}
+
+TEST_CASE("local_security_policy secedit_policy_rows: a NUL inside a key or value is refused (defence in depth)",
+          "[local_security_policy][parsers][secedit]") {
+    InfSections sections;
+    sections["System Access"]["MinimumPasswordAge"] = std::string("1\0" "2", 3);
+    const auto pw = secedit_policy_rows("password_policy", sections);
+    CHECK(pw.failure_token == "secedit:embedded_nul");
+    CHECK(pw.rows.empty());
+    InfSections audit;
+    audit["Event Audit"][std::string("Audit\0X", 7)] = "1";
+    CHECK(secedit_policy_rows("audit_policy", audit).failure_token == "secedit:embedded_nul");
 }
 
 TEST_CASE("local_security_policy secedit: audit setting bitmask", "[local_security_policy][parsers][secedit]") {
@@ -1253,7 +1456,11 @@ TEST_CASE("local_security_policy sweep: staleness is strict, exact equality is f
           "[local_security_policy][parsers][sweep]") {
     CHECK_FALSE(is_stale(1000, 1000 + 3600, 3600));       // exactly the threshold: fresh
     CHECK(is_stale(1000, 1000 + 3601, 3600));             // one second past: stale
-    CHECK_FALSE(is_stale(1000, 500, 3600));               // a future-dated mtime (clock skew): fresh
+    CHECK_FALSE(is_stale(1000, 500, 3600));               // a modest future skew (within the threshold): fresh
+    // A far-future mtime (a clock that ran ahead at crash time, then stepped back) is stale too, or
+    // the orphan would hide for as long as the skew; exactly at the threshold it is still fresh.
+    CHECK_FALSE(is_stale(10000, 10000 - 3600, 3600));
+    CHECK(is_stale(10000, 10000 - 3601, 3600));
 }
 
 TEST_CASE("local_security_policy sweep: candidate classification covers all four states",
