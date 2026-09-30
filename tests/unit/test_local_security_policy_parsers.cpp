@@ -1236,6 +1236,24 @@ TEST_CASE("local_security_policy sudoers: amplification is bounded per line, per
     CHECK(parse_sudoers(many).size() == 50);
 }
 
+TEST_CASE("local_security_policy Tally: a byte budget bounds output independently of the row count",
+          "[local_security_policy][parsers][sudoers]") {
+    static_assert(kMaxRowBytes <= 4u * 1024 * 1024); // the point is that it stays small
+    detail::Tally t;
+    t.marker_prefix = "sudoers";
+    t.marker_fields = 7;
+    const std::string big(100 * 1024, 'x'); // 100 rows of this is 10 MiB, far under the 4096-row cap
+    for (int i = 0; i < 100; ++i)
+        t.row(format_sudoers_row("/etc/sudoers", {"unmodelled", "-", "-", "-", big}));
+    CHECK(t.capped);
+    CHECK(t.rows.size() < 100);
+    CHECK(t.rows.back() == "sudoers|-|unreadable|-|-|-|row_cap");
+    CHECK(t.acc.reason() == "row_cap");
+    std::size_t total = 0;
+    for (const auto& r : t.rows) total += r.size() + 1;
+    CHECK(total <= kMaxRowBytes + 64);
+}
+
 TEST_CASE("local_security_policy sudoers: the row cap emits the 7-field marker through collect_file_policy",
           "[local_security_policy][parsers][sudoers]") {
     std::string text;

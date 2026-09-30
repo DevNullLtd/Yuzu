@@ -140,7 +140,7 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 /// fedora:40); all paths are under /etc. `strict` (the sudoers sources, see is_sudoers_source)
 /// is the opposite: the leaf is opened O_NOFOLLOW (a link is kReadSymlink) and the opened object
 /// must be owned by `owner_uid` (uid 0 in production) and not group/other-writable
-/// (kReadInsecure), so a planted link or a file sudo would refuse can never be read back to a
+/// (kReadInsecure; stricter than sudo), so a planted link or a loose file can never be read back to a
 /// Security:Read caller as policy content. Only the LEAF is checked: a symlinked parent
 /// directory is followed (root-owned /etc is the trust anchor).
 ///
@@ -152,7 +152,8 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 /// symlink means the node need not sit under /etc itself. Once fstat proves
 /// S_ISREG the flag is inert (POSIX: reads of a regular file never block), so
 /// nothing clears it afterwards and no real host behaves differently.
-inline FileRead posix_read_file_at(const std::string& path, bool strict, uid_t owner_uid = 0) {
+inline FileRead posix_read_file_at(const std::string& path, bool strict,
+                                   uid_t owner_uid = kSudoersOwnerUid) {
     yuzu::agent::ScopedFd fd(
         ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | (strict ? O_NOFOLLOW : 0)));
     if (!fd) return {strict && errno == ELOOP ? kReadSymlink : errno, {}};
@@ -179,7 +180,8 @@ inline FileRead posix_read_file_at(const std::string& path, bool strict, uid_t o
 /// The production reader: sudoers sources strict, everything else lenient. `root` and
 /// `sudoers_owner_uid` exist so a test can drive this exact routing over a temporary tree
 /// (`<root>/etc/sudoers.d/x`) as any user; production passes neither (real /etc, uid 0).
-inline FileReader make_posix_reader(std::string root = {}, uid_t sudoers_owner_uid = 0) {
+inline FileReader make_posix_reader(std::string root = {},
+                                    uid_t sudoers_owner_uid = kSudoersOwnerUid) {
     return [root = std::move(root), sudoers_owner_uid](const std::string& path) {
         return posix_read_file_at(root + path, is_sudoers_source(path), sudoers_owner_uid);
     };

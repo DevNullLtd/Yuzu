@@ -686,6 +686,9 @@ inline bool has_passwd_tag(std::string_view s) {
 /// bounded by (entries x ~12 KiB), not by the line's repetition structure.
 inline constexpr std::size_t kMaxSudoersListBytes = 4096;
 inline constexpr std::size_t kMaxSudoersLineEntries = 256;
+// The point of the bound is that it is SMALL (a pre-fix value of 4096 amplified one line into
+// hundreds of MiB): pin the ceiling so a later edit cannot quietly raise it.
+static_assert(kMaxSudoersListBytes <= 4096 && kMaxSudoersLineEntries <= 256);
 
 /// One lexed user spec, parsed by the sudoers(5) grammar:
 /// `User_List Host_List = Cmnd_Spec_List (: Host_List = Cmnd_Spec_List)*`, each
@@ -812,7 +815,8 @@ inline std::vector<SudoersEntry> parse_sudoers(std::string_view text,
                                                std::size_t max_entries = static_cast<std::size_t>(-1)) {
     std::vector<SudoersEntry> out;
     for (const auto& st : detail::SudoersLexer{text}.run()) {
-        if (out.size() >= max_entries) break; // the caller's own row cap: nothing past it is emitted
+        if (out.size() >= max_entries) break; // the caller's row budget: stop parsing once it is met
+                                              // (one statement may overshoot by < kMaxSudoersLineEntries)
         const std::string_view line = st.text;
         auto word = line.substr(0, line.find_first_of(" \t"));
         // A Defaults scope is a list, and the grammar allows blanks around its commas
@@ -883,9 +887,15 @@ inline constexpr int kReadEmbeddedNul = -3;
 /// file CONTENT (unparsable lines verbatim), so a planted link would turn it into a read
 /// primitive for any file the agent can read. Never followed, never treated as absent.
 inline constexpr int kReadSymlink = -4;
-/// A sudoers source is not owned by uid 0 or is group/other-writable -- the check sudo itself
-/// makes before it will honour a file, so content sudo would refuse is not reported as policy.
+/// A sudoers source is not owned by uid 0 or is group/other-writable. Stricter than sudo's own
+/// check (sudo allows a group-writable file owned by the sudoers group), and the same direction:
+/// content sudo would refuse is never reported as policy.
 inline constexpr int kReadInsecure = -5;
+
+/// The owner a sudoers source must have in production: root. Named so the default cannot drift
+/// (the reader takes the owner as a parameter only so tests can run as any user).
+inline constexpr unsigned kSudoersOwnerUid = 0;
+static_assert(kSudoersOwnerUid == 0, "sudoers sources must be root-owned");
 
 /// The sources read under the strict (no-follow, root-owned) rule. Every other source keeps
 /// the following reader: /etc/pam.d/system-auth is a real symlink into /etc/authselect.
@@ -1003,6 +1013,7 @@ inline std::string_view action_row_prefix(LocalPolicyAction a) {
 inline constexpr std::size_t kMaxFileBytes = 256 * 1024;
 inline constexpr std::size_t kMaxDirEntries = 256;
 inline constexpr std::size_t kMaxRows = 4096;
+inline constexpr std::size_t kMaxRowBytes = 4u * 1024 * 1024; // formatted output cap per dispatch
 
 struct Collected {
     std::vector<std::string> rows;
@@ -1026,7 +1037,9 @@ struct Tally {
     /// marker match the action's own field count (4 for the kv actions, 7 for
     /// sudoers), so the truncation notice never breaks the wire shape.
     void row(std::string r) {
-        if (rows.size() + 1 >= kMaxRows) {
+        // Row COUNT alone does not bound output: sudoers rows can each be ~12 KiB, so 4096 of them
+        // is ~50 MB from a 256 KiB file. The byte budget shares the row cap's marker and status.
+        if (rows.size() + 1 >= kMaxRows || bytes + r.size() > kMaxRowBytes) {
             if (!capped) {
                 acc.add_failure("row_cap");
                 rows.push_back(truncation_marker());
@@ -1034,9 +1047,11 @@ struct Tally {
             capped = true;
             return;
         }
+        bytes += r.size() + 1;
         rows.push_back(std::move(r));
     }
 
+    std::size_t bytes = 0; // formatted row bytes so far (each row plus its newline)
     std::string marker_prefix{"local_security_policy"};
     std::size_t marker_fields{4};
     [[nodiscard]] std::string truncation_marker() const {
@@ -1132,7 +1147,7 @@ inline void sudoers_file(const FileReader& rd, Tally& t, const std::string& path
         t.row(format_sudoers_row(path, {st.first, "-", "-", "-", st.second.empty() ? "-" : st.second}));
     });
     if (!text) return;
-    for (const auto& e : parse_sudoers(*text, kMaxRows)) {
+    for (const auto& e : parse_sudoers(*text, kMaxRows - t.rows.size())) {
         if (t.capped) return; // rows past the cap are dropped: stop formatting (and parsing) here
         t.row(format_sudoers_row(path, e));
         // The fail-safe half of parse_user_spec: a NOPASSWD:/PASSWD: tag the parser could

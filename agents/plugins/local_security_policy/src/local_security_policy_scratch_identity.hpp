@@ -3,8 +3,8 @@
 /**
  * local_security_policy_scratch_identity.hpp -- ownership verification for the
  * Windows leg's scratch directory and the sweep's candidates. PLUGIN-LOCAL COPY
- * of execution_artifacts_scratch_identity.hpp's two functions (only the
- * namespace differs); not lifted into agents/shared until a second consumer
+ * of execution_artifacts_scratch_identity.hpp's two functions (the namespace differs, and
+ * the SdGuard here has an explicit constructor and deleted copies); not lifted into agents/shared until a second consumer
  * justifies it. Both resolve against an OPEN HANDLE, never a path, and compare
  * against the current process token's owner (never a hardcoded SYSTEM pair).
  * Windows-only (#ifdef _WIN32); empty elsewhere.

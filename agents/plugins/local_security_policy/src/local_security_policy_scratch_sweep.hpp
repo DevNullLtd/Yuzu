@@ -21,8 +21,10 @@
  * agents/shared: that root takes zero-dependency leaves only and this package
  * needs agents/core (confined_fs's WinHandle, via the identity header), so the
  * real destination is agents/core/include/yuzu/agent/ beside confined_fs.hpp.
- * Tracked for extraction as its own change; until then a fix to either copy
- * MUST be applied to both.
+ * Tracked for extraction as its own change; until then a fix to one copy should be weighed
+ * against the other. DELIBERATE DIVERGENCE: is_stale here also treats a far-future mtime as
+ * stale (a clock that ran ahead at crash time must not hide an orphan for the skew), where
+ * execution_artifacts' copy still reads any future-dated mtime as fresh.
  *
  * ---- Clock-guarded-retention adoption (docs/clock-guarded-retention.md,
  *      parts 1-7) -- DELIBERATE, PARTIAL adoption, decided here -------------
@@ -37,7 +39,7 @@
  * late; it can destroy nothing (a forward step can make a live directory LOOK stale, but
  * the dispatch's open handle -- not the clock -- makes the removal fail; the dispatch
  * itself is unaffected unless the sweep wins the create-to-open window, which fails it
- * closed as `dest_dir_open_<n>` and is retried).
+ * closed as `dest_dir_open_<n>`; the next dispatch succeeds).
  *   - Parts 1 (probe by OUTCOME) and 2 (compare against a PERSISTED reading):
  *     NOT adopted -- nothing to probe for, and no prior reading worth
  *     persisting when what ages out is disposable scratch space.
@@ -63,7 +65,7 @@
  * create-to-open window), so the same numbers are the right answer and a
  * different one would need its own justification. Only one DERIVATION differs:
  * kScratchSweepMaxDirEntries is 64 here because a real export directory holds
- * exactly ONE file (policy.inf), where the sibling reaches the same 64 sizing
+ * one export file (plus at most the secedit.log beside it), where the sibling reaches the same 64 sizing
  * for a hive plus its .LOG1/.LOG2 sidecars. kScratchSweepMaxFailures is capped
  * separately from removals for the reason the sibling gives at its own
  * declaration -- a failure deletes nothing, so persistent failures early in
@@ -107,7 +109,7 @@ inline constexpr std::size_t kScratchSweepMaxRemovals = 64;
 /// persistent failures must not starve a later removable orphan.
 inline constexpr std::size_t kScratchSweepMaxFailures = 256;
 inline constexpr std::int64_t kScratchSweepMaxWallMs = 2000;
-/// A real export directory holds one file (policy.inf).
+/// A real export directory holds the export (policy.inf) and at most the secedit.log beside it.
 inline constexpr std::size_t kScratchSweepMaxDirEntries = 64;
 
 struct ScratchSweepResult {
@@ -145,8 +147,11 @@ struct ScratchSweepResult {
 /// the clock -- and a modest skew (within the threshold) still reads as fresh.
 [[nodiscard]] inline bool is_stale(std::int64_t mtime_unix_s, std::int64_t now_unix_s,
                                    std::int64_t stale_after_s) noexcept {
-    const std::int64_t age = now_unix_s - mtime_unix_s;
-    return age > stale_after_s || -age > stale_after_s;
+    // Unsigned subtraction: defined on every input (the result converts back modularly), so no
+    // signed overflow for a synthetic extreme; real mtimes are FILETIME-derived and far from it.
+    const auto age = static_cast<std::int64_t>(static_cast<std::uint64_t>(now_unix_s) -
+                                               static_cast<std::uint64_t>(mtime_unix_s));
+    return age > stale_after_s || age < -stale_after_s;
 }
 
 enum class SweepCandidate {

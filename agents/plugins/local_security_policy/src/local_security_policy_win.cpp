@@ -3,9 +3,11 @@
  * password_policy / lockout_policy / audit_policy read from ONE
  * `secedit /export` of the SECURITYPOLICY area, parsed from its UTF-16LE INI.
  *
- * RUNG 2 (an honest argv leaf, not rung 1): no in-tree LSA policy-query
- * precedent, NetUserModalsGet passed over, and docs/agent-privilege-model.md "Audit and review"
- * names `secedit /export` the authoritative source on a running box. Spawned via
+ * RUNG 2 (an honest argv leaf, not rung 1): rung 1 is passed over on ADR-3002 Decision 1's
+ * disproportionate-cost ground (NetUserModalsGet lacks PasswordComplexity/ClearTextPassword and the
+ * legacy audit categories need LsaQueryInformationPolicy: three API families against one bounded
+ * leaf; the sink manifest row has the per-key detail), and docs/agent-privilege-model.md "Audit
+ * and review" names `secedit /export` the authoritative source on a running box. Spawned via
  * yuzu::agent::run_bounded_subprocess (Job-Object path unchanged), argv[0] the
  * absolute `<system directory>\secedit.exe` resolved through
  * yuzu::agent::windows_system_directory() (GetSystemDirectoryW, never a guessed
