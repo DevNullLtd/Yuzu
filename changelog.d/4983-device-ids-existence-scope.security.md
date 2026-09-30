@@ -10,8 +10,8 @@
   an error toast (the dashboard fragment) — never a silent drop and never a partial create — with
   the offending id(s) named in the error (the caller's own submitted list, so this is not a
   disclosure of someone else's device existence). Each `device_ids` entry is also now capped at
-  256 bytes (`400 RESULT_SET_DEVICE_ID_TOO_LONG` / the JSON-RPC equivalent / an error toast) — a
-  separate, additional new rejection path on all three surfaces. **Breaking change:** the new gate
+  256 bytes (`400 RESULT_SET_DEVICE_ID_TOO_LONG` / the JSON-RPC equivalent / an error toast) on
+  REST and the dashboard fragment — MCP already enforced this cap (#4353). **Breaking change:** the new gate
   is a mandatory admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017),
   checked whenever `device_ids` is non-empty. Under an RBAC-**enabled** deployment, of the 7
   seeded built-in roles only `Administrator` and `ITServiceOwner` hold `Infrastructure:Read` —
@@ -26,14 +26,12 @@
   The existence check is presence-merged (the same fleet-wide domain a real dispatch uses, not
   just this replica's local connections), so a device known only via cross-replica presence is
   correctly recognized as existing under normal operation. During a cross-replica presence-store
-  degradation, however, `AgentRegistry::all_ids()` narrows to local-only ids (the same documented
-  residual its other two existing callers already carry, tracked under #5007) — this can cause a
-  transient, non-retryable false-reject of a presence-only device in that window; it is not the
-  "never wrongly rejected" guarantee an earlier draft of this note claimed.
+  degradation, `AgentRegistry::all_ids()` narrows to local-only ids (the same documented residual
+  its other two existing callers already carry, tracked under #5007) — this can cause a transient,
+  non-retryable false-reject of a presence-only device in that window.
 
-  Correction to an earlier draft of this note: the per-owner result-set quota is **not** paddable
-  by a junk `device_ids` entry — `ResultSetStore`'s quota check counts result *sets*
-  (`SELECT COUNT(*) ... WHERE owner_principal = $1`), not member rows, so one set with junk
-  members only ever consumes exactly one quota unit regardless of member count. The gap this fix
-  closes is the unverified `device_count`/lineage and the missing authorization check, not quota
-  padding.
+  Note: the per-owner result-set quota is **not** paddable by a junk `device_ids` entry —
+  `ResultSetStore`'s quota check counts result *sets* (`SELECT COUNT(*) ... WHERE owner_principal =
+  $1`), not member rows, so one set with junk members only ever consumes exactly one quota unit
+  regardless of member count. The gap this fix closes is the unverified `device_count`/lineage and
+  the missing authorization check, not quota padding.

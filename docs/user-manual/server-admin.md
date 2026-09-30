@@ -2555,11 +2555,27 @@ surfaces. This is a genuine, confirmed regression path, not a hypothetical one. 
 never consulted. **RBAC-disabled deployments (the shipped default) are entirely unaffected** — the
 legacy permission fallback admits every authenticated session regardless of this change.
 
-**What to do.** On an RBAC-enabled deployment, grant `Infrastructure:Read` to any custom role (or
-built-in role) whose holders need to create result sets from a caller-supplied `device_ids` list —
-`Administrator` and `ITServiceOwner` already hold it and need no change. There is no per-route
-opt-out; a caller that only ever creates result sets via `parent_id`/`source_payload` (no
-`device_ids`) is unaffected and needs no grant change.
+**Check your automation and your dashboard operators, not just your admins — this is the failure
+that hides.** Before upgrading an RBAC-enabled deployment, identify every non-admin principal
+(API token, service account, or interactive session) that currently calls `POST
+/api/v1/result-sets` / `create_result_set` / the dashboard's CSV-paste import ("New result set
+from a list of device ids") with a non-empty `device_ids`. This includes a dashboard operator
+pasting a CSV of ids just as much as an automation calling the API — both hit the identical new
+gate. Audit your `AuthDB`/API-token principal list and your dashboard-role assignments for holders
+of `Viewer`, `Operator`, `PlatformEngineer`, `ApiTokenManager`, or `Reviewer` who use this
+capability; each will start receiving `403` the moment this release is live, with no advance
+warning from the caller's own side.
+
+**What to do.** Of the 6 fleet-wide-assignable built-in roles, only `Administrator` holds
+`Infrastructure:Read` — `ITServiceOwner` (the 7th, management-group-scoped-only) also holds it. A
+principal who needs to keep creating result sets with `device_ids` after this release needs one of
+those two roles; per `rbac.md`'s own current state, there is **no REST API or Settings UI yet for
+creating a custom role or editing an existing role's permission set** (tracked as planned, not
+implemented) — the only way to grant `Infrastructure:Read` to a role that doesn't already hold it
+is a direct `RbacStore::set_permission()` call against the shared Postgres `rbac_store` schema (see
+`rbac.md`'s "Custom roles" section for the exact mechanism). There is no per-route opt-out; a
+caller that only ever creates result sets via `parent_id`/`source_payload` (no `device_ids`) is
+unaffected and needs no change.
 
 ## Settings Page
 

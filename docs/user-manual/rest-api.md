@@ -6679,7 +6679,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_UNKNOWN_DEVICE_ID` (#4983) — a non-empty `device_ids` contains an id that does not exist, or exists but is outside the caller's own scope; the offending id(s) are named in the error message (the caller's own submitted list, so echoing them back is not a disclosure) — checked after the size cap and before `create_materialized`, so an oversized array is rejected for that reason first |
 | 400 | `RESULT_SET_DEVICE_ID_TOO_LONG` (#4983) — a `device_ids` entry exceeds 256 bytes; checked before both the per-set member-count cap and the existence/scope lookup above |
-| 403 | Service-scoped API token |
+| 403 | Service-scoped API token, or (#4983) the caller lacks `Infrastructure:Read` — only reachable when `device_ids` is non-empty; a request without it never consults this gate |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
 | 503 | The `device_ids` existence/scope check itself is unwired or its backing agent registry is unavailable — only reachable when `device_ids` is non-empty; a request without it is unaffected |
