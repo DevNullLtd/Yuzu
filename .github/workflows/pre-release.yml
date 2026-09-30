@@ -353,8 +353,9 @@ jobs:
             || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
           echo 'PASS: systemd service file exists'
           if [ "$PKG" = gateway ]; then
-            # Start it the way the installed unit does, read from the unit
-            # itself: as its User=, in its WorkingDirectory=, with its
+            # Start it with the installed unit's own settings, read from the
+            # unit file (not under its sandboxing, and with `daemon` rather
+            # than its `foreground`): as its User=, in its WorkingDirectory=, with its
             # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
             # (/etc/yuzu/gateway.env, the per-install distribution cookie the
             # postinst generates; yuzu_gw_app refuses to start without it).
@@ -377,7 +378,7 @@ jobs:
               if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
                 echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
               else
-                echo "FAIL: $1 (the gateway log is above)"
+                echo "FAIL: $1 (the gateway log, if any, is above)"
               fi
               exit 1
             }
@@ -491,8 +492,9 @@ jobs:
             || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
           echo 'PASS: systemd service file exists'
           if [ "$PKG" = gateway ]; then
-            # Start it the way the installed unit does, read from the unit
-            # itself: as its User=, in its WorkingDirectory=, with its
+            # Start it with the installed unit's own settings, read from the
+            # unit file (not under its sandboxing, and with `daemon` rather
+            # than its `foreground`): as its User=, in its WorkingDirectory=, with its
             # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
             # (/etc/yuzu/gateway.env, the per-install distribution cookie the
             # postinst generates; yuzu_gw_app refuses to start without it).
@@ -510,7 +512,8 @@ jobs:
             done < "$ENV_FILE"
             # fedora:42's base image has no runuser (util-linux): a test tool,
             # not a dependency of the package under test.
-            command -v runuser >/dev/null || dnf install -y -q util-linux
+            command -v runuser >/dev/null || dnf install -y -q util-linux \
+              || { echo "FAIL: could not install runuser (util-linux) for the gateway check"; exit 1; }
             GW=(runuser -u "$GW_USER" -- env "${GW_ENV[@]}" /opt/yuzu_gw/bin/yuzu_gw)
             cd "$GW_DIR"
             gw_fail() {
@@ -518,7 +521,7 @@ jobs:
               if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
                 echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
               else
-                echo "FAIL: $1 (the gateway log is above)"
+                echo "FAIL: $1 (the gateway log, if any, is above)"
               fi
               exit 1
             }
@@ -1244,9 +1247,11 @@ jobs:
               if UP=$(bash "$QA" roundtrip status health uptime_seconds 10); then
                 RT="ok(uptime=${UP}s)"; RT_OK=$((RT_OK + 1))
                 # The memory baseline is the sample of the first successful
-                # round-trip, not the first sample: every service grows while
-                # it warms up (the server went 24MiB -> 125MiB in the first
-                # minutes), so a first-sample baseline warned on every soak.
+                # round-trip, not the first sample: the server grows from its
+                # just-started size (24MiB -> 67MiB by the first round-trip on
+                # rc2, then steadily to 125MiB over the soak), so a first-sample
+                # baseline warned on every soak. This does not show warm-up has
+                # ended; memory stays informational.
                 [ -n "$FIRST_MEM" ] || { FIRST_MEM="$MEM"; FIRST_MEM_TS="$TS"; }
               else
                 RT="FAIL"; RT_FAIL=$((RT_FAIL + 1)); PROBLEMS+="command round-trip failed; "

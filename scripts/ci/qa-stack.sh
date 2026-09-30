@@ -64,7 +64,12 @@
 #                           unhealthy), then the server, which the gateway
 #                           depends on (10s + 30 x 10s = 310s). 380s lets
 #                           compose report its own verdict; 420s is that
-#                           plus margin.
+#                           plus margin. Those sums count interval x retries
+#                           only: a probe that hangs to its own timeout (psql
+#                           5s, the server's 3s) adds that per retry, so a
+#                           hung stack can outlast 420s before compose
+#                           decides. The 420s bound then fires first; the
+#                           run still fails, bounded, after dump_stack.
 #   wait_server             <= 180s + one probe (cp + 10s curl + 3s) ~ 195s
 #   wait_gateway            <= 180s + one probe (5s curl + 3s)      ~ 190s
 #   wait_agent              <= 180s + one metric read (<= 3 x 30s)  = 270s
@@ -532,7 +537,7 @@ cmd_check_stable() {
 # spellings stay for any other template. A bare "Supervisor:" must NOT match:
 # every child start at boot logs "Supervisor: {local,x}. Started: ...".
 GW_CRASH_PAT='\] <[0-9.]+> crasher: |crasher: initial call'
-GW_CRASH_PAT+='|[Ss]upervisor: .*[Cc]ontext: (child_terminated|start_error|shutdown_error|reached_max_restart_intensity)'
+GW_CRASH_PAT+='|[Ss]upervisor: .*[Cc]ontext: (child_terminated|start_error|shutdown_error)|Reason: reached_max_restart_intensity'
 GW_CRASH_PAT+='|CRASH REPORT|crash_report|SUPERVISOR REPORT|supervisor_report'
 cmd_crash_check() {
   local s pat log hits found=()
