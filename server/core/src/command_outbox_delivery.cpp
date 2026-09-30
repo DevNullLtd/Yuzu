@@ -336,52 +336,48 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //      count/audit here (the re-send is dedup-absorbed).
     //    - fenced out / already terminal → the TRUE leader owns finalize+count+
     //      audit; doing it here too would double-count one logical delivery (C-5).
-    auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
-    if (!marked.has_value()) {
-        count("yuzu_server_command_outbox_deliver_degrade_total");
-        spdlog::warn("command_outbox_delivery: mark_sent degraded for occurrence '{}' — "
-                     "will re-drive",
-                     c.occurrence_id);
-        return;
-    }
-    if (!*marked)
-        return; // fenced out or already terminal — not ours to finalize/count/audit
-
-    // 7. We own this delivery. Finalize the (fire-time-created) execution row so
-    //    it cannot idle to the materialise timeout (executions ladder), then count
-    //    and audit exactly once. sent==0 (no agents reachable right now) is a
-    //    DISTINCT outcome from a real delivery — a separate counter so the
-    //    delivered SLI is not inflated by no-agent misses (C-1).
-    if (d_.execution_tracker && !c.execution_id.empty()) {
-        if (outcome.sent > 0) {
-            if (!d_.execution_tracker->set_agents_targeted(c.execution_id, outcome.sent)) {
-                spdlog::error("command_outbox_delivery: set_agents_targeted failed for "
-                              "execution_id={} occurrence='{}' — falling back to cancel",
-                              c.execution_id, c.occurrence_id);
-                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
-                // no observable signal — count it alongside the log line,
-                // matching Part A's REST/MCP instrumentation pattern.
-                if (d_.metrics)
-                    d_.metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                 {{"op", "set_agents_targeted"}, {"surface", "outbox"}})
-                        .increment();
-                if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
-                    spdlog::error("command_outbox_delivery: mark_cancelled failed for "
-                                  "execution_id={} occurrence='{}' after set_agents_targeted "
-                                  "also failed — row remains 'running'",
-                                  c.execution_id, c.occurrence_id);
-                    // #4982 fix round 2 (Fix 5): this is the sharpest of the five
-                    // swallowed sites — a DOUBLE bookkeeping failure with
-                    // previously neither a log nor a metric at all.
-                    if (d_.metrics)
-                        d_.metrics
-                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                     {{"op", "mark_cancelled"}, {"surface", "outbox"}})
-                            .increment();
-                }
-            }
-        } else {
+    //
+    //    #4982 round 3: a genuine dispatch (`outcome.sent > 0`, with an
+    //    execution row to bookkeep) uses the ATOMIC
+    //    `CommandOutboxStore::mark_sent_with_target` — the sent-transition and
+    //    the real `agents_targeted` count commit in ONE transaction, closing a
+    //    race where a reaper pass could observe `state='sent'` with
+    //    `agents_targeted` still 0 (two separate autocommit statements, one
+    //    committed and one not yet) and force-cancel a live, still-executing
+    //    command with no kill RPC ever sent (see that method's own doc
+    //    comment). Every other case — `sent==0`, or no execution row to
+    //    bookkeep at all — keeps the plain autocommit `mark_sent`: a
+    //    `sent==0` occurrence never had a live agent execution to falsely
+    //    kill, so an early reaper cancel racing the `mark_cancelled` call
+    //    below is harmless (both converge on `cancelled`; `mark_cancelled`'s
+    //    own terminal-exclusion guard makes a second cancel a clean, event-
+    //    free no-op).
+    const bool bookkeep_target = d_.execution_tracker && !c.execution_id.empty();
+    bool owns_delivery = false;
+    if (bookkeep_target && outcome.sent > 0) {
+        auto marked = d_.outbox->mark_sent_with_target(c.occurrence_id, lock_name, epoch,
+                                                       c.execution_id, outcome.sent);
+        if (!marked.has_value()) {
+            count("yuzu_server_command_outbox_deliver_degrade_total");
+            spdlog::warn("command_outbox_delivery: mark_sent_with_target degraded for "
+                         "occurrence '{}' — will re-drive",
+                         c.occurrence_id);
+            return;
+        }
+        owns_delivery = *marked;
+    } else {
+        auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
+        if (!marked.has_value()) {
+            count("yuzu_server_command_outbox_deliver_degrade_total");
+            spdlog::warn("command_outbox_delivery: mark_sent degraded for occurrence '{}' — "
+                         "will re-drive",
+                         c.occurrence_id);
+            return;
+        }
+        owns_delivery = *marked;
+        if (owns_delivery && bookkeep_target) {
+            // sent==0: no agents reached — cancel the (fire-time-created)
+            // execution row so it doesn't idle to the materialise timeout.
             if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
                 spdlog::error("command_outbox_delivery: mark_cancelled failed for "
                               "execution_id={} occurrence='{}' (sent==0) — row remains 'running'",
@@ -395,6 +391,13 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             }
         }
     }
+    if (!owns_delivery)
+        return; // fenced out or already terminal — not ours to finalize/count/audit
+
+    // 7. We own this delivery — count and audit exactly once. sent==0 (no
+    //    agents reachable right now) is a DISTINCT outcome from a real
+    //    delivery — a separate counter so the delivered SLI is not inflated by
+    //    no-agent misses (C-1).
     if (outcome.sent > 0) {
         count("yuzu_server_command_outbox_delivered_total");
         spdlog::info("command_outbox_delivery: delivered occurrence '{}' — command_id={} "

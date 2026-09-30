@@ -33,10 +33,11 @@
 ///  `approval_id` and stamped here (this loop is the declared #1398 stamping
 ///  site for outbox dispatch — see `dispatch_caller.hpp`'s closed list).
 ///
-///  Fenced marks — `mark_sent` / `mark_failed` / `reschedule` embed the leader
-///  epoch (read once per tick from the elector). A stale ex-leader is fenced out
-///  of the state change; the row stays `pending` for the true leader (the
-///  duplicate send it may already have made is absorbed by command_id dedup).
+///  Fenced marks — `mark_sent` / `mark_sent_with_target` / `mark_failed` /
+///  `reschedule` embed the leader epoch (read once per tick from the
+///  elector). A stale ex-leader is fenced out of the state change; the row
+///  stays `pending` for the true leader (the duplicate send it may already
+///  have made is absorbed by command_id dedup).
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
@@ -44,8 +45,13 @@
 /// degraded `GatewayRouteStore::lookup_routes` read; both mean "the read
 /// itself could not answer", never "answered no") → `reschedule` with
 /// back-off (retry, DON'T mark sent); authority revoked → `mark_failed`;
-/// every other outcome — including `sent == 0` because the targeted agents
-/// are offline right now — → `mark_sent`
+/// a genuine dispatch with an execution row to bookkeep (`sent > 0`) →
+/// `mark_sent_with_target` (#4982 round 3 — the sent-transition and the
+/// execution's real `agents_targeted` count commit ATOMICALLY, closing a
+/// race where a reaper pass could observe the two half-applied and
+/// force-cancel a still-executing command); every other outcome — `sent == 0`
+/// because the targeted agents are offline right now, or no execution row to
+/// bookkeep at all — → plain `mark_sent`
 /// (a missed occurrence is recorded and skipped, never spun into a backlog).
 
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance

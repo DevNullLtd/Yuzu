@@ -3195,11 +3195,18 @@ public:
         // #4982 Part B — the recovery side of the counter above:
         // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
         // execution row permanently wedged at status='running',
-        // agents_targeted=0. outcome="cancelled" counts by the number of rows
-        // actually transitioned this pass; outcome="not_cancelled" counts
-        // candidates the pass selected but mark_cancelled did not transition
-        // (already terminal, raced by another replica, or the write itself
-        // failed — see that call's own spdlog::error for the latter);
+        // agents_targeted=0, via ONE atomic in-transaction `UPDATE ...
+        // RETURNING id` that re-checks the full candidate predicate at
+        // mutation time — NOT a separate post-commit mark_cancelled() call
+        // (fix round 2 TOCTOU close; see that method's own comment).
+        // outcome="cancelled" counts by the number of rows the RETURNING set
+        // actually confirmed transitioned this pass; outcome="not_cancelled"
+        // counts candidates the earlier SELECT chose that the atomic UPDATE's
+        // RETURNING set excluded — the row no longer matched the predicate at
+        // mutation time (a genuine dispatch landed, the outbox row moved back
+        // to pending, or the row otherwise changed between the SELECT and the
+        // UPDATE), never a failed write (the UPDATE statement failing outright
+        // aborts the whole pass as outcome="degraded" instead — see below);
         // outcome="clock_anomaly"/"would_wipe" each count once per pass
         // DECLINED for that reason (an implausible now()/anchor reading, or
         // candidates being an implausibly large fraction of all running

@@ -433,13 +433,29 @@ invert theirs:
    here can only feed a still-corrupted `now_s` into the SAME would-wipe ratio guard and the SAME
    unconditional per-pass cap (`kStuckExecReapCap = 500`) this sweep already carries for every
    accepted pass — a spuriously-huge cutoff makes candidates a LARGE fraction of all running
-   executions (would-wipe's own job to catch) rather than a targeted, silent mass-cancel, and even
-   below the would-wipe floor the blast radius is capped at 500 ATOMICALLY-rechecked rows, each
-   individually re-verified against LIVE state at cancel time (the fix round 2 TOCTOU close, below) —
-   never a bare cutoff-matched DELETE/UPDATE the way GatewayRouteStore's own route-tombstone sweep is.
+   executions (would-wipe's own job to catch) rather than a targeted, silent mass-cancel, and the
+   blast radius is additionally capped at 500 ATOMICALLY-rechecked rows, each individually
+   re-verified against LIVE state at cancel time (the fix round 2 TOCTOU close, below) — never a bare
+   cutoff-matched DELETE/UPDATE the way GatewayRouteStore's own route-tombstone sweep is.
    GatewayRouteStore has neither safety net for its own sweeps, which is why ITS omission of this
-   field was genuinely unsafe. If a future change ever removes either safety net here, this omission
-   must be re-examined against the same reasoning GatewayRouteStore's own entry above records.
+   field was genuinely unsafe. If a future change ever removes any of these safety nets here, this
+   omission must be re-examined against the same reasoning GatewayRouteStore's own entry above
+   records.
+
+   **Round-3 correction — the would-wipe FLOOR is not a safety net on a recovery pass.** The
+   paragraph above originally claimed the blast radius was bounded "even below the would-wipe
+   floor" by the per-pass cap alone — that was wrong: the floor (`kStuckExecWouldWipeFloor = 20`)
+   exists to SKIP the ratio check entirely on a small running population, so on a fleet with fewer
+   than 20 running executions, a corrupted recovered `now_s` could make its ENTIRE running
+   population look stuck with no ratio check to decline the pass — the 500-row cap does not help
+   here, since the affected population is already smaller than the cap. Fixed by bypassing the
+   would-wipe FLOOR (never the ratio itself) specifically on a pass that took the recovery branch
+   above (`recovering_from_clock_anomaly` in `execution_tracker.cpp`) — a recovered reading is, by
+   construction, one this sweep already judged untrustworthy once, so the small-population
+   noise-floor reasoning that justifies skipping the ratio check on an ORDINARY clean pass does not
+   apply to it. The 50% ratio check is unchanged and still applies on every recovery pass, so the
+   bound this omission now rests on is "at most a minority of the running population, of any size,
+   per recovery pass" — the same bound an above-floor ordinary pass already carries.
 
 **Claim+mutate atomicity (fix round 2, not a clock-guard part but load-bearing for the SINGLE-WRITER
 rule above).** The original Part B design selected candidates under the advisory lock, then cancelled
@@ -458,6 +474,27 @@ Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a
 genuinely still stuck survives to the next pass regardless of whether this one's cutoff arithmetic
 used a fresh or a from-boot-skewed clock, so acting on the first pass against an unverified clock is
 an acceptable worst case, bounded by the same would-wipe/cap guards as any other pass.
+
+**Upstream candidate-predicate race (fix round 3, #4982) — closed at the SOURCE, not by widening the
+predicate.** Fix round 2's atomic `UPDATE ... RETURNING id` above re-checks `status='running' AND
+agents_targeted=0 AND NOT EXISTS <pending outbox row>` at mutation time and calls that the "full
+candidate predicate" — but that predicate is only trustworthy if a `'sent'` outbox row genuinely
+implies its execution's `agents_targeted` bookkeeping is settled. It was not: `command_outbox_delivery.cpp`
+called `CommandOutboxStore::mark_sent` (outbox `pending → sent`) and
+`ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit statements. Between the two
+commits, a genuinely in-flight, successfully-dispatched command read `state='sent'` (excluded by the
+outbox clause) with `agents_targeted` still 0 (matching the predicate's own clause) — a false
+candidate for a command that was, in truth, still being delivered/executed, force-cancelled with no
+kill RPC ever sent. Fixed by `CommandOutboxStore::mark_sent_with_target`
+(`command_outbox_store.{hpp,cpp}`): the sent-transition and the real `agents_targeted` count now
+commit in ONE cross-schema transaction on this store's own pool — the same single Postgres
+instance/database this reaper's own cross-schema `NOT EXISTS command_outbox_store.outbox` read
+already relies on — so no reader can ever observe the two half-applied. A DB/lease failure on either
+half rolls BOTH back (the occurrence stays `pending`, re-driven next tick; the agent's `command_id`
+dedup, WS-0, absorbs the harmless re-send) rather than leaving `mark_sent` committed with
+`agents_targeted` unset. This is a NEW instance of the general lesson every entry in this file
+teaches: a reaper's own predicate can be perfectly correctly re-checked and still race, if the WRITE
+SIDE it depends on is allowed to commit as two independent halves.
 
 ### `guardian_lifecycle_journal.cpp`
 

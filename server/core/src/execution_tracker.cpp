@@ -2720,15 +2720,32 @@ constexpr double kStuckExecWouldWipeRatio = 0.5;
 // guard and the SAME unconditional per-pass cap this sweep already carries
 // — a spuriously-huge cutoff makes candidates a LARGE fraction of all
 // running executions (the would-wipe guard's own job) rather than a
-// targeted, silent mass-cancel, and even below the would-wipe floor the
-// blast radius is capped at kStuckExecReapCap atomically-rechecked rows,
-// each individually re-verified against LIVE state at cancel time (Fix
-// 2/3, below) — never a bare cutoff-matched DELETE/UPDATE the way
-// GatewayRouteStore's route-tombstone sweep is. GatewayRouteStore has
-// neither safety net for its own sweeps, which is why ITS omission of this
-// field was genuinely unsafe. If a future change ever removes either safety
-// net here, this omission must be re-examined against the same reasoning
-// GatewayRouteStore's own entry in docs/clock-guarded-retention.md records.
+// targeted, silent mass-cancel, and the blast radius is additionally capped
+// at kStuckExecReapCap atomically-rechecked rows, each individually
+// re-verified against LIVE state at cancel time (Fix 2/3, below) — never a
+// bare cutoff-matched DELETE/UPDATE the way GatewayRouteStore's
+// route-tombstone sweep is.
+//
+// #4982 round 3 correction: "even below the would-wipe floor" used to be part
+// of that safety-net claim, and it was WRONG — the floor (kStuckExecWouldWipeFloor,
+// below) exists specifically to skip the ratio check on a small running
+// population, so on a fleet with FEWER running executions than the floor, a
+// corrupted recovered `now_s` could make its ENTIRE running population look
+// stuck with nothing to decline the pass — the per-pass cap does not help
+// here, since the affected population is already smaller than the cap. The
+// fix: the would-wipe floor is now BYPASSED specifically on a recovery pass
+// (see `recovering_from_clock_anomaly` below) — a recovered reading is, by
+// definition, one this sweep has already judged untrustworthy once, so the
+// small-population noise-floor reasoning that justifies skipping the ratio
+// check on an ORDINARY clean pass does not apply to it. The ratio check
+// itself is unchanged (still 50%), so the bound this omission now rests on is
+// "at most a minority of the running population, of any size, per recovery
+// pass" — matching what an ABOVE-floor ordinary pass already guarantees.
+// GatewayRouteStore has neither this safety net nor the per-pass cap for its
+// own sweeps, which is why ITS omission of `first_now_ms` was genuinely
+// unsafe. If a future change ever removes any of these safety nets here, this
+// omission must be re-examined against the same reasoning GatewayRouteStore's
+// own entry in docs/clock-guarded-retention.md records.
 struct StuckExecDeclinedMarker {
     std::int64_t anchor{0};
     std::string direction; ///< "forward" | "backward"
@@ -2763,6 +2780,14 @@ ExecutionTracker::reap_stuck_running_executions() {
 
     bool clock_anomaly = false;
     bool would_wipe = false;
+    // #4982 round 3: true only for a pass that fell through via the wedge-
+    // recovery branch below (a persisted skew anomaly that repeated across a
+    // full decline pass) — its `now_s` is a reading this sweep has already
+    // judged untrustworthy once, so the ordinary would-wipe FLOOR (sized for
+    // a small population under a TRUSTED clock) must not shield it; see the
+    // would-wipe check below and the `DELIBERATELY OMITTED` comment above
+    // `StuckExecDeclinedMarker`.
+    bool recovering_from_clock_anomaly = false;
     std::vector<std::string> candidate_ids;
     std::vector<std::string> confirmed_ids; // #4982 fix round 2: RETURNING-confirmed cancels
     bool should_publish = false;
@@ -2866,6 +2891,11 @@ ExecutionTracker::reap_stuck_running_executions() {
                 // forward-skew-poisoned anchor stuck forever) — then fall
                 // through to the ordinary would-wipe/candidate/cancel logic
                 // below using this now_s, exactly like any accepted pass.
+                // #4982 round 3: flag this pass so the would-wipe check below
+                // does NOT exempt it from the floor — see that flag's own doc
+                // comment and the `DELIBERATELY OMITTED` note above
+                // `StuckExecDeclinedMarker`.
+                recovering_from_clock_anomaly = true;
                 spdlog::warn(
                     "ExecutionTracker::reap_stuck_running_executions recovering: a {}-skew "
                     "anomaly persisted across a full decline pass (anchor={}, now_s={}) — "
@@ -2998,7 +3028,19 @@ ExecutionTracker::reap_stuck_running_executions() {
         if (candidate_count == 0)
             return true; // nothing to do this pass
 
-        if (total_running >= kStuckExecWouldWipeFloor &&
+        // #4982 round 3: the floor below is sized to skip a noisy ratio on a
+        // small population under a TRUSTED clock reading — a recovery pass's
+        // `now_s` is, by construction, a reading this sweep already judged
+        // untrustworthy once, so the floor is BYPASSED for it (the ratio
+        // check below still applies, unconditionally, bounding the blast
+        // radius to a minority of the running population either way; see the
+        // `recovering_from_clock_anomaly` flag's own doc comment above and
+        // the `DELIBERATELY OMITTED` note above `StuckExecDeclinedMarker`).
+        // `candidate_count > 0` here (the `candidate_count == 0` early-return
+        // above already excluded 0), and candidates are always <= total_running,
+        // so `total_running > 0` whenever this branch is reached — no
+        // division-by-zero risk from bypassing the floor.
+        if ((recovering_from_clock_anomaly || total_running >= kStuckExecWouldWipeFloor) &&
             static_cast<double>(candidate_count) / static_cast<double>(total_running) >
                 kStuckExecWouldWipeRatio) {
             spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined to act: {} of "
@@ -3062,6 +3104,28 @@ ExecutionTracker::reap_stuck_running_executions() {
         // cannot begin its own pass (the advisory lock above) until this
         // ENTIRE claim+mutate sequence commits, so the row cap is an honest
         // per-pass bound, never fleet-wide-exceedable.
+        //
+        // "FULL candidate predicate" here deliberately omits the SELECT's
+        // `dispatched_at < cutoff` clause — safe because `dispatched_at` is
+        // write-once (never mutated after `create_execution`) and both
+        // statements run inside this ONE transaction against the SAME
+        // `cutoff`, so re-evaluating it could never change the answer.
+        //
+        // #4982 round 3: this predicate's `agents_targeted = 0` re-check is
+        // COMPLETE against the intra-pass TOCTOU it was built to close
+        // (fix round 2) ONLY because `CommandOutboxStore::mark_sent` and
+        // `ExecutionTracker::set_agents_targeted` can no longer be observed
+        // as two independently-committed halves for a genuine dispatch — a
+        // reaper pass landing between those two commits used to see
+        // `state='sent'` (excluded by the outbox NOT EXISTS clause) with
+        // `agents_targeted` still 0 (matching this predicate), i.e. a false
+        // candidate for a command that was, in truth, still being delivered.
+        // `CommandOutboxStore::mark_sent_with_target` closes that upstream
+        // race by committing both writes atomically — see its own doc
+        // comment in command_outbox_store.hpp. Do not reintroduce a call site
+        // that writes the outbox `sent` transition and `agents_targeted`
+        // as two separate statements; this predicate's completeness depends
+        // on there being no such window.
         std::vector<std::string_view> sv(candidate_ids.begin(), candidate_ids.end());
         pg::PgResult upd = pg::exec_params(
             c,

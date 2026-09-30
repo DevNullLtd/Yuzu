@@ -3057,14 +3057,20 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions excludes a row "
 }
 
 TEST_CASE("ExecutionTracker: reap_stuck_running_executions still cancels a "
-          "row once its outbox entry reached a TERMINAL state — the exclusion "
-          "is scoped to state='pending' only",
+          "row once its outbox entry reached the TERMINAL 'failed' state — "
+          "the exclusion is scoped to state='pending' only",
           "[pg][execution_tracker][stuck_reap]") {
+    // 'failed' is a genuinely PERMANENT give-up (authority revoked / payload
+    // decode failure — command_outbox_delivery.cpp's mark_failed paths): the
+    // occurrence is never re-driven, and no code path ever writes
+    // agents_targeted for a failed occurrence, so there is no atomicity
+    // question here at all (unlike 'sent', below) — this row genuinely is
+    // fair game once its outbox entry stops being 'pending'.
     StuckExecPg env;
     auto id = env.tracker().create_execution(make_execution());
     REQUIRE(id.has_value());
     backdate_dispatched_at(env.pool(), *id, 3600);
-    insert_outbox_row(env.pool(), "occ-sent-1", *id, "sent");
+    insert_outbox_row(env.pool(), "occ-failed-1", *id, "failed");
 
     auto out = env.tracker().reap_stuck_running_executions();
     REQUIRE(out.has_value());
@@ -3073,6 +3079,96 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions still cancels a "
     auto exec = env.tracker().get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "cancelled");
+}
+
+// #4982 round 3: the OLD version of this test file directly inserted an
+// outbox row with state='sent' and agents_targeted left at 0 via raw SQL,
+// then asserted the reaper CORRECTLY cancels it — locking in the exact bug
+// two adversarial-review rounds found: `CommandOutboxDelivery::deliver` used
+// to call `CommandOutboxStore::mark_sent` and
+// `ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit
+// statements, so a reaper pass landing in the gap between those two commits
+// would observe precisely this state — state='sent' (no longer excluded by
+// the outbox NOT EXISTS clause), agents_targeted still 0 (matching the
+// candidate predicate) — for a command that was, in truth, still being
+// actively delivered, and force-cancel it with no kill RPC ever sent.
+//
+// `CommandOutboxStore::mark_sent_with_target` closes this by committing both
+// writes in ONE transaction. That makes the dangerous intermediate state
+// UNOBSERVABLE to any external reader (including this reaper) — not just
+// absent from this test's fixed end-state. The two tests below prove BOTH
+// halves of that claim by manually replicating `mark_sent_with_target`'s own
+// two statements, ONE AT A TIME, on a dedicated connection, and running the
+// reaper at each checkpoint:
+//   1. mid-transaction (sent-transition done, target-count write NOT done,
+//      NOT yet committed) — the reaper, on a separate connection, must see
+//      the row exactly as it did before the transaction started (still
+//      'pending' — Postgres READ COMMITTED never surfaces another session's
+//      uncommitted write), so the existing state='pending' exclusion holds
+//      and the row survives.
+//   2. post-commit (both writes landed together) — agents_targeted is
+//      already positive, so the row is excluded from candidacy structurally,
+//      never via any new state='sent' special-case.
+// At no point does any reader ever observe 'sent' with agents_targeted still
+// 0 for this row.
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions never observes a "
+          "sent-but-not-yet-targeted outbox row (#4982 round 3) — the two "
+          "writes mark_sent_with_target makes commit atomically",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600); // 1h old, past the 30m window
+    insert_outbox_row(env.pool(), "occ-race-1", *id, "pending");
+
+    // A dedicated connection holding open the SAME two-statement transaction
+    // `mark_sent_with_target` runs — paused right after statement 1, before
+    // statement 2 and before COMMIT.
+    pg::PgConn race_conn{PQconnectdb(env.dsn().c_str())};
+    REQUIRE(PQstatus(race_conn.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(race_conn.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(race_conn.get(),
+                            "UPDATE command_outbox_store.outbox SET state='sent', "
+                            "updated_at=now() WHERE occurrence_id=$1 AND state='pending'",
+                            std::vector<std::string>{"occ-race-1"})
+                .status() == PGRES_COMMAND_OK);
+
+    // Checkpoint 1: still uncommitted. The reaper runs on the pool's OWN
+    // (different) connections and must not observe the sent-transition at
+    // all — this is plain MVCC visibility, not a new rule this fix added.
+    auto out_mid = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out_mid.has_value());
+    CHECK(out_mid->cancelled == 0);
+    CHECK(out_mid->not_cancelled == 0);
+    {
+        auto exec_mid = env.tracker().get_execution(*id);
+        REQUIRE(exec_mid.has_value());
+        CHECK(exec_mid->status == "running"); // untouched mid-transaction
+    }
+
+    // Complete the SAME transaction with the target-count write and commit —
+    // exactly like mark_sent_with_target's second half.
+    REQUIRE(pg::exec_params(
+                race_conn.get(),
+                "UPDATE execution_tracker.executions SET agents_targeted=$1 WHERE id=$2",
+                std::vector<std::string>{"3", *id})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(race_conn.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    // Checkpoint 2: post-commit, agents_targeted is ALREADY 3 (never
+    // observably 0 alongside state='sent') — the row is structurally
+    // excluded from candidacy, a genuine in-flight dispatch never reachable
+    // via the sent-outbox route at all.
+    auto out_after = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out_after.has_value());
+    CHECK(out_after->cancelled == 0);
+
+    auto exec_after = env.tracker().get_execution(*id);
+    REQUIRE(exec_after.has_value());
+    CHECK(exec_after->status == "running"); // never touched — real dispatch in flight
+    CHECK(exec_after->agents_targeted == 3);
 }
 
 TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines to act "
@@ -3295,10 +3391,22 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions recovers on a "
 
     // A genuinely stuck row created between the decline and the recovery
     // pass — proves the third pass actually ran the ordinary capped sweep,
-    // not just cleared the anomaly flag.
+    // not just cleared the anomaly flag. Alongside it, a handful of already-
+    // targeted (non-candidate) executions keep this a MINORITY-stuck
+    // population (1 of 5, 20% < the 50% ratio) — #4982 round 3: a recovery
+    // pass bypasses the would-wipe FLOOR (see that fix), so a population that
+    // is MOSTLY stuck, even below the 20-row floor, correctly declines rather
+    // than cancels (covered by its own dedicated test); this test keeps
+    // proving the ORIGINAL Fix-1 claim — a real, MINORITY backlog still
+    // drains on the very recovery pass that un-wedges it.
     auto id = env.tracker().create_execution(make_execution());
     REQUIRE(id.has_value());
     backdate_dispatched_at(env.pool(), *id, 3600);
+    for (int i = 0; i < 4; ++i) {
+        auto fresh_id = env.tracker().create_execution(make_execution());
+        REQUIRE(fresh_id.has_value());
+        REQUIRE(env.tracker().set_agents_targeted(*fresh_id, 1));
+    }
 
     // Third pass: the SAME (anchor, direction) anomaly persisted across a
     // full decline pass — recovers, re-anchors to the current reading, and
@@ -3306,11 +3414,101 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions recovers on a "
     auto third = env.tracker().reap_stuck_running_executions();
     REQUIRE(third.has_value());
     CHECK_FALSE(third->clock_anomaly);
+    CHECK_FALSE(third->would_wipe);
     CHECK(third->cancelled == 1);
 
     auto exec = env.tracker().get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "cancelled");
+}
+
+// #4982 round 3: the would-wipe FLOOR (kStuckExecWouldWipeFloor=20) is sized
+// to skip a noisy ratio on a small population under a TRUSTED clock reading —
+// see the sibling "proceeds below the would-wipe floor" test above, which
+// confirms an ORDINARY below-floor pass still mass-cancels at a 100% ratio.
+// A RECOVERY pass's now_s is, by construction, a reading this sweep has
+// already judged untrustworthy once (it fed a persisted forward/backward-skew
+// anomaly that repeated across a full decline pass), so that same floor
+// exemption must NOT apply to it — on a small fleet, an implausible recovered
+// clock could otherwise make the ENTIRE running population look stuck with no
+// ratio check to decline the pass. This test proves the floor (not the ratio
+// itself) is what a recovery pass bypasses: a small, below-floor population
+// that is MOSTLY (but not entirely) stuck-looking must still decline rather
+// than being mass-cancelled.
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT let the "
+          "would-wipe FLOOR shield a small population on a RECOVERY pass "
+          "(#4982 round 3) — a mostly-stuck-looking population below the "
+          "floor still declines instead of being mass-cancelled",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Freeze the anchor ~55h in the past — forward-skew, well past the 24h
+    // implausibility bound (same technique as the "recovers on a REPEATED
+    // same-direction forward-skew anomaly" test above).
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint - 200000)::text WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    // First occurrence of the anomaly — declines once and arms the
+    // wedge-recovery marker. No rows exist yet, so nothing is at risk on this
+    // pass either way.
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+
+    // A SMALL population — well under kStuckExecWouldWipeFloor (20) — where
+    // MOST rows look genuinely stuck (backdated, untargeted, no outbox row)
+    // and a couple are genuinely fresh (dispatched "now", not actually
+    // stuck): 3 of 5 running executions (60%) look stuck, above the 50%
+    // ratio.
+    std::vector<std::string> stuck_ids;
+    for (int i = 0; i < 3; ++i) {
+        auto id = env.tracker().create_execution(make_execution());
+        REQUIRE(id.has_value());
+        backdate_dispatched_at(env.pool(), *id, 3600);
+        stuck_ids.push_back(*id);
+    }
+    std::vector<std::string> fresh_ids;
+    for (int i = 0; i < 2; ++i) {
+        auto id = env.tracker().create_execution(make_execution()); // dispatched_at = now
+        REQUIRE(id.has_value());
+        fresh_ids.push_back(*id);
+    }
+
+    // Third pass: the SAME (anchor, direction) anomaly persisted across the
+    // full decline above — recovers and runs the would-wipe/candidate logic
+    // using the current now_s. Without this fix, a below-floor population
+    // (5 < 20) would skip the ratio check entirely and mass-cancel the 3
+    // stuck-looking rows; with the fix, the floor is bypassed on this
+    // recovery pass, so the 60%-stuck ratio trips would_wipe and the WHOLE
+    // pass declines instead.
+    auto third = env.tracker().reap_stuck_running_executions();
+    REQUIRE(third.has_value());
+    CHECK_FALSE(third->clock_anomaly); // recovered — not a fresh anomaly this pass
+    CHECK(third->would_wipe);
+    CHECK(third->cancelled == 0);
+
+    for (const auto& id : stuck_ids) {
+        auto exec = env.tracker().get_execution(id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running"); // declined — survives despite looking stuck
+    }
+    for (const auto& id : fresh_ids) {
+        auto exec = env.tracker().get_execution(id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running");
+    }
 }
 
 TEST_CASE("ExecutionTracker: reap_stuck_running_executions does NOT recover "

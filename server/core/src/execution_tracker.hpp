@@ -774,35 +774,65 @@ public:
     /// call itself failed), the row is fair game.
     ///
     /// Clock-guarded-retention shape mirrors `reap_command_execution_mappings`
-    /// exactly for the anchor/anomaly half (advisory lock as its own
-    /// statement, one in-SQL DB `now()` read, persisted+sanitised `reap_meta`
-    /// anchor keyed `stuck_exec_reap_anchor`, forward/backward-anomaly
-    /// decline, unconditional per-pass cap) and DECLINES part 4 the same way
-    /// (no fact-set anomaly dedup — a decline is `spdlog::warn`'d and
-    /// surfaced via the caller's metric, not deduped by fact identity). Part
-    /// 6 (missing-anchor) is PROCEED, the same answer as its siblings — a
-    /// cold sweep with no anomaly history is still protected against mass
-    /// action by the would-wipe ratio gate below, independent of anchor
-    /// state.
+    /// for the anchor/anomaly half (advisory lock as its own statement, one
+    /// in-SQL DB `now()` read, persisted+sanitised `reap_meta` anchor keyed
+    /// `stuck_exec_reap_anchor`, forward/backward-anomaly decline,
+    /// unconditional per-pass cap), but — as of fix round 2 — ADOPTS part 4
+    /// (fact-set anomaly dedup) rather than declining it, at a deliberately
+    /// simpler width than `GatewayRouteStore`'s: a SECOND persisted marker,
+    /// `stuck_exec_reap_declined = "<anchor>:<direction>"`, direction-keyed so
+    /// a different-direction anomaly at the same frozen anchor can never
+    /// free-ride a stale recovery. A REPEAT of the exact SAME (anchor,
+    /// direction) anomaly across a full decline pass is treated as proof the
+    /// gap PERSISTED (not just one bad reading) and RECOVERS — clears the
+    /// marker, re-anchors unconditionally to the current `now_s`, and falls
+    /// through to run this pass as an ordinary one. A first occurrence, or a
+    /// different-direction anomaly, still declines and arms/re-arms the
+    /// marker. See `StuckExecDeclinedMarker`'s doc comment in
+    /// execution_tracker.cpp for the full design, including why
+    /// `GatewayRouteStore`'s third marker field (`first_now_ms`,
+    /// persistence-interval bounding) is deliberately omitted here — and see
+    /// the would-wipe-floor caveat that omission now carries (below). Part 6
+    /// (missing-anchor) is PROCEED, the same answer as its siblings — a cold
+    /// sweep with no anomaly history is still protected against mass action
+    /// by the would-wipe ratio gate below, independent of anchor state.
     ///
-    /// UNLIKE both siblings, this sweep ADOPTS part 1's would-wipe probe: see
-    /// the recorded reasoning at the constants' definition in
-    /// execution_tracker.cpp for why (in short — this pass MUTATES live,
-    /// still-referenced execution state rather than draining a regenerable
-    /// observability aid, and a healthy fleet's candidate fraction should
-    /// always be small, unlike a table that legitimately drains to 100%
-    /// expiry as routine behaviour). The would-wipe denominator is the RAW
-    /// total running-execution count, NOT itself outbox-filtered, so a
-    /// broadly-broken `set_agents_targeted` call site on the SYNCHRONOUS
-    /// dispatch path (which never touches the outbox at all) still trips it.
+    /// UNLIKE both DELETE-based siblings, this sweep ADOPTS part 1's
+    /// would-wipe probe: see the recorded reasoning at the constants'
+    /// definition in execution_tracker.cpp for why (in short — this pass
+    /// MUTATES live, still-referenced execution state rather than draining a
+    /// regenerable observability aid, and a healthy fleet's candidate
+    /// fraction should always be small, unlike a table that legitimately
+    /// drains to 100% expiry as routine behaviour). The would-wipe
+    /// denominator is the RAW total running-execution count, NOT itself
+    /// outbox-filtered, so a broadly-broken `set_agents_targeted` call site on
+    /// the SYNCHRONOUS dispatch path (which never touches the outbox at all)
+    /// still trips it. **On a RECOVERY pass (above), the would-wipe floor
+    /// itself is bypassed** — round 3 finding: a recovered `now_s` is, by
+    /// construction, a reading this sweep has already judged untrustworthy
+    /// once; below the floor a small fleet's ENTIRE running population could
+    /// otherwise be candidates with no ratio check to catch it. The ratio
+    /// check itself still applies unconditionally, so at most a minority of
+    /// the running population can be wrongly cancelled in one recovery pass —
+    /// the same bound an above-floor NORMAL pass already carries.
     ///
-    /// The actual cancellation happens through the SAME `mark_cancelled` every
-    /// other terminal transition in this file uses, called once per selected
-    /// candidate AFTER the guard transaction commits — its own guarded UPDATE
-    /// (`status NOT IN (...)`) and execution-completed event-publish shape,
-    /// so a candidate that already transitioned between the SELECT and this
-    /// call (a genuine terminal response, or a race with another replica) is
-    /// a safe, silent no-op, never a double-cancel.
+    /// The actual cancellation is an ATOMIC, in-transaction
+    /// `UPDATE ... RETURNING id` (fix round 2 TOCTOU close) that RE-CHECKS the
+    /// full candidate predicate (`status='running' AND agents_targeted=0 AND
+    /// NOT EXISTS <pending outbox row>`) at mutation time, in the SAME
+    /// lock-held transaction as the candidate SELECT and would-wipe check —
+    /// NOT a separate post-commit `mark_cancelled()` call the way every other
+    /// terminal transition in this file makes one. `RETURNING id` reports
+    /// exactly which rows actually transitioned; a row that no longer matches
+    /// (dispatched in the interim, its outbox entry went pending, or anything
+    /// else changed between the SELECT and this UPDATE) is silently excluded
+    /// — correct, since it was only ever eligible at the SELECT's now-stale
+    /// snapshot. This predicate is complete against the intra-pass TOCTOU it
+    /// was built to close; it relies on `CommandOutboxStore::mark_sent` and
+    /// `ExecutionTracker::set_agents_targeted` never being allowed to observe
+    /// as two independently-committed halves for a genuine dispatch — see
+    /// `command_outbox_store.hpp`'s `mark_sent_with_target` (#4982 round 3),
+    /// which is what makes that true.
     [[nodiscard]] std::expected<StuckExecutionReapOutcome, std::string>
     reap_stuck_running_executions();
 
