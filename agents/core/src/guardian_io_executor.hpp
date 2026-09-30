@@ -332,8 +332,8 @@ public:
     /// §7.7b item 5): at most one quota holder plus one predecessor still in its
     /// callback per slot is the STRUCTURAL population under the consumer's
     /// one-nested-refill-per-callback shape (since #5168 a completion callback can
-    /// dispatch up to TWO off-lock: the same-key refill and one retained arm of the
-    /// freed class - still bounded by the class quota, which binds first), but
+    /// dispatch up to TWO off-lock: the same-key refill and one parked arm (of any
+    /// class) - still bounded by the class quota, which binds first), but
     /// successive submissions can reuse
     /// released quota while earlier callbacks are still alive, so the factor is a
     /// backstop rather than a proof. Derived from the CLAMPED total_quota, never a

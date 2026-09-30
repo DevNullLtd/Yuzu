@@ -505,6 +505,13 @@ flip, with a red-first test each:
   the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
   (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
   `disarms == 200` this row's chaos reproduction disproved.
+- **#5168 flip preconditions (congestion parking; spark path only, dormant until the flip)**: a
+  congestion refusal at arm dispatch now parks the arm and redrives it instead of failing it (see
+  `docs/spark-stage2-guardian-consumer-design.md` R5.2 amendment). Two items belong on the flip
+  checklist: measure real Service `watch()` latency against the 5 s claim deadline (a large surplus
+  of slow arms can still end congestion-expired), and export the parked-arm counters
+  (`arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`) as heartbeat tags -
+  they are runtime accessors only today.
 - **up-3/up-4/ch-1/up-5 status (rung 9c PR-5b, #4221)**: up-3 fixed via a runtime-owned
   compensating-disarm reservation reserved per claim BEFORE its arm dispatches (not routed through
   `GuardianIoExecutor`'s own admission - it has no compensation-priority `IoClass` and rejects

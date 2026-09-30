@@ -2123,7 +2123,7 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
 }
 
 TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm reservation "
-          "holds arms every rule - the surplus is retained and redriven, never left unenforced",
+          "holds arms every rule - the surplus is parked and redriven and never left unenforced",
           "[spark][guardian][reconcile][boot]") {
     // Service reservation capacity == GuardianIoExecutor::Config{}.service_quota == 3.
     // Before #5168 the 4th+ rule of a cached policy was REFUSED synchronously at boot
@@ -2153,10 +2153,12 @@ TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm
                                                "Svc" + std::to_string(i));
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
-        REQUIRE(yuzu::test::spin_until([&] {
-            engine.journal_maintenance_tick();
-            return engine.spark_armed_rule_count() == kRules;
-        }));
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                engine.journal_maintenance_tick();
+                return engine.spark_armed_rule_count() == kRules;
+            },
+            std::chrono::seconds(30)));
         engine.stop();
         spark_engine.stop();
     }
@@ -2209,6 +2211,41 @@ TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm
     CHECK(engine.spark_armed_rule_count() == kRules);
     CHECK(mechanism->watching_count() == kRules);
 
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5168: with the production default (prefer_spark false) no rule reaches the spark "
+          "runtime, so nothing is ever parked",
+          "[spark][guardian][reconcile][boot]") {
+    // The parked-arm path lives in the spark arm path, which production leaves off (the
+    // two-argument GuardianEngine constructor, agent.cpp). This pins that the change is
+    // dormant there: the changelog and design docs scope the fix to the spark backend.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test"};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Retain; });
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    for (int i = 0; i < 6; ++i)
+        *p.add_rules() = make_service_rule("d" + std::to_string(i), true, "Svc" + std::to_string(i));
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                .exit_code == 0);
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    CHECK(rt->arms_parked_total() == 0);
+    CHECK(rt->arms_parked() == 0);
+    CHECK(engine.spark_armed_rule_count() == 0);
     engine.stop();
     spark_engine.stop();
 }

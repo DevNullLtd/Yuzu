@@ -119,8 +119,9 @@ namespace {
 /// up-3 (#4221): a runtime-level refusal, not an IoFailure - the compensating-
 /// disarm reservation pool (compensation_reserved_count_) is exhausted for this
 /// claim's IoClass. Since #5168 this is the reason string only for a DIRTY claim
-/// (one the PR-5c race already resolved); a clean claim is retained and redriven
-/// instead (park_congested_arm_locked). Deliberately NOT a case in arm_failure_reason's switch above:
+/// (one the PR-5c race already resolved); a clean claim is parked and redriven
+/// instead (park_congested_arm_locked). Deliberately NOT a case in arm_failure_reason's
+/// switch above:
 /// that map is exhaustively keyed on IoFailure (governance consistency c-1) and
 /// this refusal happens BEFORE io_executor_ is ever consulted. Named here so both
 /// call sites that report it route through the same string, not an ad-hoc literal.
@@ -513,10 +514,8 @@ void GuardianSparkRuntime::on_disarm_complete(const std::string& key,
     claim_cv_.notify_all();
     if (refill)
         dispatch_arm_off_lock(key, refill);
-    if (class_refill) {
-        arm_redrives_.fetch_add(1, std::memory_order_relaxed);
-        dispatch_arm_off_lock(class_refill->key, class_refill);
-    }
+    if (class_refill)
+        dispatch_parked_arm_guarded(class_refill);
 }
 
 std::size_t GuardianSparkRuntime::redrive_retained_disarms() {
@@ -584,14 +583,21 @@ bool GuardianSparkRuntime::park_congested_arm_locked(const std::shared_ptr<KeyCl
         return c == claim || !parked_arm_entry_valid_locked(c);
     });
     try {
+        fault_here_for_test(11); // test seam: the deque push failing
         if (requeue)
             dq.push_front(claim); // re-refused after a redrive: keep FIFO position
         else
             dq.push_back(claim);
     } catch (...) {
-        // The claim stays a Queued arm_parked head that is in no deque: the next
-        // redrive_parked_arms() pass adopts any such head (adopt_undriven_arm_head_
-        // locked), and failing that its own deadline ends it (CongestionExpired, counted).
+        // Undo the parking: the claim stays a clean Queued head that is in no deque, and
+        // adopt_undriven_arm_head_locked() only adopts a head that is NOT marked parked,
+        // so the mark and the counts are rolled back to let the next redrive_parked_arms()
+        // pass re-park it. Failing that, its own deadline ends it (CongestionExpired,
+        // counted here in claim_drain_failures_).
+        claim->arm_parked = false;
+        --claim->arm_park_count;
+        if (!requeue)
+            arms_parked_total_.fetch_sub(1, std::memory_order_relaxed);
         claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
     }
     return true;
@@ -601,8 +607,12 @@ void GuardianSparkRuntime::adopt_undriven_arm_head_locked(KeyClaimQueue& entry) 
     // A CLEAN Queued Arm head that is not parked has no dispatcher: heads are flipped to
     // Dispatching under the same lock that queues them, so the only ways to get here are
     // (a) the head ahead of it was erased (a parked head withdrawn or expired, leaving
-    // its same-key follower), (b) a deque push failed, (c) a redrive threw after taking
-    // it. Park it so the permit-release hooks and redrive_parked_arms() reach it.
+    // its same-key follower), (b) a deque push failed, (c) a dispatch of a taken claim
+    // threw, or (d) a double-fault recovery in on_arm_complete / finalize_arm_compensation /
+    // dispatch_arm_off_lock handed a head back to Queued (its own comment says the claim
+    // may already have committed: a re-arm of a committed key fails at keys_.emplace and is
+    // compensated, never leaked, so driving it here is safe and self-healing). Park it so
+    // the permit-release hooks and redrive_parked_arms() reach it.
     if (entry.fifo.empty())
         return;
     const auto& head = entry.fifo.front();
@@ -687,6 +697,38 @@ std::size_t GuardianSparkRuntime::parked_arm_waiter_depth_for_test() const {
     return n;
 }
 
+void GuardianSparkRuntime::dispatch_parked_arm_guarded(const std::shared_ptr<KeyClaim>& c) noexcept {
+    arm_redrives_.fetch_add(1, std::memory_order_relaxed);
+    try {
+        fault_here_for_test(10); // test seam: a throw between the take and the dispatch
+        dispatch_arm_off_lock(c->key, c);
+    } catch (...) {
+        // The take flipped the claim to Dispatching and nothing completes a Dispatching
+        // claim that was never submitted: hand it back as an un-parked Queued head so the
+        // next redrive pass adopts it. If even taking registry_mu_ throws (std::system_error,
+        // not reachable in practice) the claim stays Dispatching; that is the same
+        // exposure every other off-lock dispatch site in this file already has.
+        claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+        try {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            if (c->dispatch == ClaimDispatch::Dispatching && !c->outcome && !c->commit_exception) {
+                if (stopping_) {
+                    // begin_stop()'s walk skipped this claim (it was Dispatching), and
+                    // nothing redrives after a sticky stop: resolve it the way that walk
+                    // would have, so its receipt does not stay Pending forever.
+                    c->outcome = std::unexpected(std::string{"stopping"});
+                    c->end = ClaimEnd::Stopped;
+                    claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    c->dispatch = ClaimDispatch::Queued;
+                    c->arm_parked = false;
+                }
+            }
+        } catch (...) {
+        }
+    }
+}
+
 std::size_t GuardianSparkRuntime::redrive_parked_arms() {
     // One claim at a time: take under the lock, dispatch off it (dispatch_arm_off_lock
     // takes registry_mu_ itself). Nothing is collected into a container, so no
@@ -711,22 +753,7 @@ std::size_t GuardianSparkRuntime::redrive_parked_arms() {
             if (!c)
                 break;
             ++attempted;
-            arm_redrives_.fetch_add(1, std::memory_order_relaxed);
-            try {
-                fault_here_for_test(10); // test seam: a throw between the take and the dispatch
-                dispatch_arm_off_lock(c->key, c);
-            } catch (...) {
-                // The claim was flipped to Dispatching by the take: hand it back as an
-                // un-parked Queued head so the next pass adopts and redrives it, rather
-                // than leaving a Dispatching claim nothing will ever complete.
-                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
-                std::lock_guard<std::mutex> lk{registry_mu_};
-                if (c->dispatch == ClaimDispatch::Dispatching && !c->outcome &&
-                    !c->commit_exception) {
-                    c->dispatch = ClaimDispatch::Queued;
-                    c->arm_parked = false;
-                }
-            }
+            dispatch_parked_arm_guarded(c);
             std::lock_guard<std::mutex> lk{registry_mu_};
             if (c->arm_parked || c->dispatch == ClaimDispatch::Queued)
                 break; // refused again (or reverted): stop this class for this pass
@@ -848,15 +875,20 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
     }
     std::shared_ptr<KeyClaim> parked_refill; // #5168: a parked arm this call admits
     {
-        std::lock_guard<std::mutex> lk{registry_mu_};
+        std::unique_lock<std::mutex> lk{registry_mu_};
         const auto eit = claims_.find(key);
         if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim) {
             // The callback already ran (before submit() even returned) and erased or
             // replaced it - never touch whatever occupies the key now. If admission
             // itself failed, the callback never fired and never will; nothing else
-            // will ever release this claim's reservation, so this call must.
-            if (!adm)
-                release_compensation_locked(*claim);
+            // will ever release this claim's reservation, so this call must, and the
+            // freed permit may admit a parked arm (dispatched after the lock is dropped).
+            if (!adm) {
+                release_compensation_and_drain_locked(*claim, nullptr, parked_refill);
+                lk.unlock();
+                if (parked_refill)
+                    dispatch_parked_arm_guarded(parked_refill);
+            }
             return;
         }
         if (adm) {
@@ -907,15 +939,15 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
                 if (claim->dispatch == ClaimDispatch::Dispatching)
                     claim->dispatch = ClaimDispatch::Queued; // recoverable: re-driven by the next event
             }
-            // The permit released above may admit a parked arm of some class.
-            parked_refill = take_parked_arm_after_release_locked(claim->io_class, 0);
+            // No drain here even though a permit was released: a terminal refusal
+            // (LaunchFailed, AlreadyRunning, Stopped) is systemic, and draining would make
+            // every failed arm dispatch the next parked one from this tail, recursing once
+            // per parked claim. The next completion hook or redrive_parked_arms() admits it.
         }
     }
     claim_cv_.notify_all();
-    if (parked_refill) {
-        arm_redrives_.fetch_add(1, std::memory_order_relaxed);
-        dispatch_arm_off_lock(parked_refill->key, parked_refill);
-    }
+    if (parked_refill)
+        dispatch_parked_arm_guarded(parked_refill);
 }
 
 void GuardianSparkRuntime::fault_here_for_test(int point) {
@@ -1090,10 +1122,8 @@ void GuardianSparkRuntime::finalize_arm_compensation(std::shared_ptr<ArmCompensa
     }
     if (refill)
         dispatch_arm_off_lock(cont->key, refill);
-    if (class_refill) {
-        arm_redrives_.fetch_add(1, std::memory_order_relaxed);
-        dispatch_arm_off_lock(class_refill->key, class_refill);
-    }
+    if (class_refill)
+        dispatch_parked_arm_guarded(class_refill);
 }
 
 void GuardianSparkRuntime::on_arm_complete(const std::string& key,
@@ -1717,10 +1747,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     }
     if (refill)
         dispatch_arm_off_lock(key, refill);
-    if (class_refill) {
-        arm_redrives_.fetch_add(1, std::memory_order_relaxed);
-        dispatch_arm_off_lock(class_refill->key, class_refill);
-    }
+    if (class_refill)
+        dispatch_parked_arm_guarded(class_refill);
 }
 
 std::size_t GuardianSparkRuntime::claim_queue_depth_for_test(const std::string& key) const {

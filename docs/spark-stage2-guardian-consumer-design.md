@@ -500,7 +500,9 @@ per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected
 stay at 0); this design's wedge is the ordinary, K-bounded, non-alerting outcome
 of a single wedged key, not a mechanism-wide fault.
 
-**Amended for #5168 - a congestion refusal is PARKED, not failed.** A CONGESTION
+**Amended for #5168 - a congestion refusal is PARKED, not failed.** This applies to the
+spark arm path only, which is dormant in shipped agents until the ADR-0021 F14 flip
+(`prefer_spark_` is false in production, so no rule reaches this runtime). A CONGESTION
 refusal at dispatch (the compensating-disarm reservation pool exhausted, or the
 executor's `CapacityExhausted` / `CeilingExhausted`) is no longer an immediate terminal
 outcome. A claim that is still clean (no outcome, not withdrawn, not abandoned, runtime
@@ -509,19 +511,24 @@ executor quota, and it never reaches backend `arm()` without first reserving its
 compensating-disarm permit, so the up-3 guarantee is unchanged. It is redriven (a) when
 a compensation permit frees (the permit-release hook in the arm-completion callbacks),
 (b) when a class's executor quota frees (the disarm-completion hook), (c) once
-immediately if an executor refusal raced a completion, and (d) by the convergence
-scheduler's `redrive_parked_arms()`, a last-resort sweep on the priority lane's ~5 s
-cadence. ("Parked" is deliberate: "retained" already names a disarm held after a
+immediately if an executor refusal raced a completion, (d) by a same-key attach that
+lands on the parked head, and (e) by the convergence scheduler's
+`redrive_parked_arms()`, a last-resort sweep on the priority lane's ~5 s cadence (it also
+adopts any clean Queued arm head that is parked nowhere). ("Parked" is deliberate: "retained" already names a disarm held after a
 refusal and a wedge held after a timeout.) The claim keeps its attach-time deadline,
 `cfg.backend_op_deadline` (5 s by default), and that deadline is NOT reset when the
 claim is redriven. A parked arm that is never admitted therefore ends as
 congestion-expired, exactly as before this amendment, but only after the deadline is
 observed by the maintenance pass that runs `expire_overdue_claims()` (the heartbeat
-tick), not at the 5 s mark itself. What changes is the size of the surplus that
-survives: with quota `q` and per-arm latency `t`, roughly `q` arms are admitted per `t`,
-so `N` same-class rules arm only if about `ceil(N/q) * t` fits inside the deadline;
-rules beyond that still end congestion-expired and recover on the next successful
-re-apply. Real `watch()` latency was not measured. A terminal refusal (`Stopped`,
+tick, `heartbeat_interval` 30 s by default), not at the 5 s mark itself: its effective
+wait is the deadline plus up to one heartbeat interval. An arm redriven after its
+deadline but before that pass can be abandoned in flight and briefly reported as
+dispatched-timeout (Wedged); its late result is still applied (ruling 14(b)). What
+changes is the size of the surplus that survives: with quota `q` and per-arm latency
+`t`, roughly `q` arms are admitted per `t`, so `N` same-class rules arm only if about
+`ceil(N/q) * t` fits inside the deadline plus that heartbeat window; rules beyond that
+still end congestion-expired and recover on the next successful re-apply. Real
+`watch()` latency was not measured. A terminal refusal (`Stopped`,
 `AlreadyRunning`, `LaunchFailed`) and every dirty claim (the PR-5c Dispatching-window
 race shapes) keep the immediate-failure path unchanged. Before this amendment a pushed
 or cached policy with more rules of one I/O class than that class's reservation
@@ -577,8 +584,9 @@ K-qualifying; the consequence is instead that the affected generation's acknowle
 is HELD, with the server's 25 s `full_sync` retry re-applying the whole push until the
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3; since #5168 a
-congestion refusal surfaces as admission-expiry after being parked, and
-admission-rejection is the terminal refusals only), so an operator
+congestion refusal that is parked and never admitted is logged as
+`status=CongestionExpired`, and admission-rejection is the terminal refusals only; the
+reason/phase breakdown itself is still unbuilt, as the rung 9c status note further down records), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
 the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 
