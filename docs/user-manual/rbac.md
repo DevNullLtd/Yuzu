@@ -377,7 +377,7 @@ Seven roles are created automatically and cannot be deleted:
 | `Approval` | Approval workflow entries |
 | `ManagementGroup` | Hierarchical device groups |
 | `UserManagement` | User accounts and role assignments |
-| `Security` | Security settings (TLS, enrollment) |
+| `Security` | Security settings (TLS, enrollment, quarantine, CA and KEK reads, and privilege-posture reads such as the local_security_policy `sudoers` content) |
 | `ApiToken` | API token lifecycle |
 | `AuditLog` | Audit event records |
 | `Policy` | Guaranteed State policy fragments and composed policies |

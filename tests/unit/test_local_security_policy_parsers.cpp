@@ -2,7 +2,8 @@
  * test_local_security_policy_parsers.cpp -- pure tests for the local_security_policy
  * plugin's PAM/login.defs/auditd parsers, the sudoers lexer, the secedit export decode and row
  * mapping, the Windows scratch-sweep decisions and the pwpolicy row mapping. Runs on every OS:
- * nothing here touches the filesystem, the registry or a process.
+ * no test here touches the registry or spawns a process; the only filesystem use is the POSIX
+ * reader's real-filesystem cases, in a private temp directory (non-Windows only).
  *
  * No REAL CAPTURE fixtures here (unlike app_control/autoruns/runtimes): this plugin's
  * inputs are host-specific system files (a live pwpolicy plist) that vary machine to

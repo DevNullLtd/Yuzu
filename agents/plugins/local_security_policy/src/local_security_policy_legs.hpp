@@ -102,7 +102,7 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 /// its row, this fallback would write a 4-field row into a 7-field contract. Keep the
 /// pairing, or give this function the action-shaped fallback before you break it.
 /// No direct test pins this specific pairing: the empty-rows fallback (the `if (c.rows.empty())`
-/// arms above) is reachable only from a real pwpolicy subprocess failure, which
+/// arms below) is reachable only from a real pwpolicy subprocess failure, which
 /// LocalDispatcher-based tests can't force deterministically, and a bare CommandContext
 /// can't be cheaply constructed outside that harness for a standalone call. The `sudoers.d`
 /// truncation arm was the one site that counted without emitting, and it no longer does.

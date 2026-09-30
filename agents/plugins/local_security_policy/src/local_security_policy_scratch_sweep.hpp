@@ -34,7 +34,10 @@
  * `secedit /export` output THIS PLUGIN staged into its own scratch directory,
  * a regenerable copy of the host's own policy that the next dispatch
  * reproduces exactly. A wrong clock can reclaim such a directory early or
- * late; it can destroy nothing.
+ * late; it can destroy nothing (a forward step can make a live directory LOOK stale, but
+ * the dispatch's open handle -- not the clock -- makes the removal fail; the dispatch
+ * itself is unaffected unless the sweep wins the create-to-open window, which fails it
+ * closed as `dest_dir_open_<n>` and is retried).
  *   - Parts 1 (probe by OUTCOME) and 2 (compare against a PERSISTED reading):
  *     NOT adopted -- nothing to probe for, and no prior reading worth
  *     persisting when what ages out is disposable scratch space.
