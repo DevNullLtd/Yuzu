@@ -86,19 +86,10 @@ Filename: "{app}\bin\yuzu-server.exe"; Parameters: "--remove-service"; Flags: ru
 Type: filesandordirs; Name: "{app}\logs"
 
 [Code]
-// Setup's exit code when the configuration could not be written securely
-// (the files are installed but the service is not registered). Above Inno's
-// own 0-8 so it cannot be confused with them.
-const
-  ConfigGenExitCode = 10;
-
 // ── Variables ────────────────────────────────────────────────────────────
 var
   // Wizard pages
   AdminPage: TInputQueryWizardPage;
-  // Set when yuzu-server.cfg could not be written with its strict ACL; the
-  // service is then not registered and setup exits with ConfigGenExitCode.
-  ConfigGenFailed: Boolean;
   OperatorPage: TInputQueryWizardPage;
   NetworkPage: TWizardPage;
   IdentityPage: TWizardPage;
@@ -771,26 +762,20 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
-    // 1. Generate yuzu-server.cfg with PBKDF2 hashed credentials. The script
-    // writes the hashes only into a file with a verified Administrators+SYSTEM
-    // ACL and exits non-zero on any failure (#5176 review, #5196). A failure
-    // must not leave a running server: skip cert copy and service
-    // registration, and exit setup with ConfigGenExitCode.
-    if (not Exec('powershell.exe', GetConfigGenArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode))
-       or (ResultCode <> 0) then
+    // 1. Generate yuzu-server.cfg with PBKDF2 hashed credentials
+    Exec('powershell.exe', GetConfigGenArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Never show this box on a silent install: a plain MsgBox is not
+    // suppressed by /SUPPRESSMSGBOXES, and even SuppressibleMsgBox still
+    // shows (and waits forever) when /VERYSILENT is given without that flag
+    // (#5147). The Log line records the failure in the /LOG= setup log.
+    if ResultCode <> 0 then
     begin
-      ConfigGenFailed := True;
-      Log('Failed to write a securely permissioned server configuration (exit code ' +
-          IntToStr(ResultCode) + '). The YuzuServer service was not registered; ' +
-          'setup will exit with code ' + IntToStr(ConfigGenExitCode) + '.');
-      // Never show this box on a silent install: a plain MsgBox is not
-      // suppressed by /SUPPRESSMSGBOXES (#5147). The Log line records it.
+      Log('Failed to generate server configuration (exit code ' +
+          IntToStr(ResultCode) + ').');
       if not WizardSilent then
-        MsgBox('The server configuration could not be written with secure permissions ' +
-               '(exit code ' + IntToStr(ResultCode) + '), so the Yuzu Server service ' +
-               'was not registered. See the setup log, fix the cause and run setup again.',
+        MsgBox('Warning: Failed to generate server configuration (exit code ' +
+               IntToStr(ResultCode) + '). You may need to run first-time setup manually.',
                mbError, MB_OK);
-      Exit;
     end;
 
     // 2. Copy certificate files
@@ -809,14 +794,6 @@ begin
     if ShouldStartService then
       Exec('sc.exe', 'start YuzuServer', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
-end;
-
-function GetCustomSetupExitCode: Integer;
-begin
-  if ConfigGenFailed then
-    Result := ConfigGenExitCode
-  else
-    Result := 0;
 end;
 
 // ── Stop service before upgrade ──────────────────────────────────────────

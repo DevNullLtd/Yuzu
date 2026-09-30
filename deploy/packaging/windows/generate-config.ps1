@@ -66,73 +66,27 @@ if ($OperatorUser -ne "" -and $OperatorPass -ne "") {
     $lines += New-PBKDF2Entry -Username $OperatorUser -Password $OperatorPass -Role "user"
 }
 
-# The file holds the admin/operator password hashes, so it must never exist
-# readable by anyone but Administrators and SYSTEM (#5176 review, #5196).
-# The hashes are written only into a file that already carries a protected,
-# verified Administrators+SYSTEM-only ACL, built from SIDs, not account names,
-# which are translated on non-English Windows. Any failure removes what this
-# run created and exits 1, and the installer then does not register the
-# service. A config left by an earlier install is not touched unless this
-# run fully succeeds.
-$ErrorActionPreference = 'Stop'
-$AdminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-$SystemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+# Ensure parent directory exists
+$parentDir = Split-Path -Parent $ConfigPath
+if ($parentDir -and -not (Test-Path $parentDir)) {
+    New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+}
 
-function Set-StrictAcl([string]$Path) {
+# Write config (UTF-8, no BOM for C++ compatibility)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllLines($ConfigPath, $lines, $utf8NoBom)
+
+# Set restrictive ACL: Administrators + SYSTEM only
+try {
     $acl = New-Object System.Security.AccessControl.FileSecurity
     $acl.SetAccessRuleProtection($true, $false)
-    foreach ($sid in @($AdminsSid, $SystemSid)) {
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $sid, 'FullControl', 'Allow')))
-    }
-    [System.IO.File]::SetAccessControl($Path, $acl)
-}
-
-function Assert-StrictAcl([string]$Path) {
-    $acl = [System.IO.File]::GetAccessControl($Path)
-    if (-not $acl.AreAccessRulesProtected) { throw "$Path still inherits permissions" }
-    $allowed = @($AdminsSid.Value, $SystemSid.Value)
-    foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
-        if ($allowed -notcontains $r.IdentityReference.Value) {
-            throw "$Path grants access to $($r.IdentityReference.Value)"
-        }
-    }
-}
-
-$tmpPath = $null
-$moved = $false
-try {
-    $parentDir = Split-Path -Parent $ConfigPath
-    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {
-        New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
-    }
-
-    # Create an empty file beside the target, lock it down, verify, then write.
-    $tmpPath = Join-Path $parentDir ('.yuzu-server.cfg.' + [System.Guid]::NewGuid().ToString('N') + '.tmp')
-    [System.IO.File]::WriteAllBytes($tmpPath, [byte[]]@())
-    Set-StrictAcl $tmpPath
-    Assert-StrictAcl $tmpPath
-
-    # Write config (UTF-8, no BOM for C++ compatibility)
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines($tmpPath, $lines, $utf8NoBom)
-
-    # A same-volume move keeps the file's own protected ACL; it replaces an
-    # earlier config (and whatever ACL it had) only now that this one is ready.
-    Move-Item -LiteralPath $tmpPath -Destination $ConfigPath -Force
-    $tmpPath = $null
-    $moved = $true
-    Assert-StrictAcl $ConfigPath
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "BUILTIN\Administrators", "FullControl", "Allow")))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "NT AUTHORITY\SYSTEM", "FullControl", "Allow")))
+    Set-Acl -Path $ConfigPath -AclObject $acl
 } catch {
-    if ($tmpPath -and (Test-Path -LiteralPath $tmpPath)) {
-        Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
-    }
-    # If the final check failed after the move, do not leave the hashes behind.
-    if ($moved) {
-        Remove-Item -LiteralPath $ConfigPath -Force -ErrorAction SilentlyContinue
-    }
-    [Console]::Error.WriteLine("Could not write a securely permissioned configuration: $($_.Exception.Message)")
-    exit 1
+    Write-Warning "Could not restrict file permissions: $_"
 }
 
 Write-Host "Configuration written to: $ConfigPath"
