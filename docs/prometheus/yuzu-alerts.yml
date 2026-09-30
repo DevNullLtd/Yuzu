@@ -120,8 +120,12 @@ groups:
         annotations:
           summary: "Gateway metrics endpoint is down"
           description: >-
-            Prometheus cannot scrape the gateway (:9568). The gateway process
-            is down, crash-looping, or refusing to boot — including a #1422
+            Prometheus cannot scrape the gateway (:9568). Either /metrics
+            itself is failing while the gateway runs (check
+            `curl -i http://<gateway-host>:9568/metrics`; 0.14.0-rc1..rc3
+            returned 500 on every scrape, #5177; agents are unaffected in that
+            case), or the gateway process is down, crash-looping, or refusing
+            to boot — including a #1422
             mgmt-listener posture refusal (gateway log: "Refusing to start:
             management listener"). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
