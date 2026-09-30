@@ -58,14 +58,20 @@
 # which the job timeouts in .github/workflows/pre-release.yml are sized from:
 #   fetch one tagged file   <= 3 x 20s (--retry 2) + backoff        ~ 65s
 #   pull                    <= 3 x 120s + 10s + 20s sleeps          = 390s
-#   compose up -d           <= 120s per call (it waits on Postgres' healthcheck)
+#   compose up -d           <= UP_SECS = 420s per call. `up -d server gateway`
+#                           waits on two healthchecks in turn: Postgres
+#                           (start_period 10s + 12 x 5s = 70s to be declared
+#                           unhealthy), then the server, which the gateway
+#                           depends on (10s + 30 x 10s = 310s). 380s lets
+#                           compose report its own verdict; 420s is that
+#                           plus margin.
 #   wait_server             <= 180s + one probe (cp + 10s curl + 3s) ~ 195s
 #   wait_gateway            <= 180s + one probe (5s curl + 3s)      ~ 190s
 #   wait_agent              <= 180s + one metric read (<= 3 x 30s)  = 270s
 #   login / one api call    <= 30s
 #   `up`      = 2 fetches + pull + 2 x up -d + the three waits + login
-#               + token                                             ~ 1470s (24.5 min)
-#   `upgrade` = the same without the agent's up -d and the token    ~ 1320s (22 min)
+#               + token                                             ~ 2080s (35 min)
+#   `upgrade` = the same without the agent's up -d and the token    ~ 1630s (27 min)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -80,6 +86,7 @@ ENV_FILE="$STATE/qa.env"
 OVERRIDE="$STATE/qa.override.yml"
 SERVICES=(server gateway agent postgres)
 WAIT_SECS=180
+UP_SECS=420
 COMPOSE=(docker compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" -f "$OVERRIDE")
 
 log() { printf '[qa-stack] %s\n' "$*" >&2; }
@@ -172,9 +179,12 @@ stage_version() {
   fetch_tag_file "$ver" "$SYS_CONFIG_PATH" "$STATE/gateway-sys.config" || rc=$?
   [[ "$rc" -eq 0 ]] || die "v${ver} has no $SYS_CONFIG_PATH"
 
-  # Exactly one: with two, which one the gateway reads is not ours to guess.
+  # Exactly one: with two different paths, which one the gateway reads is
+  # not ours to guess.
   local targets n
-  targets="$(grep -oE '/opt/yuzu_gw/releases/[^/:[:space:]]+/sys\.config' "$tagged" || true)"
+  # Distinct paths: the same path named twice (a volume and a comment) is
+  # still one target.
+  targets="$(grep -oE '/opt/yuzu_gw/releases/[^/:[:space:]]+/sys\.config' "$tagged" | sort -u || true)"
   n="$(printf '%s' "$targets" | grep -c . || true)"
   [[ "$n" -eq 1 ]] \
     || die "v${ver}'s template names $n /opt/yuzu_gw/releases/<vsn>/sys.config paths, expected exactly one: $(printf '%s' "$targets" | tr '\n' ' ')"
@@ -241,7 +251,8 @@ pull() {
 }
 
 up() {  # up [SERVICE...]
-  timeout 120 "${COMPOSE[@]}" up -d "$@" || { dump_stack; die "compose up -d $* failed or took over 120s"; }
+  timeout "$UP_SECS" "${COMPOSE[@]}" up -d "$@" \
+    || { dump_stack; die "compose up -d $* failed or took over ${UP_SECS}s"; }
 }
 
 # Origin is the stack's own origin: cookie-authenticated mutations are
@@ -281,9 +292,12 @@ wait_gateway() {
 
 login() {
   local code
-  code="$(curl_tls -c "$STATE/cookies.txt" -o /dev/null -w '%{http_code}' \
+  # The password goes to curl on stdin (password@-), never on its argv, where
+  # any process on the runner could read it. get_env's trailing newline is
+  # stripped: curl encodes the whole stream.
+  code="$(get_env QA_ADMIN_PASSWORD | tr -d '\n' | curl_tls -c "$STATE/cookies.txt" -o /dev/null -w '%{http_code}' \
     --data-urlencode "username=qaadmin" \
-    --data-urlencode "password=$(get_env QA_ADMIN_PASSWORD)" \
+    --data-urlencode "password@-" \
     "$BASE_URL/login")"
   [[ "$code" == 200 || "$code" == 302 || "$code" == 303 ]] || die "login returned HTTP $code"
   # A failed login also answers 200 (the form again), so the proof is the
@@ -506,19 +520,30 @@ cmd_check_stable() {
 }
 
 # Postgres is excluded: its own vocabulary (PANIC is a log level) is not ours
-# to police, and a Postgres crash already shows as a restart. The gateway is an
-# OTP release: a crashed process logs a CRASH REPORT, a restarted child a
-# SUPERVISOR REPORT, while the node itself stays up and never restarts.
+# to police, and a Postgres crash already shows as a restart.
+#
+# The gateway is an OTP release. A crashed process, or a supervisor restarting
+# a child, is logged while the node itself stays up and never restarts. The
+# reference sys.config's logger template ([time, " [", level, "] ", pid, " ",
+# msg]) has NO legacy report header, so OTP 28 writes those as
+#   ... [error] <0.85.0> crasher: initial call: ...
+#   ... [error] <0.84.0> Supervisor: {local,x}. Context: child_terminated. Reason: ...
+# (captured from the real formatter), not "=CRASH REPORT====". The legacy
+# spellings stay for any other template. A bare "Supervisor:" must NOT match:
+# every child start at boot logs "Supervisor: {local,x}. Started: ...".
+GW_CRASH_PAT='\] <[0-9.]+> crasher: |crasher: initial call'
+GW_CRASH_PAT+='|[Ss]upervisor: .*[Cc]ontext: (child_terminated|start_error|shutdown_error|reached_max_restart_intensity)'
+GW_CRASH_PAT+='|CRASH REPORT|crash_report|SUPERVISOR REPORT|supervisor_report'
 cmd_crash_check() {
   local s pat log hits found=()
   for s in "${SERVICES[@]}"; do
     [[ "$s" == postgres ]] && continue
     pat='segfault|ASAN|UBSAN|panic|SIGABRT|core dump'
-    [[ "$s" == gateway ]] && pat+='|CRASH REPORT|crash_report|SUPERVISOR REPORT|supervisor_report'
+    [[ "$s" == gateway ]] && pat+="|$GW_CRASH_PAT"
     log="$STATE/crash-check-$s.log"
     compose logs --no-color --no-log-prefix "$s" > "$log" 2>&1 \
       || die "crash-check: could not read the $s logs"
-    hits="$(grep -iE "$pat" "$log" || true)"
+    hits="$(grep -iE "$pat" "$log" || true)"   # -i: "Supervisor:"/"Context:" too
     if [[ -n "$hits" ]]; then
       printf '%s\n' "$hits" | head -n 20 | sed "s/^/[$s] /" >&2
       found+=("$s")
