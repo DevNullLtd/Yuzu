@@ -216,7 +216,7 @@ Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yu
 ; scripts/install-agent-user.ps1 New-ProcBootAutologger — keep in sync (LogFileMode
 ; 0x2 = circular, 16 MB cap, System clock for FILETIME decode, FlushTimer 1 so the
 ; boot window reaches disk before the agent replays, keyword 0x10 = start/stop).
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=(Join-Path $PSHOME 'Modules')+';'+[Environment]::GetEnvironmentVariable('PSModulePath','Machine'); Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
 ; #1822 fix means `sc stop` now genuinely stops a running process holding open
@@ -244,7 +244,7 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: run
 ; session slot and still writing the 16 MB circular .etl. Unconditional (harmless
 ; no-op if never configured). Mirror of
 ; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=(Join-Path $PSHOME 'Modules')+';'+[Environment]::GetEnvironmentVariable('PSModulePath','Machine'); Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 ; gate-3 sre remediation (#3403 sockwho retirement): Inno Setup does not
 ; delete a file merely dropped from [Files] on an in-place upgrade, and
@@ -505,7 +505,16 @@ begin
   { Built from plain literals so any braces stay literal -- Inno expands a
     brace-delimited constant only inside ExpandConstant, which is applied to the
     paths separately above. }
+  { Windows PowerShell 5.1 resolves Get-Acl/Get-ChildItem/Set-Content through
+    PSModulePath, which it inherits from whatever started the installer. Started
+    (via any intermediate process) from PowerShell 7, that path leads to the
+    PowerShell 7 copies of these modules, which 5.1 cannot load, so the check
+    failed and the install aborted (#5176). Reset it to Windows PowerShell's own
+    modules plus the machine value first. The AutoLogger [Run] entries do the
+    same. }
   Script :=
+    '$env:PSModulePath=(Join-Path $PSHOME ''Modules'')+'';''+' +
+    '[Environment]::GetEnvironmentVariable(''PSModulePath'',''Machine'');' +
     '$ErrorActionPreference=''Stop'';' +
     '$d=' + PsLit(CertDir) + ';' +
     '$out=' + PsLit(ReasonFile) + ';' +

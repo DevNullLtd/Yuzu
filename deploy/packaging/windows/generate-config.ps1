@@ -16,6 +16,12 @@ param(
     [string]$OperatorPass = ""
 )
 
+# Use Windows PowerShell's own modules. PSModulePath is inherited from whatever
+# started the installer; started (via any intermediate process) from
+# PowerShell 7, it leads 5.1 to PowerShell 7 module copies it cannot load, and
+# Set-Acl/New-Item/Test-Path fail (#5176).
+$env:PSModulePath = (Join-Path $PSHOME 'Modules') + ';' + [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
+
 function New-PBKDF2Entry {
     param(
         [Parameter(Mandatory=$true)][string]$Username,
