@@ -2867,11 +2867,43 @@ ExecutionTracker::reap_stuck_running_executions() {
         if (has_anchor) {
             auto parsed_anchor = parse_reap_i64(col_str(ar.get(), 0, 0));
             if (!parsed_anchor || *parsed_anchor < 0) {
+                // SELF-HEAL a corrupt/tampered PERSISTED anchor (mirrors
+                // GatewayRouteStore's identical corrupt-anchor branch,
+                // gateway_route_reap_rules.hpp): re-anchor to THIS pass's own
+                // already-sanitised now_s and clear any stale skew marker
+                // (recorded against the now-discarded anchor), declining only
+                // this one pass. Without this repair, an unparseable or
+                // negative persisted value would take this branch on EVERY
+                // future pass with no way out — the skew-recovery logic below
+                // can never reach it, since control returns before the marker
+                // is read. Do NOT drain-on-repeat: a garbage anchor is not
+                // evidence of genuine elapsed downtime the way a persisting
+                // skew is, so this pass still declines the actual sweep.
                 spdlog::warn("ExecutionTracker::reap_stuck_running_executions declined: "
-                             "unparseable or negative persisted anchor '{}'",
-                             col_str(ar.get(), 0, 0));
+                             "unparseable or negative persisted anchor '{}' — re-anchoring to "
+                             "now_s={}",
+                             col_str(ar.get(), 0, 0), now_s);
                 clock_anomaly = true;
-                return true;
+                pg::PgResult dr = pg::exec_params(
+                    c,
+                    "DELETE FROM execution_tracker.reap_meta WHERE key = "
+                    "'stuck_exec_reap_declined'",
+                    std::vector<std::string>{});
+                if (dr.status() != PGRES_COMMAND_OK) {
+                    err = "stuck-exec reap declined-marker clear failed";
+                    return false;
+                }
+                pg::PgResult ur = pg::exec_params(
+                    c,
+                    "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+                    "('stuck_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = "
+                    "EXCLUDED.value",
+                    std::vector<std::string>{std::to_string(now_s)});
+                if (ur.status() != PGRES_COMMAND_OK) {
+                    err = "stuck-exec reap anchor update failed";
+                    return false;
+                }
+                return true; // decline only this pass, anchor now repaired
             }
             anchor = *parsed_anchor;
         }

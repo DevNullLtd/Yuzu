@@ -506,6 +506,22 @@ dedup, WS-0, absorbs the harmless re-send) rather than leaving `mark_sent` commi
 teaches: a reaper's own predicate can be perfectly correctly re-checked and still race, if the WRITE
 SIDE it depends on is allowed to commit as two independent halves.
 
+**Corrupt persisted-anchor self-heal (fix round 7, #4982) — closes a permanent wedge distinct from
+the skew-recovery marker above.** The skew-recovery marker (round 2, above) rescues a `now_s` that
+reads implausibly against a PARSEABLE persisted anchor. It cannot rescue an anchor that is itself
+unparseable or negative — that branch returned `clock_anomaly = true` without touching
+`stuck_exec_reap_anchor` or `stuck_exec_reap_declined`, and precedes the skew-marker read entirely, so
+an anchor corrupted by storage damage, a bad migration, or a manual repair gone wrong took that same
+branch on every future pass with no recovery path short of an operator hand-editing `reap_meta` — the
+identical permanent-wedge class this file's `GatewayRouteStore::reap_stale_routes` entry above already
+fixed for its own sibling anchor. Fixed by mirroring that sibling's corrupt-anchor branch exactly: on
+an unparseable/negative persisted anchor, clear `stuck_exec_reap_declined` and re-anchor
+`stuck_exec_reap_anchor` to THIS pass's own already-sanitised `now_s`, in the same transaction,
+declining only that one pass. Deliberately NOT drain-on-repeat, matching the sibling's own reasoning:
+a garbage anchor is not evidence of genuine elapsed downtime the way a persisting skew is, so the
+repaired pass still declines the actual sweep and the NEXT pass is the first to act on the healed
+anchor.
+
 ### `guardian_lifecycle_journal.cpp`
 
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do

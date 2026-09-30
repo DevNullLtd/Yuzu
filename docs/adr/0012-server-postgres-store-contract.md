@@ -250,10 +250,17 @@ commit). `kPendingOutboxNotExistsClause` is the second instance of that same pat
 **When this exception applies, precisely, so a future author cannot cite it as a general escape
 hatch:** ONLY when a caller needs the predicate as one conjunct of its OWN atomic check-and-act
 statement, where a separately-leased read would introduce a check-then-act race the caller's
-transaction is specifically structured to avoid. It does NOT license a cross-schema `SELECT` embedded
-for convenience, or a fragment a caller could just as well obtain by calling an owner method on its
-own lease — the default in section 3 is still owner-executed, and this exception is for the one case
-that default cannot serve: a predicate that must be evaluated INSIDE somebody else's transaction, not
-its own. Adding a third instance of this shape should point back to this paragraph, not merely to
+transaction is specifically structured to avoid — OR as one conjunct of a preparatory `SELECT` that
+runs inside that SAME transaction, under the SAME lock, directly selecting or counting candidates for
+that same check-and-act, PROVIDED the predicate text is byte-identical to the one the final
+check-and-act re-evaluates atomically. `ExecutionTracker::reap_stuck_running_executions`'s
+candidate-count and candidate-select queries are this second case: preparatory reads under the same
+advisory lock and transaction snapshot as the atomic cancel `UPDATE` that re-checks the identical
+clause. It does NOT license a cross-schema `SELECT` embedded for convenience, run outside the
+check-and-act's own transaction/lock, or against a predicate the final mutation does not itself
+re-evaluate — nor a fragment a caller could just as well obtain by calling an owner method on its own
+lease. The default in section 3 is still owner-executed, and this exception is for the one case that
+default cannot serve: a predicate that must be evaluated INSIDE somebody else's transaction, not its
+own. Adding a third instance of this shape should point back to this paragraph, not merely to
 `kPendingOutboxNotExistsClause`'s doc comment, so the precondition is re-checked each time rather than
 copied as a template.

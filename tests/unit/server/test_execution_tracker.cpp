@@ -2992,8 +2992,9 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions cancels an old "
     REQUIRE(exec.has_value());
     CHECK(exec->status == "cancelled");
 
-    // Event-publish shape matches mark_cancelled's own (the sweep calls it
-    // directly for the actual mutation).
+    // Event-publish shape matches mark_cancelled's own — the sweep reproduces
+    // mark_cancelled's state/event coupling inside its own lock-held
+    // transaction, rather than calling mark_cancelled itself.
     auto rows = fetch_outbox(env.pool(), *id);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].event_type == "execution-completed");
@@ -3289,6 +3290,78 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines on a "
     auto exec = env.tracker().get_execution(*id);
     REQUIRE(exec.has_value());
     CHECK(exec->status == "running"); // declined outright — clock anomaly
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions self-heals a "
+          "corrupt/unparseable persisted anchor instead of wedging forever "
+          "(round 7 C1 fix)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+    auto first = env.tracker().reap_stuck_running_executions();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Corrupt the persisted anchor with a value parse_reap_i64 rejects —
+    // simulating storage corruption / a bad migration / a manual repair gone
+    // wrong, never a value the sole writer itself produces.
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = 'not-a-number' WHERE key = "
+            "'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    // Pass 2: declines (the corrupt value is still an anomaly for THIS pass —
+    // a garbage anchor is not evidence of genuine elapsed downtime) but MUST
+    // repair the persisted anchor rather than leaving the garbage in place.
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->clock_anomaly);
+    CHECK(second->cancelled == 0);
+    {
+        auto exec = env.tracker().get_execution(*id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "running");
+    }
+
+    // The anchor must now be a plausible, parseable value again — proving the
+    // self-heal ran rather than leaving 'not-a-number' in place (which would
+    // wedge every future pass identically, forever).
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM execution_tracker.reap_meta WHERE key = 'stuck_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        std::string repaired = PQgetvalue(res.get(), 0, 0);
+        std::int64_t repaired_anchor = 0;
+        REQUIRE_NOTHROW(repaired_anchor = std::stoll(repaired));
+        CHECK(repaired_anchor >= 0);
+    }
+
+    // Pass 3: an ORDINARY pass now proceeds normally — proving the repair
+    // actually un-wedged the sweep rather than just changing the log message.
+    // Without the fix, the next pass would parse the same 'not-a-number'
+    // value again and decline identically, forever.
+    auto third = env.tracker().reap_stuck_running_executions();
+    REQUIRE(third.has_value());
+    CHECK_FALSE(third->clock_anomaly);
+    CHECK(third->cancelled == 1);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
 }
 
 // ── #4982 fix round 2 ────────────────────────────────────────────────────────

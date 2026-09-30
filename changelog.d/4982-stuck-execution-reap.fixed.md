@@ -25,3 +25,26 @@
   500-row cap an honest per-pass bound under a second replica); the advisory lock is now
   try-and-skip rather than blocking; and a bounded per-pass log now names the cancelled
   `execution_id`s.
+
+  **Fix round 3** (post-adversarial-review, still pre-release): the sweep's exclusion of
+  still-`pending` outbox rows above was only as trustworthy as the write side it depends on —
+  `command_outbox_delivery.cpp` committed the outbox `pending → sent` transition and
+  `ExecutionTracker::set_agents_targeted`'s real target count as two SEPARATE autocommit
+  statements, so a genuinely in-flight, successfully-dispatched command could read `state='sent'`
+  (excluded by this sweep's own clause) with `agents_targeted` still `0` between the two commits —
+  a false candidate, force-cancelled with no kill RPC ever sent. Fixed by
+  `CommandDeliveryFinalizationOwner::mark_sent_with_target` (`command_delivery_finalization_owner.{hpp,cpp}`,
+  a new ADR-0012 query owner): the sent-transition and the target-count write now commit in ONE
+  transaction, so this sweep's own atomic recheck (round 2, above) can no longer observe them
+  half-applied. See `docs/clock-guarded-retention.md`'s own entry for the full race and
+  `docs/adr/0012-server-postgres-store-contract.md`'s Update for the new owner and its shared-fragment
+  exception.
+
+  **Fix round 7** (post-adversarial-review, still pre-release): an unparseable or negative
+  *persisted* `stuck_exec_reap_anchor` — storage corruption, a bad migration, or a manual repair
+  gone wrong — previously declined every future pass without repair, wedging the sweep
+  permanently with no recovery path short of an operator hand-editing `reap_meta` (the
+  round-2 skew-recovery marker above cannot reach this case, since control returns before it is
+  read). The sweep now self-heals a corrupt persisted anchor the same way `GatewayRouteStore`'s
+  sibling already does: re-anchor to the current pass's own sanitised clock reading and clear any
+  stale skew marker, declining only that one pass.
