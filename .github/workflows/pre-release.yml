@@ -491,8 +491,9 @@ jobs:
     name: "Install Windows .exe"
     needs: resolve
     runs-on: windows-2022
-    # Two install/uninstall cycles plus the bounded service polls. The uninstaller alone now
-    # spends up to 15s polling for STOPPED against a service that is genuinely running.
+    # Two install/uninstall cycles plus bounded service polls. Worst case: 60s to reach
+    # Running + a 20s hold, 60s to reach Stopped, 90s for the fail-closed pass to stop, and a
+    # 3-minute deadline on each uninstall = ~11 min, plus the installs and the download.
     timeout-minutes: 20
     steps:
       - name: Download artifacts
@@ -647,6 +648,7 @@ jobs:
 
       # ── Pass 2: default TLS posture — must fail closed ────────────────
       - name: Silent install (default TLS posture)
+        id: tls_install
         shell: pwsh
         run: |
           $installer = Get-ChildItem "artifacts/YuzuAgentSetup-*.exe" | Select-Object -First 1
@@ -702,8 +704,10 @@ jobs:
       # The assertion above copies the log only once the service has stopped;
       # if WaitForStatus throws first, this is the only copy — and the
       # uninstaller deletes {app}\logs. Mirrors the --no-tls pass.
+      # Only once pass 2's install succeeded: otherwise the log on disk is pass 1's
+      # (or none), and saving it as agent-tls.log would mislabel it.
       - name: Collect agent log (TLS pass)
-        if: always()
+        if: always() && steps.tls_install.outcome == 'success'
         shell: pwsh
         run: |
           $log = "${env:ProgramFiles}\Yuzu\logs\yuzu-agent.log"
@@ -790,7 +794,7 @@ jobs:
             uninstall-tls.log
             system-events.log
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 90
 
   # ── macOS installer smoke test ──────────────────────────────────────
   install-macos:
@@ -1033,7 +1037,7 @@ jobs:
           name: security-scan
           path: |
             trivy-*.txt
-          retention-days: 30
+          retention-days: 90
 
   # ── Soak test (10 min stability) ────────────────────────────────────
   soak-test:
