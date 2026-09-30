@@ -524,8 +524,7 @@ tick, `heartbeat_interval` 30 s by default), not at the 5 s mark itself: its eff
 wait is the deadline plus up to one heartbeat interval. An arm redriven after its
 deadline but before that pass can be abandoned in flight and is then reported as
 dispatched-timeout (Wedged) until its late result lands; that result is still applied
-(ruling 14(b)). What
-changes is the size of the surplus that survives: with quota `q` and per-arm latency
+(ruling 14(b)). What changes is the size of the surplus that survives: with quota `q` and per-arm latency
 `t`, roughly `q` arms are admitted per `t`, so `N` same-class rules arm only if about
 `ceil(N/q) * t` fits inside the deadline plus that heartbeat window; rules beyond that
 still end congestion-expired and recover on the next successful re-apply. Real
@@ -583,7 +582,7 @@ post-flip package. **Consequence under ruling 14(a), stated explicitly:** a same
 stall can no longer K-waive healthy sibling keys, because admission congestion is not
 K-qualifying; the consequence is instead that the affected generation's acknowledgment
 is HELD, with the server's 25 s `full_sync` retry re-applying the whole push until the
-contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
+contention clears. `yuzu.guardian_arm_failed` is therefore intended to carry a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3; since #5168 a
 congestion refusal that is parked and never admitted is logged as
 `status=CongestionExpired`, and admission-rejection is the terminal refusals only. The

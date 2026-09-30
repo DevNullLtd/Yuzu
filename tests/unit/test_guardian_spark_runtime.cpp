@@ -8386,6 +8386,8 @@ struct ParkedPoolRig {
         while (rt->io_executor_stats_for_test().active_total != 0 &&
                std::chrono::steady_clock::now() < end)
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (rt->io_executor_stats_for_test().active_total != 0)
+            std::fputs("ParkedPoolRig: io_executor workers still alive after 10 s\n", stderr);
     }
     /// Number of backend calls currently blocked inside the gate.
     [[nodiscard]] int gate_parked() const {
@@ -8693,6 +8695,7 @@ TEST_CASE("#5168: terminal refusals of parked arms do not recurse and every park
     // Only the four permit-release hooks may have taken a parked arm: a terminal refusal
     // must not chain into the next parked claim (the old recursive drain would have failed
     // all 40 here, from one call stack).
+    CHECK(rig.rt->arm_redrives() >= 1); // the hooks did take parked arms (not vacuous)
     CHECK(rig.rt->arm_redrives() <= static_cast<std::uint64_t>(ParkedPoolRig::kCapacity));
     CHECK(rig.rt->arms_parked() >= static_cast<std::size_t>(kParked - ParkedPoolRig::kCapacity));
     REQUIRE(yuzu::test::spin_until([&] {
