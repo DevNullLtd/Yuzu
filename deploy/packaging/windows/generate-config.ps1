@@ -1,7 +1,7 @@
 # generate-config.ps1 — Generate yuzu-server.cfg with PBKDF2-SHA256 hashed credentials
 #
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File generate-config.ps1 `
+#   powershell -NoProfile -ExecutionPolicy Bypass -File generate-config.ps1 `
 #     -ConfigPath "C:\ProgramData\Yuzu Server\yuzu-server.cfg" `
 #     -AdminUser admin -AdminPass "MyPassword123" `
 #     [-OperatorUser operator -OperatorPass "OpPassword123"]
