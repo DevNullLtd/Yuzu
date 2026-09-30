@@ -119,13 +119,18 @@ public:
     /// transaction/connection) iff `executions.id` (the correlated column —
     /// callers embed this literally in a `WHERE ... AND
     /// <kPendingOutboxNotExistsClause>` over `execution_tracker.executions`,
-    /// never rename that alias) still has a `state='pending'` row in
-    /// `command_outbox_store.outbox` — i.e. the delivery loop still owns this
-    /// occurrence and has not yet finalized it either way. See this file's
-    /// header banner for why this is a shared TEXT fragment rather than an
-    /// owner-executed method: the caller's own transaction, not a separately-
-    /// leased read, must evaluate it. Never build this fragment by hand at a
-    /// new call site — reference this symbol.
+    /// never rename that alias) does NOT have a `state='pending'` row in
+    /// `command_outbox_store.outbox` — i.e. TRUE means the delivery loop no
+    /// longer owns this occurrence (it was already finalized, sent or
+    /// failed, one way or the other); FALSE means it is still pending and
+    /// the delivery loop still owns it. #4982 round 6 (Kimi K4): read the
+    /// SQL, not this paragraph's shape, if in doubt — it is a literal
+    /// `NOT EXISTS (...)`, so the predicate is true precisely when no such
+    /// row exists. See this file's header banner for why this is a shared
+    /// TEXT fragment rather than an owner-executed method: the caller's own
+    /// transaction, not a separately-leased read, must evaluate it. Never
+    /// build this fragment by hand at a new call site — reference this
+    /// symbol.
     static constexpr std::string_view kPendingOutboxNotExistsClause =
         "NOT EXISTS (SELECT 1 FROM command_outbox_store.outbox "
         "            WHERE execution_id = executions.id AND state = 'pending')";

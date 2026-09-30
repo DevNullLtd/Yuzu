@@ -168,6 +168,17 @@ struct OutboxCommand {
 
 class CommandOutboxStore {
 public:
+    /// Lease-acquire write deadline (ADR-0012 §2): this store is a
+    /// leader-driven background surface (a scheduler tick, a delivery loop)
+    /// with no operator waiting on a request, so the deadline is modest and
+    /// the caller always has its own next tick to retry. #4982 round 6
+    /// (Kimi K3): also the deadline `CommandDeliveryFinalizationOwner`'s own
+    /// write uses — that class's write runs on THIS store's pool (it shares
+    /// this store's cross-schema write reasoning exactly), so it references
+    /// this ONE symbol rather than carrying its own independently-declared
+    /// copy that a future tuning change could silently desync.
+    static constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
     /// Borrows the shared pool; runs the `command_outbox_store` schema migration
     /// on a pinned construction lease. `is_open()` is false if the lease was
     /// empty or the migration failed (a fatal startup error at the wiring site,

@@ -1,5 +1,6 @@
 #include "command_delivery_finalization_owner.hpp"
 
+#include "command_outbox_store.hpp" // CommandOutboxStore::kWriteTimeout (#4982 round 6, Kimi K3)
 #include "leader_elector.hpp" // LeaderElector::epoch_fence_sql — the embeddable epoch predicate
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -11,14 +12,6 @@
 #include <vector>
 
 namespace yuzu::server {
-
-namespace {
-// Byte-identical to `CommandOutboxStore::kWriteTimeout` (the constant this
-// write used before the move) — this owner's write is leader-driven
-// background work with no operator waiting synchronously on it, same
-// reasoning as command_outbox_store.cpp's own comment on that constant.
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
-} // namespace
 
 // #4982 round 3 → round 5: byte-identical body to
 // `CommandOutboxStore::mark_sent_with_target`'s pre-move implementation — see
@@ -45,7 +38,8 @@ CommandDeliveryFinalizationOwner::mark_sent_with_target(const std::string& occur
     // transaction — see the header doc comment for the race this closes.
     // Cross-schema, single pool/database — this owner's whole reason to
     // exist (ADR-0012 §3).
-    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+    const bool committed =
+        pool_.with_txn_for(CommandOutboxStore::kWriteTimeout, [&](PGconn* c) -> bool {
         pg::PgResult sent_res =
             pg::exec_params(c, sent_sql.c_str(), std::vector<std::string>{occurrence_id});
         if (sent_res.status() != PGRES_TUPLES_OK) {

@@ -24,13 +24,15 @@ namespace {
 // CommandOutboxStore -> command_outbox_store. One schema, one table (`outbox`).
 constexpr const char* kStoreName = "command_outbox_store";
 
-// Lease-acquire deadlines (ADR-0012 §2). This store is a leader-driven
-// background surface (a scheduler tick, a delivery loop) with no operator
-// waiting on a request, so the deadlines are modest and the caller always has
-// its own next tick to retry — a degrade is logged at `warn` + counted, never
-// silently swallowed (posture is authoritative, but the CALLER, not this
-// store, decides fail-closed on the typed error it returns).
-constexpr std::chrono::milliseconds kWriteTimeout{2000};
+// Read lease-acquire deadline (ADR-0012 §2) — see
+// `CommandOutboxStore::kWriteTimeout`'s doc comment (command_outbox_store.hpp)
+// for the write-side deadline and the shared-symbol rationale (#4982 round 6,
+// Kimi K3): this store is a leader-driven background surface (a scheduler
+// tick, a delivery loop) with no operator waiting on a request, so the
+// deadlines are modest and the caller always has its own next tick to retry —
+// a degrade is logged at `warn` + counted, never silently swallowed (posture
+// is authoritative, but the CALLER, not this store, decides fail-closed on
+// the typed error it returns).
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 
 // Interpret the result of the fenced idempotent INSERT ... RETURNING plus its
