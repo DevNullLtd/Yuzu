@@ -924,6 +924,41 @@ TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-
     }
 }
 
+// Post-migration projection check (postgres-store-playbook "Runner guards"). schema_meta stays
+// current while a column a runtime query selects is missing, which models a version stamped by a
+// different binary: PgMigrationRunner::run() sees nothing pending and returns true, so only the
+// constructor's LIMIT 0 projection can refuse to open.
+TEST_CASE("SoftwareInventoryStore reports !is_open when a column its queries select is missing "
+          "although schema_meta is current",
+          "[pg][software_inventory][extended_row]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore intact{pool};
+        REQUIRE(intact.is_open()); // control: the guard must not refuse a healthy schema
+    }
+    auto drop_column = [&](const char* table, const char* column) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        const std::string sql = std::string("ALTER TABLE software_inventory_store.") + table +
+                                " DROP COLUMN " + column;
+        pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+
+    SECTION("a column v7 added to installed_software") {
+        drop_column("installed_software", "source");
+        SoftwareInventoryStore store{pool};
+        CHECK_FALSE(store.is_open());
+    }
+    SECTION("a column of a table other than installed_software") {
+        drop_column("catalog_rollup_meta", "total_devices");
+        SoftwareInventoryStore store{pool};
+        CHECK_FALSE(store.is_open());
+    }
+}
+
 TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts it (UP-10)",
           "[pg][software_inventory][seam][pg-smoke]") {
     // Regression for the UTF-8 byte-cut: a raw field whose multibyte codepoint

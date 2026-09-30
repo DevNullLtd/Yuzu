@@ -219,7 +219,10 @@ const std::vector<pg::PgMigration>& migrations() {
          // runner's txn, so SET LOCAL lifts it for this txn only (it cannot leak to the
          // pool). lock_timeout (10 s) still bounds lock acquisition; only the finite
          // rewrite work is uncapped, because at fleet scale a cancelled boot migration
-         // is a permanently fail-closed server, not a protection. IF [NOT] EXISTS keeps
+         // is a permanently fail-closed server, not a protection. Accepted risk: at very
+         // large fleets this is a lock of tens of minutes; tolerated only while no
+         // production fleet exists, and every later change to this table must be online
+         // (docs/postgres-migration-ladder.md, SoftwareInventoryStore row). IF [NOT] EXISTS keeps
          // a white-box schema_meta rewind idempotent (a re-run adds no second sequence;
          // the column drop cascades the index, so DROP IF EXISTS no-ops). install_id
          // churns on every full replace (DELETE + INSERT) — it is a TIEBREAK inside
@@ -444,6 +447,40 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("SoftwareInventoryStore: schema migration failed — software inventory "
                       "persistence disabled");
         return;
+    }
+
+    // Post-migration projection check (postgres-store-playbook "Runner guards"; ApiTokenStore
+    // is the reference shape). run() skips any migration whose id is at or below the stored
+    // high-water mark, so a schema_meta stamped by a different binary can leave a column
+    // missing while run() still reports success. A LIMIT 0 SELECT of every column the runtime
+    // queries read touches no rows and fails the store closed here, not as `undefined column`
+    // on whichever request runs first. Keep in step with the SELECTs in this file.
+    struct Projection {
+        const char* table;
+        const char* columns;
+    };
+    static constexpr Projection kProjections[] = {
+        {"installed_software",
+         "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
+         "arch, signature_status, distro_id, distro_version, install_location, "
+         "uninstall_string, package_id, source, install_id"},
+        {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
+        {"catalog_rollup", "name, publisher, device_count, version_count"},
+        {"version_rollup", "name, version, device_count"},
+        {"catalog_rollup_meta", "id, refreshed_at, total_titles, total_devices"},
+    };
+    for (const auto& p : kProjections) {
+        const std::string sql = std::string("SELECT ") + p.columns +
+                                " FROM software_inventory_store." + p.table + " LIMIT 0";
+        pg::PgResult probe = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("SoftwareInventoryStore: post-migration schema projection check failed "
+                          "on {} — an expected column is missing (hypothesis: a skipped or "
+                          "partial migration; could also be a dropped connection or other "
+                          "transient failure) — software inventory persistence disabled: {}",
+                          p.table, PQresultErrorMessage(probe.get()));
+            return;
+        }
     }
     open_ = true;
 }
