@@ -1,0 +1,31 @@
+# tree.manifest -- ONE composite injected root for lnx::apt_rows_at / lnx::linux_rows_at.
+# Line grammar: <relative path>TAB<payload>; '#' lines and blank lines are skipped.
+#   F:<path>   copy the committed fixture at <path> (relative to this file's directory)
+#   T:<text>   literal text; escapes \n \t \\ (RECONSTRUCTION lines only)
+#   B:<base64> literal bytes
+#   L:<target> symlink to <target>
+# Every entry carries its own label. Byte sources are the wave-1 captures listed in
+# provenance.txt (single copy of each capture; nothing is duplicated here).
+#
+# REAL CAPTURE (debian:bookworm, 2026-09-21): deb822 sources with Signed-By + armored keyring.
+etc/apt/sources.list.d/debian.sources	F:debian-bookworm/etc/apt/sources.list.d/debian.sources
+etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc	F:debian-bookworm/etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.asc
+# REAL CAPTURE (ubuntu:22.04, 2026-09-21): one-line sources.list + binary keyring.
+etc/apt/sources.list	F:ubuntu-2204/etc/apt/sources.list
+etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg	F:ubuntu-2204/etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg
+# RECONSTRUCTION (hand-written, not a capture): names apt itself ignores -- in trusted.gpg.d only
+# *.gpg and *.asc are keyrings, in sources.list.d only *.list and *.sources are read. They exist
+# purely to prove the two name filters on this root: none of the three may yield a row.
+etc/apt/trusted.gpg.d/README	T:not a key\n
+etc/apt/trusted.gpg.d/z.txt	T:not a key either\n
+etc/apt/sources.list.d/notes.txt	T:deb http://ignored.example/ x main\n
+# RECONSTRUCTION (hand-written, not a capture): ONE placeholder .repo standing for the deferred
+# rpm/dnf family. Its content is never parsed -- the leg only lists /etc/yum.repos.d and records
+# `linux:rpm_repo:planned` -- so the file exists purely to prove that tripwire on the same root as
+# the apt rows above and below.
+etc/yum.repos.d/placeholder.repo	T:[placeholder]\nname=RECONSTRUCTION placeholder, never parsed\n
+# RECONSTRUCTION (hand-written, not a capture): a third-party one-line source that pins a
+# Signed-By keyring under /etc/apt/keyrings, and an insecure one (trusted=yes allow-insecure=yes).
+etc/apt/sources.list.d/thirdparty.list	T:deb [signed-by=/etc/apt/keyrings/thirdparty.gpg] https://repo.example.com/apt stable main\ndeb [trusted=yes allow-insecure=yes] http://insecure.example.com/apt ./\n
+# RECONSTRUCTION: the four leading bytes of a binary OpenPGP key packet (0x99 0x01 0x0d 0x04).
+etc/apt/keyrings/thirdparty.gpg	B:mQENBA==
