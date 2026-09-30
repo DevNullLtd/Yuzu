@@ -8330,7 +8330,7 @@ TEST_CASE("up-3 (#4221) + #5168: the compensating-disarm reservation defers at c
 
     // A 5th, distinct-key File attach: capacity is fully reserved by the 4 parked
     // arms above, so it is refused reservation BEFORE ever calling backend->arm() -
-    // but (#5168) that is a CONGESTION refusal, so the claim is retained (Accepted,
+    // but (#5168) that is a CONGESTION refusal, so the claim is parked (Accepted,
     // not Failed) instead of failed, and left for the next permit release to redrive.
     const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
                                       file_exists_rule("r4"), true);
@@ -8377,7 +8377,21 @@ struct ParkedPoolRig {
     std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
     std::shared_ptr<GuardianSparkRuntime> rt;
     explicit ParkedPoolRig(GuardianSparkRuntime::Config cfg = {}) : rt(make_rt(r, b, cfg)) {}
-    ~ParkedPoolRig() { b->arm_park.open(); }
+    ~ParkedPoolRig() {
+        b->arm_park.open();
+        // Detached io_executor_ workers may still be finishing (they log and touch the
+        // backend after the gate opens): wait for them, bounded and non-throwing, so no
+        // worker outlives the test body into static destruction.
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (rt->io_executor_stats_for_test().active_total != 0 &&
+               std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    /// Number of backend calls currently blocked inside the gate.
+    [[nodiscard]] int gate_parked() const {
+        std::lock_guard lk(b->arm_park.mu);
+        return b->arm_park.parked;
+    }
     void fill_pool() {
         b->arm_park.park_every = 1;
         for (int i = 0; i < kCapacity; ++i) {
@@ -8387,7 +8401,8 @@ struct ParkedPoolRig {
                                              file_exists_rule(rid), true);
             REQUIRE(res.has_value());
         }
-        REQUIRE(yuzu::test::spin_until([&] { return b->arm_entries.load() == kCapacity; }));
+        // arm_entries is bumped BEFORE the gate, so wait for the calls to actually be parked.
+        REQUIRE(yuzu::test::spin_until([&] { return gate_parked() == kCapacity; }));
     }
     /// Attach a distinct-key rule that finds the pool full; it must come back Accepted.
     GuardianSparkRuntime::ArmReceipt park_rule(const std::string& rid, const std::string& path) {
@@ -8658,6 +8673,7 @@ TEST_CASE("#5168: a taken parked arm whose dispatch throws after begin_stop is r
     rig.settle();
     CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Stopped);
     CHECK(rig.rt->arms_parked() == 0);
+    CHECK(rig.rt->claim_queue_depth_for_test(spark_key(file_spec("/k4"))) == 0); // no residue
     CHECK(rig.rt->redrive_parked_arms() == 0);
 }
 
@@ -8674,6 +8690,11 @@ TEST_CASE("#5168: terminal refusals of parked arms do not recurse and every park
     rig.rt->set_io_executor_fail_launch_for_test(true); // every later submit is a terminal refusal
     rig.release_gate();
     rig.settle();
+    // Only the four permit-release hooks may have taken a parked arm: a terminal refusal
+    // must not chain into the next parked claim (the old recursive drain would have failed
+    // all 40 here, from one call stack).
+    CHECK(rig.rt->arm_redrives() <= static_cast<std::uint64_t>(ParkedPoolRig::kCapacity));
+    CHECK(rig.rt->arms_parked() >= static_cast<std::size_t>(kParked - ParkedPoolRig::kCapacity));
     REQUIRE(yuzu::test::spin_until([&] {
         (void)rig.rt->redrive_parked_arms(); // a terminal refusal drains nothing itself
         return rig.rt->arms_parked() == 0;
@@ -8693,7 +8714,7 @@ TEST_CASE("#5168: the normal completion release site redrives a parked arm while
                                     file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true)
                     .has_value());
     }
-    REQUIRE(yuzu::test::spin_until([&] { return rig.b->arm_entries.load() == 3; }));
+    REQUIRE(yuzu::test::spin_until([&] { return rig.gate_parked() == 3; }));
     {
         std::lock_guard lk(rig.b->arm_park.mu);
         rig.b->arm_park.park_every = 0; // later arms do not park in the gate

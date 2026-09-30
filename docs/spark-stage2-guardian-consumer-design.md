@@ -522,8 +522,9 @@ congestion-expired, exactly as before this amendment, but only after the deadlin
 observed by the maintenance pass that runs `expire_overdue_claims()` (the heartbeat
 tick, `heartbeat_interval` 30 s by default), not at the 5 s mark itself: its effective
 wait is the deadline plus up to one heartbeat interval. An arm redriven after its
-deadline but before that pass can be abandoned in flight and briefly reported as
-dispatched-timeout (Wedged); its late result is still applied (ruling 14(b)). What
+deadline but before that pass can be abandoned in flight and is then reported as
+dispatched-timeout (Wedged) until its late result lands; that result is still applied
+(ruling 14(b)). What
 changes is the size of the surplus that survives: with quota `q` and per-arm latency
 `t`, roughly `q` arms are admitted per `t`, so `N` same-class rules arm only if about
 `ceil(N/q) * t` fits inside the deadline plus that heartbeat window; rules beyond that
@@ -585,8 +586,9 @@ is HELD, with the server's 25 s `full_sync` retry re-applying the whole push unt
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3; since #5168 a
 congestion refusal that is parked and never admitted is logged as
-`status=CongestionExpired`, and admission-rejection is the terminal refusals only; the
-reason/phase breakdown itself is still unbuilt, as the rung 9c status note further down records), so an operator
+`status=CongestionExpired`, and admission-rejection is the terminal refusals only. The
+reason/phase breakdown itself is still unbuilt (see the PR-5e "Explicit narrowing"
+bullet further down), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
 the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 

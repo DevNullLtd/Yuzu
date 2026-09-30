@@ -2188,7 +2188,7 @@ TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm
     auto* rt = engine.spark_runtime_for_test();
     REQUIRE(rt != nullptr);
     // Three arms hold the whole Service quota and reservation; the other three are
-    // retained (not failed): nothing armed yet, nothing left unenforced-for-good.
+    // parked (not failed): nothing armed yet, nothing left unenforced-for-good.
     // watch() is per-type-serialised (spark_mechanism.hpp), so only ONE of the three
     // admitted arms is inside the fake at a time; the other two wait on that lock
     // while still holding their quota slot and reservation permit.
@@ -2227,9 +2227,9 @@ TEST_CASE("#5168: with the production default (prefer_spark false) no rule reach
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};
     SparkEngine spark_engine;
-    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
-                                            std::make_unique<FakeServiceMechanism>())
-                .has_value());
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    auto* mechanism = mech.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
     spark_engine.start();
     GuardianEngine engine{&kv, "agent-test"};
     REQUIRE(engine.start_local().has_value());
@@ -2243,6 +2243,12 @@ TEST_CASE("#5168: with the production default (prefer_spark false) no rule reach
                 .exit_code == 0);
     auto* rt = engine.spark_runtime_for_test();
     REQUIRE(rt != nullptr);
+    // Spark arms are asynchronous, so an immediate read proves nothing: give a spark arm
+    // (which would reach the mechanism within milliseconds) time to show itself. A
+    // negative assertion, so a bounded sleep is the honest tool here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    engine.journal_maintenance_tick();
+    CHECK(mechanism->watch_call_count() == 0); // nothing reached the spark mechanism
     CHECK(rt->arms_parked_total() == 0);
     CHECK(rt->arms_parked() == 0);
     CHECK(engine.spark_armed_rule_count() == 0);

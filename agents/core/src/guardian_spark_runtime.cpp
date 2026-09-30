@@ -714,11 +714,20 @@ void GuardianSparkRuntime::dispatch_parked_arm_guarded(const std::shared_ptr<Key
             if (c->dispatch == ClaimDispatch::Dispatching && !c->outcome && !c->commit_exception) {
                 if (stopping_) {
                     // begin_stop()'s walk skipped this claim (it was Dispatching), and
-                    // nothing redrives after a sticky stop: resolve it the way that walk
-                    // would have, so its receipt does not stay Pending forever.
+                    // nothing redrives after a sticky stop: drop it the way that walk
+                    // drops a Queued claim (release its index mapping, publish a counted
+                    // "stopping" outcome, erase it from the fifo) so the receipt does not
+                    // stay Pending and no residue is left behind.
+                    release_claim_index_locked(*c); // noexcept
                     c->outcome = std::unexpected(std::string{"stopping"});
                     c->end = ClaimEnd::Stopped;
                     claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+                    if (const auto eit = claims_.find(c->key); eit != claims_.end()) {
+                        std::erase(eit->second.fifo, c);
+                        if (eit->second.fifo.empty())
+                            claims_.erase(eit);
+                    }
+                    claim_cv_.notify_all();
                 } else {
                     c->dispatch = ClaimDispatch::Queued;
                     c->arm_parked = false;
