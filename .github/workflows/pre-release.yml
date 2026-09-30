@@ -944,7 +944,11 @@ jobs:
         run: |
           for img in yuzu-server yuzu-agent-chisel yuzu-gateway; do
             echo "=== $img ==="
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
+            # Every release publishes these images; a missing one is a failure, not a
+            # SKIP that passes while inspecting nothing (#5151). One retry for a
+            # registry blip.
+            docker pull -q "$REGISTRY/$img:$VERSION" || { sleep 15; docker pull -q "$REGISTRY/$img:$VERSION"; } \
+              || { echo "::error::$img:$VERSION could not be pulled from $REGISTRY"; exit 1; }
             # Non-root user
             USER=$(docker inspect "$REGISTRY/$img:$VERSION" --format='{{.Config.User}}')
             [ -n "$USER" ] && [ "$USER" != "root" ] && echo "PASS: non-root user ($USER)" || echo "WARN: running as root"
@@ -989,9 +993,11 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          # A missing image must fail here: Trivy would otherwise scan nothing and
+          # the job would read as a clean scan (#5151). One retry for a registry blip.
           for img in yuzu-server yuzu-gateway; do
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
-              || echo "SKIP: $img:$VERSION not found"
+            docker pull -q "$REGISTRY/$img:$VERSION" || { sleep 15; docker pull -q "$REGISTRY/$img:$VERSION"; } \
+              || { echo "::error::$img:$VERSION could not be pulled from $REGISTRY"; exit 1; }
           done
 
       - name: Scan yuzu-server
