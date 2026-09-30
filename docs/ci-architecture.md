@@ -422,9 +422,10 @@ than the tag under test (#5150). The other jobs check the following:
   fail closed because no CA is pinned. The uninstall wait is bounded (#5145).
 - **install-macos**: the `.pkg` is present and installs, `--version` runs, the
   launchd plist is in place, and at least 5 plugins are installed.
-- **artifact-verify**: checks the archive contents and ELF hardening, and that
-  each `.deb` control `Version` equals the tag's Debian spelling
-  (`0.14.0~rc3`). A mismatch fails. The ARM64 archive is checked only when the
+- **artifact-verify**: checks the archive contents and ELF hardening (a
+  missing NX fails; PIE, RELRO and stack canaries only warn), and that each
+  `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
+  mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
   release ships one (#5135).
 - **security-scan**: Trivy scans the server and gateway images. Its findings
   are informational and do not fail the run, but an image that cannot be
