@@ -2028,7 +2028,8 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
             [&] {
                 engine.journal_maintenance_tick();
                 return engine.spark_armed_rule_count() == 5; // armed via spark BEFORE the restart
-            }));
+            },
+            std::chrono::seconds(30)));
         engine.stop();
         spark_engine.stop();
     }
@@ -2102,7 +2103,8 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     // rung 9c PR-2 Unit 6: start_local()'s boot re-arm is Accepted, not yet resolved,
     // when it returns - settle (generous bound, see the Phase 1 seeding block's own
     // comment on this same class of full-agent-suite load sensitivity).
-    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; }));
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; },
+                                   std::chrono::seconds(30)));
     CHECK(engine.spark_armed_rule_count() == 5);
     CHECK(engine.armed_guard_count() == 0);
     CHECK(engine.unsupported_counts_by_type().empty());
@@ -2168,12 +2170,14 @@ TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm
     REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
     spark_engine.start();
     mechanism->set_park_all_watches();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    // Declared AFTER engine so it runs BEFORE engine's destructor: a failed REQUIRE below
+    // must not leave watch() parked while engine.stop() waits on the workers.
     struct Release {
         FakeServiceMechanism* m;
         ~Release() { m->release_park_all(); }
     } release_guard{mechanism};
-
-    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
     engine.wire_spark_engine(&spark_engine, false,
                              [](const OutboxEntry&) { return SendResult::Sent; });
     REQUIRE(engine.start_local().has_value());
@@ -2187,17 +2191,23 @@ TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm
     // admitted arms is inside the fake at a time; the other two wait on that lock
     // while still holding their quota slot and reservation permit.
     REQUIRE(yuzu::test::spin_until([&] { return mechanism->parked_watch_count() == 1; }));
-    REQUIRE(yuzu::test::spin_until([&] { return rt->arms_retained() == 3; }));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->arms_parked() == 3; }));
     CHECK(mechanism->watch_call_count() == 1);
-    CHECK(rt->compensation_reservation_refused() >= 3);
+    CHECK(rt->compensation_reservation_refused() == 3);
+    CHECK(rt->arms_parked_total() == 3);
     CHECK(engine.spark_armed_rule_count() == 0);
 
     mechanism->release_park_all();
     REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == kRules; }));
     CHECK(mechanism->watch_call_count() == kRules);
     CHECK(mechanism->watching_count() == kRules);
-    CHECK(rt->arms_retained() == 0);
+    CHECK(rt->arms_parked() == 0);
     CHECK(engine.armed_guard_count() == 0);
+    // The rules stay armed: a maintenance tick (which also runs the claim-deadline
+    // expiry pass) must not re-expire or tear down anything.
+    engine.journal_maintenance_tick();
+    CHECK(engine.spark_armed_rule_count() == kRules);
+    CHECK(mechanism->watching_count() == kRules);
 
     engine.stop();
     spark_engine.stop();

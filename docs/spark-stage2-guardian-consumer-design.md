@@ -477,10 +477,13 @@ bookkeeping guards (a committed claim is a `rules_` entry, never a pending one).
 
 **Three distinct non-success outcomes, named once (PR-1 doc pass, 2026-09-08; an
 earlier version of this section used "expired" for two of them).** (1) **Admission
-rejection**: the executor refuses the operation synchronously (`CapacityExhausted`,
-`CeilingExhausted`, `AlreadyRunning`, `LaunchFailed`); no backend call was attempted.
-(2) **Queue-wait expiry**: a queued sibling's own wait ends before its key's in-flight
-claim resolves; it was never dispatched. (3) **Dispatched-operation timeout**: a
+rejection**: a TERMINAL synchronous refusal (`AlreadyRunning`, `LaunchFailed`,
+`Stopped`); no backend call was attempted. Since #5168 a CONGESTION refusal of a clean
+arm claim (`CapacityExhausted`, `CeilingExhausted`, or the compensating-disarm
+reservation pool exhausted) is not an outcome at all: the claim is parked (see the
+amendment below) until it is admitted or ends as (2). (2) **Queue-wait expiry**: a
+queued sibling's, or a parked arm's, own wait ends before it is dispatched - its
+claim deadline elapses; it was never dispatched. (3) **Dispatched-operation timeout**: a
 dispatched operation has not returned by its deadline, location unknown - it may be
 inside the real OS call, or parked on `SparkEngine`'s per-type lock (`arm_impl()`
 takes `mech_ops_mu_by_type_` before `watch_guarded()`, `spark_engine.cpp`), and the
@@ -489,32 +492,48 @@ runtime cannot tell which. Only (3) is bounded by a deadline and marks the key
 attempt until the original worker's call completes (if ever) and clears the marker.
 The two stuck states, side by side so they are never conflated: **wedged** =
 dispatched, timed out, K-waivable (R5.3), recoverable when its late result arrives
-(ruling 14(b) below); **congestion-expired** = outcome (1) or (2), never dispatched,
+(ruling 14(b) below); **congestion-expired** = outcome (2), never dispatched,
 NOT K-waivable (ruling 14(a) below), recovers only on the next successful re-apply.
-**Amended for #5168:** a CONGESTION refusal at dispatch (the compensating-disarm
-reservation pool exhausted, or the executor's `CapacityExhausted` /
-`CeilingExhausted`) is no longer an immediate terminal outcome. A claim that is still
-clean (no outcome, not withdrawn, not abandoned, runtime not stopping) is handed back
-to `Queued`, holds no permit and no executor quota, and is redriven when a permit or
-quota slot frees (the completion callbacks' permit-release hook) or by the convergence
-scheduler's `redrive_retained_arms()` backstop. It stays bounded by its own claim
-deadline, so a retained arm that is never admitted ends as congestion-expired, as
-above. A terminal refusal (`Stopped`, `AlreadyRunning`, `LaunchFailed`) and every
-dirty claim (the PR-5c Dispatching-window race shapes) keep the immediate-failure
-path unchanged. Before this amendment a pushed or cached policy with more rules of one
-I/O class than that class's reservation capacity (Service 3, File 4, Registry 3)
-left the surplus unenforced until a later push, including at pre-network boot.
 This
 per-key wedge marker is distinct from — and not wired to — the existing
 per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected to
 stay at 0); this design's wedge is the ordinary, K-bounded, non-alerting outcome
 of a single wedged key, not a mechanism-wide fault.
 
+**Amended for #5168 - a congestion refusal is PARKED, not failed.** A CONGESTION
+refusal at dispatch (the compensating-disarm reservation pool exhausted, or the
+executor's `CapacityExhausted` / `CeilingExhausted`) is no longer an immediate terminal
+outcome. A claim that is still clean (no outcome, not withdrawn, not abandoned, runtime
+not stopping) is handed back to `Queued` and marked parked; it holds no permit and no
+executor quota, and it never reaches backend `arm()` without first reserving its
+compensating-disarm permit, so the up-3 guarantee is unchanged. It is redriven (a) when
+a compensation permit frees (the permit-release hook in the arm-completion callbacks),
+(b) when a class's executor quota frees (the disarm-completion hook), (c) once
+immediately if an executor refusal raced a completion, and (d) by the convergence
+scheduler's `redrive_parked_arms()`, a last-resort sweep on the priority lane's ~5 s
+cadence. ("Parked" is deliberate: "retained" already names a disarm held after a
+refusal and a wedge held after a timeout.) The claim keeps its attach-time deadline,
+`cfg.backend_op_deadline` (5 s by default), and that deadline is NOT reset when the
+claim is redriven. A parked arm that is never admitted therefore ends as
+congestion-expired, exactly as before this amendment, but only after the deadline is
+observed by the maintenance pass that runs `expire_overdue_claims()` (the heartbeat
+tick), not at the 5 s mark itself. What changes is the size of the surplus that
+survives: with quota `q` and per-arm latency `t`, roughly `q` arms are admitted per `t`,
+so `N` same-class rules arm only if about `ceil(N/q) * t` fits inside the deadline;
+rules beyond that still end congestion-expired and recover on the next successful
+re-apply. Real `watch()` latency was not measured. A terminal refusal (`Stopped`,
+`AlreadyRunning`, `LaunchFailed`) and every dirty claim (the PR-5c Dispatching-window
+race shapes) keep the immediate-failure path unchanged. Before this amendment a pushed
+or cached policy with more rules of one I/O class than that class's reservation
+capacity (Service 3, File 4, Registry 3) had its surplus refused at dispatch, so those
+rules were not enforced until a later push, including at pre-network boot.
+
 **Resolved (ruling 14, 2026-09-08 - routed to Astra via `/codex opine`, then Fable as
 advisor, ruled by Dave; previously flagged open by round 7's adversarial review; closes
 #4148):** (a) **Congestion-only outcomes are EXCLUDED from K.** Neither a queued
-waiter's own expiry nor an admission-time `CapacityExhausted` (a push that never
-reached the per-key queue) is K-qualifying; only a dispatched-and-timed-out operation
+waiter's own expiry nor a congestion refusal at dispatch (since #5168 parked as a
+Queued head and redriven, ending as a queue-wait expiry if it is never admitted) is
+K-qualifying; only a dispatched-and-timed-out operation
 whose claim is still retained is. Both congestion outcomes therefore hold the
 acknowledgment, exactly as R5.3's "genuine refusal" list already did for "arm queue
 full" - the two sections now agree. Accepted cost, stated as a load consequence rather
@@ -557,7 +576,9 @@ stall can no longer K-waive healthy sibling keys, because admission congestion i
 K-qualifying; the consequence is instead that the affected generation's acknowledgment
 is HELD, with the server's 25 s `full_sync` retry re-applying the whole push until the
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
-(admission-expiry / admission-rejection / dispatched-timeout, R5.3), so an operator
+(admission-expiry / admission-rejection / dispatched-timeout, R5.3; since #5168 a
+congestion refusal surfaces as admission-expiry after being parked, and
+admission-rejection is the terminal refusals only), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
 the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 
@@ -628,14 +649,15 @@ default first action without first checking whether the target is transient or
 permanently dead**); a later policy change re-evaluates the rule but cannot by itself
 re-attempt the arm. A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
-admission rejection that is TERMINAL, such as `LaunchFailed`, where no call was
-attempted; a congestion rejection is retained and redriven per #5168 and holds the
-acknowledgment only while retained) or a
+admission rejection that is TERMINAL - `AlreadyRunning`, `LaunchFailed` or
+`Stopped` - where no call was attempted; a congestion rejection is parked and redriven
+per #5168, so it holds the acknowledgment while it is Pending and, if it is never
+admitted before its claim deadline, as congestion-expired) or a
 queue-wait expiry is a different case and holds the acknowledgment indefinitely - K
 only bounds the wedged case, never a live refusal and never a congestion-only
 outcome. **K is not a generation-wide liveness bound** (ruling 14(a)): a single wedged
 worker that exhausts its class quota pushes its siblings into non-K-qualifying
-`CapacityExhausted` (retained and redriven since #5168, congestion-expired at their
+`CapacityExhausted` (parked and redriven since #5168, congestion-expired at their
 claim deadline if never admitted), and those held rules keep the generation unacknowledged past the
 wedged key's own K; do not read K as a promise that every generation acknowledges
 within three re-applies. **Zero-accepted push:** a push whose every rule is refused at
@@ -1210,7 +1232,7 @@ including a rule whose guard failed to start — that rule is silently stranded 
 logged but not held against the generation. Spark's acknowledgment holds on a genuine
 refusal, and is K-bounded (never unconditional) on a wedged key only - a
 congestion-expired or terminally admission-rejected rule holds it (ruling 14(a);
-a congestion refusal that is still retained under #5168 is Pending, and holds it the same way). This is a
+a congestion refusal that is still parked under #5168 is Pending, and holds it the same way). This is a
 deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
 oversight to reconcile — spark's stricter acknowledgment is the point of this design,
 and legacy's asymmetry pre-dates it and is out of scope to change here.

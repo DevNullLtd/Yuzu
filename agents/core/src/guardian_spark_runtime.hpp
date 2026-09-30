@@ -251,8 +251,8 @@ private:
 };
 
 /// rung 9c PR-5b hardening (#4221, same cpp-safety adjudication as CompensationPermit
-/// above): move-only RAII guard for the disarm_retained_ live-lifecycle count (see
-/// GuardianSparkRuntime::disarm_retained()'s own doc comment). The target counter is
+/// above): move-only RAII guard for the disarm_parked_ live-lifecycle count (see
+/// GuardianSparkRuntime::disarm_parked()'s own doc comment). The target counter is
 /// already std::atomic<std::uint64_t>, so - same reasoning as CompensationPermit -
 /// the destructor is unconditionally safe to run off-lock, giving a structural
 /// backstop against a future terminal-removal path that forgets to release it.
@@ -643,8 +643,8 @@ public:
     /// locked(). A repeated refusal on the SAME already-retained claim
     /// (KeyClaim::retained_guard's own engaged check in mark_retained_locked())
     /// never inflates this past 1 for that claim. Lock-free read.
-    [[nodiscard]] std::uint64_t disarm_retained() const noexcept {
-        return disarm_retained_.load(std::memory_order_relaxed);
+    [[nodiscard]] std::uint64_t disarm_parked() const noexcept {
+        return disarm_parked_.load(std::memory_order_relaxed);
     }
     /// rung 9c R5.2: queued (never dispatched) claims dropped by begin_stop(), plus
     /// disarm claims the executor refused with Stopped. Lock-free.
@@ -653,7 +653,10 @@ public:
     }
     /// up-3 (#4221): an arm was refused admission because its compensating-disarm
     /// reservation pool was exhausted (compensation_reserved_count_ at capacity for
-    /// its IoClass) - the arm never dispatched, no backend call ran. Lock-free.
+    /// its IoClass) - the arm never dispatched, no backend call ran. Since #5168 a
+    /// clean claim is PARKED and redriven rather than failed, and this counts those
+    /// deferrals as well as the terminal refusals of dirty claims; arms_parked_total()
+    /// counts first parkings from every cause. Lock-free.
     [[nodiscard]] std::uint64_t compensation_reservation_refused() const noexcept {
         return compensation_reservation_refused_.load(std::memory_order_relaxed);
     }
@@ -743,7 +746,7 @@ public:
     /// arm or disarm the executor refuses outright - AlreadyRunning (the (class, key)
     /// single-flight ticket is still held) or CapacityExhausted (the per-class quota is
     /// full) - is counted NOWHERE at this surface (rung 9c R5.2: a refused DISARM is
-    /// now retained + counted by disarm_retained(), but the executor-side breakdown
+    /// now retained + counted by disarm_parked(), but the executor-side breakdown
     /// still is not). A concurrency test that reconciles
     /// "every id armed" against "every id disarmed" therefore cannot distinguish a
     /// genuinely leaked subscription from a disarm the executor simply declined to run:
@@ -753,7 +756,7 @@ public:
     ///
     /// TEST-ONLY ON PURPOSE, and the production gap is real and SEPARATE: the runtime
     /// still has no egress for these counters; a refused disarm is retained rather than
-    /// dropped since rung 9c PR-1 (disarm_retained()), but the per-cause breakdown is
+    /// dropped since rung 9c PR-1 (disarm_parked()), but the per-cause breakdown is
     /// still invisible to an operator. Tracked as #3415
     /// (docs/spark-legacy-delta-registry.md) - do NOT read this accessor as having
     /// closed it.
@@ -1183,7 +1186,7 @@ private:
         // up-5 (#4221, rung 9c PR-5b): Disarm-claim-only. Engaged from this claim's
         // FIRST retention (an admission refusal or worker throw) until it is either
         // finally removed (success, Stopped-drop, DeadSubscription shortcut) or
-        // successfully redriven to completion - see disarm_retained()'s own doc
+        // successfully redriven to completion - see disarm_parked()'s own doc
         // comment on GuardianSparkRuntime for the full lifecycle contract. A
         // repeated refusal on the SAME already-retained claim must never engage a
         // second RetainedGuard (mark_retained_locked()'s own idempotency check on
@@ -1195,16 +1198,17 @@ private:
         // #5168: Arm-claim-only. True while this claim is the Queued head of its key
         // BECAUSE dispatch_arm_off_lock() met a CONGESTION refusal (the compensating-
         // disarm reservation pool exhausted, or io_executor_ CapacityExhausted /
-        // CeilingExhausted) rather than a terminal one - see retain_congested_arm_
-        // locked(). Holds NO permit and NO executor quota while set. Cleared the
-        // moment the claim is next set Dispatching (try_dispatch_head_locked /
-        // take_retained_arm_locked); a stale true on a claim already removed from
-        // claims_ is harmless because every reader re-validates the claim is still
-        // its key's Queued head. `arm_retain_count` is the number of times it has
-        // been retained, so a re-refused drained claim is put back at the FRONT of its
-        // class's waiter queue (FIFO fairness) rather than the back.
-        bool arm_retained{false};
-        std::uint32_t arm_retain_count{0};
+        // CeilingExhausted) rather than a terminal one - see park_congested_arm_
+        // locked(). "Parked" (not "retained") on purpose: retained already names a
+        // disarm held after a refusal and a wedge held after a timeout. Holds NO permit
+        // and NO executor quota while set. Cleared the moment the claim is next set
+        // Dispatching (try_dispatch_head_locked / take_parked_arm_locked); a stale true
+        // on a claim already removed from claims_ is harmless because every reader
+        // re-validates the claim is still its key's Queued head. `arm_park_count` is
+        // the number of times it has been parked, so a re-refused claim goes back to
+        // the FRONT of its class's waiter queue (FIFO fairness) rather than the back.
+        bool arm_parked{false};
+        std::uint32_t arm_park_count{0};
     };
     struct KeyClaimQueue {
         std::deque<std::shared_ptr<KeyClaim>> fifo; ///< front() = the current claim
@@ -1513,29 +1517,37 @@ public:
     /// claim is picked up again on the next call).
     std::size_t redrive_retained_disarms();
 
-    /// #5168: bounded, on-demand pass for Arm claims retained after a CONGESTION
-    /// refusal (see retain_congested_arm_locked). Dispatches, off-lock, as many
-    /// retained arms per I/O class as that class's compensating-disarm reservation
-    /// pool has free permits for; each is dispatched through dispatch_arm_off_lock
-    /// exactly like any other arm, which re-retains it if still refused. This is the
-    /// correctness BACKSTOP (ConvergenceScheduler calls it from its ~5 s priority
-    /// lane); the prompt path is the permit-release hook in on_arm_complete /
-    /// finalize_arm_compensation / on_disarm_complete. Safe at any cadence and from
-    /// any thread that holds neither runtime lock. Returns the number of arms this
-    /// call attempted to dispatch.
-    std::size_t redrive_retained_arms();
+    /// #5168: bounded, on-demand pass for Arm claims PARKED after a CONGESTION refusal
+    /// (see park_congested_arm_locked). First adopts any clean Queued arm head that is
+    /// parked nowhere (a follower left behind by an erased parked head, a failed deque
+    /// push, a redrive that threw), then dispatches, off-lock and one claim at a time,
+    /// up to one class-capacity's worth of parked arms per class. Each goes through
+    /// dispatch_arm_off_lock like any other arm, which re-parks it if still refused
+    /// (ending that class's pass). This is the last-resort sweep, NOT the prompt path:
+    /// the prompt path is the permit-release hook in on_arm_complete /
+    /// finalize_arm_compensation / on_disarm_complete and the one-shot immediate retry
+    /// in dispatch_arm_off_lock. ConvergenceScheduler calls it from its priority lane
+    /// (~5 s, with jitter), which is NOT shorter than cfg_.backend_op_deadline (5 s
+    /// default), so an arm that only this sweep could rescue may reach its deadline
+    /// first and end CongestionExpired (counted). Safe at any cadence and from any
+    /// thread that holds neither runtime lock. Returns the number of arms this call
+    /// attempted to dispatch.
+    std::size_t redrive_parked_arms();
 
-    /// #5168: Arm claims currently retained after a congestion refusal (Queued
-    /// head, arm_retained set, no outcome). A live gauge, computed under
-    /// registry_mu_ by scanning claims_ - diagnostic/test use, not a hot-path read.
-    [[nodiscard]] std::size_t arms_retained() const;
-    /// #5168: monotonic count of first retentions (a claim re-refused after a
+    /// #5168: Arm claims currently parked after a congestion refusal (Queued head,
+    /// arm_parked set, no outcome). A live gauge, computed under registry_mu_ by
+    /// scanning claims_ - diagnostic/test use, not a hot-path read.
+    [[nodiscard]] std::size_t arms_parked() const;
+    /// #5168 test seam: total entries across the per-class waiter deques (live and
+    /// stale), to pin that they stay bounded.
+    [[nodiscard]] std::size_t parked_arm_waiter_depth_for_test() const;
+    /// #5168: monotonic count of first parkings (a claim re-refused after a
     /// redrive is not counted again). Lock-free.
-    [[nodiscard]] std::uint64_t arms_retained_total() const noexcept {
-        return arms_retained_total_.load(std::memory_order_relaxed);
+    [[nodiscard]] std::uint64_t arms_parked_total() const noexcept {
+        return arms_parked_total_.load(std::memory_order_relaxed);
     }
-    /// #5168: monotonic count of retained-arm dispatch attempts made by
-    /// redrive_retained_arms() and the permit-release hook. Lock-free.
+    /// #5168: monotonic count of parked-arm dispatch attempts made by
+    /// redrive_parked_arms() and the permit-release / quota-release hooks. Lock-free.
     [[nodiscard]] std::uint64_t arm_redrives() const noexcept {
         return arm_redrives_.load(std::memory_order_relaxed);
     }
@@ -1685,7 +1697,7 @@ private:
     /// here). This function only handles SYNCHRONOUS admission: an executor
     /// ADMISSION refusal (capacity, key, ceiling, launch, or a throw building the
     /// call) does NOT drop the claim - it is RETAINED at the head, counted
-    /// (disarm_retained_), and re-driven by the next same-key event (an attach on
+    /// (disarm_parked_), and re-driven by the next same-key event (an attach on
     /// the key, which then queues its own arm behind it) or by
     /// redrive_retained_disarms(); only Stopped drops it, counted, via
     /// fail_all_claims_locked. No-op if the claim is no longer the Queued head
@@ -1711,24 +1723,40 @@ private:
     /// dispatch_arm_off_lock() just had refused for CONGESTION (reservation pool
     /// exhausted, or executor CapacityExhausted / CeilingExhausted). If the claim is
     /// still CLEAN (no outcome, no commit exception, not withdrawn, not abandoned,
-    /// runtime not stopping) hand it back to Queued, mark it arm_retained and queue a
-    /// weak reference on its class's waiter deque; returns true. A dirty claim (the
+    /// runtime not stopping) hand it back to Queued, mark it arm_parked, compact its
+    /// class's waiter deque (dead/stale entries and any earlier entry for this claim
+    /// are erased) and queue a weak reference on it; returns true. A dirty claim (the
     /// PR-5c Dispatching-window race shapes) returns false so the caller takes its
     /// unchanged terminal-fail path. Never throws: a failed deque push is counted in
-    /// claim_drain_failures_ and the claim stays Queued (bounded by its deadline).
-    [[nodiscard]] bool retain_congested_arm_locked(const std::shared_ptr<KeyClaim>& claim) noexcept;
-    /// #5168, registry_mu_ held. Pop the oldest still-valid retained arm of class `c`
+    /// claim_drain_failures_ and the claim stays a Queued head that
+    /// adopt_undriven_arm_head_locked() re-parks on the next redrive pass.
+    [[nodiscard]] bool park_congested_arm_locked(const std::shared_ptr<KeyClaim>& claim) noexcept;
+    /// #5168, registry_mu_ held. A waiter-deque entry is valid iff its claim is alive,
+    /// arm_parked, Queued, has no outcome/commit exception, is neither withdrawn nor
+    /// abandoned, and is still the front of its key's fifo.
+    [[nodiscard]] bool parked_arm_entry_valid_locked(const std::shared_ptr<KeyClaim>& c) const noexcept;
+    /// #5168, registry_mu_ held. If `entry`'s front is a clean Queued Arm claim that is
+    /// not parked, park it: such a head has no dispatcher (heads are flipped to
+    /// Dispatching under the lock that queues them), so it is a follower left behind
+    /// by an erased parked head, a failed deque push, or a redrive that threw.
+    void adopt_undriven_arm_head_locked(KeyClaimQueue& entry) noexcept;
+    /// #5168, registry_mu_ held. Pop the oldest still-valid parked arm of class `c`
     /// IF the reservation pool would still have a free permit after `reserved_extra`
     /// more permits are taken (a same-key refill about to dispatch reserves one).
-    /// Validates each candidate is still its key's Queued clean head; stale entries
-    /// are dropped. The returned claim is already flipped to Dispatching for the
-    /// caller to dispatch off-lock. Never throws.
-    [[nodiscard]] std::shared_ptr<KeyClaim> take_retained_arm_locked(IoClass c,
-                                                                      int reserved_extra) noexcept;
+    /// Stale entries at the front are dropped BEFORE the capacity check, so a full pool
+    /// cannot pin dead entries. The returned claim is already flipped to Dispatching
+    /// for the caller to dispatch off-lock. Never throws.
+    [[nodiscard]] std::shared_ptr<KeyClaim> take_parked_arm_locked(IoClass c,
+                                                                   int reserved_extra) noexcept;
+    /// #5168, registry_mu_ held. take_parked_arm_locked for the class whose permit or
+    /// quota just freed, then for the other classes (a CeilingExhausted refusal is
+    /// global, so any worker finishing may admit a parked arm of another class).
+    [[nodiscard]] std::shared_ptr<KeyClaim>
+    take_parked_arm_after_release_locked(IoClass freed, int reserved_extra) noexcept;
     /// #5168, registry_mu_ held: release `claim`'s compensation permit and, since a
-    /// permit just freed, pick a retained arm of that class to dispatch off-lock into
-    /// `class_refill` (left untouched if already set). `refill` is the same-key refill
-    /// the caller is about to dispatch, if any.
+    /// permit just freed, pick a parked arm to dispatch off-lock into `class_refill`
+    /// (left untouched if already set). `refill` is the same-key refill the caller is
+    /// about to dispatch, if any.
     void release_compensation_and_drain_locked(KeyClaim& claim,
                                                const std::shared_ptr<KeyClaim>& refill,
                                                std::shared_ptr<KeyClaim>& class_refill) noexcept;
@@ -2079,7 +2107,7 @@ private:
     // kMaxAliveIoWorkers exactly (10 + 10 == 20) - the compensation population can
     // never itself become the thing that drives alive-worker count past the existing
     // ceiling.
-    // #5168: exhaustion of this pool RETAINS a clean arm (Queued, arm_retained,
+    // #5168: exhaustion of this pool RETAINS a clean arm (Queued, arm_parked,
     // redriven when a permit frees) instead of failing it - the pool is exhausted
     // routinely at a boot/full_sync walk of more same-class rules than its capacity,
     // because a permit is released at publish, after the executor has already freed
@@ -2140,15 +2168,15 @@ private:
     /// up-5 (#4221, rung 9c PR-5b): registry_mu_ held. First retention of `claim`
     /// (an admission refusal or worker throw) - idempotent: a claim already marked
     /// retained does not engage a second RetainedGuard (and so does not increment
-    /// disarm_retained_ a second time) on a repeated refusal. Callers keep their
+    /// disarm_parked_ a second time) on a repeated refusal. Callers keep their
     /// own `++claim->admission_rejections` (unconditional attempt history,
     /// unchanged shape) - this touches ONLY the lifecycle count. Disarm claims
     /// only, but harmless (a no-op guard) if ever called on anything else.
     void mark_retained_locked(KeyClaim& claim) noexcept {
         if (claim.retained_guard)
             return;
-        disarm_retained_.fetch_add(1, std::memory_order_relaxed);
-        claim.retained_guard.emplace(&disarm_retained_);
+        disarm_parked_.fetch_add(1, std::memory_order_relaxed);
+        claim.retained_guard.emplace(&disarm_parked_);
     }
     /// Gate 8 re-review (this governance run, unhappy-path UP-8): registry_mu_ IS
     /// required here, same correction as release_compensation_locked() above -
@@ -2158,7 +2186,7 @@ private:
     /// locality. Idempotent: a no-op if `claim` is not currently counted as
     /// retained. Call at EVERY terminal removal of a Disarm claim (successful
     /// completion, Stopped-drop, DeadSubscription shortcut) - never decrement
-    /// disarm_retained_ directly.
+    /// disarm_parked_ directly.
     void clear_retained_locked(KeyClaim& claim) noexcept {
         claim.retained_guard.reset();
     }
@@ -2206,17 +2234,20 @@ private:
     /// capacity check atomic with the claim-identity recheck it's paired with.
     std::array<std::atomic<int>, kIoClassCount> compensation_reserved_count_{};
     /// up-3: #4221's own criterion text ("the fallback is deadline-bounded and
-    /// counted, and a ceiling hit is surfaced") - reservation-exhaustion refusals and
+    /// counted, and a ceiling hit is surfaced") - reservation-exhaustion refusals (since
+    /// #5168 also the deferrals of parked arms) and
     /// compensation-deadline elapses, counted separately from every pre-existing
     /// counter. Fleet-visible egress is out of scope here; rides #3415's already-open
     /// counter-egress scope like every other internal-only counter in this file.
     std::atomic<std::uint64_t> compensation_reservation_refused_{0};
-    /// #5168: per-class FIFO of arms retained after a congestion refusal
+    /// #5168: per-class FIFO of arms parked after a congestion refusal
     /// (registry_mu_-guarded). Weak: the claim's lifetime is owned by claims_, so a
-    /// terminal removal never needs to touch this; take_retained_arm_locked drops
-    /// dead/stale entries on pop. Cleared by begin_stop().
-    std::array<std::deque<std::weak_ptr<KeyClaim>>, kIoClassCount> retained_arm_waiters_;
-    std::atomic<std::uint64_t> arms_retained_total_{0};
+    /// terminal removal never needs to touch this. Dead and stale entries are dropped
+    /// at the front by take_parked_arm_locked and compacted away on every push by
+    /// park_congested_arm_locked, so the deque is bounded by the number of live parked
+    /// claims. Cleared by begin_stop().
+    std::array<std::deque<std::weak_ptr<KeyClaim>>, kIoClassCount> parked_arm_waiters_;
+    std::atomic<std::uint64_t> arms_parked_total_{0};
     std::atomic<std::uint64_t> arm_redrives_{0};
     std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
     /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant refused immediately
@@ -2233,7 +2264,7 @@ private:
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
     std::atomic<std::uint64_t> backend_op_late_arms_{0};  ///< #3816/R5.2: late-succeeding arm disarmed by the drain
-    std::atomic<std::uint64_t> disarm_retained_{0};       ///< R5.2: disarm claims retained after an admission refusal
+    std::atomic<std::uint64_t> disarm_parked_{0};       ///< R5.2: disarm claims retained after an admission refusal
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
