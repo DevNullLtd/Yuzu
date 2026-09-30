@@ -11,13 +11,13 @@
  */
 #pragma once
 
-#include <yuzu/agent/updater.hpp>
-
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <thread>
 #include <utility>
+
+#include <yuzu/agent/updater.hpp>
 
 namespace yuzu::agent {
 

@@ -10,10 +10,10 @@
  */
 #pragma once
 
-#include <grpcpp/client_context.h>
-
 #include <atomic>
 #include <mutex>
+
+#include <grpcpp/client_context.h>
 
 namespace yuzu::agent {
 

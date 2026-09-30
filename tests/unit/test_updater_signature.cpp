@@ -515,6 +515,51 @@ TEST_CASE("CtxSlot reports a stop that landed before publish", "[updater][stop][
     CHECK_FALSE(s2.stop_seen());
 }
 
+// The predicate must run AFTER the publish and UNDER the mutex: that ordering is what makes
+// "canceller saw the slot, or the predicate sees the flag" hold. Observe both from inside the
+// predicate. std::mutex::try_lock on the holding thread is undefined, so a helper thread
+// probes it while the predicate waits (bounded) for the result.
+TEST_CASE("CtxSlot evaluates the predicate after publishing and under the mutex",
+          "[updater][stop][2182]") {
+    std::mutex mu;
+    std::atomic<grpc::ClientContext*> slot{nullptr};
+    grpc::ClientContext ctx;
+    std::atomic<bool> in_predicate{false};
+    std::atomic<bool> probe_done{false};
+    std::atomic<bool> probe_got_lock{false};
+    std::atomic<bool> published_in_predicate{false};
+
+    std::thread prober([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!in_predicate.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        if (in_predicate.load() && mu.try_lock()) {
+            probe_got_lock = true;
+            mu.unlock();
+        }
+        probe_done = true;
+    });
+
+    {
+        yuzu::agent::CtxSlot s{mu, slot, &ctx, [&] {
+                                   published_in_predicate = (slot.load() == &ctx);
+                                   in_predicate = true;
+                                   const auto deadline =
+                                       std::chrono::steady_clock::now() + std::chrono::seconds{2};
+                                   while (!probe_done.load() &&
+                                          std::chrono::steady_clock::now() < deadline)
+                                       std::this_thread::yield();
+                                   return false;
+                               }};
+        CHECK_FALSE(s.stop_seen());
+    }
+    prober.join();
+    CHECK(in_predicate.load());
+    CHECK(probe_done.load());
+    CHECK(published_in_predicate.load());   // already published when the predicate runs
+    CHECK_FALSE(probe_got_lock.load());     // mutex held while the predicate runs
+}
+
 TEST_CASE("cancel_ctx_slot cancels an RPC published through CtxSlot", "[updater][stop][2182]") {
     BlockingCheckService svc;
     grpc::ServerBuilder builder;
