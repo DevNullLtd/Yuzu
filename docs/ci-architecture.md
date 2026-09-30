@@ -405,11 +405,17 @@ than the tag under test (#5150). The other jobs check the following:
   round-trips, and no service has restarted.
 - **install-deb / install-rpm**: for each of server, agent and gateway, exactly
   one package is in the release. It installs, ships its systemd unit, and
-  removes cleanly. It must also run: `--version` for server and agent, and for
-  the gateway the OTP release boots and answers `ping`. The legs are
-  ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and fedora:42 and
-  rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc or libstdc++ is
-  older than the build's, the job fails and names the glibc floor (#5143). A
+  removes cleanly. It must also run: `--version` for server and agent. The
+  gateway is started the way its systemd unit starts it: as the unit's
+  `User=`, with its `Environment=` and its `EnvironmentFile=`
+  (`/etc/yuzu/gateway.env`, the distribution cookie). The `yuzu_gw`
+  application must be running within 30s, the node must still answer 10s
+  later, and `stop` must succeed. A bare `ping` is not enough: it answers
+  once Erlang distribution is up, even when the application refuses to
+  start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
+  fedora:42 and rockylinux:9 for .rpm (installed with `dnf`). If a leg's libc
+  or libstdc++ is older than the build's, the job fails and names the glibc
+  floor (#5143). A gateway whose crypto NIF cannot load is named as #5171. A
   missing package fails; it is not skipped (#5151).
 - **install-windows**: two install/uninstall passes. With `/NOTLS` the service
   must start and stay Running. With the default TLS posture the agent must
@@ -420,18 +426,23 @@ than the tag under test (#5150). The other jobs check the following:
   each `.deb` control `Version` equals the tag's Debian spelling
   (`0.14.0~rc3`). A mismatch fails. The ARM64 archive is checked only when the
   release ships one (#5135).
-- **security-scan**: Trivy scans the server and gateway images. It is
-  informational and does not fail the run.
+- **security-scan**: Trivy scans the server and gateway images. Its findings
+  are informational and do not fail the run, but an image that cannot be
+  pulled fails the job.
 - **soak-test**: ten minutes on the stack. Every 30s it checks that all four
   services are running with 0 restarts, at least one agent is connected, and
   the gateway is ready. About once a minute it also round-trips a command. At
   the end the registration counters (`yuzu_agents_registered_total`,
-  `yuzu_gw_agents_connected_total`) must be unchanged: an agent that
-  reconnected between samples fails the soak. A failed metric fetch fails its
-  sample and is reported as a fetch failure, not as 0. Memory growth over 2x is
-  a warning only. Crash signatures in the server, agent and gateway logs fail
-  the job; for the gateway that includes OTP crash and supervisor reports.
-  Postgres logs are not checked.
+  `yuzu_gw_agents_connected_total`, read once the gateway shows the agent's
+  stream) must be unchanged: an agent that reconnected between samples, or a
+  gateway that replayed registrations, fails the soak. A failed metric fetch
+  fails its sample and is reported as a fetch failure, not as 0. Memory
+  growth over 2x, measured from the first successful round-trip (after
+  warm-up), is a warning only. Crash signatures in the server, agent and
+  gateway logs fail the job. For the gateway that includes OTP process crashes
+  (`crasher: initial call`) and supervisor restarts (`Supervisor: ...
+  Context: child_terminated`), in the header-less format the reference
+  `sys.config` logger writes. Postgres logs are not checked.
 - **upgrade-test**: brings up the previous stable release and upgrades every
   service in place, keeping the Postgres volume, CA and agent data dir. The
   same agent must reconnect running the new version. All services must be
@@ -454,9 +465,18 @@ the run, it reads `NOT RUN`. `has-stack` separates "predates" (exit 3) from
 "could not reach GitHub" (exit 1), so an outage fails the upgrade job instead
 of reading as NOT TESTED.
 
-**Expected failures on old releases.** Artifacts from the v0.13.0 era fail the
-rpm install (#5142), the macOS install (#5144) and the Windows install
-(#5147, #1468). Those defects are fixed from 0.14.0-rc3 on.
+**Expected failures.** These reds are intended, not flakes.
+
+- Artifacts from the v0.13.0 era fail the rpm install (#5142), the macOS
+  install (#5144) and the Windows install (#5147, #1468). Those defects are
+  fixed from 0.14.0-rc3 on.
+- From 0.14.0-rc3 on, until the glibc/libstdc++ floor (#5143) is decided,
+  these legs stay red: install-deb on ubuntu:22.04 and debian:12, the
+  ubuntu:24.04 server (GLIBCXX_3.4.34), and install-rpm on rockylinux:9 (the
+  gateway's bundled ERTS needs GLIBC_2.38 too).
+- The gateway stays red on fedora:42 until #5171 is fixed: its bundled OTP
+  crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
+  same defect is waiting behind #5143 on rockylinux:9.
 
 ## Self-hosted runner topology
 
