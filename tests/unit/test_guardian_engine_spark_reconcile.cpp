@@ -204,6 +204,20 @@ public:
             gate_cv_.notify_all();
             gate_cv_.wait(gate_lk, [this] { return released_; });
         }
+        // #5168: park-ALL gate, unlike the one-shot hang above. Every watch() blocks
+        // here until release_park_all(), so a test can hold the Service class's whole
+        // I/O quota AND its compensating-disarm reservation exhausted at once and
+        // assert what the runtime does with the arms that cannot be admitted -
+        // deterministically, with no dependence on how fast a fake watch() returns.
+        {
+            std::unique_lock<std::mutex> gate_lk{gate_mu_};
+            if (park_all_) {
+                ++parked_watches_;
+                gate_cv_.notify_all();
+                gate_cv_.wait(gate_lk, [this] { return !park_all_; });
+                --parked_watches_;
+            }
+        }
         // #2818 pin: THROW rather than return std::unexpected, and do it AFTER the hang
         // gate. Both halves matter. `fail_next_watch_` is checked before the gate and
         // returns immediately, so it cannot produce the state that pin needs — a watch
@@ -294,6 +308,22 @@ public:
         return watched_;
     }
     int watch_call_count() const { return watch_calls_.load(std::memory_order_relaxed); }
+    /// #5168: every subsequent watch() parks until release_park_all().
+    void set_park_all_watches() {
+        std::lock_guard<std::mutex> gate_lk{gate_mu_};
+        park_all_ = true;
+    }
+    void release_park_all() {
+        {
+            std::lock_guard<std::mutex> gate_lk{gate_mu_};
+            park_all_ = false;
+        }
+        gate_cv_.notify_all();
+    }
+    int parked_watch_count() {
+        std::lock_guard<std::mutex> gate_lk{gate_mu_};
+        return parked_watches_;
+    }
 
 private:
     std::atomic<int> watch_calls_{0};
@@ -312,6 +342,8 @@ private:
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
     bool released_{false};
+    bool park_all_{false};      ///< #5168, guarded by gate_mu_
+    int parked_watches_{0};     ///< #5168, guarded by gate_mu_
 };
 
 // Service: the ONE type with a mechanism registered in this fixture -> Arm.
@@ -1996,8 +2028,7 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
             [&] {
                 engine.journal_maintenance_tick();
                 return engine.spark_armed_rule_count() == 5; // armed via spark BEFORE the restart
-            },
-            std::chrono::seconds(30)));
+            }));
         engine.stop();
         spark_engine.stop();
     }
@@ -2071,8 +2102,7 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     // rung 9c PR-2 Unit 6: start_local()'s boot re-arm is Accepted, not yet resolved,
     // when it returns - settle (generous bound, see the Phase 1 seeding block's own
     // comment on this same class of full-agent-suite load sensitivity).
-    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; },
-                                   std::chrono::seconds(30)));
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; }));
     CHECK(engine.spark_armed_rule_count() == 5);
     CHECK(engine.armed_guard_count() == 0);
     CHECK(engine.unsupported_counts_by_type().empty());
@@ -2085,6 +2115,89 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     }
     CHECK(std::string_view{yuzu::agent::guardian_backend_label(yuzu::agent::guardian_backend_from_state(
               /*prefer_spark=*/true, engine.spark_availability()))} == "spark");
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("#5168: boot re-arm of more Service rules than the compensating-disarm reservation "
+          "holds arms every rule - the surplus is retained and redriven, never left unenforced",
+          "[spark][guardian][reconcile][boot]") {
+    // Service reservation capacity == GuardianIoExecutor::Config{}.service_quota == 3.
+    // Before #5168 the 4th+ rule of a cached policy was REFUSED synchronously at boot
+    // ("compensating-disarm reservation exhausted") and stayed unenforced until the
+    // next policy push. The park-all gate holds the first three arms in watch(), so
+    // the pool is deterministically exhausted while the remaining three are attached.
+    constexpr int kRules = 6;
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Retain; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        for (int i = 0; i < kRules; ++i)
+            *p.add_rules() = make_service_rule("r" + std::to_string(i), true,
+                                               "Svc" + std::to_string(i));
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine.journal_maintenance_tick();
+            return engine.spark_armed_rule_count() == kRules;
+        }));
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    auto* mechanism = mech.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    mechanism->set_park_all_watches();
+    struct Release {
+        FakeServiceMechanism* m;
+        ~Release() { m->release_park_all(); }
+    } release_guard{mechanism};
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.start_local().has_value());
+    REQUIRE(engine.rule_count() == kRules);
+
+    auto* rt = engine.spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    // Three arms hold the whole Service quota and reservation; the other three are
+    // retained (not failed): nothing armed yet, nothing left unenforced-for-good.
+    // watch() is per-type-serialised (spark_mechanism.hpp), so only ONE of the three
+    // admitted arms is inside the fake at a time; the other two wait on that lock
+    // while still holding their quota slot and reservation permit.
+    REQUIRE(yuzu::test::spin_until([&] { return mechanism->parked_watch_count() == 1; }));
+    REQUIRE(yuzu::test::spin_until([&] { return rt->arms_retained() == 3; }));
+    CHECK(mechanism->watch_call_count() == 1);
+    CHECK(rt->compensation_reservation_refused() >= 3);
+    CHECK(engine.spark_armed_rule_count() == 0);
+
+    mechanism->release_park_all();
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == kRules; }));
+    CHECK(mechanism->watch_call_count() == kRules);
+    CHECK(mechanism->watching_count() == kRules);
+    CHECK(rt->arms_retained() == 0);
+    CHECK(engine.armed_guard_count() == 0);
 
     engine.stop();
     spark_engine.stop();

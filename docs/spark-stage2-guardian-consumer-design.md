@@ -491,6 +491,19 @@ The two stuck states, side by side so they are never conflated: **wedged** =
 dispatched, timed out, K-waivable (R5.3), recoverable when its late result arrives
 (ruling 14(b) below); **congestion-expired** = outcome (1) or (2), never dispatched,
 NOT K-waivable (ruling 14(a) below), recovers only on the next successful re-apply.
+**Amended for #5168:** a CONGESTION refusal at dispatch (the compensating-disarm
+reservation pool exhausted, or the executor's `CapacityExhausted` /
+`CeilingExhausted`) is no longer an immediate terminal outcome. A claim that is still
+clean (no outcome, not withdrawn, not abandoned, runtime not stopping) is handed back
+to `Queued`, holds no permit and no executor quota, and is redriven when a permit or
+quota slot frees (the completion callbacks' permit-release hook) or by the convergence
+scheduler's `redrive_retained_arms()` backstop. It stays bounded by its own claim
+deadline, so a retained arm that is never admitted ends as congestion-expired, as
+above. A terminal refusal (`Stopped`, `AlreadyRunning`, `LaunchFailed`) and every
+dirty claim (the PR-5c Dispatching-window race shapes) keep the immediate-failure
+path unchanged. Before this amendment a pushed or cached policy with more rules of one
+I/O class than that class's reservation capacity (Service 3, File 4, Registry 3)
+left the surplus unenforced until a later push, including at pre-network boot.
 This
 per-key wedge marker is distinct from — and not wired to — the existing
 per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected to
@@ -615,12 +628,15 @@ default first action without first checking whether the target is transient or
 permanently dead**); a later policy change re-evaluates the rule but cannot by itself
 re-attempt the arm. A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
-admission rejection such as `CapacityExhausted`, where no call was attempted) or a
+admission rejection that is TERMINAL, such as `LaunchFailed`, where no call was
+attempted; a congestion rejection is retained and redriven per #5168 and holds the
+acknowledgment only while retained) or a
 queue-wait expiry is a different case and holds the acknowledgment indefinitely - K
 only bounds the wedged case, never a live refusal and never a congestion-only
 outcome. **K is not a generation-wide liveness bound** (ruling 14(a)): a single wedged
 worker that exhausts its class quota pushes its siblings into non-K-qualifying
-`CapacityExhausted`, and those held rules keep the generation unacknowledged past the
+`CapacityExhausted` (retained and redriven since #5168, congestion-expired at their
+claim deadline if never admitted), and those held rules keep the generation unacknowledged past the
 wedged key's own K; do not read K as a promise that every generation acknowledges
 within three re-applies. **Zero-accepted push:** a push whose every rule is refused at
 admission has nothing pending and nothing armed; its generation does NOT advance
@@ -1193,7 +1209,8 @@ wait) is fixed in the same PR that adds this stamp.
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,
 logged but not held against the generation. Spark's acknowledgment holds on a genuine
 refusal, and is K-bounded (never unconditional) on a wedged key only - a
-congestion-expired or admission-rejected rule holds it (ruling 14(a)). This is a
+congestion-expired or terminally admission-rejected rule holds it (ruling 14(a);
+a congestion refusal that is still retained under #5168 is Pending, and holds it the same way). This is a
 deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
 oversight to reconcile — spark's stricter acknowledgment is the point of this design,
 and legacy's asymmetry pre-dates it and is out of scope to change here.

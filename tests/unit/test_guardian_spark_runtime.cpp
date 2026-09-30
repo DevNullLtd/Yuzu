@@ -8295,8 +8295,9 @@ TEST_CASE("rung 9c PR-2 Unit 4: begin_stop() while a compensating disarm is stil
 // (disarm_retained_ real lifecycle + convergence-lane redrive wiring).
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity, before "
-          "any backend arm runs - the accumulation-to-ceiling path is now unreachable",
+TEST_CASE("up-3 (#4221) + #5168: the compensating-disarm reservation defers at capacity, before "
+          "any backend arm runs - the accumulation-to-ceiling path stays unreachable and the "
+          "deferred arm is redriven the moment a permit frees",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -8307,6 +8308,16 @@ TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity
     constexpr int kCapacity = 4;
     std::vector<std::thread> threads;
     std::vector<std::expected<std::uint64_t, std::string>> results(static_cast<std::size_t>(kCapacity));
+    struct GateCleanup {
+        FakeBackend* backend;
+        std::vector<std::thread>* ts;
+        ~GateCleanup() {
+            backend->arm_park.open();
+            for (auto& t : *ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } gate_cleanup{b.get(), &threads};
     for (int i = 0; i < kCapacity; ++i) {
         threads.emplace_back([&, i] {
             const auto rid = "r" + std::to_string(i);
@@ -8318,25 +8329,207 @@ TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity
                                    std::chrono::seconds(10)));
 
     // A 5th, distinct-key File attach: capacity is fully reserved by the 4 parked
-    // arms above, so this must be refused BEFORE ever calling backend->arm().
-    const auto res5 = rt->attach_rule("r4", file_spec("/k4"), file_exists_rule("r4"), true);
-    REQUIRE_FALSE(res5.has_value());
-    CHECK(res5.error() == "compensating-disarm reservation exhausted");
+    // arms above, so it is refused reservation BEFORE ever calling backend->arm() -
+    // but (#5168) that is a CONGESTION refusal, so the claim is retained (Accepted,
+    // not Failed) instead of failed, and left for the next permit release to redrive.
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
+                                      file_exists_rule("r4"), true);
+    REQUIRE(res5.has_value());
+    CHECK(res5->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
     CHECK(rt->compensation_reservation_refused() == 1);
+    CHECK(rt->arms_retained() == 1);
+    CHECK(rt->arms_retained_total() == 1);
     CHECK(b->arm_entries.load() == kCapacity); // the 5th never entered arm()
     CHECK(rt->io_executor_stats_for_test().counters[0].rejected_ceiling == 0); // never got that far
 
-    b->arm_park.pulse(); // release all 4 parked arms
+    {
+        std::lock_guard lk(b->arm_park.mu);
+        b->arm_park.park_every = 0; // the redriven 5th arm must not park again
+    }
+    b->arm_park.pulse(); // release all 4 parked arms: their permits free, the 5th redrives
     for (auto& t : threads)
         t.join();
     for (int i = 0; i < kCapacity; ++i)
         CHECK(results[static_cast<std::size_t>(i)].has_value());
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed;
+        },
+        std::chrono::seconds(10)));
+    CHECK(b->arm_entries.load() == kCapacity + 1);
+    CHECK(rt->arms_retained() == 0);
+    CHECK(rt->arm_redrives() >= 1);
     CHECK(b->arm_park.watchdog_trips == 0);
-    b->arm_park.park_every = 0; // done parking - the 6th key below must arm normally
 
     // Capacity has recovered: a 6th distinct key now succeeds.
     const auto res6 = rt->attach_rule("r5", file_spec("/k5"), file_exists_rule("r5"), true);
     REQUIRE(res6.has_value());
+}
+
+TEST_CASE("#5168: a retained arm is dropped Stopped by begin_stop and never dispatches",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    b->arm_park.park_every = 1;
+    constexpr int kCapacity = 4;
+    std::vector<std::thread> threads;
+    struct GateCleanup {
+        FakeBackend* backend;
+        std::vector<std::thread>* ts;
+        ~GateCleanup() {
+            backend->arm_park.open();
+            for (auto& t : *ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } gate_cleanup{b.get(), &threads};
+    for (int i = 0; i < kCapacity; ++i) {
+        threads.emplace_back([&, i] {
+            const auto rid = "r" + std::to_string(i);
+            (void)rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true);
+        });
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return b->arm_entries.load() == kCapacity; },
+                                   std::chrono::seconds(10)));
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
+                                      file_exists_rule("r4"), true);
+    REQUIRE(res5.has_value());
+    REQUIRE(rt->arms_retained() == 1);
+
+    const auto stopped_before = rt->claims_dropped_at_stop();
+    rt->begin_stop();
+    CHECK(rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Stopped);
+    CHECK(rt->claims_dropped_at_stop() == stopped_before + 1);
+    CHECK(rt->arms_retained() == 0);
+    CHECK(rt->redrive_retained_arms() == 0);
+    CHECK(b->arm_entries.load() == kCapacity); // the retained arm never dispatched
+}
+
+TEST_CASE("#5168: detaching a rule whose arm is retained withdraws it and it is never redriven",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    b->arm_park.park_every = 1;
+    constexpr int kCapacity = 4;
+    std::vector<std::thread> threads;
+    struct GateCleanup {
+        FakeBackend* backend;
+        std::vector<std::thread>* ts;
+        ~GateCleanup() {
+            backend->arm_park.open();
+            for (auto& t : *ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } gate_cleanup{b.get(), &threads};
+    for (int i = 0; i < kCapacity; ++i) {
+        threads.emplace_back([&, i] {
+            const auto rid = "r" + std::to_string(i);
+            (void)rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true);
+        });
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return b->arm_entries.load() == kCapacity; },
+                                   std::chrono::seconds(10)));
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
+                                      file_exists_rule("r4"), true);
+    REQUIRE(res5.has_value());
+    REQUIRE(rt->arms_retained() == 1);
+
+    rt->detach_rule("r4");
+    CHECK(rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Withdrawn);
+    CHECK(rt->arms_retained() == 0);
+    {
+        std::lock_guard lk(b->arm_park.mu);
+        b->arm_park.park_every = 0;
+    }
+    b->arm_park.pulse(); // permits free: a stale waiter entry must not dispatch the withdrawn claim
+    for (auto& t : threads)
+        t.join();
+    CHECK(rt->redrive_retained_arms() == 0);
+    CHECK(b->arm_entries.load() == kCapacity);
+}
+
+TEST_CASE("#5168: a retained arm that outlives its claim deadline expires CongestionExpired "
+          "and is never redriven past expiry",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.backend_op_deadline = std::chrono::milliseconds{200};
+    auto rt = make_rt(r, b, cfg);
+    b->arm_park.park_every = 1;
+    constexpr int kCapacity = 4;
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->arm_park.open(); }
+    } gate_cleanup{b.get()};
+    for (int i = 0; i < kCapacity; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        const auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, rid,
+                                         file_spec("/k" + std::to_string(i)),
+                                         file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return b->arm_entries.load() == kCapacity; },
+                                   std::chrono::seconds(10)));
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
+                                      file_exists_rule("r4"), true);
+    REQUIRE(res5.has_value());
+    REQUIRE(rt->arms_retained() == 1);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    (void)rt->expire_overdue_claims();
+    CHECK(rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired);
+    CHECK(rt->arms_retained() == 0);
+    CHECK(rt->redrive_retained_arms() == 0);
+    CHECK(b->arm_entries.load() == kCapacity);
+}
+
+TEST_CASE("#5168: an arm refused for EXECUTOR capacity (not the reservation pool) is retained "
+          "and redriven when a disarm frees the class quota",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    constexpr int kQuota = 4; // File class: Config{}.file_quota
+    for (int i = 0; i < kQuota; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true));
+    }
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->disarm_park.open(); }
+    } gate_cleanup{b.get()};
+    b->disarm_park.park_every = 1; // every disarm parks, holding its File-class quota
+    for (int i = 0; i < kQuota; ++i)
+        rt->detach_rule("r" + std::to_string(i));
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarm_entries.load() == kQuota; },
+                                   std::chrono::seconds(10)));
+
+    // Reservation permits are free (the 4 arms published long ago) but the executor's
+    // File quota is fully held by the parked disarms: CapacityExhausted, retained.
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r9", file_spec("/k9"),
+                                      file_exists_rule("r9"), true);
+    REQUIRE(res5.has_value());
+    CHECK(res5->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->arms_retained() == 1);
+    CHECK(rt->compensation_reservation_refused() == 0); // not the reservation pool
+
+    {
+        std::lock_guard lk(b->disarm_park.mu);
+        b->disarm_park.park_every = 0;
+    }
+    b->disarm_park.pulse(); // disarms finish: the first to complete redrives the retained arm
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            (void)rt->redrive_retained_arms(); // backstop, in case the last disarm won the race
+            return rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed;
+        },
+        std::chrono::seconds(10)));
+    CHECK(rt->arms_retained() == 0);
 }
 
 TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous submission "
