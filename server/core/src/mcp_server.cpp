@@ -111,6 +111,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -12137,8 +12138,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     // the SAME domain evaluate_scope's Fleet path and every
                     // real dispatch already use (see REST's #4983 fix / the
                     // #4981 local-vs-presence precedent for why this matters).
-                    const std::vector<std::string> known = agent_registry->all_ids();
-                    const std::unordered_set<std::string> known_set(known.begin(), known.end());
+                    //
+                    // NICE (cpp-expert, #4983 fix round): `known` is never
+                    // read again after `known_set` is built, so move each
+                    // string in rather than copying it.
+                    std::vector<std::string> known = agent_registry->all_ids();
+                    const std::unordered_set<std::string> known_set(
+                        std::make_move_iterator(known.begin()),
+                        std::make_move_iterator(known.end()));
 
                     // #3564-style oracle safety (see GET /api/v1/devices/{id}'s
                     // identical rationale): a nonexistent id and a real-but-
@@ -12147,21 +12154,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     // submitted list, so citing which one(s) failed back to
                     // them is not a disclosure of someone else's device
                     // existence.
+                    //
+                    // NICE (cpp-expert, #4983 fix round): only the first
+                    // kMaxCitedBadIds are ever displayed (below) -- track the
+                    // total count separately instead of accumulating every
+                    // bad id into `bad_ids` when the caller's device_ids can
+                    // run to kMaxMembersPerSet (100000) entries.
+                    constexpr std::size_t kMaxCitedBadIds = 20;
                     std::vector<std::string> bad_ids;
+                    std::size_t bad_id_count = 0;
                     for (const auto& did : members) {
-                        if (!known_set.contains(did) || !authz::in_scope(gate.scope, did))
-                            bad_ids.push_back(did);
+                        if (!known_set.contains(did) || !authz::in_scope(gate.scope, did)) {
+                            ++bad_id_count;
+                            if (bad_ids.size() < kMaxCitedBadIds)
+                                bad_ids.push_back(did);
+                        }
                     }
-                    if (!bad_ids.empty()) {
-                        constexpr std::size_t kMaxCitedBadIds = 20;
+                    if (bad_id_count > 0) {
                         std::string cited;
-                        for (std::size_t i = 0; i < bad_ids.size() && i < kMaxCitedBadIds; ++i) {
+                        for (std::size_t i = 0; i < bad_ids.size(); ++i) {
                             if (i)
                                 cited += ", ";
                             cited += bad_ids[i];
                         }
-                        if (bad_ids.size() > kMaxCitedBadIds)
-                            cited += std::format(" (+{} more)", bad_ids.size() - kMaxCitedBadIds);
+                        if (bad_id_count > kMaxCitedBadIds)
+                            cited += std::format(" (+{} more)", bad_id_count - kMaxCitedBadIds);
                         // Audited on the same action/outcome as the parent_id
                         // shape-check guard above (governance #4307/#4734/
                         // #4983 round) -- the sibling denial a few lines above

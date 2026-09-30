@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <format>
+#include <iterator>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -352,8 +353,13 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 // fix (see RestApiV1::AllAgentIdsFn's doc comment).
                 // Presence-merged (AgentRegistry::all_ids()), NOT a
                 // local-only snapshot.
-                const std::vector<std::string> known = deps.all_agent_ids_fn();
-                const std::unordered_set<std::string> known_set(known.begin(), known.end());
+                //
+                // NICE (cpp-expert, #4983 fix round): `known` is never read
+                // again after `known_set` is built, so move each string in
+                // rather than copying it.
+                std::vector<std::string> known = deps.all_agent_ids_fn();
+                const std::unordered_set<std::string> known_set(
+                    std::make_move_iterator(known.begin()), std::make_move_iterator(known.end()));
 
                 // #3564-style oracle safety (see GET /api/v1/devices/{id}'s
                 // identical rationale): a nonexistent id and a real-but-out-
@@ -361,21 +367,31 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 // these ids are the CALLER'S OWN submitted list, so citing
                 // which one(s) failed back is not a disclosure of someone
                 // else's device existence.
+                //
+                // NICE (cpp-expert, #4983 fix round): only the first
+                // kMaxCitedBadIds are ever displayed (below) -- track the
+                // total count separately instead of accumulating every bad
+                // id into `bad_ids` when the caller's device_ids can run to
+                // kMaxMembersPerSet (100000) entries.
+                constexpr std::size_t kMaxCitedBadIds = 20;
                 std::vector<std::string> bad_ids;
+                std::size_t bad_id_count = 0;
                 for (const auto& mid : members) {
-                    if (!known_set.contains(mid) || !authz::in_scope(gate.scope, mid))
-                        bad_ids.push_back(mid);
+                    if (!known_set.contains(mid) || !authz::in_scope(gate.scope, mid)) {
+                        ++bad_id_count;
+                        if (bad_ids.size() < kMaxCitedBadIds)
+                            bad_ids.push_back(mid);
+                    }
                 }
-                if (!bad_ids.empty()) {
-                    constexpr std::size_t kMaxCitedBadIds = 20;
+                if (bad_id_count > 0) {
                     std::string cited;
-                    for (std::size_t i = 0; i < bad_ids.size() && i < kMaxCitedBadIds; ++i) {
+                    for (std::size_t i = 0; i < bad_ids.size(); ++i) {
                         if (i)
                             cited += ", ";
                         cited += bad_ids[i];
                     }
-                    if (bad_ids.size() > kMaxCitedBadIds)
-                        cited += std::format(" (+{} more)", bad_ids.size() - kMaxCitedBadIds);
+                    if (bad_id_count > kMaxCitedBadIds)
+                        cited += std::format(" (+{} more)", bad_id_count - kMaxCitedBadIds);
                     deps.audit_fn(req, "result_set.create", "denied", "ResultSet", "",
                                   "RESULT_SET_UNKNOWN_DEVICE_ID");
                     res.set_header(
