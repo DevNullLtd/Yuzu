@@ -63,8 +63,8 @@ check() {
       echo "::error::test_agent_ota_wiring_lexical: $name is no longer built with CtxSlot's predicate constructor (CtxSlot $name{ctx_mu_, $ctxm, &ctx, <stop predicate>}) (#2182)" >&2; rc=1
     fi
     # stop_seen() consulted after the declaration (order: declaration first).
-    if ! printf '%s' "$t" | grep -qE -- "CtxSlot $name ?\{.*$name\.stop_seen\(\)"; then
-      echo "::error::test_agent_ota_wiring_lexical: $name.stop_seen() is no longer consulted after publishing (#2182)" >&2; rc=1
+    if ! printf '%s' "$t" | grep -qE -- "CtxSlot $name ?\{.*if \($name\.stop_seen\(\)\) ?(break|return)"; then
+      echo "::error::test_agent_ota_wiring_lexical: $name.stop_seen() no longer gates a break/return after publishing (#2182)" >&2; rc=1
     fi
   done
 
