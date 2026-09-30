@@ -1717,7 +1717,9 @@ public:
                 // than left to justify a bound nobody measured.
                 // (governance: cpp-safety BLOCKING, unhappy-path UP-C11/C12, enterprise C1.)
                 ctx.set_deadline(std::chrono::system_clock::now() + kRegisterTimeout);
-                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx};
+                CtxSlot register_slot{ctx_mu_, register_ctx_, &ctx, [this] {
+                                          return stop_requested_.load(std::memory_order_acquire);
+                                      }};
 
                 // PUBLISH, THEN RE-CHECK. The loop tested stop_requested_ above, but a stop()
                 // landing in the window between that test and the publish above finds
@@ -1726,7 +1728,9 @@ public:
                 // SIGKILLs us mid-teardown. The window is a few instructions wide; the fix is one
                 // line, and it closes it structurally rather than by argument.
                 // (governance: security-guardian, cpp-safety — independently, this PR.)
-                if (stop_requested_.load(std::memory_order_acquire))
+                // The re-check is CtxSlot's predicate ctor (unit-tested, #2182): it evaluates
+                // stop_requested_ under ctx_mu_ right after publishing.
+                if (register_slot.stop_seen())
                     break;
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
@@ -2033,7 +2037,9 @@ public:
                 // context whose stream is already gone. That is safe — gRPC's ClientContext
                 // owns the underlying call ref, so TryCancel after the stream dies is a no-op,
                 // not a UAF — and `sub_ctx` outlives every moment it is published.
-                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx};
+                CtxSlot sub_slot{ctx_mu_, subscribe_ctx_, &sub_ctx, [this] {
+                                     return stop_requested_.load(std::memory_order_acquire);
+                                 }};
                 // PUBLISH-THEN-RE-CHECK, the register_slot pattern's SIBLING SITE. A stop()
                 // that ran to completion in the window between Register success and this
                 // publish — a WIDE window: CSR/TLS handling, Updater construction,
@@ -2049,7 +2055,7 @@ public:
                 // stream's own lifecycle as backstop. The original hand-split applied the
                 // re-check to register_slot only and orphaned this sibling.
                 // (governance gate round: cpp-safety BLOCKING, this branch.)
-                if (stop_requested_.load(std::memory_order_acquire))
+                if (sub_slot.stop_seen())
                     break;
 
                 std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
@@ -2223,7 +2229,20 @@ public:
                             // lock at all, so a teardown cancel could TryCancel this frame's
                             // `ctx` after it had been destroyed. Retracted under ctx_mu_ by the
                             // dtor, on the early `return std::nullopt` below too.
-                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx};
+                            // Teardown sets stop_requested_ / sync_stop_ BEFORE cancel_ctx(sync_ctx_),
+                            // so the predicate (evaluated under ctx_mu_ after publishing) either
+                            // sees the flag or the canceller saw the published slot. Without it a
+                            // stop between the sync thread's should_stop() poll and this publish
+                            // ran an un-cancelled RPC, bounded only by the 30s deadline. The
+                            // predicate captures `this` only (not the thread's should_stop), as the
+                            // sender may outlive that frame via the scheduler.
+                            CtxSlot sync_slot{ctx_mu_, sync_ctx_, &ctx, [this] {
+                                                  return stop_requested_.load(
+                                                             std::memory_order_acquire) ||
+                                                         sync_stop_.load(std::memory_order_acquire);
+                                              }};
+                            if (sync_slot.stop_seen())
+                                return std::nullopt;
                             pb::InventoryAck ack;
                             auto status = sync_stub->ReportInventory(&ctx, report, &ack);
                             if (!status.ok()) {
