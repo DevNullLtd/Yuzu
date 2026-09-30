@@ -2,7 +2,7 @@
 
 /// @file enrollment_token_rejection.hpp
 /// Wire-boundary collapse + audit/metric expansion contract for
-/// `AuthManager::consume_enrollment_token` rejections (W1.4 / #827).
+/// `AuthManager::consume_and_enroll` token rejections (W1.4 / #827; WS-6 6.2 folded the consume into the atomic consume-and-enroll).
 ///
 /// **Mirror of `device_token_rejection.hpp` (W1.3).** Same hard rule:
 /// every gRPC handler that maps an `EnrollmentTokenError` to a wire
@@ -30,9 +30,79 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include <grpcpp/support/status.h>
+
+#include <string>
 #include <string_view>
 
 namespace yuzu::server {
+
+/// Exact wire shape of an enrollment token: 64 lowercase hex characters (a
+/// 32-byte CSPRNG value through `AuthManager::bytes_to_hex`). THE single
+/// predicate for both Register and ProxyRegister (WS-6 6.2): a token that fails
+/// it cannot exist, so the handlers reject it WITHOUT touching the store — an
+/// unauthenticated caller must not be able to turn arbitrary junk into a Postgres
+/// write transaction each (pre-auth amplification). No negative cache: the check
+/// is O(64) and stateless. A shape-invalid token is answered EXACTLY like a
+/// well-formed token that matched nothing (`not_found` audit/metric class,
+/// the uniform public message) so the shape check is not an oracle.
+[[nodiscard]] inline bool enrollment_token_shape_valid(std::string_view token) noexcept {
+    if (token.size() != 64)
+        return false;
+    for (const char c : token) {
+        const bool digit = c >= '0' && c <= '9';
+        const bool lower_hex = c >= 'a' && c <= 'f';
+        if (!digit && !lower_hex)
+            return false;
+    }
+    return true;
+}
+
+/// Sanitize an AGENT-SUPPLIED descriptive string (hostname / os / arch /
+/// agent_version, and the "auto-approve:<rule>" attribution) before it reaches
+/// the enrollment store: drop embedded NUL bytes and other ASCII control
+/// characters (0x00-0x1F, 0x7F — `\n`/`\r` in particular could otherwise forge
+/// additional lines in a plain-string audit/log detail once these fields reach
+/// one) and truncate to `auth::kMaxEnrollmentTextLength` on a UTF-8
+/// code-point boundary. The store REJECTS out-of-bounds text
+/// (`StoreError::InvalidInput`); doing that at Register would turn a long or
+/// odd hostname into a permanent INVALID_ARGUMENT that strands an otherwise-
+/// legitimate agent forever. These fields are descriptive only (identity is
+/// `agent_id`, which keeps its own hard reject on the same control-character
+/// class — see `agent_id_ok` in auth_db.cpp — because `agent_id` also feeds a
+/// comma-joined bulk-audit-detail list, which no field here does today), so
+/// lossy sanitising is the safe direction. Shared by Register + ProxyRegister.
+[[nodiscard]] inline std::string sanitize_enrollment_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() < auth::kMaxEnrollmentTextLength ? s.size()
+                                                          : auth::kMaxEnrollmentTextLength);
+    for (const char c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        if (u > 0x1FU && u != 0x7FU)
+            out.push_back(c);
+    }
+    if (out.size() > auth::kMaxEnrollmentTextLength) {
+        std::size_t cut = auth::kMaxEnrollmentTextLength;
+        // Back off any UTF-8 continuation bytes (10xxxxxx) so we never split a
+        // multi-byte character.
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0U) == 0x80U)
+            --cut;
+        out.resize(cut);
+    }
+    return out;
+}
+
+/// gRPC status for a failed enrollment/pending store call (WS-6 6.2), shared by
+/// the direct Register and gateway ProxyRegister handlers. A store outage maps
+/// to UNAVAILABLE — NOT `accepted=false`/`reject_reason`, which the agent treats
+/// as a PERMANENT rejection (agent.cpp:1649-1657, #3401) — so the agent retries
+/// on its normal reconnect backoff. The PG failure detail stays server-side.
+/// Bad caller input (oversize / NUL / empty field) is INVALID_ARGUMENT.
+[[nodiscard]] inline grpc::Status enrollment_store_status(StoreError e) {
+    if (e == StoreError::InvalidInput)
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid enrollment request");
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE, "enrollment temporarily unavailable");
+}
 
 /// Public wire message — single string regardless of variant. The Register
 /// RPC's `reject_reason` field gets this value verbatim. Do not vary by

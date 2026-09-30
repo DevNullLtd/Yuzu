@@ -5462,6 +5462,10 @@ Do not conflate with the unrelated existing MCP tool `list_pending_approvals`, w
 
 **Confinement (ADR-0017):** unlike every other route in this section, each row here carries genuine per-agent identity (`agent_id` plus hostname/os/arch/agent_version), so this route gates on the admit-then-filter chokepoint (`AuthRoutes::require_fleet_read`), not a bare permission check. A holder of a management-group-scoped `Enrollment:Read` grant (rather than a global one) is admitted and gets the real visible-agent intersection — typically the empty list, since a pending (not-yet-approved) agent normally has no management-group membership yet, but this is a workflow expectation, not a data-model guarantee: an agent pre-assigned to a group before approval yields a non-empty, correctly-confined result instead. This closes a defect where such a grant was previously denied outright (403) instead of admitted with its correct, confined result — see `docs/auth-architecture.md`'s ADR-0017 migration list.
 
+Returns `503` if the Postgres enrollment store (`auth.pending_agents`) is degraded, rather than an empty list or a `200` — a degraded read is never laundered into "no pending agents" (WS-6 6.2).
+
+`DELETE /api/settings/pending-agents/{id}` (documented in `server-admin.md`'s [Settings API Reference](server-admin.md#settings-api-reference)) now returns `409` if the target row is no longer `pending` — removal only succeeds against a genuinely pending row; an `approved` or `denied` row is refused rather than silently reversed (WS-6 6.2 governance hardening).
+
 **Response:**
 
 ```json
@@ -6656,7 +6660,7 @@ A store-level read failure now answers `503 RESULT_SET_STORE_UNAVAILABLE` (fail-
 
 Create a result set directly from a pre-computed device-id list (e.g. an operator with a CSV of device ids). Synchronous — lands `materialized` immediately, no dispatch involved.
 
-**Permission:** Session-authenticated (owner-scoped).
+**Permission:** Session-authenticated (owner-scoped). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets) for what that does and doesn't mean. An MCP-tiered bearer token additionally passes through the same tier/approval belt its `create_result_set` MCP twin enforces (#5047) — this is the cross-transport parity check, not an RBAC grant.
 
 **Request body:**
 
@@ -6678,8 +6682,10 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
+| 503 | `RESULT_SET_TIER_POLICY_UNAVAILABLE` — the tier/approval check is misconfigured (server-side wiring fault, not a caller error; unreachable in a correctly-configured deployment) |
 
 #### `GET /api/v1/result-sets/{id}`
 
@@ -6701,7 +6707,7 @@ Fetch one result set by id.
 
 Delete a result set.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets). An MCP-tiered bearer additionally passes through the same tier/approval belt its `delete_result_set` MCP twin enforces (#5047); `Infrastructure:Delete` is approval-gated for the supervised tier on every transport except `/mcp/v1/` itself, so a supervised-tier bearer must use the MCP ticket-then-recall flow to delete — this REST route cannot approve one.
 
 **Response:** `{"data": {"deleted": true}, "meta": {"api_version": "v1"}}`
 
@@ -6710,9 +6716,11 @@ Delete a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Delete` — an MCP-tiered bearer whose tier disallows delete outright (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
+| 403 | Supervised-tier bearer, approval required — `"operation requires approval for this MCP tier on this transport"`, with a `remediation` pointing at the MCP ticket-then-recall flow (#5047) |
 | 404 | No such set, or not owned by the caller. Also returned if the delete itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `RESULT_SET_PINNED` — unpin the set before deleting it |
-| 503 | Result-set store unavailable (ownership lookup only) |
+| 503 | Result-set store unavailable (ownership lookup only), or `RESULT_SET_TIER_POLICY_UNAVAILABLE` (tier/approval check misconfigured; server-side wiring fault, unreachable in a correctly-configured deployment) |
 
 #### `GET /api/v1/result-sets/{id}/members`
 
@@ -6757,7 +6765,7 @@ Read a result set's ancestor chain (walks `parent_id` links up to the root).
 
 Pin (exempt from TTL expiry) or unpin a result set.
 
-**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+**Permission:** Session-authenticated (owner-scoped, `load_owned`). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets). An MCP-tiered bearer additionally passes through the same tier/approval belt its `pin_result_set`/`unpin_result_set` MCP twins enforce (#5047) — this is the cross-transport parity check, not an RBAC grant.
 
 **Response (200):** The updated `ResultSet` object (`pinned` flipped).
 
@@ -6766,9 +6774,10 @@ Pin (exempt from TTL expiry) or unpin a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
+| 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
 | 404 | No such set, or not owned by the caller. Also returned if the pin/unpin write itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `PIN_LIMIT` — owner is at the per-owner pin cap (pin only) |
-| 503 | Result-set store unavailable (ownership lookup only) |
+| 503 | Result-set store unavailable (ownership lookup only), or `RESULT_SET_TIER_POLICY_UNAVAILABLE` (tier/approval check misconfigured; server-side wiring fault, unreachable in a correctly-configured deployment) |
 
 ---
 

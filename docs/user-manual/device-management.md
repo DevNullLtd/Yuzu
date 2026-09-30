@@ -51,6 +51,18 @@ curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
   -b "$COOKIE"
 ```
 
+`DELETE` only succeeds against a row that is still `pending` — it returns `409` if the agent has
+already been approved or denied, refusing to silently reverse that admin decision (WS-6 6.2). A
+Tier 1 agent removed while genuinely pending simply re-enters the pending queue on its next
+reconnect attempt, same as if it had never been seen. Before this guard, removing an already-
+*approved* row (typically a Tier 2, token-enrolled agent) deleted the row backing its enrollment
+with no admin decision behind it and no audit trail — that specific gap is now closed, since an
+approved row can no longer be removed via this endpoint at all. There is no remaining asymmetry for
+the remove-then-reconnect case: a still-`pending` agent (Tier 1 or Tier 2, before it has presented a
+valid token) behaves identically either way, and a Tier 2 agent's token-based enrollment
+(`consume_and_enroll`) creates a fresh `approved` row on the next successful token presentation
+regardless of whether a prior pending row existed.
+
 ### Tier 2: Pre-Shared Enrollment Tokens
 
 For automated deployments, administrators generate **enrollment tokens** -- time-limited and use-limited secrets that agents present at registration for immediate enrollment without manual approval.
@@ -116,7 +128,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
