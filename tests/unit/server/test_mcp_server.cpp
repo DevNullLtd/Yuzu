@@ -30166,6 +30166,41 @@ TEST_CASE("MCP create_result_set: more than kMaxCitedBadIds=20 bad ids are "
     CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
 }
 
+// Fix 9 (NICE, #4983 fix round): pin the boundary the other direction --
+// exactly kResultSetDeviceIdMaxLen (256) bytes is a `>` comparator, not `>=`,
+// so this must succeed. Only the rejection side (the schema-consistency
+// table test above) was covered until now.
+TEST_CASE("MCP create_result_set: a device_ids entry of exactly 256 bytes is "
+          "accepted (#4983 Fix 9)",
+          "[pg][mcp][integration][result-sets][security][4983]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    const std::string boundary_id(256, 'a');
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    yuzu::agent::v1::AgentInfo info;
+    info.set_agent_id(boundary_id);
+    (void)registry.register_agent(info);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.agent_registry_for_test = &registry;
+    ts.start();
+
+    nlohmann::json req = {{"jsonrpc", "2.0"},
+                          {"method", "tools/call"},
+                          {"id", 9},
+                          {"params",
+                           {{"name", "create_result_set"},
+                            {"arguments", {{"name", "x"}, {"device_ids", {boundary_id}}}}}}};
+    auto res = ts.call(req.dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(body["result"]["structuredContent"]["device_count"] == 1);
+}
+
 TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-scoped tools "
           "(ServiceScopeClass::denied — matches REST's deny_fleet_wide_service_scoped)",
           "[mcp][integration][result-sets]") {

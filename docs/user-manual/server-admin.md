@@ -2545,7 +2545,7 @@ dashboard fragment) — a separate, additional new rejection path on all three s
 
 **Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
 result set by supplying `device_ids` directly. Checked against this repository's actual seed
-grants (`RbacStore::seed_defaults`), of the six built-in roles only **Administrator** and
+grants (`RbacStore::seed_defaults`), of the 7 seeded built-in roles only **Administrator** and
 **ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
 ApiTokenManager, and Reviewer do not**. A principal holding one of those five roles who could
 previously create a result set with `device_ids` (the RBAC-enabled default before this release

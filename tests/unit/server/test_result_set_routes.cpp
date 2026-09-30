@@ -869,6 +869,32 @@ TEST_CASE("result_set_routes: [pg] create: a device_ids entry over 256 bytes "
     CHECK(h.audits.back().detail == "reason=device_id_too_long");
 }
 
+// Fix 9 (NICE, #4983 fix round): pin the boundary the other direction --
+// exactly kResultSetDeviceIdMaxLen (256) bytes is a `>` comparator, not `>=`,
+// so this must succeed. Only the 257-byte-rejection side had a dedicated
+// test until now.
+TEST_CASE("result_set_routes: [pg] create: a device_ids entry of exactly 256 "
+          "bytes is accepted (#4983 Fix 9)",
+          "[pg][server][routes][result_set_routes][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_result_set_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    const std::string boundary_id(256, 'a');
+    h.all_agent_ids_override = {boundary_id};
+    h.wire();
+
+    auto r = h.sink.Post("/fragments/result-sets/create", "device_ids=" + boundary_id,
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->get_header_value("HX-Trigger") == "resultSetsChanged");
+    std::string next;
+    auto sets = w.store.list_by_owner("alice", "", 10, next);
+    REQUIRE(sets.size() == 1);
+    CHECK(sets[0].device_count == 1);
+}
+
 // Gate 3 SHOULD (quality-engineer + cpp-safety, both independently found,
 // #4983 fix round): REST's and MCP's twins of this create route both already
 // have a dedicated test pinning the kMaxCitedBadIds=20 "(+N more)" truncation

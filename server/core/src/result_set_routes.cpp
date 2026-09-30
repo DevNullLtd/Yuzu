@@ -290,6 +290,32 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
 
+            // Gate 4 NICE (#4983 fix round): bound the array size BEFORE the
+            // O(n) existence-check loop below, mirroring REST's/MCP's
+            // identical early reject (`rest_api_v1.cpp`/`mcp_server.cpp`,
+            // both right after building `members`). Defense-in-depth only --
+            // already bounded by the 4 MiB pre-routing body cap regardless,
+            // and `create_materialized` below enforces the same cap itself,
+            // so an oversized array was never actually persisted; this only
+            // moves the rejection earlier and matches REST/MCP's shape
+            // (including the absence of an audit call on this specific
+            // branch -- neither of those two twins audits it either).
+            if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                if (deps.metrics)
+                    deps.metrics->counter("yuzu_result_set_quota_rejected").increment();
+                res.set_header(
+                    "HX-Trigger",
+                    nlohmann::json{{"showToast",
+                                    {{"level", "error"},
+                                     {"message", to_string(ResultSetError::TooManyMembers)}}}}
+                        .dump());
+                std::string next;
+                auto sets = deps.store->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, ""),
+                                "text/html; charset=utf-8");
+                return;
+            }
+
             // #4983: full existence + scope check on a non-empty device_ids,
             // mirroring the identical fix on POST /api/v1/result-sets (REST)
             // and MCP create_result_set (same PR) -- this fragment's

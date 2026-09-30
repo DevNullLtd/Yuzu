@@ -3240,6 +3240,29 @@ TEST_CASE("POST /api/v1/result-sets: a device_ids entry over 256 bytes is "
     CHECK(h.audits.back().detail == "reason=device_id_too_long");
 }
 
+// Fix 9 (NICE, #4983 fix round): pin the boundary the other direction --
+// exactly kResultSetDeviceIdMaxLen (256) bytes is a `>` comparator, not `>=`,
+// so this must succeed. Only the truncation/257-byte-rejection side had a
+// dedicated test until now.
+TEST_CASE("POST /api/v1/result-sets: a device_ids entry of exactly 256 bytes "
+          "is accepted (#4983 Fix 9)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string boundary_id(256, 'a');
+    h.all_agent_ids_override = {boundary_id};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    nlohmann::json{{"name", "x"},
+                                  {"device_ids", nlohmann::json::array({boundary_id})}}
+                        .dump(),
+                    status);
+    CHECK(status == 201);
+    CHECK(j["data"]["device_count"] == 1);
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
