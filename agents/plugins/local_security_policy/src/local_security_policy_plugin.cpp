@@ -23,10 +23,22 @@
 
 namespace {
 
-// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md "Audit and review");
-// the wording is finalised from the Windows leg's rig-probe banner. Every leg names each
-// file it reads and, on Windows, the scratch file it stages and the sweep that removes it.
-//
+// Windows legs: rung 2 (secedit /export is an argv leaf, docs/agent-privilege-model.md "Audit and review").
+// Every leg names each file it reads and, on Windows, the scratch file it stages and the sweep
+// that removes it. The three actions share one export, so the mechanism text is one constant;
+// password_policy and lockout_policy also share their fallback text.
+constexpr const char* kWinSeceditMechanism =
+    "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
+    "into an agent.data_dir scratch file";
+constexpr const char* kWinKeyValueFallback =
+    "argv leaf parsed from the exported UTF-16LE INI: the local security database "
+    "(secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. "
+    "The export (the whole SECURITYPOLICY area) is staged as "
+    "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
+    "directory removed on return; each policy dispatch first sweeps such directories older than "
+    "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
+    "elevated, on a standalone host; see the Windows leg banner";
+
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "password_policy",
@@ -48,16 +60,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Measured on an UNMANAGED Mac: whether an MDM configuration-profile passcode payload "
          "surfaces here is unverified"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
-         "into an agent.data_dir scratch file",
-         "argv leaf parsed from the exported UTF-16LE INI: the local security database "
-         "(secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. "
-         "The export (the whole SECURITYPOLICY area) is staged as "
-         "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
-         "directory removed on return; each policy dispatch first sweeps such directories older than "
-         "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
-         "elevated, on a standalone host; see the Windows leg banner"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, kWinSeceditMechanism, kWinKeyValueFallback},
     },
     {
         /* .action      = */ "lockout_policy",
@@ -76,16 +79,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "Measured on an UNMANAGED Mac, so on a managed device policies|none must not be read as "
          "'no lockout enforced' -- profile-delivered policy is unverified here"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
-         "into an agent.data_dir scratch file",
-         "argv leaf parsed from the exported UTF-16LE INI: the local security database "
-         "(secedit /export without /mergedpolicy); domain-joined behaviour is unmeasured. "
-         "The export (the whole SECURITYPOLICY area) is staged as "
-         "agent.data_dir\\local_security_policy-{32 hex}\\policy.inf in an owner-only "
-         "directory removed on return; each policy dispatch first sweeps such directories older than "
-         "one hour, so a crash leaves one until a later dispatch. Measured only as LocalSystem, "
-         "elevated, on a standalone host; see the Windows leg banner"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, kWinSeceditMechanism, kWinKeyValueFallback},
     },
     {
         /* .action      = */ "audit_policy",
@@ -101,9 +95,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "absent by default on current macOS (only audit_control.example ships), reported as absent; "
          "a present file is root-readable only"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 2,
-         "secedit.exe (system directory via GetSystemDirectoryW) /export /areas SECURITYPOLICY "
-         "into an agent.data_dir scratch file",
+        {YUZU_SUPPORT_CONSTRAINED, 2, kWinSeceditMechanism,
          "the LEGACY [Event Audit] categories only. Where Advanced Audit Policy "
          "subcategories are in force -- the Windows 10/11 default and the norm under GPO -- "
          "these are NOT the effective audit state: a category reading none means the legacy "
@@ -202,7 +194,7 @@ public:
     }
 
 private:
-    std::string data_dir_; // unused in this PR; see init()'s comment
+    std::string data_dir_; // agent.data_dir; the Windows leg's scratch root
 };
 
 YUZU_PLUGIN_EXPORT(LocalSecurityPolicyPlugin)

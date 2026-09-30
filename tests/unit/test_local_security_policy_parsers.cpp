@@ -61,11 +61,9 @@ TEST_CASE("local_security_policy text helpers: trim and line splitting",
 }
 
 // ── secedit export helpers (UTF-16LE INI) ──────────────────────────────────────────
-// PLANNED for the Windows leg (PR4) -- these are pure, OS-independent parsing/comparison
-// primitives shipped ahead of their caller in this PR (local_security_policy_legs.hpp's
-// "WHEN THE SUDOERS ACTION LANDS" banner). Tested now, matching platform_security's own
-// tested decode_utf16le_bom precedent, so PR4 wires up already-verified logic rather than
-// untested code under deadline pressure (adversarial-review finding K2).
+// Pure, OS-independent parsing/comparison primitives the Windows leg wires up
+// (local_security_policy_win.cpp). Tested on every OS, matching platform_security's own
+// tested decode_utf16le_bom precedent.
 
 TEST_CASE("local_security_policy decode_utf16le_bom: BOM required, exact round-trip, "
           "malformed input is nullopt never a truncated guess",
@@ -443,8 +441,22 @@ TEST_CASE("local_security_policy Tally: the row cap reserves its own slot for th
     // A further row is dropped outright, not appended past the cap.
     t.row("password_policy|extra|v|src");
     CHECK(t.rows.size() == kMaxRows);
-    // The 7-field sudoers truncation-marker shape is PLANNED, follows as its own PR (the
-    // Sudoers action is out of scope for this PR's Tally -- see legs.hpp's banner).
+}
+
+TEST_CASE("local_security_policy Tally: the sudoers row cap emits its own 7-field marker",
+          "[local_security_policy][parsers][sudoers]") {
+    detail::Tally t;
+    t.marker_prefix = "sudoers";
+    t.marker_fields = 7;
+    for (std::size_t i = 0; i < kMaxRows; ++i)
+        t.row(format_sudoers_row("/etc/sudoers", {"user_spec", "u" + std::to_string(i), "-", "-", "-"}));
+    REQUIRE(t.rows.size() == kMaxRows);
+    // The marker keeps the action's own 7-field wire shape: a 4-field kv row here would
+    // break the column contract of every sudoers consumer.
+    CHECK(t.rows.back() == "sudoers|-|unreadable|-|-|-|row_cap");
+    CHECK(std::count(t.rows.back().begin(), t.rows.back().end(), '|') == 6);
+    CHECK(t.capped);
+    CHECK(t.acc.reason() == "row_cap");
 }
 
 
@@ -990,6 +1002,76 @@ TEST_CASE("local_security_policy collect_file_policy: sudoers.d name filtering a
     }
     CHECK(ignored == 2); // backup~ (trailing '~') and webadmins.rpmnew (a '.')
     CHECK(real == 1);
+}
+
+TEST_CASE("local_security_policy collect_file_policy: sudoers.d listing failure is a 7-field unreadable row",
+          "[local_security_policy][parsers][sudoers]") {
+    auto rd = reader_from({{"/etc/sudoers", "alice ALL = /bin/ls\n"}});
+    const auto dl = [](const std::string& path) -> DirList {
+        if (path == "/etc/sudoers.d") return {EACCES, {}, false};
+        return {};
+    };
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, dl);
+    // /etc/sudoers itself read fine, so a refused directory is CONSTRAINED, not PERMISSION_DENIED.
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("sudoers.d:permission_denied") != std::string::npos);
+    bool saw = false;
+    for (const auto& r : c.rows)
+        if (r == "sudoers|/etc/sudoers.d|unreadable|-|-|-|permission_denied") saw = true;
+    CHECK(saw); // never a failure without its row, never a 4-field fallback
+}
+
+TEST_CASE("local_security_policy collect_file_policy: a truncated sudoers.d listing is put on the wire",
+          "[local_security_policy][parsers][sudoers]") {
+    auto rd = reader_from({{"/etc/sudoers", "alice ALL = /bin/ls\n"},
+                           {"/etc/sudoers.d/readable", "bob ALL = /bin/cat\n"}});
+    const auto dl = [](const std::string& path) -> DirList {
+        if (path == "/etc/sudoers.d") return {0, {"readable"}, true};
+        return {};
+    };
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Sudoers, rd, dl);
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("sudoers.d:truncated") != std::string::npos);
+    bool saw_marker = false, saw_real = false;
+    for (const auto& r : c.rows) {
+        if (r == "sudoers|/etc/sudoers.d|unreadable|-|-|-|truncated") saw_marker = true;
+        if (r.rfind("sudoers|/etc/sudoers.d/readable|user_spec|", 0) == 0) saw_real = true;
+    }
+    CHECK(saw_marker);
+    CHECK(saw_real); // the names that WERE listed are still read
+}
+
+// sudo's lexer: an escaped separator inside a command never splits the clause, and a `#`
+// comment -- glued to the previous word or not -- ends the line even when it ends in a
+// backslash, so the next physical line is its own statement. Checked against sudo 1.9.16.
+TEST_CASE("local_security_policy sudoers: escaped separators and comments before a continuation",
+          "[local_security_policy][parsers][sudoers]") {
+    for (const char* text : {"alice ALL=NOPASSWD:/bin/ls#comment\\\nbob ALL=/bin/cat\n",
+                             "alice ALL=NOPASSWD:/bin/ls # comment\\\nbob ALL=/bin/cat\n"}) {
+        INFO(text);
+        const auto rows = parse_sudoers(text);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].subject == "alice@ALL");
+        CHECK(rows[0].nopasswd == "true");
+        CHECK(rows[0].commands == "/bin/ls");
+        CHECK(rows[1].subject == "bob@ALL"); // not swallowed into the comment's continuation
+        CHECK(rows[1].nopasswd == "false");
+        CHECK(rows[1].commands == "/bin/cat");
+    }
+    const auto colon = parse_sudoers("alice ALL=(root) NOPASSWD:/bin/echo a\\:b, /bin/cat\n");
+    REQUIRE(colon.size() == 1); // the escaped ':' is not a tag separator
+    CHECK(colon[0].runas == "root");
+    CHECK(colon[0].nopasswd == "true");
+    CHECK(colon[0].commands == "/bin/echo a\\:b, /bin/cat");
+    const auto comma = parse_sudoers("alice ALL=/bin/echo a\\,b, NOPASSWD:/bin/id\n");
+    REQUIRE(comma.size() == 2); // the escaped ',' stays inside the first command
+    CHECK(comma[0].commands == "/bin/echo a\\,b");
+    CHECK(comma[0].nopasswd == "false");
+    CHECK(comma[1].commands == "/bin/id");
+    CHECK(comma[1].nopasswd == "true");
+    const auto hash = parse_sudoers("alice ALL=/bin/echo a\\#b\n");
+    REQUIRE(hash.size() == 1); // an escaped '#' is not a comment
+    CHECK(hash[0].commands == "/bin/echo a\\#b");
 }
 
 TEST_CASE("local_security_policy secedit: audit setting bitmask", "[local_security_policy][parsers][secedit]") {

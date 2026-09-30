@@ -51,9 +51,10 @@
  * in local_security_policy_scratch_sweep.hpp, OS-free so it compiles everywhere.
  * The exported INI -> rows mapping is NOT in this TU: it is the parsers header's
  * (secedit_policy_rows), the one mapper. Both pure layers are unit-tested in
- * test_local_security_policy_parsers.cpp; this TU (the Win32 calls) is covered by the
- * dispatcher suite (on Windows) and the rig probe below. It performs the Win32 calls and
- * writes what those return. The exception
+ * test_local_security_policy_parsers.cpp; this TU (the Win32 calls) is covered only by the
+ * rig probe below -- the unit suite's dispatcher never sets agent.data_dir, so on Windows it
+ * stops at the fail-closed `data_dir_unset` row. It performs the Win32 calls and writes
+ * what those return. The exception
  * boundary is the shared execute(); it is not repeated here.
  *
  * ---- RIG PROBE (the-rig, 2026-09-21; sweep contract re-run 2026-09-29) -------------
@@ -424,7 +425,6 @@ ExportBytes read_export(const std::wstring& file) {
     return out;
 }
 
-
 } // namespace
 
 int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
@@ -477,7 +477,8 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
 
     // sink: local_security_policy/do_export#1
     const yuzu::agent::SubprocessResult run = yuzu::agent::run_bounded_subprocess(
-        {sys_dir + "\\secedit.exe", "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY", "/quiet"},
+        {sys_dir + "\\secedit.exe", "/export", "/cfg", out_utf8, "/areas", "SECURITYPOLICY",
+         "/quiet"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::milliseconds{kExportDeadlineMs}});
     const std::string run_token = classify_export_run(to_run_end(run.termination_reason),
                                                       run.exit_code);

@@ -5,8 +5,8 @@
  * Windows leg's secedit export: which leftover directories under
  * agent.data_dir the pre-dispatch sweep may reclaim, how the secedit run and
  * the read of its output are classified. No OS calls -- only the standard
- * library -- so every decision compiles on every OS (the plugin has no dedicated
- * unit suite; the decisions were kept pure so one can be added). The shell in
+ * library -- so every decision compiles on every OS and is unit-tested in
+ * test_local_security_policy_parsers.cpp. The shell in
  * local_security_policy_win.cpp only performs what these functions return. The
  * exported-INI -> rows mapping is NOT here: it is the parsers header's.
  *

@@ -18,7 +18,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string_view>
-#include <unordered_set>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -150,6 +149,27 @@ TEST_CASE("local_security_policy: each real action returns at least one well-sha
 }
 
 #if defined(_WIN32)
+// LocalDispatcher never sets agent.data_dir, so the three secedit-backed actions stop at the
+// fail-closed data_dir_unset row here: no export, no spawn, nothing written. Pinning that row
+// (and the status, completeness, provenance and rc the plugin's contract gives every degraded
+// read) keeps this case from passing on any other constrained row, e.g. a re-planned leg. The
+// export itself is covered by the pure secedit tests and the rig capture, not this suite.
+TEST_CASE("local_security_policy: Windows policy actions fail closed without agent.data_dir",
+          "[local_security_policy][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) return;
+    yuzu::agent::LocalDispatcher dispatcher;
+    for (const char* action : {"password_policy", "lockout_policy", "audit_policy"}) {
+        INFO(action);
+        const auto result = dispatcher.run(plugin->descriptor(), action);
+        CHECK(result.rc == 0); // degradation is the status, rc is not a proxy for it
+        CHECK(rows_of(result.captured) == std::vector<std::string>{"constrained|data_dir_unset"});
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "data_dir_unset");
+    }
+}
+
 // Windows has no sudoers: the plugin short-circuits with one fixed row, UNAVAILABLE/PARTIAL and
 // a named provenance -- never a read, never an empty success.
 TEST_CASE("local_security_policy: sudoers refuses cleanly with a fixed row on Windows",

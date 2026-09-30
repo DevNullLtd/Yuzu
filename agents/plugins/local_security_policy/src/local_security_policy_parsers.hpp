@@ -3,15 +3,16 @@
  * or clock. Every decision (errno class, status, row shape) is a function here; the
  * leg TUs only read bytes and hand them in.
  *
- * All four actions (password_policy, lockout_policy, audit_policy, sudoers) and all three
- * legs (Linux, macOS, Windows) read today. `sudoers` emits the 7-field row below; the Windows
+ * All four actions (password_policy, lockout_policy, audit_policy, sudoers) read on Linux and
+ * macOS; the Windows leg serves the first three (sudoers is unsupported there). The Windows
  * leg decodes a secedit export here and returns the 2-field diagnostic row on its own faults.
  *
  * Rows (fields through safe_output_field):
  *   <action>|<key>|<value>|<source>          password_policy, lockout_policy, audit_policy
+ *   sudoers|<file>|<kind>|<subject>|<runas>|<nopasswd>|<detail>   sudoers: always 7 fields
  *   <action>|status|<state>|<reason>         the zero-row fallback (local_security_policy_legs.hpp)
- *   constrained|<token>                      a contained exception (`internal_error`), or the
- *                                            planned-leg placeholder (local_security_policy_plugin.cpp)
+ *   constrained|<token>                      a contained exception (`internal_error`), or a Windows
+ *                                            leg failure (local_security_policy_win.cpp)
  * A definitively missing source is the row state `absent` (key `source_state`) and no
  * failure token; an unreadable one is `unreadable:<token>` -- failure never reads as absent.
  * A pwpolicy item that is not in the documented plist shape is the same
