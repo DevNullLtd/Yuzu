@@ -302,7 +302,7 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_connect_failures_total},
         {labels, []},
         {help, "Total net_kernel:connect_node/1 failures from the cluster "
-               "discovery redial loop (#4555) — a sustained non-zero rate "
+               "discovery redial loop (#4555) - a sustained non-zero rate "
                "alongside a resolved/connected gap most often means a "
                "distribution-cookie mismatch across replicas"}]),
     prometheus_counter:declare([
@@ -310,7 +310,7 @@ declare_metrics() ->
         {labels, []},
         {help, "Total times the cluster discovery redial loop's lifetime "
                "distinct-address cap (1024) refused to atomize a "
-               "never-before-seen address (#4555 review round 2) — any "
+               "never-before-seen address (#4555 review round 2) - any "
                "non-zero value means the seed DNS name is returning an "
                "unexpectedly large or rotating/hostile answer set and "
                "should be investigated immediately, not just noted"}]),
@@ -391,7 +391,7 @@ declare_metrics() ->
         {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
         {help, "Number of agents dispatched to a DIFFERENT node than the "
                "dispatching one per fanout (HA WS-4 4.3a cross-node routing "
-               "— counts a cast SEND, not a confirmed delivery; see #4555)"}]),
+               "- counts a cast SEND, not a confirmed delivery; see #4555)"}]),
 
     %% Gauges
     prometheus_gauge:declare([
@@ -424,7 +424,7 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_peers_resolved},
         {labels, [node]},
         {help, "Peer addresses found by the cluster discovery redial loop's "
-               "most recent tick (#4555) — 0 means the seed name/list "
+               "most recent tick (#4555) - 0 means the seed name/list "
                "resolved nothing, which is expected for a genuinely "
                "single-node deployment"}]),
     prometheus_gauge:declare([
@@ -432,7 +432,7 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Distribution-connected peer nodes (length(nodes())) as of "
                "the cluster discovery redial loop's most recent tick "
-               "(#4555) — compare against peers_resolved to distinguish a "
+               "(#4555) - compare against peers_resolved to distinguish a "
                "wrong seed name (resolved=0) from a partial mesh (resolved "
                "> connected > 0, most often a cookie mismatch)"}]),
 

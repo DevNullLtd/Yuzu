@@ -63,3 +63,42 @@ counter_val(Name, Labels) ->
         undefined -> 0;
         V -> V
     end.
+
+%% #5177: every scrape of :9568/metrics returned HTTP 500 from 0.14.0-rc1 to
+%% rc3. Five HELP strings in declare_metrics/0 held an em-dash; in a UTF-8
+%% source a non-ASCII literal becomes an integer > 255 in the charlist, and
+%% prometheus_text_format's iolist_to_binary/1 raised badarg on it, which
+%% prometheus_httpd answers with a bare 500 and no log line. No test called
+%% the formatter, so nothing caught it. Render the whole registry exactly as
+%% a scrape does, and require every HELP line to be ASCII.
+metrics_scrape_renders_test_() ->
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"the text exposition of every declared metric renders without crashing",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           ?assert(is_binary(Out)),
+           %% A metric from declare_metrics/0 is in the output, so this
+           %% really covered the gateway's own declarations.
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"# HELP yuzu_gw_cluster_connect_failures_total ">>))
+       end},
+      {"every HELP line is ASCII (Prometheus help text must be ASCII)",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           Help = [L || L <- binary:split(Out, <<"\n">>, [global]),
+                        binary:longest_common_prefix([L, <<"# HELP ">>]) =:= 7],
+           ?assertNotEqual([], Help),
+           NonAscii = [L || L <- Help, lists:any(fun(B) -> B > 127 end,
+                                                 binary_to_list(L))],
+           ?assertEqual([], NonAscii)
+       end}
+     ]}.
