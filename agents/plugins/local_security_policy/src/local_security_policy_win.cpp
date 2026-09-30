@@ -40,8 +40,9 @@
  * A non-default agent.data_dir (an SMB share whose owner reads as HOST$, a non-NTFS
  * volume, a path over MAX_PATH) is unmeasured and may fail the leg as `dest_dir_acl`
  * or `secedit:exit_<n>`. Per
- * Microsoft's secedit documentation, with no /log argument secedit also appends to
- * its default log (%windir%\security\logs\scesrv.log); not measured on the rig. The
+ * Microsoft's secedit documentation, with no /log argument secedit appends to its default
+ * log (%windir%\security\logs\scesrv.log); the rig wrote none with or without /log (2026-09-30),
+ * and /log <scratch>\secedit.log is passed anyway so any output stays in the scratch dir. The
  * sweep outcome is logged at warn, only when the pass did something, as
  * `scratch_sweep: removed <n> failed <n> fresh <n> not_ours <n> deferred <n>`
  * (format_sweep_summary) -- never a row or a token.
@@ -478,9 +479,9 @@ int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
         return emit_constrained(ctx, "dest_dir_acl");
 
     const std::string out_utf8 = std::string{scratch_utf8} + "\\policy.inf";
-    // Without /log, secedit appends every run to %windir%\security\logs\scesrv.log, a log the
-    // agent does not own and that would grow with every polled dispatch. Pointing it into the
-    // scratch directory keeps the side effect inside what the guard and the sweep remove.
+    // Per Microsoft's documentation, without /log secedit appends to
+    // %windir%\security\logs\scesrv.log, a log the agent does not own; the rig wrote none either
+    // way, so this is precautionary: any log output stays inside what the guard and the sweep remove.
     const std::string log_utf8 = std::string{scratch_utf8} + "\\secedit.log";
 
     // sink: local_security_policy/do_export#1
