@@ -573,7 +573,7 @@ begin
               'having checked. Confirm manually that only Administrators and SYSTEM ' +
               'have access to it, then re-run the installer. If the Yuzu Agent service ' +
               'was running, it was stopped for the installation and has not been ' +
-              'restarted: run "sc start YuzuAgent".';
+              'restarted: run "sc.exe start YuzuAgent".';
     Exit;
   end;
 
@@ -599,7 +599,7 @@ begin
               'read it, the agent cannot verify updates at all. Securing it did not take ' +
               'effect -- security software may have blocked it. The installation has ' +
               'been stopped. If the Yuzu Agent service was running, it was stopped for ' +
-              'the installation and has not been restarted: run "sc start YuzuAgent" ' +
+              'the installation and has not been restarted: run "sc.exe start YuzuAgent" ' +
               'once this is resolved.';
   end;
 end;

@@ -18,6 +18,8 @@ What they pin, each verified on Windows Server 2022:
   the same expressions, so the two cannot drift apart again.
 - PsLit doubles every character PowerShell treats as a single quote.
 - The script contains no double quote, which would end the -Command argument.
+- The abort messages say `sc.exe start`: in Windows PowerShell 5.1 `sc` is an
+  alias for Set-Content, so `sc start YuzuAgent` would silently write a file.
 
 Each check also runs against a mutated copy of the source and must fail there,
 so a check that has stopped matching anything cannot pass silently.
@@ -121,6 +123,8 @@ def problems(iss: str, md: str) -> list:
                         ("($Matches[1] -ne $Matches[2])", "two distinct accounts")):
         if needle not in verify:
             found.append(f"manual verify lost its {why}: {needle}")
+    if re.search(r"\bsc start YuzuAgent", iss):
+        found.append("an abort message says `sc start`, which is Set-Content in Windows PowerShell 5.1; use sc.exe")
     body = pslit_body(iss)
     for ch in ("''''", "#$2018", "#$2019", "#$201A", "#$201B"):
         if f"(S[I] = {ch})" not in body:
@@ -153,6 +157,7 @@ class InstallerAclLint(unittest.TestCase):
             "manual verify drifted": ("md", "($Matches[1] -ne $Matches[2])", "($true)"),
             "PsLit U+2019 dropped": ("iss", " or (S[I] = #$2019)", ""),
             "PsLit ASCII quote dropped": ("iss", "if (S[I] = '''') or ", "if "),
+            "abort text says sc start": ("iss", 'run "sc.exe start YuzuAgent"', 'run "sc start YuzuAgent"'),
             "PsLit stops doubling": ("iss", "Result := Result + S[I] + S[I]", "Result := Result + S[I]"),
         }
         for name, (which, old, new) in mutations.items():

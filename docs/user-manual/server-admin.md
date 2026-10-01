@@ -3156,17 +3156,19 @@ Get these right, because several mistakes are silent:
 - **`reg add /f` replaces the whole value, and it must stay `REG_MULTI_SZ`.** If
   the service already has an `Environment` value, read it first with
   `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`.
-  Give its other entries again in the same command, but leave out every existing
-  `YUZU_UPDATE_*` entry and write only the ones for the stage you want: two entries
-  with the same name, such as `=0` from a rollback and a new `=1`, leave it to the
-  order which one the agent sees. Group Policy Preferences or another tool must
-  write the value as a multi-string too.
+  Give its other entries again in the same command (`YUZU_UPDATE_CHECK_INTERVAL`,
+  for example), but leave out any existing `YUZU_UPDATE_TRUST_BUNDLE` and
+  `YUZU_UPDATE_REQUIRE_SIGNATURE` entry and write only the ones for the stage you
+  want: with two entries of the same name, such as `=0` from a rollback and a new
+  `=1`, which one the agent sees is undefined. Group Policy Preferences or another
+  tool must write the value as a multi-string too, with **no empty entry**: the
+  service sees nothing after an empty entry.
 - **Names must be exact.** A misspelt name is ignored without any error, and
   signing then stays off. Run the check below after every change.
 - **`YUZU_UPDATE_REQUIRE_SIGNATURE` must be exactly `1`.** A value the agent cannot
   read as on or off, such as `enabled` or `1` followed by a space, stops it at
   startup.
-- **If the service will not start after a change** — `sc start YuzuAgent` fails with
+- **If the service will not start after a change** — `sc.exe start YuzuAgent` fails with
   error 1053, and the agent's log has nothing new — the agent refused before
   logging began: `YUZU_UPDATE_REQUIRE_SIGNATURE` without `YUZU_UPDATE_TRUST_BUNDLE`,
   or a value it cannot read. Correct the value and start the service again.
@@ -3175,37 +3177,48 @@ Get these right, because several mistakes are silent:
   alone. Uninstalling removes the service, and the value with it. That includes an
   SCCM or Intune deployment set to uninstall the previous version first. Set it
   again after any uninstall, and put the bundle file back if it is gone.
-- **Remove any signing flags you put in the binary path earlier.** A flag there
-  takes precedence over the variable, until the next installer run silently drops it.
+- **Remove any signing flags you put in the binary path earlier,** in either form:
+  `--update-trust-bundle` or the Windows-style `/update-trust-bundle:<path>`, which
+  the agent also accepts (and likewise for `--update-require-signature`). A flag
+  there takes precedence over the variable, until the next installer run silently
+  drops it.
 - **Do not use `setx /M`.** Services inherit the machine environment from
   `services.exe`, which caches it at boot, so a machine variable is typically NOT
   visible to a merely-restarted service.
 
-To check an endpoint, use the script below. It prints `OK` and exits 0 only when
-all of these hold:
+To check an endpoint, use the script below. Run it elevated, or as SYSTEM (as
+Intune and Configuration Manager compliance scripts run): the bundle directory is
+readable only by Administrators and SYSTEM, so an unelevated run reports NOT
+CONFIGURED. It prints `OK` and exits 0 only when all of these hold:
 
-- the value is a multi-string;
-- its `YUZU_UPDATE_*` entries are exactly the ones for the stage set on its first
-  line, with no duplicates;
+- the value is a multi-string with no empty entry;
+- its `YUZU_UPDATE_TRUST_BUNDLE` and `YUZU_UPDATE_REQUIRE_SIGNATURE` entries are
+  exactly the ones for the stage set on its first line, with no duplicates (other
+  variables are ignored);
 - the bundle file exists;
-- no signing flag is left in the binary path.
+- the binary path carries neither signing flag, in either form.
 
-Save it as a `.ps1` and run that, or use it as a configuration-management
-compliance script, comparing its output with `OK`. Pasted into an interactive
-PowerShell window, its `exit` closes the window.
+Otherwise it prints `NOT CONFIGURED` and exits 1. Save it as a `.ps1` and run that,
+or use it as a configuration-management compliance script, comparing its output
+with `OK`. Pasted into an interactive PowerShell window, its `exit` closes the
+window.
 
 ```powershell
 $stage = 1   # 2 once the endpoint also refuses unsigned packages
 $b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
 $want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
 $k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
-$have = @($k.Environment | Where-Object { $_ -like 'YUZU_UPDATE_*' })
-$ok = ($k.Environment -is [string[]]) -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and ($k.ImagePath -notmatch '--update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+$have = @($k.Environment | Where-Object { $_ -match '^YUZU_UPDATE_(TRUST_BUNDLE|REQUIRE_SIGNATURE)=' })
+$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
 if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 ```
 
-The check confirms the configuration only. It does not prove the agent read it:
-the agent does not yet log its signing mode at startup.
+**What `OK` does and does not mean.** It means the service is configured the way
+this section describes. It is not proof that the agent loaded that configuration,
+because the agent does not yet log its signing mode at startup. It also does not
+check that the bundle file holds the right certificates: a wrong bundle makes the
+agent refuse signed updates, which shows in
+`yuzu_agent_ota_signature_refused_total` and the agent log.
 
 ### The verifier's catastrophic invariants
 

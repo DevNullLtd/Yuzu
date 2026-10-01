@@ -162,7 +162,7 @@ because it could not confirm that only Administrators and SYSTEM can write
 `%ProgramData%\Yuzu\agent-certs`, and that both have full control of it and of
 everything in it. The lines after it give the directory and then the reason.
 The agent service was stopped for the install and is not restarted: run
-`sc start YuzuAgent` once you have dealt with the reason. Installers from
+`sc.exe start YuzuAgent` once you have dealt with the reason. Installers from
 0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
 Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
 for an install run by an administrator rather than as SYSTEM (#5196): use a
