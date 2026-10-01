@@ -40,6 +40,13 @@ APK_SHIM = textwrap.dedent(
     a = sys.argv[1:]
     if a[:2] != ["version", "-t"] or len(a) != 4:
         sys.exit(2)
+    import os
+    mode = os.environ.get("YUZU_TEST_APK_SILENT")
+    if mode == "1":
+        sys.exit(1)
+    if mode == "musl-double":
+        print("" if a[3] == "1.2.6" else "<<")
+        sys.exit(0)
     v = r"[0-9]+(\\.[0-9]+)*"
     if not (re.fullmatch(v, a[2]) and re.fullmatch(v, a[3])):
         sys.exit(1)
@@ -72,7 +79,7 @@ def guard_body():
 
 @unittest.skipIf(os.name == "nt" or shutil.which("sh") is None, "needs a POSIX sh")
 class AbiGuard(unittest.TestCase):
-    def run_guard(self, build, runtime_alpine, runtime_musl):
+    def run_guard(self, build, runtime_alpine, runtime_musl, apk_silent=False):
         """build: the raw bytes of /build-abi.env, as the builder writes it."""
         with tempfile.TemporaryDirectory(prefix="yuzu_test_abi_guard_") as d:
             d = Path(d)
@@ -100,6 +107,8 @@ class AbiGuard(unittest.TestCase):
                 self.assertIn(real, body, f"guard no longer reads {real}; update this test")
                 body = body.replace(real, fake)
             env = dict(os.environ, PATH=f"{d / 'bin'}{os.pathsep}{os.environ['PATH']}")
+            if apk_silent:
+                env["YUZU_TEST_APK_SILENT"] = "1" if apk_silent is True else apk_silent
             r = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
             return r.returncode, r.stdout + r.stderr
 
@@ -111,8 +120,8 @@ class AbiGuard(unittest.TestCase):
         rc, out = self.run_guard(*a)
         self.assertEqual(rc, 0, out)
 
-    def assertFails(self, *a, says=None):
-        rc, out = self.run_guard(*a)
+    def assertFails(self, *a, says=None, **kw):
+        rc, out = self.run_guard(*a, **kw)
         self.assertNotEqual(rc, 0, out)
         if says:
             self.assertIn(says, out)
@@ -124,6 +133,27 @@ class AbiGuard(unittest.TestCase):
     # The defect that shipped in 0.13.0 .. 0.14.0-rc4.
     def test_runtime_324_on_323_builder_fails(self):
         self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2"), "3.24.1", "1.2.6", says="differs")
+
+    # Same musl, different Alpine release: an OpenSSL ABI skew on its own.
+    def test_alpine_mismatch_same_musl_fails(self):
+        self.assertFails(self.env("3.22", "1.2.5", "28.5.0.2"), "3.23.6", "1.2.5", says="differs")
+
+    def test_non_dotted_alpine_fails(self):
+        self.assertFails(self.env("edge", "1.2.5", "28.5.0.2"), "3.23.6", "1.2.5",
+                         says="not a plain dotted version")
+        self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2"), "3.23_alpha20250108", "1.2.5",
+                         says="not a plain dotted version")
+
+    def test_malformed_dotted_versions_fail(self):
+        for otp in ("29..1", "29.1.", ".29"):
+            with self.subTest(otp=otp):
+                self.assertFails(self.env("3.23", "1.2.5", otp), "3.23.6", "1.2.5",
+                                 says="not a plain dotted version")
+
+    # apk printing nothing for a validated version must never read as "not older".
+    def test_silent_apk_fails_closed(self):
+        self.assertFails(self.env("3.24", "1.2.6", "28.5.0.2"), "3.24.1", "1.2.6",
+                         apk_silent=True, says="could not compare versions")
 
     def test_musl_mismatch_same_alpine_fails(self):
         self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2"), "3.23.6", "1.2.6", says="differs")
@@ -150,10 +180,21 @@ class AbiGuard(unittest.TestCase):
         self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2**"), "3.23.6", "1.2.5",
                          says="not a plain dotted version")
 
-    # Two releases/*/OTP_VERSION files: the builder writes a second bare line.
+    # Two releases/*/OTP_VERSION files: the builder writes a second bare line,
+    # and sourcing the env file fails on it (command not found) before the
+    # guard's own checks run.
     def test_otp_two_versions_fails_closed(self):
         build = "BUILD_ALPINE=3.23\nBUILD_MUSL=1.2.5\nBUILD_OTP=28.5.0.2\n29.1\n"
-        self.assertFails(build, "3.23.6", "1.2.5")
+        rc, out = self.run_guard(build, "3.23.6", "1.2.5")
+        self.assertEqual(rc, 127, out)
+
+    # Each comparison must be exactly one symbol; a pair that happens to be two
+    # characters long in total ("" + "<<") must not pass.
+    def test_apk_output_checked_per_comparison(self):
+        rc, out = self.run_guard(self.env("3.24", "1.2.6", "28.5.0.2"), "3.24.1", "1.2.6",
+                                 apk_silent="musl-double")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("could not compare versions", out)
 
     def test_empty_runtime_musl_fails(self):
         self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2"), "3.23.6", "",

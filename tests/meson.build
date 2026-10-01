@@ -2428,7 +2428,8 @@ test('gateway build wrapper',
 
 # Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
 # run under sh against fake facts, and the gateway crash signatures in
-# scripts/ci/qa-stack.sh. Hermetic, no Docker; skip on Windows (no POSIX sh).
+# scripts/ci/qa-stack.sh. Hermetic, no Docker; the cases that need a POSIX sh
+# skip themselves on Windows.
 test('gateway abi-guard',
   _python3_test,
   args: [files('test_gateway_abi_guard.py')],

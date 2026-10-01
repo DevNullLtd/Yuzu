@@ -37,6 +37,12 @@ CRASHES = [
     "application_master:init/3, pid: <0.704.0>",
     "2026-10-01T11:52:33.5+00:00 [error] <0.84.0> Supervisor: {local,yuzu_gw_sup}. "
     "Context: child_terminated. Reason: killed",
+    "=CRASH REPORT==== 1-Oct-2026::11:52:33.555557 ===",
+    "=SUPERVISOR REPORT==== 1-Oct-2026::11:52:33.555557 ===",
+    "Reason: reached_max_restart_intensity",
+    # The base pattern every service shares.
+    "Segmentation fault (core dumped)",
+    "AddressSanitizer: heap-use-after-free; ASAN report follows",
 ]
 
 HEALTHY = [
@@ -54,9 +60,15 @@ HEALTHY = [
 def crash_check_pattern():
     """The gateway's full crash-check pattern, as cmd_crash_check builds it."""
     text = QA_STACK.read_text(encoding="utf-8")
-    gw = [l for l in text.splitlines() if re.match(r"GW_CRASH_PAT\+?=", l)]
+    named = [l for l in text.splitlines() if l.lstrip().startswith("GW_CRASH_PAT")]
+    gw = [l for l in named if re.match(r"GW_CRASH_PAT\+?='", l)]
+    if gw != named:
+        bad = [l for l in named if l not in gw]
+        raise AssertionError(f"GW_CRASH_PAT line(s) this test cannot read: {bad}")
     if not gw or not gw[0].startswith("GW_CRASH_PAT="):
         raise AssertionError("GW_CRASH_PAT assignments not found in qa-stack.sh")
+    if 'pat+="|$GW_CRASH_PAT"' not in text:
+        raise AssertionError("cmd_crash_check no longer adds GW_CRASH_PAT to the gateway pattern")
     base = re.search(r"^\s*pat='([^']*)'\s*$", text, re.M)
     if not base:
         raise AssertionError("crash-check base pattern (pat='...') not found in qa-stack.sh")

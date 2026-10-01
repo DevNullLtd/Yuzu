@@ -109,8 +109,10 @@ FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9
 # Builder/runtime ABI guard (#2150). See the stage header above for why.
 # Every version is first required to be a plain dotted number: `apk version -t`
 # prints nothing for anything else (an OTP release candidate "29.0-rc1", a
-# patched "28.5.0.2**", two OTP_VERSION files), and an empty comparison must
-# never read as "not older". otp_fix_min is the first OTP release whose ERTS
+# patched "28.5.0.2**"), and an empty comparison must never read as "not
+# older"; each comparison must then be exactly one of < = >. (Two OTP_VERSION
+# files in the builder put a bare line in the env file, which fails the build
+# at the `.` with "not found" before any of this runs.) otp_fix_min is the first OTP release whose ERTS
 # sizes the signal stack from sysconf(_SC_MINSIGSTKSZ); lower it only if an
 # OTP 28 release gains the backport. tests/test_gateway_abi_guard.py runs this
 # step's text, so keep the paths it reads where they are.
@@ -131,8 +133,10 @@ RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.e
       exit 1; fi; \
     musl_vs=$(apk version -t "$rt_musl" 1.2.6 || true); \
     otp_vs=$(apk version -t "$BUILD_OTP" "$otp_fix_min" || true); \
-    case "$musl_vs$otp_vs" in [\<=\>][\<=\>]) ;; *) \
-      echo "FATAL: abi-guard: could not compare versions (apk printed '$musl_vs' '$otp_vs')."; exit 1;; esac; \
+    for c in "$musl_vs" "$otp_vs"; do \
+      case "$c" in '<'|'='|'>') ;; *) \
+        echo "FATAL: abi-guard: could not compare versions (apk printed '$musl_vs' '$otp_vs')."; exit 1;; esac; \
+    done; \
     if [ "$musl_vs" != "<" ] && [ "$otp_vs" = "<" ]; then \
       echo "FATAL: abi-guard: musl $rt_musl with OTP $BUILD_OTP: beam.smp aborts at boot on AMX CPUs" \
            "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
