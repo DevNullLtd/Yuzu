@@ -301,16 +301,25 @@ TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config
     cfg.type = TriggerType::Interval;
     cfg.plugin = "p1";
     cfg.action = "act";
-    cfg.interval_seconds = 5; // below minimum
+    // Below the 30s minimum. 1s is deliberate: interval_loop ticks every 1s, records the first
+    // observation on tick 1 and fires on the first later tick where elapsed >= interval, so an
+    // UNCLAMPED 1s trigger fires at ~2s. The negative window below (3s) therefore goes red if
+    // the clamp is removed. (The old value of 5 only fired at ~6s unclamped, outside the old 3s
+    // window, so that test stayed green with no clamp at all.)
+    cfg.interval_seconds = 1;
 
     engine.register_trigger(cfg);
 
-    // Start and let it run for 3 seconds — the trigger should NOT fire because
-    // the interval was clamped to 30s and first observation doesn't fire.
+    // Negative window: with the interval clamped to 30s the trigger must NOT fire. wait_for
+    // returns the instant a dispatch arrives (so a regression goes red fast); a green run pays
+    // the whole window. The window is bounded below by the unclamped fire time (~2s). The
+    // engine's 1s tick is the floor and there is no production seam to shorten it, and no
+    // accessor exposes the clamped config value.
     engine.start();
-    std::this_thread::sleep_for(std::chrono::seconds{3});
+    const bool fired = recorder.wait_for(1, std::chrono::milliseconds{3000});
     engine.stop();
 
+    CHECK_FALSE(fired);
     CHECK(recorder.count() == 0);
 }
 
@@ -437,12 +446,14 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
     engine.start();
     REQUIRE(engine.is_running());
 
-    // Let the interval loop iterate a couple times
-    std::this_thread::sleep_for(std::chrono::seconds{3});
+    // Negative / no-crash window: interval_loop ticks once per second, so 1.2s lets it run its
+    // first tick (first-observation baseline for this trigger) and still be mid-loop at stop().
+    // Anything longer only re-runs the same no-op tick; the 1s tick is the floor.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1200});
 
     engine.stop();
     CHECK_FALSE(engine.is_running());
-    // No fires expected within 3 seconds (30s interval, first observation skip)
+    // No fires expected (30s interval, first observation skip)
     CHECK(recorder.count() == 0);
 }
 
@@ -522,7 +533,7 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     fs::remove_all(tmp_dir, ec);
 }
 
-TEST_CASE("TriggerEngine: file change trigger with empty watch_path is skipped",
+TEST_CASE("TriggerEngine: file change trigger with empty watch_path starts and stops safely",
           "[trigger_engine][filechange]") {
     TriggerEngine engine;
     DispatchRecorder recorder;
@@ -537,7 +548,13 @@ TEST_CASE("TriggerEngine: file change trigger with empty watch_path is skipped",
     engine.register_trigger(cfg);
 
     engine.start();
-    std::this_thread::sleep_for(std::chrono::seconds{2});
+    // Negative / no-crash window, honestly bounded: file_watch_loop does its first poll only
+    // after a 5s wait, so no window short of >5s reaches the empty watch_path skip, and the
+    // outcome is the same either way (canonical("") fails and the loop continues; a first
+    // observation never fires). This case therefore proves "registering an empty-path
+    // FileChange trigger and starting/stopping the engine is safe and dispatches nothing". To
+    // exercise the skip itself would need an injectable file-poll interval in TriggerEngine.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
     engine.stop();
 
     CHECK(recorder.count() == 0);
@@ -565,7 +582,10 @@ TEST_CASE("TriggerEngine: start without any triggers", "[trigger_engine][lifecyc
     CHECK(engine.trigger_count() == 0);
     engine.start();
     CHECK(engine.is_running());
-    std::this_thread::sleep_for(std::chrono::seconds{2});
+    // Nothing periodic is under test with zero triggers: the property is that an engine with
+    // an empty trigger table starts all workers and stop() joins them without hanging or
+    // crashing. 200ms lets the workers get scheduled and park in their first wait.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
     engine.stop();
     CHECK_FALSE(engine.is_running());
 }

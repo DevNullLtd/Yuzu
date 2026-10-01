@@ -37,16 +37,34 @@ static_assert(!std::is_copy_assignable_v<ShutdownDeadlineGuard<>>);
 static_assert(!std::is_move_constructible_v<ShutdownDeadlineGuard<>>);
 static_assert(!std::is_move_assignable_v<ShutdownDeadlineGuard<>>);
 
+// A negative test ("a cancelled guard never fires") has to let the deadline elapse before it
+// can assert anything. A fixed sleep only "gives it time"; instead each case below arms an
+// UN-cancelled witness guard (its own state, its own recorder) whose grace outlasts the
+// guard under test's by kWitnessGap, and waits for the witness to FIRE - an observable event
+// ordering evidence, not synchronisation: each guard has its own detached worker, so the
+// witness firing makes it likely, not certain, that the deadline machinery has run past the
+// cancelled guard's own deadline. A cancel() that failed to take effect would have fired the
+// guard under test kWitnessGap earlier, so a regression shows up as `fired` (and under heavy
+// load it can slip past, never produce a false red).
+// The wait is bounded generously and fails loudly rather than the test ever sleeping blind.
+namespace {
+constexpr auto kCancelledGrace = 150ms; // generous vs a loaded-runner stall before cancel()
+constexpr auto kWitnessGap = 100ms;
+} // namespace
+
 TEST_CASE("cancel() before the deadline prevents the action from firing",
           "[shutdown_deadline_guard]") {
     auto fired = std::make_shared<std::atomic<bool>>(false);
-    ShutdownDeadlineGuard guard{200ms, [fired] { fired->store(true, std::memory_order_release); }};
+    auto witness_fired = std::make_shared<std::atomic<bool>>(false);
+    ShutdownDeadlineGuard guard{kCancelledGrace,
+                                [fired] { fired->store(true, std::memory_order_release); }};
+    ShutdownDeadlineGuard witness{kCancelledGrace + kWitnessGap, [witness_fired] {
+                                      witness_fired->store(true, std::memory_order_release);
+                                  }};
     guard.cancel();
 
-    // Give the worker time to have observed the deadline if cancel() hadn't worked - the
-    // grace (200ms) is generous relative to this sleep, so a real bug here would show up
-    // reliably, not just occasionally.
-    std::this_thread::sleep_for(300ms);
+    REQUIRE(yuzu::test::spin_until([&] { return witness_fired->load(std::memory_order_acquire); },
+                                   5s));
     CHECK_FALSE(fired->load(std::memory_order_acquire));
     CHECK_FALSE(guard.fired_for_test());
 }
@@ -54,11 +72,17 @@ TEST_CASE("cancel() before the deadline prevents the action from firing",
 TEST_CASE("the destructor cancels an un-fired guard, same as explicit cancel()",
           "[shutdown_deadline_guard]") {
     auto fired = std::make_shared<std::atomic<bool>>(false);
+    auto witness_fired = std::make_shared<std::atomic<bool>>(false);
+    ShutdownDeadlineGuard witness{kCancelledGrace + kWitnessGap, [witness_fired] {
+                                      witness_fired->store(true, std::memory_order_release);
+                                  }};
     {
-        ShutdownDeadlineGuard guard{200ms, [fired] { fired->store(true, std::memory_order_release); }};
+        ShutdownDeadlineGuard guard{kCancelledGrace,
+                                    [fired] { fired->store(true, std::memory_order_release); }};
         // left armed - the destructor below must cancel it.
     }
-    std::this_thread::sleep_for(300ms);
+    REQUIRE(yuzu::test::spin_until([&] { return witness_fired->load(std::memory_order_acquire); },
+                                   5s));
     CHECK_FALSE(fired->load(std::memory_order_acquire));
 }
 
@@ -105,8 +129,9 @@ TEST_CASE("cancel racing the deadline is race-free under repeat",
     // test-local recorder state is destroyed, or a repeat-only timing race test can pass
     // vacuously (the worker touches already-destroyed memory, which may or may not crash
     // depending on luck/ASan). Every piece of state the worker can touch is therefore
-    // shared_ptr-owned here, and each iteration waits on an explicit "the worker is done"
-    // signal (set by BOTH the cancelled path and the fired path) before moving on, so no
+    // shared_ptr-owned here, and each iteration waits until `retired` is the only owner (the
+    // worker's payload, which holds the action's copy, is deleted on BOTH the cancelled path
+    // and the fired path) before moving on, so no
     // iteration ever leaves a detached worker with a dangling reference into a destroyed
     // stack frame.
     for (int i = 0; i < 50; ++i) {
@@ -124,12 +149,15 @@ TEST_CASE("cancel racing the deadline is race-free under repeat",
             guard.cancel();
         }
         // If the action never runs (cancel won the race), nothing ever sets `retired` -
-        // that is a legitimate outcome, not a hang, so don't require it: wait a bounded,
-        // short window for EITHER outcome to settle before the shared_ptrs go out of
-        // scope naturally (they stay alive as long as the detached worker holds its own
-        // copy, so this is a liveness convenience, not a correctness requirement).
-        (void)yuzu::test::spin_until([&] { return retired->load(std::memory_order_acquire); },
-                                      20ms);
+        // that is a legitimate outcome, not a hang, so `retired` cannot be the settle
+        // signal. The worker's OWN copy of the action (and so of `retired`) is destroyed
+        // exactly when its payload is deleted on the worker's way out, on BOTH the
+        // cancelled and the fired path - so `retired.use_count() == 1` (only this scope's
+        // handle left) is an event that fires whichever outcome the race took. Wait for it
+        // so the worker has fully retired before this iteration's locals go away (the
+        // shared_ptrs keep the state alive regardless, so this is a liveness convenience,
+        // not a correctness requirement - hence a generous bound, not a tight one).
+        REQUIRE(yuzu::test::spin_until([&] { return retired.use_count() == 1; }, 5s));
     }
     SUCCEED("50 cancel-vs-fire races completed without crash/hang");
 }
