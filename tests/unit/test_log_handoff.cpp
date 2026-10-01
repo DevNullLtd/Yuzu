@@ -73,6 +73,17 @@ struct EmitSilencer {
     EmitSilencer(const EmitSilencer&) = delete;
     EmitSilencer& operator=(const EmitSilencer&) = delete;
 };
+
+// Wall-clock policy for this file (#5173). A failing assertion must mean the code under
+// test is wrong, never that a loaded runner stalled the test thread. Two rules:
+//  * UPPER bounds (something must happen "within" N) are DEADLINES, not margins: a wait
+//    that returns the moment the event happens, so a green run pays nothing for a long
+//    bound. kEventDeadline is that bound for events that are really due in ~300 ms; it is
+//    the regression-detection latency only, never part of a pass. Scaled for sanitizers.
+//  * LOWER bounds (something must NOT happen before N) can only get safer under load. They
+//    are kept at a fraction of the nominal delay, so they also tolerate a coarse platform
+//    timer (MSVC's tick-granular waits can return up to one ~16 ms tick early).
+inline constexpr auto kEventDeadline = 10s * yuzu::test::kSpinScale;
 } // namespace
 
 namespace {
@@ -123,30 +134,38 @@ TEST_CASE("U1: producer submits return promptly while the sink is parked, "
     constexpr int kProducers = 4;
     constexpr int kPerProducer = 1000;
 
-    const auto submit_start = std::chrono::steady_clock::now();
+    std::atomic<int> producers_done{0};
     std::vector<std::thread> producers;
     producers.reserve(kProducers);
     for (int p = 0; p < kProducers; ++p) {
         producers.emplace_back([&, p] {
             for (int i = 0; i < kPerProducer; ++i)
                 logger->info("p{}-{}", p, i);
+            producers_done.fetch_add(1, std::memory_order_release);
         });
     }
-    for (auto& t : producers)
-        t.join();
-    const auto submit_elapsed = std::chrono::steady_clock::now() - submit_start;
 
     // The whole 4000-message batch enqueues while the single worker is still parked on
     // message #0 - proving enqueue never waits on sink I/O (the guarantee stated in the
-    // header). 200ms is generous for 4000 uncontended enqueues even on a loaded CI box;
-    // scaled for sanitizer builds like every other liveness bound in this suite.
-    CHECK(submit_elapsed < 200ms * yuzu::test::kSpinScale);
+    // header). The assertion is "every producer finished while the sink was still parked",
+    // not a duration: enqueue blocked on the parked sink would never finish at all, so the
+    // deadline only bounds how long a regression takes to report (#5173: the former
+    // 200 ms bound on 4000 enqueues was a margin a loaded runner could miss).
+    const bool enqueued_while_parked = yuzu::test::spin_until(
+        [&] { return producers_done.load(std::memory_order_acquire) == kProducers; }, 10s);
     // Nothing has been CAPTURED yet -- the worker is still inside log() for message #0,
     // blocked on the gate BEFORE that call appends to captured_ (see GatedCaptureSink's
-    // own log() ordering: wait, then capture).
-    CHECK(h.sink->count() == 0);
+    // own log() ordering: wait, then capture). Sampled BEFORE the release below.
+    const auto captured_while_parked = h.sink->count();
 
+    // Unwedge first so a failed wait above still joins the producers instead of
+    // std::terminate()-ing on a joinable thread.
     h.sink->release();
+    for (auto& t : producers)
+        t.join();
+    REQUIRE(enqueued_while_parked);
+    CHECK(captured_while_parked == 0);
+
     REQUIRE(yuzu::test::spin_until(
         [&] { return h.sink->count() == static_cast<std::size_t>(1 + kProducers * kPerProducer); },
         5s));
@@ -197,10 +216,12 @@ void run_stamp_preservation_case(const std::string& text) {
 
     std::size_t producer_tid = 0;
     std::chrono::system_clock::time_point t0;
+    std::chrono::system_clock::time_point t1;
     std::thread producer([&] {
         producer_tid = spdlog::details::os::thread_id();
         t0 = std::chrono::system_clock::now();
         logger->info(text);
+        t1 = std::chrono::system_clock::now();
     });
     producer.join();
 
@@ -215,9 +236,15 @@ void run_stamp_preservation_case(const std::string& text) {
 
     CHECK(rec.payload == text);
 
-    const auto stamp_delta =
-        std::chrono::duration_cast<std::chrono::milliseconds>(rec.time - t0);
-    CHECK(std::abs(stamp_delta.count()) < 100);
+    // The record's time was stamped by the producer INSIDE logger->info(), so it lies in
+    // the producer's own [t0, t1] window. That is an exact containment, not a margin: a
+    // producer descheduled for any length of time between the two reads still passes (the
+    // former `|rec.time - t0| < 100ms` failed on such a stall, #5173), while a re-stamp at
+    // write time lands after the 1500ms hold below and so after t1.
+    CHECK(rec.time >= t0);
+    CHECK(rec.time <= t1);
+    // Lower bound only (a stall lengthens the hold, never shortens it); 500ms of slack
+    // against a timer that returns early.
     CHECK(rec.time < t_release - 1000ms);
     CHECK(rec.thread_id == producer_tid);
 
@@ -338,24 +365,31 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
     std::mutex fired_mu;
     std::condition_variable fired_cv;
     bool fired = false;
+    std::chrono::steady_clock::time_point fired_at;
     const auto grace = 300ms;
+    const auto teardown_start = std::chrono::steady_clock::now();
 
     std::thread teardown_thread([&] {
         h.handoff->teardown_with_action_for_test(grace, [&] {
             {
                 std::lock_guard<std::mutex> lk(fired_mu);
                 fired = true;
+                fired_at = std::chrono::steady_clock::now();
             }
             fired_cv.notify_all();
         });
     });
 
+    // UPPER bound = a generous deadline (kEventDeadline), returned from the instant the
+    // action fires -- never a margin over `grace` (#5173: `grace + 100ms` was missed by a
+    // scheduler stall on loaded macOS runners). "Never fires" is what this test exists to
+    // catch and it still reports, after the deadline.
     bool ok;
     {
         std::unique_lock<std::mutex> lk(fired_mu);
-        ok = fired_cv.wait_for(lk, (grace + 100ms) * yuzu::test::kSpinScale,
-                               [&] { return fired; });
+        ok = fired_cv.wait_for(lk, kEventDeadline, [&] { return fired; });
     }
+    const auto fired_after = ok ? (fired_at - teardown_start) : std::chrono::steady_clock::duration{};
 
     // Cleanup runs UNCONDITIONALLY, before any assertion on `ok` -- release the gate
     // so the worker's blocked log() call (and thus ~thread_pool's join inside
@@ -371,6 +405,10 @@ TEST_CASE("U5: teardown() on a wedged sink fires the deadline action within grac
     teardown_thread.join();
 
     REQUIRE(ok);
+    // LOWER bound: the action must fire at the DEADLINE, not at once. grace/2 (150ms) is
+    // far above one platform timer tick (~16ms on MSVC), and a stall can only lengthen
+    // the gap, never shorten it.
+    CHECK(fired_after >= grace / 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,21 +447,33 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     h.handoff->logger()->info("park");
     REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
 
-    // A long-lived concurrent drain -- holds a strong pool ref for up to 2s while the
-    // sink stays wedged, comfortably past teardown()'s own short grace below, so the
-    // drain is still genuinely in flight at the moment the watchdog is expected to
-    // fire.
+    // A long-lived concurrent drain -- holds a strong pool ref while the sink stays
+    // wedged, for far longer than teardown()'s own short grace below (30s against 300ms),
+    // so the drain is still genuinely in flight at the moment the watchdog is expected to
+    // fire. The bound is never reached on a passing run: the unconditional cleanup below
+    // releases the sink, which ends the drain's pending() spin at once. (#5173: it was
+    // 2000ms, a ~1.7s margin that a stalled test thread could lose, turning
+    // drain_done_before_release true by the drain timing out on its own.)
+    std::atomic<bool> drain_started{false};
     std::atomic<bool> drain_result{false};
     std::atomic<bool> drain_done{false};
     std::thread drain_thread([&] {
-        drain_result.store(drain_log_bounded(2000ms), std::memory_order_release);
+        drain_started.store(true, std::memory_order_release);
+        drain_result.store(drain_log_bounded(30000ms), std::memory_order_release);
         drain_done.store(true, std::memory_order_release);
     });
 
-    // Give the drain a moment to acquire its lease and start spinning before teardown()
-    // begins -- matches both reviewers' repro timing (~50ms); scaled for sanitizer
-    // builds like every other liveness bound in this suite.
-    std::this_thread::sleep_for(100ms * yuzu::test::kSpinScale);
+    // The drain must hold its DrainLease before teardown() closes admission, or
+    // drain_log_bounded() refuses and returns at once (drain_done goes true and the
+    // interleaving this test exists for never happens). The lease is not observable from
+    // here, so: a positive handshake that the drain thread is running, then a settle for
+    // its few instructions between that store and the lease's lock. Both are scaled for
+    // sanitizer builds. RESIDUAL: a preemption of the drain thread for longer than the
+    // settle, inside that window, is still possible; it surfaces as the
+    // CHECK_FALSE(drain_done_before_release) below, not as a silent pass.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return drain_started.load(std::memory_order_acquire); }, 10s));
+    std::this_thread::sleep_for(500ms * yuzu::test::kSpinScale);
 
     std::mutex fired_mu;
     std::condition_variable fired_cv;
@@ -444,12 +494,12 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     });
 
     // THE FALSIFIER: see this TEST_CASE's own header comment for the exact red/green
-    // shape.
+    // shape. The upper bound is this generous deadline (kEventDeadline), returned from
+    // the instant the action fires; never a margin over `grace` (#5173).
     bool ok;
     {
         std::unique_lock<std::mutex> lk(fired_mu);
-        ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
-                               [&] { return fired; });
+        ok = fired_cv.wait_for(lk, kEventDeadline, [&] { return fired; });
     }
     // Capture the values these CHECKs need BEFORE the unconditional cleanup below can
     // change them -- drain_done specifically must reflect "was the drain still
@@ -476,8 +526,9 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     // test's own bounded waits above. Now safe to assert -- no joinable thread
     // remains for a throw to strand.
     REQUIRE(ok);
+    // LOWER bound only (see U5): grace/2 tolerates a coarse timer; the upper bound is the
+    // kEventDeadline wait above, so `ok` is the assertion.
     CHECK(fired_after >= grace / 2);
-    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
     // The drain thread must NOT have completed before we released the sink above --
     // it was still legitimately spinning inside its own 2s wait while the sink
     // stayed wedged. This proves the interleaving this test exists to exercise was
@@ -558,11 +609,11 @@ TEST_CASE("BLOCKER round-2 regression: teardown()'s deadline watchdog still fire
         });
     });
 
+    // Upper bound = generous deadline, not a margin over `grace` (#5173; see U5).
     bool ok = false;
     {
         std::unique_lock<std::mutex> lk(fired_mu);
-        ok = fired_cv.wait_for(lk, (grace + 1000ms) * yuzu::test::kSpinScale,
-                               [&] { return fired; });
+        ok = fired_cv.wait_for(lk, kEventDeadline, [&] { return fired; });
     }
     const auto fired_after = fired ? (fired_at - teardown_start) : std::chrono::steady_clock::duration::zero();
 
@@ -577,8 +628,7 @@ TEST_CASE("BLOCKER round-2 regression: teardown()'s deadline watchdog still fire
     teardown_thread.join();
 
     REQUIRE(ok);
-    CHECK(fired_after >= grace / 2);
-    CHECK(fired_after < (grace + 1000ms) * yuzu::test::kSpinScale);
+    CHECK(fired_after >= grace / 2); // lower bound only; see U5
     SUCCEED("teardown()'s watchdog covered the concurrent producer traffic; every "
             "thread joined cleanly");
 }
@@ -715,38 +765,53 @@ TEST_CASE("U9: drain_log_bounded() delivers a pending breadcrumb when healthy, t
         yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
 
         h.handoff->logger()->info("pre-abort breadcrumb");
+        // A long wait that a healthy drain never uses: it returns the moment the queue is
+        // empty. "Returns promptly" is asserted as `elapsed < wait / 2`, scale-separated
+        // (microseconds against 15s); a drain that slept out its wait would miss it by
+        // 15s. The former 200ms wait / 250ms bound was a 50ms margin (#5173).
+        constexpr auto kWait = 30s;
         const auto start = std::chrono::steady_clock::now();
-        const bool drained = drain_log_bounded(200ms);
+        const bool drained = drain_log_bounded(kWait);
         const auto elapsed = std::chrono::steady_clock::now() - start;
 
         CHECK(drained);
-        CHECK(elapsed < 250ms * yuzu::test::kSpinScale);
+        CHECK(elapsed < kWait / 2);
         REQUIRE(yuzu::test::spin_until([&] { return h.sink->count() == 1; }));
         CHECK(h.sink->snapshot().front().payload == "pre-abort breadcrumb");
     }
 
-    SECTION("wedged: returns false within wait plus a small epsilon") {
+    SECTION("wedged: returns false once the wait elapses, and not before") {
         Harness h; // initially paused
         yuzu::test::ScopeExit release_on_exit{[&] { h.sink->release(); }};
 
         h.handoff->logger()->info("park");
         REQUIRE(yuzu::test::spin_until([&] { return h.handoff->in_write(); }));
 
+        // This case must really wait out `wait`, so it stays short. LOWER bound: it may
+        // not give up early (a drain that returned false at once would otherwise pass
+        // CHECK_FALSE); the 16ms is one coarse-timer tick of tolerance, though the loop
+        // is on steady_clock and cannot return early. UPPER bound: a hang detector only,
+        // `wait` plus a multi-second allowance, never a tight epsilon.
+        constexpr auto kWait = 400ms;
         const auto start = std::chrono::steady_clock::now();
-        const bool drained = drain_log_bounded(200ms);
+        const bool drained = drain_log_bounded(kWait);
         const auto elapsed = std::chrono::steady_clock::now() - start;
 
         CHECK_FALSE(drained);
-        CHECK(elapsed < 350ms * yuzu::test::kSpinScale);
+        CHECK(elapsed >= kWait - 16ms);
+        CHECK(elapsed < kWait + kEventDeadline);
     }
 
     SECTION("null-safe: no LogHandoff installed returns false immediately") {
+        // With nothing installed it returns at once; a long wait makes "at once" a
+        // scale-separated `elapsed < wait / 2` instead of a 20ms margin (#5173).
+        constexpr auto kWait = 30s;
         const auto start = std::chrono::steady_clock::now();
-        const bool drained = drain_log_bounded(50ms);
+        const bool drained = drain_log_bounded(kWait);
         const auto elapsed = std::chrono::steady_clock::now() - start;
 
         CHECK_FALSE(drained);
-        CHECK(elapsed < 20ms * yuzu::test::kSpinScale);
+        CHECK(elapsed < kWait / 2);
     }
 }
 
