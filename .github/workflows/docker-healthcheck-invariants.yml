@@ -121,16 +121,17 @@ jobs:
           # gate to run and a human to look.
           #
           # KEEP IN SYNC with the healthcheck list in
-          # scripts/ci/verify-healthcheck-invariants.sh. The last two patterns are
-          # easy to forget: scripts/test/ and the compose heredocs inlined in
-          # pre-release.yml both healthcheck yuzu-server with bash + /dev/tcp.
+          # scripts/ci/verify-healthcheck-invariants.sh. scripts/test/ is the
+          # easy one to forget: it healthchecks yuzu-server with bash + /dev/tcp.
+          # pre-release.yml is not listed: it inlines no compose stack any more
+          # and runs docker-compose.reference-gateway.yml (matched by the
+          # deploy/docker pattern) through scripts/ci/qa-stack.sh.
           if echo "$FILES" | grep -qE \
             -e '^deploy/docker/Dockerfile\.(server|gateway)(\.chisel)?$' \
             -e '^deploy/docker/Dockerfile\.agent\.chisel$' \
             -e '^deploy/docker/docker-compose.*\.ya?ml$' \
             -e '^docker-compose\.uat\.yml$' \
             -e '^scripts/test/docker-compose\.upgrade-test\.yml$' \
-            -e '^\.github/workflows/pre-release\.yml$' \
             -e '^scripts/ci/verify-healthcheck-invariants\.sh$' \
             -e '^\.github/workflows/docker-healthcheck-invariants\.yml$'; then
             echo "Image surface touched -- verifying."

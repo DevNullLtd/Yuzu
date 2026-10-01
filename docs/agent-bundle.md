@@ -156,6 +156,14 @@ config page), or fully unattended —
 `installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
 Service name `YuzuAgent`.
+If a silent install exits with code **7** and its `/LOG=` log says "The update
+trust-anchor directory is not secured", the installer refused to continue
+because it could not confirm that only Administrators and SYSTEM can write
+`%ProgramData%\Yuzu\agent-certs`. The lines after it give the directory and
+then the reason. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+PowerShell 7 through another process (#5176): run them from a new
+`powershell.exe` or `cmd.exe` window that was not itself started from
+PowerShell 7, or use a later installer.
 
 Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
 (add `/LOG=<path>` to keep a log; if the agent was installed to another
