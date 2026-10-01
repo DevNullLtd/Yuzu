@@ -482,7 +482,11 @@ than the tag under test (#5150). The other jobs check the following:
   gateway logs fail the job. For the gateway that includes OTP process crashes
   (`crasher: initial call`) and supervisor restarts (`Supervisor: ...
   Context: child_terminated`), in the header-less format the reference
-  `sys.config` logger writes. Postgres logs are not checked.
+  `sys.config` logger writes. It also includes the VM dying outright: an ERTS
+  abort (`<file>.c:<line>:<func>(): Internal error`), a failed boot
+  (`Kernel pid terminated`) and a crash dump (`GW_CRASH_PAT` in
+  `scripts/ci/qa-stack.sh`, locked by `tests/test_qa_stack_crash_pat.py`).
+  Postgres logs are not checked.
 - **upgrade-test**: brings up the previous stable release and upgrades every
   service in place, keeping the Postgres volume, CA and agent data dir. The
   same agent must reconnect running the new version. All services must be
