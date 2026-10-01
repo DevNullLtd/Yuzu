@@ -833,7 +833,83 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
   )
 endif
 
-# [tsan-heavy] is ALWAYS excluded from this entry (previously only in a plain build) - see
+# ── Agent unit tests: 3 tag-partitioned shards (#5073) ───────────────────────
+# The single 'agent unit tests' entry (one Catch2 process, serial) was the
+# Windows suite's longest and had no headroom left: 2026-10-01 case-level sum
+# on real MSVC hardware (DGRHP, `-d yes`, 4134 cases) was ~221s against its
+# 240s budget, and CI had timed the entry out on Windows (12 of the 59 agent-
+# suite failures in the last 100 runs (#5073 CI analysis); the other 47 were ordinary test failures,
+# which sharding does not touch). It is now three entries over the SAME binary,
+# one positional tag spec each, so they run as concurrent OS processes.
+#
+# PARTITION RULE (shard order matters): a case runs in the LOWEST-numbered
+# shard that holds any one of its tags. Shard A is the OR of its tags; shard B
+# is the OR of its tags, each AND NOT every tag shard A holds; shard C is the
+# AND-NOT complement of every carved tag, so a NEW test, or a new tag, lands in
+# shard C automatically and can never be silently dropped (it can only drift
+# the balance). In Catch2 a ',' inside ONE spec is OR, adjacent `[a][b]` is AND,
+# `~` negates, and TWO positional specs are ANDed (never ORed): that is why
+# each shard is exactly ONE positional spec, and why a `--test-args '[tag]'`
+# appended by `meson test` ANDs onto the shard spec (see --allow-running-no-tests
+# below).
+#
+# SUFFIX: every INCLUSION term carries `~[.]~[tsan-heavy]~[flaky-4086]`
+# (agent_shard_suffix), and the complement shard and the partition checker's
+# reference spec carry the same `~[.]` explicitly. An exclusion-only spec drops
+# hidden `[.]` cases by Catch2's own rule, but an inclusion term does NOT, so
+# without the suffix a carved tag pulls in cases the old single entry never ran.
+# Linux, 2026-10-01: the one `[tsan-heavy]` case (test_guardian_spark_runtime.cpp
+# ~2721, tagged [runtime][liveness], both carved here) would run twice, here and in
+# 'agent tsan-heavy checkpoints'; and the one hidden `[.]` case (same file, ~7194,
+# tagged [runtime][liveness]) would run although it is hidden. On Windows the
+# `[.][flaky-4086][guardian][guard]...` case (test_guard_file.cpp ~1110, under
+# #ifdef _WIN32) carries [guard], which shard A carves, so there the suffix is what
+# keeps it out; that Windows leak was reasoned from the tags, NOT observed. The
+# `~[.]` on the complement is explicit because the exclusion-only hidden-case rule
+# was not reliably observed on real Windows hardware (comment above).
+#
+# EXACTNESS IS PROVEN, BALANCE IS NOT: 'agent shard partition invariant' (below)
+# lists every shard with `--list-tests` against the real binary and fails on a
+# case in no shard, in two shards, or outside the reference set
+# `~[.]~[tsan-heavy]~[flaky-4086]`. It prints per-shard case counts as an
+# informational notice only: count is not time, so there is no ratio gate. The
+# drift signal is flake-retry.py's 80%-of-budget table (#2092/#2093).
+#
+# MEASURED BALANCE (2026-10-01, case-sum predictions from per-case durations
+# joined to tags, not CI measurements): Linux ~[30.6, 29.4, 29.9]s, Windows
+# ~[74.0, 73.1, 74.2]s for A/B/C, against 89.9s / 221.3s for the old single
+# entry. Linux binary (4227 cases) at the same date: 539 / 482 / 3206 cases per
+# shard; measured wall on a quiet 32-core box, shards run 3-wide by `meson test`:
+# 29.9 / 30.8 / 32.0s, against 92.6s for the old single-spec run of the same
+# binary. Windows startup cost, and what concurrent shards cost each other under
+# CI's smaller pools, were not measured.
+# The carve uses only tags with >=25 cases (hand-pruned from a simulated-annealing
+# fit that used tiny tags and was 1-3% tighter): A is guarded by [ack],[actions],
+# [browser_policy],[drain],[execution_artifacts],[guard],[runtime]; B by [agent],
+# [liveness],[mechanism],[trigger_engine]. Re-balance by moving a tag between the
+# two variables below, never by hand-editing a spec string.
+#
+# The real-DISM cases ([actions][windows_optional_features] in
+# test_windows_optional_features_local_dispatcher.cpp ~157-237) stay in ONE shard
+# (A, via [actions]): they share a process-wide DISM slot. The
+# [windows_optional_features] tag itself is split (3 cases there, the slot unit
+# tests in test_windows_optional_features_parsers.cpp land in C) but those C cases
+# are not real-DISM.
+#
+# --allow-running-no-tests on EVERY shard: the documented local practice
+# `meson test --suite agent --test-args '[tag]'` (see the BR4-005 notes below)
+# appends that tag as a SECOND positional spec, which Catch2 ANDs with the shard's
+# own, so a shard that holds none of the tag's cases would otherwise exit 2. A
+# genuinely empty shard is still caught loudly, by the checker's 'matched ZERO
+# cases' failure. flake-retry.py strips both the spec and this flag for an isolated
+# case retry.
+#
+# NAMES: 'agent unit tests' must not survive as a substring of any entry name:
+# flake-retry.py maps a junit name to its entry by LONGEST substring. suite
+# 'agent-shard' is what the checker discovers by; 'agent' is what CI selects
+# (ci.yml/nightly.yml select `--suite agent` on every leg, never these names).
+#
+# [tsan-heavy] is ALWAYS excluded from the shards (previously only in a plain build) - see
 # the #2373/#4153 split comment above and the dedicated 'agent tsan-heavy checkpoints' entry
 # below, which is the only place a sanitizer build runs the sole survivor now.
 #
@@ -841,18 +917,66 @@ endif
 # "FileGuard rename: the compliant edge cache...") with a measured 9/10 standalone failure
 # rate (issue #4086 - guard_win_handle.hpp's cancel_and_close_ doesn't drain a cancelled
 # OVERLAPPED read before reuse). Its own [.] tag was NOT reliably observed to keep it out
-# of this entry on its own - repeat real-hardware runs against this entry's `~[tsan-heavy]`
+# of the old single entry on its own - repeat real-hardware runs against its `~[tsan-heavy]`
 # filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
 # unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
 # verified to work - see the header comment on the TEST_CASE for detail.
-agent_test_args = ['~[tsan-heavy]~[flaky-4086]']
-test(
-  'agent unit tests',
-  agent_test_exe,
-  args: agent_test_args,
-  suite: 'agent',
-  timeout: 240, # restored after moving [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28-60s, so 240s is generous headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling. #4153 moved two of the three former [tsan-heavy] cases INTO this entry (retagged [tsan]) - still comfortably inside this budget (measured).
-  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
+agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
+agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine']
+_agent_a_terms = []
+_agent_a_excl = ''
+foreach t : agent_shard_a_tags
+  _agent_a_terms += ['[' + t + ']' + agent_shard_suffix]
+  _agent_a_excl += '~[' + t + ']'
+endforeach
+_agent_b_terms = []
+_agent_b_excl = ''
+foreach t : agent_shard_b_tags
+  _agent_b_terms += ['[' + t + ']' + _agent_a_excl + agent_shard_suffix]
+  _agent_b_excl += '~[' + t + ']'
+endforeach
+agent_shard_specs = {
+  'A': ','.join(_agent_a_terms),
+  'B': ','.join(_agent_b_terms),
+  'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
+}
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin]
+foreach shard, spec : agent_shard_specs
+  test(
+    'agent unit tests shard ' + shard,
+    agent_test_exe,
+    args: [spec, '--allow-running-no-tests'],
+    suite: ['agent', 'agent-shard'],
+    # 240s per shard, unchanged from the old single entry. Do NOT lower it from the
+    # uncontended ~75s Windows prediction: docs/ci-architecture.md measures ~2.1x
+    # wall-time inflation under box-wide contention (server ~[pg] c0 289s -> c4 603s),
+    # which puts a 75s shard near 158s - past a 120s budget, and past the 80% warning
+    # line of a 180s one. At 240s the hang detector is the same as before with ~3x the
+    # headroom. A real hang is also bounded by the job-level timeouts.
+    timeout: 240,
+    depends: agent_shard_deps,
+  )
+endforeach
+
+# Structural partition-invariant check for the agent shards (#5073): proves, against
+# the real compiled binary via --list-tests, that every case matched by
+# `~[.]~[tsan-heavy]~[flaky-4086]` lands in EXACTLY ONE 'agent-shard'-suite entry. The
+# SAME script as 'server pg shard partition invariant' (--family agent), not a fork. It
+# is deliberately outside `if build_server`: the agent suite must be self-sufficient
+# (windows-asan and the Linux sanitizer legs select `--suite agent`), and it depends
+# only on the agent test binary. suite 'agent-checks' lets the Windows step's
+# assert-suite-cover.py and `--suite agent` select it. Needs no fixtures: --list-tests
+# never runs a test body. It tolerates the `--test-args '[tag]'` that meson appends to
+# every test in the suite (the script ignores trailing extras in the agent family).
+_agent_shard_python3 = find_program('python3', 'python')
+test('agent shard partition invariant',
+  _agent_shard_python3,
+  args: [files('../scripts/ci/check-pg-shard-partition.py'),
+         '--family', 'agent', '--builddir', meson.project_build_root()],
+  suite: ['agent', 'agent-checks'],
+  depends: [agent_test_exe],
+  timeout: 60,
 )
 
 if get_option('b_sanitize') != 'none'
@@ -875,7 +999,7 @@ if get_option('b_sanitize') != 'none'
   # range above once real contention is added, both well under 600s) -
   # left unchanged rather than tightened, since a single-test entry has no other case to protect
   # from a stall's blast radius, and #3848's own 30s watchdogs already bound its own worst case.
-  # Not the plain suite's ~28-60s fast-entry baseline above; nightly's own --timeout-multiplier 2
+  # Not the fast shards' budget above; nightly's own --timeout-multiplier 2
   # (Linux legs) / the windows-asan job's now-added multiplier scale 600s to 1200s under
   # sanitizer instrumentation plus contention. Do NOT replace this with a wall-clock cap inside
   # the tests themselves -
@@ -885,13 +1009,15 @@ if get_option('b_sanitize') != 'none'
   # comments in test_guardian_spark_runtime.cpp.
   #
   # is_parallel: false on Windows ONLY (governance Gate 4/6, #4018 hardening round):
-  # neither this entry nor 'agent unit tests' caps --num-processes, so meson's own
-  # scheduler is free to run both as concurrent OS processes sharing suite: 'agent' -
-  # exactly the shared-disk/Defender-minifilter contention docs/ci-architecture.md's
+  # neither this entry nor the 'agent unit tests shard' entries cap --num-processes, so
+  # meson's own scheduler is free to run them as concurrent OS processes sharing suite:
+  # 'agent' - exactly the shared-disk/Defender-minifilter contention docs/ci-architecture.md's
   # "Windows test-phase concurrency gate" measures as real ACROSS jobs, now possible
-  # WITHIN one job between these two sibling entries. A barrier is nearly free on
-  # windows-asan (its only sibling under --suite agent is the ~28s-baseline fast
-  # entry) but must NOT apply on Linux's unfiltered `meson test` (sanitize-asan/tsan):
+  # WITHIN one job between these sibling entries. The agent shards (#5073) are NOT given
+  # this barrier: they are concurrent with each other by design, and this flag only keeps
+  # THIS entry from overlapping them. The barrier's cost on windows-asan is the drain of
+  # the three shards under instrumentation, which was not measured; it must NOT apply on
+  # Linux's unfiltered `meson test` (sanitize-asan/tsan):
   # forcing a full drain-then-run-alone there adds real critical-path time to legs
   # already sized close to their timeout-minutes budget.
   tsan_heavy_checkpoints_is_parallel = host_machine.system() != 'windows'

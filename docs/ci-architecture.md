@@ -1608,6 +1608,36 @@ to `known-flaky.json`), grep the junit failure text for
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
 
+## Agent unit-test shards (#5073)
+
+The agent suite's single `agent unit tests` entry (one serial Catch2 process,
+240 s budget) is three entries over the same `yuzu_agent_tests` binary:
+`agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard:
+the ~2.1x contention inflation measured in "Windows test-phase concurrency
+gate" is the reason not to shrink it to the uncontended per-shard time) and
+`--allow-running-no-tests` (so `meson test --suite agent --test-args '[tag]'`
+keeps working: meson appends the tag as a second positional spec, Catch2 ANDs
+it, and a shard holding none of that tag's cases would otherwise exit 2). Every
+CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
+sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
+is unsharded and unchanged.
+
+Partition rule and measured balance live in the comment above the entries in
+`tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
+tags, shard C is the AND-NOT complement so new tests land there, and every
+inclusion term ends `~[.]~[tsan-heavy]~[flaky-4086]` because an inclusion term
+does not drop hidden cases by itself. `'agent shard partition invariant'`
+(`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
+`scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
+`check_partition()` as the server shards: it proves against the real binary that
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It proves
+exactness, not balance: it prints per-shard case counts as an informational
+notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
+the new names.
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR, or a push to
