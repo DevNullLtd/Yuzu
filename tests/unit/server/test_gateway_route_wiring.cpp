@@ -2186,8 +2186,9 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
 // ── #1197: BatchHeartbeatResponse.unknown_session_ids ───────────────────────
 //
 // A concurrent BatchHeartbeat-vs-ProxyRegister/Deregister test is deliberately
-// deferred to the nightly TSan lane: the unknown set and the counters are
-// function-local, and sessions_mu_ use is unchanged by this change.
+// not written here: the unknown set and counters are function-local and
+// sessions_mu_ use is unchanged. The nightly TSan lane runs the existing
+// BatchHeartbeat cases.
 
 TEST_CASE("BatchHeartbeat verdict: a batch of only known sessions lists nothing and is not "
           "truncated (#1197)",

@@ -445,6 +445,8 @@ unreachable via that gateway until it happened to reconnect on its own. This
 was reachable on a single, otherwise-healthy replica; no core restart was
 required.
 
+This section applies to circuit-breaker recovery replays, not to a server-only restart while a gateway stays connected; for that case see the known limitation under [Server-Side Setup](gateway.md#server-side-setup).
+
 **What changes:** the server now decides adopt-vs-refuse for a replayed
 session before installing anything, the gateway re-announces the agent's own
 connection to converge placement on a successful adopt, and a genuinely

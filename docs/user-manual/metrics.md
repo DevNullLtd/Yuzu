@@ -175,7 +175,7 @@ tracks). The desync counter's own guard-rejection outcomes
 (`shortfall`/`session_mismatch`/`unknown_session`/`malformed_session_id`) remain without a dedicated
 alert — they're expected at a low background rate (see the row above) and a
 threshold that doesn't page on a routine post-restart baseline rise needs
-real fleet data to set. Both shipped alerts use conservative/INITIAL
+real fleet data to set. A SUSTAINED `renew_leases`/`unknown_session` rise while `/health` `agents.online` stays low is the known limitation described under Server-Side Setup in [gateway.md](gateway.md#server-side-setup), not a routine baseline. Both shipped alerts use conservative/INITIAL
 thresholds for the same reason (the #913 OTA-bounds lesson: alert thresholds
 are the top source of external-review findings), to be tuned once fleet data
 exists.

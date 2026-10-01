@@ -506,24 +506,28 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > [Prometheus Metrics](#prometheus-metrics) runs after an upstream reconnect,
 > which a server-only restart did not trigger in the observed runs). Signals at
 > the default log level: the server WARN `GatewayRouteStore renew_leases guard
-> rejected the write (outcome=unknown_session ...)` on each heartbeat batch that
-> carries such a session (about every 30 s per agent), the WARN `ProxyInventory:
-> unknown session` when an inventory report arrives, and
+> rejected the write (outcome=unknown_session ...)`, logged for each heartbeat
+> batch that carries such a session (about every 30 s per agent on the rig;
+> expect more log volume on a larger fleet), the WARN `ProxyInventory: unknown
+> session` when an inventory report arrives, and
 > `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`
-> rising, alongside `agents.online`. With `--log-level debug` the server also
-> logs `BatchHeartbeat: unknown session` and `0/1 acked`. Observed on one local
-> development rig after a SIGKILL of the server with an immediate restart
-> (about 5 s of downtime), with one agent; graceful shutdown, longer downtime
-> and multiple agents or replicas were not tested. A command to the agent was
-> still delivered while its route lease was unexpired (90 s from the last
-> heartbeat the previous server ingested, minus the downtime) and was refused
-> (503) afterwards; if the previous server had ingested no heartbeat there was
-> no such window; the server did not relearn the session in the observed
-> windows (to about 125 s). A full restart of the server, the gateway and every
-> agent behind that gateway restored it; that is the only recovery observed and
-> is NOT a recommended procedure (restarting only the gateway, or only the
-> agent, was not tested). The gateway-side fix is tracked in #1197; this note
-> will be revised when it ships.
+> rising while `/health` `agents.online` stays at 0. With `--log-level debug`
+> the server also logs `BatchHeartbeat: unknown session` and `0/1 acked`.
+> Observed on one local development rig after a SIGKILL of the server with an
+> immediate restart (about 5 to 13 s of downtime across the four samples), with
+> one agent; graceful shutdown, longer downtime and multiple agents or replicas
+> were not tested. A command to the agent was still delivered while its route
+> lease was unexpired (the lease runs 90 s from the last heartbeat the previous
+> server ingested, so the window after the restart is 90 s minus that
+> heartbeat's age at the kill minus the downtime) and was refused (503)
+> afterwards; if the previous server had ingested no heartbeat there was no
+> such window; the server did not relearn the session in the observed windows
+> (to about 125 s). A full restart of the server, the gateway and the agent
+> restored it (the one agent tested; for a fleet this would mean every agent
+> behind that gateway, which was not tested); that is the only recovery
+> observed and is NOT a recommended procedure (restarting only the gateway, or
+> only the agent, was not tested). The gateway-side fix is tracked in #1197;
+> this note will be revised when it ships.
 
 ---
 
