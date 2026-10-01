@@ -2440,6 +2440,23 @@ test('gateway build wrapper',
   timeout: 180,
 )
 
+# Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
+# run under sh against fake facts, and the gateway crash signatures in
+# scripts/ci/qa-stack.sh. Hermetic, no Docker; the cases that need a POSIX sh
+# skip themselves on Windows.
+test('gateway abi-guard',
+  _python3_test,
+  args: [files('test_gateway_abi_guard.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('qa-stack gateway crash signatures',
+  _python3_test,
+  args: [files('test_qa_stack_crash_pat.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
