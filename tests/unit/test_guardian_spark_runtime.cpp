@@ -6122,16 +6122,21 @@ TEST_CASE("rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key 
     REQUIRE(gen);
     // attach_rule() waits only on r2's own arm claim on /b, which is queued behind /b's
     // retained disarm. The /a prior-generation disarm is submitted off-lock as a separate
-    // task and nothing in attach_rule() waits on it, so it can still be in flight here
-    // (reproduced deterministically by delaying that one disarm). Wait for both disarms
-    // to land and both claim queues to drain before asserting on their effects.
-    REQUIRE(yuzu::test::spin_until(
+    // task and nothing in attach_rule() waits on it, so it can still be in flight here.
+    // Wait for both disarms to land and both claim queues to drain before asserting on
+    // their effects.
+    const bool disarms_landed = yuzu::test::spin_until(
         [&] {
             return b->disarms.load() == 2 &&
                    rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0 &&
                    rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))) == 0;
         },
-        std::chrono::seconds(10)));
+        std::chrono::seconds(10));
+    // Sampled after the wait so a timeout reports where it got stuck.
+    INFO("disarms=" << b->disarms.load()
+                    << " depth(/a)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/a")))
+                    << " depth(/b)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))));
+    REQUIRE(disarms_landed);
     CHECK(b->disarms.load() == 2);
     CHECK(b->arms.load() == 3);
     REQUIRE(b->armed_ids().size() == 3);
@@ -10207,6 +10212,15 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id target
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
                                        std::chrono::seconds(10)));
         CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    } else {
+        // Armed: the arm already committed before attach_rule() returned, so there is no
+        // receipt to poll. The commit evidence the Accepted branch gets from its receipt
+        // comes from the outcome instead: a real generation was assigned, and rule r1 is
+        // registered as the committed generation (rule_active_for_test() is nullopt for
+        // an uncommitted or absent rule).
+        CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed);
+        CHECK(res2->generation != 0);
+        CHECK(rt->rule_active_for_test("r1").has_value());
     }
     REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));

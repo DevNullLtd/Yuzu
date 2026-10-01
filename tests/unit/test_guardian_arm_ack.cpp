@@ -21,9 +21,11 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <variant>
 
 using namespace yuzu::agent;
 namespace gpb = ::yuzu::guardian::v1;
@@ -64,9 +66,31 @@ struct FakeBackend : ISparkBackend {
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
     bool released_{false};
+    // Per-path single-shot gates (all guarded by gate_mu_), independent of the global
+    // gate above: lets a test park a SECOND arm and release it alone while an earlier
+    // arm stays parked on the global gate (e.g. a still-wedged r1). Checked BEFORE the
+    // global gate, so a path-gated arm never consumes hang_next_arm.
+    std::set<std::string> hang_paths_;
+    std::set<std::string> entered_paths_;
+    std::set<std::string> released_paths_;
 
-    std::expected<std::uint64_t, std::string> arm(const SparkSpec&) override {
-        if (hang_next_arm.exchange(false) || hang_every_arm.load()) {
+    /// accept()'s precondition: an arm that could resolve (success OR fail_arm) on
+    /// the worker before attach_rule(NonWaiting) re-checks the claim may legitimately
+    /// return Armed or a failure instead of Accepted. So every fresh (non-Reobserved)
+    /// accept() must be preceded by arming a gate whose release it controls.
+    std::expected<std::uint64_t, std::string> arm(const SparkSpec& spec) override {
+        const auto* file = std::get_if<FileSparkParams>(&spec.params);
+        bool path_gated = false;
+        if (file) {
+            std::unique_lock<std::mutex> lk{gate_mu_};
+            if (hang_paths_.erase(file->path) > 0) {
+                path_gated = true;
+                entered_paths_.insert(file->path);
+                gate_cv_.notify_all();
+                gate_cv_.wait(lk, [this, file] { return released_paths_.contains(file->path); });
+            }
+        }
+        if (!path_gated && (hang_next_arm.exchange(false) || hang_every_arm.load())) {
             std::unique_lock<std::mutex> lk{gate_mu_};
             entered_hang_ = true;
             ++parked;
@@ -87,10 +111,43 @@ struct FakeBackend : ISparkBackend {
         std::unique_lock<std::mutex> lk{gate_mu_};
         return gate_cv_.wait_for(lk, timeout, [this, n] { return parked.load() >= n; });
     }
+    /// Releases the global gate AND every armed or parked per-path gate - the
+    /// teardown-safe "let every worker go" call every Cleanup guard relies on.
     void release_hang() {
         {
             std::lock_guard<std::mutex> lk{gate_mu_};
             released_ = true;
+            released_paths_.insert(entered_paths_.begin(), entered_paths_.end());
+            released_paths_.insert(hang_paths_.begin(), hang_paths_.end());
+        }
+        gate_cv_.notify_all();
+    }
+    /// Re-arms the global gate after a previous release_hang(): without this, a
+    /// second wait_entered_hang()/release_hang() pair passes trivially (both flags
+    /// are still true) and hang_next_arm, being single-shot, no longer parks
+    /// anything. Only valid while nothing is parked on the global gate.
+    void reset_hang() {
+        std::lock_guard<std::mutex> lk{gate_mu_};
+        entered_hang_ = false;
+        released_ = false;
+    }
+
+    /// Per-path gate: the NEXT arm() of `path` parks until release_path(path) (or
+    /// release_hang()). Re-armable - clears any earlier entered/released state.
+    void hang_next_arm_on(const std::string& path) {
+        std::lock_guard<std::mutex> lk{gate_mu_};
+        hang_paths_.insert(path);
+        entered_paths_.erase(path);
+        released_paths_.erase(path);
+    }
+    bool wait_entered_path(const std::string& path, std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> lk{gate_mu_};
+        return gate_cv_.wait_for(lk, timeout, [this, &path] { return entered_paths_.contains(path); });
+    }
+    void release_path(const std::string& path) {
+        {
+            std::lock_guard<std::mutex> lk{gate_mu_};
+            released_paths_.insert(path);
         }
         gate_cv_.notify_all();
     }
@@ -459,6 +516,16 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     // Omitting the out-param entirely (every pre-existing call site) must remain
     // valid and behave exactly as before - the default is nullptr, checked before
     // every increment.
+    //
+    // Re-arm the backend exactly like r1's half: hang_next_arm was consumed by r1,
+    // fail_arm is still set, and the global gate's entered/released flags are still
+    // true - without this reset r2's arm fails on the worker straight away, racing
+    // accept()'s Accepted expectation (the flake seen on macOS CI), and the
+    // wait_entered_hang()/release_hang() pair below passes trivially.
+    b->fail_arm.store(false);
+    b->reset_hang();
+    b->hang_next_arm.store(true);
+    yuzu::test::ScopeExit release_guard{[&] { b->release_hang(); }};
     GuardianArmAckLedger ledger2;
     ledger2.begin_application(2, std::string(64, 'e'), false, 1);
     auto receipt2 = accept(*rt, "r2");
@@ -467,6 +534,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
     b->fail_arm.store(true);
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt2); }, std::chrono::seconds(10)));
+    REQUIRE(rt->receipt_status(receipt2) == GuardianSparkRuntime::ReceiptStatus::Failed);
     CHECK(ledger2.drain_locked(*rt, 10) == 1); // no third argument - must not crash
 }
 
@@ -991,14 +1059,18 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-wa
     auto r1 = accept(*rt, "r1", "/a");
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
-    // r2: a DIFFERENT, distinct-key rule whose backend call refuses IMMEDIATELY (no
-    // hang at all - hang_next_arm was already consumed by r1's own call above, so
-    // this one proceeds straight to the fail_arm check) - a genuine, ordinary
-    // (non-Wedged) BackendRefused failure. R5.3's "K is not a generation-wide
-    // liveness bound": a sibling's ordinary refusal must hold the generation
-    // regardless of r1's own reapply count.
+    // r2: a DIFFERENT, distinct-key rule whose backend call refuses as soon as it is
+    // let go - a genuine, ordinary (non-Wedged) BackendRefused failure, resolved well
+    // before any expiry pass runs. R5.3's "K is not a generation-wide liveness
+    // bound": a sibling's ordinary refusal must hold the generation regardless of
+    // r1's own reapply count. It parks on its OWN per-path gate first (r1 still holds
+    // the global one) so accept() sees Accepted deterministically - an unparked
+    // refusal can resolve on the worker before attach_rule(NonWaiting) returns.
     b->fail_arm.store(true);
+    b->hang_next_arm_on("/b");
     auto r2 = accept(*rt, "r2", "/b");
+    REQUIRE(b->wait_entered_path("/b", std::chrono::seconds(30)));
+    b->release_path("/b");
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
     CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Failed);
 
@@ -1018,12 +1090,15 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-wa
     // Drive reapply_count to K: r1's claim is Reobserved each time (still the same
     // retained-wedge head); r2's rule_id gets a brand-new claim each time (its prior
     // one already resolved and popped) - fail_arm is still set, so each fresh r2
-    // attach refuses again immediately, matching "the same rule keeps failing every
-    // push" exactly.
+    // attach refuses again as soon as its per-path gate is released, matching "the
+    // same rule keeps failing every push" exactly.
     for (int i = 0; i < 3; ++i) {
         ledger.begin_application(1, digest, false, 2);
         auto re_r1 = accept(*rt, "r1", "/a"); // Reobserved
-        auto re_r2 = accept(*rt, "r2", "/b"); // fresh claim, refuses again
+        b->hang_next_arm_on("/b");            // parked, as above, then refuses again
+        auto re_r2 = accept(*rt, "r2", "/b"); // fresh claim
+        REQUIRE(b->wait_entered_path("/b", std::chrono::seconds(30)));
+        b->release_path("/b");
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r1", re_r1);
@@ -1071,7 +1146,12 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     CHECK(ledger.reapply_count_for_test() == 0);
     b->fail_arm.store(true);
     {
+        // Parked on its per-path gate first so accept() sees Accepted deterministically
+        // (an unparked refusal can resolve before attach_rule(NonWaiting) returns).
+        b->hang_next_arm_on("/b");
         auto r2 = accept(*rt, "r2", "/b");
+        REQUIRE(b->wait_entered_path("/b", std::chrono::seconds(30)));
+        b->release_path("/b");
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r2", r2);
@@ -1088,7 +1168,10 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     for (int i = 1; i <= 3; ++i) {
         ledger.begin_application(1, digest, false, 1);
         CHECK(ledger.reapply_count_for_test() == static_cast<std::size_t>(i));
+        b->hang_next_arm_on("/b");
         auto re_r2 = accept(*rt, "r2", "/b");
+        REQUIRE(b->wait_entered_path("/b", std::chrono::seconds(30)));
+        b->release_path("/b");
         REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
                                        std::chrono::seconds(10)));
         ledger.add_pending("r2", re_r2);
@@ -1106,7 +1189,13 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrel
     b->hang_next_arm.store(true);
     auto r1 = accept(*rt, "r1", "/a");
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    // r2 succeeds this time - still parked first (its own gate; r1 keeps the global
+    // one), since an unparked success can resolve before attach_rule(NonWaiting)
+    // returns and come back Armed rather than Accepted.
+    b->hang_next_arm_on("/b");
     auto r2 = accept(*rt, "r2", "/b");
+    REQUIRE(b->wait_entered_path("/b", std::chrono::seconds(30)));
+    b->release_path("/b");
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
     CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Committed);
 
