@@ -422,8 +422,14 @@ _AGENT_REF = _mod.AGENT_REF_SPEC
 _C1, _C2, _C3 = ("t1", "f.cpp", "1"), ("t2", "f.cpp", "2"), ("t3", "f.cpp", "3")
 
 
+def _sp(i):
+    """Shard i's fixture spec: a valid tag spec ending with the reference suffix
+    (the shape the real meson specs have, and what check_agent_shard_suffix pins)."""
+    return f"[s{i}]{_AGENT_REF}"
+
+
 def _agent_tests(n=3):
-    return [_agent_entry(f"agent unit tests shard {chr(65 + i)}", f"[s{i}]") for i in range(n)]
+    return [_agent_entry(f"agent unit tests shard {chr(65 + i)}", _sp(i)) for i in range(n)]
 
 
 def _run_main_agent(tests, cases_by_spec):
@@ -457,14 +463,14 @@ def test_agent_parse_entries(failures):
 
 
 def test_agent_partition_clean(failures):
-    cases = {_AGENT_REF: {_C1, _C2, _C3}, "[s0]": {_C1}, "[s1]": {_C2}, "[s2]": {_C3}}
+    cases = {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1}, _sp(1): {_C2}, _sp(2): {_C3}}
     rc, out = _run_main_agent(_agent_tests(), cases)
     check(rc == 0, "agent exact partition: rc 0", failures)
     check("A=1" in out and "B=1" in out and "C=1" in out and "::notice::" in out,
           "agent exact partition: per-shard case counts printed as a ::notice::", failures)
     check("3 agent shards, 3 cases" in out, "agent exact partition: summary line", failures)
     entries = [(n, "/fake/agent_exe", sp) for n, sp in
-               (("A", "[s0]"), ("B", "[s1]"), ("C", "[s2]"))]
+               (("A", _sp(0)), ("B", _sp(1)), ("C", _sp(2)))]
     ok, msgs, stats = _mod.check_partition(
         entries, lambda e, sp: cases[sp], ref_spec=_AGENT_REF, label=_mod.AGENT_LABEL)
     check(ok and stats == {"shard_count": 3, "case_count": 3},
@@ -472,13 +478,13 @@ def test_agent_partition_clean(failures):
 
 
 def test_agent_partition_duplicate(failures):
-    cases = {_AGENT_REF: {_C1, _C2, _C3}, "[s0]": {_C1, _C2}, "[s1]": {_C2}, "[s2]": {_C3}}
+    cases = {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1, _C2}, _sp(1): {_C2}, _sp(2): {_C3}}
     rc, out = _run_main_agent(_agent_tests(), cases)
     check(rc == 1 and "appears in BOTH" in out, "agent duplicate: fails with the BOTH message", failures)
 
 
 def test_agent_partition_missing(failures):
-    cases = {_AGENT_REF: {_C1, _C2, _C3}, "[s0]": {_C1}, "[s1]": {_C2}}
+    cases = {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1}, _sp(1): {_C2}}
     rc, out = _run_main_agent(_agent_tests(2), cases)
     check(rc == 1 and "in NO agent-shard shard" in out,
           "agent missing: a case in no shard fails with the NO-shard message", failures)
@@ -488,7 +494,7 @@ def test_agent_partition_hidden_leak(failures):
     # A shard that matches a case outside the reference set (the hidden `[.]`
     # / [tsan-heavy] leak shape an unsuffixed inclusion term produces).
     leak = ("hidden exploratory", "g.cpp", "7194")
-    cases = {_AGENT_REF: {_C1, _C2, _C3}, "[s0]": {_C1, leak}, "[s1]": {_C2}, "[s2]": {_C3}}
+    cases = {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1, leak}, _sp(1): {_C2}, _sp(2): {_C3}}
     rc, out = _run_main_agent(_agent_tests(), cases)
     check(rc == 1 and "not in the '~[.]~[tsan-heavy]~[flaky-4086]' reference set" in out
           and "hidden exploratory" in out,
@@ -496,14 +502,14 @@ def test_agent_partition_hidden_leak(failures):
 
 
 def test_agent_partition_zero_case_shard(failures):
-    cases = {_AGENT_REF: {_C1, _C2}, "[s0]": {_C1}, "[s1]": {_C2}, "[s2]": set()}
+    cases = {_AGENT_REF: {_C1, _C2}, _sp(0): {_C1}, _sp(1): {_C2}, _sp(2): set()}
     rc, out = _run_main_agent(_agent_tests(), cases)
     check(rc == 1 and "matched ZERO cases" in out,
           "agent zero-case shard: fails with 'matched ZERO cases'", failures)
 
 
 def test_agent_hollow_discovery(failures):
-    cases = {_AGENT_REF: {_C1}, "[s0]": {_C1}}
+    cases = {_AGENT_REF: {_C1}, _sp(0): {_C1}}
     rc, out = _run_main_agent(_agent_tests(1), cases)
     check(rc == 1 and "hollow discovery" in out, "agent hollow (1 entry): fails loud", failures)
     rc, out = _run_main_agent([], cases)
@@ -512,11 +518,74 @@ def test_agent_hollow_discovery(failures):
 
 def test_agent_missing_allow_no_tests(failures):
     tests = _agent_tests()
-    tests[1] = _agent_entry("agent unit tests shard B", "[s1]", extra_args=())
-    cases = {_AGENT_REF: {_C1, _C2, _C3}, "[s0]": {_C1}, "[s1]": {_C2}, "[s2]": {_C3}}
+    tests[1] = _agent_entry("agent unit tests shard B", _sp(1), extra_args=())
+    cases = {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1}, _sp(1): {_C2}, _sp(2): {_C3}}
     rc, out = _run_main_agent(tests, cases)
     check(rc == 1 and "shard B" in out and "--allow-running-no-tests" in out,
           "agent flag: a shard without --allow-running-no-tests fails and is named", failures)
+
+
+def _agent_clean_cases():
+    return {_AGENT_REF: {_C1, _C2, _C3}, _sp(0): {_C1}, _sp(1): {_C2}, _sp(2): {_C3}}
+
+
+def test_agent_shard_names(failures):
+    # Red: a duplicate name, and a name contained in another (the retired bare
+    # 'agent unit tests' name is the realistic shape). Green: the real shape.
+    dup = _agent_tests()
+    dup[1] = _agent_entry("agent unit tests shard A", _sp(1))
+    rc, out = _run_main_agent(dup, _agent_clean_cases())
+    check(rc == 1 and "share the name" in out and "shard A" in out,
+          "agent names: two equal entry names fail and are named", failures)
+    sub = _agent_tests()
+    sub[0] = _agent_entry("agent unit tests", _sp(0))
+    rc, out = _run_main_agent(sub, _agent_clean_cases())
+    check(rc == 1 and "is a substring of" in out and "'agent unit tests'" in out,
+          "agent names: a name contained in another entry's name fails and is named", failures)
+    rc, _out = _run_main_agent(_agent_tests(), _agent_clean_cases())
+    check(rc == 0, "agent names: A/B/C (shared prefix, no containment) pass", failures)
+
+
+def test_agent_shard_suffix_pin(failures):
+    # Red: the whole spec loses the suffix (meson-side drift), and ONE comma term
+    # of a multi-term spec loses it (a partial edit). Green: every term ends with it.
+    drift = _agent_tests()
+    drift[0] = _agent_entry("agent unit tests shard A", "[s0]~[.]~[tsan-heavy]")
+    rc, out = _run_main_agent(drift, _agent_clean_cases())
+    check(rc == 1 and "does not end with the reference suffix" in out,
+          "agent suffix pin: a spec missing ~[flaky-4086] fails", failures)
+    two = _agent_tests()
+    two[0] = _agent_entry("agent unit tests shard A", f"[s0]{_AGENT_REF},[s9]")
+    rc, out = _run_main_agent(two, _agent_clean_cases())
+    check(rc == 1 and "'[s9]'" in out,
+          "agent suffix pin: one comma term without the suffix fails and is named", failures)
+    green_spec = f"[s0]{_AGENT_REF},[s9]{_AGENT_REF}"
+    two[0] = _agent_entry("agent unit tests shard A", green_spec)
+    green_cases = _agent_clean_cases()
+    green_cases[green_spec] = {_C1}
+    rc, _out = _run_main_agent(two, green_cases)
+    check(rc == 0, "agent suffix pin: every comma term suffixed passes", failures)
+
+
+def test_agent_shard_spec_shape(failures):
+    # Red: a name-pattern term is not strippable by the isolated retry. Green: the
+    # real shape (covered by every other agent test).
+    bad = _agent_tests()
+    bad[2] = _agent_entry("agent unit tests shard C", "some case name" + _AGENT_REF)
+    rc, out = _run_main_agent(bad, _agent_clean_cases())
+    check(rc == 1 and "CATCH2_TAG_SPEC" in out,
+          "agent spec shape: a spec flake-retry cannot strip fails", failures)
+
+
+def test_catch2_tag_spec_matches_flake_retry(failures):
+    # The checker's CATCH2_TAG_SPEC is a copy (flake-retry.py is hyphenated); fail
+    # if the two patterns ever diverge.
+    fr_spec = importlib.util.spec_from_file_location(
+        "flake_retry_for_parity", os.path.join(HERE, "flake-retry.py"))
+    fr = importlib.util.module_from_spec(fr_spec)
+    fr_spec.loader.exec_module(fr)
+    check(fr.CATCH2_TAG_SPEC.pattern == _mod.CATCH2_TAG_SPEC.pattern,
+          "CATCH2_TAG_SPEC: checker copy equals flake-retry.py's pattern", failures)
 
 
 def test_default_family_is_server(failures):
@@ -576,6 +645,10 @@ def main():
     test_agent_partition_zero_case_shard(failures)
     test_agent_hollow_discovery(failures)
     test_agent_missing_allow_no_tests(failures)
+    test_agent_shard_names(failures)
+    test_agent_shard_suffix_pin(failures)
+    test_agent_shard_spec_shape(failures)
+    test_catch2_tag_spec_matches_flake_retry(failures)
     test_default_family_is_server(failures)
 
     if failures:

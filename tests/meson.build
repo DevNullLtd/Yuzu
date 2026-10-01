@@ -775,7 +775,7 @@ agent_test_exe = executable(
 # find a race with, so the cost buys no signal there, and its concurrent code paths are
 # line-covered by the sequential prune/page/gauge tests plus the cheap [tsan] cases below.
 # It keeps its OWN test() with its own budget (below) so a stall here cannot time out the
-# fast entry's other cases.
+# fast shards' other cases.
 #
 # The other two used to live here too - "concurrent pagers + a drainer" and QE-1 "concurrent
 # persist + page + prune + drain" - and were genuinely SQLite-bound: four to five threads
@@ -836,10 +836,14 @@ endif
 # ── Agent unit tests: 3 tag-partitioned shards (#5073) ───────────────────────
 # The single 'agent unit tests' entry (one Catch2 process, serial) was the
 # Windows suite's longest and had no headroom left: 2026-10-01 case-level sum
-# on real MSVC hardware (DGRHP, `-d yes`, 4134 cases) was ~221s against its
-# 240s budget, and CI had timed the entry out on Windows (12 of the 59 agent-
-# suite failures in the last 100 runs (#5073 CI analysis); the other 47 were ordinary test failures,
-# which sharding does not touch). It is now three entries over the SAME binary,
+# on real MSVC hardware (DGRHP, `-d yes`; 4134 cases in that timing record, while the
+# later partition proof on the same rig counted 4141 in the reference set below; the
+# 7-case gap is not explained here and was not re-run) was ~221s against its
+# 240s budget, and CI had timed the entry out on Windows: 12 of the 59 agent-suite
+# failures per the #5073 CI forensics over runs 2026-09-28..2026-10-01 (that per-job
+# table is kept outside the repo, so this figure cannot be re-derived from the tree);
+# the other 47 were ordinary test failures, which sharding does not touch. It is now
+# three entries over the SAME binary,
 # one positional tag spec each, so they run as concurrent OS processes.
 #
 # PARTITION RULE (shard order matters): a case runs in the LOWEST-numbered
@@ -848,15 +852,16 @@ endif
 # AND-NOT complement of every carved tag, so a NEW test, or a new tag, lands in
 # shard C automatically and can never be silently dropped (it can only drift
 # the balance). In Catch2 a ',' inside ONE spec is OR, adjacent `[a][b]` is AND,
-# `~` negates, and TWO positional specs are ANDed (never ORed): that is why
-# each shard is exactly ONE positional spec, and why a `--test-args '[tag]'`
-# appended by `meson test` ANDs onto the shard spec (see --allow-running-no-tests
-# below).
+# `~` negates, and a second positional spec is ANDed (never ORed) but, measured,
+# only onto the LAST comma-separated OR term: that is why each shard is exactly ONE
+# positional spec, and why a `--test-args '[tag]'` appended by `meson test` does NOT
+# AND against a whole comma-bearing shard (A and B); see --allow-running-no-tests
+# below for the measured effect.
 #
 # SUFFIX: every INCLUSION term carries `~[.]~[tsan-heavy]~[flaky-4086]`
 # (agent_shard_suffix), and the complement shard and the partition checker's
 # reference spec carry the same `~[.]` explicitly. An exclusion-only spec drops
-# hidden `[.]` cases by Catch2's own rule, but an inclusion term does NOT, so
+# hidden `[.]` cases by Catch2's own rule (Linux-verified), but an inclusion term does NOT, so
 # without the suffix a carved tag pulls in cases the old single entry never ran.
 # Linux, 2026-10-01: the one `[tsan-heavy]` case (test_guardian_spark_runtime.cpp
 # ~2721, tagged [runtime][liveness], both carved here) would run twice, here and in
@@ -866,7 +871,7 @@ endif
 # #ifdef _WIN32) carries [guard], which shard A carves, so there the suffix is what
 # keeps it out; that Windows leak was reasoned from the tags, NOT observed. The
 # `~[.]` on the complement is explicit because the exclusion-only hidden-case rule
-# was not reliably observed on real Windows hardware (comment above).
+# was not reliably observed on real Windows hardware (comment below).
 #
 # EXACTNESS IS PROVEN, BALANCE IS NOT: 'agent shard partition invariant' (below)
 # lists every shard with `--list-tests` against the real binary and fails on a
@@ -878,8 +883,12 @@ endif
 # MEASURED BALANCE (2026-10-01, case-sum predictions from per-case durations
 # joined to tags, not CI measurements): Linux ~[30.6, 29.4, 29.9]s, Windows
 # ~[74.0, 73.1, 74.2]s for A/B/C, against 89.9s / 221.3s for the old single
-# entry. Linux binary (4227 cases) at the same date: 539 / 482 / 3206 cases per
-# shard; measured wall on a quiet 32-core box, shards run 3-wide by `meson test`:
+# entry. Linux binary, cases in the reference set `~[.]~[tsan-heavy]~[flaky-4086]`:
+# 4228 re-counted at commit 79344ceae on 2026-10-01 (the 4227 / 3206 first recorded
+# here predates the [progress_listener] case, which lands in C): 539 / 482 / 3207 per
+# shard. Windows, same reference set, the author's run on the DGRHP rig (not re-run
+# since): 4141 = 539 / 564 / 3038. Measured wall on a quiet 32-core Linux box,
+# shards run 3-wide by `meson test`:
 # 29.9 / 30.8 / 32.0s, against 92.6s for the old single-spec run of the same
 # binary. Windows startup cost, and what concurrent shards cost each other under
 # CI's smaller pools, were not measured.
@@ -896,17 +905,29 @@ endif
 # tests in test_windows_optional_features_parsers.cpp land in C) but those C cases
 # are not real-DISM.
 #
-# --allow-running-no-tests on EVERY shard: the documented local practice
-# `meson test --suite agent --test-args '[tag]'` (see the BR4-005 notes below)
-# appends that tag as a SECOND positional spec, which Catch2 ANDs with the shard's
-# own, so a shard that holds none of the tag's cases would otherwise exit 2. A
-# genuinely empty shard is still caught loudly, by the checker's 'matched ZERO
-# cases' failure. flake-retry.py strips both the spec and this flag for an isolated
-# case retry.
+# --allow-running-no-tests on EVERY shard. What it does: `meson test --suite agent
+# --test-args '[tag]'` appends the tag as a SECOND positional spec, and the
+# comma-free shard C (the AND-NOT complement) ANDs it with its whole spec, so C
+# matches zero cases unless it holds the tag and would otherwise exit 2; the flag
+# is what stops that. What it does NOT make true: `--test-args '[tag]'` is NOT a
+# targeted run any more. The extra spec binds to the LAST OR term of A and B only,
+# so those shards list a widened or unrelated set, and a mistyped tag no longer
+# fails loudly (the old single entry matched zero cases and exited 2). Measured on
+# build-linux's yuzu_agent_tests at HEAD 79344ceae, 2026-10-01, `<shard spec>
+# '[nonexistent_zzz]' --list-tests --allow-running-no-tests`: A lists 319 cases, B
+# 437, C 0; A with '[spark]' appended lists 539. So `--test-args '[tag]'` is exact
+# only for shard C. For a targeted run call the binary directly,
+# `build-*/tests/yuzu_agent_tests '[tag]'` (docs/build-guide.md, "Direct binary
+# invocation"). A genuinely empty shard is still caught loudly by the checker's
+# 'matched ZERO cases' failure. flake-retry.py strips both the spec and this flag
+# for an isolated case retry.
 #
-# NAMES: 'agent unit tests' must not survive as a substring of any entry name:
-# flake-retry.py maps a junit name to its entry by LONGEST substring. suite
-# 'agent-shard' is what the checker discovers by; 'agent' is what CI selects
+# NAMES: no shard entry name may be a substring of another entry name, and no two
+# may be equal: flake-retry.py maps a junit name to its entry by LONGEST substring,
+# so a contained or duplicated name is attributed to the wrong entry. The shared
+# prefix 'agent unit tests' is fine (the longest match picks the right shard); the
+# checker enforces the no-substring/no-duplicate rule among the agent-shard entries.
+# suite 'agent-shard' is what the checker discovers by; 'agent' is what CI selects
 # (ci.yml/nightly.yml select `--suite agent` on every leg, never these names).
 #
 # [tsan-heavy] is ALWAYS excluded from the shards (previously only in a plain build) - see
@@ -921,6 +942,8 @@ endif
 # filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
 # unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
 # verified to work - see the header comment on the TEST_CASE for detail.
+# check-pg-shard-partition.py pins this same literal as AGENT_REF_SPEC and fails if any
+# shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
 agent_shard_a_tags = ['ack', 'actions', 'browser_policy', 'drain', 'execution_artifacts', 'guard', 'runtime']
 agent_shard_b_tags = ['agent', 'liveness', 'mechanism', 'trigger_engine']
@@ -948,12 +971,13 @@ foreach shard, spec : agent_shard_specs
     agent_test_exe,
     args: [spec, '--allow-running-no-tests'],
     suite: ['agent', 'agent-shard'],
-    # 240s per shard, unchanged from the old single entry. Do NOT lower it from the
-    # uncontended ~75s Windows prediction: docs/ci-architecture.md measures ~2.1x
-    # wall-time inflation under box-wide contention (server ~[pg] c0 289s -> c4 603s),
-    # which puts a 75s shard near 158s - past a 120s budget, and past the 80% warning
-    # line of a 180s one. At 240s the hang detector is the same as before with ~3x the
-    # headroom. A real hang is also bounded by the job-level timeouts.
+    # 240s per shard, unchanged from the old single entry; treat it as conservative
+    # headroom, not a measured need. Uncontended Windows is ~75s (a case-sum
+    # prediction), ~3x under 240s. The only measured contention figure is for SERVER
+    # `~[pg]` (c0 289s -> c4 603s, ~2.1x, across jobs, on the pre-#3443 combined step;
+    # docs/ci-architecture.md "Windows test-phase concurrency gate"); it has NOT been
+    # re-measured for agent shards, so do not size or lower this timeout from it. A
+    # real hang is also bounded by the job-level timeouts.
     timeout: 240,
     depends: agent_shard_deps,
   )
@@ -988,11 +1012,11 @@ if get_option('b_sanitize') != 'none'
   # weeks after #2345 merged, so it cannot have caused an incident that predates it. Both
   # incidents belonged to the two SQLite-bound [tsan-heavy] cases this entry ALSO held before
   # #4153 (below). This entry's own budget means a stall here times out AT ITS OWN BUDGET,
-  # classifiably, instead of either being absorbed into the fast suite's tight 240s
-  # ceiling (windows-asan's prior state, #4018) or dragging the whole fast suite down with it.
+  # classifiably, instead of either being absorbed into the (then single) fast entry's tight
+  # 240s ceiling (windows-asan's prior state, #4018) or dragging that whole entry down with it.
   # #4153 redesigned the OTHER two former [tsan-heavy] cases off real on-disk SQLite entirely
   # (an in-memory FakeJournalStore) and off the unbounded stop-flag race that caused #2345/
-  # #4018's stalls - they moved to [tsan] and now run in the fast entry above, in every build.
+  # #4018's stalls - they moved to [tsan] and now run in the fast shards above, in every build.
   # 600s here was ORIGINALLY sized off the measured ~480s (8-minute) stall when this entry held
   # all three cases; #4153 removed the two tests that stall belonged to, so #3848 alone now
   # runs against this budget with generous headroom (measured ~3s uncontended, within the ~4-15s
