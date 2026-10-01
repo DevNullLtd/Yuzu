@@ -75,15 +75,27 @@ struct EmitSilencer {
 };
 
 // Wall-clock policy for this file (#5173). A failing assertion must mean the code under
-// test is wrong, never that a loaded runner stalled the test thread. Two rules:
+// test is wrong, not that a loaded runner stalled the test thread. Two rules:
 //  * UPPER bounds (something must happen "within" N) are DEADLINES, not margins: a wait
 //    that returns the moment the event happens, so a green run pays nothing for a long
 //    bound. kEventDeadline is that bound for events that are really due in ~300 ms; it is
-//    the regression-detection latency only, never part of a pass. Scaled for sanitizers.
+//    the regression-detection latency only (a passing run does not wait it out; U9's wedged
+//    section also uses it as a hang detector). Scaled for sanitizers.
 //  * LOWER bounds (something must NOT happen before N) can only get safer under load. They
 //    are kept at a fraction of the nominal delay, so they also tolerate a coarse platform
 //    timer (MSVC's tick-granular waits can return up to one ~16 ms tick early).
-inline constexpr auto kEventDeadline = 10s * yuzu::test::kSpinScale;
+// Deliberately NOT converted (each documented where it sits): the 1100 ms sleeps in the U11
+// family (they must span a real 1 s throttle window and a stall only lengthens them); graces
+// of 2 s or more; the 100-500 ms "settle" sleeps, which wait for a thread to reach a point the
+// test cannot observe; and the concurrent real-teardown test that carries the production 2 s
+// hard_exit grace ("U10 (concurrent teardown)", distinct from the U4 title that also says
+// U10): converting it needs a production test seam for that grace, so a test-thread stall of
+// about 2 s there can still abort the binary.
+constexpr auto kEventDeadline = 10s * yuzu::test::kSpinScale; // PRE-SCALED: never hand this to
+                                                              // spin_until, which scales itself.
+// One coarse-timer tick (GetTickCount64, ~15.6 ms) plus millisecond truncation, with room to
+// spare. One-sided (lower bounds only), so a larger value costs nothing.
+constexpr auto kCoarseTimerTolerance = 50ms;
 } // namespace
 
 namespace {
@@ -471,8 +483,11 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     // sanitizer builds. RESIDUAL: a preemption of the drain thread for longer than the
     // settle, inside that window, is still possible; it surfaces as the
     // CHECK_FALSE(drain_done_before_release) below, not as a silent pass.
-    REQUIRE(yuzu::test::spin_until(
-        [&] { return drain_started.load(std::memory_order_acquire); }, 10s));
+    // NOT a REQUIRE here: drain_thread is joinable, and a throw would unwind past it into
+    // std::terminate() (this file's own cleanup-before-assert rule). The result is asserted
+    // after the unconditional cleanup below, next to REQUIRE(ok).
+    const bool drain_running = yuzu::test::spin_until(
+        [&] { return drain_started.load(std::memory_order_acquire); }, 10s);
     std::this_thread::sleep_for(500ms * yuzu::test::kSpinScale);
 
     std::mutex fired_mu;
@@ -516,7 +531,7 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     // blocked -- std::thread::~thread() on a joinable thread calls std::terminate(),
     // SIGABRTing the whole binary instead of failing this one test cleanly. Unwedge:
     // the drain thread's pending() check goes false and it returns (releasing its
-    // lease well before its own 2s bound), which lets teardown()'s
+    // lease well before its own 30s bound), which lets teardown()'s
     // wait_for_drain_quiescence() finally observe active_readers==0 and proceed.
     h.sink->release();
     drain_thread.join();
@@ -525,12 +540,13 @@ TEST_CASE("BLOCKER-1 regression: teardown()'s deadline watchdog still fires whil
     // Neither thread was left blocked on an unwatched join: both joined within this
     // test's own bounded waits above. Now safe to assert -- no joinable thread
     // remains for a throw to strand.
+    REQUIRE(drain_running);
     REQUIRE(ok);
     // LOWER bound only (see U5): grace/2 tolerates a coarse timer; the upper bound is the
     // kEventDeadline wait above, so `ok` is the assertion.
     CHECK(fired_after >= grace / 2);
     // The drain thread must NOT have completed before we released the sink above --
-    // it was still legitimately spinning inside its own 2s wait while the sink
+    // it was still legitimately spinning inside its own 30s wait while the sink
     // stayed wedged. This proves the interleaving this test exists to exercise was
     // genuinely live at the moment the watchdog fired, not accidentally avoided by
     // scheduling luck.
@@ -611,11 +627,13 @@ TEST_CASE("BLOCKER round-2 regression: teardown()'s deadline watchdog still fire
 
     // Upper bound = generous deadline, not a margin over `grace` (#5173; see U5).
     bool ok = false;
+    std::chrono::steady_clock::duration fired_after = std::chrono::steady_clock::duration::zero();
     {
         std::unique_lock<std::mutex> lk(fired_mu);
         ok = fired_cv.wait_for(lk, kEventDeadline, [&] { return fired; });
+        if (fired)
+            fired_after = fired_at - teardown_start; // read under fired_mu: no race on a timeout
     }
-    const auto fired_after = fired ? (fired_at - teardown_start) : std::chrono::steady_clock::duration::zero();
 
     // Cleanup runs UNCONDITIONALLY, before any assertion on `ok` -- see this
     // TEST_CASE's own header comment for why: a RED run must never leave an abandoned
@@ -767,7 +785,7 @@ TEST_CASE("U9: drain_log_bounded() delivers a pending breadcrumb when healthy, t
         h.handoff->logger()->info("pre-abort breadcrumb");
         // A long wait that a healthy drain never uses: it returns the moment the queue is
         // empty. "Returns promptly" is asserted as `elapsed < wait / 2`, scale-separated
-        // (microseconds against 15s); a drain that slept out its wait would miss it by
+        // (far less than 15s); a drain that slept out its wait would miss it by
         // 15s. The former 200ms wait / 250ms bound was a 50ms margin (#5173).
         constexpr auto kWait = 30s;
         const auto start = std::chrono::steady_clock::now();
@@ -798,7 +816,7 @@ TEST_CASE("U9: drain_log_bounded() delivers a pending breadcrumb when healthy, t
         const auto elapsed = std::chrono::steady_clock::now() - start;
 
         CHECK_FALSE(drained);
-        CHECK(elapsed >= kWait - 16ms);
+        CHECK(elapsed >= kWait - kCoarseTimerTolerance);
         CHECK(elapsed < kWait + kEventDeadline);
     }
 

@@ -15,24 +15,28 @@
 
 using namespace std::chrono_literals;
 
-// Timing policy (#5173). No assertion here depends on a wall-clock margin under ~1 s:
+// Timing policy (#5173). No UPPER bound here is a wall-clock margin under ~1 s:
 //  - Upper bounds are SCALE-SEPARATED: a 30 s grace asserted against `elapsed < grace / 2`
 //    (15 s). A loaded runner (observed: a 310 ms stall against a 250 ms bound on macOS)
 //    cannot cross that, while a wait that ignores the semaphore and sleeps out the whole
 //    grace (30 s) still fails it.
 //  - Lower bounds carry a one-tick tolerance. MSVC's std::binary_semaphore::try_acquire_for
 //    builds its deadline from GetTickCount64() (tick = ~15.6 ms), so it can return up to one
-//    tick EARLY against steady_clock (observed: 98.5 ms for a 100 ms wait). kTickTolerance
-//    is a little over one tick.
+//    tick EARLY against steady_clock (observed: 98.4-99.7 ms for a 100 ms wait). kTickTolerance
+//    is a little over one tick (the lower bounds below are one-sided, so extra room is free).
 //  - "Returned only after the release" is proven deterministically with a flag set before
 //    the release, not by elapsed time.
 // Only the never-released test actually waits a grace out, so its grace is kept short
 // (kShortGrace); its hang/ignore-the-grace failure mode is caught by a 30 s backstop.
-// The tick tolerance was reasoned from the MSVC STL source, not run on MSVC or macOS.
+// Confirmed on real MSVC (debug, Windows 11): the original `elapsed >= 100ms` failed 14 of
+// 200 runs at 98.4-99.7 ms. Not run on macOS.
+// Contract note: with the 15 s upper bound this file detects a wait that blocks or ignores the
+// grace, and a wait that returns early; it does NOT detect one that overshoots by a small
+// factor.
 namespace {
 constexpr auto kLongGrace = 30s;      // never waited out by a correct implementation
 constexpr auto kShortGrace = 250ms;   // waited out once, by the never-released test
-constexpr auto kTickTolerance = 20ms; // > one GetTickCount64 tick (15.6 ms)
+constexpr auto kTickTolerance = 50ms; // one GetTickCount64 tick (~15.6 ms) plus truncation, with room
 } // namespace
 
 TEST_CASE("wait returns true near-instantly when already released",
@@ -79,7 +83,7 @@ TEST_CASE("wait returns true once released mid-wait, bounded by the release not 
     CHECK(elapsed < kLongGrace / 2); // bounded by the release, not the grace
 }
 
-TEST_CASE("wait returns false and does not overshoot the grace when never released",
+TEST_CASE("wait returns false after the grace and neither returns early nor hangs when never released",
           "[service_completion]") {
     std::binary_semaphore done{0};
 
