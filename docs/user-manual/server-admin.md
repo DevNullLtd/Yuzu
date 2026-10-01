@@ -3153,10 +3153,14 @@ For stage 2, give both variables, separated by `\0`:
 
 Get these right, because several mistakes are silent:
 
-- **`reg add /f` replaces the whole value.** If the service already has an
-  `Environment` value, read it first with
-  `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`, and
-  give its entries again in the same command.
+- **`reg add /f` replaces the whole value, and it must stay `REG_MULTI_SZ`.** If
+  the service already has an `Environment` value, read it first with
+  `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`.
+  Give its other entries again in the same command, but leave out every existing
+  `YUZU_UPDATE_*` entry and write only the ones for the stage you want: two entries
+  with the same name, such as `=0` from a rollback and a new `=1`, leave it to the
+  order which one the agent sees. Group Policy Preferences or another tool must
+  write the value as a multi-string too.
 - **Names must be exact.** A misspelt name is ignored without any error, and
   signing then stays off. Run the check below after every change.
 - **`YUZU_UPDATE_REQUIRE_SIGNATURE` must be exactly `1`.** A value the agent cannot
@@ -3170,26 +3174,38 @@ Get these right, because several mistakes are silent:
   An upgrade or reinstall over an installed agent leaves the service's registry key
   alone. Uninstalling removes the service, and the value with it. That includes an
   SCCM or Intune deployment set to uninstall the previous version first. Set it
-  again after any uninstall.
+  again after any uninstall, and put the bundle file back if it is gone.
 - **Remove any signing flags you put in the binary path earlier.** A flag there
   takes precedence over the variable, until the next installer run silently drops it.
 - **Do not use `setx /M`.** Services inherit the machine environment from
   `services.exe`, which caches it at boot, so a machine variable is typically NOT
   visible to a merely-restarted service.
 
-To check an endpoint — it prints `OK` and exits 0 only when the bundle variable is
-set exactly and no signing flag is left in the binary path. Save it as a `.ps1` and
-run that, or use it as a configuration-management compliance script; pasted into an
-interactive PowerShell window, its `exit` closes the window:
+To check an endpoint, use the script below. It prints `OK` and exits 0 only when
+all of these hold:
+
+- the value is a multi-string;
+- its `YUZU_UPDATE_*` entries are exactly the ones for the stage set on its first
+  line, with no duplicates;
+- the bundle file exists;
+- no signing flag is left in the binary path.
+
+Save it as a `.ps1` and run that, or use it as a configuration-management
+compliance script, comparing its output with `OK`. Pasted into an interactive
+PowerShell window, its `exit` closes the window.
 
 ```powershell
+$stage = 1   # 2 once the endpoint also refuses unsigned packages
+$b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
+$want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
 $k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
-if (($k.Environment -ccontains 'YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem') -and ($k.ImagePath -notmatch '--update-')) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
+$have = @($k.Environment | Where-Object { $_ -like 'YUZU_UPDATE_*' })
+$ok = ($k.Environment -is [string[]]) -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and ($k.ImagePath -notmatch '--update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 ```
 
-Add `-and ($k.Environment -ccontains 'YUZU_UPDATE_REQUIRE_SIGNATURE=1')` once the
-endpoint is at stage 2. The check confirms the configuration only; it does not
-prove the agent read it. The agent does not yet log its signing mode at startup.
+The check confirms the configuration only. It does not prove the agent read it:
+the agent does not yet log its signing mode at startup.
 
 ### The verifier's catastrophic invariants
 

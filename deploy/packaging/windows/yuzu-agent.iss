@@ -571,7 +571,9 @@ begin
               'The update trust-anchor directory could not be verified, so the ' +
               'installation has been stopped rather than report it secured without ' +
               'having checked. Confirm manually that only Administrators and SYSTEM ' +
-              'have access to it, then re-run the installer.';
+              'have access to it, then re-run the installer. If the Yuzu Agent service ' +
+              'was running, it was stopped for the installation and has not been ' +
+              'restarted: run "sc start YuzuAgent".';
     Exit;
   end;
 
@@ -596,8 +598,9 @@ begin
               'trust bundle and authorise their own agent updates; while SYSTEM cannot ' +
               'read it, the agent cannot verify updates at all. Securing it did not take ' +
               'effect -- security software may have blocked it. The installation has ' +
-              'been stopped, and the Yuzu Agent service, stopped for it, has not been ' +
-              'restarted: run "sc start YuzuAgent" once this is resolved.';
+              'been stopped. If the Yuzu Agent service was running, it was stopped for ' +
+              'the installation and has not been restarted: run "sc start YuzuAgent" ' +
+              'once this is resolved.';
   end;
 end;
 
