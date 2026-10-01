@@ -512,7 +512,9 @@ begin
   begin
     Result := 'Could not create the update trust-anchor directory:' + #13#10 +
               CertDir + #13#10#13#10 +
-              'The installation has been stopped rather than continue without it.';
+              'The installation has been stopped rather than continue without it. If ' +
+              'the Yuzu Agent service was running, it was stopped for the installation ' +
+              'and has not been restarted: run "sc.exe start YuzuAgent".';
     Exit;
   end;
 

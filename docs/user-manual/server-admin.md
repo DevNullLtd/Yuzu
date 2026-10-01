@@ -3161,8 +3161,9 @@ Get these right, because several mistakes are silent:
   `YUZU_UPDATE_REQUIRE_SIGNATURE` entry and write only the ones for the stage you
   want: with two entries of the same name, such as `=0` from a rollback and a new
   `=1`, which one the agent sees is undefined. Group Policy Preferences or another
-  tool must write the value as a multi-string too, with **no empty entry**: the
-  service sees nothing after an empty entry.
+  tool must write the value as a properly terminated multi-string too, every
+  entry in `name=value` form and **no empty entry**: the service sees nothing
+  after an empty entry.
 - **Names must be exact.** A misspelt name is ignored without any error, and
   signing then stays off. Run the check below after every change.
 - **`YUZU_UPDATE_REQUIRE_SIGNATURE` must be exactly `1`.** A value the agent cannot
@@ -3182,9 +3183,11 @@ Get these right, because several mistakes are silent:
   the agent also accepts (and likewise for `--update-require-signature`). A flag
   there takes precedence over the variable, until the next installer run silently
   drops it.
-- **Do not use `setx /M`.** Services inherit the machine environment from
-  `services.exe`, which caches it at boot, so a machine variable is typically NOT
-  visible to a merely-restarted service.
+- **Do not set these variables machine-wide,** with `setx /M` or otherwise.
+  Services inherit the machine environment from `services.exe`, which caches it at
+  boot, so a machine variable is typically NOT visible to a merely-restarted
+  service. The service's own value overrides a machine variable of the same name,
+  and the check below reads only the service's own value.
 
 To check an endpoint, use the script below. Run it elevated, or as SYSTEM (as
 Intune and Configuration Manager compliance scripts run): the bundle directory is
@@ -3215,7 +3218,10 @@ if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 
 **What `OK` does and does not mean.** It means the service is configured the way
 this section describes. It is not proof that the agent loaded that configuration,
-because the agent does not yet log its signing mode at startup. It also does not
+because the agent does not yet log its signing mode at startup, and it assumes an
+agent recent enough to have these options (`yuzu-agent.exe --help` lists
+`--update-trust-bundle`). It does not validate the value's other entries, and it
+compares names case-insensitively, so type them in plain ASCII. It also does not
 check that the bundle file holds the right certificates: a wrong bundle makes the
 agent refuse signed updates, which shows in
 `yuzu_agent_ota_signature_refused_total` and the agent log.

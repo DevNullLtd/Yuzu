@@ -123,7 +123,7 @@ def problems(iss: str, md: str) -> list:
                         ("($Matches[1] -ne $Matches[2])", "two distinct accounts")):
         if needle not in verify:
             found.append(f"manual verify lost its {why}: {needle}")
-    if re.search(r"\bsc start YuzuAgent", iss):
+    if re.search(r"(?i)\bsc\s+start\b", iss):
         found.append("an abort message says `sc start`, which is Set-Content in Windows PowerShell 5.1; use sc.exe")
     body = pslit_body(iss)
     for ch in ("''''", "#$2018", "#$2019", "#$201A", "#$201B"):
