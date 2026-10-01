@@ -3041,7 +3041,15 @@ unfiltered.**
    its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
    unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
    the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
-   `tar_tree_routes.cpp` (×2).
+   `tar_tree_routes.cpp` (×2). #5047 added `AuthRoutes::require_tier_policy`'s
+   `actionable_permission` parameter — a THIRD shape, not a fourth call-site-by-call-site migration:
+   a single production factory, `AuthRoutes::gateless_tier_policy_fn()`, is the ONE place all 8
+   gate-less-route call sites (the 4 result-set REST write routes plus their 4 dashboard-fragment
+   twins) source their `TierPolicyFn` from, with `actionable_permission=false` baked in there once —
+   `require_permission`'s own call (RBAC-gated, the grant WOULD admit the caller) passes `true`
+   explicitly at its one call site. `actionable_permission` deliberately carries no default value,
+   so a future 9th gate-less caller cannot inherit `true` by omission the way the original violation
+   this clause exists to prevent did.
 
    **One known, tracked exception, not retroactively bound:** pre-existing
    `deny_fleet_wide_service_scoped` call sites that fire AFTER the route's own `perm_fn` already
@@ -3526,7 +3534,7 @@ this section does not restate them.
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
 - **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
-- **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
+- **Enrollment token persistence** — Postgres-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`, shared by every server replica), not per-replica `.cfg` files. `AuthManager`'s file mode is deleted, not deprecated: `consume_and_enroll` is a single guarded-UPDATE transaction (exactly-N winners across pooled connections AND across separate server processes — a max_uses=1 token race never double-accepts), and every enrollment/pending call fails CLOSED with no `AuthDB` attached. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported exactly once, at the first 6.2 boot, under a per-file content-fingerprint marker (`auth.import_meta`) that never resurrects an already-removed/denied/revoked row and refuses (never merges) a mismatched-fingerprint file; see `docs/adr/2002-high-availability-architecture.md` §8.
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
 
 ## Per-session peer binding and NAT-aware relaxation

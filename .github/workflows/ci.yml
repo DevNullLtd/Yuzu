@@ -1359,6 +1359,15 @@ jobs:
           YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
         run: bash tests/shell/test_mfa_reset.sh
 
+      # --generate-tokens CLI contract (WS-6 6.2) — same rationale as the
+      # break-glass CLI test above: exit codes + the stdout JSON scripting
+      # contract of `yuzu-server --generate-tokens` are not exercisable by the
+      # Catch2 suite (which does not drive main()).
+      - name: Generate-tokens CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_generate_tokens.sh
+
       # Fresh-install Administrator bootstrap: the fatal refusal when the config
       # lists local users but none has role=admin, and the durable
       # rbac.bootstrap.first_admin audit row on a successful bootstrap — neither

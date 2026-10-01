@@ -1,15 +1,16 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same twenty-three capability-declaration spans the production site
-// composes, for route-handler fixtures that must wire a `ClassifyFn`.
+// composed from the capability-declaration spans listed below (the production site
+// composes more: local_security_policy and privacy_permissions are still missing here, #5131),
+// for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
 // same fail-closed contract `McpServer::ClassifyFn` carries — an unwired
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the twenty-three-span composition is the drift a shared seam exists to
+// copy of the composition is the drift a shared seam exists to
 // remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.
@@ -36,6 +37,7 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
@@ -70,6 +72,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_browser_policy(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::plugin_action_catalogue_runtimes(),

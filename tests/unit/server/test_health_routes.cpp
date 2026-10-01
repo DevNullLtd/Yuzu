@@ -445,6 +445,10 @@ TEST_CASE("health_routes: GET /health with a session gets the heavier "
     CHECK(h.resolve_session_fn_called);
     auto body = json::parse(r->body);
     CHECK(body["agents"].contains("pending"));
+    // WS-6 6.2: this harness's AuthManager has no AuthDB attached, so the pending
+    // count is UNKNOWN (JSON null) — never a `0` that reads as "nothing awaiting
+    // approval" when the enrollment store could not be read.
+    CHECK(body["agents"]["pending"].is_null());
     CHECK(body.contains("executions"));
     CHECK(body.contains("system"));
 }
