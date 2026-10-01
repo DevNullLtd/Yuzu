@@ -1744,9 +1744,9 @@ if build_server
   # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear as POSITIONAL args (flake-retry.py
-  #     strips positional tag specs before an isolated case retry — Catch2 ORs
-  #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
-  #     inside a single arg; multiple positional args would AND, not OR).
+  #     strips positional tag specs before an isolated case retry). Each [pg]
+  #     half is ONE comma-OR spec (Catch2 ORs inside a single arg; multiple
+  #     positional args AND, not OR).
   #     Catch2 OPTION flags (--long form, e.g. --allow-running-no-tests on an
   #     all-skip-on-macOS shard) are permitted: they are not positional, so
   #     the selftest exempts them from the tag-spec pin, and the whole-shard
