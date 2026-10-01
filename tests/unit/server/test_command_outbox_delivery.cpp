@@ -738,3 +738,90 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine dispatch whose target-count writ
     CHECK(after->agents_targeted == 0); // never written — rolled back with the sent-transition
     CHECK(after->status == "running");
 }
+
+// governance Gate 4 fix (unhappy-path, BLOCKING, independently discovered second
+// path to the Gate 2 false-cancel class): the round-6 test above proves a genuine
+// sent>0 dispatch whose target-count write fails rolls BOTH writes back, re-driving
+// the occurrence next tick. This test proves the NEXT tick's own sent==0 branch
+// correctly declines to cancel when the execution_id already carries a real
+// agent_exec_status response from that earlier, genuinely-dispatched attempt --
+// reproducing the scenario directly (seed a real response, then redrive to
+// sent==0) rather than orchestrating the full two-tick rollback sequence.
+TEST_CASE("CommandOutboxDelivery[pg]: a redrive to sent==0 does NOT cancel an "
+          "execution that already has a real agent_exec_status response from an "
+          "earlier dispatch attempt (governance Gate 4 fix)",
+          "[command_outbox][pg][delivery][4982]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    // Seed a REAL agent response, as if an earlier dispatch attempt genuinely
+    // reached this agent before this occurrence's bookkeeping write failed and
+    // rolled back (round 3's own atomic rollback-on-degrade design).
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.first_response_at = 1001;
+    as.completed_at = 1002;
+    as.exit_code = 0;
+    tracker.update_agent_status(*exec_id, as);
+
+    auto req = fx.req("occ-redrive-zero", "cmd-redrive-zero");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    yuzu::MetricsRegistry metrics;
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.metrics = &metrics;
+    d.dispatch_fn = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&, const DispatchCaller&, const std::string&) {
+        return ConfinedDispatchOutcome{}; // sent==0 — the redrive's current zero-reach
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    // mark_cancelled must NEVER have been called — the row stays 'running', not
+    // 'cancelled', and no bookkeeping-failure metric fires (the guard short-
+    // circuits before mark_cancelled is ever reached, it is not a failed call).
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "running");
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+              .value() == 0.0);
+
+    // The genuine response is still there, untouched.
+    auto statuses = tracker.get_agent_statuses(*exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "success");
+
+    // The occurrence itself still reaches a terminal outbox state (sent==0 is a
+    // real, distinct outcome from a bookkeeping decision) — this fix only changes
+    // whether the EXECUTION gets force-cancelled, not the outbox's own bookkeeping.
+    CHECK(fx.raw_state("occ-redrive-zero") == "sent");
+}

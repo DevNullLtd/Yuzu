@@ -223,6 +223,26 @@ separately.
 
 ## Upgrade Notes
 
+### vNEXT — a new always-on background sweep auto-cancels executions already stuck at `running` (#4982, NOT breaking)
+
+**What changed.** A new clock-guarded background pass, `ExecutionTracker::reap_stuck_running_executions`
+(~15-minute cadence, no CLI flag or env var — same unconfigurable-by-design posture as its
+sibling reapers), recovers an execution row left permanently stranded at `status='running'`
+because a post-dispatch bookkeeping write (`set_agents_targeted`/`mark_cancelled`) itself failed.
+It excludes any execution with a still-pending outbox entry or with at least one real per-agent
+response already recorded — only a genuinely-orphaned row (never reached, or genuinely abandoned
+by a dispatch that failed its own cleanup) is cancelled.
+
+**What an operator sees on this upgrade.** Any execution rows ALREADY stranded at `running`
+before this build started will auto-cancel within roughly 15–30 minutes of the first post-upgrade
+tick that reaches them, each writing a new `execution.cancel` audit row with `principal="system"`
+— the first system-sourced row that action has ever carried; a SIEM rule or dashboard filter keyed
+only on human/session principals for `execution.cancel` will not see these. This is a one-time
+settling period for pre-existing stuck rows, not an ongoing behaviour change for new dispatches.
+See `docs/user-manual/metrics.md` "Execution bookkeeping + stuck-execution reap metrics" for the
+new `yuzu_exec_tracker_stuck_reap_total{outcome}` counter and `docs/clock-guarded-retention.md`
+for the full design.
+
 ### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
 
 **What changed.** On every boot (not only first boot), the server checks the loaded config's local

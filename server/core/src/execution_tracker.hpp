@@ -797,6 +797,19 @@ public:
     /// #4982 bug — a synchronous REST/MCP dispatch whose OWN `mark_cancelled`
     /// call itself failed), the row is fair game.
     ///
+    /// A SECOND false-positive this sweep must not act on (governance Gate 2
+    /// fix, BLOCKING, empirically reproduced): a dispatch that genuinely
+    /// reached one or more agents, with real responses recorded in
+    /// `agent_exec_status` via `update_agent_status` — independently of
+    /// `agents_targeted` — but whose OWN `set_agents_targeted` bookkeeping
+    /// write failed. The candidate query ALSO excludes every `execution_id`
+    /// with at least one `agent_exec_status` row (`kNoAgentResponseExistsClause`,
+    /// execution_tracker.cpp) — a real agent response means this is a
+    /// genuinely-working dispatch, never a candidate for this sweep, even
+    /// though `agents_targeted` stays 0 forever (there is no repair path
+    /// today that re-derives it from `agent_exec_status`). The ORIGINAL
+    /// orphan population above (zero agent_exec_status rows) is unaffected.
+    ///
     /// Clock-guarded-retention shape mirrors `reap_command_execution_mappings`
     /// for the anchor/anomaly half (advisory lock as its own statement, one
     /// in-SQL DB `now()` read, persisted+sanitised `reap_meta` anchor keyed
@@ -843,7 +856,9 @@ public:
     /// The actual cancellation is an ATOMIC, in-transaction
     /// `UPDATE ... RETURNING id` (fix round 2 TOCTOU close) that RE-CHECKS the
     /// full candidate predicate (`status='running' AND agents_targeted=0 AND
-    /// NOT EXISTS <pending outbox row>`) at mutation time, in the SAME
+    /// NOT EXISTS <pending outbox row> AND NOT EXISTS <agent_exec_status row>`
+    /// — the third clause is the governance Gate 2 BLOCKING fix above) at
+    /// mutation time, in the SAME
     /// lock-held transaction as the candidate SELECT and would-wipe check —
     /// NOT a separate post-commit `mark_cancelled()` call the way every other
     /// terminal transition in this file makes one. `RETURNING id` reports

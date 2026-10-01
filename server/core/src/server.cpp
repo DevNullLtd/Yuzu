@@ -3178,7 +3178,14 @@ public:
         // command_outbox_delivery.cpp — three more dispatch/redispatch
         // surfaces than the original REST/MCP pair. `surface` widens to 5
         // values (rest|mcp|workflow|schedule|outbox); 2 ops x 5 surfaces = 10
-        // series.
+        // pre-seeded series, but {op=set_agents_targeted,surface=outbox}
+        // (governance Gate 4 finding, happy-path) can fire on neither success
+        // nor failure and reads 0 forever by construction, not drift:
+        // command_outbox_delivery.cpp's set_agents_targeted write moved into
+        // the atomic CommandDeliveryFinalizationOwner::mark_sent_with_target,
+        // whose own failure counts via the pre-existing
+        // yuzu_server_command_outbox_deliver_degrade_total instead. 9 of the
+        // 10 pre-seeded series are reachable.
         metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
                           "failed (pool exhaustion or a failed statement) at a dispatch call "
@@ -16313,6 +16320,19 @@ private:
                                         std::chrono::duration_cast<std::chrono::seconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
+                                    // governance Gate 6 fix (sre, HIGH): a degraded audit
+                                    // pool makes every log() call wait out the full
+                                    // kWriteTimeout (4s) before failing — up to 500
+                                    // sequential calls on a capped pass could stall THIS
+                                    // thread (which also runs poll_event_outbox_once's
+                                    // every-tick cross-replica SSE delivery and the
+                                    // sibling reaps) for ~33 minutes. A pool-exhaustion
+                                    // timeout does not recover call-to-call, so break on
+                                    // the FIRST failure rather than retrying the same
+                                    // degraded pool up to 500 times; the audit gap itself
+                                    // is already counted (AuditStore::log increments
+                                    // yuzu_server_audit_emit_failed_total internally) and
+                                    // the store-degrade metric below.
                                     for (const auto& cancelled_id : reaped->cancelled_ids) {
                                         AuditEvent ev;
                                         ev.timestamp = audit_now_s;
@@ -16322,7 +16342,15 @@ private:
                                         ev.target_id = cancelled_id;
                                         ev.detail = "reap_stuck_running_executions";
                                         ev.result = "success";
-                                        (void)audit_store_->log(ev);
+                                        if (!audit_store_->log(ev)) {
+                                            spdlog::warn(
+                                                "stuck-execution reap: audit write failed for "
+                                                "execution_id={} -- stopping this pass's audit "
+                                                "loop early (degraded pool), remaining "
+                                                "cancellations in this pass are unaudited",
+                                                cancelled_id);
+                                            break;
+                                        }
                                     }
                                 }
                             } else {

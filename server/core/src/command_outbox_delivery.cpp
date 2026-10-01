@@ -346,10 +346,18 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //    committed and one not yet) and force-cancel a live, still-executing
     //    command with no kill RPC ever sent (see that method's own doc
     //    comment). Every other case — `sent==0`, or no execution row to
-    //    bookkeep at all — keeps the plain autocommit `mark_sent`: a
-    //    `sent==0` occurrence never had a live agent execution to falsely
-    //    kill, so an early reaper cancel racing the `mark_cancelled` call
-    //    below is harmless (both converge on `cancelled`; `mark_cancelled`'s
+    //    bookkeep at all — keeps the plain autocommit `mark_sent`. This
+    //    occurrence's CURRENT dispatch attempt reached no agents, but it is
+    //    NOT necessarily true that the execution_id has never had a live
+    //    agent execution — a sent>0 attempt whose OWN
+    //    mark_sent_with_target then degraded rolls the whole transaction
+    //    back (occurrence stays pending, re-driven here), so a redrive CAN
+    //    reach sent==0 for an execution_id that already has real
+    //    agent_exec_status responses from that earlier attempt (governance
+    //    Gate 4 fix, unhappy-path). The `mark_cancelled` call below now
+    //    checks for exactly that case first — see its own comment. An early
+    //    reaper cancel racing a GENUINE no-agents-ever-reached case is still
+    //    harmless (both converge on `cancelled`; `mark_cancelled`'s
     //    own terminal-exclusion guard makes a second cancel a clean, event-
     //    free no-op).
     const bool bookkeep_target = d_.execution_tracker && !c.execution_id.empty();
@@ -378,7 +386,45 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         if (owns_delivery && bookkeep_target) {
             // sent==0: no agents reached — cancel the (fire-time-created)
             // execution row so it doesn't idle to the materialise timeout.
-            if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
+            //
+            // governance Gate 4 fix (unhappy-path, BLOCKING, independently
+            // discovered second path to the Gate 2 false-cancel class): the
+            // comment above this branch ("a sent==0 occurrence never had a
+            // live agent execution to falsely kill") was true before round
+            // 3's atomic mark_sent_with_target existed, but round 3 itself
+            // broke it — a genuine sent>0 dispatch whose bookkeeping write
+            // then fails rolls the WHOLE transaction back (occurrence stays
+            // pending, re-driven next tick); if reachability drops to zero
+            // by the time of the re-drive, THIS branch runs for an
+            // occurrence whose execution_id may already carry real
+            // agent_exec_status responses from the earlier, genuinely-
+            // dispatched attempt. mark_cancelled's own guard checks only
+            // terminal-status exclusion — it has no agent-response
+            // equivalent of the stuck-reap sweep's
+            // kNoAgentResponseExistsClause (correctly so: the OPERATOR-
+            // initiated cancel route also calls mark_cancelled, and an
+            // operator must still be able to cancel an execution with
+            // partial responses — that exclusion belongs here, at this
+            // automatic-redrive call site, not inside mark_cancelled
+            // itself). Mirror the sweep's own philosophy: a degraded check
+            // declines toward NOT cancelling (leaving the row wedged is
+            // strictly safer than falsely cancelling it; the stuck-reap
+            // sweep's own exclusion then correctly leaves it alone forever
+            // once it sees the same response row).
+            auto statuses = d_.execution_tracker->get_agent_statuses_checked(c.execution_id);
+            if (!statuses.has_value()) {
+                spdlog::warn("command_outbox_delivery: agent_exec_status check degraded for "
+                             "execution_id={} occurrence='{}' (sent==0) — declining to cancel "
+                             "this tick, will retry on a later pass",
+                             c.execution_id, c.occurrence_id);
+            } else if (!statuses->empty()) {
+                spdlog::warn(
+                    "command_outbox_delivery: occurrence='{}' redrove to sent==0 but "
+                    "execution_id={} already has {} real agent response(s) from an earlier "
+                    "dispatch attempt — NOT cancelling (a genuinely-dispatched execution must "
+                    "never be force-cancelled on a later redrive's zero-reach)",
+                    c.occurrence_id, c.execution_id, statuses->size());
+            } else if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
                 spdlog::error("command_outbox_delivery: mark_cancelled failed for "
                               "execution_id={} occurrence='{}' (sent==0) — row remains 'running'",
                               c.execution_id, c.occurrence_id);
