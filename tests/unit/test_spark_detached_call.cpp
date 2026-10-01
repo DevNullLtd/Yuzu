@@ -609,9 +609,15 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     // The destructor parks here once it starts (see SlowDtor), so "the destructor is still
     // running" is a state this test holds for as long as it needs and then ends, not a
     // sleep it has to out-wait. Declared AFTER everything the worker touches so that it is
-    // released FIRST on any exit path - a failed REQUIRE can never strand the worker.
+    // released FIRST on any exit path. The cleanup also releases `gate` and waits (bounded) for
+    // the worker to retire, because the worker holds by-reference captures of this frame's
+    // locals: without the wait a failed REQUIRE could unwind the frame under a live worker.
     Gate dtor_gate;
-    yuzu::test::ScopeExit release_dtor{[&] { dtor_gate.release(); }};
+    yuzu::test::ScopeExit release_dtor{[&] {
+        gate.release();
+        dtor_gate.release();
+        spin_until([&] { return lane.active_workers() == 0; }, 5s);
+    }};
 
     auto res = lane.launch([&gate, &dtor_started, &dtor_thread, &dtor_gate]() -> SlowDtor {
         gate.wait();
@@ -670,9 +676,13 @@ TEST_CASE("launch: fn's OWN captured RAII state outlives fn() returning, and the
     SparkDetachedLane lane(f3, /*cap=*/4);
     std::atomic<bool> dtor_started{false};
     std::atomic<std::thread::id> dtor_thread{};
-    // See the previous case: the destructor parks on this gate, released first on any exit.
+    // See the previous case: the destructor parks on this gate, released first on any exit,
+    // and the cleanup waits (bounded) for the worker to retire.
     Gate dtor_gate;
-    yuzu::test::ScopeExit release_dtor{[&] { dtor_gate.release(); }};
+    yuzu::test::ScopeExit release_dtor{[&] {
+        dtor_gate.release();
+        spin_until([&] { return lane.active_workers() == 0; }, 5s);
+    }};
 
     SlowDtor held(&dtor_started, &dtor_thread, 0ms, 2, &dtor_gate);
     auto res = lane.launch([held = std::move(held)]() -> int { return held.value; });

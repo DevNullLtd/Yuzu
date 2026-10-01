@@ -566,8 +566,10 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
     // Each host child is a 30s `sleep` that the test CANCELS once every victim of its round
     // has returned (via a per-invocation CancellationToken), instead of a fixed `sleep 1`
     // that every round had to wait out (5 rounds = 5s of pure waiting). Per round the host
-    // therefore outlives every victim's deadline by construction - by ~75x, not 2.5x - so a
-    // leaked write end can never be released early by the host exiting, which is exactly the
+    // therefore normally outlives every victim's deadline (for the whole round, not a fixed
+    // 1s; a host thread scheduled after all victims returned gets an already-cancelled token
+    // and adds no overlap that round), so a leaked write end is not released early by the host
+    // exiting, which is exactly the
     // condition the victim deadline is the detector for. The host's own deadline is only a
     // safety net and its timing is not under test.
     constexpr auto kHostDeadline = 60000ms;

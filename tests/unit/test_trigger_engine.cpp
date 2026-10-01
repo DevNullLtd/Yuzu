@@ -303,7 +303,7 @@ TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config
     cfg.action = "act";
     // Below the 30s minimum. 1s is deliberate: interval_loop ticks every 1s, records the first
     // observation on tick 1 and fires on the first later tick where elapsed >= interval, so an
-    // UNCLAMPED 1s trigger fires at ~2s. The negative window below (2.6s) therefore goes red if
+    // UNCLAMPED 1s trigger fires at ~2s. The negative window below (3s) therefore goes red if
     // the clamp is removed. (The old value of 5 only fired at ~6s unclamped, outside the old 3s
     // window, so that test stayed green with no clamp at all.)
     cfg.interval_seconds = 1;
@@ -316,7 +316,7 @@ TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config
     // engine's 1s tick is the floor and there is no production seam to shorten it, and no
     // accessor exposes the clamped config value.
     engine.start();
-    const bool fired = recorder.wait_for(1, std::chrono::milliseconds{2600});
+    const bool fired = recorder.wait_for(1, std::chrono::milliseconds{3000});
     engine.stop();
 
     CHECK_FALSE(fired);
@@ -533,7 +533,7 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     fs::remove_all(tmp_dir, ec);
 }
 
-TEST_CASE("TriggerEngine: file change trigger with empty watch_path is skipped",
+TEST_CASE("TriggerEngine: file change trigger with empty watch_path starts and stops safely",
           "[trigger_engine][filechange]") {
     TriggerEngine engine;
     DispatchRecorder recorder;

@@ -41,13 +41,15 @@ static_assert(!std::is_move_assignable_v<ShutdownDeadlineGuard<>>);
 // can assert anything. A fixed sleep only "gives it time"; instead each case below arms an
 // UN-cancelled witness guard (its own state, its own recorder) whose grace outlasts the
 // guard under test's by kWitnessGap, and waits for the witness to FIRE - an observable event
-// proving the deadline machinery has run past the cancelled guard's own deadline. A cancel()
-// that failed to take effect would have fired the guard under test kWitnessGap earlier (the
-// original sleep-based form had the same shape: a bug shows up as `fired`, never as a flake).
+// ordering evidence, not synchronisation: each guard has its own detached worker, so the
+// witness firing makes it likely, not certain, that the deadline machinery has run past the
+// cancelled guard's own deadline. A cancel() that failed to take effect would have fired the
+// guard under test kWitnessGap earlier, so a regression shows up as `fired` (and under heavy
+// load it can slip past, never produce a false red).
 // The wait is bounded generously and fails loudly rather than the test ever sleeping blind.
 namespace {
-constexpr auto kCancelledGrace = 50ms;
-constexpr auto kWitnessGap = 50ms;
+constexpr auto kCancelledGrace = 150ms; // generous vs a loaded-runner stall before cancel()
+constexpr auto kWitnessGap = 100ms;
 } // namespace
 
 TEST_CASE("cancel() before the deadline prevents the action from firing",
@@ -127,8 +129,9 @@ TEST_CASE("cancel racing the deadline is race-free under repeat",
     // test-local recorder state is destroyed, or a repeat-only timing race test can pass
     // vacuously (the worker touches already-destroyed memory, which may or may not crash
     // depending on luck/ASan). Every piece of state the worker can touch is therefore
-    // shared_ptr-owned here, and each iteration waits on an explicit "the worker is done"
-    // signal (set by BOTH the cancelled path and the fired path) before moving on, so no
+    // shared_ptr-owned here, and each iteration waits until `retired` is the only owner (the
+    // worker's payload, which holds the action's copy, is deleted on BOTH the cancelled path
+    // and the fired path) before moving on, so no
     // iteration ever leaves a detached worker with a dangling reference into a destroyed
     // stack frame.
     for (int i = 0; i < 50; ++i) {

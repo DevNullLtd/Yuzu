@@ -33,7 +33,7 @@ struct ParkGate {
     bool open = false;
     void wait() {
         std::unique_lock lk{m};
-        cv.wait_for(lk, std::chrono::seconds(20), [&] { return open; });
+        cv.wait_for(lk, std::chrono::seconds(120), [&] { return open; }); // above the scaled spin_until deadlines (10 s * kSpinScale = 60 s under sanitizers)
     }
     void release() {
         {
@@ -60,9 +60,9 @@ TEST_CASE("bounded_call: a function that never returns in time yields nullopt, n
     // The callable parks on a gate (rather than sleeping a fixed 3s) so the test can end it
     // the moment the caller has returned: a fixed sleep left a detached thread alive for ~3s
     // after this case, which a later case's process-quiescence wait (fork()-based death
-    // tests) then had to sit out. The gate's own safety-net timeout is far longer than any
-    // bound asserted here, so the callable still blocks "far longer than the caller is
-    // willing to wait".
+    // tests) could then have to sit out. The gate's own safety-net timeout (120 s, above the
+    // scaled spin deadlines) is far longer than any bound asserted here, so the callable still
+    // blocks "far longer than the caller is willing to wait".
     using yuzu::shared::detail::g_outstanding_bounded_calls;
     const int baseline = g_outstanding_bounded_calls.load();
     auto gate = std::make_shared<ParkGate>();
@@ -79,8 +79,8 @@ TEST_CASE("bounded_call: a function that never returns in time yields nullopt, n
 
     CHECK_FALSE(result.has_value());
     // The whole point of the fix: the CALLER returns promptly, not after the
-    // callable finishes. Generous CI-safe ceiling, still far under the 3s the
-    // callable itself sleeps for.
+    // callable finishes. Generous CI-safe ceiling, still far under the gate's safety net
+    // (120 s) that the callable would otherwise block for.
     CHECK(elapsed < 1500ms);
 }
 
