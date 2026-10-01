@@ -1091,15 +1091,16 @@ TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and nev
 // the verbose --success reporter (which slows the race window enough to miss it) — a
 // real, high-frequency race in shipped code, not test-environment noise.
 //
-// [.] alone was NOT reliably observed to exclude this from the "agent unit tests" meson
-// entry — repeated real-hardware runs against this suite's own `~[tsan-heavy]` filter
+// [.] alone was NOT reliably observed to exclude this from the (then single) "agent unit
+// tests" meson entry; repeated real-hardware runs against that suite's own `~[tsan-heavy]` filter
 // were inconsistent on whether Catch2's hidden-tag default-exclusion still applies once
 // a non-empty filter is present (a governance review disputed the mechanism claimed in an
 // earlier version of this comment; re-testing then showed BOTH outcomes across repeat
 // runs, so the exact Catch2 rule here is left unresolved rather than restated with false
 // confidence). What IS reliably, repeatedly verified: the explicit [flaky-4086] tag plus
 // `tests/meson.build`'s `~[flaky-4086]` exclusion (mirroring how `[tsan-heavy]` is excluded
-// from this same entry) keeps this case out of every run tested, with no exception. [.] is
+// from the agent shards, now via the `agent_shard_suffix` on every shard term) keeps this
+// case out of every run tested, with no exception. [.] is
 // kept too so a manual, zero-argument run of the exe still skips it.
 //
 // Re-tag back into the normal suite once #4086 lands a real fix (mirror spark_file.cpp's
