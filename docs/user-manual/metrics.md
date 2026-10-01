@@ -86,6 +86,23 @@ replica sees live execution progress driven from any replica. See
 | `yuzu_exec_outbox_reap_clock_anomaly_total` | counter | Retention sweep passes DECLINED because the substrate `now()` reading was implausible (forward- or backward-skewed vs the persisted anchor) — the clock-guard refusing to delete under a mistrusted clock. A non-zero/rising value means investigate host/DB clock integrity, not retention. |
 | `yuzu_exec_outbox_store_degrade_total` | counter | `event_outbox` **reap OR cross-replica poll** passes that failed outright (pool-acquire timeout / query error), distinct from a clock-anomaly decline. The two sources share one series today (a `stage` label to separate reap from poll is a follow-up); correlate with `yuzu_pg_acquire_timeout_total` / Postgres health. |
 
+### Execution bookkeeping + stuck-execution reap metrics (#4982)
+
+`ExecutionTracker::set_agents_targeted`/`::mark_cancelled` failures on the synchronous
+dispatch path were previously log-only; a separate clock-guarded background sweep,
+`reap_stuck_running_executions()` (~15-minute cadence, see `docs/clock-guarded-retention.md`'s
+entry for the full seven-part design), recovers an execution row left permanently stranded at
+`status='running'` as a result.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_exec_tracker_bookkeeping_failed_total{op,surface}` | counter | A swallowed `set_agents_targeted`/`mark_cancelled` write failure at a post-dispatch bookkeeping call site, labeled `op` (`set_agents_targeted`\|`mark_cancelled`) and `surface` (`rest`\|`mcp`\|`workflow`\|`schedule`\|`outbox`). Pre-seeded to 0 (10-series closed set). `mark_cancelled` failing is the more consequential of the two: a dispatch refused before it reached any agent that ALSO fails to cancel its execution row leaves that row stranded forever absent the reap sweep below. Deliberately operational, not `event="security"` — pair with the `spdlog::error` line at the same call site for the specific `execution_id`. |
+| `yuzu_exec_tracker_stuck_reap_total{outcome}` | counter | `reap_stuck_running_executions()` pass outcomes, `outcome` ∈ `cancelled`\|`not_cancelled`\|`would_wipe`\|`clock_anomaly`\|`degraded`\|`capped`\|`skipped`. `cancelled`/`not_cancelled` increment by the per-row count for an accepted pass; `would_wipe` means the pass declined to act outright because candidates were an implausibly large fraction of all running executions (likely a systemic bookkeeping bug, not a genuine backlog — see the would-wipe floor/ratio in `docs/clock-guarded-retention.md`); `clock_anomaly` means the pass declined on an implausible/unparseable clock or persisted-anchor reading; `degraded` means the store call itself failed (pool/query degradation); `capped` (governance Gate 3 fix, sre) means an ACCEPTED pass's true backlog exceeded the per-pass cap (`kStuckExecReapCap`, 500) — distinct from `would_wipe`: this fires on a pass that DID act but didn't fully drain. A sustained non-zero `capped` rate means the reaper is chronically behind even though every pass is successfully cancelling rows — same meaning as the Gateway routing directory metrics' `ok_capped` below. `skipped` (governance Gate 3 fix, sre) means another replica already held the `execution_tracker:stuck_exec_reap` advisory lock this tick (`pg_try_advisory_xact_lock`, non-blocking) — routine on a multi-replica deployment, never a failure, same meaning as that same sibling's own `skipped`. Every cancellation this sweep performs also writes an `execution.cancel` audit row (`principal="system"`) — see `docs/user-manual/audit-log.md`. |
+
+No dedicated alert rule ships for either family in this change — same posture as the Gateway
+routing directory reap counter below, which also has none; revisit once real fleet data exists
+to size a threshold.
+
 ## Command outbox delivery metrics (HA WS-3 3.3)
 
 Scheduled instruction fires enqueue a durable `pending` occurrence to

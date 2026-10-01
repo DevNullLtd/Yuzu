@@ -3217,13 +3217,20 @@ public:
         // reap outcome family).
         metrics_.describe("yuzu_exec_tracker_stuck_reap_total",
                           "reap_stuck_running_executions() pass outcomes (#4982 Part B), by "
-                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded). "
-                          "cancelled/not_cancelled increment by the per-row count for an accepted "
-                          "pass; would_wipe/clock_anomaly/degraded increment once per declined/"
-                          "failed pass.",
+                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded|"
+                          "capped|skipped). cancelled/not_cancelled increment by the per-row "
+                          "count for an accepted pass; would_wipe/clock_anomaly/degraded "
+                          "increment once per declined/failed pass; capped increments once per "
+                          "ACCEPTED pass whose true backlog exceeded the per-pass cap (governance "
+                          "Gate 3 fix, sre) — a sustained non-zero capped rate means the reaper is "
+                          "chronically behind even though it is successfully cancelling every "
+                          "pass, same meaning as the gateway-route-reap sibling's ok_capped; "
+                          "skipped (governance Gate 3 fix, sre) increments once when another "
+                          "replica already held the advisory lock this tick — routine on a "
+                          "multi-replica deployment, same meaning as that sibling's own skipped.",
                           "counter");
-        for (const char* outcome :
-            {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly", "degraded"})
+        for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
+                                     "degraded", "capped", "skipped"})
             metrics_.counter("yuzu_exec_tracker_stuck_reap_total", {{"outcome", outcome}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
@@ -16280,6 +16287,44 @@ private:
                                         .counter("yuzu_exec_tracker_stuck_reap_total",
                                                  {{"outcome", "clock_anomaly"}})
                                         .increment();
+                                if (reaped->capped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "capped"}})
+                                        .increment();
+                                if (reaped->skipped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "skipped"}})
+                                        .increment();
+                                // governance Gate 2 fix (security-guardian, SHOULD): this
+                                // sweep force-cancels executions the same way the
+                                // operator-initiated DELETE route does (execution_routes.cpp's
+                                // "execution.cancel" audit action) — a background actor
+                                // silently transitioning a command's terminal state is exactly
+                                // the class audit coverage exists to catch. principal="system"
+                                // (no HTTP session/token principal; matches this file's own
+                                // server.viz_disabled precedent), principal_class left at its
+                                // documented "" default (AuditEvent's own doc comment: that
+                                // field is reserved for a session/token principal this program
+                                // CAN attribute, which a background writer is not).
+                                if (audit_store_ && audit_store_->is_open()) {
+                                    const std::int64_t audit_now_s =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    for (const auto& cancelled_id : reaped->cancelled_ids) {
+                                        AuditEvent ev;
+                                        ev.timestamp = audit_now_s;
+                                        ev.principal = "system";
+                                        ev.action = "execution.cancel";
+                                        ev.target_type = "execution";
+                                        ev.target_id = cancelled_id;
+                                        ev.detail = "reap_stuck_running_executions";
+                                        ev.result = "success";
+                                        (void)audit_store_->log(ev);
+                                    }
+                                }
                             } else {
                                 spdlog::warn("stuck-execution reap failed: {}", reaped.error());
                                 metrics_

@@ -1671,6 +1671,69 @@ TEST_CASE("instruction execute: mark_cancelled failing on a sent=0 dispatch is n
     CHECK(execs[0].status == "running");
 }
 
+// governance Gate 3 fix (quality-engineer, SHOULD): the sibling above only
+// exercises mark_cancelled{workflow} (a sent=0 dispatch) — set_agents_targeted's
+// own distinct call site at this surface (workflow_routes.cpp, after a REAL
+// dispatch reaching >=1 agent) had zero test coverage, unlike its REST and MCP
+// twins. Mirrors test_rest_result_sets_async.cpp's established #4982 technique
+// exactly: dispatch_sent_override>0 so the route reaches the
+// set_agents_targeted call instead of mark_cancelled's sent=0 branch, then
+// lock execution_tracker.executions from WITHIN the dispatch side-effect so
+// the post-dispatch set_agents_targeted UPDATE itself fails on lock_timeout.
+TEST_CASE("instruction execute: set_agents_targeted failing after a real dispatch "
+          "is now observable via yuzu_exec_tracker_bookkeeping_failed_total{"
+          "op=set_agents_targeted,surface=workflow} (governance Gate 3 fix)",
+          "[pg][workflow][executions][4982]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    ExecHarness h(pool);
+    h.make_def("def-FAIL-TARGETED", "FT");
+    h.dispatch_cmd_override = "cmd-fail-targeted-abc";
+    h.dispatch_sent_override = 1; // a REAL dispatch -- reaches set_agents_targeted, not mark_cancelled
+
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.dispatch_side_effect = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    auto res = h.sink.Post("/api/instructions/def-FAIL-TARGETED/execute",
+                           R"({"params":{},"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    // set_agents_targeted's own failure is swallowed to the caller too -- the
+    // route already committed to 200 once dispatch itself succeeded.
+    CHECK(res->status == 200);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "set_agents_targeted"}, {"surface", "workflow"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+              .value() == 0.0);
+
+    // agents_targeted never got set -- the row stays at its pre-dispatch 0,
+    // exactly the orphan population #4982 Part B's reap sweep exists to
+    // recover (and, as of the governance Gate 2 BLOCKING fix, correctly
+    // leaves alone once a real agent_exec_status response lands).
+    ExecutionQuery q;
+    q.definition_id = "def-FAIL-TARGETED";
+    auto execs = h.tracker->query_executions(q);
+    REQUIRE(execs.size() == 1);
+    CHECK(execs[0].agents_targeted == 0);
+    CHECK(execs[0].status == "running");
+}
+
 // #3424/#3511 Gate 8 round-4 (quality-engineer): the sibling above only
 // exercises the generic catch-all zero-reach branch (stub defaults). These
 // three pin the other branches of the same 4-way split, matching the

@@ -2652,6 +2652,38 @@ constexpr int kStuckExecReapCap = 500;
 // days, not minutes).
 constexpr std::int64_t kStuckExecMaxPlausibleSkewSecs = 24 * 3600;
 
+// #4982 governance Gate 2 fix (security-guardian, CRITICAL/HIGH, empirically
+// reproduced): the outbox NOT EXISTS clause above excludes a row the DELIVERY
+// LOOP still owns, but says nothing about a row the AGENTS themselves have
+// already responded to. `update_agent_status` upserts into
+// `agent_exec_status` completely independently of `agents_targeted` — a
+// synchronous REST/MCP dispatch that genuinely reached N agents, got real
+// responses recorded there, but whose OWN `set_agents_targeted` bookkeeping
+// write failed (the exact degrade Part 1's `op=set_agents_targeted` counter
+// exists to detect) sits at `agents_targeted=0` forever: `refresh_counts_once`
+// only promotes to terminal when `agents_targeted > 0`
+// (`exec->agents_targeted > 0 && exec->agents_responded >= exec->agents_targeted`
+// above), so nothing else ever clears it. Without this clause this sweep
+// force-cancels that row at the 30-minute mark regardless of how many agents
+// actually succeeded — a genuinely-successful execution permanently
+// mislabelled `cancelled`, with only the raw `agent_exec_status` rows left to
+// contradict the parent's terminal status (reproduced against a real
+// Postgres fixture: 3/3 agent successes recorded, sweep still cancels).
+//
+// This is why Part B's ORIGINAL scope — recovering a dispatch refused
+// PRE-agent (zero agents ever reached: a degraded pre-dispatch quota check,
+// zero agents matched the target scope, a dispatch exception, a lost
+// create_pending race) — is narrower than "agents_targeted=0": that refusal
+// case has ZERO `agent_exec_status` rows, so this clause does not exclude it;
+// only a row with at least one REAL per-agent response is excluded. Leaving a
+// row with a genuine response wedged (the pre-#4982 behaviour) is strictly
+// safer than falsely cancelling it — there is no repair path today that
+// re-derives `agents_targeted` from `agent_exec_status`, so until one exists,
+// never acting on this population is correct, not merely conservative.
+constexpr std::string_view kNoAgentResponseExistsClause =
+    "NOT EXISTS (SELECT 1 FROM execution_tracker.agent_exec_status "
+    "            WHERE execution_id = executions.id)";
+
 // Would-wipe (clock-guarded-retention part 1) is ADOPTED here — UNLIKE this
 // file's two DELETE-based siblings above, which deliberately decline it
 // because their tables drain to 100% expiry as ROUTINE behaviour (every
@@ -2781,6 +2813,12 @@ ExecutionTracker::reap_stuck_running_executions() {
 
     bool clock_anomaly = false;
     bool would_wipe = false;
+    bool capped = false;  // governance Gate 3 fix (sre): true iff candidate_count exceeded
+                          // kStuckExecReapCap on an accepted pass — see StuckExecutionReapOutcome's
+                          // own doc comment.
+    bool skipped = false; // governance Gate 3 fix (sre): true iff another replica held the
+                          // advisory lock this tick — see StuckExecutionReapOutcome's own doc
+                          // comment.
     // #4982 round 3: true only for a pass that fell through via the wedge-
     // recovery branch below (a persisted skew anomaly that repeated across a
     // full decline pass) — its `now_s` is a reading this sweep has already
@@ -2834,8 +2872,10 @@ ExecutionTracker::reap_stuck_running_executions() {
             err = "stuck-exec reap advisory lock failed";
             return false;
         }
-        if (col_str(lk.get(), 0, 0) != "t")
+        if (col_str(lk.get(), 0, 0) != "t") {
+            skipped = true;
             return true; // another replica is sweeping this tick — skip (no candidates touched)
+        }
         {
             pg::PgResult nr = pg::exec_params(
                 c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
@@ -3078,7 +3118,8 @@ ExecutionTracker::reap_stuck_running_executions() {
             "SELECT count(*) FROM execution_tracker.executions "
             "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
             "AND " +
-            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause);
+            std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
+            " AND " + std::string(kNoAgentResponseExistsClause);
         pg::PgResult cr =
             pg::exec_params(c, candidate_count_sql.c_str(), std::vector<std::string>{cutoff});
         if (cr.status() != PGRES_TUPLES_OK || PQntuples(cr.get()) == 0) {
@@ -3115,6 +3156,20 @@ ExecutionTracker::reap_stuck_running_executions() {
             return true; // decline to act; anchor already advanced above
         }
 
+        // governance Gate 3 fix (sre, SHOULD): this true, uncapped backlog
+        // size was previously computed for the would-wipe ratio check alone
+        // and then discarded — a sustained failure storm producing MORE than
+        // kStuckExecReapCap new stuck rows per cadence, but still under the
+        // 50%-of-running-population would_wipe ratio, looked identical to a
+        // healthy, fully-draining reaper (cancelled==cap every pass) with no
+        // signal anywhere that the real backlog was flat or growing. Zero
+        // extra query cost — candidate_count is already in hand. Deliberately
+        // placed AFTER the would_wipe decline above returns: `capped` means
+        // "this pass ACTED but didn't fully drain", a distinct signal from
+        // "this pass declined to act at all" — the two must never both be
+        // true for the same pass.
+        capped = candidate_count > kStuckExecReapCap;
+
         // #4982 round 5: same shared owner-defined predicate as the candidate
         // count above — see that call site's comment.
         const std::string candidate_select_sql =
@@ -3122,6 +3177,7 @@ ExecutionTracker::reap_stuck_running_executions() {
             "WHERE status = 'running' AND agents_targeted = 0 AND dispatched_at < $1::bigint "
             "AND " +
             std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
+            " AND " + std::string(kNoAgentResponseExistsClause) +
             " ORDER BY dispatched_at ASC LIMIT $2::bigint";
         pg::PgResult ids =
             pg::exec_params(c, candidate_select_sql.c_str(),
@@ -3200,13 +3256,21 @@ ExecutionTracker::reap_stuck_running_executions() {
         // `kPendingOutboxNotExistsClause`'s own doc comment for why that
         // requires this query to keep issuing the SQL on THIS transaction's
         // own connection rather than delegating execution to the owner.
+        //
+        // #4982 governance Gate 2 fix (security-guardian): `kNoAgentResponseExistsClause`
+        // is re-evaluated here too, for the same reason — a row that picked up
+        // its FIRST `agent_exec_status` response in the interval between the
+        // candidate SELECT and this UPDATE must be excluded at mutation time,
+        // not just at selection time, or this atomic re-check closes the
+        // outbox-race TOCTOU while reopening the identical shape for a genuine
+        // agent response landing in that same window.
         std::vector<std::string_view> sv(candidate_ids.begin(), candidate_ids.end());
         const std::string atomic_cancel_sql =
             "UPDATE execution_tracker.executions SET status = 'cancelled', completed_at = $1 "
             "WHERE id = ANY($2::text[]) AND status = 'running' AND agents_targeted = 0 "
             "AND " +
             std::string(CommandDeliveryFinalizationOwner::kPendingOutboxNotExistsClause) +
-            " RETURNING id";
+            " AND " + std::string(kNoAgentResponseExistsClause) + " RETURNING id";
         pg::PgResult upd = pg::exec_params(
             c, atomic_cancel_sql.c_str(),
             std::vector<std::string>{std::to_string(now_epoch()), pg::to_text_array(sv)});
@@ -3243,7 +3307,10 @@ ExecutionTracker::reap_stuck_running_executions() {
     StuckExecutionReapOutcome out;
     out.clock_anomaly = clock_anomaly;
     out.would_wipe = would_wipe;
+    out.capped = capped;
+    out.skipped = skipped;
     out.cancelled = static_cast<int>(confirmed_ids.size());
+    out.cancelled_ids = confirmed_ids;
     out.not_cancelled = static_cast<int>(candidate_ids.size() - confirmed_ids.size());
 
     // #4982 fix round 2 (Fix 6): a bounded per-pass log naming exactly which

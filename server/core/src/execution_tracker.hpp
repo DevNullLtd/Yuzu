@@ -220,6 +220,13 @@ struct EventOutboxReapOutcome {
 struct StuckExecutionReapOutcome {
     int cancelled{0};     ///< executions actually transitioned to 'cancelled' this pass — the
                           ///< RETURNING-confirmed set of the atomic cancel UPDATE (fix round 2).
+    std::vector<std::string> cancelled_ids; ///< governance Gate 2 fix (security-guardian,
+                          ///< SHOULD): the SAME RETURNING-confirmed set as `cancelled` above, by
+                          ///< id — lets the caller (server.cpp) emit one audit row per
+                          ///< system-initiated cancel, matching the operator-initiated route's
+                          ///< own `execution.cancel` audit action. Bounded by the SAME
+                          ///< `kStuckExecReapCap` that bounds `cancelled` — no unbounded-growth
+                          ///< risk beyond what already exists for the per-pass log line.
     int not_cancelled{0}; ///< candidates the pass selected but the atomic UPDATE's own
                           ///< full-predicate recheck excluded at mutation time: a genuine
                           ///< dispatch landed (agents_targeted > 0), its outbox entry went
@@ -232,8 +239,25 @@ struct StuckExecutionReapOutcome {
                                ///< a repeat anomaly that has not yet earned this sweep's
                                ///< (anchor, direction) wedge-recovery match (fix round 2, Fix 1
                                ///< — see `reap_stuck_running_executions`'s definition).
+    bool skipped{false};       ///< governance Gate 3 fix (sre, SHOULD): another replica already
+                               ///< held the advisory lock this tick (`pg_try_advisory_xact_lock`,
+                               ///< non-blocking) — routine on a multi-replica deployment, never a
+                               ///< failure. Previously this pass touched NO outcome field at
+                               ///< all, asymmetric with the `GatewayRouteStore` sibling's own
+                               ///< `skipped` outcome and untestable as a result.
     bool would_wipe{false};    ///< pass declined to ACT: candidates were an implausibly large
                                ///< fraction of all currently-running executions.
+    bool capped{false};        ///< governance Gate 3 fix (sre, SHOULD): an ACCEPTED pass whose
+                               ///< true backlog (`candidate_count`, read before the
+                               ///< `kStuckExecReapCap` LIMIT) exceeded the cap — this pass only
+                               ///< drained part of it, and the remainder is retried next pass.
+                               ///< Distinct from `would_wipe`: that guard declines to act at all
+                               ///< above a 50%-of-running-population ratio; this flag fires on an
+                               ///< ACTED-on pass that is nonetheless chronically behind (e.g. a
+                               ///< sustained failure storm under that ratio, producing >500 new
+                               ///< stuck rows every ~15-minute cadence) — a population this
+                               ///< sweep's five outcomes previously could not distinguish from a
+                               ///< healthy, fully-draining reaper.
 };
 
 /// #2146 A2-R1 governance re-review (blocking): `get_children_checked`'s

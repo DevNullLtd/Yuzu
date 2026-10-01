@@ -48,3 +48,29 @@
   read). The sweep now self-heals a corrupt persisted anchor the same way `GatewayRouteStore`'s
   sibling already does: re-anchor to the current pass's own sanitised clock reading and clear any
   stale skew marker, declining only that one pass.
+
+  **Governance Gate 2 fix, still pre-release (BLOCKING, security-guardian, empirically
+  reproduced):** the candidate predicate excluded a still-`pending` outbox row but never
+  consulted `agent_exec_status` — a synchronous REST/MCP dispatch that genuinely reached one or
+  more agents, with real responses recorded there, but whose OWN `set_agents_targeted`
+  bookkeeping write failed, sat at `agents_targeted=0` forever (the terminal transition requires
+  `agents_targeted > 0`) and was force-cancelled by this sweep at the 30-minute mark regardless
+  of how many agents actually succeeded. The candidate predicate now also excludes any row with
+  at least one `agent_exec_status` row — Part B's original orphan population (a dispatch refused
+  BEFORE any agent was ever reached) has zero such rows, so this does not narrow that population;
+  only a row with a genuine per-agent response is now additionally excluded. Every cancellation
+  this sweep performs also now writes an `execution.cancel` audit row (`principal="system"`) —
+  see `docs/user-manual/audit-log.md` — closing a gap where a background actor silently
+  transitioning a command's terminal state left no audit trail at all (governance Gate 2,
+  security-guardian, SHOULD).
+
+  **Governance Gate 3 fixes, still pre-release (sre, SHOULD):** the pass's true, uncapped backlog
+  size (`candidate_count`) was computed for the would-wipe ratio check and then discarded — a
+  sustained failure storm producing more than 500 new stuck rows per ~15-minute cadence, but still
+  under the 50%-of-running-population would-wipe ratio, looked identical to a healthy,
+  fully-draining reaper. A new `capped` outcome on `yuzu_exec_tracker_stuck_reap_total` now fires
+  once per ACCEPTED pass whose true backlog exceeded the cap, same meaning as the
+  `GatewayRouteStore` sibling's `ok_capped`. A new `skipped` outcome fires when another replica
+  already held the advisory lock this tick — previously this pass touched no outcome field at
+  all, asymmetric with that same sibling's own `skipped`. See `docs/user-manual/metrics.md`'s new
+  "Execution bookkeeping + stuck-execution reap metrics" section.

@@ -3224,6 +3224,110 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions proceeds below the "
     REQUIRE(out.has_value());
     CHECK_FALSE(out->would_wipe);
     CHECK(out->cancelled == 3);
+
+    // governance Gate 2 fix (security-guardian): cancelled_ids is the data
+    // server.cpp's tick handler audits one row per id from — must be the
+    // exact RETURNING-confirmed set, not just a count, and in no particular
+    // order relative to `ids` (both are std::vector<std::string>, so sort
+    // before comparing).
+    REQUIRE(out->cancelled_ids.size() == 3);
+    auto sorted_ids = ids;
+    auto sorted_cancelled = out->cancelled_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    std::sort(sorted_cancelled.begin(), sorted_cancelled.end());
+    CHECK(sorted_ids == sorted_cancelled);
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions reports capped "
+          "when the true backlog exceeds kStuckExecReapCap on an accepted "
+          "pass (governance Gate 3 fix, sre)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+
+    // 501 genuinely stuck candidates (one over kStuckExecReapCap=500) plus
+    // 501 healthy running executions (agents_targeted>0, never candidates)
+    // — 1002 total running, so the candidate ratio is 501/1002 < 50%, safely
+    // under kStuckExecWouldWipeRatio: this pass must ACT, not decline. Bulk
+    // SQL insert (not 1002 create_execution round-trips) to keep this test
+    // fast; `backdate_dispatched_at`'s own mechanism (dispatched_at -
+    // seconds_ago) is reproduced inline for the same reason.
+    {
+        auto lease = env.pool().acquire();
+        REQUIRE(lease);
+        auto stuck = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.executions "
+            "(id, definition_id, status, dispatched_at, agents_targeted) "
+            "SELECT 'bulk-stuck-' || gs, 'bulk-def', 'running', "
+            "       extract(epoch FROM now())::bigint - 3600, 0 "
+            "FROM generate_series(1, 501) gs",
+            std::vector<std::string>{});
+        REQUIRE(stuck.status() == PGRES_COMMAND_OK);
+        auto healthy = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.executions "
+            "(id, definition_id, status, dispatched_at, agents_targeted) "
+            "SELECT 'bulk-healthy-' || gs, 'bulk-def', 'running', "
+            "       extract(epoch FROM now())::bigint, 1 "
+            "FROM generate_series(1, 501) gs",
+            std::vector<std::string>{});
+        REQUIRE(healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->would_wipe);
+    CHECK_FALSE(out->clock_anomaly);
+    CHECK(out->cancelled == 500); // kStuckExecReapCap — this pass only drained part of it
+    CHECK(out->capped);           // the signal this fix adds: 501 > 500, backlog remains
+
+    // A second pass (no new candidates created) drains the one remaining row
+    // and is NOT capped — proving the flag tracks the actual backlog size,
+    // not a sticky/latched state.
+    auto second = env.tracker().reap_stuck_running_executions();
+    REQUIRE(second.has_value());
+    CHECK(second->cancelled == 1);
+    CHECK_FALSE(second->capped);
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions reports skipped "
+          "when a sibling replica holds the advisory lock (governance Gate "
+          "3 fix, sre) — mirrors GatewayRouteStore's identical test",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    pg::PgConn locker{PQconnectdb(env.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        pg::PgResult begin{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult lock{PQexec(
+            locker.get(),
+            "SELECT pg_advisory_xact_lock(hashtext('execution_tracker:stuck_exec_reap'))")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+    }
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->skipped);
+    CHECK_FALSE(out->clock_anomaly);
+    CHECK_FALSE(out->would_wipe);
+    CHECK_FALSE(out->capped);
+    CHECK(out->cancelled == 0);
+    CHECK(out->cancelled_ids.empty());
+
+    // Nothing was touched — the sibling held the lock before this pass could
+    // even read now()/the anchor.
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+
+    pg::PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
+    REQUIRE(rollback.status() == PGRES_COMMAND_OK);
 }
 
 TEST_CASE("ExecutionTracker: reap_stuck_running_executions declines on an "
@@ -3358,6 +3462,90 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions self-heals a "
     REQUIRE(third.has_value());
     CHECK_FALSE(third->clock_anomaly);
     CHECK(third->cancelled == 1);
+
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions never cancels a "
+          "row with any real agent_exec_status response, even though "
+          "agents_targeted never got set (governance Gate 2 BLOCKING fix, "
+          "security-guardian)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+
+    // Reproduces the exact scenario security-guardian found: a synchronous
+    // dispatch that genuinely reached an agent and got a real SUCCESS
+    // response recorded in agent_exec_status, but whose OWN
+    // set_agents_targeted bookkeeping call failed — agents_targeted stays 0
+    // forever (refresh_counts_once's terminal transition requires
+    // agents_targeted > 0 to ever fire), so without this fix the sweep force-
+    // cancels a row that actually succeeded.
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "dispatched";
+    as.dispatched_at = 1000;
+    env.tracker().update_agent_status(*id, as);
+    as.status = "running";
+    as.first_response_at = 1001;
+    env.tracker().update_agent_status(*id, as);
+    as.status = "success";
+    as.completed_at = 1002;
+    as.exit_code = 0;
+    env.tracker().update_agent_status(*id, as);
+
+    // agents_targeted is STILL 0 — set_agents_targeted was never called, by
+    // construction of this reproduction — so without the fix this row still
+    // matches every other clause of the candidate predicate.
+    {
+        auto exec = env.tracker().get_execution(*id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->agents_targeted == 0);
+        CHECK(exec->status == "running");
+    }
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->clock_anomaly);
+    CHECK_FALSE(out->would_wipe);
+    CHECK(out->cancelled == 0);
+
+    // The row must stay 'running', not 'cancelled' — a real agent success
+    // must never be overwritten by a false terminal verdict with no repair
+    // path.
+    auto exec = env.tracker().get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+
+    auto statuses = env.tracker().get_agent_statuses(*id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "success");
+}
+
+TEST_CASE("ExecutionTracker: reap_stuck_running_executions still recovers "
+          "the ORIGINAL Part B orphan — a dispatch refused pre-agent, with "
+          "zero agent_exec_status rows (governance Gate 2 fix does not "
+          "narrow Part B's actual scope)",
+          "[pg][execution_tracker][stuck_reap]") {
+    StuckExecPg env;
+
+    auto id = env.tracker().create_execution(make_execution());
+    REQUIRE(id.has_value());
+    backdate_dispatched_at(env.pool(), *id, 3600);
+    // No update_agent_status call at all — this reproduces a dispatch
+    // refused BEFORE any agent was ever reached (zero agents matched scope,
+    // a dispatch exception, a lost create_pending race), the exact case
+    // Part B exists to recover. agent_exec_status has zero rows for this
+    // execution_id, so kNoAgentResponseExistsClause must NOT exclude it.
+
+    auto out = env.tracker().reap_stuck_running_executions();
+    REQUIRE(out.has_value());
+    CHECK(out->cancelled == 1);
 
     auto exec = env.tracker().get_execution(*id);
     REQUIRE(exec.has_value());
