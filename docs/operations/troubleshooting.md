@@ -70,8 +70,21 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 |-------|-----|
 | Heartbeat timeout | Increase agent `--heartbeat` interval or server `--session-timeout` |
 | Erlang VM crash | Check `/var/log/yuzu/gateway-crash.dump` |
+| Gateway container keeps restarting at boot on an Intel host (`docker ps` shows `Restarting (134)`); the log has `sys_sigaltstack(): Internal error: Failed to set alternate signal stack` | The CPU supports AMX (Sapphire Rapids or newer, e.g. AWS c7i/m7i/r7i; `grep -m1 -o amx_tile /proc/cpuinfo` prints `amx_tile`) and the `yuzu-gateway` image is 0.13.0 through 0.14.0-rc4, which run on Alpine 3.24 (#2150). Pull a fixed image (0.14.0-rc5 or later). Until you can, run the gateway on a host without AMX, or use the `yuzu-gateway-chisel` image of the same version (glibc, unaffected). In a gateway cluster, a node that is `Down` while the others report the cluster partially formed may be this. Rolling back the gateway to an earlier image does not help on such a host: 0.13.0 is affected too. |
 | Upstream unreachable | Verify server `--gateway-upstream` address matches gateway config |
 | Process limit | Erlang default process limit is 262144 — sufficient for most fleets |
+
+### Gateway image build fails at abi-guard
+
+When you build `deploy/docker/Dockerfile.gateway` yourself, a step in the
+runtime stage prints `abi-guard: builder Alpine ... runtime Alpine ...` and
+fails the build when the two stages cannot safely run the same release:
+
+| Message | Fix |
+|---------|-----|
+| `runtime Alpine/musl (...) differs from the builder's (...)` | The `erlang:28-alpine` builder and the runtime `alpine:` image are on different Alpine releases. Point the runtime `FROM` at the builder's Alpine release (`docker run --rm <erlang image> cat /etc/alpine-release`). |
+| `musl ... with OTP ...: beam.smp aborts at boot on AMX CPUs` | The runtime is on musl 1.2.6 or newer (Alpine 3.24+) with an OTP older than 29.1. Keep both stages on Alpine 3.23, or move the builder to OTP 29.1 or newer. |
+| `... is not a plain dotted version` | A version could not be read or compared, for example an OTP release candidate or a patched OTP (`28.5.0.2**`). Build from a released OTP. |
 
 ## Certificate Errors
 

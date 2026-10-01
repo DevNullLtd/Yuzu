@@ -60,11 +60,11 @@ updates:
     #     hand (declined #1140).
     #   alpine: only Dockerfile.gateway's runtime stage uses it, and it must
     #     stay on the Alpine release erlang:28-alpine is built on (#2150).
-    #     The 3.23 -> 3.24 auto-bump (#2110) put the runtime on musl 1.2.6,
-    #     which makes OTP 28's beam.smp abort at boot on AMX CPUs (#1743).
-    #     Block major AND minor; digest refreshes of 3.23 still flow. Move it
-    #     by hand, together with the builder, once the gateway is on OTP
-    #     29.1.1 or newer (the build's abi-guard enforces this).
+    #     The 3.23 -> 3.24 auto-bump (#1377, reported in #2110) put the
+    #     runtime on musl 1.2.6, which makes OTP 28's beam.smp abort at boot
+    #     on AMX CPUs (#1743). Block major AND minor; digest refreshes of 3.23
+    #     still flow. Move it by hand, together with the builder, once the
+    #     gateway is on OTP 29.1 or newer (the build's abi-guard enforces this).
     ignore:
       - dependency-name: "erlang"
         update-types: ["version-update:semver-major"]

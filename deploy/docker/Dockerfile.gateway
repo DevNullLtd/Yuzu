@@ -65,10 +65,14 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 
 # ── Stage 3: Runtime — MUST be the builder's Alpine release (#2150) ──────
 #
-# Two reasons, both enforced by the guard RUN below, which fails the build:
+# Two reasons. The guard RUN below fails the build when the Alpine release or
+# the musl version differs, which covers the second directly and the first by
+# proxy:
 #
 #  1. OpenSSL ABI. The crypto NIF in the release was built against the
-#     builder's libcrypto.so.
+#     builder's libcrypto.so.3. The runtime's libcrypto3 comes from the
+#     `apk add` below, from the same Alpine release branch, so the soname and
+#     the 3.x ABI match even when the patch level differs.
 #
 #  2. musl's sigaltstack() check. ERTS (OTP 28) sizes its alternate signal
 #     stack with the compile-time constant SIGSTKSZ (8192 on x86_64). musl
@@ -79,11 +83,11 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 #     to set alternate signal stack" (#1743). musl 1.2.5 checks a fixed
 #     constant and accepts it. Rebuilding against 1.2.6 does NOT help: SIGSTKSZ
 #     is still 8192 there. The fix is in ERTS (erlang/otp#11249, #11376), first
-#     released in OTP 29.1.1; no OTP 28 release carries it.
+#     released in OTP 29.1; no OTP 28 or 29.0.x release carries it.
 #
 # So: keep this FROM on the builder's Alpine release (erlang:28-alpine is on
 # 3.23 today). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's OTP
-# is 29.1.1 or newer. Dependabot is told to ignore Alpine minor bumps for this
+# is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for this
 # reason (.github/dependabot.yml). If upstream erlang:28-alpine itself moves to
 # 3.24 while still on OTP 28, the guard fails the build rather than ship an
 # image that crash-loops on AMX hosts.
@@ -103,25 +107,35 @@ RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
 FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 
 # Builder/runtime ABI guard (#2150). See the stage header above for why.
-# OTP_SIGALTSTACK_FIX_MIN is the first OTP release whose ERTS sizes the signal
-# stack from sysconf(_SC_MINSIGSTKSZ); lower it only if an OTP 28 release
-# gains the backport.
-ARG OTP_SIGALTSTACK_FIX_MIN=29.1.1
+# Every version is first required to be a plain dotted number: `apk version -t`
+# prints nothing for anything else (an OTP release candidate "29.0-rc1", a
+# patched "28.5.0.2**", two OTP_VERSION files), and an empty comparison must
+# never read as "not older". otp_fix_min is the first OTP release whose ERTS
+# sizes the signal stack from sysconf(_SC_MINSIGSTKSZ); lower it only if an
+# OTP 28 release gains the backport. tests/test_gateway_abi_guard.py runs this
+# step's text, so keep the paths it reads where they are.
 RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.env \
     set -eu; . /tmp/build-abi.env; \
+    otp_fix_min=29.1; \
     rt_alpine=$(cut -d. -f1,2 /etc/alpine-release); \
     rt_musl=$(/lib/ld-musl-*.so.1 2>&1 | sed -n 's/^Version //p'); \
     echo "abi-guard: builder Alpine $BUILD_ALPINE musl $BUILD_MUSL OTP $BUILD_OTP; runtime Alpine $rt_alpine musl $rt_musl"; \
-    if [ -z "$rt_musl" ] || [ -z "$BUILD_MUSL" ] || [ -z "$BUILD_OTP" ]; then \
-      echo "FATAL: abi-guard could not read a version (see the line above)"; exit 1; fi; \
+    for v in "$BUILD_ALPINE" "$BUILD_MUSL" "$BUILD_OTP" "$rt_alpine" "$rt_musl"; do \
+      case "$v" in ''|*[!0-9.]*|.*|*.|*..*) \
+        echo "FATAL: abi-guard: '$v' is not a plain dotted version, so builder and runtime cannot be compared. See the abi-guard line above and docs/operations/troubleshooting.md, Gateway image build fails at abi-guard."; \
+        exit 1;; esac; \
+    done; \
     if [ "$rt_alpine" != "$BUILD_ALPINE" ] || [ "$rt_musl" != "$BUILD_MUSL" ]; then \
-      echo "FATAL: runtime Alpine/musl ($rt_alpine/$rt_musl) differs from the builder's" \
-           "($BUILD_ALPINE/$BUILD_MUSL). Move the runtime FROM to the builder's Alpine release."; \
+      echo "FATAL: abi-guard: runtime Alpine/musl ($rt_alpine/$rt_musl) differs from the builder's" \
+           "($BUILD_ALPINE/$BUILD_MUSL). Move the runtime FROM to the builder's Alpine release; see docs/operations/troubleshooting.md."; \
       exit 1; fi; \
-    if [ "$(apk version -t "$rt_musl" 1.2.6)" != "<" ] \
-       && [ "$(apk version -t "$BUILD_OTP" "$OTP_SIGALTSTACK_FIX_MIN")" = "<" ]; then \
-      echo "FATAL: musl $rt_musl with OTP $BUILD_OTP: beam.smp aborts at boot on AMX CPUs" \
-           "(sys_sigaltstack internal error, #1743). Needs OTP >= $OTP_SIGALTSTACK_FIX_MIN or musl < 1.2.6."; \
+    musl_vs=$(apk version -t "$rt_musl" 1.2.6 || true); \
+    otp_vs=$(apk version -t "$BUILD_OTP" "$otp_fix_min" || true); \
+    case "$musl_vs$otp_vs" in [\<=\>][\<=\>]) ;; *) \
+      echo "FATAL: abi-guard: could not compare versions (apk printed '$musl_vs' '$otp_vs')."; exit 1;; esac; \
+    if [ "$musl_vs" != "<" ] && [ "$otp_vs" = "<" ]; then \
+      echo "FATAL: abi-guard: musl $rt_musl with OTP $BUILD_OTP: beam.smp aborts at boot on AMX CPUs" \
+           "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
       exit 1; fi
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
