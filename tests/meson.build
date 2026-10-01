@@ -814,7 +814,7 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     # BR4-005 sibling (this executable is Linux-only, so the macOS branch
     # review never reached it): a plugin-scoped `--test-args '[tag]'` against
     # the agent suite appends that filter here too, where it never matches —
-    # see the cert_store_fallback_test_exe comment above for the full
+    # see the cert_store_fallback_test_exe comment below for the full
     # rationale.
     args: ['--allow-running-no-tests'],
     suite: 'agent',
@@ -904,7 +904,8 @@ endif
 # fails loudly (the old single entry matched zero cases and exited 2). Measured on
 # build-linux's yuzu_agent_tests at HEAD 79344ceae, 2026-10-01, `<shard spec>
 # '[nonexistent_zzz]' --list-tests --allow-running-no-tests`: A lists 319 cases, B
-# 437, C 0; A with '[spark]' appended lists 539. So `--test-args '[tag]'` is exact
+# 437, C 0; appending '[spark]' to A still lists all 539 of A's cases (the
+# reference set has 704 [spark] cases). So `--test-args '[tag]'` is exact
 # only for shard C. For a targeted run call the binary directly,
 # `build-*/tests/yuzu_agent_tests '[tag]'` (docs/build-guide.md, "Direct binary
 # invocation"). A genuinely empty shard is still caught loudly by the checker's
@@ -912,9 +913,10 @@ endif
 # for an isolated case retry.
 #
 # NAMES: no shard entry name may be a substring of another entry name, and no two
-# may be equal: flake-retry.py maps a junit name to its entry by LONGEST substring,
-# so a contained or duplicated name is attributed to the wrong entry. The shared
-# prefix 'agent unit tests' is fine (the longest match picks the right shard); the
+# may be equal: flake-retry.py maps a junit name to its entry by LONGEST substring.
+# Two EQUAL names are ambiguous; a contained name resolves correctly today (the
+# longest match picks the right entry), but the checker also rejects it so this rule
+# does not depend on the matcher. The shared prefix 'agent unit tests' is fine. The
 # checker enforces the no-substring/no-duplicate rule among the agent-shard entries.
 # suite 'agent-shard' is what the checker discovers by; 'agent' is what CI selects
 # (ci.yml/nightly.yml select `--suite agent` on every leg, never these names).
@@ -930,7 +932,7 @@ endif
 # of the old single entry on its own - repeat real-hardware runs against its `~[tsan-heavy]`
 # filter gave inconsistent results, so the exact Catch2 hidden-tag rule here is left
 # unresolved. The explicit `~[flaky-4086]` exclusion is what's reliably, repeatedly
-# verified to work - see the header comment on the TEST_CASE for detail.
+# verified to work (on the pre-shard single entry) - see the header comment on the TEST_CASE for detail.
 # check-pg-shard-partition.py pins this same literal as AGENT_REF_SPEC and fails if any
 # shard spec does not end with it, so edit both together (an edit to only one is caught).
 agent_shard_suffix = '~[.]~[tsan-heavy]~[flaky-4086]'
@@ -1076,7 +1078,8 @@ if host_machine.system() == 'darwin'
   # including this standalone executable — which has no tag matching a
   # plugin-specific filter like `[autoruns]`/`[app_usage]`. Catch2 exits 2 on
   # a zero-match tag filter by default, so a plugin-scoped `--test-args`
-  # invocation (documented practice for a fast, targeted local check)
+  # invocation (it appends the filter to every entry in the suite; note it is no
+  # longer a targeted run for the sharded agent entries, see the agent-shard block)
   # deterministically fails this ENTIRELY UNRELATED test. --allow-running-no-tests
   # makes a zero-match filter here report success (0 run) instead, matching
   # what the caller actually meant: "run autoruns's tests", not "fail
