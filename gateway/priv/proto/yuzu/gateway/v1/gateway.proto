@@ -62,8 +62,13 @@ message BatchHeartbeatResponse {
   // though that is not guaranteed under sustained flooding with junk ids. An
   // empty list means nothing the server asks the gateway to replay, NOT that
   // nothing is wrong: a server that predates these fields is indistinguishable
-  // from one with nothing unknown (no presence marker by design). Field 4 is
-  // intentionally unused.
+  // from one with nothing unknown (no presence marker by design). The list is
+  // an advisory snapshot and may be stale: a listed id may have registered or
+  // been disconnected since, so a consumer must not treat it as "session is
+  // dead". Re-registering a stale id installs a new session and can revoke the
+  // agent's device tokens, so verify the session locally before acting. Read
+  // the fields with defaults (the generated decoder fills [] and false); an
+  // absent field means nothing to replay. Field 4 is intentionally unused.
   repeated string unknown_session_ids = 2;
   bool unknown_session_ids_truncated = 3;
 }

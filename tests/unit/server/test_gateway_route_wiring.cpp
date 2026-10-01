@@ -230,7 +230,8 @@ struct LiveGatewayWiringHarness {
 /// Direct-call fixture for the BatchHeartbeat unknown-session verdict cases
 /// (#1197): a PG-backed GatewayRouteStore wired into a GatewayUpstreamServiceImpl
 /// the test drives without a real grpc::Server (BatchHeartbeat reads no client
-/// metadata). Postgres-gated like every case in this file (PgAuthManager).
+/// metadata). Postgres-gated through PgAuthManager; the no-store case below that
+/// needs no database builds its own bare service instead.
 struct BatchHbFixture {
     PgPool pool;
     GatewayRouteStore store;
@@ -2183,6 +2184,10 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
 }
 
 // ── #1197: BatchHeartbeatResponse.unknown_session_ids ───────────────────────
+//
+// A concurrent BatchHeartbeat-vs-ProxyRegister/Deregister test is deliberately
+// deferred to the nightly TSan lane: the unknown set and the counters are
+// function-local, and sessions_mu_ use is unchanged by this change.
 
 TEST_CASE("BatchHeartbeat verdict: a batch of only known sessions lists nothing and is not "
           "truncated (#1197)",
@@ -2276,7 +2281,7 @@ TEST_CASE("BatchHeartbeat verdict: an over-length UNKNOWN id is neither acked no
     CHECK(resp.acknowledged_count() == 1);
     // The boundary: exactly 64 bytes is still a listable unknown.
     CHECK(listed_unknown(resp) == std::vector<std::string>{at_limit});
-    // One call per batch with count = number of malformed entries (the
+    // The counter is advanced by the number of malformed entries (the
     // duplicate over-length id is two entries).
     CHECK(f.desync("batch_heartbeat", "malformed_session_id") == 2);
     CHECK(f.desync("renew_leases", "unknown_session") == 1);
@@ -2360,6 +2365,10 @@ TEST_CASE("BatchHeartbeat verdict: a mixed batch lists exactly the distinct unkn
     raw_bump_epoch(db.dsn(), "agent-mixed-race", (*row)->connection_epoch + 1000,
                    "gw-session-mixed-already-won");
     const auto losing = h.register_agent("agent-mixed-race").session_id();
+    auto row_after_race = store.lookup_route("agent-mixed-race");
+    REQUIRE(row_after_race.has_value());
+    REQUIRE(row_after_race->has_value());
+    CHECK((*row_after_race)->session_id == "gw-session-mixed-already-won"); // the loser did NOT win
 
     const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
     gw::BatchHeartbeatRequest batch;

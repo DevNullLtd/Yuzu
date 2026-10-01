@@ -1312,8 +1312,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // #1197: the verdict. Reported regardless of whether a route store is
     // wired (it reflects only this replica's in-memory gateway_sessions_).
     // The listed subset under truncation is arbitrary (unordered_set order,
-    // deliberately not sorted); omitted ids are reported again when those
-    // agents next heartbeat. No presence marker by design.
+    // deliberately not sorted); omitted ids are typically reported again when
+    // those agents next heartbeat (not guaranteed under junk-id flooding). No
+    // presence marker by design.
     if (!unknown_ids.empty()) {
         const auto total = unknown_ids.size();
         const auto cap = static_cast<std::size_t>(kMaxUnknownSessionIdsPerResponse);
