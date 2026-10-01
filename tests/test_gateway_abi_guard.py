@@ -47,6 +47,8 @@ APK_SHIM = textwrap.dedent(
     if mode == "musl-double":
         print("" if a[3] == "1.2.6" else "<<")
         sys.exit(0)
+    if (mode == "musl-silent" and a[3] == "1.2.6") or (mode == "otp-silent" and a[3] != "1.2.6"):
+        sys.exit(1)
     v = r"[0-9]+(\\.[0-9]+)*"
     if not (re.fullmatch(v, a[2]) and re.fullmatch(v, a[3])):
         sys.exit(1)
@@ -190,6 +192,12 @@ class AbiGuard(unittest.TestCase):
 
     # Each comparison must be exactly one symbol; a pair that happens to be two
     # characters long in total ("" + "<<") must not pass.
+    def test_each_comparison_must_answer(self):
+        for mode in ("musl-silent", "otp-silent"):
+            with self.subTest(mode=mode):
+                self.assertFails(self.env("3.23", "1.2.5", "28.5.0.2"), "3.23.6", "1.2.5",
+                                 apk_silent=mode, says="could not compare versions")
+
     def test_apk_output_checked_per_comparison(self):
         rc, out = self.run_guard(self.env("3.24", "1.2.6", "28.5.0.2"), "3.24.1", "1.2.6",
                                  apk_silent="musl-double")

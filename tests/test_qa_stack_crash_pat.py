@@ -42,7 +42,11 @@ CRASHES = [
     "Reason: reached_max_restart_intensity",
     # The base pattern every service shares.
     "Segmentation fault (core dumped)",
+    "beam.smp[812]: segfault at 0 ip 00007f sp 00007f error 4",
+    "thread 'main' panicked; panic: runtime error",
+    "Program received signal SIGABRT, Aborted.",
     "AddressSanitizer: heap-use-after-free; ASAN report follows",
+    "runtime error: signed integer overflow (UBSAN)",
 ]
 
 HEALTHY = [
@@ -67,8 +71,8 @@ def crash_check_pattern():
         raise AssertionError(f"GW_CRASH_PAT line(s) this test cannot read: {bad}")
     if not gw or not gw[0].startswith("GW_CRASH_PAT="):
         raise AssertionError("GW_CRASH_PAT assignments not found in qa-stack.sh")
-    if 'pat+="|$GW_CRASH_PAT"' not in text:
-        raise AssertionError("cmd_crash_check no longer adds GW_CRASH_PAT to the gateway pattern")
+    if not re.search(r'^\s*\[\[ "\$s" == gateway \]\] && pat\+="\|\$GW_CRASH_PAT"\s*$', text, re.M):
+        raise AssertionError("cmd_crash_check no longer adds GW_CRASH_PAT to the gateway's pattern")
     base = re.search(r"^\s*pat='([^']*)'\s*$", text, re.M)
     if not base:
         raise AssertionError("crash-check base pattern (pat='...') not found in qa-stack.sh")

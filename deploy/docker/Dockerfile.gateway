@@ -110,12 +110,13 @@ FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9
 # Every version is first required to be a plain dotted number: `apk version -t`
 # prints nothing for anything else (an OTP release candidate "29.0-rc1", a
 # patched "28.5.0.2**"), and an empty comparison must never read as "not
-# older"; each comparison must then be exactly one of < = >. (Two OTP_VERSION
+# older"; each comparison must then be exactly one of < = >. Two OTP_VERSION
 # files in the builder put a bare line in the env file, which fails the build
-# at the `.` with "not found" before any of this runs.) otp_fix_min is the first OTP release whose ERTS
-# sizes the signal stack from sysconf(_SC_MINSIGSTKSZ); lower it only if an
-# OTP 28 release gains the backport. tests/test_gateway_abi_guard.py runs this
-# step's text, so keep the paths it reads where they are.
+# at the `.` (command not found) before any of this runs. otp_fix_min is the
+# first OTP release whose ERTS sizes the signal stack from
+# sysconf(_SC_MINSIGSTKSZ); lower it only if an OTP 28 release gains the
+# backport. tests/test_gateway_abi_guard.py runs this step's text, so keep
+# the paths it reads where they are.
 RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.env \
     set -eu; . /tmp/build-abi.env; \
     otp_fix_min=29.1; \
