@@ -536,7 +536,14 @@ cmd_check_stable() {
 # (captured from the real formatter), not "=CRASH REPORT====". The legacy
 # spellings stay for any other template. A bare "Supervisor:" must NOT match:
 # every child start at boot logs "Supervisor: {local,x}. Started: ...".
-GW_CRASH_PAT='\] <[0-9.]+> crasher: |crasher: initial call'
+#
+# The VM itself dying is a different shape: no OTP report, just ERTS on
+# stderr. "<file>.c:<line>:<func>(): Internal error: ..." is ERTS's abort
+# (#2150: musl 1.2.6 rejecting beam's signal stack on AMX CPUs);
+# "Kernel pid terminated" is a failed boot (e.g. the crypto NIF not loading);
+# "Crash dump is being written" is an erl_crash.dump on the way out.
+GW_CRASH_PAT='\.c:[0-9]+:[A-Za-z0-9_]+\(\): Internal error|Kernel pid terminated|Crash dump is being written'
+GW_CRASH_PAT+='|\] <[0-9.]+> crasher: |crasher: initial call'
 GW_CRASH_PAT+='|[Ss]upervisor: .*[Cc]ontext: (child_terminated|start_error|shutdown_error)|Reason: reached_max_restart_intensity'
 GW_CRASH_PAT+='|CRASH REPORT|crash_report|SUPERVISOR REPORT|supervisor_report'
 cmd_crash_check() {
