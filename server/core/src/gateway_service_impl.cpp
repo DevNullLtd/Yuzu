@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
@@ -166,9 +167,19 @@ void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view
 // this counter as a false "session_mismatch" desync.
 void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op,
                              std::string_view outcome, double count = 1.0) {
-    spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, count={}) "
-                 "— directory may be out of sync with the in-memory session map",
-                 op, outcome, count);
+    if (op == "batch_heartbeat" && outcome == "malformed_session_id") {
+        // No store write is attempted for this outcome, so the guard-rejection
+        // wording below would mislead. The offending id is deliberately not
+        // logged (it is untrusted and unbounded in content).
+        spdlog::warn("[gateway] BatchHeartbeat: {} entries carried an over-length session_id "
+                     "this replica does not hold (outcome={}); no write was attempted. Likely a "
+                     "buggy gateway or an agent sending a malformed session_id",
+                     count, outcome);
+    } else {
+        spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, "
+                     "count={}) — directory may be out of sync with the in-memory session map",
+                     op, outcome, count);
+    }
     if (metrics) {
         metrics
             ->counter("yuzu_server_gateway_route_desync_total",
@@ -246,9 +257,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
             "to tolerate like the others. #1197: op=\"batch_heartbeat\", "
             "outcome=\"malformed_session_id\" counts BatchHeartbeat entries whose session_id "
-            "is over-length and not held by this replica (no write is attempted and the id is "
-            "never echoed in unknown_session_ids); the expected rate is zero, so a sustained "
-            "rate means a buggy or hostile gateway.",
+            "is over-length and not held by this replica, counted per entry and not deduped "
+            "(no write is attempted and the id is never echoed in unknown_session_ids); the "
+            "expected rate is zero, so a sustained rate means a buggy gateway, or an agent "
+            "sending a malformed session_id (the gateway forwards agent heartbeats "
+            "verbatim).",
             "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
         // only the (op,outcome) pairs this file ACTUALLY emits (see the
@@ -1129,7 +1142,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         }
         if (agent_id.empty()) {
             spdlog::debug("[gateway] BatchHeartbeat: unknown session {}",
-                          hb.session_id().substr(0, kMaxGatewaySessionIdLen));
+                          std::string_view{hb.session_id()}.substr(0, kMaxGatewaySessionIdLen));
             continue;
         }
         // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
@@ -1199,11 +1212,17 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         // condition (or, once multi-replica routing exists, an LB handing a
         // batch to a replica that never registered the session) stays
         // visible rather than silently dropped — the exact signal #4246 #8
-        // exists for. #1197 (D25): the unknown set is NOT recomputed here; it
-        // is the first loop's `unknown_ids`, the single source of truth for
-        // "this replica does not hold it", which also feeds the response
-        // verdict. Over-length unknown ids are excluded from it (counted as
-        // batch_heartbeat/malformed_session_id instead).
+        // exists for. #1197: the unknown set is NOT recomputed here; it is the
+        // first loop's `unknown_ids`, which also feeds the response verdict.
+        // It is a snapshot taken in the first loop, not atomic with this
+        // block's lookup: an id that registers in between is renewed AND
+        // listed/counted unknown for that batch; an id that is erased in
+        // between was acked and ingested but is neither renewed nor counted.
+        // Over-length unknown ids are excluded from the set (counted as
+        // batch_heartbeat/malformed_session_id instead), so a session that
+        // legitimately holds a >64-byte presented id (reclaim-absent adopt)
+        // is counted malformed and never listed after a server restart; that
+        // is by design (ids this server mints are 43 bytes).
         {
             std::lock_guard lock(sessions_mu_);
             for (const auto& hb : request->heartbeats()) {

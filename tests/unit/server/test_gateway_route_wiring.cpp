@@ -56,6 +56,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2235,10 +2236,15 @@ TEST_CASE("BatchHeartbeat verdict: the listed unknown set is capped, truncation 
         CHECK(f.desync("renew_leases", "unknown_session") == kTestUnknownCap);
     }
     SECTION("cap + 1: cap listed (distinct), truncated, desync counts the full set") {
-        auto resp = f.heartbeat(make_ids(kTestUnknownCap + 1));
+        const auto input = make_ids(kTestUnknownCap + 1);
+        auto resp = f.heartbeat(input);
         CHECK(resp.unknown_session_ids_size() == kTestUnknownCap);
         CHECK(resp.unknown_session_ids_truncated());
         auto listed = listed_unknown(resp);
+        // Every listed id came from the input (nothing invented or mangled).
+        const std::set<std::string> input_set(input.begin(), input.end());
+        CHECK(std::all_of(listed.begin(), listed.end(),
+                          [&](const std::string& id) { return input_set.contains(id); }));
         std::sort(listed.begin(), listed.end());
         CHECK(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
         CHECK(f.desync("renew_leases", "unknown_session") == kTestUnknownCap + 1);
@@ -2300,7 +2306,7 @@ TEST_CASE("BatchHeartbeat verdict: a lost-race session is KNOWN, so it is never 
 TEST_CASE("BatchHeartbeat verdict: a KNOWN session holding an over-length gateway-presented id "
           "is still acked and never listed or counted malformed (#1197, lookup-before-cap)",
           "[pg][gateway_route_wiring][grpc]") {
-    // The D23 discriminator. A reclaim-absent ProxyRegister ADOPTS the id the
+    // Lookup-before-cap discriminator. A reclaim-absent ProxyRegister ADOPTS the id the
     // gateway presented, whatever its length, so gateway_sessions_ can hold a
     // known id longer than the unknown-id cap. A length check BEFORE the
     // lookup would silently drop this session's heartbeats (no ingest, no
@@ -2330,6 +2336,111 @@ TEST_CASE("BatchHeartbeat verdict: a KNOWN session holding an over-length gatewa
               .counter("yuzu_server_gateway_route_desync_total",
                        {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}})
               .value() == 0);
+}
+
+TEST_CASE("BatchHeartbeat verdict: a mixed batch lists exactly the distinct unknown ids and "
+          "counts the rest correctly (#1197)",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    // known: a normally minted session.
+    const auto known = h.register_agent("agent-mixed-known").session_id();
+    // known: a gateway-presented id over the cap, adopted verbatim.
+    const std::string long_id = "gw-session-" + std::string(kTestMaxSessionIdLen + 1 - 11, 'q');
+    REQUIRE(h.register_agent("agent-mixed-longknown", long_id).session_id() == long_id);
+    // known: a session that lost its register_fresh epoch race.
+    h.register_agent("agent-mixed-race");
+    auto row = store.lookup_route("agent-mixed-race");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    raw_bump_epoch(db.dsn(), "agent-mixed-race", (*row)->connection_epoch + 1000,
+                   "gw-session-mixed-already-won");
+    const auto losing = h.register_agent("agent-mixed-race").session_id();
+
+    const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-mixed");
+    for (const auto& id : std::vector<std::string>{known, long_id, "gw-session-mixed-unknown",
+                                                   "gw-session-mixed-unknown", losing, "",
+                                                   too_long, too_long})
+        batch.add_heartbeats()->set_session_id(id);
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(h.svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    // The three known sessions are acked; the empty, over-length and unknown
+    // entries are not.
+    CHECK(resp.acknowledged_count() == 3);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-mixed-unknown"});
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+    // Counted per entry (the duplicate over-length id is two entries).
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}})
+              .value() == 2);
+    // Distinct unknown ids only.
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "unknown_session"}})
+              .value() == 1);
+}
+
+TEST_CASE("BatchHeartbeat verdict: with no route store and no metrics the verdict is still "
+          "filled for unknown, over-length and empty ids (#1197)",
+          "[gateway_route_wiring]") {
+    // The verdict reflects only the in-memory session map, so it must not be
+    // gated on a wired GatewayRouteStore or MetricsRegistry. Non-PG: a bare
+    // AuthManager is enough because nothing is registered.
+    EventBus bus;
+    yuzu::MetricsRegistry registry_metrics;
+    AgentRegistry registry{bus, registry_metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, /*metrics=*/nullptr};
+
+    const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-nostore");
+    for (const auto& id : std::vector<std::string>{"gw-session-nostore-a", "gw-session-nostore-a",
+                                                   "", too_long, "gw-session-nostore-b"})
+        batch.add_heartbeats()->set_session_id(id);
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    CHECK(resp.acknowledged_count() == 0);
+    auto listed = listed_unknown(resp);
+    std::sort(listed.begin(), listed.end());
+    CHECK(listed == std::vector<std::string>{"gw-session-nostore-a", "gw-session-nostore-b"});
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+}
+
+TEST_CASE("BatchHeartbeat verdict: with no route store a KNOWN session is still acked and the "
+          "unknown one still listed (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr; // PG only for the enrollment token; NO route store is wired
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
+
+    auto req = make_gw_register(auth_mgr, "agent-nostore-known");
+    apb::RegisterResponse reg;
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req, &reg).ok());
+
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-nostore-known");
+    batch.add_heartbeats()->set_session_id(reg.session_id());
+    batch.add_heartbeats()->set_session_id("gw-session-nostore-unknown");
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    CHECK(resp.acknowledged_count() == 1);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-nostore-unknown"});
 }
 
 // ── Fail-open posture ────────────────────────────────────────────────────────

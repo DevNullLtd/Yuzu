@@ -215,9 +215,9 @@ answering server replica does not hold in memory (at most 4096; empty and
 over-length ids are never listed), and `unknown_session_ids_truncated` is set
 when more than that were unknown. A server that predates these fields and a
 server with nothing unknown look the same on the wire, by design. **The gateway
-does not read either field yet** (#1197 PR-B added the server side only), so
+does not read either field yet** (only the server side exists today), so
 today they have no effect on gateway behaviour; the gateway-side replay that
-will consume them is a separate change.
+will consume them is tracked in #1197.
 
 ### StreamStatusNotification Message
 
@@ -259,7 +259,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {upstream_pool_size, 16},
 
     %% Heartbeat batching interval (ms)
-    {heartbeat_batch_interval_ms, 10000},
+    {heartbeat_batch_interval_ms, 1000},
 
     %% Default command timeout (seconds)
     {default_command_timeout_s, 300},
@@ -498,6 +498,21 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > cannot observe the direct agent peer, and the durable source arrives with the
 > QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
 > `source_ip` with network logs on this path will see the gateway's address.
+
+> **Known limitation - server-only restart (#1197).** After the server restarts
+> while a gateway stays connected, `/health` `agents.online` can stay 0 and the
+> server logs `BatchHeartbeat: unknown session` / `0/1 acked` at debug level.
+> The server keeps its gateway sessions in memory and the gateway does not yet
+> replay its registrations when the server loses them. Observed on one local
+> development rig with one agent (not reproduced elsewhere): a command to the
+> agent was still delivered while its route lease was unexpired (90 s from the
+> last heartbeat the previous server ingested, minus the downtime) and was
+> refused (503) afterwards; if the previous server had ingested no heartbeat
+> there was no such window; the server did not relearn the session in the
+> observed windows (to about 125 s); a full restart of server, gateway and
+> agent restored it, which is the only recovery observed (restarting only the
+> gateway, or only the agent, was not tested). The gateway-side fix is tracked
+> in #1197; this note will be revised when it ships.
 
 ---
 

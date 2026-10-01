@@ -69,13 +69,17 @@ inline constexpr std::size_t kMaxClusterIdLen = 64;
 // misconfigured values.
 inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
 
-// #1197: BatchHeartbeatResponse.unknown_session_ids caps. The listed count is
-// tied to the gateway heartbeat buffer's own 10000-entry bound
-// (max_heartbeat_buffer); 4096 ids x 64 B keeps the response about 260 KiB,
-// under every default message limit on both sides. The listed subset under
-// truncation is whatever the unordered set yields: do NOT sort it (omitted ids
-// are reported again when those agents next heartbeat, so there is no fairness
-// to preserve and a sort would only add cost).
+// #1197: BatchHeartbeatResponse.unknown_session_ids cap. Deliberately smaller
+// than the gateway heartbeat buffer's 10000-entry bound: 4096 ids x 64 B keeps
+// the response at about 260 KiB, far under gRPC's 4 MiB default message limit.
+// The listed subset under truncation is whatever the unordered set yields: do
+// NOT sort it (an omitted id is typically reported again when that agent next
+// heartbeats, so there is no fairness to preserve and a sort would only add
+// cost). Only the LISTED set is capped. The set collected inside BatchHeartbeat
+// is not, and is bounded only by the receive limit (gRPC's 4 MiB default; server
+// code sets no custom limit): capping it would saturate the
+// renew_leases/unknown_session count and make the truncation warn's total
+// inexact.
 inline constexpr int kMaxUnknownSessionIdsPerResponse = 4096;
 
 // #1197: a session_id longer than this that does NOT resolve in

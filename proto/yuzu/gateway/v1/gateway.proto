@@ -53,14 +53,17 @@ message BatchHeartbeatRequest {
 
 message BatchHeartbeatResponse {
   int32 acknowledged_count = 1;
-  // Distinct session ids in this batch that this server instance does not hold
-  // (per-replica in-memory map). Deduped, capped at
-  // kMaxUnknownSessionIdsPerResponse, never an empty or over-length id.
-  // Absent/empty means nothing to replay. The listed subset under truncation
-  // is arbitrary; omitted ids are reported again when those agents next
-  // heartbeat. No presence marker by design: a server that predates these
-  // fields and a server with nothing unknown are indistinguishable. Field 4
-  // is left free.
+  // Session ids from this batch that this server instance does not hold in its
+  // per-replica in-memory session map: distinct, at most 4096 of them, each at
+  // most 64 bytes. An empty or over-length session id is never listed. If more
+  // than 4096 distinct unknown ids were seen, unknown_session_ids_truncated is
+  // set and the listed subset is arbitrary (not sorted, no fairness); an
+  // omitted id is typically reported again when that agent next heartbeats,
+  // though that is not guaranteed under sustained flooding with junk ids. An
+  // empty list means nothing the server asks the gateway to replay, NOT that
+  // nothing is wrong: a server that predates these fields is indistinguishable
+  // from one with nothing unknown (no presence marker by design). Field 4 is
+  // intentionally unused.
   repeated string unknown_session_ids = 2;
   bool unknown_session_ids_truncated = 3;
 }
