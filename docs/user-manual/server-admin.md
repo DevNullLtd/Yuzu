@@ -2278,16 +2278,26 @@ takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
 #    entry held by anyone else survives it untouched.
 icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
 
-# 3. Break inheritance and grant exactly Administrators and SYSTEM. Without the
-#    inheritance break, %ProgramData%'s inherited rights let an unprivileged local
-#    user plant the anchor file before you do.
-icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q
+# 3. Break inheritance and grant exactly Administrators and SYSTEM, on the DIRECTORY
+#    ONLY: its files inherit this from step 2. Without the inheritance break,
+#    %ProgramData%'s inherited rights let an unprivileged local user plant the anchor
+#    file before you do. Do NOT add /T here: on a file the (OI)(CI) grant is invalid,
+#    and icacls then leaves every existing file (an update-trust-bundle.pem already in
+#    place) with an EMPTY permission list -- SYSTEM, and so the agent, can no longer
+#    read it -- while still reporting success (#5196).
+icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /C /Q
 
-# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F),
-# and nothing marked (I). Check the OWNER too -- an unexpected owner can restore its own
-# access at any time, so "the list looks right" is not on its own sufficient.
+# Verify the directory: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each
+# (OI)(CI)(F), and nothing marked (I). Check the OWNER too -- an unexpected owner can
+# restore its own access at any time, so "the list looks right" is not on its own
+# sufficient.
 icacls "C:\ProgramData\Yuzu\agent-certs"
 (Get-Acl "C:\ProgramData\Yuzu\agent-certs").Owner
+# And every file in it: each must show BUILTIN\Administrators:(I)(F) and
+# NT AUTHORITY\SYSTEM:(I)(F). A file listed with NO entries at all is unreadable by
+# the agent; repair it by resetting the FILES only (not the directory, which must keep
+# step 3's permissions): icacls "C:\ProgramData\Yuzu\agent-certs\*" /reset /T /C /Q
+icacls "C:\ProgramData\Yuzu\agent-certs\*"
 ```
 
 ```bash
@@ -3077,7 +3087,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. A post-install check verifies the resulting owner and entry set exactly and aborts the install if anything else can write there. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. The grant is applied to the directory alone and its contents inherit it. A pre-install check verifies, for the directory and every file in it, the owner, that no other account has an entry, and that Administrators and SYSTEM both have full control; it aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged

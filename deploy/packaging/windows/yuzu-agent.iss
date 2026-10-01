@@ -400,9 +400,12 @@ var
   I: Integer;
 begin
   Result := '';
+  // PowerShell also treats the typographic quotes U+2018..U+201B as single
+  // quotes, so each must be doubled like ' is -- a {tmp} path
+  // under a profile whose name contains U+2019 would otherwise end the literal early.
   for I := 1 to Length(S) do
-    if S[I] = '''' then
-      Result := Result + ''''''
+    if (S[I] = '''') or (S[I] = #$2018) or (S[I] = #$2019) or (S[I] = #$201A) or (S[I] = #$201B) then
+      Result := Result + S[I] + S[I]
     else
       Result := Result + S[I];
   Result := '''' + Result + '''';
@@ -427,15 +430,22 @@ end;
   takeown (which also enables the privilege needed to recover a directory whose
   DACL grants Administrators nothing at all), then /reset to drop every explicit
   ACE, then /inheritance:r /grant:r to drop the inherited ones and grant exactly
-  Administrators and SYSTEM. /T because a file the attacker planted carries its
-  own ACL and its own owner.
+  Administrators and SYSTEM. takeown and /reset run with /T because a file the
+  attacker planted carries its own ACL and its own owner; the GRANT runs on the
+  directory alone, and its children inherit it. It must NOT use /T: (OI)(CI) is
+  invalid on a file, and icacls /T then leaves every existing file -- the
+  operator's update-trust-bundle.pem on every reinstall -- with an empty
+  protected DACL that locks SYSTEM out too, while reporting success. Verified
+  on Windows Server 2022 with the 0.14.0-rc5 installer (#5196).
 
   `icacls /grant:r` ALONE IS NOT ENOUGH and this is the bug that shipped: it
   replaces grants only for the SIDs it NAMES, so a third SID's explicit entry
   survives it untouched.
 
   THE CHECK MUST COMPARE THE EXACT OWNER AND ACE SET, not a marker within the
-  ACL text. The previous check tested for the inherited-ACE marker "(I)", which
+  ACL text -- and it must require that Administrators and SYSTEM actually HAVE
+  full control: "nobody else has access" is also true of an empty DACL, which
+  is exactly what the /T bug above produced and what the check passed. The previous check tested for the inherited-ACE marker "(I)", which
   an explicit ACE does not carry -- so it passed a directory the attacker could
   still write to. Verified on Windows 11 26100: the install completed, reported
   the directory secured, and the attacker retained (OI)(CI)(F) plus ownership.
@@ -503,7 +513,7 @@ begin
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
              '"' + CertDir + '" /inheritance:r /grant:r ' +
-             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q',
+             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /C /Q',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   { Built from plain literals so any braces stay literal -- Inno expands a
@@ -532,11 +542,14 @@ begin
       'try{$x=Get-Acl -LiteralPath $p}catch{Fail (''the permissions could not be read on '' + $p)};' +
       '$o=$x.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;' +
       'if($ok -notcontains $o){Fail (''it is owned by '' + $o + '': '' + $p)};' +
+      '$g=@();' +
       'foreach($r in $x.Access){' +
         'try{$s=$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}' +
         'catch{Fail (''an account on its permission list could not be resolved: '' + $p)};' +
-        'if($ok -notcontains $s){Fail (''access is granted to '' + $s + '': '' + $p)}' +
-      '}' +
+        'if($ok -notcontains $s){Fail (''access is granted to '' + $s + '': '' + $p)};' +
+        'if($r.AccessControlType -eq ''Allow'' -and ($r.FileSystemRights -band 2032127) -eq 2032127){$g+=$s}' +
+      '};' +
+      'foreach($k in $ok){if($g -notcontains $k){Fail (''full control is not granted to '' + $k + '' (an empty permission list locks everyone out, the service included): '' + $p)}};' +
     '};' +
     'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
     'exit 0';
