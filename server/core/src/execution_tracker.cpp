@@ -3163,12 +3163,16 @@ ExecutionTracker::reap_stuck_running_executions() {
         // 50%-of-running-population would_wipe ratio, looked identical to a
         // healthy, fully-draining reaper (cancelled==cap every pass) with no
         // signal anywhere that the real backlog was flat or growing. Zero
-        // extra query cost — candidate_count is already in hand. Deliberately
-        // placed AFTER the would_wipe decline above returns: `capped` means
-        // "this pass ACTED but didn't fully drain", a distinct signal from
-        // "this pass declined to act at all" — the two must never both be
-        // true for the same pass.
-        capped = candidate_count > kStuckExecReapCap;
+        // extra query cost — candidate_count is already in hand. The
+        // assignment itself is deliberately BELOW the candidate-select's own
+        // empty-check below (governance Gate 8 re-review, sre NICE finding),
+        // not right here where candidate_count is first read: `capped` means
+        // "this pass ACTED but didn't fully drain" — if candidate_count>0
+        // raced down to 0 by the time of the SELECT (the exact race the
+        // early-return below already names), this pass does NOT act, and
+        // `capped=true` paired with `cancelled=0` would contradict its own
+        // meaning. `would_wipe`'s own early return above still guarantees
+        // `capped`/`would_wipe` mutual exclusivity either way.
 
         // #4982 round 5: same shared owner-defined predicate as the candidate
         // count above — see that call site's comment.
@@ -3192,6 +3196,7 @@ ExecutionTracker::reap_stuck_running_executions() {
             candidate_ids.push_back(col_str(ids.get(), i, 0));
         if (candidate_ids.empty())
             return true; // candidate_count>0 above raced down to 0 in-transaction; nothing to do
+        capped = candidate_count > kStuckExecReapCap;
 
         // #4982 fix round 2 (Fix 2/3): the ATOMIC cancel. The former design
         // selected candidates HERE, inside the lock, then cancelled each one

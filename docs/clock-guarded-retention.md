@@ -488,7 +488,8 @@ an acceptable worst case, bounded by the same would-wipe/cap guards as any other
 **Upstream candidate-predicate race (fix round 3, #4982) — closed at the SOURCE, not by widening the
 predicate.** Fix round 2's atomic `UPDATE ... RETURNING id` above re-checks `status='running' AND
 agents_targeted=0 AND NOT EXISTS <pending outbox row>` at mutation time and calls that the "full
-candidate predicate" — but that predicate is only trustworthy if a `'sent'` outbox row genuinely
+candidate predicate" (as of round 3 — a governance Gate 2 fix below adds a THIRD clause; read that
+entry too before treating this round-3 description as current) — but that predicate is only trustworthy if a `'sent'` outbox row genuinely
 implies its execution's `agents_targeted` bookkeeping is settled. It was not: `command_outbox_delivery.cpp`
 called `CommandOutboxStore::mark_sent` (outbox `pending → sent`) and
 `ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit statements. Between the two
@@ -521,6 +522,35 @@ declining only that one pass. Deliberately NOT drain-on-repeat, matching the sib
 a garbage anchor is not evidence of genuine elapsed downtime the way a persisting skew is, so the
 repaired pass still declines the actual sweep and the NEXT pass is the first to act on the healed
 anchor.
+
+**Real-agent-response exclusion (governance Gate 2 fix, #4982, BLOCKING, security-guardian,
+empirically reproduced) — the candidate predicate gains a THIRD clause.** The round-3 fix above
+closed the race against the WRITE side (`mark_sent`/`set_agents_targeted` committing as two
+halves) for an OUTBOX-originated dispatch. It said nothing about a SYNCHRONOUS REST/MCP dispatch
+that never touches the outbox at all: if that dispatch genuinely reached one or more agents (real
+responses recorded in `agent_exec_status` via `update_agent_status`, independently of
+`agents_targeted`) but the dispatcher's OWN `set_agents_targeted` bookkeeping write failed,
+`agents_targeted` stayed `0` forever — `refresh_counts_once`'s terminal transition requires
+`agents_targeted > 0` to ever fire — and this sweep force-cancelled that row at the 30-minute mark
+regardless of how many agents actually succeeded, since nothing in the predicate checked for a
+real response. Reproduced: 3 genuine `SUCCESS` responses recorded, `agents_targeted` never set,
+the sweep still cancelled the row and published a terminal `execution-completed` event
+misrepresenting a working execution as cancelled.
+
+Fixed by a third shared clause, `kNoAgentResponseExistsClause` (`execution_tracker.cpp`, same
+file-scope anonymous-namespace shape as the window/cap constants above): `NOT EXISTS (SELECT 1
+FROM execution_tracker.agent_exec_status WHERE execution_id = executions.id)`, `AND`-ed into all
+THREE predicate occurrences (the candidate-count SELECT, the candidate-select SELECT, and the
+atomic cancel UPDATE's own re-check). **This does NOT narrow Part B's original scope**: a dispatch
+refused BEFORE any agent was ever reached (a degraded pre-dispatch quota check, zero agents
+matched the target scope, a dispatch exception, a lost `create_pending` race — Part B's actual
+target population) has ZERO `agent_exec_status` rows, so the new clause is vacuously satisfied and
+such a row is still recovered exactly as before. Only a row with at least one genuine per-agent
+response is now additionally excluded — and that exclusion is permanent, by design: leaving a row
+with a real response wedged (the pre-fix behaviour, now narrowed to exactly this population) is
+strictly safer than falsely cancelling it, since there is no repair path today that re-derives
+`agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
+(force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
 ### `guardian_lifecycle_journal.cpp`
 

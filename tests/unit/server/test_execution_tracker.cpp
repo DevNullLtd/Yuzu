@@ -3514,6 +3514,16 @@ TEST_CASE("ExecutionTracker: reap_stuck_running_executions never cancels a "
     CHECK_FALSE(out->clock_anomaly);
     CHECK_FALSE(out->would_wipe);
     CHECK(out->cancelled == 0);
+    // governance Gate 8 re-review (quality-engineer): without this
+    // assertion, dropping the candidate-SELECT site's clause alone (while
+    // keeping it at the count SELECT and the atomic UPDATE) would still pass
+    // this test green — the row would never be OFFERED as a candidate at
+    // the count stage... but the count SELECT already excludes it too, so a
+    // SELECT-only regression actually surfaces here: not_cancelled stays 0
+    // only because the row is never selected as a candidate in the first
+    // place, never reaching the atomic UPDATE's own recheck. Pins the
+    // candidate-select site specifically, not just "cancelled == 0" overall.
+    CHECK(out->not_cancelled == 0);
 
     // The row must stay 'running', not 'cancelled' — a real agent success
     // must never be overwritten by a false terminal verdict with no repair
