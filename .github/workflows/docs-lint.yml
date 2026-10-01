@@ -156,6 +156,18 @@ jobs:
       - name: RBAC doc/seed parity
         run: python3 tests/test_rbac_doc_counts.py
 
+      # Gateway image guards (#2150). The abi-guard in Dockerfile.gateway's
+      # runtime stage once shipped failing OPEN (`apk version -t` prints
+      # nothing for a version it cannot parse); this runs the guard's real
+      # text under sh against fake builder/runtime facts. The second pins the
+      # gateway crash signatures qa-stack's crash-check greps for, which
+      # missed beam aborting at boot on v0.14.0-rc4's soak. Stdlib only, no
+      # Docker.
+      - name: Gateway image abi-guard
+        run: python3 tests/test_gateway_abi_guard.py
+      - name: QA-stack gateway crash signatures
+        run: python3 tests/test_qa_stack_crash_pat.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The

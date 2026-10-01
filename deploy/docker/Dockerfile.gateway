@@ -55,15 +55,46 @@ RUN grep -q 'YUZU PATCH (PKI PR5c)' _checkouts/grpcbox/src/grpcbox_pool.erl \
 
 RUN rebar3 as prod release
 
-# ── Stage 3: Runtime — must match the builder's Alpine version for
-#    OpenSSL ABI compatibility (crypto NIF links against libcrypto.so).
-#    erlang:28-alpine is currently based on alpine:3.23 (see its
-#    org.opencontainers.image.base.name annotation); bump this FROM line
-#    in lockstep whenever the erlang image's base drifts.
+# Record the build-side ABI facts the runtime stage's guard checks (#2150).
+# The musl version comes from the dynamic loader itself, so it is the libc the
+# release was linked against, not a package-database claim.
+RUN { echo "BUILD_ALPINE=$(cut -d. -f1,2 /etc/alpine-release)"; \
+      echo "BUILD_MUSL=$(/lib/ld-musl-*.so.1 2>&1 | sed -n 's/^Version //p')"; \
+      echo "BUILD_OTP=$(cat "$(erl -noshell -eval 'io:format("~s", [code:root_dir()]), halt().')"/releases/*/OTP_VERSION)"; \
+    } > /build-abi.env && cat /build-abi.env
+
+# ── Stage 3: Runtime — MUST be the builder's Alpine release (#2150) ──────
+#
+# Two reasons. The guard RUN below fails the build when the Alpine release or
+# the musl version differs, which covers the second directly and the first by
+# proxy:
+#
+#  1. OpenSSL ABI. The crypto NIF in the release was built against the
+#     builder's libcrypto.so.3. The runtime's libcrypto3 comes from the
+#     `apk add` below, from the same Alpine release branch, so the soname and
+#     the 3.x ABI match even when the patch level differs.
+#
+#  2. musl's sigaltstack() check. ERTS (OTP 28) sizes its alternate signal
+#     stack with the compile-time constant SIGSTKSZ (8192 on x86_64). musl
+#     1.2.6 (Alpine 3.24) rejects any size below sysconf(_SC_MINSIGSTKSZ),
+#     which comes from the kernel's AT_MINSIGSTKSZ. That value exceeds 8192 on
+#     AMX-capable Intel CPUs (Sapphire Rapids and newer: AWS c7i/m7i/r7i), so
+#     beam.smp aborts at boot with "sys_sigaltstack(): Internal error: Failed
+#     to set alternate signal stack" (#1743). musl 1.2.5 checks a fixed
+#     constant and accepts it. Rebuilding against 1.2.6 does NOT help: SIGSTKSZ
+#     is still 8192 there. The fix is in ERTS (erlang/otp#11249, #11376), first
+#     released in OTP 29.1; no OTP 28 or 29.0.x release carries it.
+#
+# So: keep this FROM on the builder's Alpine release (erlang:28-alpine is on
+# 3.23 today). Do not move to Alpine 3.24 (musl 1.2.6) until the builder's OTP
+# is 29.1 or newer. Dependabot is told to ignore Alpine minor bumps for this
+# reason (.github/dependabot.yml). If upstream erlang:28-alpine itself moves to
+# 3.24 while still on OTP 28, the guard fails the build rather than ship an
+# image that crash-loops on AMX hosts.
 #
 # RUNTIME INVARIANT: busybox wget is required by docker-compose.uat.yml's
-# healthcheck (`wget --spider -q http://localhost:8081/healthz`). Alpine 3.23
-# ships busybox which provides wget with --spider. Do not switch this base
+# healthcheck (`wget --spider -q http://localhost:8081/healthz`). Alpine's
+# busybox provides wget with --spider. Do not switch this base
 # image to a wget-less variant or strip busybox without first updating every
 # compose file's healthcheck block to use a tool the new base provides.
 # Governance Gate 7, architect SHOULD-2.
@@ -73,7 +104,44 @@ RUN rebar3 as prod release
 # pushes it, and on every PR that touches this file. NOTE: Alpine's busybox is
 # built WITHOUT the httpd applet, so it cannot serve the probe's listener — the
 # script uses the official busybox image for that.
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+FROM alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+
+# Builder/runtime ABI guard (#2150). See the stage header above for why.
+# Every version is first required to be a plain dotted number: `apk version -t`
+# prints nothing for anything else (an OTP release candidate "29.0-rc1", a
+# patched "28.5.0.2**"), and an empty comparison must never read as "not
+# older"; each comparison must then be exactly one of < = >. Two OTP_VERSION
+# files in the builder put a bare line in the env file, which fails the build
+# at the `.` (command not found) before any of this runs. otp_fix_min is the
+# first OTP release whose ERTS sizes the signal stack from
+# sysconf(_SC_MINSIGSTKSZ); lower it only if an OTP 28 release gains the
+# backport. tests/test_gateway_abi_guard.py runs this step's text, so keep
+# the paths it reads where they are.
+RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.env \
+    set -eu; . /tmp/build-abi.env; \
+    otp_fix_min=29.1; \
+    rt_alpine=$(cut -d. -f1,2 /etc/alpine-release); \
+    rt_musl=$(/lib/ld-musl-*.so.1 2>&1 | sed -n 's/^Version //p'); \
+    echo "abi-guard: builder Alpine $BUILD_ALPINE musl $BUILD_MUSL OTP $BUILD_OTP; runtime Alpine $rt_alpine musl $rt_musl"; \
+    for v in "$BUILD_ALPINE" "$BUILD_MUSL" "$BUILD_OTP" "$rt_alpine" "$rt_musl"; do \
+      case "$v" in ''|*[!0-9.]*|.*|*.|*..*) \
+        echo "FATAL: abi-guard: '$v' is not a plain dotted version, so builder and runtime cannot be compared. See the abi-guard line above and docs/operations/troubleshooting.md, Gateway image build fails at abi-guard."; \
+        exit 1;; esac; \
+    done; \
+    if [ "$rt_alpine" != "$BUILD_ALPINE" ] || [ "$rt_musl" != "$BUILD_MUSL" ]; then \
+      echo "FATAL: abi-guard: runtime Alpine/musl ($rt_alpine/$rt_musl) differs from the builder's" \
+           "($BUILD_ALPINE/$BUILD_MUSL). Move the runtime FROM to the builder's Alpine release; see docs/operations/troubleshooting.md."; \
+      exit 1; fi; \
+    musl_vs=$(apk version -t "$rt_musl" 1.2.6 || true); \
+    otp_vs=$(apk version -t "$BUILD_OTP" "$otp_fix_min" || true); \
+    for c in "$musl_vs" "$otp_vs"; do \
+      case "$c" in '<'|'='|'>') ;; *) \
+        echo "FATAL: abi-guard: could not compare versions (apk printed '$musl_vs' '$otp_vs')."; exit 1;; esac; \
+    done; \
+    if [ "$musl_vs" != "<" ] && [ "$otp_vs" = "<" ]; then \
+      echo "FATAL: abi-guard: musl $rt_musl with OTP $BUILD_OTP: beam.smp aborts at boot on AMX CPUs" \
+           "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
+      exit 1; fi
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     # bind-tools (dig) + iproute2: HA WS-4 #4555 — gateway-entrypoint.sh
