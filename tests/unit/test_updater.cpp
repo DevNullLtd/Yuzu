@@ -315,3 +315,17 @@ TEST_CASE("OtaUpdateThread::join and stop tolerate an unstarted thread and a nul
     thread.stop_and_join(nullptr); // reconnect teardown with auto_update off / no updater
     thread.join();
 }
+
+TEST_CASE("Updater::effective_check_interval clamps to [1s, 8760h]", "[updater][2182]") {
+    using std::chrono::hours;
+    using std::chrono::seconds;
+    static_assert(noexcept(Updater::effective_check_interval(seconds{})));
+
+    const seconds max_interval{hours{8760}};
+    CHECK(Updater::effective_check_interval(seconds{0}) == seconds{1});
+    CHECK(Updater::effective_check_interval(seconds{-5}) == seconds{1});
+    CHECK(Updater::effective_check_interval(seconds{1}) == seconds{1});
+    CHECK(Updater::effective_check_interval(max_interval) == max_interval);
+    CHECK(Updater::effective_check_interval(seconds::max()) == max_interval);
+    CHECK(Updater::effective_check_interval(seconds{hours{9000}}) == max_interval);
+}
