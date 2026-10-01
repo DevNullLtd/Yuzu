@@ -3220,8 +3220,8 @@ if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
 this section describes. It is not proof that the agent loaded that configuration,
 because the agent does not yet log its signing mode at startup, and it assumes an
 agent recent enough to have these options (`yuzu-agent.exe --help` lists
-`--update-trust-bundle`). It does not validate the value's other entries, and it
-compares names case-insensitively, so type them in plain ASCII. It also does not
+`--update-trust-bundle`). It does not check the other entries' contents, only that
+none is empty, and it compares names case-insensitively, so type them in plain ASCII. It also does not
 check that the bundle file holds the right certificates: a wrong bundle makes the
 agent refuse signed updates, which shows in
 `yuzu_agent_ota_signature_refused_total` and the agent log.
