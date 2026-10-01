@@ -163,8 +163,10 @@ because it could not confirm that only Administrators and SYSTEM can write
 everything in it. The lines after it give the directory and then the reason.
 The agent service was stopped for the install and is not restarted: run
 `sc start YuzuAgent` once you have dealt with the reason. Installers from
-0.14.0-rc1 to rc5 also hit this on every endpoint that enforces WDAC or
-AppLocker script rules (#5196): use a later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
+Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
+for an install run by an administrator rather than as SYSTEM (#5196): use a
+later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
 PowerShell 7 through another process (#5176): run them from a new
 `powershell.exe` or `cmd.exe` window that was not itself started from
 PowerShell 7, or use a later installer.

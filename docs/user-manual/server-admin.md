@@ -3124,7 +3124,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | Set the variables in the service's own environment -- a `REG_MULTI_SZ` value named `Environment` under the service's registry key -- then restart the service: `reg add HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment /t REG_MULTI_SZ /d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem" /f`, then `Restart-Service YuzuAgent`. The service reads it every time it starts, and **installer upgrades and reinstalls leave it in place**. Separate several variables with `\0` (`/d "YUZU_UPDATE_TRUST_BUNDLE=...\0YUZU_UPDATE_REQUIRE_SIGNATURE=1"`); `reg add` replaces the whole value, so give every variable each time, and check it with `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`. **Do not add the flags to the service's binary path.** Every run of the agent installer -- a reinstall, or an upgrade pushed through SCCM, Intune or GPO -- rewrites that path in full and drops them, so verification is silently OFF afterwards with nothing to show it (#5196). An endpoint configured that way before should be moved to the `Environment` value. Do not use `setx /M` either: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service. |
+| Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:
 
@@ -3135,6 +3135,61 @@ Every flag below has the environment variable shown beside it:
 
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
+
+#### Windows: the service's `Environment` value
+
+The Service Control Manager merges a service's `Environment` value into the
+environment it starts the service with, so the agent sees these variables beside
+the usual `Path`, `SystemRoot` and so on. Elevated, for the trust bundle alone
+(stage 1 of *Rolling signing out to a live fleet*):
+
+```powershell
+reg add HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment /t REG_MULTI_SZ /d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem" /f
+Restart-Service YuzuAgent
+```
+
+For stage 2, give both variables, separated by `\0`:
+`/d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem\0YUZU_UPDATE_REQUIRE_SIGNATURE=1"`.
+
+Get these right, because several mistakes are silent:
+
+- **`reg add /f` replaces the whole value.** If the service already has an
+  `Environment` value, read it first with
+  `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`, and
+  give its entries again in the same command.
+- **Names must be exact.** A misspelt name is ignored without any error, and
+  signing then stays off. Run the check below after every change.
+- **`YUZU_UPDATE_REQUIRE_SIGNATURE` must be exactly `1`.** A value the agent cannot
+  read as on or off, such as `enabled` or `1` followed by a space, stops it at
+  startup.
+- **If the service will not start after a change** — `sc start YuzuAgent` fails with
+  error 1053, and the agent's log has nothing new — the agent refused before
+  logging began: `YUZU_UPDATE_REQUIRE_SIGNATURE` without `YUZU_UPDATE_TRUST_BUNDLE`,
+  or a value it cannot read. Correct the value and start the service again.
+- **Installing over the existing agent keeps the value; uninstalling deletes it.**
+  An upgrade or reinstall over an installed agent leaves the service's registry key
+  alone. Uninstalling removes the service, and the value with it. That includes an
+  SCCM or Intune deployment set to uninstall the previous version first. Set it
+  again after any uninstall.
+- **Remove any signing flags you put in the binary path earlier.** A flag there
+  takes precedence over the variable, until the next installer run silently drops it.
+- **Do not use `setx /M`.** Services inherit the machine environment from
+  `services.exe`, which caches it at boot, so a machine variable is typically NOT
+  visible to a merely-restarted service.
+
+To check an endpoint — it prints `OK` and exits 0 only when the bundle variable is
+set exactly and no signing flag is left in the binary path. Save it as a `.ps1` and
+run that, or use it as a configuration-management compliance script; pasted into an
+interactive PowerShell window, its `exit` closes the window:
+
+```powershell
+$k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
+if (($k.Environment -ccontains 'YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem') -and ($k.ImagePath -notmatch '--update-')) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
+```
+
+Add `-and ($k.Environment -ccontains 'YUZU_UPDATE_REQUIRE_SIGNATURE=1')` once the
+endpoint is at stage 2. The check confirms the configuration only; it does not
+prove the agent read it. The agent does not yet log its signing mode at startup.
 
 ### The verifier's catastrophic invariants
 
@@ -4926,7 +4981,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
 
-> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installer runs leave alone (see *Signing update binaries (#416)*).
+> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installing over the existing agent leaves alone, though uninstalling deletes it (see *Windows: the service's `Environment` value*).
 
 **If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 

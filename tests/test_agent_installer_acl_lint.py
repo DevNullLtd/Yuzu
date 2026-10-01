@@ -123,8 +123,10 @@ def problems(iss: str, md: str) -> list:
             found.append(f"manual verify lost its {why}: {needle}")
     body = pslit_body(iss)
     for ch in ("''''", "#$2018", "#$2019", "#$201A", "#$201B"):
-        if ch not in body:
-            found.append(f"PsLit no longer doubles {ch}")
+        if f"(S[I] = {ch})" not in body:
+            found.append(f"PsLit no longer tests for {ch}")
+    if "Result := Result + S[I] + S[I]" not in body:
+        found.append("PsLit no longer doubles the quote characters it matches")
     return found
 
 
@@ -150,6 +152,8 @@ class InstallerAclLint(unittest.TestCase):
                                    "'^\\(A;OICI;FA;;;(SY|BA)\\)'"),
             "manual verify drifted": ("md", "($Matches[1] -ne $Matches[2])", "($true)"),
             "PsLit U+2019 dropped": ("iss", " or (S[I] = #$2019)", ""),
+            "PsLit ASCII quote dropped": ("iss", "if (S[I] = '''') or ", "if "),
+            "PsLit stops doubling": ("iss", "Result := Result + S[I] + S[I]", "Result := Result + S[I]"),
         }
         for name, (which, old, new) in mutations.items():
             with self.subTest(mutation=name):

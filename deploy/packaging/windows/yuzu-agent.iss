@@ -216,9 +216,10 @@ Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yu
 ; scripts/install-agent-user.ps1 New-ProcBootAutologger — keep in sync (LogFileMode
 ; 0x2 = circular, 16 MB cap, System clock for FILETIME decode, FlushTimer 1 so the
 ; boot window reaches disk before the agent replays, keyword 0x10 = start/stop).
-; PSModulePath reset: same as SecureTrustAnchorDir (#5176). The AutoLogger cmdlets load fine
-; without it; it is here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules;'+[Environment]::GetEnvironmentVariable('PSModulePath','Machine'); Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
+; PSModulePath reset: same as SecureTrustAnchorDir (#5176) -- $PSHOME\Modules only, no .NET call, so it
+; also runs under Constrained Language Mode (#5196). The AutoLogger cmdlets load fine without it; it is
+; here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules'; Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; New-AutologgerConfig -Name YuzuProcBoot -LogFileMode 0x2 -LocalFilePath '{commonappdata}\Yuzu\procboot.etl' -MaximumFileSize 16 -ClockType System -FlushTimer 1 -ErrorAction SilentlyContinue | Out-Null; Add-EtwTraceProvider -AutologgerName YuzuProcBoot -Guid '{{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}' -Level 4 -MatchAnyKeyword ([uint64]0x10) -ErrorAction SilentlyContinue | Out-Null; exit 0"""; StatusMsg: "Configuring boot process-capture AutoLogger..."; Flags: runhidden waituntilterminated; Components: plugins\advanced
 
 [UninstallRun]
 ; #1822 fix means `sc stop` now genuinely stops a running process holding open
@@ -246,9 +247,10 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--remove-service"; Flags: run
 ; session slot and still writing the 16 MB circular .etl. Unconditional (harmless
 ; no-op if never configured). Mirror of
 ; scripts/install-agent-user.ps1 Remove-ProcBootAutologger — keep in sync.
-; PSModulePath reset: same as SecureTrustAnchorDir (#5176). The AutoLogger cmdlets load fine
-; without it; it is here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules;'+[Environment]::GetEnvironmentVariable('PSModulePath','Machine'); Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
+; PSModulePath reset: same as SecureTrustAnchorDir (#5176) -- $PSHOME\Modules only, no .NET call, so it
+; also runs under Constrained Language Mode (#5196). The AutoLogger cmdlets load fine without it; it is
+; here so every powershell.exe the installer starts sees Windows PowerShell's own modules.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$env:PSModulePath=$PSHOME+'\Modules'; Remove-AutologgerConfig -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Stop-EtwTraceSession -Name YuzuProcBoot -ErrorAction SilentlyContinue | Out-Null; Remove-Item '{commonappdata}\Yuzu\procboot.etl' -Force -ErrorAction SilentlyContinue | Out-Null; exit 0"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveProcBootAutologger"
 
 ; gate-3 sre remediation (#3403 sockwho retirement): Inno Setup does not
 ; delete a file merely dropped from [Files] on an in-place upgrade, and
@@ -460,12 +462,13 @@ end;
   inherited (A;ID;FA;;;..) or (A;OICIID;FA;;;..) pair). SDDL names accounts by
   SID alias, never by localised name -- icacls prints localised names, so
   matching "BUILTIN\Administrators" would silently fail open off an English
-  build. It also uses NO .NET method call: under WDAC/AppLocker PowerShell runs
-  in Constrained Language Mode, which refuses method calls on non-core types,
-  and the rc1..rc5 check called GetOwner()/Translate(), so on such an endpoint
-  it could not run and every install aborted. Verified on Windows Server 2022
-  under ConstrainedLanguage (#5196). Property reads, -match and cmdlets are
-  allowed there.
+  build. It also uses NO .NET method call: under WDAC script enforcement, or
+  AppLocker script rules for a non-SYSTEM install, PowerShell runs in
+  Constrained Language Mode, which refuses method calls on non-core types. The
+  rc1..rc5 check called GetOwner()/Translate(), so there it could not run and
+  the install aborted. Verified on Windows Server 2022 with AppLocker script
+  rules enforced, installing as an elevated administrator: rc5 exit 7, this
+  check exit 0 (#5196). Property reads, -match and cmdlets are allowed there.
 
   IT MUST NOT PIPE icacls INTO find. An earlier form did:
 
@@ -593,7 +596,8 @@ begin
               'trust bundle and authorise their own agent updates; while SYSTEM cannot ' +
               'read it, the agent cannot verify updates at all. Securing it did not take ' +
               'effect -- security software may have blocked it. The installation has ' +
-              'been stopped.';
+              'been stopped, and the Yuzu Agent service, stopped for it, has not been ' +
+              'restarted: run "sc start YuzuAgent" once this is resolved.';
   end;
 end;
 
