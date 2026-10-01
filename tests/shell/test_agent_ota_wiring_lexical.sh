@@ -17,16 +17,18 @@
 #      sync_stop_ -> cancel_ctx(sync_ctx_) (same two), and stop() cancels heartbeat, sync and
 #      register contexts in sequence. quiesce_run_workers() additionally must call
 #      `u->stop()` between the heartbeat flag and its cancel, and must end by joining
-#      `update_thread_.join()` after the sync thread. The post-publish predicate is only sound because of this
-#      flag-then-cancel order.
+#      `update_thread_.join()` after the sync thread. The post-publish predicate is only
+#      sound because of this flag-then-cancel order.
 #
 # Robustness: comments are stripped and whitespace is collapsed before matching, so line
 # wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a
 # check. Patterns anchor on distinctive tokens, never line numbers.
 #
 # Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
-# (review-enforced). A built-in negative control (--self-test, run by default too) applies
-# one deletion per invariant to a temp copy of agent.cpp and requires the gate to FAIL on each.
+# (review-enforced). A built-in negative control (--self-test, run by default too) applies 14
+# perl mutations to a temp copy of agent.cpp (10 deletions/reorders across the invariants, plus
+# 4 predicate-ctor arity reversions at the register, heartbeat, subscribe and sync sites) and
+# requires the gate to FAIL on each; it also runs a regex-error control and a bound-lint control.
 #
 # Portability (GNU + BSD/macOS, bash 3.2): the gate must give the same answer everywhere. Every
 # regex is POSIX ERE with no repetition bound over 255 (BSD RE_DUP_MAX; linted below), a regex

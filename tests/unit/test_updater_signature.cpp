@@ -525,17 +525,29 @@ TEST_CASE("CtxSlot evaluates the predicate after publishing and under the mutex"
     std::atomic<grpc::ClientContext*> slot{nullptr};
     grpc::ClientContext ctx;
     std::atomic<bool> in_predicate{false};
+    std::atomic<bool> predicate_done{false};
     std::atomic<bool> probe_done{false};
+    std::atomic<bool> probed{false}; // try_lock ran while the predicate was provably still running
     std::atomic<bool> probe_got_lock{false};
     std::atomic<bool> published_in_predicate{false};
+    constexpr auto kWait = std::chrono::seconds{5};
 
     std::thread prober([&] {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        const auto deadline = std::chrono::steady_clock::now() + kWait;
         while (!in_predicate.load() && std::chrono::steady_clock::now() < deadline)
             std::this_thread::yield();
-        if (in_predicate.load() && mu.try_lock()) {
-            probe_got_lock = true;
-            mu.unlock();
+        if (in_predicate.load()) {
+            // A probe counts only if the predicate had not returned before AND after try_lock:
+            // after the predicate returns the ctor releases the mutex, so a late try_lock
+            // succeeds on correct code and proves nothing.
+            const bool pre_done = predicate_done.load();
+            const bool got = mu.try_lock();
+            if (got)
+                mu.unlock();
+            if (!pre_done && !predicate_done.load()) {
+                probed = true;
+                probe_got_lock = got;
+            }
         }
         probe_done = true;
     });
@@ -544,18 +556,18 @@ TEST_CASE("CtxSlot evaluates the predicate after publishing and under the mutex"
         yuzu::agent::CtxSlot s{mu, slot, &ctx, [&] {
                                    published_in_predicate = (slot.load() == &ctx);
                                    in_predicate = true;
-                                   const auto deadline =
-                                       std::chrono::steady_clock::now() + std::chrono::seconds{2};
+                                   const auto deadline = std::chrono::steady_clock::now() + kWait;
                                    while (!probe_done.load() &&
                                           std::chrono::steady_clock::now() < deadline)
                                        std::this_thread::yield();
+                                   predicate_done = true;
                                    return false;
                                }};
         CHECK_FALSE(s.stop_seen());
     }
     prober.join();
     CHECK(in_predicate.load());
-    CHECK(probe_done.load());
+    CHECK(probed.load());                   // the probe really ran while the predicate was live
     CHECK(published_in_predicate.load());   // already published when the predicate runs
     CHECK_FALSE(probe_got_lock.load());     // mutex held while the predicate runs
 }
