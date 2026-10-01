@@ -70,7 +70,7 @@ loudly here ('matched ZERO cases'), which is why every agent shard may carry
 flag is what stops the comma-free shard C failing when `meson test --suite
 agent --test-args '[tag]'` appends a second positional spec; it does NOT make
 `--test-args '[tag]'` a targeted run: Catch2 binds the extra spec to the LAST
-comma-separated OR term only, so shards A and B list a widened set and a typo'd
+comma-separated OR term only, so shards A and B list a widened set and a mistyped
 tag is no longer loud (measured 2026-10-01 on build-linux, `<shard spec>
 '[nonexistent_zzz]' --list-tests`: A 319, B 437, C 0 cases). Run the binary
 directly (`yuzu_agent_tests '[tag]'`) for a targeted run.
@@ -128,7 +128,7 @@ ALLOW_NO_TESTS_FLAG = "--allow-running-no-tests"
 AGENT_SHARD_SUITE = "yuzu:agent-shard"
 AGENT_REF_SPEC = "~[.]~[tsan-heavy]~[flaky-4086]"
 AGENT_LABEL = "agent-shard"
-# Hollow-discovery floor: fewer than this many agent-shard entries is a typo'd
+# Hollow-discovery floor: fewer than this many agent-shard entries is a mistyped
 # suite label or a dropped test() entry, never a valid sharding.
 AGENT_MIN_SHARDS = 2
 # A positional Catch2 tag-filter spec, as flake-retry.py's isolated retry can
@@ -280,7 +280,7 @@ def check_agent_shard_opts(entries):
 
 def check_agent_shard_suffix(entries):
     """Every comma-separated term of every agent shard spec must end with
-    AGENT_REF_SPEC (#5073, governance ARCH-1): tests/meson.build's
+    AGENT_REF_SPEC (#5073): tests/meson.build's
     `agent_shard_suffix` and this script's AGENT_REF_SPEC are two hand-synced
     literals, and `[flaky-4086]` matches no case on Linux/macOS, so a one-sided
     edit would otherwise surface only on the Windows leg. The reference is

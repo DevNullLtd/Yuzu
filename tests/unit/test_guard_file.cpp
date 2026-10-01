@@ -1101,7 +1101,8 @@ TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and nev
 // explicit [flaky-4086] tag plus `tests/meson.build`'s `~[flaky-4086]` exclusion (mirroring
 // how `[tsan-heavy]` is excluded) kept this case out of every run tested before sharding.
 // The sharded form of that exclusion (the `agent_shard_suffix` on every shard term) has not
-// been run on Windows (this case is `_WIN32`-only, so on Linux the `~[flaky-4086]` term
+// been EXECUTED on Windows, only listed there by the partition checker (this case is
+// `_WIN32`-only, so on Linux the `~[flaky-4086]` term
 // matches nothing and only the checker's suffix pin covers it). [.] is kept too so a
 // manual, zero-argument run of the exe still skips it.
 //

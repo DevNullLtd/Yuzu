@@ -1615,8 +1615,9 @@ The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
 'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
 and conservative headroom rather than a measured need: the only measured
-contention figure is for the SERVER `~[pg]` shards, c0 289 s to c4 603 s,
-about 2.1x, across jobs on the pre-#3443 combined step, per "Windows test-phase
+contention figure is for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
+the pre-#3443 combined step, per "Windows test-phase
 concurrency gate"; it has not been re-measured for the agent shards) and
 `--allow-running-no-tests`. That flag is what stops the zero-match shard C from
 failing when `meson test --suite agent --test-args '[tag]'` appends a second
