@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -130,6 +131,38 @@ public:
 private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);
     void audit(const OutboxCommand& c, const std::string& result, const std::string& detail);
+
+    /// governance Gate 4+ systematic fix (unhappy-path BLOCKING finding, then
+    /// a security-guardian sibling sweep across every mark_cancelled call
+    /// site in this file): the SOLE chokepoint for cancelling an occurrence's
+    /// execution row on an automatic (never operator-initiated) terminal
+    /// path. A redriven occurrence — route_unreadable/containment_unreadable
+    /// rescheduling EVEN WHEN outcome.sent > 0, a mark_sent_with_target
+    /// degrade rolling a genuine dispatch's bookkeeping back, or tick()'s own
+    /// catch-and-reschedule after a partial-send throw — can reach ANY
+    /// terminal branch in deliver() on a LATER tick for an execution_id that
+    /// already has a real agent_exec_status response from an earlier
+    /// attempt. Never force-cancel that row: declining toward NOT cancelling
+    /// (an undeterminable check, or an existing response) is strictly safer
+    /// than falsely cancelling a genuinely-dispatched execution — the
+    /// stuck-reap sweep's own kNoAgentResponseExistsClause exclusion then
+    /// correctly leaves such a row alone forever. Every one of this file's
+    /// mark_cancelled call sites MUST route through this method, never a
+    /// direct call — a fifth inline copy of this same three-way check is the
+    /// fork pattern this repo treats as a finding in its own right.
+    enum class ExecCancelOutcome {
+        kCancelled,        ///< no prior response existed; mark_cancelled succeeded.
+        kCancelFailed,      ///< no prior response existed; mark_cancelled itself failed
+                           ///< (already counted/logged by this method).
+        kDeclinedHasResponse, ///< a real agent_exec_status response already exists —
+                              ///< the execution row is left 'running', untouched.
+        kDeclinedDegraded,    ///< the agent_exec_status check itself degraded — declines
+                              ///< toward safety, retried on a later pass.
+    };
+    ExecCancelOutcome decline_or_cancel_exec(const std::string& execution_id,
+                                             const std::string& principal,
+                                             const std::string& occurrence_id,
+                                             std::string_view context);
     void count(const char* name);
     // Labeled companion to count(): the bare counter above stays a single
     // series (dashboards/alerts-in-waiting keep working unchanged), while this

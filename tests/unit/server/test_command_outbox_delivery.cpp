@@ -825,3 +825,87 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive to sent==0 does NOT cancel an "
     // whether the EXECUTION gets force-cancelled, not the outbox's own bookkeeping.
     CHECK(fx.raw_state("occ-redrive-zero") == "sent");
 }
+
+// governance sibling-sweep fix (security-guardian, BLOCKING, found by a
+// systematic audit of every mark_cancelled call site in this file after the
+// sent==0 fix above): the authority_denied branch had the identical gap —
+// a redrive that reaches "authority revoked since enqueue" for an
+// execution_id that already has a real agent_exec_status response from an
+// EARLIER attempt (route_unreadable/containment_unreadable rescheduling even
+// when that earlier attempt reached agents, or a mark_sent_with_target
+// degrade rolling it back) must not force-cancel it either.
+TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
+          "cancel an execution that already has a real agent_exec_status "
+          "response from an earlier dispatch attempt (governance sibling-"
+          "sweep fix)",
+          "[command_outbox][pg][delivery][4982]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    // Seed a REAL agent response, as if an earlier dispatch attempt genuinely
+    // reached this agent before authority was revoked and this occurrence
+    // redrove into the authority_denied branch.
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.first_response_at = 1001;
+    as.completed_at = 1002;
+    as.exit_code = 0;
+    tracker.update_agent_status(*exec_id, as);
+
+    auto req = fx.req("occ-denied-with-response", "cmd-denied-with-response");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    yuzu::MetricsRegistry metrics;
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.metrics = &metrics;
+    d.dispatch_fn = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&, const DispatchCaller&, const std::string&) {
+        return ConfinedDispatchOutcome{};
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return false; // authority revoked since enqueue
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    // mark_cancelled must NEVER have been called.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "running");
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+              .value() == 0.0);
+
+    auto statuses = tracker.get_agent_statuses(*exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "success");
+
+    // The occurrence itself is still durably marked failed — the denial is
+    // permanent at the outbox level regardless of the exec-cancel decision.
+    CHECK(fx.raw_state("occ-denied-with-response") == "failed");
+}

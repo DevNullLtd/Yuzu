@@ -38,3 +38,11 @@
   (`CommandDeliveryFinalizationOwner::mark_sent_with_target`), so a genuinely in-flight,
   successfully-dispatched command can never be observed as a false stuck-execution candidate
   between the two writes.
+
+  A second related fix closes the same false-cancel risk inside `command_outbox_delivery.cpp`'s
+  own automatic terminal paths (a redelivery attempt whose authority was revoked, or whose
+  payload fails validation, after an earlier attempt for the same execution already reached
+  real agents): every automatic cancel in that file now checks for an existing agent response
+  first, through one shared chokepoint, and declines to cancel — leaving the row `running` for
+  the stuck-execution sweep above to correctly never touch — rather than force-cancelling a
+  dispatch that genuinely ran.

@@ -156,23 +156,28 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // (unexpected) mark_failed means the row stays pending for the true
         // leader — this replica must not cancel the exec row or audit a terminal
         // it did not own.
+        //
+        // governance sibling-sweep fix (security-guardian, BLOCKING): a
+        // redriven occurrence (route_unreadable/containment_unreadable
+        // rescheduling even when a PRIOR attempt reached agents with
+        // outcome.sent>0, or a mark_sent_with_target degrade rolling a
+        // genuine dispatch back) can reach THIS branch, on a later tick, for
+        // an execution_id that already has real agent_exec_status
+        // responses — route the cancel through decline_or_cancel_exec, and
+        // say so in the audit detail (this is the ONLY audit row this
+        // occurrence ever gets, unlike the sent==0 path, so it must not
+        // misrepresent a genuinely-dispatched execution as "nothing ran").
         auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "authority_denied");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty() &&
-                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
-                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
-                              "execution_id={} occurrence='{}' after authority_denied",
-                              c.execution_id, c.occurrence_id);
-                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
-                // no observable signal — count it alongside the log line,
-                // matching Part A's REST/MCP instrumentation pattern.
-                if (d_.metrics)
-                    d_.metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
-                        .increment();
+            std::string detail = "authority_denied_at_delivery";
+            if (d_.execution_tracker && !c.execution_id.empty()) {
+                auto outcome = decline_or_cancel_exec(c.execution_id, c.principal,
+                                                      c.occurrence_id, "authority_denied");
+                if (outcome == ExecCancelOutcome::kDeclinedHasResponse ||
+                    outcome == ExecCancelOutcome::kDeclinedDegraded)
+                    detail += " exec_not_cancelled=prior_agent_response_or_degraded";
             }
-            audit(c, "denied", "authority_denied_at_delivery");
+            audit(c, "denied", detail);
         }
         return;
     }
@@ -212,21 +217,17 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                       "parsed",
                       c.occurrence_id, c.command_id, mcp::kMcpMaxJsonDepth);
         // CDX-P1-02: own-the-mark gating, same as every other terminal path here.
+        // Routed through decline_or_cancel_exec for the same reason as the
+        // authority_denied branch above — see its own comment. A legacy row
+        // written before this depth guard existed could, in principle,
+        // reach this branch on a redrive after an old-binary dispatch; the
+        // guard costs one indexed read on an already-rare path.
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_depth_exceeded");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty() &&
-                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
-                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
-                              "execution_id={} occurrence='{}' after payload_depth_exceeded",
-                              c.execution_id, c.occurrence_id);
-                // #4982 fix round 2 (Fix 5)
-                if (d_.metrics)
-                    d_.metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
-                        .increment();
-            }
+            if (d_.execution_tracker && !c.execution_id.empty())
+                decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id,
+                                       "payload_depth_exceeded");
             audit(c, "failure", "payload_depth_exceeded");
         }
         return;
@@ -244,21 +245,14 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                       "marking failed",
                       c.occurrence_id);
         // CDX-P1-02: own-the-mark gating, same as the denial + success paths.
+        // Routed through decline_or_cancel_exec — see authority_denied's
+        // comment above for why.
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_decode_failed");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty() &&
-                !d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
-                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
-                              "execution_id={} occurrence='{}' after payload_decode_failed",
-                              c.execution_id, c.occurrence_id);
-                // #4982 fix round 2 (Fix 5)
-                if (d_.metrics)
-                    d_.metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
-                        .increment();
-            }
+            if (d_.execution_tracker && !c.execution_id.empty())
+                decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id,
+                                       "payload_decode_failed");
             audit(c, "failure", "payload_decode_failed");
         }
         return;
@@ -410,31 +404,10 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             // declines toward NOT cancelling (leaving the row wedged is
             // strictly safer than falsely cancelling it; the stuck-reap
             // sweep's own exclusion then correctly leaves it alone forever
-            // once it sees the same response row).
-            auto statuses = d_.execution_tracker->get_agent_statuses_checked(c.execution_id);
-            if (!statuses.has_value()) {
-                spdlog::warn("command_outbox_delivery: agent_exec_status check degraded for "
-                             "execution_id={} occurrence='{}' (sent==0) — declining to cancel "
-                             "this tick, will retry on a later pass",
-                             c.execution_id, c.occurrence_id);
-            } else if (!statuses->empty()) {
-                spdlog::warn(
-                    "command_outbox_delivery: occurrence='{}' redrove to sent==0 but "
-                    "execution_id={} already has {} real agent response(s) from an earlier "
-                    "dispatch attempt — NOT cancelling (a genuinely-dispatched execution must "
-                    "never be force-cancelled on a later redrive's zero-reach)",
-                    c.occurrence_id, c.execution_id, statuses->size());
-            } else if (!d_.execution_tracker->mark_cancelled(c.execution_id, c.principal)) {
-                spdlog::error("command_outbox_delivery: mark_cancelled failed for "
-                              "execution_id={} occurrence='{}' (sent==0) — row remains 'running'",
-                              c.execution_id, c.occurrence_id);
-                // #4982 fix round 2 (Fix 5)
-                if (d_.metrics)
-                    d_.metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                 {{"op", "mark_cancelled"}, {"surface", "outbox"}})
-                        .increment();
-            }
+            // once it sees the same response row). Now the shared chokepoint
+            // (governance sibling-sweep consolidation) every other automatic
+            // cancel site in this file also routes through.
+            decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id, "sent==0");
         }
     }
     if (!owns_delivery)
@@ -460,6 +433,40 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         audit(c, "failure",
               "no_agents_reached command_id=" + c.command_id + " execution_id=" + c.execution_id);
     }
+}
+
+CommandOutboxDelivery::ExecCancelOutcome CommandOutboxDelivery::decline_or_cancel_exec(
+    const std::string& execution_id, const std::string& principal,
+    const std::string& occurrence_id, std::string_view context) {
+    auto statuses = d_.execution_tracker->get_agent_statuses_checked(execution_id);
+    if (!statuses.has_value()) {
+        spdlog::warn("command_outbox_delivery: agent_exec_status check degraded for "
+                     "execution_id={} occurrence='{}' ({}) — declining to cancel this tick, "
+                     "will retry on a later pass",
+                     execution_id, occurrence_id, context);
+        return ExecCancelOutcome::kDeclinedDegraded;
+    }
+    if (!statuses->empty()) {
+        spdlog::warn(
+            "command_outbox_delivery: occurrence='{}' reached '{}' but execution_id={} already "
+            "has {} real agent response(s) from an earlier dispatch attempt — NOT cancelling "
+            "(a genuinely-dispatched execution must never be force-cancelled on a later tick's "
+            "terminal failure)",
+            occurrence_id, context, execution_id, statuses->size());
+        return ExecCancelOutcome::kDeclinedHasResponse;
+    }
+    if (!d_.execution_tracker->mark_cancelled(execution_id, principal)) {
+        spdlog::error("command_outbox_delivery: mark_cancelled failed for execution_id={} "
+                      "occurrence='{}' ({})",
+                      execution_id, occurrence_id, context);
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                         {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                .increment();
+        return ExecCancelOutcome::kCancelFailed;
+    }
+    return ExecCancelOutcome::kCancelled;
 }
 
 void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& result,
