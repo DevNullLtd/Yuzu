@@ -35,6 +35,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
@@ -64,27 +65,45 @@ struct Gate {
     }
 };
 
+// Bounded park on a Gate: returns when the test releases it, or after kDtorGateSafetyNet
+// (never reached by a passing run - it only keeps a regressed run from hanging the suite).
+constexpr auto kDtorGateSafetyNet = 30s;
+// How long the F3 timing cases watch the counters while a destructor is held on its gate.
+// Negative-evidence window only: the destructor cannot finish inside it, so it carries no
+// timer-margin risk; a premature-decrement defect is visible at once (it precedes disposal).
+constexpr auto kHeldWindow = 100ms;
+void wait_gate_bounded(Gate& g) {
+    std::unique_lock<std::mutex> lk{g.m};
+    g.cv.wait_for(lk, kDtorGateSafetyNet, [&] { return g.go; });
+}
+
 // A move-only result type whose destructor records WHEN it started (an
-// atomic<bool> flag) and ON WHICH THREAD, then sleeps `hold_for` before
-// returning. Used to make the "disposal, not publication, is what the F3
-// counter waits for" property directly observable: a poller on another
-// thread can watch the flag flip and then confirm the lane/F3 counter stays
-// nonzero for the FULL duration of the destructor's own run, not just up to
-// the moment the worker decided whether to publish or self-dispose.
+// atomic<bool> flag) and ON WHICH THREAD, then - if given a `hold_gate` -
+// parks on it until the test releases it (or sleeps `hold_for` when no gate
+// is given) before returning. Used to make the "disposal, not publication,
+// is what the F3 counter waits for" property directly observable: a poller
+// on another thread can watch the flag flip and then confirm the lane/F3
+// counter stays nonzero for the FULL duration of the destructor's own run,
+// not just up to the moment the worker decided whether to publish or
+// self-dispose. The gate makes "the destructor is still running" a state the
+// test CONTROLS rather than a sleep it has to out-wait, so the observation
+// window is not tied to a timer's duration or granularity.
 struct SlowDtor {
     std::atomic<bool>* started{nullptr};
     std::atomic<std::thread::id>* thread_id{nullptr};
     std::chrono::milliseconds hold_for{0};
     int value{0};
+    Gate* hold_gate{nullptr};
 
     SlowDtor() = default;
     SlowDtor(std::atomic<bool>* s, std::atomic<std::thread::id>* tid,
-             std::chrono::milliseconds hold, int v)
-        : started(s), thread_id(tid), hold_for(hold), value(v) {}
+             std::chrono::milliseconds hold, int v, Gate* gate = nullptr)
+        : started(s), thread_id(tid), hold_for(hold), value(v), hold_gate(gate) {}
     SlowDtor(const SlowDtor&) = delete;
     SlowDtor& operator=(const SlowDtor&) = delete;
     SlowDtor(SlowDtor&& o) noexcept
-        : started(o.started), thread_id(o.thread_id), hold_for(o.hold_for), value(o.value) {
+        : started(o.started), thread_id(o.thread_id), hold_for(o.hold_for), value(o.value),
+          hold_gate(o.hold_gate) {
         o.started = nullptr; // moved-from: its destructor becomes a no-op
         o.thread_id = nullptr;
     }
@@ -94,6 +113,7 @@ struct SlowDtor {
             thread_id = o.thread_id;
             hold_for = o.hold_for;
             value = o.value;
+            hold_gate = o.hold_gate;
             o.started = nullptr;
             o.thread_id = nullptr;
         }
@@ -105,7 +125,9 @@ struct SlowDtor {
         started->store(true, std::memory_order_relaxed);
         if (thread_id)
             thread_id->store(std::this_thread::get_id(), std::memory_order_relaxed);
-        if (hold_for.count() > 0)
+        if (hold_gate)
+            wait_gate_bounded(*hold_gate);
+        else if (hold_for.count() > 0)
             std::this_thread::sleep_for(hold_for);
     }
 };
@@ -124,24 +146,28 @@ struct SlowDtor {
 // the actual T-move - and the moved-from remnant's destructor - to unbox(),
 // which every caller runs strictly AFTER releasing cell_->mu.
 //
-// This type makes that difference OBSERVABLE: its moved-from destructor
-// sleeps for `hold_for`. The regression test below races a second,
-// concurrent try/wait_take() against the one that "wins" (takes the real
-// value and thus runs this slow destructor inside its own call) - the LOSER
-// must see cell_->mu released almost immediately (an uncontended lock,
-// already-taken -> nullopt) rather than blocking for the winner's entire
-// slow-destructor duration, which is exactly what the pre-fix code would
-// have done (mutation-tested: reverting take_locked()/unbox() to the
-// pre-fix shape makes this test's loser_elapsed assertion fail).
+// This type makes that difference OBSERVABLE: once `armed`, its moved-from
+// destructor flags `entered` and parks on `gate` until the test releases it.
+// The regression test below can then watch a loser's take complete while
+// the winner is PROVABLY still inside that destructor, instead of timing
+// the loser against a sleeping destructor. Disarmed (the worker's own
+// remnant, destroyed before `done` is set), it is inert so publication is
+// not delayed.
+struct MovedFromProbe {
+    std::atomic<bool> armed{false};
+    std::atomic<bool> entered{false};
+    Gate gate;
+};
+
 struct SlowMoveObservableDtor {
-    std::chrono::milliseconds hold_for{0};
+    MovedFromProbe* probe{nullptr};
     bool moved_from{false};
 
     SlowMoveObservableDtor() = default;
-    explicit SlowMoveObservableDtor(std::chrono::milliseconds hold) : hold_for(hold) {}
+    explicit SlowMoveObservableDtor(MovedFromProbe* p) : probe(p) {}
     SlowMoveObservableDtor(const SlowMoveObservableDtor&) = delete;
     SlowMoveObservableDtor& operator=(const SlowMoveObservableDtor&) = delete;
-    SlowMoveObservableDtor(SlowMoveObservableDtor&& o) noexcept : hold_for(o.hold_for) {
+    SlowMoveObservableDtor(SlowMoveObservableDtor&& o) noexcept : probe(o.probe) {
         o.moved_from = true; // o (the SOURCE) becomes the probed remnant;
                               // `this` (the destination) is the live value
                               // and stays moved_from == false (its own
@@ -149,10 +175,10 @@ struct SlowMoveObservableDtor {
     }
     SlowMoveObservableDtor& operator=(SlowMoveObservableDtor&&) = delete;
     ~SlowMoveObservableDtor() {
-        if (!moved_from)
+        if (!moved_from || !probe || !probe->armed.load(std::memory_order_acquire))
             return; // the live (moved-to) value's teardown isn't probed
-        if (hold_for.count() > 0)
-            std::this_thread::sleep_for(hold_for);
+        probe->entered.store(true, std::memory_order_release);
+        wait_gate_bounded(probe->gate);
     }
 };
 
@@ -580,11 +606,16 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     Gate gate;
     std::atomic<bool> dtor_started{false};
     std::atomic<std::thread::id> dtor_thread{};
-    constexpr auto kHold = 300ms;
+    // The destructor parks here once it starts (see SlowDtor), so "the destructor is still
+    // running" is a state this test holds for as long as it needs and then ends, not a
+    // sleep it has to out-wait. Declared AFTER everything the worker touches so that it is
+    // released FIRST on any exit path - a failed REQUIRE can never strand the worker.
+    Gate dtor_gate;
+    yuzu::test::ScopeExit release_dtor{[&] { dtor_gate.release(); }};
 
-    auto res = lane.launch([&gate, &dtor_started, &dtor_thread, kHold]() -> SlowDtor {
+    auto res = lane.launch([&gate, &dtor_started, &dtor_thread, &dtor_gate]() -> SlowDtor {
         gate.wait();
-        return SlowDtor(&dtor_started, &dtor_thread, kHold, 1);
+        return SlowDtor(&dtor_started, &dtor_thread, 0ms, 1, &dtor_gate);
     });
     REQUIRE(res.status == DetachedLaunch::Launched);
     CHECK(lane.active_workers() == 1);
@@ -599,21 +630,24 @@ TEST_CASE("launch: an abandoned-before-publish result's disposal keeps the lane/
     gate.release();
 
     REQUIRE(spin_until([&] { return dtor_started.load(); }, 5s));
-    // The destructor has STARTED (and is now sleeping for kHold) - poll for
-    // a window comfortably inside that sleep and assert the counters never
-    // read 0 during it. A premature-decrement bug would show 0 almost
-    // immediately after dtor_started flips, well inside this window.
-    const auto poll_until = std::chrono::steady_clock::now() + kHold - 50ms;
+    // The destructor has STARTED and is now parked on dtor_gate - poll for a
+    // window while it is held and assert the counters never read 0 during it.
+    // A premature-decrement bug would show 0 almost immediately after
+    // dtor_started flips (the decrement it models happens BEFORE disposal
+    // begins), well inside this window. The destructor cannot finish during
+    // the window whatever the scheduler does, so no timer margin is involved.
+    const auto poll_until = std::chrono::steady_clock::now() + kHeldWindow;
     bool saw_zero_early = false;
     while (std::chrono::steady_clock::now() < poll_until) {
         if (lane.active_workers() == 0 || f3->load() == 0) {
             saw_zero_early = true;
             break;
         }
-        std::this_thread::sleep_for(10ms);
+        std::this_thread::sleep_for(5ms);
     }
     CHECK_FALSE(saw_zero_early);
 
+    dtor_gate.release(); // let the destructor finish; only now may the counters reach 0
     REQUIRE(spin_until([&] { return lane.active_workers() == 0; }, 5s));
     CHECK(f3->load() == 0);
     CHECK(dtor_thread.load() != std::this_thread::get_id()); // disposed on the WORKER thread
@@ -636,9 +670,11 @@ TEST_CASE("launch: fn's OWN captured RAII state outlives fn() returning, and the
     SparkDetachedLane lane(f3, /*cap=*/4);
     std::atomic<bool> dtor_started{false};
     std::atomic<std::thread::id> dtor_thread{};
-    constexpr auto kHold = 300ms;
+    // See the previous case: the destructor parks on this gate, released first on any exit.
+    Gate dtor_gate;
+    yuzu::test::ScopeExit release_dtor{[&] { dtor_gate.release(); }};
 
-    SlowDtor held(&dtor_started, &dtor_thread, kHold, 2);
+    SlowDtor held(&dtor_started, &dtor_thread, 0ms, 2, &dtor_gate);
     auto res = lane.launch([held = std::move(held)]() -> int { return held.value; });
     REQUIRE(res.status == DetachedLaunch::Launched);
 
@@ -651,17 +687,20 @@ TEST_CASE("launch: fn's OWN captured RAII state outlives fn() returning, and the
     // until Payload itself is torn down, which happens strictly after this.
 
     REQUIRE(spin_until([&] { return dtor_started.load(); }, 5s));
-    const auto poll_until = std::chrono::steady_clock::now() + kHold - 50ms;
+    // The capture's destructor is now parked on dtor_gate: poll a window while it is held
+    // (see the previous case) and assert the counters never read 0 during it.
+    const auto poll_until = std::chrono::steady_clock::now() + kHeldWindow;
     bool saw_zero_early = false;
     while (std::chrono::steady_clock::now() < poll_until) {
         if (lane.active_workers() == 0 || f3->load() == 0) {
             saw_zero_early = true;
             break;
         }
-        std::this_thread::sleep_for(10ms);
+        std::this_thread::sleep_for(5ms);
     }
     CHECK_FALSE(saw_zero_early);
 
+    dtor_gate.release(); // let the destructor finish; only now may the counters reach 0
     REQUIRE(spin_until([&] { return lane.active_workers() == 0; }, 5s));
     CHECK(f3->load() == 0);
     CHECK(dtor_thread.load() != std::this_thread::get_id());
@@ -770,49 +809,65 @@ TEST_CASE("take_locked()/unbox(): a concurrent second take is not blocked by the
           "[spark][detachedcall]") {
     auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
     SparkDetachedLane lane(f3, /*cap=*/4);
-    constexpr auto kHold = 400ms;
+    MovedFromProbe probe;
+    std::array<std::atomic<bool>, 2> finished{};
+    std::array<bool, 2> got_value{false, false};
+    std::vector<std::thread> racers;
+    racers.reserve(2);
 
-    auto res = lane.launch([kHold]() -> SlowMoveObservableDtor {
-        return SlowMoveObservableDtor(kHold);
+    auto res = lane.launch([&probe]() -> SlowMoveObservableDtor {
+        return SlowMoveObservableDtor(&probe);
     });
     REQUIRE(res.status == DetachedLaunch::Launched);
+    // Declared AFTER everything the destructor and the racers touch (including `res`): runs
+    // FIRST on any exit path, so a failed REQUIRE (or a regression that wedges a racer)
+    // releases the parked destructor and joins the racers instead of stranding them.
+    yuzu::test::ScopeExit cleanup{[&] {
+        probe.gate.release();
+        for (auto& t : racers)
+            if (t.joinable())
+                t.join();
+    }};
 
     // Wait for the worker to publish. The worker's OWN local `value` (see
     // Payload::operator()()) is itself a moved-from remnant of the move
-    // into the box - its slow destructor runs here too, but on the WORKER
-    // thread, before `done` is even set, and has nothing to do with
-    // cell_->mu (the worker never holds it during this phase) - this just
-    // means `done` may take a little over kHold to become true.
+    // into the box, but the probe is not armed yet, so its destructor is
+    // inert and publication is not delayed.
     REQUIRE(spin_until([&] { return res.call->done(); }, 5s));
+    probe.armed.store(true, std::memory_order_release);
 
     // Race two takers. Whichever wins runs the box's real moved-from T
-    // destructor (this type's slow path) inside unbox() - AFTER the fix,
-    // strictly outside cell_->mu; before the fix, still inside it (see the
-    // type's own comment above). The LOSER must see an uncontended lock and
-    // return promptly regardless of which side wins the race.
-    std::array<std::chrono::steady_clock::duration, 2> elapsed{};
-    std::array<bool, 2> got_value{false, false};
+    // destructor inside unbox() - AFTER the fix, strictly outside cell_->mu;
+    // before the fix, still inside it (see the type's own comment above) -
+    // and that destructor now PARKS on the probe's gate. So the winner cannot
+    // return until this test releases the gate, and the first racer to
+    // finish can only be the loser. The LOSER must see an uncontended lock
+    // and return (nullopt, already taken) while the winner is still parked
+    // inside the destructor; if cell_->mu were held across that destructor
+    // the loser would block behind it and never finish. Event-driven: no
+    // sleep, no elapsed-time margin.
     auto racer = [&](std::size_t idx) {
-        auto start = std::chrono::steady_clock::now();
         auto v = res.call->wait_take(std::chrono::steady_clock::now() + 5s);
-        elapsed[idx] = std::chrono::steady_clock::now() - start;
         got_value[idx] = v.has_value();
+        finished[idx].store(true, std::memory_order_release);
     };
-    std::thread t0([&] { racer(0); });
-    std::thread t1([&] { racer(1); });
-    t0.join();
-    t1.join();
+    racers.emplace_back([&] { racer(0); });
+    racers.emplace_back([&] { racer(1); });
+
+    REQUIRE(spin_until([&] { return finished[0].load() || finished[1].load(); }, 5s));
+    // The winner is parked in the slow destructor (it cannot have finished); the racer that
+    // did finish is therefore the loser and must have seen "already taken".
+    REQUIRE(spin_until([&] { return probe.entered.load(std::memory_order_acquire); }, 5s));
+    const std::size_t loser = finished[0].load() ? 0 : 1;
+    CHECK_FALSE(got_value[loser]);
+    CHECK_FALSE(finished[1 - loser].load()); // the winner is still held by the destructor
+
+    probe.gate.release();
+    for (auto& t : racers)
+        t.join();
 
     // Exactly one racer took the value; the other saw nullopt.
-    REQUIRE(got_value[0] != got_value[1]);
-    const auto loser_elapsed = got_value[0] ? elapsed[1] : elapsed[0];
-    // The loser must not have blocked anywhere near the winner's slow
-    // destructor duration - a generous margin (kHold/3) well clear of
-    // ordinary scheduling jitter, but far enough under kHold that this
-    // assertion FAILS if cell_->mu is held across the slow destructor
-    // (verified: reverting the take_locked()/unbox() fix makes this fail,
-    // with loser_elapsed landing close to kHold instead).
-    CHECK(loser_elapsed < kHold / 3);
+    CHECK(got_value[0] != got_value[1]);
 }
 
 // ── Regression: two lanes sharing one F3 counter add/subtract correctly and

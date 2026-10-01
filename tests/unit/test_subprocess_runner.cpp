@@ -36,6 +36,7 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <algorithm>
+#include <array>
 #include <barrier>
 #include <chrono>
 #include <cstdint>
@@ -559,12 +560,30 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
                                                                            // -- see FP-003.
     constexpr int kRounds = 5; // bounded: kNumThreads * kRounds == 60 total child
                                 // processes for the whole test, never more.
-    constexpr auto kVictimDeadline = 400ms; // comfortably < the host's real 1s runtime
-    constexpr auto kHostDeadline = 3000ms;  // generous; the host's own timing isn't under test
+    constexpr auto kVictimDeadline = 400ms; // the false-timeout detector: far < the host's
+                                            // runtime, which is held open until every
+                                            // victim of the round has returned (below)
+    // Each host child is a 30s `sleep` that the test CANCELS once every victim of its round
+    // has returned (via a per-invocation CancellationToken), instead of a fixed `sleep 1`
+    // that every round had to wait out (5 rounds = 5s of pure waiting). Per round the host
+    // therefore outlives every victim's deadline by construction - by ~75x, not 2.5x - so a
+    // leaked write end can never be released early by the host exiting, which is exactly the
+    // condition the victim deadline is the detector for. The host's own deadline is only a
+    // safety net and its timing is not under test.
+    constexpr auto kHostDeadline = 60000ms;
 
     std::atomic<int> false_timeouts{0};
     std::atomic<int> unexpected_no_run{0};
     std::atomic<int> victim_calls{0};
+
+    // One token per (round, host) and one victims-done counter per round: the LAST victim
+    // of a round to return cancels that round's hosts (see kHostDeadline above), which is
+    // what lets the next round's barrier release without waiting out a host's runtime.
+    std::vector<std::vector<std::shared_ptr<CancellationToken>>> host_tokens(kRounds);
+    for (auto& round_tokens : host_tokens)
+        for (unsigned t = 0; t < kNumHostThreads; ++t)
+            round_tokens.push_back(std::make_shared<CancellationToken>());
+    std::array<std::atomic<unsigned>, kRounds> victims_done{};
 
     // Synchronizes every thread's per-round call to run_bounded_subprocess
     // so they start together -- see the rationale above.
@@ -574,15 +593,16 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
     threads.reserve(kNumThreads);
 
     for (unsigned t = 0; t < kNumHostThreads; ++t) {
-        threads.emplace_back([&]() {
+        threads.emplace_back([&, t]() {
             // Leak host: outlives every victim's deadline, so if it ends up
             // holding a victim's write end open (the race), the victim is
             // starved for the host's whole runtime, not just a few
             // microseconds -- long enough to land past its own deadline.
             for (int r = 0; r < kRounds; ++r) {
                 sync_point.arrive_and_wait();
-                (void)run_bounded_subprocess({"/bin/sleep", "1"},
-                                              SubprocessOptions{.deadline = kHostDeadline});
+                (void)run_bounded_subprocess({"/bin/sleep", "30"},
+                                              SubprocessOptions{.deadline = kHostDeadline,
+                                                                .cancel_token = host_tokens[r][t]});
             }
         });
     }
@@ -603,6 +623,12 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
                     false_timeouts.fetch_add(1, std::memory_order_relaxed);
                 else if (!r_result.tool_ran)
                     unexpected_no_run.fetch_add(1, std::memory_order_relaxed);
+                // The last victim of this round releases the round's hosts.
+                if (victims_done[r].fetch_add(1, std::memory_order_acq_rel) + 1 ==
+                    kNumVictimThreads) {
+                    for (auto& tok : host_tokens[r])
+                        tok->cancel();
+                }
             }
         });
     }
