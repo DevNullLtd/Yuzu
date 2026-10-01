@@ -1451,6 +1451,9 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
     // is genuine proof the straddle itself was sampled, not just the after-state.
     std::atomic<bool> observed_pending_then_wedged{false};
     std::atomic<bool> observed_eligible_then_settled_ineligible{false};
+    // Barrier flag for the release below (see its comment): set once the poller has
+    // sampled the Wedged-and-still-eligible state at least once.
+    std::atomic<bool> poller_saw_eligible_wedged{false};
     std::thread poller{[&] {
         bool ever_pending = false;
         bool ever_wedged = false;
@@ -1468,8 +1471,10 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
                     observed_pending_then_wedged.store(true, std::memory_order_relaxed);
                 ever_wedged = true;
             }
-            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && wa.wedge_eligible)
+            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && wa.wedge_eligible) {
                 ever_eligible_wedged = true;
+                poller_saw_eligible_wedged.store(true, std::memory_order_relaxed);
+            }
             if (ever_settled_ineligible && wa.wedge_eligible)
                 saw_eligible_after_settled_ineligible.store(true, std::memory_order_relaxed);
             if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && !wa.wedge_eligible) {
@@ -1518,6 +1523,20 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
     REQUIRE(rt->expire_overdue_claims() == 1);
     REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     REQUIRE(rt->receipt_wedge_k_eligible(receipt));
+
+    // Second barrier (#4661): the eligible->settled-ineligible straddle can only be
+    // sampled if the poller observes the Wedged-and-eligible state BEFORE the release
+    // below settles it. Under CPU contention the poller can go unscheduled for the
+    // whole expire -> release window, so the settled-ineligible state is the only one
+    // it ever sees and the straddle flag stays false with no code defect involved
+    // (the final spin_until then times out: it waits on a flag that can no longer be
+    // set). Waiting on this latched flag instead of sampling the transient state is
+    // the same idiom as the poll_count barrier above. Eligibility cannot narrow before
+    // the release (the claim stays parked and FIFO-front), so this waits for a state
+    // the test already asserts above; it does not weaken any check.
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return poller_saw_eligible_wedged.load(std::memory_order_relaxed); },
+        std::chrono::seconds(10)));
 
     // The real completion, racing the poller above on its own detached worker -
     // not test-hook-gated.
