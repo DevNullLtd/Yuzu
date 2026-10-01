@@ -147,7 +147,8 @@ revocation, and the future gateway-mTLS cutover.)
 
 Individual agent heartbeats are not forwarded one-by-one. Instead,
 `yuzu_gw_upstream` buffers heartbeats and sends them in a single
-`BatchHeartbeat` RPC at a configurable interval (default: 10 seconds).
+`BatchHeartbeat` RPC at a configurable interval (`heartbeat_batch_interval_ms`,
+default 1000 ms; env override `YUZU_GW_HEARTBEAT_INTERVAL_MS`).
 
 This reduces upstream load from O(agents/interval) to O(nodes/interval).
 
@@ -181,7 +182,9 @@ connectivity records.
 
 The `GatewayUpstream` service is a gRPC service exposed by the C++ server
 specifically for gateway communication. It is defined in
-`proto/yuzu/gateway/v1/gateway.proto`.
+`proto/yuzu/gateway/v1/gateway.proto`. Each core replica answers from its own
+in-memory view of the gateway sessions it holds; see the `BatchHeartbeat`
+message below for the per-replica unknown-session list the server now returns.
 
 ### RPCs
 
@@ -202,8 +205,19 @@ message BatchHeartbeatRequest {
 
 message BatchHeartbeatResponse {
   int32 acknowledged_count = 1;
+  repeated string unknown_session_ids = 2;
+  bool unknown_session_ids_truncated = 3;
 }
 ```
+
+`unknown_session_ids` lists the distinct session ids in the batch that the
+answering server replica does not hold in memory (at most 4096; empty and
+over-length ids are never listed), and `unknown_session_ids_truncated` is set
+when more than that were unknown. A server that predates these fields and a
+server with nothing unknown look the same on the wire, by design. **The gateway
+does not read either field yet** (#1197 PR-B added the server side only), so
+today they have no effect on gateway behaviour; the gateway-side replay that
+will consume them is a separate change.
 
 ### StreamStatusNotification Message
 
