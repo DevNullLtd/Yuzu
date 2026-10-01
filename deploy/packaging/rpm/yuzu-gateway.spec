@@ -3,7 +3,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Yuzu endpoint management gateway
 License:        AGPL-3.0-or-later
-URL:            https://github.com/Tr3kkR/Yuzu
+URL:            https://github.com/DevNullLtd/Yuzu
 
 # The Erlang release bundles crypto.so with broad OpenSSL runpaths from upstream.
 # This is a self-contained release with embedded ERTS — runpath validation is not applicable.

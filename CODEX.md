@@ -44,7 +44,7 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 
 - This repo uses a single-context layout: `CONTEXT.md` at the root and ADRs in `docs/adr/`.
 - `docs/agents/issue-standard.md` is the binding standard for every `gh issue` operation (ADR-3001): dedupe before filing, four body sections, three-axis labels, and never-close rules for `security`/`do-not-close` issues.
-- `docs/agents/issue-tracker.md` records GitHub Issues at `github.com/Tr3kkR/Yuzu` (command crib).
+- `docs/agents/issue-tracker.md` records GitHub Issues at `github.com/DevNullLtd/Yuzu` (command crib).
 - `docs/agents/triage-labels.md` records the full label taxonomy, including the canonical triage mapping.
 - `docs/agents/domain.md` records how engineering skills consume context and ADRs.
 

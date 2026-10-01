@@ -1,9 +1,10 @@
+%{!?_sysusersdir:%global _sysusersdir /usr/lib/sysusers.d}
 Name:           yuzu-server
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Yuzu endpoint management server
 License:        AGPL-3.0-or-later
-URL:            https://github.com/Tr3kkR/Yuzu
+URL:            https://github.com/DevNullLtd/Yuzu
 
 %description
 Enterprise endpoint management platform — server component.
@@ -17,6 +18,13 @@ install -D -m 0755 %{_sourcedir}/install-server-postgres.sh %{buildroot}%{_datad
 install -d -m 0750 %{buildroot}/var/lib/yuzu
 install -d -m 0750 %{buildroot}/var/log/yuzu
 install -d -m 0750 %{buildroot}/etc/yuzu
+
+# Service account as a sysusers.d entry (#5142). rpm >= 4.19 turns the
+# yuzu-owned paths in %files into Requires: user(yuzu) and
+# group(yuzu), and this file into the matching Provides, so the package
+# satisfies its own requirement. %pre still creates the account.
+install -d -m 0755 %{buildroot}%{_sysusersdir}
+printf 'u yuzu - "Yuzu server" /var/lib/yuzu /sbin/nologin\n' > %{buildroot}%{_sysusersdir}/yuzu.conf
 
 %pre
 getent group yuzu >/dev/null 2>&1 || groupadd -r yuzu
@@ -46,3 +54,4 @@ fi
 %dir %attr(0750,yuzu,yuzu) /var/lib/yuzu
 %dir %attr(0750,yuzu,yuzu) /var/log/yuzu
 %dir %attr(0750,yuzu,yuzu) /etc/yuzu
+%{_sysusersdir}/yuzu.conf

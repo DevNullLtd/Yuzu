@@ -2801,31 +2801,7 @@
       "server/core/src/capability_decls/core_dispatch_capabilities.hpp",
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
-    "changelog": [
-      "changelog.d/1567-tar-db-corruption-fleet-observability.added.md",
-      "changelog.d/1654-tar-collector-write-durability.fixed.md",
-      "changelog.d/1846-tar-perf-health-tokens.added.md",
-      "changelog.d/1986-getting-started-import-examples.fixed.md",
-      "changelog.d/20260825-offload-target-store-postgres.changed.md",
-      "changelog.d/20260914-wave7b-tar-usage-sql-denied.security.md",
-      "changelog.d/2093-tar-db-ddl-one-transaction.changed.md",
-      "changelog.d/2093-tar-events-resurrected-on-reopen.fixed.md",
-      "changelog.d/2361-tar-retention-clock-guard.fixed.md",
-      "changelog.d/2437-mcp-targeting-safety.security.md",
-      "changelog.d/2500-rest-targeting-widening.security.md",
-      "changelog.d/2573-tar-clockguard-factset.fixed.md",
-      "changelog.d/2854-restart-loop-alert.added.md",
-      "changelog.d/2f-pr3a-mcp-terminal-starvation.fixed.md",
-      "changelog.d/3885-dashboard-destructive-targeting.security.md",
-      "changelog.d/4027-tar-read-twins.added.md",
-      "changelog.d/4269-tar-usage-source.added.md",
-      "changelog.d/5.2-tar-arp-posix.added.md",
-      "changelog.d/5.2-tar-mapdrive-macos.added.md",
-      "changelog.d/5.2-tar-popen-rehome.changed.md",
-      "changelog.d/6.2b-tar-cursor-seam.added.md",
-      "changelog.d/6.2b-tar-power-source.added.md",
-      "changelog.d/6.3-tar-removable-source.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/tar.yaml",
       "content/definitions/tar_warehouse.yaml"

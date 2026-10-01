@@ -74,7 +74,7 @@ run_validate() {
   : > "$TMP/log" > "$TMP/out.env"
   ( set +e
     export PATH="$TMP/bin:$PATH" GH_TOKEN=""
-    export REPOSITORY=Tr3kkR/Yuzu PR_NUMBER=42 APPROVED_SHA="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" REVIEW_RUN_ID=999
+    export REPOSITORY=DevNullLtd/Yuzu PR_NUMBER=42 APPROVED_SHA="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" REVIEW_RUN_ID=999
     export GITHUB_REF="refs/heads/trusted-fork/pr-42"
     export PR_STATE=open PR_SHA="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" PR_HEAD_REPO="someone/Yuzu"
     export REVIEW_WORKFLOW="Fork dynamic review" \
@@ -109,7 +109,7 @@ run_validate PR_STATE=closed
 check "PR not open: exits non-zero"      "1" "$([ "$rc" != 0 ] && echo 1 || echo 0)"
 run_validate PR_SHA="b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
 check "PR moved: exits non-zero"         "1" "$([ "$rc" != 0 ] && echo 1 || echo 0)"
-run_validate PR_HEAD_REPO="Tr3kkR/Yuzu"
+run_validate PR_HEAD_REPO="DevNullLtd/Yuzu"
 check "not a fork PR: exits non-zero"    "1" "$([ "$rc" != 0 ] && echo 1 || echo 0)"
 run_validate REVIEW_WORKFLOW="Some other workflow"
 check "wrong review workflow: exits non-zero" "1" "$([ "$rc" != 0 ] && echo 1 || echo 0)"

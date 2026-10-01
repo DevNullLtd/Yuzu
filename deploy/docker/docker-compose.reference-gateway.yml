@@ -48,7 +48,7 @@
 
 services:
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-server:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
@@ -93,7 +93,7 @@ services:
       start_period: 10s
 
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-gateway
     restart: unless-stopped
     environment:
@@ -109,13 +109,22 @@ services:
       server: { condition: service_healthy }
 
   agent:
-    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.13.0}
+    # `-chisel` is the ONLY published agent image: release.yml builds the
+    # agent in docker-publish-chisel only, never in the plain docker-publish
+    # matrix, so `yuzu-agent` has never existed at any tag and this service
+    # could never start. Same binary and entrypoint as the other images.
+    image: ghcr.io/devnullltd/yuzu-agent-chisel:${YUZU_VERSION:-0.14.0}
     command:
       - "--server=gateway:50051"
       # No --ca-cert: the agent auto-discovers the install CA at
       # /etc/yuzu/certs/default-ca.pem (mounted below). No --no-tls.
       - "--cert-dir=/var/lib/yuzu-agent/certs"   # persists its issued leaf
       - "--data-dir=/var/lib/yuzu-agent"
+      # This `command:` replaces the image's CMD, so restate its plugin dir:
+      # without it the agent falls back to <binary dir>/../plugins
+      # (/usr/local/plugins in this image), loads 0 plugins, and rejects every
+      # command with `plugin not found: <name>`.
+      - "--plugin-dir=/usr/lib/yuzu/plugins"
       - "--enrollment-token=${YUZU_ENROLL_TOKEN:?set YUZU_ENROLL_TOKEN to an enrollment token}"
     volumes:
       - certs:/etc/yuzu/certs:ro
@@ -130,7 +139,7 @@ services:
   # An external/managed Postgres is first-class — point the server's
   # YUZU_POSTGRES_DSN at it and drop this service + the server depends_on.
   postgres:
-    image: ghcr.io/tr3kkr/yuzu-postgres:${YUZU_VERSION:-0.13.0}
+    image: ghcr.io/devnullltd/yuzu-postgres:${YUZU_VERSION:-0.14.0}
     container_name: yuzu-postgres
     restart: unless-stopped
     environment:

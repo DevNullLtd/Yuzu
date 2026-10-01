@@ -42,8 +42,27 @@ VERSION="${YUZU_VERSION:-0.12.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0
 
-REPO_SLUG="$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$|\1|')"
-[ -n "$REPO_SLUG" ] || REPO_SLUG="Tr3kkR/Yuzu"
+# REPO_SLUG drives THREE things: the registry namespace (below), `gh release
+# download` (:116) and `gh attestation verify` (:148). A wrong value silently
+# downloads another project's artifacts and verifies provenance against the
+# wrong repository, so an unresolvable remote is a HARD ERROR here rather than
+# a guessed default -- same fail-loud stance as the GHCR login in release.yml,
+# which this file previously contradicted. Set YUZU_REPO_SLUG to run outside a
+# checkout. Note the old `-n` guard could not catch a non-GitHub remote either:
+# sed passes non-matching input through unchanged, so the whole URL survived as
+# a "slug"; the shape check below rejects that too.
+REPO_SLUG="${YUZU_REPO_SLUG:-$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]([^/]+/[^/.]+)(\.git)?$|\1|')}"
+case "$REPO_SLUG" in
+  */*/*|*://*|*" "*|"")
+    printf '[xx] cannot determine the GitHub repo slug (got: %s)\n' "${REPO_SLUG:-<empty>}" >&2
+    printf '     run inside a checkout with a github.com origin, or set YUZU_REPO_SLUG=owner/repo\n' >&2
+    exit 1 ;;
+  */*) ;;
+  *)
+    printf '[xx] cannot determine the GitHub repo slug (got: %s)\n' "$REPO_SLUG" >&2
+    printf '     run inside a checkout with a github.com origin, or set YUZU_REPO_SLUG=owner/repo\n' >&2
+    exit 1 ;;
+esac
 
 derive_owner() {
   printf '%s' "$REPO_SLUG" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]'
@@ -107,8 +126,9 @@ info "image=$IMAGE_REF  push=$PUSH  multiarch=$MULTIARCH"
 # ── 1. Download + verify release assets ────────────────────────────────────
 # Download by glob so we match GitHub's *canonical* asset names: GitHub
 # sanitises some characters on upload (e.g. the Debian '~' in 0.12.0~rc0 is
-# served as '.', so the name in SHA256SUMS != the downloadable name). We
-# therefore verify by HASH presence in the signed manifest, never by filename.
+# served as '.', so for releases before 0.14.0-rc3 the name in SHA256SUMS !=
+# the downloadable name; #5141 fixed that). We therefore verify by HASH
+# presence in the signed manifest, never by filename.
 DL="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-agent-bundle.XXXXXX")"
 ARCHIVES="yuzu-linux-x64.tar.gz yuzu-windows-x64.zip yuzu-macos-arm64.tar.gz"
 

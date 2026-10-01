@@ -4,7 +4,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 ## Enabling RBAC
 
-RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that the fallback still refuses to a non-admin; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
+RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that the fallback still refuses to a non-admin; see "The authorization topology floor" below. When enabled, every API call and UI action gated on a real securable type is checked against the caller's assigned roles — but not every surface has one: result sets are ownership-scoped, not RBAC-gated, regardless of this toggle; see "Not RBAC-gated: per-operator result sets" below.
 
 Toggle RBAC via `PUT /api/v1/rbac/enforcement` (or the `set_rbac_enforcement` MCP tool) — **not** a Settings-page control and **not** a `[rbac] enabled = true` config-file key. Neither exists: nothing in `server/core/src/main.cpp` or any `Config` header reads a `[rbac]` section — see [#388](https://github.com/Tr3kkR/Yuzu/issues/388).
 
@@ -405,6 +405,33 @@ Seven roles are created automatically and cannot be deleted:
 | `AnalyticsConfig` | Analytics/offload configuration. Server-administration, same posture as `TlsConfig` |
 | `Enrollment` | Auto-approve enrollment rules and pending-agent visibility |
 | `OidcConfig` | OIDC SSO configuration |
+
+### Not RBAC-gated: per-operator result sets
+
+Result sets (scope-walking capability §30, `docs/scope-walking-design.md`) are **ownership-scoped, not RBAC-gated** — the RBAC toggle above has no effect on them, whether it is on or off. This is a deliberate phase-1 design (design §4.1), not an oversight, and it is unaffected by [#5047](https://github.com/Tr3kkR/Yuzu/issues/5047)'s fix below.
+
+The 8 routes/tools in this family authorize purely on `owner_principal == session.username`:
+
+| REST | MCP tool | Dashboard fragment |
+|---|---|---|
+| `GET /api/v1/result-sets` | `list_result_sets` | `GET /fragments/result-sets/sidebar` |
+| `POST /api/v1/result-sets` | `create_result_set` | `POST /fragments/result-sets/create` |
+| `GET /api/v1/result-sets/{id}` | `get_result_set` | `GET /fragments/result-sets/{id}/detail` |
+| `GET /api/v1/result-sets/{id}/members` | `get_result_set_members` | *(no fragment equivalent — the detail fragment shows only a device COUNT, not the member list)* |
+| `GET /api/v1/result-sets/{id}/lineage` | `get_result_set_lineage` | *(shown as the breadcrumb on the detail fragment)* |
+| `POST /api/v1/result-sets/{id}/pin` | `pin_result_set` | `POST /fragments/result-sets/{id}/pin` |
+| `POST /api/v1/result-sets/{id}/unpin` | `unpin_result_set` | `POST /fragments/result-sets/{id}/unpin` |
+| `DELETE /api/v1/result-sets/{id}` | `delete_result_set` | `POST /fragments/result-sets/{id}/delete` |
+
+`ResultSet` appearing as a `target_type` in audit rows, and the `Infrastructure:Write`/`Infrastructure:Delete` labels the 4 write tools (`create_result_set`/`pin_result_set`/`unpin_result_set`/`delete_result_set`) carry internally — the other 4 tools in the table above carry `Infrastructure:Read`, unaffected by any of this — are **not** a real RBAC securable or grant — they are borrowed labels used only to bucket the tools into the MCP tier/approval belt below (see "MCP tier/approval belt" below); naming them as a `.permission` an operator could self-remediate with would be a false claim, so the 403 body for a denial on this surface never does.
+
+**No admin override.** `ResultSetStore::delete_set`/`pin`/`unpin` take only an id — there is no admin-bypass parameter, and every caller (REST's `load_owned`, MCP's `rs_load_owned`, the dashboard fragments' `rs_get_owned`) runs the ownership check before calling any of them. The one owner-blind path is `gc_sweep()`, the background TTL reaper — not an operator-triggered action, and it never deletes a pinned set.
+
+**MCP tier/approval belt (added by #5047).** Ownership is the primary — and, for an untiered caller, only — gate on this surface. But the 4 write operations (create/pin/unpin/delete) also carry the same MCP tier/approval enforcement every RBAC-gated route gets (`AuthRoutes::require_tier_policy`, extracted from `require_permission`): a `readonly`-tier bearer cannot reach any of them, an `operator`-tier bearer cannot reach any of them (`Infrastructure:Write`/`:Delete` are not on `tier_allows()`'s operator allow-list), and a `supervised`-tier bearer's `delete` requires an approval ticket (`Infrastructure:Delete` is on `requires_approval()`'s list; create/pin/unpin are not). Before #5047 this belt applied on the MCP transport only — a tiered bearer could reach the identical REST/dashboard-fragment route and skip it entirely, since these routes have no `perm_fn`/RBAC gate to carry the belt. #5047 wires the belt into all 8 write sites (4 REST + 4 fragments) so a token cannot bypass its tier by switching endpoints (#520), matching MCP's own C8 chokepoint exactly. This belt is **not** RBAC — an empty-tier caller (a plain cookie session, or an API token minted with no `mcp_tier`) is untouched by it either way, which is the separate, already-tracked, open design question [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) tracks, not this fix.
+
+**The producers ARE RBAC-gated.** The routes/tools that reach into fleet data to *mint* a result set are a different surface, with real securables: `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, and `reevaluate_result_set` all gate on `Execution:Execute` with the caller's confined dispatch-visible set (ADR-0033 §2); `create_result_set_from_inventory_query` gates on `Inventory:Read` via the ADR-0017 admit-and-confine fleet-read chokepoint (its MCP `kToolSecurity` row is labelled `Inventory:Write`, but that is tier-bucketing only — the actual RBAC check is `Inventory:Read`, matching its REST twin). None of these four is affected by the ownership-only posture above.
+
+[#1207](https://github.com/Tr3kkR/Yuzu/issues/1207) tracks giving `ResultSet` a real RBAC securable for cross-operator sharing. When it lands, ownership must remain sufficient on its own — an operator's own result sets stay theirs whether or not they hold the new securable — and the grant must be **additive** (owner **OR** grant admits, never owner **AND** grant), so it only ever *widens* who can reach a set, never narrows an owner's own access. Sharing must be its own distinct, separately-gated operation, not a side effect of a broader grant. It must also cover the scope-expression resolver — the `from_result_set:<id>` evaluation path a shared set's grantee needs to actually *target* it (dispatch/policy/TAR scope evaluation, a code surface distinct from the CRUD routes: `scope_engine.cpp`, `scope_yaml.cpp`, `dispatch_scope_ladder.hpp`) — in addition to all three CRUD surfaces above (REST, MCP, and the 6 dashboard fragments); the CRUD surfaces alone let a grantee *see* a shared set without letting them *use* it in a scope.
 
 ## Operations
 

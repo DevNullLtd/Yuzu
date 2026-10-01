@@ -1601,7 +1601,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Validate a scope expression's syntax", "tags": ["Scope"], "description": "Versioned twin of the legacy POST /api/scope/validate and MCP validate_scope — all three call the SAME yuzu::scope::validate(). Auth-only, no RBAC gate (a syntax-only check with no data disclosure).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{valid: true, expression} or {valid: false, error}"}, "400": {"description": "expression missing or empty"}}}
     },
     "/scope/preview": {
-      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
+      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). #4981: this route runs the SAME evaluation ladder a real dispatch uses (owner-check gate included) — tag:<key>, props.<key>, and from_result_set:<id> atoms all resolve identically to a real dispatch, not just tag:/ostype/arch/hostname/agent_version as before. A service-scoped API token is denied outright (403) before the fleet-read gate or evaluation ladder ever run — same cross-service-reach reasoning as POST /api/v1/result-sets/from-inventory-query (#4980): a from_result_set:<id>/props.<key> atom resolves against the MINTING OPERATOR's identity, not the token's own scope. Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet; the ladder itself evaluates fleet-wide, then this confinement is intersected in afterward.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "403": {"description": "Service-scoped API token — denied outright, before the fleet-read gate/ladder ever run. No .permission field in the error body: a service-scoped caller holding Infrastructure:Read is still denied, so naming it would be a false self-remediation claim."}, "404": {"description": "a from_result_set:<id> atom references a result set that is absent, expired, or not owned by the caller (RESULT_SET_NOT_FOUND)"}, "503": {"description": "Scope evaluation aborted — never silently under-reports the match set. A store preload (tag/props/result-set) failure or the cross-replica presence read failure is TRANSIENT (db_degraded/presence_degraded, retry_after_ms: 5000); no dispatching principal being resolvable, a required store not being wired (unresolvable), or the evaluator itself being unwired (misconfiguration) is PERMANENT — retry_after_ms: null, since a retry cannot fix any of the three without an operator intervening first."}}}
     },
     "/software-packages": {
       "get": {"summary": "List registered software packages", "tags": ["Software Deployment"], "description": "Only available when SoftwareDeploymentStore is wired — the server does not construct it today (capability 7.6 deliberately shelved, ADR-0051); documented for when a future change re-wires it. Requires SoftwareDeployment:Read.", "responses": {"200": {"description": "{data: [{id, name, version, platform, installer_type, content_hash, size_bytes, created_at, created_by}]}"}, "503": {"description": "A genuine database read failure"}}},
@@ -1918,7 +1918,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1935,7 +1935,8 @@ void RestApiV1::register_routes(
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
                     std::move(verify_api), std::move(device_api),
-                    std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api));
+                    std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api),
+                    std::move(tier_policy_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1961,7 +1962,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1972,6 +1973,8 @@ void RestApiV1::register_routes(
     // route lambdas below capture plain values, not `this`.
     EnginePrincipalStore* eps = engine_principal_store_;
     UserExistsFn user_exists_fn = user_exists_fn_;
+    // #4981 PR-2 — see set_scope_evaluate_fn's doc comment in the .hpp.
+    ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
 
     // #1788: resolve the caller's confinement set on a route whose PRIMARY
     // authorization is the per-target `scoped_perm_fn` gate — the TAR retention
@@ -2031,7 +2034,7 @@ void RestApiV1::register_routes(
     // Returns true iff the caller must return immediately (either a written
     // 401/redirect from auth_fn, or the 403 deny itself).
     auto deny_fleet_wide_service_scoped =
-        [auth_fn, audit_fn](const httplib::Request& req, httplib::Response& res,
+        [auth_fn, audit_fn, metrics_registry](const httplib::Request& req, httplib::Response& res,
                             const std::string& action, const std::string& target_type,
                             const std::string& audit_detail, const std::string& message,
                             const std::string& target_id = "",
@@ -2041,6 +2044,23 @@ void RestApiV1::register_routes(
             return true; // auth_fn already wrote the response (401/etc).
         if (session->token_scope_service.empty())
             return false;
+        // #4981 fix-round (sre finding): MCP's structural C8 default-deny gate
+        // (mcp_server.cpp, ServiceScopeClass::denied) increments
+        // yuzu_auth_service_scope_default_denied_total on the SAME class of
+        // denial reached via a completely different code path — this REST
+        // chokepoint denied fleet-wide reach to ~9 routes with no metric at
+        // all until now. Same metric name/path_class shape, `path_class="rest"`
+        // here instead of "mcp". `permission` is sometimes passed "" by a
+        // caller wanting a blanket deny with no single named securable (this
+        // PR's own scope/preview call is one) — "unspecified" avoids shipping
+        // an empty Prometheus label value.
+        if (metrics_registry) {
+            metrics_registry
+                ->counter("yuzu_auth_service_scope_default_denied_total",
+                         {{"permission", permission.empty() ? "unspecified" : permission},
+                          {"path_class", "rest"}})
+                .increment();
+        }
         // cid minted BEFORE the audit call (not after, as an earlier round
         // had it) so the persisted row carries the same id the response
         // header echoes — the OpenAPI spec's correlation_id field documents
@@ -10705,6 +10725,47 @@ void RestApiV1::register_routes(
             return row;
         };
 
+        // #5047: the C8 tier/approval belt, applied to the 4 write routes
+        // below (create/pin/unpin/delete) even though this family has no
+        // `perm_fn`/RBAC gate at all — ownership is the primary gate, by
+        // design (see the "Per-operator, owner-scoped result sets" comment
+        // above). Without this, an MCP-tiered bearer token (e.g. supervised,
+        // which is approval-gated for Delete via MCP's ticket-then-recall
+        // flow) could reach the identical mutation unrestricted by calling
+        // REST instead — TierPolicyFn's doc comment (auth_routes.hpp) has
+        // the full contract; `{}` unwired fails closed (503) for a TIERED
+        // caller only, since an untiered/plain-RBAC session has nothing this
+        // belt enforces.
+        auto tier_ok = [tier_policy_fn, rs_err, audit_fn](const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const auth::Session& session,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation) -> bool {
+            if (tier_policy_fn)
+                return tier_policy_fn(req, res, session, securable_type, operation);
+            if (!session.mcp_tier.empty()) {
+                // A degraded/misconfigured security control (the belt this
+                // whole route family exists to add just stopped being
+                // enforceable) MUST leave an evidence trail, not just a
+                // test-covered response — audited so a SOC 2 review of
+                // "does every access-control degradation get logged" finds
+                // this branch (#5047 governance fix round). Routed through
+                // try_persist_audit (not a bare audit_fn call, Gate 8 UP-10):
+                // this handler installs no exception_handler_ of its own, so
+                // an audit sink that throws must not be allowed to replace
+                // the intended 503 with httplib's bare, undetailed default
+                // 500 (see `deny_fleet_wide_service_scoped`'s identical
+                // rationale above for the precedent).
+                (void)detail::try_persist_audit(
+                    audit_fn, req, "result_set.tier_policy_unavailable", "failure", "ResultSet",
+                    "", "tier-policy check misconfigured (unwired TierPolicyFn)");
+                rs_err(res, 503,
+                       "RESULT_SET_TIER_POLICY_UNAVAILABLE: tier-policy check misconfigured");
+                return false;
+            }
+            return true;
+        };
+
         // Resolve a parent reference (canonical `rs_` id OR a per-operator
         // alias — design §2 "Source query" / §4.1) to a canonical owned id.
         // Alias pre-resolution at the dispatch layer is the right place: the
@@ -11149,7 +11210,7 @@ void RestApiV1::register_routes(
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
                   [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
-                   load_owned, deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   load_owned, deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                                httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding — same cross-
             // service reach as the GET list above (session->username-keyed,
@@ -11164,6 +11225,8 @@ void RestApiV1::register_routes(
                 return;
             auto session = auth_fn(req, res);
             if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                 return;
             // #2437-class guard: check nesting on the RAW body BEFORE parse.
             // A parsed-then-dumped subtree still crashes on the dump - the
@@ -12393,7 +12456,7 @@ void RestApiV1::register_routes(
         // POST /api/v1/result-sets/{id}/pin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
                   [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
-                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                    httplib::Response& res) {
                       // guardian-confinement-2298 PR3 §3e sweep finding: see the
                       // GET list handler above for the cross-service-reach reasoning.
@@ -12405,6 +12468,8 @@ void RestApiV1::register_routes(
                           return;
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                           return;
                       auto id = req.matches[1].str();
                       auto row = load_owned(req, id, session->username, res);
@@ -12423,7 +12488,7 @@ void RestApiV1::register_routes(
         // POST /api/v1/result-sets/{id}/unpin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
                   [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
-                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                    httplib::Response& res) {
                       // guardian-confinement-2298 PR3 §3e sweep finding: see the
                       // GET list handler above for the cross-service-reach reasoning.
@@ -12435,6 +12500,8 @@ void RestApiV1::register_routes(
                           return;
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                           return;
                       auto id = req.matches[1].str();
                       auto row = load_owned(req, id, session->username, res);
@@ -12452,7 +12519,7 @@ void RestApiV1::register_routes(
         // DELETE /api/v1/result-sets/{id}
         sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
                     [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
-                     deny_fleet_wide_service_scoped](const httplib::Request& req,
+                     deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                      httplib::Response& res) {
                         // guardian-confinement-2298 PR3 §3e sweep finding: see the
                         // GET list handler above for the cross-service-reach reasoning.
@@ -12464,6 +12531,8 @@ void RestApiV1::register_routes(
                             return;
                         auto session = auth_fn(req, res);
                         if (!session)
+                            return;
+                        if (!tier_ok(req, res, *session, "Infrastructure", "Delete"))
                             return;
                         auto id = req.matches[1].str();
                         auto row = load_owned(req, id, session->username, res);
@@ -12533,8 +12602,40 @@ void RestApiV1::register_routes(
     // `fleet_read_fn` REPLACES the permission check (it already performs the
     // RBAC check internally) rather than being paired with it — same pattern
     // as GET /api/v1/devices above.
-    sink.Post("/api/v1/scope/preview", [fleet_read_fn, tag_store, agents_fn](
-                                            const httplib::Request& req, httplib::Response& res) {
+    //
+    // #4981 PR-2: this route now routes through the SAME `resolve_scope_targets`
+    // ladder a real dispatch uses (via `scope_evaluate_fn`, a closure over
+    // `AgentRegistry::evaluate_scope` bound in server.cpp) instead of a
+    // bespoke local attribute resolver that never populated
+    // `from_result_set:`/`props.<key>` — see scope_preview.hpp's file header
+    // for the fleet-wide over-disclosure bug this closes (#4981).
+    sink.Post("/api/v1/scope/preview", [fleet_read_fn, auth_fn, audit_fn, scope_evaluate_fn,
+                                        result_set_store, deny_fleet_wide_service_scoped](
+                                           const httplib::Request& req, httplib::Response& res) {
+        // #4981 adversarial-review finding 1: a `from_result_set:`/`props.`
+        // atom in the expression resolves against session->username — for a
+        // service-scoped token this is the MINTING OPERATOR's identity
+        // (auth_routes.cpp's `synth.username = api_token.principal_id`
+        // assignment), not the token's own restricted identity. fleet_read_fn
+        // below ADMITS a service-scoped caller (narrows only the output-agent
+        // axis) rather than denying it outright, so a service-scoped token
+        // could otherwise probe/own-check a result set it never minted
+        // (owned by the minting principal, reachable by any OTHER
+        // token/session that principal holds) — the identical cross-
+        // service-reach class #4980 already closed on
+        // POST /api/v1/result-sets/from-inventory-query, and the MCP twin
+        // already denies this tool structurally (mcp_server.cpp's
+        // kToolSecurity 2-element form -> default ServiceScopeClass::denied).
+        // No `.permission` label (explicit "" — matches every ResultSet-
+        // adjacent sibling call site above): a service-scoped caller holding
+        // Infrastructure:Read is STILL denied outright after this fix, so
+        // naming Infrastructure:Read as "the permission that would help"
+        // would be a false self-remediation claim.
+        if (deny_fleet_wide_service_scoped(
+                req, res, "scope.preview.access_denied", "ResultSet",
+                "scope preview denied to a service-scoped token",
+                "service-scoped tokens may not preview scope targets", "", ""))
+            return;
         if (!fleet_read_fn) {
             spdlog::error("scope.preview: fleet_read_fn unwired — misconfigured call site; "
                           "failing closed");
@@ -12545,6 +12646,14 @@ void RestApiV1::register_routes(
         auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
         if (!gate.admitted)
             return; // gate already wrote the A4 error body + status
+        // The fleet-read gate already authenticated the request. Re-read the
+        // resolved session only for ownership — a `from_result_set:<id>` atom
+        // in the expression owner-resolves against this principal, exactly
+        // like a real dispatch (mirrors GET /api/v1/events' identical
+        // re-read-for-ownership pattern above).
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         std::string expression = (!body.is_discarded() && body.is_object())
                                      ? body.value("expression", std::string())
@@ -12554,28 +12663,85 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "expression is required"), "application/json");
             return;
         }
-        // Narrow to the caller's admitted scope BEFORE the preview builder
-        // runs — mirrors GET /api/v1/devices' own in_scope-filter-then-render.
-        nlohmann::json visible_agents = nlohmann::json::array();
-        if (agents_fn) {
-            for (const auto& a : agents_fn())
-                if (authz::in_scope(gate.scope, a.value("agent_id", "")))
-                    visible_agents.push_back(a);
+        // Checked AFTER the cheap input-shape validation above (mirrors
+        // GET /api/v1/events' own ordering: 400 on a malformed request body
+        // before any 503 for an unavailable backend) — never before it.
+        if (!scope_evaluate_fn) {
+            spdlog::error("scope.preview: scope_evaluate_fn unwired — misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
         }
-        auto outcome = preview_scope_targets(expression, visible_agents, tag_store);
+        auto outcome = preview_scope_targets(expression, session->username, gate.scope,
+                                             result_set_store, scope_evaluate_fn);
         switch (outcome.kind) {
         case ScopePreviewOutcome::Kind::kInvalidExpression:
             res.status = 400;
             res.set_content(detail::a4_error(res, outcome.detail), "application/json");
             return;
-        case ScopePreviewOutcome::Kind::kTagStoreDegraded:
+        case ScopePreviewOutcome::Kind::kEvaluationAborted: {
+            if (outcome.detail == "owner_check_failed") {
+                // Existence-oracle-safe, mirrors load_owned's own 404 body
+                // (rest_api_v1.cpp's result-set routes): a non-owner is
+                // indistinguishable from an absent set. The audit row is
+                // server-side only, so probing the existence oracle via this
+                // preview route still leaves a forensic trail. One row PER
+                // failing ref — a compound expression can name more than one
+                // (mirrors command_routes.cpp's ladder callback, which fires
+                // once per ref too).
+                for (const auto& ref : outcome.failing_refs)
+                    audit_fn(req, "result_set.access", "denied", "ResultSet", ref,
+                             "not found or not owned");
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "RESULT_SET_NOT_FOUND: result set not found"),
+                                "application/json");
+                return;
+            }
+            // db_degraded / principal_unresolved / presence_degraded /
+            // unresolvable — never silently rendered as "0 matches" (that
+            // would under-report the scope's real blast radius).
+            //
+            // #4981 adversarial-review finding 4: `principal_unresolved`
+            // (no dispatching principal to owner-resolve against) and
+            // `unresolvable` (a required store not wired — a configuration
+            // error) are PERMANENT conditions per scope_eval_error.hpp's own
+            // doc comments on those two Kind values — a retry cannot fix
+            // either without an operator intervening first, so they must NOT
+            // carry the same `retry_after_ms: 5000` hint as a genuine
+            // transient degrade (`db_degraded`/`presence_degraded`). Matches
+            // the permanent-vs-transient split `approval_store_read_error_body`
+            // (mcp_approval_error.hpp) already applies for
+            // `list_pending_approvals`/`get_pending_approval_count`: the
+            // permanent arm omits `retry_after_ms` entirely so `a4_error`'s
+            // default (null) applies, the transient arm passes a concrete
+            // hint.
             res.status = 503;
-            res.set_content(detail::a4_error(res, "tag store unavailable",
-                                             {.retry_after_ms = 5000,
-                                              .remediation = "retry once the server reports "
-                                                             "ready"}),
-                            "application/json");
+            // #4981 fix-round finding: was a raw string comparison against
+            // outcome.detail, which cannot warn if a future 6th
+            // ScopeEvalError::Kind value lands unclassified. Routed through
+            // the shared, exhaustive scope_abort_is_permanent() classifier
+            // (scope_eval_error.hpp) instead — see that function's doc
+            // comment for why OwnerCheckFailed never actually reaches here
+            // (handled above).
+            const bool permanent =
+                outcome.abort_kind && scope_abort_is_permanent(*outcome.abort_kind);
+            if (permanent) {
+                res.set_content(
+                    detail::a4_error(
+                        res, "scope evaluation unavailable: " + outcome.detail,
+                        {.remediation = "this is a permanent condition and will NOT clear on "
+                                        "retry; escalate to an operator"}),
+                    "application/json");
+            } else {
+                res.set_content(
+                    detail::a4_error(res, "scope evaluation unavailable: " + outcome.detail,
+                                     {.retry_after_ms = 5000,
+                                      .remediation = "retry once the server reports ready"}),
+                    "application/json");
+            }
             return;
+        }
         case ScopePreviewOutcome::Kind::kOk:
             res.set_content(ok_json(outcome.payload.dump()), "application/json");
             return;

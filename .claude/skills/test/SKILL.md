@@ -222,7 +222,7 @@ if [[ "$MODE" != "quick" ]]; then
         elif docker build \
             --platform "linux/${HOST_DOCKER_ARCH}" \
             --build-arg "TRIPLET=${HOST_VCPKG_TRIPLET}" \
-            -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
+            -t "ghcr.io/devnullltd/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \
             > "$LOG_DIR/build-images.log" 2>&1; then
@@ -281,7 +281,7 @@ bash scripts/test/test-upgrade-stack.sh \
 ```
 
 `--old-version` is omitted so the script resolves it from GitHub's current
-"Latest release" at runtime (`gh api repos/Tr3kkR/Yuzu/releases/latest`).
+"Latest release" at runtime (`gh api repos/DevNullLtd/Yuzu/releases/latest`).
 This keeps the upgrade baseline tracking whatever the last published stable
 tag is without needing a pipeline edit each release. Pass `--old-version
 X.Y.Z` to pin an older baseline for debugging.
@@ -762,7 +762,7 @@ After a successful run, the operator typically wants to:
 
 1. **Commit and push** — the green run is the gate. Reference `RUN_ID` in the commit message for traceability.
 2. **Compare to the prior run** — `test-db-query.sh --diff <prev> <current>` shows what changed in gate status and timings.
-3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --repo Tr3kkR/Yuzu --state open --search "<gate name>" --json number,title` and `gh search issues --repo Tr3kkR/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
+3. **Investigate WARN gates** — these don't block but accumulate as tech debt. If a pattern emerges across runs, file an issue per `docs/agents/issue-standard.md`: dedupe first with both mandatory probes (`gh issue list --repo DevNullLtd/Yuzu --state open --search "<gate name>" --json number,title` and `gh search issues --repo DevNullLtd/Yuzu --state open "<gate keywords>" --json number,title --limit 20`), four body sections, one type label + one of `P1`/`P2` + `ready-for-agent`, and an Origin section citing the `RUN_ID`s that show the pattern.
 4. **Bump the coverage baseline** if a legitimate drop or trade-off is intentional — `coverage-gate.sh --capture-baselines` and commit the updated `tests/coverage-baseline.json`. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against `tests/perf-baseline-provenance-N300.{jsonl,json}` and is not blocking.
 
 After a failed run:

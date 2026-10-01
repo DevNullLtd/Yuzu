@@ -49,12 +49,12 @@ default_version() {
 YUZU_VERSION="${YUZU_VERSION:-$(default_version)}"
 DEMO_AGENT_COUNT="${DEMO_AGENT_COUNT:-10}"
 
-# Registry owner: derive from origin remote (lowercased), default tr3kkr.
+# Registry owner: derive from origin remote (lowercased), default devnullltd.
 derive_owner() {
   local url owner
   url="$(git remote get-url origin 2>/dev/null || true)"
   owner="$(printf '%s' "$url" | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|' | tr '[:upper:]' '[:lower:]')"
-  [ -n "$owner" ] && [ "$owner" != "$url" ] && printf '%s' "$owner" || printf 'tr3kkr'
+  [ -n "$owner" ] && [ "$owner" != "$url" ] && printf '%s' "$owner" || printf 'devnullltd'
 }
 REGISTRY="${YUZU_REGISTRY:-ghcr.io/$(derive_owner)}"
 

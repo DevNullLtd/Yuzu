@@ -120,8 +120,12 @@ groups:
         annotations:
           summary: "Gateway metrics endpoint is down"
           description: >-
-            Prometheus cannot scrape the gateway (:9568). The gateway process
-            is down, crash-looping, or refusing to boot — including a #1422
+            Prometheus cannot scrape the gateway (:9568). Either /metrics
+            itself is failing while the gateway runs (check
+            `curl -i http://<gateway-host>:9568/metrics`; 0.14.0-rc1..rc3
+            returned 500 on every scrape, #5177; agents are unaffected in that
+            case), or the gateway process is down, crash-looping, or refusing
+            to boot — including a #1422
             mgmt-listener posture refusal (gateway log: "Refusing to start:
             management listener"). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
@@ -557,7 +561,7 @@ groups:
             account has no MFA (auth.breakglass.denied) does NOT move this
             counter; alert on that audit row via your SIEM. See
             docs/ops-runbooks/auth-db-recovery.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/auth-db-recovery.md"
 
       - alert: YuzuRbacEnforcementChanged
         # A1 (RBAC enforcement enable/disable toggle). Threshold-free by
@@ -1970,7 +1974,7 @@ groups:
             for "sweep_expired_rotations:" failure lines and confirm
             "Rotation sweep thread started" appears in the boot log. Runbook:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
       # SINGLE-REPLICA ONLY -- read this before enabling it. The sweep's
       # single caller is one dedicated thread on a sequential 60s loop, so it
@@ -2021,7 +2025,7 @@ groups:
             multi-replica, disable this rule -- the counter moves routinely
             there and this expression is not multi-replica-aware. Runbook:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
       # yuzu_rotation_sweep_lost_revocations_total existed with a metric
       # describe() and TWO in-code cross-references ("the signal for THAT
@@ -2074,7 +2078,7 @@ groups:
             underlying contention is ALSO persisting, not that credentials
             are piling up unrevoked forever. Runbook:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
       # #2964 round 3 review (finding 6): yuzu_rotation_sweep_declined_total
       # existed with no alert at all. A single decline is EXPECTED, routine
@@ -2125,7 +2129,7 @@ groups:
             while this persists -- see the runbook for what that costs.
             Runbook:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
@@ -2405,7 +2409,7 @@ groups:
             Work the runbook - it gives the expected-cause checklist first, then how to tell a
             normal one-off decline from a genuinely stalled drain. Do NOT use this alert's
             firing state as that test; it can resolve and re-fire on its own either way.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows
       # undeleted, so an audit table that never shrinks looks identical either
@@ -2437,7 +2441,7 @@ groups:
             in this state - it reflects only whether the database is OPEN, and a pass
             failing on a PostgreSQL fault leaves it open. Surfacing retention health there
             is tracked in #2509.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The per-pass delete cap is what turns an allowed wipe into a paced drain,
       # but it introduces its own failure: if it binds on every pass, expiry is
@@ -2482,7 +2486,7 @@ groups:
             pass, re-armed every 5s while capped) is below this fleet's audit volume, so
             audit_store grows without bound; the cap is a compile-time constant today, so this
             needs an engineering escalation rather than a config change.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
 
       # YuzuServerRestartLoop -- the crash-loop signal in its own right. Previously this
       # lived ONLY as the `resets(...) <= 1` grace-exclusion inside
@@ -2561,7 +2565,7 @@ groups:
             still fires YuzuAuditRetentionNotRunning -- seeing that alert alone is not
             evidence this one should also be firing.
             Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
 
       # THE ABSENCE ALERTS. Every COUNTER-driven rule in this group fires on a
       # counter RISING, so none of those fires when the cleanup thread never
@@ -2730,7 +2734,7 @@ groups:
             the store opened at boot (a failed migration closes it and start_cleanup()
             then early-returns), and check
             yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # YuzuAuditRetentionNeverRan -- the collapsed grace, standalone. The rule
       # above excuses exactly one state (no genuine stamp in the window: a
@@ -2811,7 +2815,7 @@ groups:
             Check that the store opened at boot (a failed migration closes it and
             start_cleanup() then early-returns) and the server log for
             "AuditStore: retention pass threw".
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionneverran"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionneverran"
 
       # THE RULE ABOVE CANNOT DETECT ITS OWN INPUT GOING MISSING, which is why
       # this exists. `increase()` over a metric with NO series returns an empty
@@ -2880,7 +2884,7 @@ groups:
             scraped and its reaper is unmonitored. Fleet-wide only - a single quiet server
             among many is not detected this way, and an `up`-based target-down alert does not
             cover it either, because that server's `up` is 1.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
@@ -2909,7 +2913,7 @@ groups:
             is being destroyed outside the server (a restore from a pre-v3 backup, a replica
             rehydrated from a template, a disk-level rollback), which that counter cannot
             see. Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
 
       - alert: YuzuAuditRetentionStateNotPersisting
         expr: |
@@ -2924,7 +2928,7 @@ groups:
             Detection still works within this process, but will not survive a restart --
             a server that reboots with a wrong clock would then see no elapsed-time step.
             Usually a disk or permissions problem on the audit database.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # Read-path evidence-availability. On the PostgreSQL substrate an audit
       # QUERY that cannot be served degrades to DENY (503), never a false-empty
@@ -2951,7 +2955,7 @@ groups:
             (see the substrate metrics) and free disk on the database host.
             Escalate toward critical if it does not clear, since evidence reads are
             a SOC 2 CC7.2 availability obligation.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#storage"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/audit-log.md#storage"
 
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
@@ -3307,7 +3311,7 @@ groups:
             failed to open at boot (should not be reachable post-boot given
             fail-closed construction — investigate as a possible regression if
             seen). Do not read a 503 window as "no devices discovered".
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-discoverystore-adr-0044"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-discoverystore-adr-0044"
       - alert: YuzuTagStoreReadDegraded
         # A tag_store read degraded and the caller failed CLOSED (ADR-0050):
         # tags are DISPATCH-CRITICAL scope input, so evaluate_scope ABORTS the
@@ -3338,7 +3342,7 @@ groups:
             policy evaluator silently skips tag-scoped checks while this
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#device-tags-migrate-to-postgres-tagstore-adr-0050"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#device-tags-migrate-to-postgres-tagstore-adr-0050"
       - alert: YuzuRuntimeConfigReadDegraded
         # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
         # families under one metric, distinguished by `reason`:
@@ -3403,7 +3407,7 @@ groups:
             degraded and answered 503 rather than a silently-wrong result.
             Pair with yuzu_pg_pool_* saturation signals; /readyz does not
             reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-productpackstore-adr-0054"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-productpackstore-adr-0054"
       - alert: YuzuProductPackCompensationPartial
         # #3481: install()'s best-effort compensating rollback (undoing
         # already-installed sibling-store content after a late persist or
@@ -3446,7 +3450,7 @@ groups:
             is resolved — resolved alert state here is NOT confirmation of
             remediation. The raw counter (never decreases) is the durable
             tracking signal, not alert state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInstructionBundledContentNotClean
         # Same absent-success shape used elsewhere on this page for a one-time boot outcome
         # (alert on the ABSENCE of a good result rather than the PRESENCE of a bad one, since
@@ -3482,7 +3486,7 @@ groups:
             definition/set id and error before assuming Postgres itself is
             down; a transient blip on one of ~240 sequential items is enough
             to trigger this even when Postgres is otherwise healthy.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-instructionstore-moves-to-postgresql--deleted-content-no-longer-resurrects-adr-0058"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-instructionstore-moves-to-postgresql--deleted-content-no-longer-resurrects-adr-0058"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
@@ -4174,6 +4178,24 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+      - alert: YuzuEnrollmentStoreDegraded
+        expr: |
+          increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable enrollment store degraded on the auth hot path (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            An enrollment/pending-agent store operation ({{ $labels.op }}) hit a
+            degraded PostgreSQL read/write for 10m (WS-6 6.2). Every enrollment/
+            pending call fails CLOSED on a degrade — agent `Register` returns
+            gRPC `UNAVAILABLE` instead of silently enrolling/denying, and the
+            admin dashboard/REST surface returns 503 rather than an empty or
+            stale list. Caller-input rejections are not counted here (`reason`
+            is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
+            case). Usually PostgreSQL pool saturation / failover — correlate
+            with the pool metrics.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
@@ -4196,7 +4218,7 @@ groups:
           severity: warning
         annotations:
           summary: "A peer is repeatedly hitting the per-peer OTA concurrency cap"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             One or more agents are being refused DownloadUpdate because they
             already hold --ota-max-concurrent-per-peer parallel transfers. This
@@ -4231,7 +4253,7 @@ groups:
           severity: warning
         annotations:
           summary: "Agent OTA RPCs rejected for a missing or mismatched certificate identity"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             CheckForUpdate or DownloadUpdate was rejected because the peer
             presented no usable client certificate, presented one from a
@@ -4269,7 +4291,7 @@ groups:
           severity: warning
         annotations:
           summary: "OTA deadline aborts exceed rate-token refunds — lockout regression suspected"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Every transfer aborted by a SERVER-imposed deadline must refund the
             rate token it was charged at admission; that invariant is what stops
@@ -4310,7 +4332,7 @@ groups:
           severity: warning
         annotations:
           summary: "OTA transfers are being aborted by a server-imposed deadline"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Transfers are hitting --ota-transfer-deadline-secs or
             --ota-chunk-write-deadline-secs. This is the alert that makes a
@@ -4366,7 +4388,7 @@ groups:
           severity: warning
         annotations:
           summary: "OTA transfers refused by the SERVER-WIDE capacity ceiling"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Window note: `for:` is shorter than the lookback (so the rule can
             actually be satisfied), and the bar is >1 over an hour rather than >0,
@@ -4401,7 +4423,7 @@ groups:
           severity: warning
         annotations:
           summary: "The OTA admission map is evicting — the rate limiter may be disabled"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Sustained eviction means --ota-max-peers-tracked is at or below the live
             peer count. This is not a cache-efficiency concern: an evicted key that
@@ -4422,7 +4444,7 @@ groups:
           severity: info
         annotations:
           summary: "OTA per-peer admission map is approaching its cardinality ceiling"
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             The per-peer OTA admission map is above 80% of
             --ota-max-peers-tracked (issue #935). Expressed as a ratio against

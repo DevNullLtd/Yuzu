@@ -129,7 +129,7 @@ fi
 # pipeline still runs on a fresh clone without gh configured.
 if [[ -z "$OLD_VERSION" ]]; then
     if command -v gh >/dev/null 2>&1; then
-        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-Tr3kkR/Yuzu}/releases/latest" \
+        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-DevNullLtd/Yuzu}/releases/latest" \
                       --jq '.tag_name' 2>/dev/null | sed 's/^v//') || resolved=""
     fi
     if [[ -n "${resolved:-}" ]]; then
@@ -253,7 +253,7 @@ if ! YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     exit 1
 fi
 record_timing "pull-old-images" "$(elapsed_ms "$T_START")"
-ok "pulled ghcr.io/tr3kkr/yuzu-server:${OLD_VERSION}"
+ok "pulled ghcr.io/devnullltd/yuzu-server:${OLD_VERSION}"
 
 # --- Step 2: stack up at OLD version --------------------------------------
 
@@ -283,6 +283,11 @@ fi
 DASHBOARD_URL="http://localhost:${SERVER_HOST_PORT}"
 info "dashboard at $DASHBOARD_URL"
 
+# Container id of the OLD server — WS-6 6.2's enrollment_pre62 fixture needs it
+# to inject/read files directly (see test-fixtures-write.sh's --container).
+# Best-effort: an empty value just means that fixture is skipped downstream.
+OLD_SERVER_CID=$(YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE"     docker compose -f "$HERE/docker-compose.upgrade-test.yml"     --project-name "$PROJECT_NAME"     ps -q server 2>/dev/null || echo "")
+
 # Wait for /readyz to come back ready
 WAITED=0
 READY=0
@@ -311,10 +316,14 @@ ok "OLD stack ready (waited ${WAITED}s)"
 phase "step: fixtures-write (against OLD ${OLD_VERSION})"
 T_START=$(now_ms)
 STATE_FILE="$PHASE2_DIR/fixtures-state.json"
-if bash "$HERE/test-fixtures-write.sh" \
-    --dashboard "$DASHBOARD_URL" \
-    --user "$USERNAME" --password "$PASSWORD" \
-    --state-file "$STATE_FILE" >> "$LOG_FILE" 2>&1; then
+WRITE_ARGS=(--dashboard "$DASHBOARD_URL" --user "$USERNAME" --password "$PASSWORD" \
+    --state-file "$STATE_FILE")
+if [[ -n "$OLD_SERVER_CID" ]]; then
+    WRITE_ARGS+=(--container "$OLD_SERVER_CID" --data-dir /var/lib/yuzu)
+else
+    warn "could not resolve the OLD server container id — enrollment_pre62 fixture will be skipped"
+fi
+if bash "$HERE/test-fixtures-write.sh" "${WRITE_ARGS[@]}" >> "$LOG_FILE" 2>&1; then
     ok "fixtures written"
     FIXTURE_WRITE_OK=1
 else
@@ -333,7 +342,7 @@ fi
 phase "step: image swap to NEW ${NEW_VERSION}"
 if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
     info "pulling new image (--new-image-loaded 0)"
-    if ! docker pull "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
+    if ! docker pull "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >> "$LOG_FILE" 2>&1; then
         fl "docker pull of new image failed"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image pull failed"
         exit 1
@@ -341,14 +350,14 @@ if [[ "$NEW_IMAGE_LOADED" != "1" ]]; then
 fi
 
 # Verify the new image is locally available
-if ! docker image inspect "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
+if ! docker image inspect "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
     # fall back: maybe the image is just `yuzu-server:test-${RUN_ID}` without ghcr prefix
     if docker image inspect "yuzu-server:${NEW_VERSION}" >/dev/null 2>&1; then
         info "using local image yuzu-server:${NEW_VERSION} (no ghcr prefix)"
         # Tag it with the ghcr prefix so the compose file picks it up
-        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION}"
+        docker tag "yuzu-server:${NEW_VERSION}" "ghcr.io/devnullltd/yuzu-server:${NEW_VERSION}"
     else
-        fl "new image ghcr.io/tr3kkr/yuzu-server:${NEW_VERSION} not in local daemon"
+        fl "new image ghcr.io/devnullltd/yuzu-server:${NEW_VERSION} not in local daemon"
         warn "Phase 1 should have built it as 'yuzu-server:${NEW_VERSION}' or pulled it"
         record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "new image missing"
         exit 1
@@ -378,6 +387,12 @@ SERVER_HOST_PORT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     port server 8080 2>/dev/null | awk -F: '{print $NF}')
 DASHBOARD_URL="http://localhost:${SERVER_HOST_PORT}"
 info "post-upgrade dashboard at $DASHBOARD_URL"
+
+# Container ids for WS-6 6.2's Postgres-shape + second-boot idempotency
+# checks (test-fixtures-verify.sh --pg-container / --server-container).
+# postgres isn't swapped across legs, so this id is stable either way.
+PG_CID=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE"     docker compose -f "$HERE/docker-compose.upgrade-test.yml"     --project-name "$PROJECT_NAME"     ps -q postgres 2>/dev/null || echo "")
+NEW_SERVER_CID=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE"     docker compose -f "$HERE/docker-compose.upgrade-test.yml"     --project-name "$PROJECT_NAME"     ps -q server 2>/dev/null || echo "")
 
 T_START=$(now_ms)
 WAITED=0
@@ -487,12 +502,12 @@ fi
 phase "step: fixtures-verify (against NEW ${NEW_VERSION})"
 T_START=$(now_ms)
 REPORT_FILE="$PHASE2_DIR/fixtures-verify.json"
-if bash "$HERE/test-fixtures-verify.sh" \
-    --dashboard "$DASHBOARD_URL" \
-    --user "$USERNAME" --password "$PASSWORD" \
-    --state-file "$STATE_FILE" \
-    --api-tokens-expect "$API_TOKENS_EXPECT" \
-    --report-file "$REPORT_FILE" >> "$LOG_FILE" 2>&1; then
+VERIFY_ARGS=(--dashboard "$DASHBOARD_URL" --user "$USERNAME" --password "$PASSWORD" \
+    --state-file "$STATE_FILE" --api-tokens-expect "$API_TOKENS_EXPECT" \
+    --report-file "$REPORT_FILE")
+[[ -n "$PG_CID" ]] && VERIFY_ARGS+=(--pg-container "$PG_CID")
+[[ -n "$NEW_SERVER_CID" ]] && VERIFY_ARGS+=(--server-container "$NEW_SERVER_CID")
+if bash "$HERE/test-fixtures-verify.sh" "${VERIFY_ARGS[@]}" >> "$LOG_FILE" 2>&1; then
     ok "fixtures verified"
     FIXTURE_VERIFY_OK=1
 else
@@ -502,6 +517,20 @@ fi
 record_timing "fixtures-verify" "$(elapsed_ms "$T_START")"
 
 # --- Step 8: synthetic UAT against upgraded stack -------------------------
+
+# WS-6 6.2's second-boot idempotency check (inside test-fixtures-verify.sh)
+# restarts the NEW server container to prove the importer doesn't re-run —
+# and, same as the image-swap step above, an UNPINNED host port ("8080", no
+# host-side number in the compose file) gets a FRESH random mapping on every
+# container start, not just at creation (measured empirically writing that
+# check). Re-resolve here too, or this step (and any later one) polls a now-
+# dead port. A no-op when --server-container was never passed to verify (no
+# restart happened) or on any release predating this fixture (port unchanged).
+SERVER_HOST_PORT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE"     docker compose -f "$HERE/docker-compose.upgrade-test.yml"     --project-name "$PROJECT_NAME"     port server 8080 2>/dev/null | awk -F: '{print $NF}')
+if [[ -n "$SERVER_HOST_PORT" ]]; then
+    DASHBOARD_URL="http://localhost:${SERVER_HOST_PORT}"
+fi
+info "post-second-boot dashboard at $DASHBOARD_URL"
 
 phase "step: synthetic UAT against upgraded stack"
 T_START=$(now_ms)

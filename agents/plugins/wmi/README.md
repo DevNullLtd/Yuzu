@@ -165,5 +165,4 @@ error|WMI not available on this platform
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_wmi_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/2026-08-wmi-property-omission.changed.md` · `changelog.d/20260818-wave3-antivirus-native-wmi-registry.changed.md` · `changelog.d/3404-hardware-wmi-bounded.fixed.md`
 <!-- END GENERATED -->

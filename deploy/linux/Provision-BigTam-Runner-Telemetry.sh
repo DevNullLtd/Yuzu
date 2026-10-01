@@ -97,6 +97,17 @@ for ((index=0; index<RUNNER_COUNT; index++)); do
     exit 1
   fi
   db="$work_folder/_tool/yuzu-test-runs/$runner_name/test-runs.db"
+  # NOT a typo after the DevNullLtd transfer, and NOT to be "corrected".
+  # A runner's systemd unit name is fixed at REGISTRATION time from the repo
+  # path it registered against; it is not re-derived from the repo's current
+  # owner. The Big Tam agents registered against Tr3kkR/Yuzu and stayed online
+  # through the 2026-09-28 org transfer without re-registering, so the units on
+  # the box are still `actions.runner.Tr3kkR-Yuzu.*`. Renaming this string
+  # would point the telemetry at units that do not exist.
+  #
+  # When an agent IS re-registered (register-bigmags-runner.sh now targets
+  # DevNullLtd/Yuzu), its new unit becomes `actions.runner.DevNullLtd-Yuzu.*`
+  # and this must be updated in the SAME change that re-registers it.
   unit="actions.runner.Tr3kkR-Yuzu.$runner_name.service"
   cpu_set="${L3_CPU_SETS[$index]}"
   cpu_count="$(cpu_list_count "$cpu_set")"
@@ -256,4 +267,5 @@ for ((index=0; index<RUNNER_COUNT; index++)); do
 done
 
 echo "Big Tam runner resources and telemetry provisioned. Apply at the next idle window:"
+# Old-owner unit prefix is deliberate -- see the note at the `unit=` assignment.
 echo "  sudo systemctl restart 'actions.runner.Tr3kkR-Yuzu.yuzu-bigtam-linux-*.service'"

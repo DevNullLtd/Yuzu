@@ -849,6 +849,13 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // example
         {"example.ping", "Returns a 'pong' response"},
         {"example.echo", "Echoes back the supplied message parameter"},
+        // update_source_trust
+        {"update_source_trust.sources",
+         "Package and update-source trust posture, facts only: Linux apt sources (one-line and "
+         "deb822; signed-by, trusted, and allow-insecure for one-line entries) and apt keyrings; "
+         "read-only, no subprocess; "
+         "other package families are not read, so an empty result on them is not evidence of no "
+         "sources"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1021,6 +1028,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags (read-only)"},
         // privacy_permissions
         {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
         // system_hardening
@@ -1625,7 +1636,8 @@ std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                                    const CustomPropertiesStore* props_store,
                                    ResultSetStore* rs_store, std::string_view principal,
-                                   ScopePopulation population) const {
+                                   ScopePopulation population,
+                                   bool touch_referenced_result_sets) const {
     // Preload owner-checked membership for every from_result_set:<id> the
     // expression references — once per set, before the agent loop, rather than a
     // store query per agent while holding mu_ (review finding F). The owner join
@@ -1706,7 +1718,15 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                 // already failed the whole evaluation for that case above). A
                 // touch racing a concurrent GC sweep is a harmless no-op (an
                 // UPDATE affecting 0 rows).
-                rs_store->touch(rsid);
+                // #4981 PR-3: gated on `touch_referenced_result_sets` — a
+                // read-only preview evaluation (evaluate_scope's own
+                // `touch_referenced_result_sets = false` caller) must resolve
+                // `from_result_set:` membership identically to a real dispatch
+                // WITHOUT extending the set's TTL merely for being referenced
+                // in a dry-run check. Every real dispatch/enforcement caller
+                // leaves this at its default `true` and is unaffected.
+                if (touch_referenced_result_sets)
+                    rs_store->touch(rsid);
                 rs_members.emplace(rsid, std::move(*mem));
             }
         }
@@ -1943,9 +1963,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
 std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                               const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
-                              std::string_view principal) const {
+                              std::string_view principal,
+                              bool touch_referenced_result_sets) const {
     return evaluate_scope_impl(expr, tag_store, props_store, rs_store, principal,
-                               ScopePopulation::Fleet);
+                               ScopePopulation::Fleet, touch_referenced_result_sets);
 }
 
 std::expected<std::vector<std::string>, ScopeEvalError>
@@ -1956,9 +1977,13 @@ AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const T
     // never consulted) and can never return Kind::OwnerCheckFailed (no
     // from_result_set: atom can resolve here regardless — an rs_store-null
     // call site collects the same Unresolvable abort evaluate_scope would
-    // give a no-store caller).
+    // give a no-store caller). `touch_referenced_result_sets` is passed as
+    // `true` (its default meaning) but is a no-op here regardless, since
+    // rs_store is always null for LocalOnly — the touch call site can never
+    // execute without a store to touch through.
     return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
-                               /*principal=*/{}, ScopePopulation::LocalOnly);
+                               /*principal=*/{}, ScopePopulation::LocalOnly,
+                               /*touch_referenced_result_sets=*/true);
 }
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {

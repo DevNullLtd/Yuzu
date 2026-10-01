@@ -1690,3 +1690,298 @@ TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not r
 
     CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);
 }
+
+// ---------------------------------------------------------------------------
+// #5047: AuthRoutes::require_tier_policy — the MCP tier/approval belt
+// extracted VERBATIM out of require_permission's mcp_tier branch so a route
+// with no RBAC gate at all (the result-set write routes, ownership-only by
+// design) can still apply it. Unlike require_permission, this takes an
+// already-resolved `auth::Session` directly rather than re-authenticating a
+// request — so these tests construct a `Session` by hand (no minted token
+// needed) and call it straight, the same shape the result-set REST/fragment
+// routes use in production (server.cpp wires this exact method as
+// `tier_policy_fn`). The pre-existing require_permission TEST_CASEs above
+// this block are the regression net proving the extraction changed no
+// observable behaviour of require_permission itself.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_tier_policy — an empty mcp_tier is a no-op "
+          "(pass-through, nothing this belt enforces — #4309 is the separate "
+          "open question of whether it should)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == -1); // httplib::Response's unset default — nothing written
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — readonly tier is denied "
+          "Infrastructure:Write",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — operator tier is denied "
+          "Infrastructure:Write and Infrastructure:Delete (not on "
+          "tier_allows' operator allow-list)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "operator";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+
+    {
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+        CHECK(res.status == 403);
+    }
+    {
+        httplib::Response res;
+        req.path = "/api/v1/result-sets/rs_deadbeef0123";
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+        CHECK(res.status == 403);
+    }
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — supervised tier IS allowed "
+          "Infrastructure:Write (create/pin/unpin are never approval-gated "
+          "at any tier — Infrastructure:Write is absent from "
+          "requires_approval()'s list)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — supervised tier's "
+          "Infrastructure:Delete is approval-gated on a REST transport (403 "
+          "with a remediation pointing at the MCP ticket-then-recall flow), "
+          "mirroring the existing require_permission ApiToken:Write shape",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets/rs_deadbeef0123"; // a REST (non-MCP) transport
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — the supervised-tier "
+          "Infrastructure:Delete approval gate is skipped on the MCP "
+          "transport itself (mcp_server.cpp's own C8 ticket-then-recall gate "
+          "is authoritative there, #289)",
+          "[pg][auth_routes][mcp][tier_policy]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/mcp/v1/";
+    httplib::Response res;
+
+    CHECK(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/true));
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — an engine-principal session "
+          "(hard-locked to mcp_tier=readonly, #5047 DoD) is denied "
+          "Infrastructure:Write — a REAL behavior change on the result-set "
+          "REST write routes, which have no perm_fn/engine-branch gate at "
+          "all and previously admitted an engine session on ownership alone",
+          "[pg][auth_routes][mcp][tier_policy][engine]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "engine:svc-1";
+    session.principal_kind = "engine";
+    session.mcp_tier = "readonly"; // the ONLY tier api_token_store.cpp's
+                                    // validate_engine_mint ever admits (§8)
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+}
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (adversarial review, both Kimi and Codex,
+// independently): the two denial arms above unconditionally named
+// `Infrastructure:Write`/`:Delete` as the A4 `.permission` field, which
+// falsely implies holding that grant would admit the caller — true on
+// require_permission's own RBAC-gated context (unchanged: default
+// `actionable_permission = true`), but NOT on a gate-less route like the
+// result-set write family, which has no RBAC check at all (clause 5,
+// docs/auth-architecture.md "Service-scoped token fleet-wide confinement",
+// CATASTROPHIC MUST — a denial must not name a `.permission` that would not,
+// by itself, admit the caller). These tests pin BOTH the preserved default
+// behaviour (true) and the new opt-out (false) on both denial arms.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=true "
+          "matches require_permission's own envelope (the tier_allows "
+          "denial names .permission) — actionable_permission has no "
+          "default (#5047 fix round); this pins the explicit-true side",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/true));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\":\"Infrastructure:Write\"") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's tier_allows denial "
+          "(#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "readonly";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Write",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    // The message still steers correctly — only the structured self-
+    // remediation field is withheld.
+    CHECK(res.body.find("does not allow") != std::string::npos);
+    // A remediation string fills the gap instead (enterprise-readiness Gate
+    // 6 finding, #5047 governance fix round) — a caller hitting this cold
+    // gets a next step, not just a bare "not X" with an unexplained label.
+    CHECK(res.body.find("higher MCP token tier") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_tier_policy — actionable_permission=false "
+          "omits .permission on a gate-less caller's requires_approval "
+          "denial too, keeping .remediation (#5047 fix round)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    auth::Session session;
+    session.username = "test_user";
+    session.mcp_tier = "supervised";
+    httplib::Request req;
+    req.path = "/api/v1/result-sets/rs_deadbeef0123"; // non-MCP transport
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_tier_policy(req, res, session, "Infrastructure", "Delete",
+                                            /*actionable_permission=*/false));
+    CHECK(res.status == 403);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// #5047 governance fix round (Gate 3 quality-engineer + Gate 4 unhappy-path,
+// converged independently): every test above calls `require_tier_policy`
+// directly with an explicit literal `actionable_permission` — none of them
+// exercise what `server.cpp` actually WIRES into production. A regression
+// reverting either `server.cpp` call site back to naming `.permission` would
+// have passed every test above. `AuthRoutes::gateless_tier_policy_fn()` is
+// the SOLE production factory both `server.cpp` sites call TODAY (no more
+// locally-duplicated lambdas) — this test obtains the REAL callable via that
+// factory, the exact same object `server.cpp` wires into `RestApiV1`/
+// `result_set::Deps`, and drives it directly. This proves the factory itself
+// is correct and gives both current call sites one shared, single-source
+// implementation to inherit from (a regression IN the factory, e.g. someone
+// changes its `false` to `true`, fails this test at both call sites at
+// once). It does NOT prove `server.cpp` keeps calling this factory — this
+// test only drives the factory's output and cannot observe whether a call
+// site actually invokes it; a future reversion of a `server.cpp` site to its
+// own hand-rolled lambda, or a new third gate-less call site written
+// in-line, would not be caught here (Gate 8 architect/quality-engineer
+// finding, independently converged).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
+          "TierPolicyFn both server.cpp sites wire omits .permission on "
+          "both denial arms (#5047 fix round, closes the wiring-coverage "
+          "gap Gate 3/4 found)",
+          "[pg][auth_routes][mcp][tier_policy][clause5]") {
+    AuthRoutesFixture fix;
+    yuzu::server::TierPolicyFn real_production_fn = fix.ar->gateless_tier_policy_fn();
+    REQUIRE(real_production_fn);
+
+    SECTION("tier_allows denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "readonly";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("higher MCP token tier") != std::string::npos);
+    }
+
+    SECTION("requires_approval denial") {
+        auth::Session session;
+        session.username = "test_user";
+        session.mcp_tier = "supervised";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets/rs_deadbeef0123";
+        httplib::Response res;
+
+        CHECK_FALSE(real_production_fn(req, res, session, "Infrastructure", "Delete"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+    }
+
+    SECTION("untiered pass-through, still the real fn") {
+        auth::Session session;
+        session.username = "test_user";
+        httplib::Request req;
+        req.path = "/api/v1/result-sets";
+        httplib::Response res;
+
+        CHECK(real_production_fn(req, res, session, "Infrastructure", "Write"));
+        CHECK(res.status == -1); // nothing written — a genuine pass-through
+    }
+}

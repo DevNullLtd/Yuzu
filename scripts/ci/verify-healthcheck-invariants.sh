@@ -27,7 +27,8 @@
 #     probe branch needed, HA WS-4 #4555)
 #   deploy/docker/docker-compose.viz-uat.yml         server: bash /dev/tcp + head + grep
 #   scripts/test/docker-compose.upgrade-test.yml     server: bash /dev/tcp + grep
-#   .github/workflows/pre-release.yml (3 heredocs)   server: bash /dev/tcp
+#   (.github/workflows/pre-release.yml no longer inlines a stack: its jobs run
+#   docker-compose.reference-gateway.yml above via scripts/ci/qa-stack.sh.)
 #
 # NOT COVERED, deliberately:
 #   - yuzu-postgres is also published and also healthchecked (pg_isready + psql
@@ -62,7 +63,7 @@
 #
 # Example:
 #   scripts/ci/verify-healthcheck-invariants.sh \
-#       server=ghcr.io/tr3kkr/yuzu-server:0.13.0 \
+#       server=ghcr.io/devnullltd/yuzu-server:0.13.0 \
 #       gateway-chisel=yuzu-gateway-chisel:ci
 #
 # Exits non-zero, naming the missing tool, if any invariant is broken.
