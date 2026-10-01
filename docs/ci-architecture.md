@@ -1617,13 +1617,21 @@ one file is one PG-instance event, not a test bug.
 The agent suite's single `agent unit tests` entry (one serial Catch2 process,
 240 s budget) is three entries over the same `yuzu_agent_tests` binary:
 `agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
-'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard:
-the ~2.1x contention inflation measured in "Windows test-phase concurrency
-gate" is the reason not to shrink it to the uncontended per-shard time) and
-`--allow-running-no-tests` (so `meson test --suite agent --test-args '[tag]'`
-keeps working: meson appends the tag as a second positional spec, Catch2 ANDs
-it, and a shard holding none of that tag's cases would otherwise exit 2). Every
-CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
+and conservative headroom rather than a measured need: the only measured
+contention figure is for the SERVER `~[pg]` shards, c0 289 s to c4 603 s,
+about 2.1x, across jobs on the pre-#3443 combined step, per "Windows test-phase
+concurrency gate"; it has not been re-measured for the agent shards) and
+`--allow-running-no-tests`. That flag is what stops the zero-match shard C from
+failing when `meson test --suite agent --test-args '[tag]'` appends a second
+positional spec. It does not make that a targeted run: Catch2 binds the extra
+spec to the LAST comma-separated OR term only, so it is exact only for shard C,
+it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
+directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
+`docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
+`build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
 is unsharded and unchanged.
@@ -1636,8 +1644,11 @@ does not drop hidden cases by itself. `'agent shard partition invariant'`
 (`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
 `scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
 `check_partition()` as the server shards: it proves against the real binary that
-every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It proves
-exactness, not balance: it prints per-shard case counts as an informational
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It also
+fails if a shard spec term does not end with that suffix (the meson
+`agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
+shape flake-retry's isolated retry can strip, or if two shard entry names are
+equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
 notice, and the drift signal is the 80%-of-budget table above. Per-entry history
 in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
 the new names.

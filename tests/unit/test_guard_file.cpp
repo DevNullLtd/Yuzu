@@ -1097,11 +1097,13 @@ TEST_CASE("FileGuard rename: a health-report sink failure is best-effort and nev
 // a non-empty filter is present (a governance review disputed the mechanism claimed in an
 // earlier version of this comment; re-testing then showed BOTH outcomes across repeat
 // runs, so the exact Catch2 rule here is left unresolved rather than restated with false
-// confidence). What IS reliably, repeatedly verified: the explicit [flaky-4086] tag plus
-// `tests/meson.build`'s `~[flaky-4086]` exclusion (mirroring how `[tsan-heavy]` is excluded
-// from the agent shards, now via the `agent_shard_suffix` on every shard term) keeps this
-// case out of every run tested, with no exception. [.] is
-// kept too so a manual, zero-argument run of the exe still skips it.
+// confidence). What WAS reliably, repeatedly verified, on the then single entry: the
+// explicit [flaky-4086] tag plus `tests/meson.build`'s `~[flaky-4086]` exclusion (mirroring
+// how `[tsan-heavy]` is excluded) kept this case out of every run tested before sharding.
+// The sharded form of that exclusion (the `agent_shard_suffix` on every shard term) has not
+// been run on Windows (this case is `_WIN32`-only, so on Linux the `~[flaky-4086]` term
+// matches nothing and only the checker's suffix pin covers it). [.] is kept too so a
+// manual, zero-argument run of the exe still skips it.
 //
 // Re-tag back into the normal suite once #4086 lands a real fix (mirror spark_file.cpp's
 // F2 drain-before-close pattern onto h_dir).

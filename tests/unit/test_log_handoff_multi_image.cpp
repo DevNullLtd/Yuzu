@@ -94,7 +94,8 @@ namespace {
 // concurrent test processes a shared name would let one process truncate another's
 // sections. One file per process keeps each report whole. A pid is never reused by a
 // live process, but a later run can land on an old pid and truncate-then-overwrite that
-// stale file, which is the same behaviour the single fixed name had.
+// stale file (the same truncate-on-first-call behaviour the single fixed name had); unlike
+// that single name, the per-pid names also accumulate one file per run in the build root.
 long current_pid_for_report() {
 #ifdef _WIN32
     return static_cast<long>(::_getpid());
