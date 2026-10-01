@@ -32,7 +32,7 @@ public:
     /// A teardown sets its stop flag BEFORE calling cancel_ctx_slot(), which takes the same
     /// mutex, so either the canceller saw the published slot and cancelled, or this
     /// predicate sees the flag. A caller that ignores stop_seen() and issues the deadline-less
-    /// RPC anyway can wedge the join on it. `stop` must be cheap and must not take `mu`.
+    /// RPC anyway can wedge the join on it. `stop` must be cheap, must not take `mu`, and must not throw (this constructor is noexcept, so a throw terminates).
     template <class StopPred>
     CtxSlot(std::mutex& mu, std::atomic<grpc::ClientContext*>& slot, grpc::ClientContext* ctx,
             StopPred&& stop) noexcept

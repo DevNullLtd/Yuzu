@@ -2,6 +2,7 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -104,6 +105,15 @@ public:
     /// state (condition variable notified by stop()), so stop() ends the loop promptly
     /// even mid-interval; the caller's join() returns without waiting out the interval
     /// (#2182). Returns true if an update was applied (process should restart).
+    /// The interval run_check_loop actually waits: `interval` clamped to [1s, 8760h]. A
+    /// non-positive value would spin, and an absurd one overflows wait_for's deadline. Callers
+    /// that log the configured interval should log this value instead.
+    [[nodiscard]] static std::chrono::seconds effective_check_interval(
+        std::chrono::seconds interval) noexcept {
+        return std::clamp(interval, std::chrono::seconds{1},
+                          std::chrono::seconds{std::chrono::hours{8760}});
+    }
+
     [[nodiscard]] bool run_check_loop(void* stub, std::chrono::seconds interval);
 
     /// Latches: a stopped Updater never runs again (run() builds a fresh one per connection).

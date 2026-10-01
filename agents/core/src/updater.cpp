@@ -288,8 +288,7 @@ bool Updater::run_check_loop(void* stub, std::chrono::seconds interval) {
     // Clamp to [1s, 1 year]: wait_for computes now() + ceil<steady_clock::duration>(interval),
     // which overflows for absurd values (e.g. seconds::max()), and a non-positive interval
     // would spin check_and_apply with no wait at all.
-    interval = std::clamp(interval, std::chrono::seconds{1},
-                          std::chrono::seconds{std::chrono::hours{8760}});
+    interval = effective_check_interval(interval);
     while (!stop_requested_.load(std::memory_order_acquire)) {
         auto result = check_and_apply(stub);
         if (result.has_value() && result.value())

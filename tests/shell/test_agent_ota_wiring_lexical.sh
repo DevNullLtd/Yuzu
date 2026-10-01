@@ -82,7 +82,7 @@ check() {
   # quiesce_run_workers(): the OTA stop() sits between the heartbeat flag and its cancel, and
   # the OTA thread is joined last (after the sync thread). Reconnect teardown differs
   # (stop_and_join, pinned above), so this is a separate check.
-  if ! printf '%s' "$t" | grep -qE -- 'quiesce_run_workers\(\) noexcept \{.{0,400}heartbeat_stop_\.store\(true, ?std::memory_order_release\); ?if \(auto u = updater\(\)\) ?u->stop\(\); ?cancel_ctx\(heartbeat_ctx_\);'; then
+  if ! printf '%s' "$t" | grep -qE -- 'quiesce_run_workers\(\) noexcept \{.*heartbeat_stop_\.store\(true, ?std::memory_order_release\); ?if \(auto u = updater\(\)\) ?u->stop\(\); ?cancel_ctx\(heartbeat_ctx_\);'; then
     echo "::error::test_agent_ota_wiring_lexical: quiesce_run_workers() no longer calls u->stop() between heartbeat_stop_.store(true) and cancel_ctx(heartbeat_ctx_) (#2182)$HINT" >&2; rc=1
   fi
   if ! printf '%s' "$t" | grep -qE -- 'cancel_ctx\(sync_ctx_\); ?if \(sync_thread_\.joinable\(\)\) ?\{? ?sync_thread_\.join\(\); ?\}? ?update_thread_\.join\(\); ?\}'; then

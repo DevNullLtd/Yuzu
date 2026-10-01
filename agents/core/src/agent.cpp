@@ -2128,7 +2128,9 @@ public:
                         updater(), raw_stub, cfg_.update_check_interval,
                         [this]() {
                             spdlog::info("OTA update checker started (interval={}s)",
-                                         cfg_.update_check_interval.count());
+                                         yuzu::agent::Updater::effective_check_interval(
+                                             cfg_.update_check_interval)
+                                             .count());
                         },
                         [this]() {
                             spdlog::info("OTA update applied - agent will restart");
