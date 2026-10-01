@@ -2745,6 +2745,19 @@ if _bash_test.found()
   )
 endif
 
+# #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
+# CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
+# flag-then-cancel_ctx() teardown order. Carries its own negative-control self-test. No build
+# required, gated only on bash like the log-handoff gate above.
+if _bash_test.found()
+  test('agent OTA/ctx-slot wiring lexical gate (#2182)',
+    _bash_test,
+    args: [files('shell/test_agent_ota_wiring_lexical.sh')],
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
 # Gated on build_agent the same way the capability matrix gate above is -- nothing to
