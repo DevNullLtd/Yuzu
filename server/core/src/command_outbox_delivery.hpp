@@ -159,6 +159,13 @@ private:
         kDeclinedDegraded,    ///< the agent_exec_status check itself degraded — declines
                               ///< toward safety, retried on a later pass.
     };
+    /// Precondition (governance Gate 8 re-review, cpp-safety NICE): every
+    /// caller MUST guard `d_.execution_tracker != nullptr` (and a non-empty
+    /// execution_id) itself before calling — this method dereferences it
+    /// unconditionally. All 4 current call sites already do; this is not
+    /// re-checked here so a caller's own guard stays the single source of
+    /// truth for whether this occurrence has an execution row to bookkeep
+    /// at all.
     ExecCancelOutcome decline_or_cancel_exec(const std::string& execution_id,
                                              const std::string& principal,
                                              const std::string& occurrence_id,

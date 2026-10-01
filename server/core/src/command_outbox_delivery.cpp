@@ -173,9 +173,17 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             if (d_.execution_tracker && !c.execution_id.empty()) {
                 auto outcome = decline_or_cancel_exec(c.execution_id, c.principal,
                                                       c.occurrence_id, "authority_denied");
+                // governance Gate 8 re-review (unhappy-path + cpp-safety, SHOULD):
+                // kCancelFailed must annotate too — mark_cancelled itself failing
+                // leaves the execution 'running' exactly like the two declined
+                // cases, and this audit row is the ONLY compliance evidence this
+                // occurrence ever gets; leaving it bare here would silently
+                // misrepresent a failed cancel as a clean one.
                 if (outcome == ExecCancelOutcome::kDeclinedHasResponse ||
                     outcome == ExecCancelOutcome::kDeclinedDegraded)
                     detail += " exec_not_cancelled=prior_agent_response_or_degraded";
+                else if (outcome == ExecCancelOutcome::kCancelFailed)
+                    detail += " exec_not_cancelled=mark_cancelled_failed";
             }
             audit(c, "denied", detail);
         }
