@@ -388,8 +388,10 @@ begin
 end;
 
 { Embed S as a PowerShell single-quoted literal. Inside single quotes PowerShell
-  expands nothing -- no $variable, no subexpression -- so the quote itself is the
-  only character needing care, and it is escaped by doubling.
+  expands nothing -- no $variable, no subexpression -- so the only characters
+  needing care are the ones that END the literal: the ASCII quote and the
+  typographic single quotes U+2018..U+201B, which PowerShell's tokenizer treats
+  as the same delimiter. Each is escaped by doubling it.
 
   Note for anyone editing the comments in this file: a Pascal comment does NOT
   nest, so a closing brace written inside one ends it there and the prose after
@@ -400,9 +402,8 @@ var
   I: Integer;
 begin
   Result := '';
-  // PowerShell also treats the typographic quotes U+2018..U+201B as single
-  // quotes, so each must be doubled like ' is -- a {tmp} path
-  // under a profile whose name contains U+2019 would otherwise end the literal early.
+  // A {tmp} path under a profile whose name contains U+2019 would otherwise
+  // end the literal early, and the check would fail to parse.
   for I := 1 to Length(S) do
     if (S[I] = '''') or (S[I] = #$2018) or (S[I] = #$2019) or (S[I] = #$201A) or (S[I] = #$201B) then
       Result := Result + S[I] + S[I]
@@ -443,18 +444,28 @@ end;
   survives it untouched.
 
   THE CHECK MUST COMPARE THE EXACT OWNER AND ACE SET, not a marker within the
-  ACL text -- and it must require that Administrators and SYSTEM actually HAVE
-  full control: "nobody else has access" is also true of an empty DACL, which
-  is exactly what the /T bug above produced and what the check passed. The previous check tested for the inherited-ACE marker "(I)", which
+  ACL text -- and the set must be exactly "Administrators and SYSTEM, each
+  allowed full control". "Nobody else has access" is also true of an empty
+  DACL, which is what the /T bug above produced and what the rc1..rc5 check
+  passed; a Deny entry or an inherit-only entry for either account is also not
+  access. The earliest check tested for the inherited-ACE marker "(I)", which
   an explicit ACE does not carry -- so it passed a directory the attacker could
   still write to. Verified on Windows 11 26100: the install completed, reported
   the directory secured, and the attacker retained (OI)(CI)(F) plus ownership.
   "No inherited ACEs" is a far weaker statement than "only Administrators and
   SYSTEM can write here", and only the latter is what this directory needs.
 
-  Identities are compared as SIDs, never as names: icacls prints localised
-  account names, so matching "BUILTIN\Administrators" would silently fail open
-  off an English build.
+  The comparison is on the SDDL string (owner BA or SY; the root exactly
+  (A;OICI;FA;;;BA)(A;OICI;FA;;;SY), protected; every descendant exactly the
+  inherited (A;ID;FA;;;..) or (A;OICIID;FA;;;..) pair). SDDL names accounts by
+  SID alias, never by localised name -- icacls prints localised names, so
+  matching "BUILTIN\Administrators" would silently fail open off an English
+  build. It also uses NO .NET method call: under WDAC/AppLocker PowerShell runs
+  in Constrained Language Mode, which refuses method calls on non-core types,
+  and the rc1..rc5 check called GetOwner()/Translate(), so on such an endpoint
+  it could not run and every install aborted. Verified on Windows Server 2022
+  under ConstrainedLanguage (#5196). Property reads, -match and cmdlets are
+  allowed there.
 
   IT MUST NOT PIPE icacls INTO find. An earlier form did:
 
@@ -524,32 +535,27 @@ begin
     path points it at PowerShell 7's copies of modules it loads on first use,
     such as Microsoft.PowerShell.Security, which 5.1 cannot load: Get-Acl failed,
     the check could not run, and the install aborted (#5176). Reset it to
-    Windows PowerShell's own modules plus the machine value first, using no
-    cmdlet to build it. The AutoLogger [Run] entries do the same. }
+    Windows PowerShell's own modules first, using no cmdlet to build it. The
+    check needs nothing else, and reading the machine value would need a .NET
+    static call, which Constrained Language Mode refuses (see above). }
   Script :=
-    '$env:PSModulePath=$PSHOME+''\Modules;''+' +
-    '[Environment]::GetEnvironmentVariable(''PSModulePath'',''Machine'');' +
+    '$env:PSModulePath=$PSHOME+''\Modules'';' +
     '$ErrorActionPreference=''Stop'';' +
     '$d=' + PsLit(CertDir) + ';' +
     '$out=' + PsLit(ReasonFile) + ';' +
-    '$ok=@(''S-1-5-32-544'',''S-1-5-18'');' +
     'function Fail($m){Set-Content -LiteralPath $out -Value $m -Encoding ASCII;exit 3};' +
-    'try{$a=Get-Acl -LiteralPath $d}catch{Fail (''the permissions could not be read: '' + $_.Exception.Message)};' +
-    'if(-not $a.AreAccessRulesProtected){Fail ''it still inherits permissions from ProgramData''};' +
     '$t=@($d);' +
     'try{$t+=@(Get-ChildItem -LiteralPath $d -Recurse -Force|ForEach-Object{$_.FullName})}catch{Fail ''its contents could not be listed''};' +
     'foreach($p in $t){' +
-      'try{$x=Get-Acl -LiteralPath $p}catch{Fail (''the permissions could not be read on '' + $p)};' +
-      '$o=$x.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;' +
-      'if($ok -notcontains $o){Fail (''it is owned by '' + $o + '': '' + $p)};' +
-      '$g=@();' +
-      'foreach($r in $x.Access){' +
-        'try{$s=$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}' +
-        'catch{Fail (''an account on its permission list could not be resolved: '' + $p)};' +
-        'if($ok -notcontains $s){Fail (''access is granted to '' + $s + '': '' + $p)};' +
-        'if($r.AccessControlType -eq ''Allow'' -and ($r.FileSystemRights -band 2032127) -eq 2032127){$g+=$s}' +
-      '};' +
-      'foreach($k in $ok){if($g -notcontains $k){Fail (''full control is not granted to '' + $k + '' (an empty permission list locks everyone out, the service included): '' + $p)}};' +
+      'try{$s=[string](Get-Acl -LiteralPath $p).Sddl}catch{Fail (''the permissions could not be read on '' + $p)};' +
+      'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is owned by an account other than Administrators or SYSTEM: '' + $p + '' '' + $s)};' +
+      'if($s -notmatch ''D:([A-Z]*)(\(.*)?$''){Fail (''its permission list could not be read: '' + $p + '' '' + $s)};' +
+      '$f=$Matches[1];$l=[string]$Matches[2];' +
+      'if($p -eq $d){' +
+        'if($f -notmatch ''P''){Fail ''it still inherits permissions from ProgramData''};' +
+        '$e=''^\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$''' +
+      '}else{$e=''^\(A;(?:OICI)?ID;FA;;;(SY|BA)\)\(A;(?:OICI)?ID;FA;;;(SY|BA)\)$''};' +
+      'if(($l -notmatch $e) -or ($Matches[1] -eq $Matches[2])){Fail (''its permission list is not exactly Administrators and SYSTEM, each with full control: '' + $p + '' '' + $s)}' +
     '};' +
     'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
     'exit 0';
@@ -582,10 +588,12 @@ begin
       Reason := 'the check did not produce a result (exit code ' + IntToStr(ResultCode) + ')';
     Result := 'The update trust-anchor directory is not secured:' + #13#10 +
               CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
-              'Only Administrators and SYSTEM may have access to it. While anyone ' +
-              'else can write there, they can install their own trust bundle and ' +
-              'authorise their own agent updates. Securing it did not take effect -- ' +
-              'security software may have blocked it. The installation has been stopped.';
+              'Only Administrators and SYSTEM may have access to it, and both need full ' +
+              'control. While anyone else can write there, they can install their own ' +
+              'trust bundle and authorise their own agent updates; while SYSTEM cannot ' +
+              'read it, the agent cannot verify updates at all. Securing it did not take ' +
+              'effect -- security software may have blocked it. The installation has ' +
+              'been stopped.';
   end;
 end;
 

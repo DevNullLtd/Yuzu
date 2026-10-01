@@ -2262,10 +2262,10 @@ route, neither the directory nor its ACL hardening exists after upgrading. Creat
 it before you enable signing, or `--update-trust-bundle` points at nothing:
 
 ```powershell
-# Windows, elevated. All three commands matter, and in this order. Keep each on ONE
+# Windows, elevated. Every step matters, and in this order. Keep each command on ONE
 # line -- a broken continuation runs the earlier steps and silently skips the rest,
 # which is the exact state this block exists to avoid.
-mkdir "C:\ProgramData\Yuzu\agent-certs"
+mkdir "C:\ProgramData\Yuzu\agent-certs" -Force
 
 # 1. Take ownership. If the directory ALREADY EXISTS, whoever created it owns it and
 #    holds WRITE_DAC permanently -- stripping their access without taking ownership
@@ -2279,25 +2279,36 @@ takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
 icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
 
 # 3. Break inheritance and grant exactly Administrators and SYSTEM, on the DIRECTORY
-#    ONLY: its files inherit this from step 2. Without the inheritance break,
-#    %ProgramData%'s inherited rights let an unprivileged local user plant the anchor
-#    file before you do. Do NOT add /T here: on a file the (OI)(CI) grant is invalid,
-#    and icacls then leaves every existing file (an update-trust-bundle.pem already in
-#    place) with an EMPTY permission list -- SYSTEM, and so the agent, can no longer
-#    read it -- while still reporting success (#5196).
+#    ONLY. Without the inheritance break, %ProgramData%'s inherited rights let an
+#    unprivileged local user plant the anchor file before you do. Do NOT add /T here:
+#    on a file the (OI)(CI) grant is invalid, and icacls then leaves every existing
+#    file (an update-trust-bundle.pem already in place) with an EMPTY permission list
+#    -- SYSTEM, and so the agent, can no longer read it -- while still reporting
+#    success (#5196).
 icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /C /Q
 
-# Verify the directory: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each
-# (OI)(CI)(F), and nothing marked (I). Check the OWNER too -- an unexpected owner can
-# restore its own access at any time, so "the list looks right" is not on its own
-# sufficient.
-icacls "C:\ProgramData\Yuzu\agent-certs"
-(Get-Acl "C:\ProgramData\Yuzu\agent-certs").Owner
-# And every file in it: each must show BUILTIN\Administrators:(I)(F) and
-# NT AUTHORITY\SYSTEM:(I)(F). A file listed with NO entries at all is unreadable by
-# the agent; repair it by resetting the FILES only (not the directory, which must keep
-# step 3's permissions): icacls "C:\ProgramData\Yuzu\agent-certs\*" /reset /T /C /Q
-icacls "C:\ProgramData\Yuzu\agent-certs\*"
+# 4. Repeat steps 1 and 2 for the CONTENTS only. Between steps 2 and 3 the directory
+#    inherited %ProgramData%'s rights again, so a file a local user created in that
+#    window is still theirs. This takes it back and makes every file inherit step 3's
+#    permissions. Note the \* -- it resets the contents, never the directory itself,
+#    which would undo step 3. On an empty directory it reports that no files were
+#    found; that is expected.
+takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
+icacls "C:\ProgramData\Yuzu\agent-certs\*" /reset /T /C /Q
+
+# 5. Verify -- the same check the installer runs. Every line must say OK. It compares
+#    the security descriptor exactly: owned by Administrators or SYSTEM; the directory
+#    protected and granting exactly those two full control; everything inside it
+#    inheriting exactly that. Accounts are compared by SID, so it works on any language.
+#    A BAD line means something else has access, or SYSTEM cannot read the item: run
+#    steps 1-4 again. An error listing the contents means the same.
+$d = "C:\ProgramData\Yuzu\agent-certs"
+foreach ($p in @($d) + @(Get-ChildItem -LiteralPath $d -Recurse -Force | ForEach-Object FullName)) {
+    $s = (Get-Acl -LiteralPath $p).Sddl
+    $e = if ($p -eq $d) { 'D:P[A-Z]*\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$' } else { 'D:[A-Z]*\(A;(?:OICI)?ID;FA;;;(SY|BA)\)\(A;(?:OICI)?ID;FA;;;(SY|BA)\)$' }
+    $ok = ($s -match '^O:(BA|SY)G:') -and ($s -match $e) -and ($Matches[1] -ne $Matches[2])
+    '{0}  {1}' -f $(if ($ok) { 'OK ' } else { 'BAD' }), $p
+}
 ```
 
 ```bash
@@ -3087,7 +3098,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. The grant is applied to the directory alone and its contents inherit it. A pre-install check verifies, for the directory and every file in it, the owner, that no other account has an entry, and that Administrators and SYSTEM both have full control; it aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. The grant is applied to the directory alone and everything inside it inherits it. A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -3113,7 +3124,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | Add the flag to the service's **binary path**. **`sc.exe config binPath=` REPLACES THE ENTIRE COMMAND LINE — it does not append.** Capture the current one first with `sc qc YuzuAgent`, then re-issue it in full with the flag added, keeping the escaped inner quotes exactly as shown under **Windows Service Installation → Agent: `--install-service`** below. Passing only the new flag drops `--server`, `--data-dir`, `--plugin-dir` and `--log-file`; the service then reaches RUNNING, fails closed on startup with no server or CA to pin, and the endpoint silently leaves the fleet while you believe you enabled signing. Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
+| Windows | Set the variables in the service's own environment -- a `REG_MULTI_SZ` value named `Environment` under the service's registry key -- then restart the service: `reg add HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment /t REG_MULTI_SZ /d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem" /f`, then `Restart-Service YuzuAgent`. The service reads it every time it starts, and **installer upgrades and reinstalls leave it in place**. Separate several variables with `\0` (`/d "YUZU_UPDATE_TRUST_BUNDLE=...\0YUZU_UPDATE_REQUIRE_SIGNATURE=1"`); `reg add` replaces the whole value, so give every variable each time, and check it with `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`. **Do not add the flags to the service's binary path.** Every run of the agent installer -- a reinstall, or an upgrade pushed through SCCM, Intune or GPO -- rewrites that path in full and drops them, so verification is silently OFF afterwards with nothing to show it (#5196). An endpoint configured that way before should be moved to the `Environment` value. Do not use `setx /M` either: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service. |
 
 Every flag below has the environment variable shown beside it:
 
@@ -4915,7 +4926,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
 
-> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
+> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installer runs leave alone (see *Signing update binaries (#416)*).
 
 **If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 
