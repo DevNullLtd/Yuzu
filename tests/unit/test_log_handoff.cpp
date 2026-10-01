@@ -86,11 +86,12 @@ struct EmitSilencer {
 //    timer (MSVC's tick-granular waits can return up to one ~16 ms tick early).
 // Deliberately NOT converted (each documented where it sits): the 1100 ms sleeps in the U11
 // family (they must span a real 1 s throttle window and a stall only lengthens them); graces
-// of 2 s or more; the 100-500 ms "settle" sleeps, which wait for a thread to reach a point the
-// test cannot observe; and the concurrent real-teardown test that carries the production 2 s
-// hard_exit grace ("U10 (concurrent teardown)", distinct from the U4 title that also says
-// U10): converting it needs a production test seam for that grace, so a test-thread stall of
-// about 2 s there can still abort the binary.
+// of 2 s or more; the 100-500 ms "settle" sleeps and U11d's 600 ms throttle-window sleep,
+// which wait for a thread to reach a point the test cannot observe; and the concurrent
+// real-teardown test that carries the production 2 s hard_exit grace ("U10 (concurrent
+// teardown)", distinct from the U4 title that also says U10): converting it needs a
+// production test seam for that grace, so a test-thread stall of about 2 s there can still
+// abort the binary.
 constexpr auto kEventDeadline = 10s * yuzu::test::kSpinScale; // PRE-SCALED: never hand this to
                                                               // spin_until, which scales itself.
 // One coarse-timer tick (GetTickCount64, ~15.6 ms) plus millisecond truncation, with room to
@@ -807,7 +808,7 @@ TEST_CASE("U9: drain_log_bounded() delivers a pending breadcrumb when healthy, t
 
         // This case must really wait out `wait`, so it stays short. LOWER bound: it may
         // not give up early (a drain that returned false at once would otherwise pass
-        // CHECK_FALSE); the 16ms is one coarse-timer tick of tolerance, though the loop
+        // CHECK_FALSE); kCoarseTimerTolerance is one coarse-timer tick plus truncation, though the loop
         // is on steady_clock and cannot return early. UPPER bound: a hang detector only,
         // `wait` plus a multi-second allowance, never a tight epsilon.
         constexpr auto kWait = 400ms;
