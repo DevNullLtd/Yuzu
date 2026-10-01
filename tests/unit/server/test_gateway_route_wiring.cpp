@@ -276,10 +276,12 @@ std::vector<std::string> listed_unknown(const gw::BatchHeartbeatResponse& r) {
 }
 
 // Mirrors kMaxUnknownSessionIdsPerResponse / kMaxGatewaySessionIdLen in
-// gateway_service_impl.hpp; kept local so this file compiles against the
-// not-yet-filled server.
+// gateway_service_impl.hpp; pinned to them below so a changed bound forces a
+// deliberate edit of these cases.
 constexpr int kTestUnknownCap = 4096;
 constexpr std::size_t kTestMaxSessionIdLen = 64;
+static_assert(kTestUnknownCap == yuzu::server::detail::kMaxUnknownSessionIdsPerResponse);
+static_assert(kTestMaxSessionIdLen == yuzu::server::detail::kMaxGatewaySessionIdLen);
 
 } // namespace
 

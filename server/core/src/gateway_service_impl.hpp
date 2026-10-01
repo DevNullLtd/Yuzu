@@ -69,6 +69,24 @@ inline constexpr std::size_t kMaxClusterIdLen = 64;
 // misconfigured values.
 inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
 
+// #1197: BatchHeartbeatResponse.unknown_session_ids caps. The listed count is
+// tied to the gateway heartbeat buffer's own 10000-entry bound
+// (max_heartbeat_buffer); 4096 ids x 64 B keeps the response about 260 KiB,
+// under every default message limit on both sides. The listed subset under
+// truncation is whatever the unordered set yields: do NOT sort it (omitted ids
+// are reported again when those agents next heartbeat, so there is no fairness
+// to preserve and a sort would only add cost).
+inline constexpr int kMaxUnknownSessionIdsPerResponse = 4096;
+
+// #1197: a session_id longer than this that does NOT resolve in
+// gateway_sessions_ is counted malformed and never listed or echoed. Mirrors
+// kMaxStreamHomeIdLen (gateway_service_impl.cpp) and sits above the 43-byte
+// "gw-session-" + 32 hex shape this server mints. It is applied ONLY after the
+// lookup misses: a reclaim-absent ProxyRegister adopts a gateway-presented id
+// of any length, so a KNOWN session may legitimately exceed this and must keep
+// being ingested.
+inline constexpr std::size_t kMaxGatewaySessionIdLen = 64;
+
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
     GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus, auth::AuthManager& auth_mgr,

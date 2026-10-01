@@ -1,5 +1,6 @@
 #include "gateway_service_impl.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include <nlohmann/json.hpp>
@@ -243,7 +244,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "DIFFERENT cluster_id than the agent's durably-bound home affinity, refused "
             "fail-closed. ANY non-zero rate is worth investigating (a misconfigured/renamed "
             "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
-            "to tolerate like the others.",
+            "to tolerate like the others. #1197: op=\"batch_heartbeat\", "
+            "outcome=\"malformed_session_id\" counts BatchHeartbeat entries whose session_id "
+            "is over-length and not held by this replica (no write is attempted and the id is "
+            "never echoed in unknown_session_ids); the expected rate is zero, so a sustained "
+            "rate means a buggy or hostile gateway.",
             "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
         // only the (op,outcome) pairs this file ACTUALLY emits (see the
@@ -302,6 +307,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // ProxyRegister's adopt/refuse decision above).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_superseded"}});
+        // #1197: BatchHeartbeat's over-length unknown session_id, same shape
+        // as malformed_home_id / malformed_cluster_id above.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}});
     }
 }
 
@@ -1087,18 +1096,40 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     int acked = 0;
+    // #1197: distinct session ids this replica does not hold, reported back to
+    // the gateway in the response, plus a count of over-length unknown ids.
+    // ORDER IS LOAD-BEARING: the gateway_sessions_ lookup runs FIRST and the
+    // length cap applies only on a MISS. A reclaim-absent ProxyRegister adopts
+    // a gateway-presented id of any length, so a known session may be longer
+    // than kMaxGatewaySessionIdLen; capping before the lookup would silently
+    // drop that session's heartbeats (no ingest, no renew, no presence).
+    std::unordered_set<std::string> unknown_ids;
+    std::size_t malformed_session_ids = 0;
     for (const auto& hb : request->heartbeats()) {
         // Validate that the session is known
         std::string agent_id;
+        bool known = false;
         {
             std::lock_guard lock(sessions_mu_);
             auto it = gateway_sessions_.find(hb.session_id());
             if (it != gateway_sessions_.end()) {
                 agent_id = it->second;
+                known = true;
+            }
+        }
+        if (!known) {
+            const auto& sid = hb.session_id();
+            if (sid.empty()) {
+                // neither acked nor listed
+            } else if (sid.size() > kMaxGatewaySessionIdLen) {
+                ++malformed_session_ids; // counted below; never echoed or logged in full
+            } else {
+                unknown_ids.insert(sid);
             }
         }
         if (agent_id.empty()) {
-            spdlog::debug("[gateway] BatchHeartbeat: unknown session {}", hb.session_id());
+            spdlog::debug("[gateway] BatchHeartbeat: unknown session {}",
+                          hb.session_id().substr(0, kMaxGatewaySessionIdLen));
             continue;
         }
         // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
@@ -1168,8 +1199,11 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         // condition (or, once multi-replica routing exists, an LB handing a
         // batch to a replica that never registered the session) stays
         // visible rather than silently dropped — the exact signal #4246 #8
-        // exists for.
-        std::unordered_set<std::string> unknown_sessions;
+        // exists for. #1197 (D25): the unknown set is NOT recomputed here; it
+        // is the first loop's `unknown_ids`, the single source of truth for
+        // "this replica does not hold it", which also feeds the response
+        // verdict. Over-length unknown ids are excluded from it (counted as
+        // batch_heartbeat/malformed_session_id instead).
         {
             std::lock_guard lock(sessions_mu_);
             for (const auto& hb : request->heartbeats()) {
@@ -1178,8 +1212,6 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 auto it = gateway_sessions_.find(hb.session_id());
                 if (it != gateway_sessions_.end())
                     session_to_agent.emplace(hb.session_id(), it->second);
-                else
-                    unknown_sessions.insert(hb.session_id());
             }
             // PR #4299 review (SHOULD 2): a session that lost its
             // register_fresh epoch race (lost_race_sessions_) is EXPECTED to
@@ -1216,9 +1248,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         // unknown session id must not inflate this beyond the actual number
         // of un-correlatable sessions, matching the dedup already applied to
         // the eligible/shortfall accounting below.
-        if (!unknown_sessions.empty()) {
+        if (!unknown_ids.empty()) {
             record_directory_desync(metrics_, "renew_leases", "unknown_session",
-                                    static_cast<double>(unknown_sessions.size()));
+                                    static_cast<double>(unknown_ids.size()));
         }
         if (!session_to_agent.empty()) {
             // A `std::unordered_map` keyed on session_id already collapses a
@@ -1256,6 +1288,36 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 }
             }
         }
+    }
+
+    // #1197: the verdict. Reported regardless of whether a route store is
+    // wired (it reflects only this replica's in-memory gateway_sessions_).
+    // The listed subset under truncation is arbitrary (unordered_set order,
+    // deliberately not sorted); omitted ids are reported again when those
+    // agents next heartbeat. No presence marker by design.
+    if (!unknown_ids.empty()) {
+        const auto total = unknown_ids.size();
+        const auto cap = static_cast<std::size_t>(kMaxUnknownSessionIdsPerResponse);
+        response->mutable_unknown_session_ids()->Reserve(static_cast<int>(std::min(total, cap)));
+        std::size_t listed = 0;
+        for (const auto& id : unknown_ids) {
+            if (listed == cap)
+                break;
+            response->add_unknown_session_ids(id);
+            ++listed;
+        }
+        if (total > cap) {
+            response->set_unknown_session_ids_truncated(true);
+            spdlog::warn("[gateway] BatchHeartbeat from node '{}': unknown-session verdict "
+                         "truncated, listed {} of {} distinct unknown ids",
+                         request->gateway_node(), listed, total);
+        }
+    }
+    if (malformed_session_ids > 0) {
+        // One call per batch with count = N, mirroring malformed_home_id /
+        // malformed_cluster_id, so the warn line fires at most once per flush.
+        record_directory_desync(metrics_, "batch_heartbeat", "malformed_session_id",
+                                static_cast<double>(malformed_session_ids));
     }
 
     response->set_acknowledged_count(acked);
