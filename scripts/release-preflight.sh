@@ -55,8 +55,13 @@ FRAG_COUNT=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/de
 if [ "$FRAG_COUNT" -eq 0 ]; then
     pass "changelog.d/ has no unpromoted fragments"
 else
-    if grep -q "^## \[$BASE_VERSION\]" CHANGELOG.md 2>/dev/null; then
-        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) and ## [$BASE_VERSION] already exists — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append --date YYYY-MM-DD"
+    if grep -qF "## [$BASE_VERSION]" CHANGELOG.md 2>/dev/null; then
+        if [ "$VERSION" = "$BASE_VERSION" ]; then
+            APPEND_DATE=" --date YYYY-MM-DD  (the final release date)"
+        else
+            APPEND_DATE="  (omit --date for an RC; pass it only at the final release)"
+        fi
+        fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) and ## [$BASE_VERSION] already exists — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append$APPEND_DATE"
     else
         fail "changelog.d/ has $FRAG_COUNT unpromoted fragment(s) — run: python3 scripts/assemble-changelog.py promote $BASE_VERSION"
     fi

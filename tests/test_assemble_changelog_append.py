@@ -156,7 +156,7 @@ class PromoteAppend(unittest.TestCase):
         f = self.frag("10-a.fixed.md", "- **Existing fixed bullet.**")
         r = self.run_append()
         self.assertEqual(r.returncode, 1)
-        self.assertIn("already in", r.stderr)
+        self.assertIn("already appears in", r.stderr)
         self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
         self.assertTrue(f.exists())
 
@@ -169,6 +169,73 @@ class PromoteAppend(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.changelog.read_text(encoding="utf-8"), before)
         self.assertEqual(before.count("New fixed bullet"), 1)
+
+    def test_first_line_substring_is_not_a_duplicate(self):
+        # A new fragment whose first line occurs inside an existing bullet, or
+        # whose first line repeats one but whose body differs, is still new.
+        self.frag("10-a.fixed.md", "- **Existing fixed")
+        self.frag("11-b.fixed.md", "- **Existing fixed bullet.**\n  plus a second line that is new.")
+        r = self.run_append()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sec = self.section()
+        self.assertIn("- **Existing fixed\n", sec)
+        self.assertIn("plus a second line that is new.", sec)
+
+    def test_fragments_separated_by_blank_line_like_plain_promote(self):
+        self.frag("10-a.fixed.md", "- **First.**")
+        self.frag("11-b.fixed.md", "- **Second.**")
+        self.assertEqual(self.run_append().returncode, 0)
+        self.assertIn("- **Existing fixed bullet.**\n\n- **First.**\n\n- **Second.**\n", self.section())
+
+    def test_new_canonical_subsection_goes_before_noncanonical(self):
+        text = CHANGELOG.replace("- **Existing fixed bullet.**\n", "- **Existing fixed bullet.**\n\n### Notes\n\n- A note.\n")
+        self.changelog.write_text(text, encoding="utf-8")
+        self.frag("10-a.security.md", "- **New security bullet.**")
+        self.assertEqual(self.run_append().returncode, 0)
+        heads = [l for l in self.section().split("\n") if l.startswith("### ")]
+        self.assertEqual(heads, ["### Added", "### Fixed", "### Security", "### Notes"])
+
+    def test_refuses_duplicate_version_headers(self):
+        text = CHANGELOG + "\n## [1.2.0] - 2026-01-01\n\n### Fixed\n\n- **Stray.**\n"
+        self.changelog.write_text(text, encoding="utf-8")
+        self.frag("10-a.fixed.md", "- **x.**")
+        r = self.run_append()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("2 ## [1.2.0] headers", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), text)
+
+    def test_missing_unreleased_refused_cleanly(self):
+        text = CHANGELOG.replace("## [Unreleased]\n\nUnreleased changes live in changelog.d/.\n\n", "")
+        self.changelog.write_text(text, encoding="utf-8")
+        self.frag("10-a.fixed.md", "- **x.**")
+        r = self.run_append()
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), text)
+
+    def test_allow_older_requires_append(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--changelog", str(self.changelog),
+                            "--fragments-dir", str(self.frags), "promote", "1.2.0", "--allow-older-section"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("only valid with promote --append", r.stderr)
+
+    def test_plain_promote_existing_section_names_append(self):
+        self.frag("10-a.fixed.md", "- **x.**")
+        r = subprocess.run([sys.executable, str(SCRIPT), "--changelog", str(self.changelog),
+                            "--fragments-dir", str(self.frags), "promote", "1.2.0"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("promote 1.2.0 --append", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+
+    def test_plain_promote_invalid_date_refused(self):
+        self.frag("10-a.fixed.md", "- **x.**")
+        r = subprocess.run([sys.executable, str(SCRIPT), "--changelog", str(self.changelog),
+                            "--fragments-dir", str(self.frags), "promote", "1.3.0", "--date", "2026-02-30"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
 
     def test_invalid_date_refused(self):
         self.frag("10-a.fixed.md", "- **x.**")
