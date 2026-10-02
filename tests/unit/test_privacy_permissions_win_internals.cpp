@@ -128,15 +128,39 @@ std::string own_sid_string() {
     return yuzu::win::from_wide(s);
 }
 
-/// A SID no real profile carries: the offline arm is the only way to reach its "profile".
-constexpr char kSyntheticSid[] = "S-1-5-21-1-2-3-4000";
+/// A SID no real profile carries: the offline arm is the only way to reach its "profile". The
+/// last sub-authority is salted per process (a fixed width, so no SID is a prefix of another):
+/// two concurrent test jobs on a shared runner never see each other's mounts (CLAUDE.md #1871).
+const std::string& synthetic_sid() {
+    static const std::string sid = [] {
+        const auto salted = 1'000'000'000u + yuzu::test::process_random_salt() % 3'000'000'000u;
+        return "S-1-5-21-1-2-3-" + std::to_string(salted); // always 10 digits
+    }();
+    return sid;
+}
 
-/// Whether any HKEY_USERS subkey is an offline mount this suite made for the synthetic SID.
+/// Whether any HKEY_USERS subkey is an offline mount this process made for the synthetic SID.
 bool synthetic_mount_present() {
     for (const auto& n : yuzu::win::enumerate_hku_subkeys())
-        if (n.find(kSyntheticSid) != std::string::npos) return true;
+        if (n.find(synthetic_sid()) != std::string::npos) return true;
     return false;
 }
+
+/// Mandatory cleanup on every path: the shared box must never keep a YUZU_HIVE_* mount. `held` is
+/// released first (a handle held on the mount's root keeps it from unloading).
+struct HiveCleanup {
+    yuzu::win::RegKey& held;
+    const yuzu::win::HiveAccessReport& report;
+    void run() const {
+        held.reset();
+        if (!report.mounted_offline) return;
+        // with_user_hive's privilege scopes have already reverted: unloading needs both again.
+        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
+    }
+    ~HiveCleanup() { run(); }
+};
 
 const RawGrant* find(const std::vector<RawGrant>& v, std::string_view app, std::string_view cat) {
     for (const auto& g : v)
@@ -150,13 +174,15 @@ TEST_CASE("privacy_permissions win: StabilityWatch reports a change armed beneat
           "is stable when nothing moved",
           "[privacy_permissions][win_internals]") {
     TestKey key;
+    // Created BEFORE arming: production watches Value writes at depth >= 2 (a capability's app
+    // key), so only a LAST_SET change beneath a subtree watch trips this, not a name change.
+    const auto grandchild = key.make(L"child\\grandchild");
     {
         StabilityWatch quiet(key.root);
         CHECK_FALSE(win::classify_stability(quiet.poll()).has_value());
     }
     StabilityWatch watch(key.root);
-    const auto child = key.make(L"child");
-    set_sz(child.get(), L"Value", L"Deny"); // a change beneath the armed root, before the poll
+    set_sz(grandchild.get(), L"Value", L"Deny"); // a depth-2 Value write after arming
     const auto token = win::classify_stability(watch.poll());
     REQUIRE(token.has_value());
     CHECK(*token == "changed_during_read");
@@ -347,7 +373,7 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a drive that is not a 
     }
     if (!letter) SKIP("every drive letter is mapped: no DRIVE_NO_ROOT_DIR root to refuse");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, kSyntheticSid, 0, std::nullopt};
+    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
     CHECK(guard.before_load(std::wstring{letter} + L":\\Users\\x\\NTUSER.DAT") ==
           "hive_path_not_fixed");
     CHECK(guard.opens == 0);
@@ -410,21 +436,23 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hive file over the s
 TEST_CASE("privacy_permissions win: HiveFileGuard reads the owner from the file, not the profile",
           "[privacy_permissions][win_internals]") {
     HiveDir hd;
-    auto user = own_token_user();
+    // SeRestorePrivilege lets the fixture assign an owner outside the allow-set (S-1-5-19), so the
+    // refusal is asserted unconditionally under any identity (LocalSystem owns files as S-1-5-18,
+    // an allow-set owner, which would make a "natural owner" assertion vacuous).
+    const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+    if (!restore.ok()) SKIP("assigning a foreign owner needs SeRestorePrivilege: not held here");
+    PSID foreign = nullptr;
+    REQUIRE(ConvertStringSidToSidW(L"S-1-5-19", &foreign));
+    const LocalFreeGuard foreign_guard{foreign};
     std::wstring wfile = hd.file.wstring();
     if (const DWORD rc = SetNamedSecurityInfoW(wfile.data(), SE_FILE_OBJECT,
-                                               OWNER_SECURITY_INFORMATION, sid_of(user), nullptr,
+                                               OWNER_SECURITY_INFORMATION, foreign, nullptr,
                                                nullptr, nullptr);
         rc != ERROR_SUCCESS)
-        SKIP("cannot set the fixture file's owner to the test's own SID (win32 " << rc << ")");
-    // The file is now owned by this process's user; the profile is someone else. LocalSystem (an
-    // allow-set owner) legitimately reads accepted, an ordinary user must read refused.
-    const std::string own = own_sid_string();
-    const std::string profile = kSyntheticSid;
+        SKIP("cannot set the fixture file's owner to S-1-5-19 (win32 " << rc << ")");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, profile, 0, std::nullopt};
-    CHECK(guard.before_load(hd.file.wstring()) ==
-          (win::hive_owner_allowed(own, profile) ? "" : "hive_owner_unexpected"));
+    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
+    CHECK(guard.before_load(hd.file.wstring()) == "hive_owner_unexpected");
 }
 
 TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first and never enters "
@@ -485,13 +513,13 @@ yuzu::win::HiveAccessStatus run_offline(const std::string& profile_path, const s
                                                     ++n.after;
                                                     return after;
                                                 }};
-    return yuzu::win::with_user_hive(kSyntheticSid, profile_path, [&](HKEY) { ++n.fn; }, &report,
+    return yuzu::win::with_user_hive(synthetic_sid(), profile_path, [&](HKEY) { ++n.fn; }, &report,
                                      &check);
 }
 
 void require_live_arm_missed() {
     yuzu::win::RegKey live;
-    REQUIRE(RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(kSyntheticSid).c_str(), 0, KEY_READ,
+    REQUIRE(RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(synthetic_sid()).c_str(), 0, KEY_READ,
                           live.put()) != ERROR_SUCCESS);
 }
 
@@ -534,8 +562,10 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on an after_load toke
     }
     const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
 
+    yuzu::win::RegKey no_held; // nothing holds either mount's root here
     HookCounts control;
     yuzu::win::HiveAccessReport control_report;
+    const HiveCleanup control_cleanup{no_held, control_report};
     const auto ok = run_offline(profile, "", "", control, control_report);
     if (ok == yuzu::win::HiveAccessStatus::privilege_missing)
         SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
@@ -546,6 +576,7 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on an after_load toke
 
     HookCounts n;
     yuzu::win::HiveAccessReport report;
+    const HiveCleanup cleanup{no_held, report};
     const auto status = run_offline(profile, "", "forced_after", n, report);
     CHECK(status == yuzu::win::HiveAccessStatus::file_refused);
     CHECK(report.refusal == "forced_after");
@@ -581,25 +612,12 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
     // (The fixture's child `k` is volatile and so is not saved into the hive: hold the ROOT.)
     yuzu::win::RegKey held;
     yuzu::win::HiveAccessReport report;
-    // Mandatory cleanup on every path: the shared box must never keep a YUZU_HIVE_* mount.
-    const struct Cleanup {
-        yuzu::win::RegKey& held;
-        yuzu::win::HiveAccessReport& report;
-        void run() const {
-            held.reset();
-            if (!report.mounted_offline) return;
-            // with_user_hive's privilege scopes have already reverted: unloading needs both again.
-            const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
-            const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-            RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
-        }
-        ~Cleanup() { run(); }
-    } cleanup{held, report};
+    const HiveCleanup cleanup{held, report};
 
     bool threw = false;
     try {
         yuzu::win::with_user_hive(
-            kSyntheticSid, profile,
+            synthetic_sid(), profile,
             [&](HKEY root) {
                 RegOpenKeyExW(root, nullptr, 0, KEY_READ, held.put());
                 throw std::runtime_error("fn failed");

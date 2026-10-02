@@ -236,7 +236,7 @@ struct OutputBudget {
         return n;
     }
     [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
-        return cost(rows) > max_bytes - std::min(bytes, max_bytes);
+        return cost(rows) > max_bytes - (std::min)(bytes, max_bytes);
     }
     void charge(std::span<const PermissionRow> rows) { bytes += cost(rows); } // allocates
 };

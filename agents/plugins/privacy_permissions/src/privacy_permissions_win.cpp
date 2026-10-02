@@ -31,11 +31,11 @@
  * never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
  *
  * DEADLINE: ~15 s, COOPERATIVE -- checked before each profile, first thing in the hive-file
- * guard's before_load, and before each capability and each app key open; there is no detached worker (a plugin must not
- * defer work past unload). One blocking call (the offline_hive_mutex wait behind a sibling
- * plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor is one enumeration of
- * at most 4,096 children, the capability-level key opens, or one key's value reads, so a dispatch can
- * overrun it.
+ * guard's before_load, and before each capability and each app key open; there is no detached
+ * worker (a plugin must not defer work past unload). One blocking call (the offline_hive_mutex
+ * wait behind a sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor
+ * is one enumeration of at most 4,096 children, the capability-level key opens, or one key's
+ * value reads, so a dispatch can overrun it.
  *
  * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
  * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
@@ -144,10 +144,17 @@ SubkeyEnum enumerate_subkey_names(HKEY parent) {
     wchar_t buf[kNameBufLen]{};
     DWORD idx = 0, len = kNameBufLen;
     LONG rc = ERROR_SUCCESS;
+    std::size_t embedded_nul = 0;
     while (idx < kMaxEnumeratedSubkeys &&
            (rc = RegEnumKeyExW(parent, idx++, buf, &len, nullptr, nullptr, nullptr, nullptr)) ==
                ERROR_SUCCESS) {
-        out.names.emplace_back(buf, len);
+        // A counted name with an embedded NUL cannot be reopened by c_str() (the open and
+        // from_wide stop at the NUL, so it would read a prefix sibling or, with a leading NUL,
+        // the parent itself): skip it here, the one site both walks route through, and count it.
+        if (std::wstring_view(buf, len).find(L'\0') != std::wstring_view::npos)
+            ++embedded_nul;
+        else
+            out.names.emplace_back(buf, len);
         len = kNameBufLen;
     }
     LONG probe_rc = ERROR_NO_MORE_ITEMS;
@@ -156,6 +163,7 @@ SubkeyEnum enumerate_subkey_names(HKEY parent) {
         probe_rc = RegEnumKeyExW(parent, idx, buf, &probe_len, nullptr, nullptr, nullptr, nullptr);
     }
     out.verdict = win::classify_subkey_enum(rc, probe_rc);
+    out.verdict.embedded_nul_names = embedded_nul;
     return out;
 }
 
@@ -434,6 +442,9 @@ struct HiveFileGuard {
         f.is_reparse = (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         f.is_directory = (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         f.is_disk_file = GetFileType(leaf.h) == FILE_TYPE_DISK;
+        f.not_resident = (tag.FileAttributes & (FILE_ATTRIBUTE_OFFLINE |
+                                                FILE_ATTRIBUTE_RECALL_ON_OPEN |
+                                                FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)) != 0;
 
         BY_HANDLE_FILE_INFORMATION info{};
         if (!GetFileInformationByHandle(leaf.h, &info)) return stat_failed(GetLastError());

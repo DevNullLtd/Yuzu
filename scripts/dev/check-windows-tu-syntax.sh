@@ -71,6 +71,8 @@ tus=(
     agents/plugins/platform_security/src/platform_security_win.cpp
     agents/plugins/system_hardening/src/system_hardening_plugin.cpp
     agents/plugins/system_hardening/src/system_hardening_win.cpp
+    agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
+    agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 

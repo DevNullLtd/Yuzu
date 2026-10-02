@@ -385,6 +385,18 @@ TEST_CASE("win::merge_with_hklm: most restrictive wins -- a successfully read HK
               std::pair{PermissionState::prompt_undetermined, std::string{"Prompt"}});
         CHECK(merged_state(allow, allow) == std::pair{PermissionState::allowed, std::string{"Allow"}});
     }
+    SECTION("an overriding HKLM Deny keeps the profile row's last-used times") {
+        auto user = allow;
+        user.last_used_start.value = "133000000000000000";
+        user.last_used_stop.value = "133000000010000000";
+        const std::vector<RawGrant> profile{user};
+        const std::vector<RawGrant> hklm{deny};
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == 1);
+        CHECK(m[0].state == PermissionState::denied);
+        CHECK(m[0].last_used_start.value == "133000000000000000");
+        CHECK(m[0].last_used_stop.value == "133000000010000000");
+    }
     SECTION("an unmodelled HKLM literal overrides nothing") {
         CHECK(merged_state(allow, prompt) == std::pair{PermissionState::allowed, std::string{"Allow"}});
     }
@@ -705,6 +717,17 @@ TEST_CASE("win::classify_subkey_enum + enum_failure: exactly the cap is complete
     REQUIRE(probe);
     CHECK(probe->cause == "packaged_enum_access_denied");
     CHECK(probe->denied);
+    // A complete walk that skipped an embedded-NUL name reports it once, not denied; a truncated
+    // walk keeps its own (incomplete-source) token.
+    auto nul = win::classify_subkey_enum(win::kErrorNoMoreItems, win::kErrorSuccess);
+    nul.embedded_nul_names = 2;
+    const auto nul_f = win::enum_failure("nonpackaged", nul);
+    REQUIRE(nul_f);
+    CHECK(nul_f->cause == "nonpackaged:name_embedded_nul");
+    CHECK_FALSE(nul_f->denied);
+    auto nul_over = over;
+    nul_over.embedded_nul_names = 1;
+    CHECK(win::enum_failure("nonpackaged", nul_over)->cause == "nonpackaged_enum_truncated");
 }
 
 TEST_CASE("win::is_valid_sid_string: only an S-1-<digits>(-<digits>)* SID may be appended to "
@@ -820,6 +843,11 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         auto pipe = stock();
         pipe.is_disk_file = false;
         CHECK(token(pipe) == "hive_not_regular");
+        auto cloud = stock();
+        cloud.not_resident = true; // an offline / recall-on-open placeholder is never loaded
+        CHECK(token(cloud) == "hive_not_resident");
+        cloud.is_directory = true; // not_regular is decided first
+        CHECK(token(cloud) == "hive_not_regular");
         auto own = stock();
         own.owner_sid = "S-1-5-21-1-2-3-1002";
         CHECK(token(own) == "hive_owner_unexpected");

@@ -7,9 +7,9 @@
  * agents/shared/win_profiles.hpp's with_user_hive() enables
  * SeBackupPrivilege/SeRestorePrivilege on the PROCESS token before an offline
  * RegLoadKeyW mount and restores the token's prior attributes on the way out.
- * Five plugins load this ladder into the SAME agent process -- autoruns,
- * registry, installed_apps, license_scan, tar -- and tar's collectors run on
- * a background thread, so two overlapping offline-mount attempts race the
+ * Six plugins load this ladder into the SAME agent process -- autoruns,
+ * registry, installed_apps, license_scan, tar, privacy_permissions -- and tar's collectors
+ * run on a background thread, so two overlapping offline-mount attempts race the
  * shared process token: A enables it, B enables it (recording A's now-enabled
  * state as "previous"), A's scope exits and restores to B's recorded
  * "previous" -- silently disabling it out from under B, mid-mount.
@@ -18,8 +18,8 @@
  * win_profiles.hpp does NOT solve this: each plugin .dll/.so file is a
  * SEPARATE dynamically loaded module, and a function-local static in a
  * header is instantiated once PER TRANSLATION UNIT THAT LINKS IT IN -- in
- * practice, once per plugin binary. Five plugins therefore got five
- * independent mutexes, not one process-wide lock (confirmed: each plugin DLL
+ * practice, once per plugin binary. Each plugin therefore got its own
+ * independent mutex, not one process-wide lock (confirmed: each plugin DLL
  * exports exactly its one required `yuzu_plugin_descriptor` symbol and
  * nothing else -- the mutex was never shared).
  *
@@ -35,12 +35,12 @@
  * path (the common case) never takes this lock.
  *
  * INSTRUMENTATION: this one process-wide lock serialises the offline arm
- * for FIVE plugins via with_user_hive() -- autoruns, installed_apps,
- * license_scan, registry, tar -- plus a SIXTH, execution_artifacts's
- * AmCache leg (execution_artifacts_win.cpp), which calls the lock directly
- * as `ScopedOfflineHiveLock("execution_artifacts")` rather than through
- * with_user_hive() -- so a long hold by any one of the six blocks the
- * other five with no prior visibility into it. `ScopedOfflineHiveLock`
+ * for SIX plugins via with_user_hive() -- autoruns, installed_apps,
+ * license_scan, registry, tar, privacy_permissions -- plus a SEVENTH,
+ * execution_artifacts's AmCache leg (execution_artifacts_win.cpp), which
+ * calls the lock directly as `ScopedOfflineHiveLock("execution_artifacts")`
+ * rather than through with_user_hive() -- so a long hold by any one of the
+ * seven blocks the other six with no prior visibility into it. `ScopedOfflineHiveLock`
  * wraps the acquire/release with a wait-time and hold-time log (spdlog,
  * this codebase's existing agent-side logging mechanism) so an unusually
  * long wait or hold is visible without
@@ -49,7 +49,7 @@
  * another caller's wait. Prefer it over a bare
  * `std::lock_guard<std::mutex>(offline_hive_mutex())` for any new caller;
  * today with_user_hive() (agents/shared/win_profiles.hpp) is the only call
- * site, serving the five plugins above.
+ * site, serving the six plugins above.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT

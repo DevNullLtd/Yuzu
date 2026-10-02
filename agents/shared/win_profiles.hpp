@@ -475,7 +475,7 @@ struct OfflineHiveFileCheck {
 /// agents/core/include/yuzu/agent/offline_hive_mutex.hpp, NOT a header-local
 /// static (code-review CFX-1). Each plugin is a SEPARATE .dll/.so; a
 /// function-local static `inline` mutex defined here would be instantiated
-/// once per plugin binary -- five independent mutexes, not one process-wide
+/// once per plugin binary -- one independent mutex per plugin, not one process-wide
 /// lock, confirmed by inspecting each built plugin's export table (each
 /// exports only its required `yuzu_plugin_descriptor` symbol). Defining it in
 /// agents/core -- the one shared library every plugin links against -- and

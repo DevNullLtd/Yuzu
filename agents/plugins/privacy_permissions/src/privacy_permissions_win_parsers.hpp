@@ -125,10 +125,11 @@ inline constexpr std::size_t kMaxProfileGrants = 8192;
 inline constexpr std::size_t kMaxProfileBytes = 2u * 1024u * 1024u;
 
 /// The run's cooperative wall-clock bound, checked before each profile, first thing in the
-/// hive-file guard's before_load, and before each capability and each app key open. A single blocking call (the
-/// offline-hive mutex wait behind a sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is
-/// not interrupted, nor is one enumeration of at most 4,096 children, a capability-level key open,
-/// or one key's value reads, so a dispatch can overrun it: a cooperative deadline, never a hard cap.
+/// hive-file guard's before_load, and before each capability and each app key open. A single
+/// blocking call (the offline-hive mutex wait behind a sibling plugin's offline arm,
+/// RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor is one enumeration of at most 4,096
+/// children, a capability-level key open, or one key's value reads, so a dispatch can overrun it:
+/// a cooperative deadline, never a hard cap.
 inline constexpr std::chrono::milliseconds kRunBudget{15'000};
 
 /// The per-source retention budget. charge() is called BEFORE a grant is retained; once the
@@ -180,6 +181,9 @@ enum class EnumOutcome { complete, truncated, failed };
 struct EnumVerdict {
     EnumOutcome outcome;
     long rc = kErrorSuccess; // the failing code when `failed`
+    /// Child names skipped because they carry an embedded NUL (a counted registry name that no
+    /// c_str() open can address); reported by enum_failure, never read as a prefix sibling.
+    std::size_t embedded_nul_names = 0;
 };
 
 /// How a capped RegEnumKeyExW walk ended. `last_rc` is the code that ended the loop: anything but
@@ -204,11 +208,15 @@ struct EnumFailure {
 };
 
 /// The failure an enumeration contributes, or nullopt for a complete one -- a complete walk,
-/// including one of exactly the cap, never produces a failure token.
+/// including one of exactly the cap, never produces a failure token, unless it skipped an
+/// embedded-NUL name (`<kind>:name_embedded_nul`, one row per walk; a truncated or failed walk
+/// already reports the source as incomplete).
 [[nodiscard]] inline std::optional<EnumFailure> enum_failure(std::string_view kind,
                                                              const EnumVerdict& v) {
     switch (v.outcome) {
     case EnumOutcome::complete:
+        if (v.embedded_nul_names > 0)
+            return EnumFailure{std::string{kind} + ":name_embedded_nul", false};
         return std::nullopt;
     case EnumOutcome::truncated:
         return EnumFailure{std::string{kind} + "_enum_truncated", false};
@@ -395,10 +403,16 @@ struct RawGrant {
     for (const auto& h : hklm) {
         if (!hklm_overrides_profile(h)) continue;
         const auto it = merged.find({h.app_id, h.category});
-        if (it != merged.end() && grant_failed(it->second))
+        if (it != merged.end() && grant_failed(it->second)) {
             extra.push_back(h);
-        else
-            merged[{h.app_id, h.category}] = h;
+            continue;
+        }
+        RawGrant r = h;
+        if (it != merged.end()) { // the profile's last-used times are facts HKLM does not carry
+            r.last_used_start = it->second.last_used_start;
+            r.last_used_stop = it->second.last_used_stop;
+        }
+        merged[{h.app_id, h.category}] = std::move(r);
     }
     std::vector<RawGrant> out;
     out.reserve(merged.size() + extra.size());
@@ -433,6 +447,10 @@ struct HiveFileFacts {
     bool is_reparse = false;
     bool is_directory = false;
     bool is_disk_file = true;
+    /// FILE_ATTRIBUTE_OFFLINE / RECALL_ON_OPEN / RECALL_ON_DATA_ACCESS: a cloud or tiered
+    /// placeholder, which RegLoadKeyW would recall while the process-wide hive lock is held.
+    /// Never FILE_ATTRIBUTE_SPARSE_FILE (a resident file can be sparse).
+    bool not_resident = false;
     std::string owner_sid;
     std::string profile_sid;
     bool final_path_matches = true;
@@ -446,6 +464,7 @@ inline constexpr std::string_view kHivePathTooDeep = "hive_path_too_deep";
 inline constexpr std::string_view kHivePathReparseAncestor = "hive_path_reparse_ancestor";
 inline constexpr std::string_view kHiveReparsePoint = "hive_reparse_point";
 inline constexpr std::string_view kHiveNotRegular = "hive_not_regular";
+inline constexpr std::string_view kHiveNotResident = "hive_not_resident";
 inline constexpr std::string_view kHiveOwnerUnexpected = "hive_owner_unexpected";
 inline constexpr std::string_view kHivePathRedirected = "hive_path_redirected";
 inline constexpr std::string_view kHiveOversized = "hive_oversized";
@@ -469,6 +488,7 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
     if (f.ancestor_reparse) return std::string{kHivePathReparseAncestor};
     if (f.is_reparse) return std::string{kHiveReparsePoint};
     if (f.is_directory || !f.is_disk_file) return std::string{kHiveNotRegular};
+    if (f.not_resident) return std::string{kHiveNotResident};
     if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
     if (!f.final_path_matches) return std::string{kHivePathRedirected};
     if (f.size > kMaxHiveBytes) return std::string{kHiveOversized};
