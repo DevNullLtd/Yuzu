@@ -1419,22 +1419,6 @@ jobs:
           artifact-name: yuzu-${{ matrix.image }}-image.spdx.json
           upload-artifact: false
 
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
-        # upload must fail this job rather than leave a green leg with an
-        # earlier attempt's SBOM (or none) for the release to sign.
-        with:
-          name: yuzu-${{ matrix.image }}-image-sbom
-          path: |
-            yuzu-${{ matrix.image }}-image.cdx.json
-            yuzu-${{ matrix.image }}-image.spdx.json
-          retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With the upload no longer continue-on-error, a
-          # re-run either uploads this attempt's SBOM or fails the job (#5242).
-          overwrite: true
-
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1463,6 +1447,26 @@ jobs:
           # release page.
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-${{ matrix.image }}-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-image.cdx.json
+            yuzu-${{ matrix.image }}-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
 
       - name: Image summary
         env:
@@ -1590,22 +1594,6 @@ jobs:
           artifact-name: yuzu-postgres-image.spdx.json
           upload-artifact: false
 
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
-        # upload must fail this job rather than leave a green leg with an
-        # earlier attempt's SBOM (or none) for the release to sign.
-        with:
-          name: yuzu-postgres-image-sbom
-          path: |
-            yuzu-postgres-image.cdx.json
-            yuzu-postgres-image.spdx.json
-          retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With the upload no longer continue-on-error, a
-          # re-run either uploads this attempt's SBOM or fails the job (#5242).
-          overwrite: true
-
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1629,6 +1617,26 @@ jobs:
           # error in v3 (see docker-publish for the #495 history).
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-postgres-image-sbom
+          path: |
+            yuzu-postgres-image.cdx.json
+            yuzu-postgres-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
 
       - name: Image summary
         env:
@@ -1692,7 +1700,8 @@ jobs:
       group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
     # The server/agent chisel images compile vcpkg (gRPC/abseil/protobuf/
-    # openssl) from source on a cold cache. The build is amd64-only now (the
+    # openssl) from source on a cold cache (the same compile peaked at 26 min
+    # in docker-publish, run 36607188023; warm chisel legs took 1-15 min). The build is amd64-only now (the
     # 360-min budget was for the dropped QEMU arm64 leg), and since #5242 the
     # release waits on this job, so the bound is tighter: 120 min. Re-adding
     # arm64 is tracked as the "Open decision — arm64 build strategy" note in
@@ -1868,22 +1877,6 @@ jobs:
           artifact-name: yuzu-${{ matrix.image }}-chisel-image.spdx.json
           upload-artifact: false
 
-      - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
-        # upload must fail this job rather than leave a green leg with an
-        # earlier attempt's SBOM (or none) for the release to sign.
-        with:
-          name: yuzu-${{ matrix.image }}-chisel-image-sbom
-          path: |
-            yuzu-${{ matrix.image }}-chisel-image.cdx.json
-            yuzu-${{ matrix.image }}-chisel-image.spdx.json
-          retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With the upload no longer continue-on-error, a
-          # re-run either uploads this attempt's SBOM or fails the job (#5242).
-          overwrite: true
-
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -1907,6 +1900,26 @@ jobs:
           # error in v3 (see docker-publish for the #495 history).
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Upload image SBOM artifacts
+        # After attest + sign (#5242): if this upload fails, the pushed tag is
+        # already signed and attested, rather than left unsigned until a re-run.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
+        with:
+          name: yuzu-${{ matrix.image }}-chisel-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-chisel-image.cdx.json
+            yuzu-${{ matrix.image }}-chisel-image.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM. With no continue-on-error and
+          # if-no-files-found: error, a re-run either uploads this attempt's
+          # SBOM or fails the job (#5242).
+          overwrite: true
 
       - name: Image summary
         env:
