@@ -583,7 +583,8 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
-  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+  cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
+  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the

@@ -437,7 +437,7 @@ Retiring or gating these lines once the benchmark concludes is recorded in `docs
 New, non-breaking, purely additive. No operator action required.
 
 Before this change, a gateway that lost and regained its connection to the
-server (a replica failover or an ordinary network blip; a server-only restart did not trigger a replay in the observed #1197 runs, see the known limitation under Server-Side Setup in gateway.md) would
+server (a replica failover or an ordinary network blip) would
 replay its held agent registrations — and on EVERY such replay, the server
 wiped that agent's placement (`gateway_node`/capabilities) before deciding
 whether to reuse or refuse the session, silently making the agent
@@ -445,7 +445,7 @@ unreachable via that gateway until it happened to reconnect on its own. This
 was reachable on a single, otherwise-healthy replica; no core restart was
 required.
 
-This section applies to circuit-breaker recovery replays, not to a server-only restart while a gateway stays connected; for that case see the known limitation under [Server-Side Setup](gateway.md#server-side-setup).
+This section applies to circuit-recovery replays, not to a server-only restart while a gateway stays connected; for that case see the known limitation under [Server-Side Setup](gateway.md#server-side-setup).
 
 **What changes:** the server now decides adopt-vs-refuse for a replayed
 session before installing anything, the gateway re-announces the agent's own
