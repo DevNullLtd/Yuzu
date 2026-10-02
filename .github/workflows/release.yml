@@ -1677,8 +1677,9 @@ jobs:
     # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold cache
     # (vcpkg from source) takes longer, bounded by the timeout below -- and a
     # failed or cancelled chisel leg now skips the release (fail-closed).
-    # Recovery: "Re-run failed jobs" on the release run, within artifact
-    # retention (see the release skill).
+    # Recovery: a fresh run of the tag (gh workflow run release.yml --ref
+    # <tag>), never "Re-run failed jobs" on an older run; see the release
+    # skill.
     needs: [build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
@@ -1700,10 +1701,11 @@ jobs:
       group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
     # The server/agent chisel images compile vcpkg (gRPC/abseil/protobuf/
-    # openssl) from source on a cold cache (the same compile peaked at 26 min
-    # in docker-publish, run 36607188023; warm chisel legs took 1-15 min). The build is amd64-only now (the
-    # 360-min budget was for the dropped QEMU arm64 leg), and since #5242 the
-    # release waits on this job, so the bound is tighter: 120 min. Re-adding
+    # openssl) from source on a cold cache: the same compile peaked at 26 min
+    # in docker-publish (run 36607188023), and the chisel legs took 1-16 min
+    # on rc1..rc6. The build is amd64-only now (the old 360-min budget was for
+    # the dropped QEMU arm64 leg), and since #5242 the release waits on this
+    # job, so the bound is tighter: 120 min. Re-adding
     # arm64 is tracked as the "Open decision — arm64 build strategy" note in
     # docs/demo-environment.md ("Publishing").
     timeout-minutes: 120

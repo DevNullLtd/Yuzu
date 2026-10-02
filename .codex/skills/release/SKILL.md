@@ -133,22 +133,19 @@ build-linux ────────────────────┴─�
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
 - **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
 
-Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any image leg fails or is cancelled (`docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed). Recovery is "Re-run failed jobs" on that run, while its artifacts are retained (3 days), **only when both of these hold**:
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any image leg fails or is cancelled (`docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed) and nothing is published.
+
+**Recovery: start a fresh run of the tag. Never use "Re-run failed jobs" on a release run.** A fresh run is always the newest run for the tag, so nothing can supersede it, and its own signed `SHA256SUMS` describes the images it pushes:
 
 ```bash
 TAG=v0.14.0
-RUN=<id of the run you want to re-run>
-# 1. It is the newest Release run for the tag. A workflow_dispatch --ref, or a
-#    deleted-and-re-pushed tag, starts a newer run (even at the same commit)
-#    that supersedes it.
-test "$(gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId')" = "$RUN"
-# 2. No release exists yet for the tag.
-! gh release view "$TAG" --repo DevNullLtd/Yuzu >/dev/null 2>&1
+gh release view "$TAG" --repo DevNullLtd/Yuzu        # read the output: it must say "release not found"
+gh workflow run release.yml --repo DevNullLtd/Yuzu --ref "$TAG"
 ```
 
-If both hold, re-run the run's failed jobs. If either fails, do not re-run it: a newer run is (or has made) the release, and re-running the older one would push and sign new image digests over the tag after the signed `SHA256SUMS` was published. After artifact retention runs out, recovery is a full re-run, which pushes every image again with new digests.
+Start it only when the first command says `release not found` (any other error: stop and investigate) and no other release run for the tag is still in progress (wait for it to finish). If a release already exists, a run has succeeded: do not start another, because it would push new image digests over the published tag. A fresh run rebuilds everything, about 40+ minutes.
 
-The chisel timeout (120 min) is fixed in the workflow at the tagged commit, so a re-run cannot raise it; changing it means committing the bump and re-tagging, which starts a new run that supersedes the old one. A re-run may land on a runner slot with a warmer cache, but the verification build does not export its cache, so a cold-cache timeout can recur.
+The chisel timeout (120 min) is set in the workflow at the tagged commit, so a fresh run of the same tag cannot change it. Raising it means committing the bump and re-tagging.
 
 Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
 
