@@ -8,7 +8,7 @@ The gateway (`gateway/`) is a standalone rebar3 project. It compiles independent
 ```bash
 cd gateway
 rebar3 compile                               # compile
-rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (309 tests as of HA WS-4 #4555)
+rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (365 tests as of the heartbeat connection-binding change)
 rebar3 dialyzer                              # type analysis — must be warning-free
 rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl in sync with priv/proto
