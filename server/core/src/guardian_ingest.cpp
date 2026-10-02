@@ -131,9 +131,11 @@ constexpr std::size_t kTServerLogQueueCapacity = 1024;
 // NOT reproduce that class's rate-limited stderr fallback (#5023): this logger backs one
 // diagnostic line, not the process's default logger, so there is no pre-existing
 // operator-visible stderr signal to preserve here, and adding one would mean a second detached
-// emit-thread/Permit apparatus for a single benchmark-diagnostic line. A future consumer that
-// wants this surfaced only needs to read the count below (no production reader today, matching
-// LogHandoff's own log_errors_total()/stderr_emits_dropped()).
+// emit-thread/Permit apparatus for a single benchmark-diagnostic line. No accessor exists today
+// (quality-engineer finding, governance Gate 3): the struct is reachable only from inside the
+// `set_error_handler` lambda's capture, so "a future consumer reads the count" is not yet true as
+// written -- a future consumer needs an accessor added first, matching LogHandoff's own
+// log_errors_total()/stderr_emits_dropped() precedent for the shape such an accessor would take.
 struct TServerErrorState {
     std::mutex mu;
     std::uint64_t count{0};
