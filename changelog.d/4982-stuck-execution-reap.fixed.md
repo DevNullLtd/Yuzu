@@ -10,10 +10,11 @@
   `running`/`agents_targeted=0` for the full duration of a `containment_unreadable`/
   `route_unreadable` degrade, retried indefinitely — that population is not a bookkeeping
   failure and must never be mass-cancelled), and any execution with at least one real
-  `agent_exec_status` response already recorded (a dispatch that genuinely reached one or
-  more agents is never force-cancelled on the strength of its own bookkeeping write having
-  failed — that row is left `running` instead, since there is no repair path today that
-  re-derives `agents_targeted` from the agents' own reported responses).
+  `agent_exec_status` response already visible to the sweep's own check (a dispatch that
+  genuinely reached one or more agents is never force-cancelled on the strength of its own
+  bookkeeping write having failed, once that response row is visible — that row is left
+  `running` instead, since there is no repair path today that re-derives `agents_targeted`
+  from the agents' own reported responses).
 
   The sweep also adopts a would-wipe guard (unlike its two DELETE-based siblings in this file,
   which deliberately don't): if the candidates are an implausibly large fraction of all
@@ -21,16 +22,20 @@
   mass-cancelling live work on the strength of what is more likely a systemic bug. A corrupt or
   unparseable persisted clock anchor self-heals rather than wedging the sweep permanently. The
   candidate selection and the cancel are one atomic, re-checked statement inside the same
-  advisory-lock-held transaction, so a row that stops matching between selection and mutation
-  (a genuine dispatch landing, its outbox entry going pending, a real agent response arriving)
-  is correctly excluded at commit time, never force-cancelled on stale information.
+  advisory-lock-held transaction, so a row that stops matching on its own columns, or picks up
+  a still-pending outbox entry, between selection and mutation is correctly excluded at commit
+  time. A row that instead picks up its first real agent response in that same narrow window is
+  usually, but not provably always, excluded the same way — see `execution_tracker.cpp`'s own
+  comment on the atomic cancel UPDATE.
 
   New metric `yuzu_exec_tracker_stuck_reap_total{outcome}` (`cancelled`\|`not_cancelled`\|
   `would_wipe`\|`clock_anomaly`\|`degraded`\|`capped`\|`skipped`) and a new
   `execution_tracker.reap_stuck_running_executions` row in the WS-10 background-job
-  classification table (`ReplicaSafe`). Every cancellation this sweep performs also writes an
-  `execution.cancel` audit row (`principal="system"`). Full seven-part clock-guarded-retention
-  record: `docs/clock-guarded-retention.md`'s own entry for this sweep.
+  classification table (`ReplicaSafe`). The sweep records an `execution.cancel` audit row
+  (`principal="system"`) for each cancellation on a best-effort basis; if the audit store is
+  unavailable, the rest of that pass is unaudited (see `yuzu_server_audit_emit_failed_total`).
+  Full seven-part clock-guarded-retention record: `docs/clock-guarded-retention.md`'s own entry
+  for this sweep.
 
   A related fix closes a race in the delivery path this sweep's exclusion depends on:
   `command_outbox_delivery.cpp`'s delivery loop now commits the outbox `pending → sent`

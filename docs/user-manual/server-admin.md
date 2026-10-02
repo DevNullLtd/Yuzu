@@ -234,11 +234,20 @@ response already recorded — only a genuinely-orphaned row (never reached, or g
 by a dispatch that failed its own cleanup) is cancelled.
 
 **What an operator sees on this upgrade.** Any execution rows ALREADY stranded at `running`
-before this build started will auto-cancel within roughly 15–30 minutes of the first post-upgrade
-tick that reaches them, each writing a new `execution.cancel` audit row with `principal="system"`
-— the first system-sourced row that action has ever carried; a SIEM rule or dashboard filter keyed
-only on human/session principals for `execution.cancel` will not see these. This is a one-time
-settling period for pre-existing stuck rows, not an ongoing behaviour change for new dispatches.
+before this build started will usually auto-cancel within roughly 15–30 minutes of the first
+post-upgrade tick that reaches them, each writing a new `execution.cancel` audit row with
+`principal="system"` on a best-effort basis (if the audit store is unavailable, that pass's
+cancellations go unaudited — see `yuzu_server_audit_emit_failed_total`) — the first system-sourced
+row that action has ever carried; a SIEM rule or dashboard filter keyed only on human/session
+principals for `execution.cancel` will not see these. The 15–30 minute figure assumes a normal-sized
+backlog: if the pre-existing stranded population is unusually large, the sweep caps itself at 500
+cancellations per pass (`capped`, draining the rest over following passes) or, if stranded rows
+exceed half of all currently-running executions, declines to act at all (`would_wipe`) on the
+assumption that something more systemic is wrong rather than a one-time backlog — in that case the
+rows stay `running` and `yuzu_exec_tracker_stuck_reap_total{outcome="would_wipe"}` holds nonzero
+until an operator investigates and, if the backlog really is benign, cancels it by hand to bring the
+ratio back under the sweep's own threshold. This is otherwise a one-time settling period for
+pre-existing stuck rows, not an ongoing behaviour change for new dispatches.
 See `docs/user-manual/metrics.md` "Execution bookkeeping + stuck-execution reap metrics" for the
 new `yuzu_exec_tracker_stuck_reap_total{outcome}` counter and `docs/clock-guarded-retention.md`
 for the full design.

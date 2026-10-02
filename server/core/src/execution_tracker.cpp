@@ -1379,9 +1379,14 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
     return create_execution(rerun);
 }
 
-bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& /*user*/) {
+bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& user) {
+    return mark_cancelled_checked(id, user) == MarkCancelledOutcome::kCancelled;
+}
+
+ExecutionTracker::MarkCancelledOutcome
+ExecutionTracker::mark_cancelled_checked(const std::string& id, const std::string& /*user*/) {
     if (!open_)
-        return false;
+        return MarkCancelledOutcome::kFailed;
 
     // Snapshot-and-release (perf-B1 / UP-A9).
     bool should_publish = false;
@@ -1450,15 +1455,15 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
                       "id={} — the execution was NOT actually cancelled (pool exhaustion or a "
                       "failed statement rolled the whole transaction back)",
                       id);
-        return false;
+        return MarkCancelledOutcome::kFailed;
     }
     if (!matched)
-        return false; // unknown/stale id — no-op, reported as not-cancelled (no phantom event)
+        return MarkCancelledOutcome::kNoOp; // unknown id, or already terminal — nothing to do
 
     if (should_publish) {
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
-    return true;
+    return MarkCancelledOutcome::kCancelled;
 }
 
 // ── per-device concurrency enforcement (ADR-1007) ──────────────────────
@@ -3221,11 +3226,22 @@ ExecutionTracker::reap_stuck_running_executions() {
         // anything else changed) is silently excluded, which is CORRECT: it
         // was never eligible at the moment of the actual mutation, only at
         // the moment of an earlier, now-stale SELECT. Under Postgres READ
-        // COMMITTED, a concurrent writer that commits a change to one of
-        // these rows before this UPDATE reaches it is seen fresh by this
-        // statement; one that is still in-flight blocks this UPDATE on the
-        // row lock and is re-checked via EvalPlanQual the instant it
-        // commits — so nothing can slip through the gap either way. This
+        // COMMITTED, a concurrent writer that commits a CHANGE TO THIS ROW
+        // ITSELF before this UPDATE reaches it is seen fresh via EvalPlanQual
+        // the instant the row lock is released — the TARGET row's own
+        // columns (status, agents_targeted) cannot slip through. The two
+        // NOT EXISTS subqueries (outbox, agent_exec_status) are NOT
+        // re-evaluated the same way: they run against THIS statement's own
+        // snapshot, taken when the UPDATE started. A writer that inserts the
+        // first agent_exec_status row for this execution_id in a transaction
+        // that ALSO takes this row's lock (so our UPDATE blocks on it, not on
+        // the subquery) and commits before we reach it is NOT guaranteed
+        // visible to the subquery once we proceed — reproduced on PostgreSQL
+        // 18 across independent runs (PR #5226 review round 2, Doomgoose).
+        // The window is narrow (it needs that specific lock interleaving, not
+        // an ordinary commit-before-we-start race) and nothing downstream
+        // trusts it being closed for correctness beyond "don't force-cancel a
+        // genuinely-dispatched execution" — but it is not fully closed. This
         // also makes the pass genuinely single-writer: a second replica
         // cannot begin its own pass (the advisory lock above) until this
         // ENTIRE claim+mutate sequence commits, so the row cap is an honest

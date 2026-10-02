@@ -3184,8 +3184,14 @@ public:
         // command_outbox_delivery.cpp's set_agents_targeted write moved into
         // the atomic CommandDeliveryFinalizationOwner::mark_sent_with_target,
         // whose own failure counts via the pre-existing
-        // yuzu_server_command_outbox_deliver_degrade_total instead. 9 of the
-        // 10 pre-seeded series are reachable.
+        // yuzu_server_command_outbox_deliver_degrade_total instead.
+        // {op=set_agents_targeted,surface=schedule} is dead for the same
+        // reason: schedule_runner.cpp never calls set_agents_targeted at all
+        // (grepped - it only ever calls mark_cancelled with surface=schedule;
+        // dispatch for a schedule-originated command sets agents_targeted,
+        // if at all, via the outbox delivery path above, which counts under
+        // surface=outbox). 8 of the 10 pre-seeded series are reachable
+        // (review round 2, Doomgoose PR #5226).
         metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
                           "failed (pool exhaustion or a failed statement) at a dispatch call "
@@ -3228,13 +3234,13 @@ public:
                           "capped|skipped). cancelled/not_cancelled increment by the per-row "
                           "count for an accepted pass; would_wipe/clock_anomaly/degraded "
                           "increment once per declined/failed pass; capped increments once per "
-                          "ACCEPTED pass whose true backlog exceeded the per-pass cap (governance "
-                          "Gate 3 fix, sre) - a sustained non-zero capped rate means the reaper is "
-                          "chronically behind even though it is successfully cancelling every "
-                          "pass, same meaning as the gateway-route-reap sibling's ok_capped; "
-                          "skipped (governance Gate 3 fix, sre) increments once when another "
-                          "replica already held the advisory lock this tick - routine on a "
-                          "multi-replica deployment, same meaning as that sibling's own skipped.",
+                          "ACCEPTED pass whose true backlog exceeded the per-pass cap - a "
+                          "sustained non-zero capped rate means the reaper is chronically behind "
+                          "even though it is successfully cancelling every pass, same meaning as "
+                          "the gateway-route-reap sibling's ok_capped; skipped increments once "
+                          "when another replica already held the advisory lock this tick - "
+                          "routine on a multi-replica deployment, same meaning as that sibling's "
+                          "own skipped.",
                           "counter");
         for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
                                      "degraded", "capped", "skipped"})

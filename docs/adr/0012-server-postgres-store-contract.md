@@ -233,13 +233,19 @@ instance is constructed to use it.
 This is a deliberate, narrow exception to section 3's default shape (an owner that takes its OWN
 lease and executes the cross-schema query itself), not a violation of it. The precondition that
 makes it correct: the caller needs the predicate evaluated as part of its OWN atomic check-and-act —
-here, the reaper's cancel-candidate re-check must run under the SAME transaction snapshot and the
-SAME advisory lock as the cancelling `UPDATE` it gates. Answering the predicate on a separately-leased
-owner connection first (the normal section-3 shape) would reopen exactly the TOCTOU the atomic
-re-check exists to close — a row could flip to outbox-pending between the owner's read and the
-reaper's own `UPDATE` committing. A shared text fragment the caller embeds in its own statement has
-no such window, because it is evaluated by the SAME statement, on the SAME connection, under the
-SAME snapshot as the write it gates.
+here, the reaper's cancel-candidate re-check must be evaluated AS PART OF the cancelling `UPDATE`
+itself — on the same connection, inside the same transaction, under the same advisory lock — not as
+a separate read whose answer could go stale before the write commits. (This is evaluation-order
+atomicity, not a shared MVCC snapshot: Postgres READ COMMITTED gives each statement its own
+snapshot, so the predicate's `NOT EXISTS` subqueries still see the data as of the UPDATE's own start,
+not a snapshot shared with any earlier read — the `EvalPlanQual` re-check that protects the UPDATE's
+locked TARGET row does not extend to those subqueries. See `execution_tracker.cpp`'s own comment on
+the atomic cancel UPDATE for the resulting narrow residual.) Answering the predicate on a
+separately-leased owner connection first (the normal section-3 shape) would reopen exactly the TOCTOU
+the atomic re-check exists to close — a row could flip to outbox-pending between the owner's read and
+the reaper's own `UPDATE` committing. A shared text fragment the caller embeds in its own statement
+closes that specific window, because it is evaluated by the SAME statement, on the SAME connection,
+under the SAME advisory lock as the write it gates.
 
 This shape is not new to the codebase: `LeaderElector::epoch_fence_sql()` (`leader_elector.hpp`) is
 the shipped precedent — also "a pure string builder (no connection)" (that header's own words) whose
@@ -255,8 +261,9 @@ runs inside that SAME transaction, under the SAME lock, directly selecting or co
 that same check-and-act, PROVIDED the predicate text is byte-identical to the one the final
 check-and-act re-evaluates atomically. `ExecutionTracker::reap_stuck_running_executions`'s
 candidate-count and candidate-select queries are this second case: preparatory reads under the same
-advisory lock and transaction snapshot as the atomic cancel `UPDATE` that re-checks the identical
-clause. It does NOT license a cross-schema `SELECT` embedded for convenience, run outside the
+advisory lock and transaction as the atomic cancel `UPDATE` that re-checks the identical clause (not
+a shared MVCC snapshot — see the note above on READ COMMITTED). It does NOT license a cross-schema
+`SELECT` embedded for convenience, run outside the
 check-and-act's own transaction/lock, or against a predicate the final mutation does not itself
 re-evaluate — nor a fragment a caller could just as well obtain by calling an owner method on its own
 lease. The default in section 3 is still owner-executed, and this exception is for the one case that

@@ -452,7 +452,27 @@ public:
     /// not report success (an audit "success" row or an HTTP 200) on a
     /// false return. `[[nodiscard]]` for the same reason as
     /// `set_agents_targeted` above.
+    ///
+    /// `false` conflates two different facts: a real pool/statement failure,
+    /// and the benign no-op of an unknown or already-terminal id (nothing to
+    /// cancel, nothing went wrong). The 19 pre-existing callers (REST/MCP/
+    /// workflow/schedule cancel routes) only ever need "did this succeed",
+    /// so this signature is UNCHANGED for them. A caller that needs to tell
+    /// the two apart (PR #5226 review, Doomgoose) — so it doesn't log an
+    /// error or increment a failure counter for a row that simply got there
+    /// first — calls `mark_cancelled_checked` instead.
     [[nodiscard]] bool mark_cancelled(const std::string& id, const std::string& user);
+
+    enum class MarkCancelledOutcome {
+        kCancelled, ///< a running row transitioned to cancelled.
+        kNoOp,      ///< unknown id, or already terminal — nothing to do, not a failure.
+        kFailed,    ///< pool exhaustion or a failed statement; NOT actually cancelled.
+    };
+    /// Same transaction/guard as `mark_cancelled`, but reports which of the
+    /// three outcomes actually happened instead of collapsing two of them to
+    /// `false`. `mark_cancelled` itself is a thin wrapper over this.
+    [[nodiscard]] MarkCancelledOutcome mark_cancelled_checked(const std::string& id,
+                                                              const std::string& user);
 
     // Statistics (capability 1.9)
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;

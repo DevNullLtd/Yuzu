@@ -480,6 +480,20 @@ from blocking to `pg_try_advisory_xact_lock` (all-but-holder skip, matching this
 `reap_event_outbox` sibling and `GatewayRouteStore`'s own idiom) so a losing replica's maintenance tick
 is never stalled waiting on it.
 
+**Clock-authority caveat (still open, PR #5226 review round 2, Doomgoose).** This sweep's cutoff is
+PG `now()` read in-SQL, but `dispatched_at` — the column the cutoff is compared against — is written
+from the caller's replica `system_clock` in the common case (`create_execution`'s `now` fallback,
+`execution_tracker.cpp`), not PG `now()`. This is the same clock-domain split the
+`concurrency_claims` reconciler's own caveat above describes, and it is NOT yet met here either —
+unlike that reconciler, though, this sweep stays classed **ReplicaSafe**, not `DisabledUntilFixed`,
+because its blast radius on a multi-replica deployment is independently bounded by the would-wipe
+ratio/floor and the per-pass row cap regardless of which replica's clock a given `dispatched_at` came
+from — a mis-cancelled row is still capped at 500 per pass and still excluded if it carries a real
+agent response. A replica meaningfully behind on `system_clock` can still see a fresh dispatch as
+already past the stuck-exec window sooner than a correctly-clocked replica would. Not fixed; stamping
+`dispatched_at` from PG `now()` at `INSERT` time (mirroring the `concurrency_claims` migration, WS-1
+class, #3715 shape, tracked #4093) is the closing move for both.
+
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a dispatch that is
 genuinely still stuck survives to the next pass regardless of whether this one's cutoff arithmetic
 used a fresh or a from-boot-skewed clock, so acting on the first pass against an unverified clock is

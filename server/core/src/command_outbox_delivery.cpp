@@ -179,11 +179,26 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                 // cases, and this audit row is the ONLY compliance evidence this
                 // occurrence ever gets; leaving it bare here would silently
                 // misrepresent a failed cancel as a clean one.
-                if (outcome == ExecCancelOutcome::kDeclinedHasResponse ||
-                    outcome == ExecCancelOutcome::kDeclinedDegraded)
+                //
+                // switch, no `default:` (cpp-safety fix-round SHOULD, PR #5226
+                // review round 2): -Werror=switch then makes a future 6th
+                // ExecCancelOutcome a BUILD FAILURE here, never a silent
+                // unannotated pass-through in the one audit row this
+                // occurrence ever gets.
+                switch (outcome) {
+                case ExecCancelOutcome::kDeclinedHasResponse:
+                case ExecCancelOutcome::kDeclinedDegraded:
                     detail += " exec_not_cancelled=prior_agent_response_or_degraded";
-                else if (outcome == ExecCancelOutcome::kCancelFailed)
+                    break;
+                case ExecCancelOutcome::kCancelFailed:
                     detail += " exec_not_cancelled=mark_cancelled_failed";
+                    break;
+                case ExecCancelOutcome::kAlreadyTerminal:
+                case ExecCancelOutcome::kCancelled:
+                    // The row reached its end state (by this call or some
+                    // other writer) — not a failure, so no annotation needed.
+                    break;
+                }
             }
             audit(c, "denied", detail);
         }
@@ -463,7 +478,25 @@ CommandOutboxDelivery::ExecCancelOutcome CommandOutboxDelivery::decline_or_cance
             occurrence_id, context, execution_id, statuses->size());
         return ExecCancelOutcome::kDeclinedHasResponse;
     }
-    if (!d_.execution_tracker->mark_cancelled(execution_id, principal)) {
+    const auto result = d_.execution_tracker->mark_cancelled_checked(execution_id, principal);
+    // Doomgoose PR #5226 review round 2 (cpp-safety fix-round SHOULD): switch,
+    // no `default:` — `-Werror=switch` (#3109 precedent, server_core's own
+    // meson.build) then makes a future 4th MarkCancelledOutcome a BUILD
+    // FAILURE here, never a silent fallthrough to kCancelled (which would
+    // misreport an unhandled outcome as a clean success).
+    switch (result) {
+    case ExecutionTracker::MarkCancelledOutcome::kNoOp:
+        // Distinct from a real failure — some other terminal writer (an
+        // operator cancel, the stuck-reap sweep, a different occurrence's
+        // own cancel of the same execution_id) got there first between our
+        // agent_exec_status check above and this call. The row is already
+        // in the end state we wanted; nothing failed, so this must not log
+        // as an error or count as a bookkeeping failure.
+        spdlog::info("command_outbox_delivery: execution_id={} occurrence='{}' ({}) was already "
+                     "terminal by the time of the cancel — nothing to do",
+                     execution_id, occurrence_id, context);
+        return ExecCancelOutcome::kAlreadyTerminal;
+    case ExecutionTracker::MarkCancelledOutcome::kFailed:
         spdlog::error("command_outbox_delivery: mark_cancelled failed for execution_id={} "
                       "occurrence='{}' ({})",
                       execution_id, occurrence_id, context);
@@ -473,8 +506,10 @@ CommandOutboxDelivery::ExecCancelOutcome CommandOutboxDelivery::decline_or_cance
                          {{"op", "mark_cancelled"}, {"surface", "outbox"}})
                 .increment();
         return ExecCancelOutcome::kCancelFailed;
+    case ExecutionTracker::MarkCancelledOutcome::kCancelled:
+        return ExecCancelOutcome::kCancelled;
     }
-    return ExecCancelOutcome::kCancelled;
+    return ExecCancelOutcome::kCancelled; // unreachable; silences -Wreturn-type on some compilers
 }
 
 void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& result,

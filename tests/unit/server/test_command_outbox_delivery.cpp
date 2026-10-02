@@ -494,6 +494,82 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
     CHECK(after->status == "running");
 }
 
+// PR #5226 review round 2 (Doomgoose, minor): decline_or_cancel_exec used to
+// call the plain bool-returning mark_cancelled and treat ANY `false` as a
+// failure — conflating a real pool/statement failure with the benign no-op
+// of a row that reached a terminal state via some OTHER writer before this
+// call ever ran (an operator cancel, the stuck-reap sweep, a different
+// occurrence's own cancel of the same execution_id). This drives the
+// authority_denied branch against an execution ALREADY cancelled by a
+// direct `mark_cancelled` call made before the tick, so decline_or_cancel_exec
+// sees a genuine no-op, not a failure — and asserts the bookkeeping-failure
+// counter does NOT fire for it (the pre-fix behaviour would have incremented
+// it and logged an error for a row that was never actually broken).
+TEST_CASE("CommandOutboxDelivery[pg]: an already-terminal execution reaching "
+          "the authority_denied cancel path does NOT count as a bookkeeping "
+          "failure (#5226 review round 2)",
+          "[command_outbox][pg][delivery][4982][5226]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{
+        {.conninfo = fx.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    // Some OTHER writer (an operator, the stuck-reap sweep) got here first.
+    REQUIRE(tracker.mark_cancelled(*exec_id, "someone-else"));
+    auto pre = tracker.get_execution(*exec_id);
+    REQUIRE(pre.has_value());
+    REQUIRE(pre->status == "cancelled");
+
+    auto req = fx.req("occ-already-terminal", "cmd-already-terminal");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    yuzu::MetricsRegistry metrics;
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.metrics = &metrics;
+    d.dispatch_fn = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&, const DispatchCaller&, const std::string&) {
+        return ConfinedDispatchOutcome{};
+    };
+    d.resolve_caller = [](const std::string& principal) {
+        DispatchCaller c;
+        c.principal = principal;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return false; // deny — the authority_denied branch, no dispatch attempted
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-already-terminal") == "failed");
+    // The core assertion: this must stay at 0, not 1 — nothing failed.
+    CHECK(metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+              .value() == 0.0);
+
+    // Still cancelled, by the earlier writer — untouched by this tick.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "cancelled");
+}
+
 // #4982 round 5 (both round-4 adversarial reviewers, SHOULD): no test in this
 // file previously drove `deliver()`'s `bookkeep_target && outcome.sent > 0`
 // branch end-to-end. Every `fx.make_delivery(...)` call above leaves

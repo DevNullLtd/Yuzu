@@ -151,8 +151,12 @@ private:
     /// direct call — a fifth inline copy of this same three-way check is the
     /// fork pattern this repo treats as a finding in its own right.
     enum class ExecCancelOutcome {
-        kCancelled,        ///< no prior response existed; mark_cancelled succeeded.
-        kCancelFailed,      ///< no prior response existed; mark_cancelled itself failed
+        kCancelled,        ///< no prior response existed; mark_cancelled_checked cancelled it.
+        kAlreadyTerminal,  ///< no prior response existed; the row was already terminal (or
+                           ///< unknown) by the time of the check — a benign race with some
+                           ///< other terminal writer, not a failure. Never counted/logged as one
+                           ///< (governance Gate 8 re-review, Doomgoose PR #5226 round 2).
+        kCancelFailed,      ///< no prior response existed; mark_cancelled_checked itself failed
                            ///< (already counted/logged by this method).
         kDeclinedHasResponse, ///< a real agent_exec_status response already exists —
                               ///< the execution row is left 'running', untouched.

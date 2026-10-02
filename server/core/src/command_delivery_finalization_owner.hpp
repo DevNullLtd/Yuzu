@@ -34,9 +34,15 @@
 ///    `reap_stuck_running_executions`'s own single transaction — most load-
 ///    bearingly inside the FINAL atomic `UPDATE ... WHERE ... RETURNING id`
 ///    that round 2/3 built specifically so the cancel's full candidate
-///    predicate (including this outbox check) is re-evaluated ATOMICALLY,
-///    under the SAME advisory lock and the SAME snapshot, as the state
-///    transition itself. Answering this predicate on a SEPARATELY-acquired
+///    predicate (including this outbox check) is evaluated AS PART OF the
+///    state transition itself — same connection, same transaction, same
+///    advisory lock, not a separately-leased read whose answer could go
+///    stale before the write commits. (Not a shared MVCC snapshot: each
+///    Postgres READ COMMITTED statement gets its own; see
+///    execution_tracker.cpp's own comment on the atomic cancel UPDATE for
+///    the narrow residual this leaves for a NOT EXISTS subquery, as opposed
+///    to the UPDATE's own locked target row.) Answering this predicate on a
+///    SEPARATELY-acquired
 ///    owner lease (the way the RBAC owner's own `regime_authority` answers
 ///    its point-in-time question on its OWN lock-free lease) would reopen
 ///    exactly the TOCTOU that atomic recheck exists to close — a row
