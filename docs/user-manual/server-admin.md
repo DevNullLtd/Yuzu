@@ -2269,49 +2269,63 @@ it before you enable signing, or `--update-trust-bundle` points at nothing:
 & {
     $ErrorActionPreference = 'Stop'
     $d = 'C:\ProgramData\Yuzu\agent-certs'
-    # True when $d is a plain directory, owned by Administrators or SYSTEM, protected from
+    # True when $p is a plain directory, owned by Administrators or SYSTEM, protected from
     # inheritance, and granting exactly those two full control. Accounts are compared by
     # SID, so this works on any language.
-    function Test-Locked {
-        if (((Get-Item -LiteralPath $d -Force).Attributes -band 1024) -ne 0) { return $false }
-        $s = (Get-Acl -LiteralPath $d).Sddl
+    function Test-Locked($p) {
+        if (((Get-Item -LiteralPath $p -Force).Attributes -band 1024) -ne 0) { return $false }
+        $s = (Get-Acl -LiteralPath $p).Sddl
         ($s -match '^O:(BA|SY)G:') -and ($s -match 'D:P[A-Z]*\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$') -and ($Matches[1] -ne $Matches[2])
     }
 
-    # 1. An existing directory must ALREADY be secured. This procedure does not take over
-    #    one someone else created: whatever is in it already decides which updates the
-    #    agent trusts. Check what it contains and remove it (a junction with
-    #    cmd /c rmdir "<path>", which removes the link, never its target; never
-    #    Remove-Item -Recurse, which in Windows PowerShell 5.1 deletes the target's
-    #    contents), then run this again.
-    $existed = Test-Path -LiteralPath $d
-    if ($existed -and -not (Test-Locked)) { throw "$d already exists and is not secured. Check what it contains, remove it, and run this again." }
-    if (-not $existed) { New-Item -ItemType Directory -Path $d | Out-Null }
+    if (Test-Path -LiteralPath $d) {
+        # 1. An existing directory must ALREADY be secured, and is not re-locked. This
+        #    procedure does not take over one someone else created: whatever is in it
+        #    already decides which updates the agent trusts. If it stops here, check what
+        #    the directory contains, move any update-trust-bundle.pem you placed there
+        #    yourself somewhere safe, delete the directory -- removing any junction or
+        #    link first with cmd /c rmdir (directory) or cmd /c del (file), which remove
+        #    the link, never its target; never Remove-Item -Recurse, which in Windows
+        #    PowerShell 5.1 deletes a junction target's contents -- run this again, then
+        #    copy the bundle back in.
+        if (-not (Test-Locked $d)) { throw "$d already exists and is not secured. See the step 1 comment." }
 
-    # 2. Lock the directory itself: take ownership (which also recovers a directory whose
-    #    permissions grant Administrators nothing), drop every explicit entry (/grant:r
-    #    alone replaces only the accounts it names), then break inheritance and grant
-    #    exactly Administrators and SYSTEM. Never /T: on a file the (OI)(CI) grant is
-    #    invalid, and icacls then leaves every existing file (an update-trust-bundle.pem
-    #    already in place) with an EMPTY permission list -- SYSTEM, and so the agent, can
-    #    no longer read it -- while still reporting success (#5196).
-    takeown /F $d /A | Out-Null
-    icacls $d /reset /L /C /Q | Out-Null
-    icacls $d /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
+        # 2. Its contents: plain files only, each already owned by Administrators or
+        #    SYSTEM and not a hard link -- nothing here takes ownership of a file, so it
+        #    only ever repairs files an administrator placed. Then reset them so they
+        #    inherit exactly Administrators and SYSTEM. This repairs the rc1..rc5
+        #    lock-out (#5196).
+        $c = @(Get-ChildItem -LiteralPath $d -Force)
+        $bad = @($c | Where-Object { ($_.Attributes -band 1040) -ne 0 })
+        if ($bad) { throw ("Only files may be in $d. Remove these first (a junction or directory link with cmd /c rmdir, a file link with cmd /c del): " + (($bad | ForEach-Object { $_.FullName }) -join ', ')) }
+        foreach ($i in $c) {
+            if ($i.LinkType -eq 'HardLink') { throw "$($i.FullName) is a hard link. Remove it and copy the file in again." }
+            if ((Get-Acl -LiteralPath $i.FullName).Sddl -notmatch '^O:(BA|SY)G:') { throw "$($i.FullName) is not owned by Administrators or SYSTEM, so it may not be a file you placed. Check it, delete it, and copy the file in again as an administrator." }
+        }
+        if ($c) { icacls "$d\*" /reset /L /C /Q | Out-Null }
+    } else {
+        # 3. A new directory is built and locked in your own temporary folder, which no
+        #    other account can reach, then moved into place, so it never exists unlocked.
+        #    The lock: make Administrators the owner, drop every explicit entry (/grant:r
+        #    alone replaces only the accounts it names), then break inheritance and grant
+        #    exactly Administrators and SYSTEM; /L on each, so icacls acts on the path
+        #    itself. Never /T: on a file the (OI)(CI) grant is invalid, and icacls then
+        #    leaves every existing file with an EMPTY permission list -- SYSTEM, and so
+        #    the agent, can no longer read it -- while still reporting success (#5196).
+        #    The move fails if something already holds the name; run this again then.
+        $stage = Join-Path $env:TEMP ('yuzu-agent-certs-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        icacls $stage /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
+        icacls $stage /reset /L /C /Q | Out-Null
+        icacls $stage /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
+        if (-not (Test-Locked $stage)) { throw "The new directory could not be secured." }
+        if (-not (Test-Path -LiteralPath (Split-Path $d))) { New-Item -ItemType Directory -Path (Split-Path $d) | Out-Null }
+        if (Test-Path -LiteralPath $d) { throw "$d appeared while it was being prepared. Check it and run this again." }
+        Move-Item -LiteralPath $stage -Destination $d
+        if (-not (Test-Locked $d) -or @(Get-ChildItem -LiteralPath $d -Force)) { throw "$d is not as prepared. Remove it and run this again." }
+    }
 
-    # 3. The lock must have taken effect before anything touches the contents, which may
-    #    hold only files -- and a directory created just now, nothing at all.
-    if (-not (Test-Locked)) { throw "$d could not be secured." }
-    $c = @(Get-ChildItem -LiteralPath $d -Force)
-    $bad = @($c | Where-Object { ($_.Attributes -band 1040) -ne 0 })
-    if ($bad) { throw ("Only files may be in $d. Remove these first (a junction or directory link with cmd /c rmdir, a file link with cmd /c del): " + (($bad | ForEach-Object { $_.FullName }) -join ', ')) }
-    if (-not $existed -and $c) { throw "Files appeared in $d while it was being created. Remove it and run this again." }
-
-    # 4. Existing files: take them back and reset them so they inherit exactly
-    #    Administrators and SYSTEM. This repairs the rc1..rc5 lock-out (#5196).
-    if ($c) { takeown /F "$d\*" /A | Out-Null; icacls "$d\*" /reset /L /C /Q | Out-Null }
-
-    # 5. Verify -- the same check the installer runs. Every line must say OK: the directory
+    # 4. Verify -- the same check the installer runs. Every line must say OK: the directory
     #    protected and granting exactly Administrators and SYSTEM full control, each file
     #    inheriting exactly that, all owned by Administrators or SYSTEM. A BAD line means
     #    something else has access or SYSTEM cannot read the item.
@@ -2325,6 +2339,16 @@ it before you enable signing, or `--update-trust-bundle` points at nothing:
     }
 }
 ```
+
+Put the bundle in only once the directory exists and is secured, by the installer or
+by this block: copy it in as an administrator, so the copy is owned by Administrators.
+A directory created or pre-staged any other way is refused by the installer, which
+leaves the agent service as it was, and by this block.
+
+**Endpoints that ran an agent installer from 0.14.0-rc1 to rc5:** those installers took
+over an `agent-certs` that already existed, including anything in it. If you did not
+place the `update-trust-bundle.pem` there yourself, delete it and copy in a fresh one
+before relying on signature checking.
 
 What this does not cover: the parent directory `C:\ProgramData\Yuzu` is not itself
 locked down (#5257), and a process that opened the directory or a file in it before
@@ -3117,7 +3141,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer creates and locks it (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`, on the directory itself), and then requires the lock to have taken effect and a newly created directory to still be empty. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory are taken back and reset so they inherit the grant (this repairs the rc1..rc5 lock-out). Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer creates and locks it (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`, on the directory itself), and then requires the lock to have taken effect and a newly created directory to still be empty. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged

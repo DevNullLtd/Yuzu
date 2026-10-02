@@ -90,14 +90,11 @@ def secure_fn(iss: str) -> str:
 def exec_args(iss: str, tool: str) -> list:
     """The argument expression of every Exec of {sys}\\<tool>.exe in SecureTrustAnchorDir."""
     pat = r"Exec\(ExpandConstant\('\{sys\}\\" + tool + r"\.exe'\),\s*(.*?),\s*'', SW_HIDE"
-    found = re.findall(pat, secure_fn(iss), re.S)
-    if not found:
-        raise AssertionError(f"no {tool} Exec found in SecureTrustAnchorDir")
-    return found
+    return re.findall(pat, secure_fn(iss), re.S)
 
 
 def grant_exec_args(iss: str) -> str:
-    m = re.search(r"'\"' \+ CertDir \+ '\" /inheritance:r /grant:r ' \+\s*'([^']*)'", iss)
+    m = re.search(r"'\"' \+ (?:CertDir|Stage) \+ '\" /inheritance:r /grant:r ' \+\s*'([^']*)'", iss)
     if not m:
         raise AssertionError("the icacls /inheritance:r /grant:r Exec was not found")
     return m.group(1)
@@ -116,8 +113,6 @@ def manual_commands(md: str, tool: str) -> list:
             part = part.strip().rstrip("}").strip()
             if part.startswith(tool + " "):
                 lines.append(part)
-    if not lines:
-        raise AssertionError(f"no {tool} line in the manual procedure")
     return lines
 
 
@@ -140,17 +135,19 @@ def pslit_body(iss: str) -> str:
 
 def problems(iss: str, md: str) -> list:
     found = []
-    for args in exec_args(iss, "takeown"):
-        if re.search(r"/[RD]\b", args):
-            found.append(f"installer takeown recurses (/R or /D): {args}")
+    if exec_args(iss, "takeown"):
+        found.append("the installer runs takeown, which has no /L and may act on a link's target")
+    if not any("Stage" in a and "/setowner *S-1-5-32-544" in a for a in exec_args(iss, "icacls")):
+        found.append("the installer no longer sets the new directory's owner with icacls /setowner")
+    if any(re.search(r"CertDir \+ '\" /(setowner|inheritance:r|reset)", a) for a in exec_args(iss, "icacls")):
+        found.append("the installer re-locks agent-certs in place instead of preparing a new one elsewhere")
     for args in exec_args(iss, "icacls"):
         if re.search(r"/T\b", args):
             found.append(f"installer icacls recurses (/T): {args}")
         if not re.search(r"/L\b", args):
             found.append(f"installer icacls lacks /L: {args}")
-    for line in manual_commands(md, "takeown"):
-        if re.search(r"\s/[RD]\b", line):
-            found.append(f"manual takeown recurses: {line}")
+    if manual_commands(md, "takeown"):
+        found.append("the manual procedure runs takeown")
     for line in manual_commands(md, "icacls"):
         if re.search(r"\s/T\b", line):
             found.append(f"manual icacls recurses: {line}")
@@ -161,18 +158,24 @@ def problems(iss: str, md: str) -> list:
     root_check = body.find("IsReparsePoint(CertDir")
     if root_check < 0 or root_check > first_exec:
         found.append("the root reparse-point check does not run before the first command")
-    create = body.index("ForceDirectories(CertDir)")
-    pre_gate = body.find("RunAclCheck(CertDir, True)")
-    if pre_gate < 0 or pre_gate > create:
-        found.append("an existing directory is not required to be secured before it is used")
-    grant_at = body.index("/inheritance:r /grant:r")
-    post_gate = body.find("RunAclCheck(CertDir, True)", grant_at)
-    contents = body.find("NotFilesOnly(CertDir, not Existed)")
-    files_step = body.index("CertDir + '\\*\" /A'")
-    if not (grant_at < post_gate < contents < files_step):
-        found.append("the lock gate and the contents check do not sit, in that order, between the directory lock and the file-level steps")
-    if "RunAclCheck(CertDir, False)" not in body[files_step:]:
-        found.append("the full check does not run after the file-level steps")
+    def seq(*needles):
+        pos = -1
+        for n in needles:
+            nxt = body.find(n, pos + 1)
+            if nxt < 0:
+                return False
+            pos = nxt
+        return True
+    if not seq("RunAclCheck(CertDir, 'root')", "if Existed then", "NotFilesOnly(CertDir, False)",
+               "RunAclCheck(CertDir, 'files')", "CertDir + '\\*\" /reset"):
+        found.append("an existing directory is not checked (secured, plain files, owned) before its files are reset")
+    if not seq("ForceDirectories(Stage)", "Stage + '\" /inheritance:r /grant:r", "RunAclCheck(Stage, 'root')",
+               "NotFilesOnly(Stage, True)", "RenameFile(Stage, CertDir)", "RunAclCheck(CertDir, 'root')",
+               "NotFilesOnly(CertDir, True)", "RunAclCheck(CertDir, 'full')"):
+        found.append("a new directory is not prepared, checked, moved and re-checked in that order")
+    prep = iss[iss.index("function PrepareToInstall("):]
+    if not (0 <= prep.find("SecureTrustAnchorDir()") < prep.find("'stop YuzuAgent'")):
+        found.append("the trust-anchor check no longer runs before the service is stopped")
     script = pascal_script(iss)
     if '"' in script:
         found.append("Script contains a double quote")
@@ -183,7 +186,9 @@ def problems(iss: str, md: str) -> list:
         found.append(f"Script makes .NET method calls {calls} (refused in Constrained Language Mode)")
     if "-Recurse" in script:
         found.append("Script uses -Recurse")
-    for needle, why in (("if(($r.Attributes -band 1024) -ne 0)", "root reparse-point check"),
+    for needle, why in (("if($i.LinkType -eq 'HardLink')", "hard-link check"),
+                        ("if($m -eq 'files')", "file-ownership gate"),
+                        ("if(($r.Attributes -band 1024) -ne 0)", "root reparse-point check"),
                         ("if(($i.Attributes -band 1024) -ne 0)", "child reparse-point check"),
                         ("if(($i.Attributes -band 16) -ne 0)", "child subdirectory check"),
                         ("'^O:(BA|SY)G:'", "owner check"),
@@ -197,13 +202,16 @@ def problems(iss: str, md: str) -> list:
     if any("-Recurse" in l for l in code):
         found.append("manual procedure uses -Recurse")
     block = manual_block(md)
-    lock_fn = block[block.index("function Test-Locked"):block.index("# 1. An existing directory")]
+    lock_fn = block[block.index("function Test-Locked"):block.index("if (Test-Path -LiteralPath $d) {")]
     if "($s -match 'D:P[A-Z]*" + ROOT_ACES + "') -and ($Matches[1] -ne $Matches[2])" not in lock_fn or "-band 1024" not in lock_fn:
         found.append("manual Test-Locked no longer checks the exact root ACE set and the reparse attribute")
-    for needle, why in (("if ($existed -and -not (Test-Locked)) { throw", "refusal of an existing unsecured directory"),
-                        ("if (-not (Test-Locked)) { throw", "lock gate"),
+    for needle, why in (("if (-not (Test-Locked $d)) { throw", "refusal of an existing unsecured directory"),
+                        ("if (-not (Test-Locked $stage)) { throw", "lock gate on the prepared directory"),
                         ("if ($bad) { throw", "files-only check"),
-                        ("if (-not $existed -and $c) { throw", "new-directory-empty check")):
+                        ("if (Test-Path -LiteralPath $d) { throw", "check that nothing took the name before the move"),
+                        ("if (-not (Test-Locked $d) -or @(Get-ChildItem -LiteralPath $d -Force)) { throw", "re-check after the move"),
+                        ("if ($i.LinkType -eq 'HardLink') { throw", "hard-link check"),
+                        ("-notmatch '^O:(BA|SY)G:') { throw", "file-ownership check")):
         if needle not in manual_block(md):
             found.append(f"manual procedure lost its {why}")
     verify = manual_verify(md)
@@ -248,23 +256,29 @@ class InstallerAclLint(unittest.TestCase):
                                    "'^\\(A;OICI;FA;;;(SY|BA)\\)'"),
             "manual verify drifted": ("md", "-and ($s -match $e) -and ($Matches[1] -ne $Matches[2])", "-and ($s -match $e) -and ($true)"),
             "manual lock test loosened": ("md", "($s -match 'D:P[A-Z]*\\(A;OICI;FA;;;(SY|BA)\\)\\(A;OICI;FA;;;(SY|BA)\\)$') -and ($Matches[1] -ne $Matches[2])", "($s -match 'D:P') -and ($Matches[1] -ne $Matches[2])"),
-            "installer takeown /R": ("iss", "'/F \"' + CertDir + '\" /A'", "'/F \"' + CertDir + '\" /A /R /D Y'"),
-            "existing directory not checked": ("iss", "      Reason := RunAclCheck(CertDir, True);\n", "      Reason := '';\n"),
-            "lock gate dropped": ("iss", "\n  Reason := RunAclCheck(CertDir, True);", "\n  Reason := '';"),
+            "takeown reintroduced": ("iss", "    Ok := Exec(ExpandConstant('{sys}\\icacls.exe'),\n               '\"' + Stage + '\" /setowner", "    Ok := Exec(ExpandConstant('{sys}\\takeown.exe'), '/F x', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);\n    Ok := Exec(ExpandConstant('{sys}\\icacls.exe'),\n               '\"' + Stage + '\" /setowner"),
+            "existing directory not checked": ("iss", "      Reason := RunAclCheck(CertDir, 'root');\n    if Reason <> '' then\n    begin\n      Result := NotSecuredMessage(CertDir,\n        'it already existed", "      Reason := '';\n    if Reason <> '' then\n    begin\n      Result := NotSecuredMessage(CertDir,\n        'it already existed"),
+            "prepared-directory gate dropped": ("iss", "    Reason := RunAclCheck(Stage, 'root');", "    Reason := '';"),
+            "in-place re-check dropped": ("iss", "    Reason := RunAclCheck(CertDir, 'root');\n    if Reason = '' then\n      Reason := NotFilesOnly(CertDir, True);", "    Reason := '';"),
+            "file-ownership gate dropped": ("iss", "      Reason := RunAclCheck(CertDir, 'files');", "      Reason := '';"),
+            "re-lock in place restored": ("iss", "    Reason := NotFilesOnly(CertDir, False);", "    Ok := Exec(ExpandConstant('{sys}\\icacls.exe'), '\"' + CertDir + '\" /reset /L /C /Q', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);\n    Reason := NotFilesOnly(CertDir, False);"),
+            "hard-link check dropped": ("iss", "'if($i.LinkType -eq ''HardLink''){Fail (''it contains a hard link: '' + $i.FullName)}' +", "'' +"),
+            "check after service stop": ("iss", "  Result := SecureTrustAnchorDir();\n  if Result <> '' then\n    Exit;\n", ""),
+            "manual takes ownership of files": ("md", "        if ($c) { icacls \"$d\\*\" /reset /L /C /Q | Out-Null }", "        if ($c) { takeown /F \"$d\\*\" /A | Out-Null; icacls \"$d\\*\" /reset /L /C /Q | Out-Null }"),
             "manual stops throwing": ("md", "if ($bad) { throw", "if ($bad) { Write-Output"),
-            "new directory not required empty": ("md", "if (-not $existed -and $c) { throw", "if ($false) { throw"),
-            "installer reset /T": ("iss", "'\"' + CertDir + '\" /reset /L /C /Q'", "'\"' + CertDir + '\" /reset /T /L /C /Q'"),
+            "manual re-check after move dropped": ("md", "if (-not (Test-Locked $d) -or @(Get-ChildItem -LiteralPath $d -Force)) { throw", "if ($false) { throw"),
+            "installer reset /T": ("iss", "'\"' + Stage + '\" /reset /L /C /Q'", "'\"' + Stage + '\" /reset /T /L /C /Q'"),
             "installer icacls without /L": ("iss", "'\"' + CertDir + '\\*\" /reset /L /C /Q'", "'\"' + CertDir + '\\*\" /reset /C /Q'"),
-            "manual takeown /R": ("md", "takeown /F $d /A | Out-Null", "takeown /F $d /A /R /D Y | Out-Null"),
-            "manual icacls without /L": ("md", "icacls $d /reset /L /C /Q", "icacls $d /reset /C /Q"),
+            "manual takeown back": ("md", "icacls $stage /setowner '*S-1-5-32-544' /L /C /Q | Out-Null", "takeown /F $stage /A | Out-Null"),
+            "manual icacls without /L": ("md", "icacls $stage /reset /L /C /Q", "icacls $stage /reset /C /Q"),
             "Script recurses": ("iss", "@(Get-ChildItem -LiteralPath $d -Force)", "@(Get-ChildItem -LiteralPath $d -Recurse -Force)"),
             "Script root reparse check dropped": ("iss", "'if(($r.Attributes -band 1024) -ne 0){Fail ''it is a junction or symbolic link, not a directory''};' +", "'' +"),
             "root check after first command": ("iss", "  if IsReparsePoint(CertDir, Found) then", "  if False then"),
-            "contents check dropped": ("iss", "  Reason := NotFilesOnly(CertDir, not Existed);", "  Reason := '';"),
+            "contents check dropped": ("iss", "    Reason := NotFilesOnly(CertDir, False);", "    Reason := '';"),
             "manual verify reparse check dropped": ("md", "if ((($i.Attributes -band 1024) -ne 0) -or", "if ((0 -ne 0) -or"),
             "PsLit U+2019 dropped": ("iss", " or (S[I] = #$2019)", ""),
             "PsLit ASCII quote dropped": ("iss", "if (S[I] = '''') or ", "if "),
-            "abort text says sc start": ("iss", 'run "sc.exe start YuzuAgent"', 'run "sc start YuzuAgent"'),
+            "abort text says sc start": ("iss", "'installed, has not been touched.';", "'installed, has not been touched; run sc start YuzuAgent.';"),
             "PsLit stops doubling": ("iss", "Result := Result + S[I] + S[I]", "Result := Result + S[I]"),
         }
         for name, (which, old, new) in mutations.items():

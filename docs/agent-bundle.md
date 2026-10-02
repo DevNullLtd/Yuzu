@@ -161,13 +161,16 @@ trust-anchor directory is not secured", the installer refused to continue
 because it could not confirm that only Administrators and SYSTEM can write
 `%ProgramData%\Yuzu\agent-certs`, and that both have full control of it and of
 everything in it. The lines after it give the directory and then the reason.
-The directory may hold only files: if it, or anything in it, is a junction,
-symbolic link or subdirectory, the installer refuses and names the item. Remove a
-junction or link with `cmd /c rmdir "<path>"`, which removes the link and never
-its target (not `Remove-Item -Recurse`, which in Windows PowerShell 5.1 deletes
-the target's contents), move anything else out, and run the installer again.
-The agent service was stopped for the install and is not restarted: run
-`sc.exe start YuzuAgent` once you have dealt with the reason. Installers from
+The installer refuses when the directory, or anything in it, is a junction,
+symbolic link, subdirectory or hard link; when the directory already existed but
+was not secured; or when a file in it is not owned by Administrators or SYSTEM.
+It never takes such a directory or file over. Remove a junction or directory link
+with `cmd /c rmdir "<path>"` and a file link with `cmd /c del "<path>"` (each
+removes the link, never its target; not `Remove-Item -Recurse`, which in Windows
+PowerShell 5.1 deletes a junction target's contents). For an unsecured directory,
+move any bundle you placed there yourself somewhere safe, delete the directory,
+run the installer again, then copy the bundle back in as an administrator. The
+check runs before the agent service is stopped, so the service is left as it was. Installers from
 0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
 Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
 for an install run by an administrator rather than as SYSTEM (#5196): use a
