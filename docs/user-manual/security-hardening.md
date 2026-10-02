@@ -117,16 +117,31 @@ Run each component under its own system user:
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
-- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
-  `:50051`, forwarding only over loopback or a trusted segment), **or**
+- **Front the gateway at L4 or with TLS passthrough only** (a plain TCP load balancer,
+  an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
+  end to end), with the gateway agent listener itself running the one-way TLS above.
+  A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
+  `:50051` is no longer a supported way to protect this edge: the gateway binds each
+  agent's heartbeats to the connection that opened its session, and such a proxy can
+  spread one agent's calls over several connections (see
+  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) are already full
-mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. Direct agent→server connections (no gateway) use TLS, with
+mutual TLS where client certificates are provisioned. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
+
+The agent listener authenticates the gateway to agents, not agents to the gateway.
+The gateway admits an agent `Heartbeat` only on the connection that opened the
+session's `Subscribe` stream, and only for a session that gateway node holds
+(a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
+`Subscribe` admission is unchanged, and the binding relies on one connection per
+agent between the agent and the gateway (see the supported topologies above). The
+same change removes the session id from two gateway log lines, which reduces the
+disclosure of session ids in logs; some log lines still include session ids.
 
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can

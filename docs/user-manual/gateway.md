@@ -155,6 +155,58 @@ This reduces upstream load from O(agents/interval) to O(nodes/interval).
 On RPC failure, heartbeat buffers are retained (capped at 10,000) for retry
 on the next flush cycle rather than being silently discarded.
 
+#### Heartbeat admission
+
+Before a heartbeat is buffered, the gateway checks that it belongs to a session
+this gateway node holds **and** that it arrived on the HTTP/2 connection that opened
+that session's `Subscribe` stream. A session that has registered but not yet
+subscribed is held to the connection that sent its `Register`. The check reads
+node-local state only: a session held by another gateway node is not admitted here,
+and the decision does not depend on what the server currently knows about the
+session.
+
+A heartbeat that does not meet both conditions is answered with gRPC `NOT_FOUND`
+(`unknown session`), counted, and not buffered or forwarded. The answer is the same
+whatever the reason (no session, wrong connection, no usable binding), so the
+response does not reveal which condition failed; the reason appears only in the
+counters below. A heartbeat that is admitted is acknowledged and buffered exactly as
+before.
+
+An agent whose heartbeat is answered `NOT_FOUND` recovers on its own, as it already
+does for any lost session: it waits an escalating cooldown (2 s on the first
+rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
+again. There is no wire, agent or server change.
+
+**Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
+directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
+agent end to end (a plain TCP load balancer, an L4 virtual IP, a TLS-passthrough
+proxy). An HTTP/2-terminating or HTTP/2-multiplexing proxy between agents and the
+gateway is **not supported** for this check: it can spread one agent's calls over
+several connections, which shows up as `connection_mismatch` rejections and
+repeated re-registration, and it removes the per-agent separation the check relies
+on. See [Security Hardening](security-hardening.md#gateway-tls-if-you-deploy-the-erlang-gateway).
+
+**Observability.** Rejections are counted by two families (see
+[Available Metrics](#available-metrics)): `yuzu_gw_heartbeat_rejected_total{reason}`
+for a heartbeat with no usable binding, and
+`yuzu_gw_heartbeat_session_mismatch_total{event="security"}` for a held session whose
+heartbeat arrived on a different connection. Every series is created at 0 at gateway
+start. There is no per-heartbeat log line. Rejections are folded into one summary
+line at `info` level, written for the first rejection and then at most once per
+`telemetry_gauge_interval_ms` (10 s by default), for example
+`Heartbeat admission rejected heartbeats since the last summary: unknown_session=3, connection_mismatch=1`.
+It carries reason names and counts only, never a session id. At startup the gateway
+logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
+rejected heartbeat has no resolved principal, so there is no audit row, only the
+counters and the summary line.
+
+**Upgrading.** Deploy this change with a **gateway restart**. The session index is a
+new in-memory table created when the gateway registry starts, and hot code upgrade
+is not supported for this change: new code loaded into a running node has no index
+table, so every heartbeat on that node is rejected as `registry_unavailable` until
+the node is restarted. After a restart agents reconnect, register and subscribe
+again, and their sessions are bound to the new connections.
+
 ### Subscribe Stream Proxy
 
 The gateway owns the agent's Subscribe bidi stream. When an operator sends a
@@ -335,13 +387,13 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 > either (a) terminate TLS in front of the gateway (a reverse proxy doing TLS on
 > `:50051`, forwarding only over loopback / a trusted segment), or (b) keep
 > `:50051` on a trusted network (VPN / private subnet / service mesh). Direct
-> agent→server connections are already full mTLS (PR2/PR3) — this gap is specific
-> to the gateway edge.
+> agent→server connections use TLS (PR2/PR3), with mutual TLS where client
+> certificates are provisioned — this gap is specific to the gateway edge.
 
 | Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
 | server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
 TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
@@ -419,8 +471,8 @@ yuzu-agent --server gateway:50051 --ca-cert /etc/yuzu/install-ca.pem \
 
 Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
 connects and enrolls; `openssl s_client -connect gateway:50051` presents the
-`default-gateway` leaf. Direct agent→server (no gateway) is already full mTLS and
-needs none of this.
+`default-gateway` leaf. Direct agent→server connections (no gateway) use TLS, with
+mutual TLS where client certificates are provisioned, and need none of this.
 
 ### Distribution Cookie (Required in Production)
 
@@ -721,6 +773,8 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
+| `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent receives `NOT_FOUND` and re-registers. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
+| `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections, and briefly around agent reconnects. There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in
