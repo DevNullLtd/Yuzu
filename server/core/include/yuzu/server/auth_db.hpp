@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "yuzu/server/auth.hpp"  // For Role, UserEntry, PendingAgent, etc.
+#include "yuzu/server/enrollment_cfg_import.hpp" // legacy-import row/result types (pure)
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -697,44 +698,127 @@ public:
     /// not-enrolled rows.
     std::expected<void, AuthDBError> mfa_disable(const std::string& username);
 
-    // ── Enrollment Token Operations ───────────────────────────────────────
+    // ── Enrollment tokens + pending agents (WS-6 slice 6.2, ADR-2002 §8) ─────
+    //
+    // Authoritative, fleet-wide (every replica shares one PG), and FAIL-CLOSED:
+    // every method returns `std::expected<_, StoreError>` so a store outage is a
+    // typed error the caller maps to gRPC UNAVAILABLE / HTTP 503 — NEVER an empty
+    // list, a `0` count, "absent", or "rejected" (an unreadable pending row that
+    // read as "absent" would let a denied agent fall through to add_pending/
+    // consume, #3401). Timestamps are authored from PG `now()` in SQL and token
+    // expiry is evaluated in SQL (DB-clock authority, ADR-2002 §4) — never the
+    // replica's `system_clock`. Raw tokens are hashed on entry (SHA-256) and are
+    // never logged, never a column; only the 8-hex `token_id` appears in logs.
+    // Text inputs are length-capped (`kMaxEnrollmentTextLength`) and rejected on
+    // an embedded NUL (`StoreError::InvalidInput`), never silently truncated.
 
-    /// Create a new enrollment token. Returns the raw token (show once).
-    /// The token is stored as a SHA-256 hash — plaintext never persisted.
-    std::expected<std::string, AuthDBError> create_enrollment_token(
-        const std::string& created_by,
-        std::chrono::seconds validity
-    );
+    /// Shared with `auth::AuthManager` (defined in auth.hpp, which must not
+    /// include this header): the create result and the atomic-consume outcome.
+    using CreatedEnrollmentToken = auth::CreatedEnrollmentToken;
+    using ConsumeEnrollResult = auth::ConsumeEnrollResult;
 
-    /// Validate an enrollment token without consuming it.
-    /// Returns true if token exists, is unused, and hasn't expired.
-    std::expected<bool, AuthDBError> validate_enrollment_token(const std::string& plain_token);
+    /// Maximum length of any free-text field (label, hostname, os, arch,
+    /// agent_version, principal) accepted by the enrollment/pending store.
+    /// `agent_id` uses `auth::kMaxAgentIdLength`, the raw token
+    /// `auth::kMaxEnrollmentTokenLength`.
+    static constexpr std::size_t kMaxEnrollmentTextLength = auth::kMaxEnrollmentTextLength;
 
-    /// Consume an enrollment token atomically.
-    /// Returns true if token was valid and consumed, false if already used/invalid.
-    /// Persists to DB BEFORE returning — survives server restart.
-    /// Defense-in-depth: Also checks expiry in same atomic operation.
-    std::expected<bool, AuthDBError> consume_enrollment_token(
-        const std::string& plain_token,
-        const std::string& agent_id
-    );
+    /// Upper bound on a token TTL (~100 years). `0` = never expires.
+    static constexpr std::int64_t kMaxEnrollmentTtlSeconds = 3'153'600'000;
 
-    // ── Pending Agent Operations ─────────────────────────────────────────
+    /// Create a token. `max_uses` 0 = unlimited; `ttl` 0 = never expires.
+    /// The token_id (8 hex of the hash) is regenerated on a UNIQUE violation —
+    /// an existing token is never overwritten.
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                 const std::string& created_by);
 
-    /// Add an agent to the pending approval queue.
-    std::expected<void, AuthDBError> add_pending_agent(const auth::PendingAgent& agent);
+    /// Test seam for `create_token`'s regenerate-on-collision loop: `entropy`
+    /// supplies the 32 raw bytes for each attempt. Production callers use
+    /// `create_token` (CSPRNG).
+    std::expected<CreatedEnrollmentToken, StoreError>
+    create_token_with_entropy(const std::string& label, int max_uses, std::chrono::seconds ttl,
+                              const std::string& created_by,
+                              const std::function<std::vector<std::uint8_t>()>& entropy);
 
-    /// List all pending agents.
-    std::expected<std::vector<auth::PendingAgent>, AuthDBError> list_pending_agents();
+    /// Revoke by token_id. true = a row exists (idempotent), false = unknown id.
+    std::expected<bool, StoreError> revoke_token(const std::string& token_id);
 
-    /// Approve a pending agent.
-    std::expected<void, AuthDBError> approve_agent(
-        const std::string& agent_id,
-        const std::string& approved_by
-    );
+    /// All tokens, newest first. `expires_at == time_point::max()` = never.
+    std::expected<std::vector<auth::EnrollmentToken>, StoreError> list_tokens();
 
-    /// Reject a pending agent.
-    std::expected<void, AuthDBError> reject_agent(const std::string& agent_id);
+    /// THE atomic enrollment claim: ONE transaction that (1) counts a use of the
+    /// token (single guarded UPDATE — exactly-N winners across replicas), then
+    /// (2) upserts the agent row to `approved` unless an admin denied it; a
+    /// denial ROLLS BACK step 1. A miss on step 1 is classified in the same txn.
+    std::expected<ConsumeEnrollResult, StoreError>
+    consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
+                       const std::string& hostname, const std::string& os,
+                       const std::string& arch, const std::string& agent_version);
+
+    /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
+    /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
+    std::expected<std::optional<auth::PendingStatus>, StoreError>
+    pending_status(const std::string& agent_id);
+
+    /// Queue an unenrolled agent as `pending`. `true` = NEWLY added (gates the
+    /// analytics event + SSE publish); `false` = a row already existed (unchanged).
+    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent);
+
+    /// No-token enrollment path: upsert to `approved` unless denied. `true` =
+    /// enrolled, `false` = admin-denied (tokens/no-token paths never override a
+    /// denial). `by` is recorded as `status_changed_by`.
+    std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
+                                                    const std::string& by);
+
+    /// Rows newest-first; `only` filters to one status.
+    std::expected<std::vector<auth::PendingAgent>, StoreError>
+    list_pending(std::optional<auth::PendingStatus> only = std::nullopt);
+
+    /// Set status approved/denied for an existing row. `true` = row existed.
+    std::expected<bool, StoreError> approve_pending(const std::string& agent_id,
+                                                    const std::string& principal);
+    std::expected<bool, StoreError> deny_pending(const std::string& agent_id,
+                                                 const std::string& principal);
+
+    /// Bulk: every currently-`pending` row -> approved/denied in one statement
+    /// (`UPDATE .. WHERE status='pending' RETURNING agent_id`). Returns the
+    /// agent_ids affected (for audit + SSE).
+    std::expected<std::vector<std::string>, StoreError>
+    approve_all_pending(const std::string& principal);
+    std::expected<std::vector<std::string>, StoreError>
+    deny_all_pending(const std::string& principal);
+
+    /// Hard-delete a row, but ONLY when its status is `pending` — see
+    /// `auth::RemovePendingOutcome`'s doc comment for why an `approved`/`denied`
+    /// row is refused instead of deleted.
+    std::expected<auth::RemovePendingOutcome, StoreError>
+    remove_pending(const std::string& agent_id);
+
+    // ── One-time legacy .cfg import (WS-6 6.2; see enrollment_cfg_import.hpp) ──
+    //
+    // Each call is ONE transaction under a dedicated advisory lock
+    // (`pg_advisory_xact_lock(2037545589, 2)`, auth_db.cpp), so two replicas racing
+    // first boot with identical files serialise: the loser sees the winner's marker
+    // and returns `already_imported`. `marker_key` is the per-FILE-KIND key in
+    // `auth.import_meta`; `fingerprint` the sha256 of the file bytes. Marker
+    // present + same fingerprint => `already_imported`; present + DIFFERENT =>
+    // `fingerprint_mismatch` (nothing written - restored-old-backup case, "refused,
+    // not merged"); absent => rows inserted and the marker stamped in the SAME txn.
+    // Rows are INSERT .. ON CONFLICT DO NOTHING keyed on token_hash / agent_id, so
+    // Postgres state (a higher use_count, a revoke, a deny, a removal) ALWAYS wins
+    // over the file. Any PG error rolls the whole txn back (no marker) and returns
+    // `StoreError` - the caller refuses to start. Never uses the file's token_id:
+    // the id is the hash prefix, lengthened per row on a collision with a DIFFERENT
+    // token so both survive.
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_tokens(std::string_view marker_key, std::string_view fingerprint,
+                         const std::vector<enrollment_import::LegacyToken>& rows,
+                         std::string_view imported_by);
+    std::expected<enrollment_import::ImportDbResult, StoreError>
+    import_legacy_pending(std::string_view marker_key, std::string_view fingerprint,
+                          const std::vector<enrollment_import::LegacyPending>& rows,
+                          std::string_view imported_by);
 
 private:
     struct Impl;

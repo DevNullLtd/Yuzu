@@ -5,10 +5,18 @@
 | File | Location | Critical |
 |------|----------|----------|
 | `yuzu-server.cfg` | `/etc/yuzu/` | Yes — contains user credentials |
-| `enrollment-tokens.cfg` | `/etc/yuzu/` | Yes — active enrollment tokens |
-| `pending-agents.cfg` | `/etc/yuzu/` | Yes — pending approval queue |
 | `*.db` (all SQLite databases) | `/var/lib/yuzu/` | Yes — all operational data |
 | TLS certificates | `/etc/yuzu/certs/` | Yes — mTLS identity |
+
+> **Enrollment tokens and the pending-agent approval queue are in PostgreSQL**
+> (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — back them
+> up via the same `pg_dump`/`pg_restore` procedure as the rest of the `auth`
+> schema, not as local files. `enrollment-tokens.cfg`/`pending-agents.cfg` are
+> no longer written by a 6.2+ server; a pre-6.2 backup restored onto a fresh
+> Postgres is imported exactly once, at the first 6.2 boot (the marker+
+> fingerprint mechanics that make a restored OLD backup with different content
+> REFUSED rather than silently merged are in
+> `docs/adr/2002-high-availability-architecture.md` §8).
 
 > Shipped InstructionDefinitions live inside the `yuzu-server` binary
 > (embedded at build time by `server/core/scripts/embed_content.py`)

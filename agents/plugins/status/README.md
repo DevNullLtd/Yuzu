@@ -364,5 +364,4 @@ verbose_logging|
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/2298-guardian-spark-6d-status-authz.security.md` · `changelog.d/3283-macos-pf-enabled-status.security.md` · `changelog.d/mcp-streamable-pr1-notification-status.changed.md`
 <!-- END GENERATED -->

@@ -6,8 +6,15 @@
 # prevent.
 #
 # Usage:
-#   scripts/check-release-artifacts.sh <artifacts-dir>
-#   scripts/check-release-artifacts.sh artifacts
+#   scripts/check-release-artifacts.sh <artifacts-dir> [<release-version>]
+#   scripts/check-release-artifacts.sh artifacts 0.14.0-rc3
+#
+# With <release-version> (the tag without its leading "v") it also checks
+# every package/installer name carries that version, so a package left in a
+# reused build workspace by an earlier release of a DIFFERENT version fails
+# the release (#5141). A leftover of the same version has the same name and
+# is not detectable here; the build jobs' `rm -f` of old packages is the
+# primary control for that.
 #
 # Expected contents of <artifacts-dir> after the flatten step:
 #
@@ -35,17 +42,22 @@
 #     yuzu-gateway-image.cdx.json  + .spdx.json
 #     yuzu-postgres-image.cdx.json + .spdx.json   (#1318)
 #
+# Every file's name must also be one GitHub stores unchanged (letters,
+# digits, ".", "_" and "-", starting with a letter or digit), or SHA256SUMS
+# and the provenance subjects would name an asset that does not exist.
+#
 # Emits GitHub Actions `::error file=...` annotations so failures show
 # up inline on the release run summary.
 
 set -euo pipefail
 
 if [[ $# -lt 1 || -z "${1:-}" ]]; then
-  echo "usage: $0 <artifacts-dir>" >&2
+  echo "usage: $0 <artifacts-dir> [<release-version>]" >&2
   exit 2
 fi
 
 ART_DIR="$1"
+RELEASE_VERSION="${2:-}"
 
 if [[ ! -d "$ART_DIR" ]]; then
   echo "::error::artifacts directory not found: $ART_DIR" >&2
@@ -128,6 +140,54 @@ if command -v jq >/dev/null 2>&1; then
   done
 fi
 
+# ── Asset names: stored by GitHub unchanged, and all from THIS release ──
+# Two ways a published name has gone wrong, both shipped before this gate:
+#  - GitHub silently rewrites characters outside [A-Za-z0-9._-] in asset
+#    names (a "~" becomes "."), so the stored asset no longer matches the
+#    name in SHA256SUMS or its provenance subject (#5141, rc1/rc2 .debs).
+#  - build-linux runs in a reused self-hosted workspace (clean: false), and
+#    a package left there by an earlier release was uploaded, attested and
+#    checksummed as this release's output (v0.13.0-rc6 shipped rc4 .debs
+#    and .rpms).
+# So every file must have a GitHub-safe name, and every package/installer
+# must carry this release's version in the form its builder writes. These
+# forms are a second copy of the builders' naming, keep them in step with:
+#   .deb  release.yml "Build .deb package(s)" rename (~ -> -)
+#   .rpm  deploy/packaging/rpm/build-rpm.sh + build-gateway-rpm.sh Release field
+#   .exe  release.yml "Build Windows installers" $version (- -> _)
+#   .pkg  release.yml "Build macOS installer (.pkg)" VERSION (- -> _)
+for f in "$ART_DIR"/*; do
+  [[ -f "$f" ]] || continue
+  name="${f##*/}"
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "::error file=$name::asset name would be rewritten by GitHub on upload (use only A-Z a-z 0-9 . _ -, starting with a letter or digit)" >&2
+    fail=1
+  fi
+done
+
+if [[ -n "$RELEASE_VERSION" ]]; then
+  base="${RELEASE_VERSION%%-*}"
+  pre=""
+  [[ "$RELEASE_VERSION" == *-* ]] && pre="${RELEASE_VERSION#*-}"
+  underscored="${RELEASE_VERSION//-/_}"
+  if [[ -n "$pre" ]]; then rpm_rel="0.1.${pre}"; else rpm_rel="1"; fi
+  for f in "$ART_DIR"/*.deb "$ART_DIR"/*.rpm "$ART_DIR"/*.exe "$ART_DIR"/*.pkg; do
+    [[ -f "$f" ]] || continue
+    name="${f##*/}"
+    case "$name" in
+      *.deb) want="*_${RELEASE_VERSION}_*.deb" ;;
+      *.rpm) want="*-${base}-${rpm_rel}.*.rpm" ;;
+      *.exe) want="*-${underscored}.exe" ;;
+      *.pkg) want="*-${underscored}-*.pkg" ;;
+    esac
+    # shellcheck disable=SC2053 # $want is a glob pattern on purpose
+    if [[ "$name" != $want ]]; then
+      echo "::error file=$name::package is not from release ${RELEASE_VERSION}: expected a name matching ${want} (a stale file from an earlier build in the workspace?)" >&2
+      fail=1
+    fi
+  done
+fi
+
 if (( fail )); then
   echo ""
   echo "::error::release artifact completeness gate FAILED — see errors above" >&2
@@ -138,3 +198,8 @@ echo "Release artifact completeness gate: OK"
 echo "  archives:         ${#REQUIRED_ARCHIVES[@]} required files present"
 echo "  installers/pkgs:  ${#REQUIRED_GLOBS[@]} required globs satisfied"
 echo "  SBOMs:            ${#SBOM_BASES[@]} bases × 2 formats (CycloneDX + SPDX) present"
+if [[ -n "$RELEASE_VERSION" ]]; then
+  echo "  asset names:      GitHub-safe; every package is from ${RELEASE_VERSION}"
+else
+  echo "  asset names:      GitHub-safe (no version given: package versions not checked)"
+fi

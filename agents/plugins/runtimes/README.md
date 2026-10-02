@@ -136,5 +136,4 @@ status|jvm|supported|-
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp`
 - Tests: `tests/test_runtimes_definition.py` · `tests/unit/test_runtimes_linux_parsers.cpp` · `tests/unit/test_runtimes_local_dispatcher.cpp` · `tests/unit/test_runtimes_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave10-pr10.1b-runtimes.added.md`
 <!-- END GENERATED -->

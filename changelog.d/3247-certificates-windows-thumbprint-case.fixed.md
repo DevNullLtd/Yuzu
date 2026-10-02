@@ -1,1 +1,0 @@
-- **`certificates` `details`/`delete` on Windows now match a thumbprint case-insensitively**, as the definition documents and as the Linux and macOS legs already did; a lowercase SHA-1 previously returned `status|not_found` against an uppercase CryptoAPI thumbprint (#3247).

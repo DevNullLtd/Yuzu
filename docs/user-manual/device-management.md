@@ -51,6 +51,18 @@ curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
   -b "$COOKIE"
 ```
 
+`DELETE` only succeeds against a row that is still `pending` — it returns `409` if the agent has
+already been approved or denied, refusing to silently reverse that admin decision (WS-6 6.2). A
+Tier 1 agent removed while genuinely pending simply re-enters the pending queue on its next
+reconnect attempt, same as if it had never been seen. Before this guard, removing an already-
+*approved* row (typically a Tier 2, token-enrolled agent) deleted the row backing its enrollment
+with no admin decision behind it and no audit trail — that specific gap is now closed, since an
+approved row can no longer be removed via this endpoint at all. There is no remaining asymmetry for
+the remove-then-reconnect case: a still-`pending` agent (Tier 1 or Tier 2, before it has presented a
+valid token) behaves identically either way, and a Tier 2 agent's token-based enrollment
+(`consume_and_enroll`) creates a fresh `approved` row on the next successful token presentation
+regardless of whether a prior pending row existed.
+
 ### Tier 2: Pre-Shared Enrollment Tokens
 
 For automated deployments, administrators generate **enrollment tokens** -- time-limited and use-limited secrets that agents present at registration for immediate enrollment without manual approval.
@@ -116,7 +128,7 @@ curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c
   -b "$COOKIE"
 ```
 
-Tokens are persisted in `enrollment-tokens.cfg` alongside the server configuration file. They survive server restarts.
+Tokens are persisted in the PostgreSQL `auth.enrollment_tokens` table (WS-6 6.2) — shared by every server replica, not a per-replica file. They survive server restarts and image swaps. A pre-6.2 install's `enrollment-tokens.cfg` is imported once, automatically, at the first 6.2 boot (see `docs/adr/2002-high-availability-architecture.md` §8).
 
 ### Tier 3: Platform Trust (Planned)
 
@@ -329,7 +341,7 @@ The full set of agent command-line flags:
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
-| `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
+| `--plugin-dir` | Directory containing plugin shared libraries (env `YUZU_PLUGIN_DIR`). The default is `<exe_dir>/../plugins`, where `<exe_dir>` is the directory part of the path the agent was started by (`argv[0]`), not resolved through `PATH` or symlinks. Started by absolute path, as the published agent image (`yuzu-agent-chisel`, `ENTRYPOINT ["/usr/local/bin/yuzu-agent"]`) does, it is `/usr/local/plugins`. Nothing is installed there: the image's default `CMD` passes `--plugin-dir /usr/lib/yuzu/plugins`. Started by bare name through `PATH`, `argv[0]` has no directory part, so the default resolves against the working directory (`<cwd>/../plugins`). A compose `command:` (or `docker run` argument) override replaces the image's `CMD`, so it must restate `--plugin-dir` | `<exe_dir>/../plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; lowercase and case sensitive, and an unrecognised value, including `WARN`, is treated as `off`; `--verbose` forces `trace` whatever this says). The `agent_actions` plugin's `set_log_level` action (needs `Infrastructure:Write` and, through the REST command dispatch, `Execution:Execute`) changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
 | `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
 | `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |

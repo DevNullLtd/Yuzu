@@ -168,5 +168,4 @@ posture|linux|fs.suid_dumpable|0|enabled
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp`
 - Tests: `tests/unit/test_system_hardening_local_dispatcher.cpp` · `tests/unit/test_system_hardening_parsers.cpp` · `tests/unit/test_system_hardening_win_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave8-pr81b-system_hardening.added.md`
 <!-- END GENERATED -->

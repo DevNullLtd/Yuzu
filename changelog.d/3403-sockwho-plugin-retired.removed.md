@@ -1,1 +1,0 @@
-- **The `sockwho` plugin is retired.** Its functionality moved to netstat's new `attribution` action (see the "netstat gains a new attribution action" entry above). `sockwho` and its `sockwho_list` action are removed; existing content built on `device.network.sockwho_list` should move to the new `device.network.netstat_attribution` definition.

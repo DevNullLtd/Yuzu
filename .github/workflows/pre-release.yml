@@ -21,11 +21,20 @@ permissions:
 # Docker rejects uppercase in a repository name outright ("repository name must
 # be lowercase"), so nothing could be pulled. GitHub expressions have no
 # lowercase function, so the owner must be folded in a shell step: the `resolve`
-# job does it once and publishes `needs.resolve.outputs.registry`. Every job that
-# touches an image sets `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`,
-# and steps that cannot read env (action `with:` inputs, e.g. trivy's image-ref)
-# reference the output directly. Defining a mixed-case default here again would
-# just re-arm the trap for the next job that forgets to override it.
+# job does it once and publishes `needs.resolve.outputs.registry`. The jobs that
+# pull images by name (artifact-verify, security-scan) set
+# `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`, and steps that cannot
+# read env (action `with:` inputs, e.g. trivy's image-ref) reference the output
+# directly. Defining a mixed-case default here again would just re-arm the trap
+# for the next job that forgets to override it.
+#
+# The stack jobs (integration, soak-test, upgrade-test) do NOT use REGISTRY:
+# scripts/ci/qa-stack.sh runs the shipped reference template, whose image names
+# are written in it already lowercased (ghcr.io/devnullltd/...), so they pull
+# exactly what an operator copying the template pulls. The version's gateway
+# sys.config and tagged template are fetched from QA_REPO below.
+env:
+  QA_REPO: ${{ github.repository }}
 
 jobs:
   # ── Resolve version and download release artifacts ──────────────────
@@ -107,6 +116,12 @@ jobs:
           else
             TAG="$EVENT_BRANCH"
           fi
+          # Shape-check before it reaches GITHUB_OUTPUT (a newline would forge
+          # another output) and every later job's URLs, image tags and sed.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag (expected e.g. v0.14.0 or v0.14.0-rc3)"
+            exit 1
+          fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -120,9 +135,29 @@ jobs:
           # interpolated into the script body (CodeQL
           # actions/code-injection/critical).
           CURRENT: ${{ steps.ver.outputs.tag }}
+        # The highest published (non-draft, non-prerelease) vX.Y.Z strictly
+        # LOWER than the tag under test (#5150) — not "the newest that isn't
+        # this tag", which picks a later stable when an older tag is re-tested
+        # (re-running v0.14.0-rc3 after v0.14.0 ships would "upgrade" down).
+        # A pre-release X.Y.Z-rcN orders below X.Y.Z, so for any tag the bound
+        # is its X.Y.Z base: a stable S is older than X.Y.Z-rcN iff S < X.Y.Z.
+        # A failed `gh` fails this step (and so the run): a listing error must
+        # never read as "no previous stable release".
         run: |
-          PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
-            -q "[.[] | select(.tagName != \"$CURRENT\" and .isPrerelease == false)] | .[0].tagName // empty")
+          BASE="${CURRENT#v}"; BASE="${BASE%%-*}"
+          [[ "$BASE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::cannot order tag '$CURRENT'"; exit 1; }
+          RELEASES=$(gh release list --limit 100 --json tagName,isPrerelease,isDraft)
+          PREV=$(printf '%s' "$RELEASES" \
+            | jq -r '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | while read -r T; do
+                V="${T#v}"
+                if [[ "$V" != "$BASE" && "$(printf '%s\n%s\n' "$V" "$BASE" | sort -V | head -1)" == "$V" ]]; then
+                  echo "$V"
+                fi
+              done \
+            | sort -V | tail -1)
+          PREV="${PREV:+v$PREV}"
           if [[ -n "$PREV" ]]; then
             echo "has_prev=true" >> "$GITHUB_OUTPUT"
             echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
@@ -164,13 +199,12 @@ jobs:
     name: "Integration test (Docker)"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Override the workflow-level REGISTRY, which carries the mixed-case owner
-    # (`ghcr.io/DevNullLtd`) that Docker refuses to pull. See resolve's "Lowercase
-    # registry owner".
-    env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
-
+    # Sized from the ceilings in scripts/ci/qa-stack.sh's "Time budget" header,
+    # so a wait reports its own failure before the job is killed: setup ~1 min
+    # + `up` <= 35 min + the tests below <= 5.5 min (a metric read <= 90s,
+    # wait-metric 30s + one read, a round-trip 30s dispatch + 40s + one poll,
+    # check-stable) + logs/teardown ~2 min = ~43.5 min.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,186 +221,61 @@ jobs:
           username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull release images
-        env:
-          # Bind tag to env to avoid code-injection via crafted ref name.
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
-            docker pull "$REGISTRY/$img:${TAG#v}"
-          done
-
-      - name: Generate server config
-        run: |
-          mkdir -p /tmp/yuzu-qa
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'qapassword1', salt, 100000, dklen=32)
-          print(f'qaadmin:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-qa/yuzu-server.cfg
-
-      - name: Create Docker Compose for QA
+      # The stack is the shipped reference template
+      # (deploy/docker/docker-compose.reference-gateway.yml): Postgres, TLS on
+      # every hop, a per-install CA, and an agent that enrols with a one-off
+      # token and receives its own mTLS leaf. scripts/ci/qa-stack.sh drives
+      # it; `compose pull` fetches exactly the images the stack runs, so there
+      # is no separate image list here to drift from what ships (#5126).
+      - name: Start stack
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          cat > /tmp/yuzu-qa/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:$VERSION
-              command:
-                - "--listen"
-                - "0.0.0.0:50051"
-                - "--no-tls"
-                - "--no-https"
-                - "--gateway-upstream"
-                - "0.0.0.0:50055"
-                - "--gateway-mode"
-                - "--gateway-command-addr"
-                - "gateway:50063"
-                - "--web-address"
-                - "0.0.0.0"
-                - "--web-port"
-                - "8080"
-                - "--metrics-no-auth"
-                - "--config"
-                - "/var/lib/yuzu/yuzu-server.cfg"
-              ports:
-                - "8080:8080"
-                - "50055:50055"
-              volumes:
-                - /tmp/yuzu-qa/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
-              # \`curl\` is NOT in the server runtime image (it installs only
-              # libssl3, libpq5, ca-certificates and bash), so this healthcheck
-              # could never pass: the container would sit \`unhealthy\` forever and
-              # \`gateway\`, which waits on \`condition: service_healthy\`, would
-              # never start. Use bash's /dev/tcp pseudo-device — the same probe
-              # deploy/docker/docker-compose.reference.yml uses. The gate added
-              # in #751 verifies bash + /dev/tcp survive in the image.
-              healthcheck:
-                test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-
-            gateway:
-              image: $REGISTRY/yuzu-gateway:$VERSION
-              environment:
-                - YUZU_GW_UPSTREAM_ADDR=server
-              ports:
-                - "50051:50051"
-                - "50063:50063"
-                - "8081:8081"
-                - "9568:9568"
-              depends_on:
-                server:
-                  condition: service_healthy
-
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:$VERSION
-              command:
-                - "--server"
-                - "gateway:50051"
-                - "--no-tls"
-                - "--log-level"
-                - "info"
-              depends_on:
-                - gateway
-          COMPOSE
-
-      - name: Start stack
-        working-directory: /tmp/yuzu-qa
-        run: |
-          docker compose up -d
-          echo "Waiting for stack to be healthy..."
-          # Wait for server
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8080/livez &>/dev/null; then break; fi
-            sleep 2
-          done
-          # Wait for gateway
-          for i in $(seq 1 20); do
-            if curl -sf http://localhost:8081/readyz &>/dev/null; then break; fi
-            sleep 2
-          done
-          # Wait for agent registration
-          for i in $(seq 1 30); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            if [ "$COUNT" -ge 1 ]; then break; fi
-            sleep 2
-          done
-          echo "Stack ready"
+        run: bash scripts/ci/qa-stack.sh up "$VERSION"
 
       - name: Test — Dashboard reachable
         run: |
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
-          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-qa/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE (verified against the install CA)" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
       - name: Test — Gateway health
         run: |
-          HEALTH=$(curl -sf http://localhost:8081/readyz)
+          HEALTH=$(curl -sf --max-time 10 http://127.0.0.1:8081/readyz)
           echo "$HEALTH" | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: $HEALTH"; exit 1; }
 
-      - name: Test — Agent registered
+      # Connected GAUGES, not the *_total counters: a counter stays >= 1 after
+      # the first registration however many times the agent drops since.
+      - name: Test — Agent connected (server)
         run: |
-          COUNT=$(curl -s http://localhost:8080/metrics | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-          [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) registered" || { echo "FAIL: 0 agents"; exit 1; }
+          COUNT=$(bash scripts/ci/qa-stack.sh metric server yuzu_agents_connected)
+          [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) connected" || { echo "FAIL: 0 agents connected"; exit 1; }
 
-      - name: Test — Gateway sees agent
+      # The gateway sets this gauge on a 10s timer, so it is polled, not read once.
+      - name: Test — Agent connected (gateway)
         run: |
-          COUNT=$(curl -s http://localhost:9568/metrics | \
-            grep -oP 'yuzu_gw_agents_connected_total\{[^}]*\} \K[0-9]+' || echo "0")
-          [ "$COUNT" -ge 1 ] && echo "PASS: Gateway shows $COUNT agent(s)" || { echo "FAIL: 0 agents"; exit 1; }
+          if COUNT=$(bash scripts/ci/qa-stack.sh wait-metric gateway yuzu_gw_agents_current 1 30); then
+            echo "PASS: Gateway holds $COUNT agent stream(s)"
+          else
+            echo "FAIL: gateway reports $COUNT agent streams after 30s"
+            exit 1
+          fi
 
       - name: Test — Command round-trip (os_info)
         run: |
-          # Login
-          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
-            -d "username=qaadmin&password=qapassword1" -o /dev/null
-
-          # Dispatch command
-          RESP=$(curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
-            -H "Content-Type: application/json" \
-            -d '{"plugin":"os_info","action":"os_name"}')
-          CMD_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null)
-
-          if [ -z "$CMD_ID" ]; then
-            echo "FAIL: Command dispatch failed: $RESP"
-            exit 1
-          fi
-
-          echo "Command dispatched: $CMD_ID"
-
-          # Poll for response
-          for i in $(seq 1 20); do
-            sleep 2
-            RESULT=$(curl -s -b /tmp/cookies.txt "http://localhost:8080/api/responses/$CMD_ID" | \
-              python3 -c "
-          import sys,json
-          d=json.load(sys.stdin)
-          for r in d.get('responses',[]):
-              o=r.get('output','')
-              if 'os_name|' in o:
-                  print(o.split('|',1)[1])
-                  break
-          " 2>/dev/null)
-            [ -n "$RESULT" ] && break
-          done
-
-          if [ -n "$RESULT" ]; then
-            echo "PASS: os_info returned '$RESULT' (${i}s)"
+          if OS=$(bash scripts/ci/qa-stack.sh roundtrip os_info os_name os_name 20); then
+            echo "PASS: os_info returned '$OS'"
           else
-            echo "FAIL: No response after polling"
+            echo "FAIL: no os_info.os_name answer within 40s"
             exit 1
           fi
+
+      # Last, so it covers the whole job: a service that crashed and was
+      # restarted by Docker is running again by now, but its count is not 0.
+      - name: Test — No service restarted
+        run: bash scripts/ci/qa-stack.sh check-stable
 
       - name: Collect logs
         if: always()
-        working-directory: /tmp/yuzu-qa
-        run: |
-          docker compose logs > /tmp/yuzu-qa/integration-logs.txt 2>&1
-          docker compose ps
+        run: bash scripts/ci/qa-stack.sh logs /tmp/yuzu-qa/integration-logs.txt
 
       - name: Upload logs
         if: always()
@@ -374,19 +283,31 @@ jobs:
         with:
           name: integration-logs
           path: /tmp/yuzu-qa/integration-logs.txt
-          retention-days: 3
+          retention-days: 90
 
       - name: Teardown
         if: always()
-        working-directory: /tmp/yuzu-qa
-        run: docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── Installer smoke tests: .deb on multiple distros ─────────────────
+  #
+  # Every package the release ships (server, agent, gateway) must be present,
+  # install, leave its unit file, RUN, and remove. "Runs" is the binary's own
+  # --version for server and agent. For the gateway (an OTP release with its
+  # own ERTS) it means started as its systemd unit starts it, with the
+  # yuzu_gw APPLICATION running and the node still up 10s later. A node that
+  # answers `ping` proves only that Erlang distribution is up. Installing is
+  # not enough: v0.13.0's packages install cleanly on debian:12 and then
+  # cannot start (GLIBC_2.38 not found).
+  #
+  # Intended reds, not flakes, until each is decided (#5151):
+  # - ubuntu:22.04 and debian:12, all three packages, and ubuntu:24.04 for
+  #   the server (GLIBCXX_3.4.34): the glibc/libstdc++ floor (#5143).
   install-deb:
     name: "Install .deb (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -398,41 +319,142 @@ jobs:
           name: release-artifacts
           path: artifacts
 
-      - name: Test .deb install and removal
+      - name: Test .deb install, run and removal
+        env:
+          DISTRO: ${{ matrix.distro }}
         run: |
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -euo pipefail
+          # runs LABEL CMD...: CMD must exit 0; a missing versioned
+          # glibc/libstdc++ symbol is named as the glibc floor (#5143).
+          runs() {
+            local label="$1" out rc=0; shift
+            out="$("$@" 2>&1)" || rc=$?
+            printf '%s\n' "$out"
+            [ "$rc" -eq 0 ] && { echo "PASS: $label (exit 0)"; return 0; }
+            # The loader's "version `GLIBC_2.38' not found", or dnf refusing
+            # an RPM whose auto-requires name one ("libstdc++.so.6(GLIBCXX_3.4.34)(64bit)").
+            if printf '%s' "$out" | grep -qE "(GLIBC|GLIBCXX|CXXABI)_[0-9.]+(' not found|\)\(64bit\))"; then
+              echo "FAIL: $label on $DISTRO: needs a newer glibc/libstdc++ than it ships (glibc floor, #5143)"
+            elif [ "$rc" -eq 124 ]; then
+              echo "FAIL: $label did not finish within its time bound"
+            else
+              echo "FAIL: $label exited $rc"
+            fi
+            return 1
+          }
+          apt-get update -qq
+          dpkg -i "/debs/$DEB_NAME" || apt-get install -f -y -qq
+          # `apt-get install -f` can "fix" a failed install by removing it.
+          dpkg -s "yuzu-$PKG" | grep -q '^Status: install ok installed' \
+            || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
+          echo 'PASS: installed'
+          test -f "/usr/lib/systemd/system/yuzu-$PKG.service" \
+            || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
+          echo 'PASS: systemd service file exists'
+          if [ "$PKG" = gateway ]; then
+            # Start it with the installed unit's own settings, read from the
+            # unit file (not under its sandboxing, and with `daemon` rather
+            # than its `foreground`): as its User=, in its WorkingDirectory=, with its
+            # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
+            # (/etc/yuzu/gateway.env, the per-install distribution cookie the
+            # postinst generates; yuzu_gw_app refuses to start without it).
+            UNIT=/usr/lib/systemd/system/yuzu-gateway.service
+            unit_val() { sed -n "s/^$1=//p" "$UNIT"; }
+            GW_USER=$(unit_val User); GW_DIR=$(unit_val WorkingDirectory)
+            ENV_FILE=$(unit_val EnvironmentFile); ENV_FILE=${ENV_FILE#-}
+            [ -n "$GW_USER" ] && [ -n "$GW_DIR" ] && [ -n "$ENV_FILE" ] \
+              || { echo "FAIL: $UNIT lacks User=, WorkingDirectory= or EnvironmentFile="; exit 1; }
+            test -f "$ENV_FILE" || { echo "FAIL: the package wrote no $ENV_FILE"; exit 1; }
+            GW_ENV=("HOME=$GW_DIR")
+            while IFS= read -r KV; do GW_ENV+=("$KV"); done < <(unit_val Environment)
+            while IFS= read -r KV; do
+              case "$KV" in ''|'#'*) ;; *) GW_ENV+=("$KV") ;; esac
+            done < "$ENV_FILE"
+            GW=(runuser -u "$GW_USER" -- env "${GW_ENV[@]}" /opt/yuzu_gw/bin/yuzu_gw)
+            cd "$GW_DIR"
+            gw_fail() {
+              tail -n 40 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
+                echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
+              else
+                echo "FAIL: $1 (the gateway log, if any, is above)"
+              fi
+              exit 1
+            }
+            # `daemon` returns once the node is up, and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            runs "yuzu_gw daemon" timeout 90 "${GW[@]}" daemon \
+              || gw_fail "the gateway node did not come up on $DISTRO"
+            # `daemon` returning, and `ping` answering pong, prove only that
+            # Erlang distribution is up. That happens before the yuzu_gw
+            # application starts, and even when it never does. Poll the
+            # application itself, against a deadline.
+            UP=no; END=$((SECONDS + 30))
+            while [ "$SECONDS" -lt "$END" ]; do
+              if [ "$(timeout 10 "${GW[@]}" eval \
+                      'lists:keymember(yuzu_gw,1,application:which_applications()).' 2>/dev/null)" = true ]; then
+                UP=yes; break
+              fi
+              sleep 1
+            done
+            [ "$UP" = yes ] || gw_fail "the yuzu_gw application was not running 30s after the node came up on $DISTRO"
+            echo 'PASS: the yuzu_gw application is running'
+            # Still up 10s later: an application that starts and then crashes
+            # takes the node down with it (it is permanent).
+            sleep 10
+            timeout 10 "${GW[@]}" ping >/dev/null 2>&1 \
+              || gw_fail "the gateway node stopped within 10s of starting on $DISTRO"
+            echo 'PASS: the gateway node is still up 10s later'
+            timeout 60 "${GW[@]}" stop || { echo "FAIL: yuzu_gw stop exited $?"; exit 1; }
+            echo 'PASS: the gateway stopped cleanly'
+          else
+            runs "yuzu-$PKG --version" "/usr/local/bin/yuzu-$PKG" --version
+          fi
+          dpkg -r "yuzu-$PKG"
+          echo 'PASS: removed cleanly'
+          SMOKE
+          shopt -s nullglob
+          FAIL=0
           for PKG in server agent gateway; do
-            DEB=$(ls artifacts/yuzu-${PKG}*.deb 2>/dev/null | head -1)
-            [ -z "$DEB" ] && { echo "SKIP: no yuzu-$PKG .deb found"; continue; }
-
-            echo "=== Testing $DEB on ${{ matrix.distro }} ==="
-
-            docker run --rm -v "$PWD/artifacts:/debs:ro" "${{ matrix.distro }}" bash -c "
-              set -e
-              apt-get update -qq
-              dpkg -i /debs/$(basename $DEB) 2>&1 || apt-get install -f -y -qq
-              echo 'PASS: installed'
-
-              # Verify service file
-              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
-                test -f /usr/lib/systemd/system/yuzu-gateway.service
-              echo 'PASS: systemd service file exists'
-
-              # Remove
-              dpkg -r yuzu-$PKG
-              echo 'PASS: removed cleanly'
-            "
+            # Exactly one per package: a missing package used to be a SKIP
+            # that passed, and with two, which one ships is a guess.
+            DEBS=(artifacts/yuzu-"$PKG"_*.deb)
+            if [ "${#DEBS[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one yuzu-${PKG}_*.deb in the release, found ${#DEBS[@]}: ${DEBS[*]}"
+              FAIL=1; continue
+            fi
+            echo "=== Testing ${DEBS[0]} on $DISTRO ==="
+            if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e DEB_NAME="$(basename "${DEBS[0]}")" \
+                 -v "$PWD/artifacts:/debs:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
+                 "$DISTRO" bash /smoke.sh; then
+              echo "::error::yuzu-$PKG failed the .deb smoke test on $DISTRO"
+              FAIL=1
+            fi
           done
+          exit "$FAIL"
 
   # ── Installer smoke tests: .rpm on Fedora/Rocky ─────────────────────
+  #
+  # Same contract as install-deb. fedora:42, not 40: the build's GCC 15
+  # libstdc++ (GLIBCXX_3.4.34) is not in fedora:40's, so that leg could never
+  # pass. `dnf install` of the file rather than `rpm -i`, because dnf resolves
+  # the package's dependencies the way an operator's install does.
+  #
+  # Intended reds, not flakes, until each is decided:
+  # - rockylinux:9, all three: the glibc/libstdc++ floor (#5143). The
+  #   gateway's bundled ERTS needs GLIBC_2.38 too, and #5171 is behind it.
+  # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
+  #   symbols Red Hat's OpenSSL lacks (#5171).
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        distro: ["fedora:40", "rockylinux:9"]
+        distro: ["fedora:42", "rockylinux:9"]
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -440,27 +462,118 @@ jobs:
           name: release-artifacts
           path: artifacts
 
-      - name: Test .rpm install and removal
+      - name: Test .rpm install, run and removal
+        env:
+          DISTRO: ${{ matrix.distro }}
         run: |
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
+          set -euo pipefail
+          # runs LABEL CMD...: as in install-deb.
+          runs() {
+            local label="$1" out rc=0; shift
+            out="$("$@" 2>&1)" || rc=$?
+            printf '%s\n' "$out"
+            [ "$rc" -eq 0 ] && { echo "PASS: $label (exit 0)"; return 0; }
+            # The loader's "version `GLIBC_2.38' not found", or dnf refusing
+            # an RPM whose auto-requires name one ("libstdc++.so.6(GLIBCXX_3.4.34)(64bit)").
+            if printf '%s' "$out" | grep -qE "(GLIBC|GLIBCXX|CXXABI)_[0-9.]+(' not found|\)\(64bit\))"; then
+              echo "FAIL: $label on $DISTRO: needs a newer glibc/libstdc++ than it ships (glibc floor, #5143)"
+            elif [ "$rc" -eq 124 ]; then
+              echo "FAIL: $label did not finish within its time bound"
+            else
+              echo "FAIL: $label exited $rc"
+            fi
+            return 1
+          }
+          runs "dnf install of yuzu-$PKG" dnf install -y -q "/rpms/$RPM_NAME"
+          rpm -q "yuzu-$PKG" >/dev/null || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
+          echo 'PASS: installed'
+          test -f "/usr/lib/systemd/system/yuzu-$PKG.service" \
+            || { echo "FAIL: no yuzu-$PKG.service"; exit 1; }
+          echo 'PASS: systemd service file exists'
+          if [ "$PKG" = gateway ]; then
+            # Start it with the installed unit's own settings, read from the
+            # unit file (not under its sandboxing, and with `daemon` rather
+            # than its `foreground`): as its User=, in its WorkingDirectory=, with its
+            # Environment= (RELX_REPLACE_OS_VARS=true) and its EnvironmentFile=
+            # (/etc/yuzu/gateway.env, the per-install distribution cookie the
+            # postinst generates; yuzu_gw_app refuses to start without it).
+            UNIT=/usr/lib/systemd/system/yuzu-gateway.service
+            unit_val() { sed -n "s/^$1=//p" "$UNIT"; }
+            GW_USER=$(unit_val User); GW_DIR=$(unit_val WorkingDirectory)
+            ENV_FILE=$(unit_val EnvironmentFile); ENV_FILE=${ENV_FILE#-}
+            [ -n "$GW_USER" ] && [ -n "$GW_DIR" ] && [ -n "$ENV_FILE" ] \
+              || { echo "FAIL: $UNIT lacks User=, WorkingDirectory= or EnvironmentFile="; exit 1; }
+            test -f "$ENV_FILE" || { echo "FAIL: the package wrote no $ENV_FILE"; exit 1; }
+            GW_ENV=("HOME=$GW_DIR")
+            while IFS= read -r KV; do GW_ENV+=("$KV"); done < <(unit_val Environment)
+            while IFS= read -r KV; do
+              case "$KV" in ''|'#'*) ;; *) GW_ENV+=("$KV") ;; esac
+            done < "$ENV_FILE"
+            # fedora:42's base image has no runuser (util-linux): a test tool,
+            # not a dependency of the package under test.
+            command -v runuser >/dev/null || dnf install -y -q util-linux \
+              || { echo "FAIL: could not install runuser (util-linux) for the gateway check"; exit 1; }
+            GW=(runuser -u "$GW_USER" -- env "${GW_ENV[@]}" /opt/yuzu_gw/bin/yuzu_gw)
+            cd "$GW_DIR"
+            gw_fail() {
+              tail -n 40 /opt/yuzu_gw/log/erlang.log.* 2>/dev/null || true
+              if grep -qs 'Failed to load NIF' /opt/yuzu_gw/log/erlang.log.*; then
+                echo "FAIL: $1: the gateway's bundled OTP crypto NIF cannot load against $DISTRO's OpenSSL (#5171)"
+              else
+                echo "FAIL: $1 (the gateway log, if any, is above)"
+              fi
+              exit 1
+            }
+            # `daemon` returns once the node is up, and waits FOREVER if the
+            # node dies while booting (relx polls is_alive), hence the bound.
+            runs "yuzu_gw daemon" timeout 90 "${GW[@]}" daemon \
+              || gw_fail "the gateway node did not come up on $DISTRO"
+            # `daemon` returning, and `ping` answering pong, prove only that
+            # Erlang distribution is up. That happens before the yuzu_gw
+            # application starts, and even when it never does. Poll the
+            # application itself, against a deadline.
+            UP=no; END=$((SECONDS + 30))
+            while [ "$SECONDS" -lt "$END" ]; do
+              if [ "$(timeout 10 "${GW[@]}" eval \
+                      'lists:keymember(yuzu_gw,1,application:which_applications()).' 2>/dev/null)" = true ]; then
+                UP=yes; break
+              fi
+              sleep 1
+            done
+            [ "$UP" = yes ] || gw_fail "the yuzu_gw application was not running 30s after the node came up on $DISTRO"
+            echo 'PASS: the yuzu_gw application is running'
+            # Still up 10s later: an application that starts and then crashes
+            # takes the node down with it (it is permanent).
+            sleep 10
+            timeout 10 "${GW[@]}" ping >/dev/null 2>&1 \
+              || gw_fail "the gateway node stopped within 10s of starting on $DISTRO"
+            echo 'PASS: the gateway node is still up 10s later'
+            timeout 60 "${GW[@]}" stop || { echo "FAIL: yuzu_gw stop exited $?"; exit 1; }
+            echo 'PASS: the gateway stopped cleanly'
+          else
+            runs "yuzu-$PKG --version" "/usr/bin/yuzu-$PKG" --version
+          fi
+          rpm -e "yuzu-$PKG"
+          echo 'PASS: removed cleanly'
+          SMOKE
+          shopt -s nullglob
+          FAIL=0
           for PKG in server agent gateway; do
-            RPM=$(ls artifacts/yuzu-${PKG}*.rpm 2>/dev/null | head -1)
-            [ -z "$RPM" ] && { echo "SKIP: no yuzu-$PKG .rpm found"; continue; }
-
-            echo "=== Testing $RPM on ${{ matrix.distro }} ==="
-
-            docker run --rm -v "$PWD/artifacts:/rpms:ro" "${{ matrix.distro }}" bash -c "
-              set -e
-              rpm -i /rpms/$(basename $RPM)
-              echo 'PASS: installed'
-
-              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
-                test -f /usr/lib/systemd/system/yuzu-gateway.service
-              echo 'PASS: systemd service file exists'
-
-              rpm -e yuzu-$PKG
-              echo 'PASS: removed cleanly'
-            "
+            RPMS=(artifacts/yuzu-"$PKG"-[0-9]*.rpm)
+            if [ "${#RPMS[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one yuzu-$PKG-<version>.rpm in the release, found ${#RPMS[@]}: ${RPMS[*]}"
+              FAIL=1; continue
+            fi
+            echo "=== Testing ${RPMS[0]} on $DISTRO ==="
+            if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e RPM_NAME="$(basename "${RPMS[0]}")" \
+                 -v "$PWD/artifacts:/rpms:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
+                 "$DISTRO" bash /smoke.sh; then
+              echo "::error::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
+              FAIL=1
+            fi
           done
+          exit "$FAIL"
 
   # ── Windows installer smoke test ────────────────────────────────────
   #
@@ -478,8 +591,9 @@ jobs:
     name: "Install Windows .exe"
     needs: resolve
     runs-on: windows-2022
-    # Two install/uninstall cycles plus the bounded service polls. The uninstaller alone now
-    # spends up to 15s polling for STOPPED against a service that is genuinely running.
+    # Two install/uninstall cycles plus bounded service polls. Worst case: 60s to reach
+    # Running + a 20s hold, 60s to reach Stopped, 90s for the fail-closed pass to stop, and a
+    # 3-minute deadline on each uninstall = ~11 min, plus the installs and the download.
     timeout-minutes: 20
     steps:
       - name: Download artifacts
@@ -586,18 +700,55 @@ jobs:
         shell: pwsh
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
-          if (Test-Path $uninstaller) {
-            Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
-            Start-Sleep -Seconds 3
+          $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
+          $log = Join-Path $PWD 'uninstall-notls.log'
+          # AppId from deploy/packaging/windows/yuzu-agent.iss; Inno Setup names the key <AppId>_is1.
+          $keyName = '{B7F3A2E1-9C4D-4F6A-8E2B-1D3C5A7F9E0B}_is1'
+          $keys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$keyName",
+                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$keyName")
+          function Get-KeysLeft { @($keys | Where-Object { Test-Path $_ }) }
+          # unins000.exe copies itself to %TEMP%, starts the copy (_unins*.tmp /
+          # _iu*.tmp) and exits at once, so its own exit proves nothing: #5145's
+          # first fix PASSED here at 2.4s with the copy still running. Done means
+          # no uninstaller process of any of those names, the Uninstall key gone
+          # and the binary gone. Bounded rather than Start-Process -Wait, which
+          # also waits on descendants and held the job to its timeout.
+          function Get-Uninstallers {
+            @(Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'unins000' -or $_.Name -like '_unins*' -or $_.Name -like '_iu*' })
           }
-          if (Test-Path "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe") {
-            Write-Error "FAIL: binary still present after uninstall"
+          if (-not (Test-Path $uninstaller)) {
+            if ((Get-KeysLeft).Count -gt 0 -or (Test-Path $bin)) {
+              Write-Error "FAIL: the agent is installed but $uninstaller is missing"
+              exit 1
+            }
+            Write-Host "Nothing installed, nothing to uninstall"
+            exit 0
+          }
+          $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            Start-Sleep -Seconds 2
+            $procs = Get-Uninstallers
+            $keysLeft = Get-KeysLeft
+            $busy = (-not $p.HasExited) -or $procs.Count -gt 0 -or $keysLeft.Count -gt 0 -or (Test-Path $bin)
+          } while ($busy -and (Get-Date) -lt $deadline)
+          if ($busy) {
+            $why = @()
+            if ($procs.Count -gt 0) { $why += "uninstaller still running ($(($procs | ForEach-Object { $_.Name }) -join ', '))" }
+            if ($keysLeft.Count -gt 0) { $why += "Uninstall key still present ($($keysLeft -join ', '))" }
+            if (Test-Path $bin) { $why += "$bin still present" }
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            # Free the runner for the steps after this one.
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Error "FAIL: uninstall not complete after 3 minutes: $($why -join '; ')"
             exit 1
           }
-          Write-Host "PASS: uninstalled cleanly"
+          Write-Host "PASS: uninstalled cleanly (no uninstaller process, Uninstall key and binary gone)"
 
       # ── Pass 2: default TLS posture — must fail closed ────────────────
       - name: Silent install (default TLS posture)
+        id: tls_install
         shell: pwsh
         run: |
           $installer = Get-ChildItem "artifacts/YuzuAgentSetup-*.exe" | Select-Object -First 1
@@ -650,20 +801,69 @@ jobs:
           }
           Write-Host "PASS: fail-closed for the expected reason (no pinnable CA)"
 
+      # The assertion above copies the log only once the service has stopped;
+      # if WaitForStatus throws first, this is the only copy — and the
+      # uninstaller deletes {app}\logs. Mirrors the --no-tls pass.
+      # Only once pass 2's install succeeded: otherwise the log on disk is pass 1's
+      # (or none), and saving it as agent-tls.log would mislabel it.
+      - name: Collect agent log (TLS pass)
+        if: always() && steps.tls_install.outcome == 'success'
+        shell: pwsh
+        run: |
+          $log = "${env:ProgramFiles}\Yuzu\logs\yuzu-agent.log"
+          if (Test-Path $log) { Copy-Item $log agent-tls.log -Force; Get-Content $log -Tail 40 }
+          else { Write-Host "no agent log at $log" }
+
       - name: Silent uninstall (TLS pass)
         if: always()
         shell: pwsh
         run: |
           $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
-          if (Test-Path $uninstaller) {
-            Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
-            Start-Sleep -Seconds 3
+          $bin = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
+          $log = Join-Path $PWD 'uninstall-tls.log'
+          # AppId from deploy/packaging/windows/yuzu-agent.iss; Inno Setup names the key <AppId>_is1.
+          $keyName = '{B7F3A2E1-9C4D-4F6A-8E2B-1D3C5A7F9E0B}_is1'
+          $keys = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$keyName",
+                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$keyName")
+          function Get-KeysLeft { @($keys | Where-Object { Test-Path $_ }) }
+          # unins000.exe copies itself to %TEMP%, starts the copy (_unins*.tmp /
+          # _iu*.tmp) and exits at once, so its own exit proves nothing: #5145's
+          # first fix PASSED here at 2.4s with the copy still running. Done means
+          # no uninstaller process of any of those names, the Uninstall key gone
+          # and the binary gone. Bounded rather than Start-Process -Wait, which
+          # also waits on descendants and held the job to its timeout.
+          function Get-Uninstallers {
+            @(Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'unins000' -or $_.Name -like '_unins*' -or $_.Name -like '_iu*' })
           }
-          if (Test-Path "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe") {
-            Write-Error "FAIL: binary still present after uninstall"
+          if (-not (Test-Path $uninstaller)) {
+            if ((Get-KeysLeft).Count -gt 0 -or (Test-Path $bin)) {
+              Write-Error "FAIL: the agent is installed but $uninstaller is missing"
+              exit 1
+            }
+            Write-Host "Nothing installed, nothing to uninstall"
+            exit 0
+          }
+          $p = Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(3)
+          do {
+            Start-Sleep -Seconds 2
+            $procs = Get-Uninstallers
+            $keysLeft = Get-KeysLeft
+            $busy = (-not $p.HasExited) -or $procs.Count -gt 0 -or $keysLeft.Count -gt 0 -or (Test-Path $bin)
+          } while ($busy -and (Get-Date) -lt $deadline)
+          if ($busy) {
+            $why = @()
+            if ($procs.Count -gt 0) { $why += "uninstaller still running ($(($procs | ForEach-Object { $_.Name }) -join ', '))" }
+            if ($keysLeft.Count -gt 0) { $why += "Uninstall key still present ($($keysLeft -join ', '))" }
+            if (Test-Path $bin) { $why += "$bin still present" }
+            if (Test-Path $log) { Get-Content $log -Tail 40 }
+            # Free the runner for the steps after this one.
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Error "FAIL: uninstall not complete after 3 minutes: $($why -join '; ')"
             exit 1
           }
-          Write-Host "PASS: uninstalled cleanly"
+          Write-Host "PASS: uninstalled cleanly (no uninstaller process, Uninstall key and binary gone)"
 
       - name: Collect failure diagnostics
         if: failure()
@@ -690,9 +890,11 @@ jobs:
             install-tls.log
             agent-notls.log
             agent-tls.log
+            uninstall-notls.log
+            uninstall-tls.log
             system-events.log
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 90
 
   # ── macOS installer smoke test ──────────────────────────────────────
   install-macos:
@@ -709,17 +911,29 @@ jobs:
 
       - name: Install .pkg
         run: |
-          PKG=$(ls artifacts/YuzuAgent-*.pkg 2>/dev/null | head -1)
-          [ -z "$PKG" ] && { echo "SKIP: no .pkg found"; exit 0; }
-          echo "Installing: $PKG"
-          sudo installer -pkg "$PKG" -target / -verboseR
+          # The release ships a macOS agent .pkg; its absence is a failure,
+          # not a SKIP that passes while testing nothing (#5151).
+          shopt -s nullglob
+          PKGS=(artifacts/YuzuAgent-*.pkg)
+          if [ "${#PKGS[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one YuzuAgent-*.pkg in the release, found ${#PKGS[@]}: ${PKGS[*]}"
+            exit 1
+          fi
+          echo "Installing: ${PKGS[0]}"
+          sudo installer -pkg "${PKGS[0]}" -target / -verboseR
 
       - name: Verify installation
         run: |
           test -x /usr/local/bin/yuzu-agent && echo "PASS: binary installed" || { echo "FAIL: binary missing"; exit 1; }
-          /usr/local/bin/yuzu-agent --version
+          /usr/local/bin/yuzu-agent --version || { echo "FAIL: --version exited $?"; exit 1; }
           test -f /Library/LaunchDaemons/com.yuzu.agent.plist && echo "PASS: launchd plist installed" || { echo "FAIL: plist missing"; exit 1; }
-          PLUGINS=$(ls /usr/local/lib/yuzu/plugins/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+          # Same floor as the Windows job: an install with no plugins is an
+          # agent that can do nothing, and used to pass here.
+          PLUGINS=$(find /usr/local/lib/yuzu/plugins -maxdepth 1 -name '*.dylib' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$PLUGINS" -lt 5 ]; then
+            echo "FAIL: only $PLUGINS plugins in /usr/local/lib/yuzu/plugins"
+            exit 1
+          fi
           echo "PASS: $PLUGINS plugins installed"
 
   # ── Artifact deep inspection ────────────────────────────────────────
@@ -743,20 +957,34 @@ jobs:
         run: |
           cd artifacts
 
+          # Each check fails the step on its own: `check && echo PASS` under
+          # bash -e only fails when it is the step's LAST command, so every
+          # earlier miss used to pass silently.
+          # The listing goes to a file first: `tar | grep -q` under pipefail
+          # can fail a present entry when grep exits early and tar takes SIGPIPE.
+          has() { tar tzf "$1" > "$1.list" && grep -q "$2" "$1.list" && echo "PASS: $3" || { echo "FAIL: $3 ($2 not in $1)"; exit 1; }; }
+
           echo "=== Linux x64 archive ==="
-          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: server binary"
-          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: agent binary"
+          has yuzu-linux-x64.tar.gz 'bin/yuzu-server' "server binary"
+          has yuzu-linux-x64.tar.gz 'bin/yuzu-agent' "agent binary"
           PLUGINS=$(tar tzf yuzu-linux-x64.tar.gz | grep -c '\.so$' || true)
           echo "Plugins: $PLUGINS"
           [ "$PLUGINS" -ge 30 ] && echo "PASS: plugin count" || { echo "FAIL: only $PLUGINS plugins"; exit 1; }
 
           echo "=== Gateway archive ==="
-          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'bin/yuzu_gw' && echo "PASS: gateway binary"
-          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'releases/' && echo "PASS: Erlang release structure"
+          has yuzu-gateway-linux-x64.tar.gz 'bin/yuzu_gw' "gateway binary"
+          has yuzu-gateway-linux-x64.tar.gz 'releases/' "Erlang release structure"
 
-          echo "=== ARM64 archive ==="
-          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: ARM64 server"
-          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: ARM64 agent"
+          # release.yml does not build a Linux ARM64 archive yet (its release
+          # notes list it as "coming soon"); check it only once it ships.
+          if [ -f yuzu-linux-arm64.tar.gz ]; then
+            echo "=== ARM64 archive ==="
+            has yuzu-linux-arm64.tar.gz 'bin/yuzu-server' "ARM64 server"
+            has yuzu-linux-arm64.tar.gz 'bin/yuzu-agent' "ARM64 agent"
+          else
+            echo "::warning::ARM64 archive NOT CHECKED: this release ships no yuzu-linux-arm64.tar.gz"
+            echo "- ARM64 archive: **not checked** (not in this release)" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Inspect Linux binaries
         run: |
@@ -787,12 +1015,28 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
-          for deb in *.deb; do
+          # The control Version spells a pre-release with `~` (0.14.0~rc3) so dpkg
+          # orders it BEFORE 0.14.0, while the tag uses `-` (0.14.0-rc3) — and,
+          # from PR #5160 on, so does the .deb FILE name (yuzu-agent_0.14.0-rc3_amd64.deb).
+          # Compare the control field against the Debian spelling of the tag. A
+          # mismatch is a package that installs as the wrong version: it fails.
+          WANT="${VERSION/-/\~}"
+          shopt -s nullglob
+          DEBS=(*.deb)
+          [ "${#DEBS[@]}" -gt 0 ] || { echo "FAIL: no .deb in the release"; exit 1; }
+          FAIL=0
+          for deb in "${DEBS[@]}"; do
             echo "=== $deb ==="
             dpkg-deb --field "$deb" Package Version
             DEB_VER=$(dpkg-deb --field "$deb" Version)
-            [ "$DEB_VER" = "$VERSION" ] && echo "PASS: version matches" || echo "WARN: version $DEB_VER != $VERSION"
+            if [ "$DEB_VER" = "$WANT" ]; then
+              echo "PASS: version $DEB_VER matches $VERSION"
+            else
+              echo "::error::$deb: control Version $DEB_VER != $WANT (tag $VERSION)"
+              FAIL=1
+            fi
           done
+          exit "$FAIL"
 
       - name: Inspect RPM metadata
         run: |
@@ -808,9 +1052,13 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
+          for img in yuzu-server yuzu-agent-chisel yuzu-gateway; do
             echo "=== $img ==="
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
+            # Every release publishes these images; a missing one is a failure, not a
+            # SKIP that passes while inspecting nothing (#5151). One retry for a
+            # registry blip.
+            docker pull -q "$REGISTRY/$img:$VERSION" || { sleep 15; docker pull -q "$REGISTRY/$img:$VERSION"; } \
+              || { echo "::error::$img:$VERSION could not be pulled from $REGISTRY"; exit 1; }
             # Non-root user
             USER=$(docker inspect "$REGISTRY/$img:$VERSION" --format='{{.Config.User}}')
             [ -n "$USER" ] && [ "$USER" != "root" ] && echo "PASS: non-root user ($USER)" || echo "WARN: running as root"
@@ -855,9 +1103,11 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          # A missing image must fail here: Trivy would otherwise scan nothing and
+          # the job would read as a clean scan (#5151). One retry for a registry blip.
           for img in yuzu-server yuzu-gateway; do
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
-              || echo "SKIP: $img:$VERSION not found"
+            docker pull -q "$REGISTRY/$img:$VERSION" || { sleep 15; docker pull -q "$REGISTRY/$img:$VERSION"; } \
+              || { echo "::error::$img:$VERSION could not be pulled from $REGISTRY"; exit 1; }
           done
 
       - name: Scan yuzu-server
@@ -887,16 +1137,23 @@ jobs:
           name: security-scan
           path: |
             trivy-*.txt
-          retention-days: 7
+          retention-days: 90
 
   # ── Soak test (10 min stability) ────────────────────────────────────
   soak-test:
     name: "Soak test (10 min)"
     needs: [resolve, integration]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # From qa-stack.sh's "Time budget": setup ~1 min + `up` <= 35 min +
+    # baseline checks and reads (two 30s wait-metrics, two metric reads)
+    # <= 4 min + the soak (600s + one sample in flight, a sample <= ~200s:
+    # three docker reads, a metric read <= 90s, readyz 10s, stats, a
+    # round-trip <= 80s) <= 13.5 min + end-of-soak reads, crash check,
+    # upload and teardown <= 6 min = ~59.5 min.
+    timeout-minutes: 60
     env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
+      QA_STATE_DIR: /tmp/yuzu-soak
+      QA_PROJECT: yuzu-soak
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -916,126 +1173,178 @@ jobs:
       - name: Start stack
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
-        run: |
-          mkdir -p /tmp/yuzu-soak
-
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'soakpass1', salt, 100000, dklen=32)
-          print(f'soak:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-soak/yuzu-server.cfg
-
-          cat > /tmp/yuzu-soak/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:$VERSION
-              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
-              ports: ["8080:8080","50055:50055"]
-              volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
-              # curl is NOT in the server runtime image — see the integration
-              # job's compose above. bash + /dev/tcp is the supported probe.
-              healthcheck:
-                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-            gateway:
-              image: $REGISTRY/yuzu-gateway:$VERSION
-              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50051:50051","50063:50063","8081:8081","9568:9568"]
-              depends_on:
-                server:
-                  condition: service_healthy
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:$VERSION
-              command: ["--server","gateway:50051","--no-tls"]
-              depends_on: [gateway]
-          COMPOSE
-
-          cd /tmp/yuzu-soak
-          docker compose up -d
-
-          # Wait for full stack
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
-          echo "Stack ready, agent registered"
+        run: bash scripts/ci/qa-stack.sh up "$VERSION"
 
       - name: Run soak (10 minutes)
+        env:
+          SOAK_SECONDS: "600"
+          SOAK_INTERVAL: "30"
         run: |
-          echo "Starting 10-minute soak test..."
-          echo "timestamp,server,gateway,agent,agents_registered" > /tmp/yuzu-soak/soak.csv
+          QA=scripts/ci/qa-stack.sh
+          CSV="$QA_STATE_DIR/soak.csv"
+          echo "Starting a ${SOAK_SECONDS}s soak test, sampling every ${SOAK_INTERVAL}s..."
+          echo 'timestamp,state,agents_connected,gw_ready,roundtrip,memory,problems' > "$CSV"
 
-          # Login for commands
-          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
-            -d "username=soak&password=soakpass1" -o /dev/null
+          # Baseline 1: every service running with a restart count of 0. A
+          # restart during bring-up is a crash too; comparing later samples to
+          # whatever count the soak started with used to absorb it.
+          bash "$QA" check-stable || { echo "FAIL: the stack was not stable when the soak began"; exit 1; }
 
-          FAILURES=0
-          for i in $(seq 1 20); do
+          # Baseline 2: the registration counters. An agent that drops and
+          # reconnects BETWEEN two samples is back by the next one, so the
+          # connected gauge never sees it; each reconnect bumps these. Both
+          # must be >= 1 already (an agent connected during `up`): a 0 means the
+          # family is gone, and a delta of 0 - 0 would prove nothing.
+          # The gateway sets its metrics on a timer and `up` waited only for the
+          # SERVER's gauge, so wait until the gateway also shows the agent's
+          # stream; a baseline read before that would count the agent's own
+          # first connect as a reconnect.
+          bash "$QA" wait-metric gateway yuzu_gw_agents_current 1 30 >/dev/null \
+            || { echo "FAIL: the gateway shows no agent stream (yuzu_gw_agents_current) 30s into the soak"; exit 1; }
+          bash "$QA" wait-metric gateway yuzu_gw_agents_connected_total 1 30 >/dev/null \
+            || { echo "FAIL: yuzu_gw_agents_connected_total is still 0 30s into the soak"; exit 1; }
+          REG0=$(bash "$QA" metric server yuzu_agents_registered_total) \
+            || { echo "FAIL: could not read yuzu_agents_registered_total at the start of the soak"; exit 1; }
+          GWC0=$(bash "$QA" metric gateway yuzu_gw_agents_connected_total) \
+            || { echo "FAIL: could not read yuzu_gw_agents_connected_total at the start of the soak"; exit 1; }
+          if [ "$REG0" -lt 1 ] || [ "$GWC0" -lt 1 ]; then
+            echo "FAIL: registration counters at start are yuzu_agents_registered_total=$REG0, yuzu_gw_agents_connected_total=$GWC0; both must be >= 1 once an agent has connected"
+            exit 1
+          fi
+          echo "Counters at start: yuzu_agents_registered_total=$REG0 yuzu_gw_agents_connected_total=$GWC0"
+
+          # A wall-clock loop: every sample starts SOAK_INTERVAL after the
+          # previous one started, until SOAK_SECONDS have passed.
+          FAILURES=0; SAMPLES=0; RT_OK=0; RT_FAIL=0
+          FIRST_MEM=""; FIRST_MEM_TS=""; LAST_MEM=""
+          END=$((SECONDS + SOAK_SECONDS))
+          while [ "$SECONDS" -lt "$END" ]; do
+            SAMPLES=$((SAMPLES + 1))
+            NEXT=$((SECONDS + SOAK_INTERVAL))
             TS=$(date +%H:%M:%S)
-
-            # Check all containers running
-            RUNNING=$(cd /tmp/yuzu-soak && docker compose ps --format json | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          states = [c.get('State','') for c in (data if isinstance(data, list) else [data])]
-          print(len([s for s in states if s == 'running']))
-          " 2>/dev/null || echo "0")
-
-            # Check agent count
-            AGENTS=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-
-            # Check gateway health
+            PROBLEMS=""
+            RUNNING=$(bash "$QA" running)
+            RESTARTS=$(bash "$QA" restarts)
+            STATE=$(bash "$QA" state)
+            [ "$RUNNING" -eq 4 ] || PROBLEMS+="only $RUNNING/4 services running; "
+            [ "$RESTARTS" -eq 0 ] || PROBLEMS+="$RESTARTS container restart(s); "
+            if AGENTS=$(bash "$QA" metric server yuzu_agents_connected); then
+              [ "$AGENTS" -ge 1 ] || PROBLEMS+="no agent connected; "
+            else
+              AGENTS="?"; PROBLEMS+="metric fetch failed (yuzu_agents_connected); "
+            fi
             GW_OK="yes"
-            curl -sf http://localhost:8081/readyz &>/dev/null || GW_OK="no"
+            curl -sf --max-time 10 http://127.0.0.1:8081/readyz 2>/dev/null | grep -q '"ready"' || GW_OK="no"
+            [ "$GW_OK" = yes ] || PROBLEMS+="gateway not ready; "
+            MEM=$(bash "$QA" stats)
+            LAST_MEM="$MEM"
 
-            # Memory (container RSS)
-            SERVER_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-server-1 2>/dev/null | cut -d/ -f1 || echo "?")
-            GW_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-gateway-1 2>/dev/null | cut -d/ -f1 || echo "?")
-            AGENT_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-agent-1 2>/dev/null | cut -d/ -f1 || echo "?")
+            # Every other sample (~once a minute) a real command round-trip
+            # through server -> gateway -> agent -> plugin and back, bounded
+            # at 20s. `status.health` answers `uptime_seconds|<n>`.
+            RT="-"
+            if [ $((SAMPLES % 2)) -eq 0 ]; then
+              if UP=$(bash "$QA" roundtrip status health uptime_seconds 10); then
+                RT="ok(uptime=${UP}s)"; RT_OK=$((RT_OK + 1))
+                # The memory baseline is the sample of the first successful
+                # round-trip, not the first sample: the server grows from its
+                # just-started size (24MiB -> 67MiB by the first round-trip on
+                # rc2, then steadily to 125MiB over the soak), so a first-sample
+                # baseline warned on every soak. This does not show warm-up has
+                # ended; memory stays informational.
+                [ -n "$FIRST_MEM" ] || { FIRST_MEM="$MEM"; FIRST_MEM_TS="$TS"; }
+              else
+                RT="FAIL"; RT_FAIL=$((RT_FAIL + 1)); PROBLEMS+="command round-trip failed; "
+              fi
+            fi
 
-            echo "$TS  containers=$RUNNING  agents=$AGENTS  gw=$GW_OK  mem=[S:$SERVER_MEM G:$GW_MEM A:$AGENT_MEM]"
-            echo "$TS,$SERVER_MEM,$GW_MEM,$AGENT_MEM,$AGENTS" >> /tmp/yuzu-soak/soak.csv
-
-            if [ "$RUNNING" -lt 3 ] || [ "$AGENTS" -lt 1 ] || [ "$GW_OK" = "no" ]; then
+            echo "$TS  running=$RUNNING/4  restarts=$RESTARTS  agents=$AGENTS  gw=$GW_OK  cmd=$RT  mem=[$MEM]"
+            echo "$TS,$STATE,$AGENTS,$GW_OK,$RT,$MEM,\"${PROBLEMS%; }\"" >> "$CSV"
+            if [ -n "$PROBLEMS" ]; then
               FAILURES=$((FAILURES + 1))
-              echo "WARNING: degraded state at $TS"
+              echo "WARNING: degraded sample at $TS: ${PROBLEMS%; } ($STATE)"
             fi
 
-            # Send a command every 30s to exercise the data path
-            if [ $((i % 2)) -eq 0 ]; then
-              curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
-                -H "Content-Type: application/json" \
-                -d '{"plugin":"status","action":"ping"}' > /dev/null 2>&1
-            fi
-
-            sleep 30
+            WAIT=$((NEXT - SECONDS))
+            LEFT=$((END - SECONDS))
+            [ "$WAIT" -le "$LEFT" ] || WAIT=$LEFT
+            if [ "$WAIT" -gt 0 ]; then sleep "$WAIT"; fi
           done
 
           echo ""
-          if [ "$FAILURES" -eq 0 ]; then
-            echo "PASS: Soak test completed — 10 minutes, 0 failures"
-          else
-            echo "FAIL: $FAILURES degraded samples during soak"
-            exit 1
+          VERDICT=0
+          echo "Command round-trips: $RT_OK ok, $RT_FAIL failed"
+          if [ "$RT_OK" -eq 0 ]; then
+            echo "FAIL: no command round-trip succeeded during the soak"
+            VERDICT=1
+          fi
+          if [ "$FAILURES" -ne 0 ]; then
+            echo "FAIL: $FAILURES of $SAMPLES samples degraded"
+            VERDICT=1
           fi
 
+          # The counters again: any reconnect in between fails the soak.
+          REG1=$(bash "$QA" metric server yuzu_agents_registered_total) \
+            || { REG1="?"; echo "FAIL: could not read yuzu_agents_registered_total at the end of the soak"; VERDICT=1; }
+          GWC1=$(bash "$QA" metric gateway yuzu_gw_agents_connected_total) \
+            || { GWC1="?"; echo "FAIL: could not read yuzu_gw_agents_connected_total at the end of the soak"; VERDICT=1; }
+          if [ "$GWC1" != "?" ] && [ "$GWC1" -ne "$GWC0" ]; then
+            echo "FAIL: the gateway accepted $((GWC1 - GWC0)) agent connection(s) during the soak (yuzu_gw_agents_connected_total $GWC0 -> $GWC1): an agent dropped and reconnected"
+            VERDICT=1
+          fi
+          if [ "$REG1" != "?" ] && [ "$REG1" -ne "$REG0" ]; then
+            if [ "$GWC1" != "?" ] && [ "$GWC1" -eq "$GWC0" ]; then
+              # The server saw a registration, the gateway no new connection:
+              # the gateway re-sent a registration over its existing stream
+              # (e.g. replaying after an upstream failure).
+              echo "FAIL: the server recorded $((REG1 - REG0)) agent re-registration(s) during the soak (yuzu_agents_registered_total $REG0 -> $REG1) while the gateway accepted no new agent connection: the gateway replayed registrations, e.g. after an upstream failure"
+            else
+              echo "FAIL: the server recorded $((REG1 - REG0)) agent re-registration(s) during the soak (yuzu_agents_registered_total $REG0 -> $REG1): an agent reconnected, or the gateway replayed registrations after an upstream failure"
+            fi
+            VERDICT=1
+          fi
+
+          # Memory is informational — a soak this short cannot establish a
+          # leak — but a service that more than doubled is worth a look.
+          GROWTH=""
+          [ -z "$FIRST_MEM" ] || GROWTH=$(bash "$QA" mem-growth "$FIRST_MEM" "$LAST_MEM")
+          while IFS= read -r LINE; do
+            [ -n "$LINE" ] && echo "::warning::Soak memory more than doubled: $LINE"
+          done <<< "$GROWTH"
+
+          {
+            echo "### Soak test"
+            echo ""
+            echo "- Samples: $SAMPLES over ${SOAK_SECONDS}s, $FAILURES degraded"
+            echo "- Command round-trips: $RT_OK ok, $RT_FAIL failed"
+            echo "- yuzu_agents_registered_total: $REG0 -> $REG1; yuzu_gw_agents_connected_total: $GWC0 -> $GWC1 (a reconnect between samples shows here)"
+            if [ -n "$FIRST_MEM" ]; then
+              echo "- Memory (informational, not a pass/fail criterion): baseline after warm-up, at the first successful round-trip ($FIRST_MEM_TS) [$FIRST_MEM], last [$LAST_MEM]"
+            else
+              echo "- Memory (informational): no baseline, as no round-trip succeeded; last [$LAST_MEM]"
+            fi
+            if [ -n "$GROWTH" ]; then
+              echo "- Memory more than doubled (warning only): $(printf '%s' "$GROWTH" | tr '\n' ';')"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$VERDICT" -eq 0 ]; then
+            echo "PASS: soak completed — $SAMPLES samples, none degraded, no container restarts, no agent reconnects"
+          fi
+          exit "$VERDICT"
+
+      # Per service (qa-stack.sh crash-check): Postgres' logs are not checked
+      # (PANIC is one of its log levels). The gateway also fails on an OTP
+      # process crash (`crasher: initial call`) or a supervisor restart
+      # (`Supervisor: ... Context: child_terminated|start_error|...`), in the
+      # header-less format the reference sys.config's logger template writes,
+      # or the legacy CRASH/SUPERVISOR REPORT spelling. Either leaves the node
+      # running, so no restart count shows it.
       - name: Check for crashes in logs
         if: always()
         run: |
-          cd /tmp/yuzu-soak
-          docker compose logs > soak-logs.txt 2>&1
-          if grep -iE 'segfault|ASAN|UBSAN|panic|SIGABRT|core dump' soak-logs.txt; then
-            echo "FAIL: crash detected in logs"
-            exit 1
-          else
-            echo "PASS: no crashes in logs"
-          fi
+          bash scripts/ci/qa-stack.sh logs "$QA_STATE_DIR/soak-logs.txt"
+          bash scripts/ci/qa-stack.sh crash-check
 
       - name: Upload soak data
         if: always()
@@ -1045,11 +1354,11 @@ jobs:
           path: |
             /tmp/yuzu-soak/soak.csv
             /tmp/yuzu-soak/soak-logs.txt
-          retention-days: 3
+          retention-days: 90
 
       - name: Teardown
         if: always()
-        run: cd /tmp/yuzu-soak && docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── Upgrade test ────────────────────────────────────────────────────
   upgrade-test:
@@ -1057,9 +1366,15 @@ jobs:
     needs: [resolve, integration]
     if: needs.resolve.outputs.has_prev == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # From qa-stack.sh's "Time budget": setup ~1 min + `up` <= 35 min +
+    # `upgrade` <= 27 min + the post-upgrade checks <= 6 min + logs/teardown
+    # ~3 min = ~72 min. Both halves are bounded by their own waits first.
+    timeout-minutes: 75
+    outputs:
+      tested: ${{ steps.prevstack.outputs.tested }}
     env:
-      REGISTRY: ${{ needs.resolve.outputs.registry }}
+      QA_STATE_DIR: /tmp/yuzu-upgrade
+      QA_PROJECT: yuzu-upgrade
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1076,101 +1391,111 @@ jobs:
           username: ${{ vars.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Start previous release
+      # Same reference stack, started at the previous stable release, then
+      # every service moved to the new version at once with the Postgres
+      # volume, the install CA and the agent's data dir (its identity and
+      # issued leaf) kept: the in-place upgrade of all four images an operator
+      # of the template performs, including the schema migrations. It is NOT a
+      # mixed-version test (new server with a not-yet-upgraded agent), and both
+      # halves run THIS checkout's template with each version's images; drift
+      # from each tagged template is printed as a warning and in the summary.
+      #
+      # A previous release that predates the reference template cannot be
+      # started this way. That is reported as "not tested" (job output
+      # `tested=false`, shown in the QA report), never as a pass.
+      - name: Check the previous release ships the reference stack
+        id: prevstack
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
-          NEW_VER: ${{ needs.resolve.outputs.version }}
+        # has-stack: 0 = ships the template, 3 = predates it, anything else
+        # (GitHub unreachable, a 5xx) = unknown. Only 3 may become NOT TESTED;
+        # treating every non-zero as "predates" let an outage report green.
         run: |
           PREV_VER="${PREV_TAG#v}"
-          mkdir -p /tmp/yuzu-upgrade
+          RC=0
+          bash scripts/ci/qa-stack.sh has-stack "$PREV_VER" || RC=$?
+          case "$RC" in
+            0) echo "tested=true" >> "$GITHUB_OUTPUT" ;;
+            3)
+              echo "tested=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::Upgrade NOT TESTED: $PREV_TAG predates deploy/docker/docker-compose.reference-gateway.yml, so there is no shipped stack to upgrade from."
+              echo "**Upgrade test: NOT TESTED** — $PREV_TAG predates the reference stack." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Could not tell whether $PREV_TAG ships the reference stack (qa-stack.sh has-stack exited $RC); refusing to report the upgrade as not tested."
+              exit 1
+              ;;
+          esac
 
-          python3 -c "
-          import hashlib, os
-          salt = os.urandom(16)
-          dk = hashlib.pbkdf2_hmac('sha256', b'upgradepass1', salt, 100000, dklen=32)
-          print(f'upgrade:admin:{salt.hex()}:{dk.hex()}')
-          " > /tmp/yuzu-upgrade/yuzu-server.cfg
-
-          # Compose file with variable image tags
-          cat > /tmp/yuzu-upgrade/docker-compose.yml <<COMPOSE
-          services:
-            server:
-              image: $REGISTRY/yuzu-server:\${YUZU_VER}
-              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
-              ports: ["8080:8080","50055:50055"]
-              volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
-              # curl is NOT in the server runtime image — see the integration
-              # job's compose above. bash + /dev/tcp is the supported probe.
-              healthcheck:
-                test: ["CMD","bash","-c","exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&-"]
-                interval: 5s
-                timeout: 3s
-                retries: 10
-            gateway:
-              image: $REGISTRY/yuzu-gateway:\${YUZU_VER}
-              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50051:50051","50063:50063","8081:8081"]
-              depends_on:
-                server:
-                  condition: service_healthy
-            agent:
-              image: $REGISTRY/yuzu-agent-chisel:\${YUZU_VER}
-              command: ["--server","gateway:50051","--no-tls"]
-              depends_on: [gateway]
-          COMPOSE
-
-          cd /tmp/yuzu-upgrade
+      - name: Start previous release
+        if: steps.prevstack.outputs.tested == 'true'
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+        run: |
+          PREV_VER="${PREV_TAG#v}"
           echo "Starting previous release: $PREV_VER"
-          YUZU_VER="$PREV_VER" docker compose up -d
-
-          # Wait for stack
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
-          echo "Previous release stack ready ($PREV_VER)"
+          bash scripts/ci/qa-stack.sh up "$PREV_VER"
+          bash scripts/ci/qa-stack.sh agents | tee /tmp/yuzu-upgrade/agents-before.txt
+          [ -s /tmp/yuzu-upgrade/agents-before.txt ] || { echo "FAIL: no connected agent before the upgrade"; exit 1; }
 
       - name: Upgrade to new release
+        if: steps.prevstack.outputs.tested == 'true'
         env:
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          cd /tmp/yuzu-upgrade
-
           echo "Upgrading to: $NEW_VER"
-          YUZU_VER="$NEW_VER" docker compose up -d
-
-          # Wait for stack to recover
-          for i in $(seq 1 40); do
-            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-            [ "$COUNT" -ge 1 ] && break
-            sleep 3
-          done
+          bash scripts/ci/qa-stack.sh upgrade "$NEW_VER"
 
       - name: Verify post-upgrade
+        if: steps.prevstack.outputs.tested == 'true'
         env:
           PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
           NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          # Dashboard reachable
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
-          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+          # All four services running (4/4) with a restart count of 0: the
+          # upgrade recreates the containers, so any restart is post-upgrade.
+          bash scripts/ci/qa-stack.sh check-stable
+          echo "PASS: 4/4 services running, none restarted"
 
-          # Agent reconnected
-          COUNT=$(curl -s http://localhost:8080/metrics | \
-            grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
-          [ "$COUNT" -ge 1 ] && echo "PASS: Agent reconnected ($COUNT)" || { echo "FAIL: Agent not reconnected"; exit 1; }
+          CODE=$(curl -s --max-time 30 --cacert /tmp/yuzu-upgrade/ca.pem -o /dev/null -w "%{http_code}" https://localhost:8443/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTPS $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
 
-          # Gateway healthy
-          curl -sf http://localhost:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
+          curl -sf --max-time 10 http://127.0.0.1:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
+
+          # The SAME agent is back (its data dir survived, so no re-enrolment
+          # and no fresh identity), and it is running the new release. The
+          # agent reports <project version>+<build>, and an -rcN tag builds
+          # the plain project version, so compare the part before any '-'.
+          bash scripts/ci/qa-stack.sh agents | tee /tmp/yuzu-upgrade/agents-after.txt
+          BEFORE_ID=$(awk 'NR==1{print $1}' /tmp/yuzu-upgrade/agents-before.txt)
+          AFTER_VER=$(awk -v id="$BEFORE_ID" '$1==id{print $2}' /tmp/yuzu-upgrade/agents-after.txt)
+          if [ -z "$AFTER_VER" ]; then
+            echo "FAIL: agent $BEFORE_ID did not reconnect (connected now: $(tr '\n' ' ' < /tmp/yuzu-upgrade/agents-after.txt))"
+            exit 1
+          fi
+          echo "PASS: agent $BEFORE_ID reconnected with the same identity"
+          WANT="${NEW_VER%%-*}"
+          if [ "${AFTER_VER%%+*}" != "$WANT" ]; then
+            echo "FAIL: agent reports $AFTER_VER, expected $WANT"
+            exit 1
+          fi
+          echo "PASS: agent runs $AFTER_VER"
+
+          if OS=$(bash scripts/ci/qa-stack.sh roundtrip os_info os_name os_name 20); then
+            echo "PASS: post-upgrade os_info round-trip returned '$OS'"
+          else
+            echo "FAIL: no os_info answer after the upgrade"
+            exit 1
+          fi
+
+          # Again at the end, covering the checks above.
+          bash scripts/ci/qa-stack.sh check-stable
 
           echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
       - name: Collect logs
         if: always()
-        run: cd /tmp/yuzu-upgrade && docker compose logs > upgrade-logs.txt 2>&1
+        run: bash scripts/ci/qa-stack.sh logs /tmp/yuzu-upgrade/upgrade-logs.txt
 
       - name: Upload logs
         if: always()
@@ -1178,11 +1503,11 @@ jobs:
         with:
           name: upgrade-logs
           path: /tmp/yuzu-upgrade/upgrade-logs.txt
-          retention-days: 3
+          retention-days: 90
 
       - name: Teardown
         if: always()
-        run: cd /tmp/yuzu-upgrade && docker compose down -v
+        run: bash scripts/ci/qa-stack.sh down
 
   # ── QA summary ──────────────────────────────────────────────────────
   report:
@@ -1203,45 +1528,91 @@ jobs:
           R_SECURITY: ${{ needs.security-scan.result }}
           R_SOAK: ${{ needs.soak-test.result }}
           R_UPGRADE: ${{ needs.upgrade-test.result }}
+          UPGRADE_TESTED: ${{ needs.upgrade-test.outputs.tested }}
+          HAS_PREV: ${{ needs.resolve.outputs.has_prev }}
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
           # Bind tag/version to env to avoid code-injection via crafted ref name.
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-
-          status_icon() {
+          # Each cell is PASS only for a suite that ran and passed. A suite
+          # that did not run, or ran without testing (the upgrade from a
+          # release predating the reference stack), is a GAP: the headline
+          # then says PASSED WITH GAPS, never a bare PASSED.
+          FAILED=0; GAPS=0
+          # Two functions, because a cell is read through $(...) — a subshell,
+          # where a counter would be lost.
+          cell() {
             case "$1" in
-              success)  echo "PASS" ;;
-              failure)  echo "FAIL" ;;
-              skipped)  echo "SKIP" ;;
-              *)        echo "????" ;;
+              success)   echo "PASS" ;;
+              failure)   echo "FAIL" ;;
+              cancelled) echo "CANCELLED" ;;
+              skipped)   echo "NOT RUN (skipped)" ;;
+              *)         echo "UNKNOWN ($1)" ;;
             esac
           }
+          tally() {  # `cancelled` and anything unknown count as failures: they verified nothing.
+            case "$1" in
+              success) ;;
+              skipped) GAPS=$((GAPS + 1)) ;;
+              *)       FAILED=$((FAILED + 1)) ;;
+            esac
+          }
+          for R in "$R_INTEGRATION" "$R_DEB" "$R_RPM" "$R_WINDOWS" "$R_MACOS" \
+                   "$R_ARTIFACT" "$R_SECURITY" "$R_SOAK"; do
+            tally "$R"
+          done
+
+          # The upgrade cell names the actual cause of a gap.
+          case "$R_UPGRADE" in
+            success)
+              if [ "$UPGRADE_TESTED" = "true" ]; then
+                UPGRADE_CELL="PASS"
+              elif [ "$UPGRADE_TESTED" = "false" ]; then
+                GAPS=$((GAPS + 1)); UPGRADE_CELL="NOT TESTED ($PREV_TAG predates the reference stack)"
+              else
+                GAPS=$((GAPS + 1)); UPGRADE_CELL="NOT TESTED (the upgrade job reported no result)"
+              fi
+              ;;
+            skipped)
+              GAPS=$((GAPS + 1))
+              if [ "$HAS_PREV" != "true" ]; then
+                UPGRADE_CELL="NOT TESTED (no previous stable release)"
+              elif [ "$R_INTEGRATION" != "success" ]; then
+                UPGRADE_CELL="NOT RUN (the integration job it needs: $R_INTEGRATION)"
+              else
+                UPGRADE_CELL="NOT RUN (skipped)"
+              fi
+              ;;
+            *)
+              tally "$R_UPGRADE"; UPGRADE_CELL=$(cell "$R_UPGRADE")
+              ;;
+          esac
 
           cat >> "$GITHUB_STEP_SUMMARY" <<REPORT
           ## Pre-release QA Report: ${TAG}
 
           | Test Suite | Result |
           |---|---|
-          | Integration (full stack round-trip) | $(status_icon "$R_INTEGRATION") |
-          | .deb install (Ubuntu 22/24, Debian 12) | $(status_icon "$R_DEB") |
-          | .rpm install (Fedora 40, Rocky 9) | $(status_icon "$R_RPM") |
-          | Windows installer (silent) | $(status_icon "$R_WINDOWS") |
-          | macOS .pkg install | $(status_icon "$R_MACOS") |
-          | Artifact verification | $(status_icon "$R_ARTIFACT") |
-          | Security scan (Trivy) | $(status_icon "$R_SECURITY") |
-          | Soak test (10 min) | $(status_icon "$R_SOAK") |
-          | Upgrade test | $(status_icon "$R_UPGRADE") |
+          | Integration (full stack round-trip) | $(cell "$R_INTEGRATION") |
+          | .deb install + run (Ubuntu 22.04/24.04/26.04, Debian 12) | $(cell "$R_DEB") |
+          | .rpm install + run (Fedora 42, Rocky 9) | $(cell "$R_RPM") |
+          | Windows installer (silent) | $(cell "$R_WINDOWS") |
+          | macOS .pkg install | $(cell "$R_MACOS") |
+          | Artifact verification | $(cell "$R_ARTIFACT") |
+          | Security scan (Trivy) | $(cell "$R_SECURITY") |
+          | Soak test (10 min) | $(cell "$R_SOAK") |
+          | Upgrade test | ${UPGRADE_CELL} |
 
           REPORT
 
-          # `resolve` is deliberately NOT in ALL_RESULTS below, because a skipped
-          # resolve must not be reported as a pass. This job is `if: always()`,
-          # so when `resolve` skips (the triggering Release failed or was
-          # cancelled — 94 of the last 100 Release runs) every one of the nine
-          # test jobs is `skipped`, nothing matches "failure", and this step used
-          # to print `### Result: PASSED` and exit 0. THAT is why Pre-release QA
-          # has looked permanently green while testing nothing: not a dead
-          # trigger, but a report that treats "never ran" as "passed".
+          # A skipped `resolve` must not be reported as a pass. This job is
+          # `if: always()`, so when `resolve` skips (the triggering Release
+          # failed or was cancelled — 94 of the last 100 Release runs) every
+          # test job is `skipped`, and this step used to print
+          # `### Result: PASSED` and exit 0. THAT is why Pre-release QA looked
+          # permanently green while testing nothing: not a dead trigger, but a
+          # report that treated "never ran" as "passed".
           if [ "$R_RESOLVE" = "skipped" ]; then
             echo "### Result: NOT RUN" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -1257,16 +1628,19 @@ jobs:
             exit 1
           fi
 
-          # Determine overall result. `cancelled` counts as a failure: a cancelled
-          # suite has verified nothing, and must never read as a pass either.
-          ALL_RESULTS="$R_INTEGRATION $R_DEB $R_RPM $R_WINDOWS $R_MACOS $R_ARTIFACT $R_SECURITY $R_SOAK $R_UPGRADE"
-          if echo "$ALL_RESULTS" | grep -qE "failure|cancelled"; then
+          # `cancelled` counts as a failure: a cancelled suite verified nothing.
+          if [ "$FAILED" -gt 0 ]; then
             echo "### Result: FAILED" >> "$GITHUB_STEP_SUMMARY"
-            echo ""
-            echo "QA FAILED for $TAG"
+            echo "QA FAILED for $TAG ($FAILED suite(s) failed or were cancelled, $GAPS not tested)"
             exit 1
+          elif [ "$GAPS" -gt 0 ]; then
+            {
+              echo "### Result: PASSED WITH GAPS ($GAPS not tested)"
+              echo ""
+              echo "Every suite that ran passed, but $GAPS did not test anything — see the NOT TESTED / NOT RUN cells above."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "QA PASSED WITH GAPS for $TAG ($GAPS not tested)"
           else
             echo "### Result: PASSED" >> "$GITHUB_STEP_SUMMARY"
-            echo ""
             echo "QA PASSED for $TAG"
           fi

@@ -3026,10 +3026,29 @@ Never upgrade agents before the server -- the server must understand the agent's
 Before upgrading any component:
 
 - [ ] Back up all data (see [Server Administration](server-admin.md))
-  - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`
+  - `yuzu-server.cfg`, `auto-approve.cfg` — enrollment tokens and pending agents are PostgreSQL-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`); back them up as part of the `pg_dump` below, not as local files. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are still worth including in a manual backup **taken before that upgrade** — they are the one-time import source at the first 6.2 boot (see the rolling-upgrade note below)
   - The NVD cache `nvd_cves.db` in `--data-dir` (the one remaining server SQLite store) — use `sqlite3 <path> ".backup ..."` rather than `cp` against a live database
   - The blob directories `agent-updates/` (or your `--update-dir`) and `upload-blobs/` in `--data-dir` — the database holds only the OTA-package and completed-upload records that point into them, so a restored dump without these directories leaves records with no files
   - The **PostgreSQL database** (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) **and the whole `--ca-dir`**, taken at the same point in time — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Upgrading to HA WS-6 6.2 or later, running more than one server replica?** Stop
+  every pre-6.2 replica before starting the first 6.2+ one. The one-time `enrollment-tokens.cfg`
+  / `pending-agents.cfg` import runs at boot on whichever replica starts first and stamps a
+  content-fingerprint marker in `auth.import_meta`; a second pre-6.2 replica started afterwards
+  against the same `--data-dir` files would only ever match or mismatch that already-consumed
+  marker, never contribute new state — its own `.cfg` files are simply skipped or, if they differ,
+  refused (never merged). A restored pre-6.2 backup with a fingerprint that no longer matches the
+  live `auth.import_meta` row is likewise **refused, not merged** — look for a `CRITICAL` log line
+  naming the mismatched file and the `yuzu_server_enrollment_import_total{outcome="fingerprint_mismatch"}`
+  metric; see [ADR-2002 §8](../adr/2002-high-availability-architecture.md#8-pki--ca-high-availability-q8) for the marker/fingerprint mechanics.
+  **A fingerprint mismatch does NOT block boot** — unlike a PG error or read failure with the file
+  present (which refuses to start, the same posture as the first-boot admin seed), a mismatch is
+  logged and the server starts normally with whatever enrollment state is already in Postgres; the
+  stale `.cfg` file's rows are simply never imported, and the file itself is left in place under its
+  original name (not renamed to `.imported`, since nothing was imported). Recover by comparing the
+  stale file's rows against the current `auth.enrollment_tokens`/`auth.pending_agents` (dashboard, or
+  `psql`), manually recreating anything genuinely missing (mint a new token / re-add the pending
+  agent), then archiving or deleting the leftover `enrollment-tokens.cfg` / `pending-agents.cfg` once
+  you've confirmed nothing in it is needed.
 - [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). Rows
   already stamped cannot be protected retroactively by any setting, and a server
@@ -3220,7 +3239,7 @@ curl -s http://localhost:8080/livez
 
 ### Docker
 
-The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds every piece of mutable state: `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries.
+The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds the remaining piece of mutable state kept on disk: `yuzu-server.cfg`, `auto-approve.cfg`, the NVD cache SQLite database, and OTA binaries. Enrollment tokens and pending agents are PostgreSQL-authoritative (HA WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents`) — a pre-6.2 volume's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported once, automatically, at the first 6.2+ container's boot, then renamed to `<name>.cfg.imported`.
 
 An upgrade is a pull-and-restart:
 
@@ -3760,6 +3779,7 @@ overridden.
 | Symptom | Diagnose | Fix |
 |---|---|---|
 | `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+| Gateway container restarts at boot on an AMX-capable Intel host (Sapphire Rapids+, AWS c7i/m7i/r7i) | Container log has `sys_sigaltstack(): Internal error: Failed to set alternate signal stack`; image is 0.13.0 through 0.14.0-rc4 (#2150) | Pull an image that carries the #2150 fix (0.14.0-rc5 or later). Until then, run the gateway on a host without AMX. A single-node gateway may use `yuzu-gateway-chisel` instead; a clustered one may not (it never joins the cluster). Do not roll back to 0.13.0 on that host: it is affected too. |
 
 > The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
 > `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
