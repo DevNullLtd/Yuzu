@@ -208,8 +208,8 @@ const std::vector<pg::PgMigration>& migrations() {
         {7,
          // Extended row: package_id / source, plus install_id for keyset paging. The
          // install_location / uninstall_string wire slots (13-14) are reserved and not
-         // stored until ADR-0016 §8 is re-opened (#5186). The two TEXT columns follow the v5 precedent
-         // (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
+         // stored until ADR-0016 §8 is re-opened (#5186). The two TEXT columns follow the
+         // v5 precedent (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
          // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
          // sequential pass at server start over a table bounded at agents x kMaxEntries
          // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds every existing
@@ -269,8 +269,11 @@ std::string sha256_hex(const std::string& in) {
 // Sort/dedup key walks every STORED field in blob order (name..source; wire slots 13-14
 // are reserved and not stored) so two entries differing only in one field are distinct
 // rows, not duplicates.
-// MUST mirror the agent's entry_less/entry_equal (sync_source_installed_software.cpp)
-// or the two sides' canonical hashes diverge → permanent always-full.
+// The agent sorts and dedups on its 12 fields (sync_source_installed_software.cpp); this
+// adds package_id and source, which no shipped agent fills, so the two agree today. The
+// agent change (#5186) must extend its key the same way, or the canonical hashes diverge
+// → permanent always-full. Records differing only in the reserved slots 13-14 collapse
+// to one row here.
 bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;

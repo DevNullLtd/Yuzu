@@ -50,8 +50,8 @@ constexpr int kMaxSources = 64;
 // re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED: they
 // are consumed to keep the positions but never stored or hashed, because ADR-0016 §8
 // has not been re-opened for them (#5186). An agent that hashes real values there gets
-// need_full until the server accepts them. A shorter record (v1 4-field, v2 12-field) parses fine: the
-// token walk stops at the record's end, leaving the remaining fields default-empty
+// need_full until the server accepts them. A shorter record (v1 4-field, v2 12-field)
+// parses fine: the token walk stops at the record's end, leaving the remaining fields default-empty
 // (the documented mixed-version behaviour — an old agent's rows store with empty
 // trailing columns). Tokens beyond the 16th are dropped. The server hash covers
 // the tail only when package_id or source is non-empty (SoftwareInventoryStore::canonical_hash);

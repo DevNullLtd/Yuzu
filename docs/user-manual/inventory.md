@@ -136,11 +136,12 @@ cadences.
   account's home directory (`/Users/<account>/...` on macOS,
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
-  `--inventory-disable`. (The sync blob also has `install_location` and
+  `--inventory-disable`. The sync blob also has `install_location` and
   `uninstall_string` slots, but they are reserved: the server ignores them and
   stores neither, until ADR-0016 §8 is re-classified for them with the
-  agent-side change, #5186.) (The only `HKCU` read is the agent's
-  own service-account hive, which is benign: the agent runs outside any
+  agent-side change, #5186. No shipped agent fills them; a build that does gets a
+  full-resend request every cycle until the server accepts them. (The only `HKCU`
+  read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
   — a tracked deviation, #1442. The conclusion is unaffected; LocalSystem's
@@ -182,8 +183,8 @@ The data lands in the Postgres schema **`software_inventory_store`**:
   `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
   agent's next full resend. Rows from agents that do not yet emit the extended
-  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned on each full report) is always
-  populated.
+  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
+  on each full report) is always populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied

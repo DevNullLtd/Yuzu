@@ -55,8 +55,9 @@ namespace yuzu::server {
 /// neither stores nor hashes them until §8 is re-opened for them (#5186).
 ///
 /// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
-/// the canonical hash walks this exact sequence; the agent's blob builder walks
-/// the first 12 today, the tail rule is the agent's to mirror).
+/// the canonical hash walks this exact sequence, except that wire slots 13-14 have no member
+/// and are hashed as empty; the agent's blob builder walks the first 12 today, the tail rule
+/// is the agent's to mirror).
 /// Fields an ecosystem does not store are EMPTY, never synthesised: NEVRA +
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows

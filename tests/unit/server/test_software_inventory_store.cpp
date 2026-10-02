@@ -728,6 +728,16 @@ TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither store
             std::vector<std::string>{});
         REQUIRE(cols.status() == PGRES_TUPLES_OK);
         CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "0");
+        // Positive control: the same catalog query does see this table's real columns, so the
+        // zero above is not a vacuous result from a wrong schema or table name.
+        pg::PgResult present = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'software_inventory_store' "
+            "AND table_name = 'installed_software' AND column_name IN ('package_id', 'source')",
+            std::vector<std::string>{});
+        REQUIRE(present.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(present.get(), 0, 0)) == "2");
         pg::PgResult leak = pg::exec_params(
             lease.get(),
             "SELECT count(*) FROM software_inventory_store.installed_software t "
@@ -750,6 +760,34 @@ TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither store
     agentpb::InventoryAck ack3;
     yuzu::server::ingest_inventory_report(store, "agent-reserved", ping_empty, ack3);
     CHECK(ack3.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: values only in slots 13-14 leave the tail unopened",
+          "[pg][software_inventory][extended_row]") {
+    // package_id and source empty, slots 13-14 filled: the server stores a v2 row and hashes
+    // the 12-field form (no tail), so it equals the hash of the same entry with nothing there.
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_v2_entry(); // package_id / source empty
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    (*rep.mutable_plugin_data())["installed_software"] =
+        wire_record_reserved(e, "/opt/x", "rm x");
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-slots-only", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+    auto got = store.get_agent_software("agent-slots-only");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id.empty());
+    CHECK((*got)[0].source.empty());
+    // The stored hash is the 12-field form: a hash-only claim of that form is a touch.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] =
+        SoftwareInventoryStore::canonical_hash({e});
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-slots-only", ping, ack2);
+    CHECK(ack2.need_full_size() == 0);
 }
 
 TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re-hash to the raw "
