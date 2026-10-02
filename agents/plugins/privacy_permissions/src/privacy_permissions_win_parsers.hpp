@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "privacy_permissions_parsers.hpp"
+#include "user_profile_model.hpp"
 
 namespace yuzu::privacy_permissions::win {
 
@@ -265,7 +266,7 @@ struct EnumFailure {
 /// there -- never set), or `unreadable`; `cause` is non-empty exactly when it is `unreadable`
 /// (`win32_<rc>`/`access_denied`, `type_<n>` or `size_<n>`); `denied` marks a refused read.
 struct LastUsedField {
-    std::string value;
+    std::string value = "-";
     std::string cause;
     bool denied = false;
 };
@@ -306,8 +307,8 @@ struct RawGrant {
     std::string_view category; // a kCapabilities literal -- static storage, safe in a row
     PermissionState state;
     std::string raw_value;
-    LastUsedField last_used_start{"-", {}, false};
-    LastUsedField last_used_stop{"-", {}, false};
+    LastUsedField last_used_start{};
+    LastUsedField last_used_stop{};
     std::string cause{};
     // The READ of this grant's `Value` was refused (ERROR_ACCESS_DENIED) -- NOT the same thing
     // as `state == PermissionState::denied` alone, which also (correctly) means "the read
@@ -318,9 +319,6 @@ struct RawGrant {
 [[nodiscard]] inline bool grant_failed(const RawGrant& g) noexcept {
     return g.read_denied || g.state == PermissionState::unreadable;
 }
-
-/// A LastUsedTime* field that was never set (RawGrant's default for both).
-inline const LastUsedField kLastUsedNotSet{"-", {}, false};
 
 /// Every retained grant's owner-controlled text, charged against the per-source RetentionBudget.
 [[nodiscard]] inline std::size_t retained_bytes(const RawGrant& g) noexcept {
@@ -334,7 +332,7 @@ inline const LastUsedField kLastUsedNotSet{"-", {}, false};
                                                  std::string cause, bool denied) {
     return {std::move(app_id), category,
             denied ? PermissionState::denied : PermissionState::unreadable, "-",
-            kLastUsedNotSet, kLastUsedNotSet, std::move(cause), denied};
+            {}, {}, std::move(cause), denied};
 }
 
 /// A `<capability>\NonPackaged` key that did not open. Genuinely missing is the desktop-apps
@@ -343,7 +341,7 @@ inline const LastUsedField kLastUsedNotSet{"-", {}, false};
 [[nodiscard]] inline RawGrant nonpackaged_open_failure(std::string_view category, long rc) {
     if (rc == kErrorFileNotFound)
         return {std::string{kNonPackagedToggleAppId}, category, PermissionState::absent, "-",
-                kLastUsedNotSet, kLastUsedNotSet, {}, false};
+                {}, {}, {}, false};
     return structural_failure("-", category, "nonpackaged_container:" + win32_cause(rc),
                               rc == kErrorAccessDenied);
 }
@@ -457,17 +455,6 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
            (owner_sid == profile_sid || owner_sid == "S-1-5-18" || owner_sid == "S-1-5-32-544");
 }
 
-[[nodiscard]] inline bool equals_ignore_ascii_case(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        char x = a[i], y = b[i];
-        if (x >= 'A' && x <= 'Z') x = static_cast<char>(x - 'A' + 'a');
-        if (y >= 'A' && y <= 'Z') y = static_cast<char>(y - 'A' + 'a');
-        if (x != y) return false;
-    }
-    return true;
-}
-
 /// The first refusal token for a hive file's facts, in this fixed order, or nullopt to proceed.
 /// Path facts come first so a UNC/redirected target is refused before any leaf fact is trusted.
 [[nodiscard]] inline std::optional<std::string> classify_hive_file(const HiveFileFacts& f) {
@@ -478,7 +465,7 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
     if (f.is_reparse) return std::string{kHiveReparsePoint};
     if (f.is_directory || !f.is_disk_file) return std::string{kHiveNotRegular};
     if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
-    if (!equals_ignore_ascii_case(f.final_path, "\\\\?\\" + f.requested_path))
+    if (!profiles::iequals_ascii(f.final_path, "\\\\?\\" + f.requested_path))
         return std::string{kHivePathRedirected};
     if (f.size > kMaxHiveBytes) return std::string{kHiveOversized};
     return std::nullopt;
