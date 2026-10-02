@@ -85,6 +85,24 @@ The following features are documented within the files listed above:
 
 > **Note:** macOS Intel (x64) builds are not currently produced or tested. Only Apple Silicon (ARM64) Macs running macOS 14+ are supported. If you require macOS Intel support, please open an issue.
 
+### Linux native packages: minimum distribution (0.14.0)
+
+The Linux binaries in the `.deb`, `.rpm` and tarball releases link the system C and C++
+runtimes dynamically, so they need a recent distribution. Measured on the 0.14.0 release
+candidates:
+
+| Component | Needs | Runs on | Does not run on |
+|---|---|---|---|
+| Server | glibc 2.38 and GCC 15's libstdc++ (`GLIBCXX_3.4.34`) | Ubuntu 26.04, Fedora 42 | Ubuntu 24.04 and 22.04, Debian 12, RHEL/Rocky 9 |
+| Agent | glibc 2.38 and GCC 14's libstdc++ (`GLIBCXX_3.4.32`) | Ubuntu 24.04 and 26.04, Fedora 42 | Ubuntu 22.04, Debian 12, RHEL/Rocky 9 |
+| Gateway | glibc 2.38 | Ubuntu 24.04 and 26.04 (`.deb`) | RHEL/Rocky 9; the `.rpm` also does not start on RHEL-family systems, Fedora included (#5171) |
+
+On an older distribution the package may still install, but the program does not start:
+the loader reports a `GLIBC_…` or `GLIBCXX_…` version "not found". The container images
+are self-contained and are not affected; use them for the server and gateway on any other
+distribution. Building the native packages to an older baseline is tracked in #5143 for
+0.14.1.
+
 ## Quick Start
 
 1. **Start the server** -- run `yuzu-server` with a configuration file or accept interactive first-run setup.
