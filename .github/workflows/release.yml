@@ -1421,7 +1421,9 @@ jobs:
 
       - name: Upload image SBOM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
         with:
           name: yuzu-${{ matrix.image }}-image-sbom
           path: |
@@ -1429,7 +1431,8 @@ jobs:
             yuzu-${{ matrix.image }}-image.spdx.json
           retention-days: 3
           # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM so the release never signs a stale one (#5242).
+          # attempt's SBOM. With the upload no longer continue-on-error, a
+          # re-run either uploads this attempt's SBOM or fails the job (#5242).
           overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
@@ -1487,10 +1490,8 @@ jobs:
   #      build failure is irrelevant to it. It IS in the release job's
   #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
   #      so a release must not publish if this image failed to.
-  #   2. Multi-arch linux/amd64,linux/arm64 (the demo/viz rigs are arm64).
-  #      The arm64 leg runs under QEMU on the amd64 self-hosted runner —
-  #      cheap here (apt install + one small C extension compile), unlike
-  #      the chisel jobs' full vcpkg-from-source builds.
+  #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
+  #      step); the demo/viz rigs would need it back.
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
@@ -1591,7 +1592,9 @@ jobs:
 
       - name: Upload image SBOM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
         with:
           name: yuzu-postgres-image-sbom
           path: |
@@ -1599,7 +1602,8 @@ jobs:
             yuzu-postgres-image.spdx.json
           retention-days: 3
           # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM so the release never signs a stale one (#5242).
+          # attempt's SBOM. With the upload no longer continue-on-error, a
+          # re-run either uploads this attempt's SBOM or fails the job (#5242).
           overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
@@ -1844,7 +1848,7 @@ jobs:
       # Mirrors docker-publish's SBOM steps so the chisel demo images get
       # the same supply-chain coverage (compliance flagged that the chisel
       # images had cosign + SLSA but no SBOM). Syft scans the pushed
-      # multi-arch image by digest. Same SHA-pinned anchore/sbom-action +
+      # image by digest. Same SHA-pinned anchore/sbom-action +
       # upload-artifact versions as docker-publish.
       - name: Generate image SBOM (CycloneDX)
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
@@ -1866,7 +1870,9 @@ jobs:
 
       - name: Upload image SBOM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        continue-on-error: true
+        # No continue-on-error (#5242): the SBOM is a release asset, so a failed
+        # upload must fail this job rather than leave a green leg with an
+        # earlier attempt's SBOM (or none) for the release to sign.
         with:
           name: yuzu-${{ matrix.image }}-chisel-image-sbom
           path: |
@@ -1874,7 +1880,8 @@ jobs:
             yuzu-${{ matrix.image }}-chisel-image.spdx.json
           retention-days: 3
           # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM so the release never signs a stale one (#5242).
+          # attempt's SBOM. With the upload no longer continue-on-error, a
+          # re-run either uploads this attempt's SBOM or fails the job (#5242).
           overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
@@ -2377,7 +2384,8 @@ jobs:
 
           Every release ships CycloneDX + SPDX SBOMs per platform
           (\`yuzu-*-{linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json\`,
-          \`yuzu-{server,gateway}-image.{cdx,spdx}.json\`), GitHub-native
+          \`yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json\` and
+          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`), GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See

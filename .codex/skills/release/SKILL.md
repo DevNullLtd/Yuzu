@@ -113,7 +113,7 @@ echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 
 ## Phase 2 — Monitor the workflow (~30-60 min)
 
-Six jobs run with a partial DAG:
+The jobs run with a partial DAG (simplified; the full list follows):
 
 ```
 build-linux ─┬─ build-gateway ─┐
@@ -128,12 +128,21 @@ build-linux ────────────────────┴─�
 - **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
 - **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
 - **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
-- **docker-publish-postgres** (~5 min) — the `yuzu-postgres` image the composes pin
+- **docker-publish-postgres** (~1 min) — the `yuzu-postgres` image the composes pin
 - **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux + build-gateway) — the `*-chisel` images and their SBOMs
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
 - **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
 
-Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If a chisel leg fails or is cancelled, the release job is skipped (fail-closed): use "Re-run failed jobs" on the release run while its artifacts are retained (3 days). After that, a full re-run pushes every image again, with new digests.
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If a chisel leg fails or is cancelled, the release job is skipped (fail-closed). Recovery is "Re-run failed jobs" on that run while its artifacts are retained (3 days), **but only if the run is still for the tag's current commit**. A re-tag starts a new run that cancels the old run's chisel legs, and re-running the old run would cancel the new run's. Check first:
+
+```bash
+TAG=v0.14.0
+git fetch -q --tags --force origin
+gh run view <run-id> --repo DevNullLtd/Yuzu --json headSha -q .headSha   # must equal:
+git rev-parse "$TAG^{commit}"
+```
+
+If they differ, leave the old run alone; the newer run is the release. After artifact retention runs out, a full re-run pushes every image again with new digests. If a chisel leg times out (120 min) on a cold vcpkg cache, re-running starts cold again: the verification build does not export its cache, so raise the timeout for that run rather than retrying.
 
 Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
 
