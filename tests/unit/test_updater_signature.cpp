@@ -21,14 +21,23 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include "ctx_slot.hpp"
+#include "updater_rpc_guard.hpp"
+
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
+#include <chrono>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include "agent.grpc.pb.h"
 #include <openssl/evp.h>
@@ -426,6 +435,179 @@ TEST_CASE("updater: with no trust bundle configured, signatures are not checked 
     auto r = updater.check_and_apply(h.stub.get());
     REQUIRE(r.has_value());
     CHECK(*r);
+}
+
+namespace {
+
+namespace apb = ::yuzu::agent::v1;
+
+/// CheckForUpdate handler that parks until released. NO Catch2 macros here (handler thread).
+class BlockingCheckService final : public apb::AgentService::Service {
+  public:
+    std::promise<void> release_p;
+    std::shared_future<void> release{release_p.get_future().share()};
+
+    grpc::Status CheckForUpdate(grpc::ServerContext*, const apb::CheckForUpdateRequest*,
+                                apb::CheckForUpdateResponse*) override {
+        release.wait();
+        return grpc::Status::OK;
+    }
+};
+
+} // namespace
+
+// #2182: stop() can land after the caller's last stop check but before the RPC context is
+// published; the guard must re-check the flag after publishing and cancel. With stop already
+// true at guard construction, the un-cancelled RPC would park in the handler forever.
+TEST_CASE("ActiveRpcCtxGuard cancels an RPC published after stop was requested",
+          "[updater][stop][2182]") {
+    BlockingCheckService svc;
+    grpc::ServerBuilder builder;
+    builder.RegisterService(&svc);
+    auto server = builder.BuildAndStart();
+    REQUIRE(server != nullptr);
+
+    // Owned by the detached thread so a regression fails the bound, not the destructor.
+    struct State {
+        std::mutex mu;
+        std::atomic<void*> slot{nullptr};
+        std::atomic<bool> stop{true};
+        std::promise<grpc::StatusCode> code;
+        std::unique_ptr<apb::AgentService::Stub> stub;
+    };
+    auto st = std::make_shared<State>();
+    st->stub = apb::AgentService::NewStub(server->InProcessChannel(grpc::ChannelArguments()));
+    auto fut = st->code.get_future();
+    std::thread([st] {
+        grpc::ClientContext ctx;
+        yuzu::agent::ActiveRpcCtxGuard guard{st->mu, st->slot, ctx, st->stop};
+        apb::CheckForUpdateRequest req;
+        apb::CheckForUpdateResponse resp;
+        st->code.set_value(st->stub->CheckForUpdate(&ctx, req, &resp).error_code());
+    }).detach();
+
+    const bool returned = fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    // Always free the parked handler so no server thread stays blocked.
+    svc.release_p.set_value();
+    REQUIRE(returned);
+    CHECK(fut.get() == grpc::StatusCode::CANCELLED);
+    // CANCELLED (not UNAVAILABLE) shows the cancel, not a failed connect, ended the call.
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds{2});
+}
+
+// #2182 heartbeat/Register/Subscribe/sync sites: AgentImpl publishes each in-flight context
+// through CtxSlot and cancels it through cancel_ctx_slot (the primitives agent.cpp uses).
+// (a) a slot published AFTER stop must report stop_seen() so the caller skips the RPC;
+// (b) a slot published BEFORE the cancel must be cancelled, unblocking the parked RPC.
+TEST_CASE("CtxSlot reports a stop that landed before publish", "[updater][stop][2182]") {
+    std::mutex mu;
+    std::atomic<grpc::ClientContext*> slot{nullptr};
+    std::atomic<bool> stop{true};
+    grpc::ClientContext ctx;
+    {
+        yuzu::agent::CtxSlot s{mu, slot, &ctx, [&] { return stop.load(); }};
+        CHECK(s.stop_seen());
+        CHECK(slot.load() == &ctx); // still published: ~CtxSlot retracts it
+    }
+    CHECK(slot.load() == nullptr);
+    stop = false;
+    yuzu::agent::CtxSlot s2{mu, slot, &ctx, [&] { return stop.load(); }};
+    CHECK_FALSE(s2.stop_seen());
+}
+
+// The predicate must run AFTER the publish and UNDER the mutex: that ordering is what makes
+// "canceller saw the slot, or the predicate sees the flag" hold. Observe both from inside the
+// predicate. std::mutex::try_lock on the holding thread is undefined, so a helper thread
+// probes it while the predicate waits (bounded) for the result.
+TEST_CASE("CtxSlot evaluates the predicate after publishing and under the mutex",
+          "[updater][stop][2182]") {
+    std::mutex mu;
+    std::atomic<grpc::ClientContext*> slot{nullptr};
+    grpc::ClientContext ctx;
+    std::atomic<bool> in_predicate{false};
+    std::atomic<bool> predicate_done{false};
+    std::atomic<bool> probe_done{false};
+    std::atomic<bool> probed{false}; // try_lock ran while the predicate was provably still running
+    std::atomic<bool> probe_got_lock{false};
+    std::atomic<bool> published_in_predicate{false};
+    constexpr auto kWait = std::chrono::seconds{5};
+
+    std::thread prober([&] {
+        const auto deadline = std::chrono::steady_clock::now() + kWait;
+        while (!in_predicate.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        if (in_predicate.load()) {
+            // A probe counts only if the predicate had not returned before AND after try_lock:
+            // after the predicate returns the ctor releases the mutex, so a late try_lock
+            // succeeds on correct code and proves nothing.
+            const bool pre_done = predicate_done.load();
+            const bool got = mu.try_lock();
+            if (got)
+                mu.unlock();
+            if (!pre_done && !predicate_done.load()) {
+                probed = true;
+                probe_got_lock = got;
+            }
+        }
+        probe_done = true;
+    });
+
+    {
+        yuzu::agent::CtxSlot s{mu, slot, &ctx, [&] {
+                                   published_in_predicate = (slot.load() == &ctx);
+                                   in_predicate = true;
+                                   const auto deadline = std::chrono::steady_clock::now() + kWait;
+                                   while (!probe_done.load() &&
+                                          std::chrono::steady_clock::now() < deadline)
+                                       std::this_thread::yield();
+                                   predicate_done = true;
+                                   return false;
+                               }};
+        CHECK_FALSE(s.stop_seen());
+    }
+    prober.join();
+    CHECK(in_predicate.load());
+    CHECK(probed.load());                   // the probe really ran while the predicate was live
+    CHECK(published_in_predicate.load());   // already published when the predicate runs
+    CHECK_FALSE(probe_got_lock.load());     // mutex held while the predicate runs
+}
+
+TEST_CASE("cancel_ctx_slot cancels an RPC published through CtxSlot", "[updater][stop][2182]") {
+    BlockingCheckService svc;
+    grpc::ServerBuilder builder;
+    builder.RegisterService(&svc);
+    auto server = builder.BuildAndStart();
+    REQUIRE(server != nullptr);
+
+    struct State {
+        std::mutex mu;
+        std::atomic<grpc::ClientContext*> slot{nullptr};
+        std::atomic<bool> published{false};
+        std::promise<grpc::StatusCode> code;
+        std::unique_ptr<apb::AgentService::Stub> stub;
+    };
+    auto st = std::make_shared<State>();
+    st->stub = apb::AgentService::NewStub(server->InProcessChannel(grpc::ChannelArguments()));
+    auto fut = st->code.get_future();
+    std::thread([st] {
+        grpc::ClientContext ctx;
+        yuzu::agent::CtxSlot slot{st->mu, st->slot, &ctx};
+        st->published = true;
+        apb::CheckForUpdateRequest req;
+        apb::CheckForUpdateResponse resp;
+        st->code.set_value(st->stub->CheckForUpdate(&ctx, req, &resp).error_code());
+    }).detach();
+
+    while (!st->published.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    std::this_thread::sleep_for(std::chrono::milliseconds{100}); // let the RPC reach the handler
+    yuzu::agent::cancel_ctx_slot(st->mu, st->slot);
+
+    const bool returned = fut.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    svc.release_p.set_value();
+    REQUIRE(returned);
+    CHECK(fut.get() == grpc::StatusCode::CANCELLED);
+    server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds{2});
 }
 
 #endif // !_WIN32 — see the linkage note above (#3957)

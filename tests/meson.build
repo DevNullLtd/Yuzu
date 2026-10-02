@@ -552,7 +552,7 @@ agent_test_exe = executable(
     'unit/test_browser_inventory_parsers.cpp',          # Wave 10 P2a: pure JSON row parsers, fixture-driven
     'unit/test_browser_inventory_linux_parsers.cpp',    # Wave 10 P2a: Linux leg walk over an injected root
     'unit/test_browser_inventory_local_dispatcher.cpp', # Wave 10 P2a: real plugin via LocalDispatcher, unguarded on every OS
-    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure PAM/login.defs/auditd/pwpolicy parsers, no OS call (Linux+macOS legs; sudoers/secedit follow in their own PR's test file)
+    'unit/test_local_security_policy_parsers.cpp',          # Wave 8 PR8.3: pure PAM/login.defs/auditd/pwpolicy/sudoers/secedit parsers and the Windows scratch-sweep decisions, no process spawn (one real-filesystem case for the POSIX reader)
     'unit/test_local_security_policy_local_dispatcher.cpp', # Wave 8 PR8.3: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
@@ -2441,6 +2441,23 @@ test('gateway build wrapper',
   timeout: 180,
 )
 
+# Gateway image guards (#2150): the Dockerfile.gateway abi-guard's real text
+# run under sh against fake facts, and the gateway crash signatures in
+# scripts/ci/qa-stack.sh. Hermetic, no Docker; the cases that need a POSIX sh
+# skip themselves on Windows.
+test('gateway abi-guard',
+  _python3_test,
+  args: [files('test_gateway_abi_guard.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('qa-stack gateway crash signatures',
+  _python3_test,
+  args: [files('test_qa_stack_crash_pat.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
 test('changelog order',
   _python3_test,
@@ -2724,6 +2741,19 @@ if _bash_test.found()
   test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
     _bash_test,
     args: [files('shell/test_log_handoff_wiring_lexical.sh')],
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
+# #2182: static lexical gate pinning that agent.cpp still CALLS the tested OtaUpdateThread /
+# CtxSlot stop_seen() primitives (no AgentImpl seam exists to test that, #1492) and keeps the
+# flag-then-cancel_ctx() teardown order. Carries its own negative-control self-test. No build
+# required, gated only on bash like the log-handoff gate above.
+if _bash_test.found()
+  test('agent OTA/ctx-slot wiring lexical gate (#2182)',
+    _bash_test,
+    args: [files('shell/test_agent_ota_wiring_lexical.sh')],
     suite: 'agent',
     timeout: 60,
   )
