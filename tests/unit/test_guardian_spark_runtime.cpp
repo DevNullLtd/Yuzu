@@ -7375,6 +7375,11 @@ TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while 
             ::_exit(96);
         if (rt->armed_key_count() != 1 || b->arms.load() != 2)
             ::_exit(97);
+        // Join before _exit: TSan's _exit interceptor runs its finalizer, which reports an
+        // unjoined (even if finished) thread as a "thread leak" and exits 66 - the child
+        // would then fail the parent's exit-0 check on every nightly TSan run. a_done is
+        // already true here, so this returns immediately.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
@@ -7502,6 +7507,9 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
         // without the underlying double-disarm itself being fixed.
         if (b->disarms.load() > 1)
             ::_exit(98); // a second, redundant disarm landed - the double-disarm bug is back
+        // Join before _exit (same reason as Unit 4 above): TSan reports an unjoined thread at
+        // the _exit finalizer and exits 66. a_done is already true, so this is immediate.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
