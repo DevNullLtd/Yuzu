@@ -1462,8 +1462,9 @@ jobs:
             yuzu-${{ matrix.image }}-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With no continue-on-error and
+          # A re-run of this job (not a supported release recovery; see the
+          # release skill) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
           overwrite: true
@@ -1632,8 +1633,9 @@ jobs:
             yuzu-postgres-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With no continue-on-error and
+          # A re-run of this job (not a supported release recovery; see the
+          # release skill) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
           overwrite: true
@@ -1917,8 +1919,9 @@ jobs:
             yuzu-${{ matrix.image }}-chisel-image.spdx.json
           if-no-files-found: error
           retention-days: 3
-          # A re-run of this job pushes a new digest; replace the earlier
-          # attempt's SBOM. With no continue-on-error and
+          # A re-run of this job (not a supported release recovery; see the
+          # release skill) pushes a new digest; replace the earlier attempt's
+          # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
           overwrite: true
