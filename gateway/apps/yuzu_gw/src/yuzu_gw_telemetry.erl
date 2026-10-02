@@ -406,9 +406,10 @@ declare_metrics() ->
         {labels, [event]},
         {help, "Agent Heartbeat calls rejected because the session is held by "
                "this node but the call arrived on a different connection than "
-               "the one that opened it. Also rises while an HTTP/2 proxy "
-               "shares connections between agents, and briefly around agent "
-               "reconnects. Carries event=security for SIEM routing"}]),
+               "the one that opened it. Also rises when an HTTP/2 proxy "
+               "between agents and the gateway spreads one agent's calls over "
+               "several connections, and briefly around agent reconnects. "
+               "Carries event=security for SIEM routing"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
     [prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,

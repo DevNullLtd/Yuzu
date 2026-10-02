@@ -439,7 +439,7 @@ register_records_conn_key() ->
 
 rejection_log_is_rate_limited_and_id_free() ->
     yuzu_gw_heartbeat_admission:reset_summary_state(),
-    Ids = [uid(<<"secretish">>) || _ <- lists:seq(1, 5)],
+    Ids = [uid(<<"rej">>) || _ <- lists:seq(1, 5)],
     Lines = capture_logs(fun() ->
         lists:foreach(fun(Id) -> beat(conn_a, Id) end, Ids)
     end),
