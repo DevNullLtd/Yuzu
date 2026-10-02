@@ -1,11 +1,18 @@
 #include "guardian_ingest.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
+#include <spdlog/async_logger.h>
+#include <spdlog/details/thread_pool.h>
+#include <spdlog/sinks/sink.h>
 #include <spdlog/spdlog.h>
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
@@ -99,6 +106,140 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
           EventInsertOutcome::Conflict, EventInsertOutcome::Error})
         metrics.histogram(kGuardianEventStoreDurationMetric,
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
+}
+
+// ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
+// See the full design rationale on the declarations in guardian_ingest.hpp. This is
+// deliberately much lighter than agents/core/src/log_handoff.hpp's LogHandoff: one 1024-slot
+// queue, one worker thread, no teardown watchdog. This is an ACCEPTED exposure, not an
+// eliminated one (see guardian_ingest.hpp's full rationale, corrected 2026-09-28 by adversarial
+// review): the server's hard-exit machinery is signal-driven, not self-armed -- the first
+// SIGTERM takes the graceful stop() path, so a wedged pool join at exit is bounded only by a
+// SECOND signal or the deployment's external stop deadline (210s in both shipped
+// systemd/Compose configs), not "a plain SIGTERM" alone -- plus no heartbeat/metrics surfacing
+// (out of scope for this PR).
+namespace {
+
+// Message-count bound (mirrors log_handoff.hpp's kLogQueueCapacity, sized down: this backs
+// exactly one diagnostic line, not the whole process's logging). (1024 + 1) *
+// sizeof(spdlog::details::async_msg) fixed RSS at construction - see
+// docs/resource-ledgers/4666-t-server-async-logger.md for the exact figure.
+constexpr std::size_t kTServerLogQueueCapacity = 1024;
+
+// Mutex-guarded count + truncated last message, no I/O of any kind in the handler itself. This
+// is a deliberately server-local, MUCH smaller equivalent of LogHandoff::ErrorState -- it does
+// NOT reproduce that class's rate-limited stderr fallback (#5023): this logger backs one
+// diagnostic line, not the process's default logger, so there is no pre-existing
+// operator-visible stderr signal to preserve here, and adding one would mean a second detached
+// emit-thread/Permit apparatus for a single benchmark-diagnostic line. No accessor exists today
+// (quality-engineer finding, governance Gate 3): the struct is reachable only from inside the
+// `set_error_handler` lambda's capture, so "a future consumer reads the count" is not yet true as
+// written -- a future consumer needs an accessor added first, matching LogHandoff's own
+// log_errors_total()/stderr_emits_dropped() precedent for the shape such an accessor would take.
+struct TServerErrorState {
+    std::mutex mu;
+    std::uint64_t count{0};
+    std::string last_message; // truncated to 256 bytes
+};
+
+std::mutex g_t_server_logger_mu;
+std::shared_ptr<spdlog::logger> g_t_server_logger; // guarded by g_t_server_logger_mu
+std::atomic<std::uint64_t> g_t_server_log_skipped_total{0};
+std::atomic<bool> g_t_server_construction_fault_for_test{false};
+
+// Snapshot under the lock, then use the returned shared_ptr lock-free: cheap (one refcount
+// bump), and keeps the logger alive for the whole ->info() call even if set_t_server_logger()
+// swaps or clears the seam concurrently (production: only at boot, before any ingest traffic;
+// tests: serialized by Catch2's default single-threaded run).
+std::shared_ptr<spdlog::logger> t_server_logger_snapshot() {
+    std::lock_guard<std::mutex> lock(g_t_server_logger_mu);
+    return g_t_server_logger;
+}
+
+} // namespace
+
+std::shared_ptr<spdlog::logger> create_t_server_logger(std::vector<spdlog::sink_ptr> sinks,
+                                                       spdlog::level::level_enum level) {
+    // Best-effort by construction (MUST #7 of the #4666 PR-4 spec): a thread-creation refusal
+    // (thread_pool's ctor can throw std::system_error) is caught here, logged via the default
+    // logger, and returns nullptr -- NEVER EXIT_FAILURE. Nothing before this point mutates any
+    // global state; the seam stays unset until set_t_server_logger() is called with the result.
+    //
+    // Consume the test-fault flag FIRST, unconditionally -- mirrors LogHandoff's own governance
+    // hardening fix (log_handoff.cpp): consuming it AFTER some other early-return path would let
+    // a fault flag set ahead of that path go unconsumed and leak into the next, unrelated call.
+    // This function has no such early-return before the try block today, but the ordering is
+    // kept first-thing regardless, so it stays correct if one is ever added.
+    if (g_t_server_construction_fault_for_test.exchange(false, std::memory_order_relaxed)) {
+        spdlog::warn("Guardian T_server: failed to construct dedicated async logger (injected "
+                     "test fault); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+        return nullptr;
+    }
+    try {
+        auto pool = std::make_shared<spdlog::details::thread_pool>(kTServerLogQueueCapacity, 1);
+        auto logger = std::make_shared<spdlog::async_logger>(
+            std::string("guardian.t_server"), sinks.begin(), sinks.end(),
+            std::weak_ptr<spdlog::details::thread_pool>(pool),
+            spdlog::async_overflow_policy::overrun_oldest);
+
+        auto error_state = std::make_shared<TServerErrorState>();
+        logger->set_error_handler([error_state](const std::string& msg) {
+            // No I/O in this handler (MUST #2) -- see the class comment above for why this
+            // deliberately does not mirror LogHandoff::ErrorState's stderr fallback.
+            std::lock_guard<std::mutex> lock(error_state->mu);
+            ++error_state->count;
+            error_state->last_message = msg.size() > 256 ? msg.substr(0, 256) : msg;
+        });
+        // Explicit level set (MUST #4): spdlog::set_level()'s registry-wide reach only applies
+        // to already-registered loggers, and register_logger() alone does not retroactively
+        // apply the process's current level (only registry::initialize_logger() does) -- so
+        // this must be set here, at construction, or --log-level would silently fail to
+        // suppress T_server.
+        logger->set_level(level);
+
+        // spdlog::async_logger holds only a WEAK back-reference to its thread_pool (verified
+        // against async_logger-inl.h: sink_it_()/flush_() both do
+        // `if (auto pool_ptr = thread_pool_.lock()) pool_ptr->post_log(...)`), so something must
+        // keep `pool` alive for as long as the returned logger is used -- otherwise the pool
+        // (and its worker thread) would be destroyed the moment this function returns and the
+        // local `pool` shared_ptr above drops, and every future ->info() call would silently
+        // no-op (thread_pool_.lock() returning nullptr, per the same guard). This function is
+        // contracted (MUST #8) to return a plain `shared_ptr<spdlog::logger>`, not a dedicated
+        // owning class the way LogHandoff is, so the two lifetimes are bundled into that one
+        // returned handle instead: a second control block sharing `logger`'s pointer, whose
+        // deleter captures both `pool` and `logger` and does nothing else. Dropping the last
+        // copy of the returned handle releases both captures, and each is then destroyed
+        // through its OWN original shared_ptr machinery -- this deleter never calls delete
+        // itself, so there is no double-free. Capture order has no correctness dependency
+        // either way: ~async_logger() never touches the pool, and ~thread_pool()'s worker join
+        // never touches the logger.
+        return std::shared_ptr<spdlog::logger>(logger.get(),
+                                                [pool, logger](spdlog::logger*) {});
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian T_server: failed to construct dedicated async logger ({}); the "
+                     "T_server diagnostic line will be skipped until the next restart",
+                     e.what());
+        return nullptr;
+    } catch (...) {
+        spdlog::warn("Guardian T_server: failed to construct dedicated async logger (unknown "
+                     "exception); the T_server diagnostic line will be skipped until the next "
+                     "restart");
+        return nullptr;
+    }
+}
+
+void set_t_server_logger(std::shared_ptr<spdlog::logger> logger) {
+    std::lock_guard<std::mutex> lock(g_t_server_logger_mu);
+    g_t_server_logger = std::move(logger);
+}
+
+std::uint64_t t_server_log_skipped_total_for_test() {
+    return g_t_server_log_skipped_total.load(std::memory_order_relaxed);
+}
+
+void set_t_server_construction_fault_for_test(bool fail) noexcept {
+    g_t_server_construction_fault_for_test.store(fail, std::memory_order_relaxed);
 }
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
@@ -247,11 +388,21 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                 // agent's T_wire/T_detect lines use (yuzu/log_token.hpp, log_id_token): a space or
                 // '=' would otherwise forge extra tokens, and a per-side rule would break the
                 // event_id join.
-                spdlog::info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
-                             "committed_ns={} agent_ns={} store_ms={}",
-                             log_id_token(ev_row.event_id), log_id_token(agent_id),
-                             log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
-                             agent_ns, store_ms);
+                //
+                // #4666 PR-4: resolved through the dedicated seam logger (never the bare
+                // spdlog:: free functions) so a stalled sink can never block this thread. Null
+                // (construction/registration never succeeded, or main.cpp hasn't wired it yet)
+                // is a silent, counted skip, not a fallback onto the synchronous default logger
+                // -- falling back would reintroduce the exact hazard this seam exists to close.
+                if (auto logger = t_server_logger_snapshot()) {
+                    logger->info("Guardian T_server event_id={} agent={} rule={} recv_ns={} "
+                                 "committed_ns={} agent_ns={} store_ms={}",
+                                 log_id_token(ev_row.event_id), log_id_token(agent_id),
+                                 log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns,
+                                 agent_ns, store_ms);
+                } else {
+                    g_t_server_log_skipped_total.fetch_add(1, std::memory_order_relaxed);
+                }
             } catch (...) { // best-effort diagnostic; never propagate onto the ingest thread
             }
         }
