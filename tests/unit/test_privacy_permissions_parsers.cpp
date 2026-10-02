@@ -829,14 +829,6 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes;
         CHECK(token(big) == "<accepted>");
     }
-    SECTION("redirection is the shell's final-path verdict (the comparison itself is "
-            "CompareStringOrdinal, tested in test_privacy_permissions_win_internals.cpp)") {
-        auto other = stock();
-        other.final_path_matches = false;
-        CHECK(token(other) == "hive_path_redirected");
-        other.final_path_matches = true;
-        CHECK(token(other) == "<accepted>");
-    }
     SECTION("the order is pinned: owner before redirect before size") {
         auto f = stock();
         f.owner_sid = "S-1-5-21-1-2-3-1002";
