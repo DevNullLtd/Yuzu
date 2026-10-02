@@ -11,6 +11,10 @@
 
 #include "local_dispatcher.hpp"
 
+#if defined(_WIN32)
+#include <win_profiles.hpp> // enumerate_profile_list: the profile set the production collector walks
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -207,12 +211,14 @@ TEST_CASE("privacy_permissions: the real Windows dispatch derives its typed stat
     // 4-runner/one-identity box, concurrent jobs running registry-touching tests can collide on a
     // profile's hive file (ERROR_SHARING_VIOLATION), which surfaces as a `hive_mount_failed` row --
     // the same exposure test_registry_local_dispatcher already carries. The oracle is therefore
-    // deliberately shape-level, like the macOS arm above: it asserts the status is DERIVED from the
-    // rows (never the placeholder, PERMISSION_DENIED/CONSTRAINED only with their evidence), and it
-    // cannot be satisfied by a hard-coded status, but it does not pin which profiles a host has or
-    // whether they could be read. Value-level behaviour is covered where the inputs are controlled:
-    // the injected-read cases in test_privacy_permissions_parsers.cpp and the fixture-registry and
-    // TempDir cases in test_privacy_permissions_win_internals.cpp.
+    // deliberately shape-level, like the macOS arm above: it pins that the status is never the
+    // placeholder and that PERMISSION_DENIED/CONSTRAINED come only with their row evidence. It does
+    // NOT pin the status itself (a hard-coded CONSTRAINED/PARTIAL satisfies the last branch), nor
+    // which profiles a host has or whether they could be read. The one discriminating check is the
+    // profile-coverage one at the end: every profile the host has must reach the wire. Value-level
+    // behaviour is covered where the inputs are controlled: the injected-read cases in
+    // test_privacy_permissions_parsers.cpp and the fixture-registry and TempDir cases in
+    // test_privacy_permissions_win_internals.cpp.
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
@@ -239,5 +245,31 @@ TEST_CASE("privacy_permissions: the real Windows dispatch derives its typed stat
             result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
         CHECK((ok_full || constrained_partial));
     }
+
+    // Profile coverage: derive the profile set exactly as the collector does. A profile -- walked,
+    // unreachable or refused -- always puts at least one `<name>/`-qualified row on the wire, so a
+    // collector that handed the assembler an empty profile list would pass every check above and
+    // fail here. HKLM's own rows are unqualified, so only a profile-name prefix proves a walk. Only
+    // plain names are compared (the wire sanitizer rewrites anything else). "Any", not "every": a
+    // slow host's cooperative deadline may legitimately stop the run after the first profiles.
+    const auto profiles = yuzu::profiles::build_profile_list(
+        yuzu::win::enumerate_profile_list().records, yuzu::win::enumerate_hku_subkeys());
+    const auto plain = [](const std::string& n) {
+        return std::all_of(n.begin(), n.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                   c == '.' || c == '_' || c == '-';
+        });
+    };
+    const auto rows = rows_of(result.captured);
+    bool expect_profile_row = false, saw_profile_row = false;
+    for (const auto& p : profiles) {
+        const std::string name = p.profile_name.empty() ? "-" : p.profile_name;
+        if (!plain(name)) continue;
+        expect_profile_row = true;
+        const std::string prefix = "permissions|windows|" + name + "/";
+        for (const auto& r : rows) saw_profile_row = saw_profile_row || r.rfind(prefix, 0) == 0;
+    }
+    INFO("the host has " << profiles.size() << " non-system profile(s), none reached the wire");
+    CHECK((!expect_profile_row || saw_profile_row));
 }
 #endif

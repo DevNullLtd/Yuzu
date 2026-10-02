@@ -555,19 +555,21 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
 
     const std::wstring ntuser = to_wide(profile_path_utf8) + L"\\NTUSER.DAT";
     const std::wstring mount = unique_hive_mount_name(wsid);
-    // Recorded BEFORE the mount is attempted, so a load failure still names
-    // the mount the operator should check for.
-    if (report) {
-        report->mounted_offline = true;
-        report->mount_name = from_wide(mount.c_str(), static_cast<int>(mount.size()));
-    }
 
     if (check && check->before_load) {
         if (std::string token = check->before_load(ntuser); !token.empty()) {
             if (report)
                 report->refusal = std::move(token);
-            return finish(HiveAccessStatus::file_refused); // nothing is mounted yet
+            return finish(HiveAccessStatus::file_refused); // no mount attempted: report stays unset
         }
+    }
+
+    // Recorded BEFORE the mount is attempted, so a load failure still names
+    // the mount the operator should check for. Set only once a mount WILL be
+    // attempted (after a before_load refusal there is none).
+    if (report) {
+        report->mounted_offline = true;
+        report->mount_name = from_wide(mount.c_str(), static_cast<int>(mount.size()));
     }
 
     bool unload_failed = false;

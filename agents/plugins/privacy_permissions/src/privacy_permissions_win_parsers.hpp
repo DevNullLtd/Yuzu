@@ -573,6 +573,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
     std::vector<PermissionRow> discovery_rows, const ReadProfileFn& read_profile,
     RetentionBudget& budget, OutputBudget& output, yuzu::shared::ConstraintAccumulator& acc) {
     std::vector<PermissionRow> rows = std::move(discovery_rows);
+    output.charge(rows); // ProfileList failures count toward the run's output bound like any row
     // A source that hit its own cap keeps the rows it charged; this row says it is incomplete.
     const auto truncated_row = [&](std::vector<PermissionRow>& into, const std::string& source,
                                    const std::string& row_id) {

@@ -203,7 +203,7 @@
     {
       "grant": "None for a loaded hive; the offline arm needs the two privileges LocalSystem already holds",
       "if_refused": "A refused registry read (`ERROR_ACCESS_DENIED`) reports that source or key `denied` (`<profile>:access_denied`, `<profile>:<category>:value_access_denied`), `PERMISSION_DENIED`/`PARTIAL`; a missing privilege reports `<profile>:privilege_missing` `denied`; a refused or unsafe hive file reports `<profile>:<hive_* token>` `unreadable`",
-      "measured": "Live-hive read on the-rig (Windows 11 Pro 10.0.26200), 2026-09-23. The offline arm, hive-file guard and stability watch: measured on the-rig as SYSTEM, in the run that produced the committed sample (2026-10-02, Windows 10.0.26200, bare-metal -- the sample's stamp records the date and host); the hostile-shape and unload-failure narrative is in the PR description",
+      "measured": "Live-hive read on the-rig (Windows 11 Pro 10.0.26200), 2026-09-23. The offline arm, hive-file guard and stability watch: measured on the-rig as SYSTEM, 2026-10-02 (Windows 10.0.26200, bare-metal -- the sample's stamp records the date and host). The final commit was re-verified on the rig the same day: compile, tests under both identities, hostile-shape and `after_load`-refusal probes, committed-sample rows byte-identical. The narrative is in the PR description",
       "os": "Windows",
       "runs_as": "agent service, LocalSystem; `SeBackupPrivilege`/`SeRestorePrivilege` are enabled only inside the offline-hive arm, under the process-wide offline-hive lock"
     },

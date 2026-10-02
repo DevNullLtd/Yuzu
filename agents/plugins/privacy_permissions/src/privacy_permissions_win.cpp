@@ -369,9 +369,12 @@ struct UniqueHandle {
 /// GetSecurityInfo, a string from ConvertSidToStringSidW); null is a no-op.
 struct LocalFreeGuard {
     HLOCAL p;
+    explicit LocalFreeGuard(HLOCAL x) noexcept : p(x) {}
     ~LocalFreeGuard() {
         if (p) LocalFree(p);
     }
+    LocalFreeGuard(const LocalFreeGuard&) = delete;
+    LocalFreeGuard& operator=(const LocalFreeGuard&) = delete;
 };
 
 /// Whether the path the kernel resolved a handle to (`final_path`, GetFinalPathNameByHandleW with

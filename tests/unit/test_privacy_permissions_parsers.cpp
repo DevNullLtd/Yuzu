@@ -914,9 +914,10 @@ struct AssembledRun {
     std::size_t reads = 0;
 
     void go(const std::vector<ProfileInfo>& profiles, const win::ConsentWalk& hklm,
-            const std::function<win::ProfileRead(const ProfileInfo&)>& read) {
+            const std::function<win::ProfileRead(const ProfileInfo&)>& read,
+            std::vector<PermissionRow> discovery = {}) {
         rows = win::assemble_windows_rows(
-            profiles, hklm, {},
+            profiles, hklm, std::move(discovery),
             [&](const ProfileInfo& p) {
                 ++reads;
                 return read(p);
@@ -1129,6 +1130,84 @@ TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with on
         run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
         CHECK(run.reads == 3);
         CHECK(run.markers(win::kTimeoutToken) == 0);
+    }
+}
+
+TEST_CASE("win::assemble_windows_rows: the per-source budget marker, source-level failures, "
+          "discovery rows and a timeout refusal each have their own row",
+          "[privacy_permissions][win_parsers]") {
+    AssembledRun run;
+    const auto with_raw = [&](std::string_view raw) {
+        return run.count([&](const PermissionRow& r) { return r.raw == raw; });
+    };
+    const auto allow = [](const ProfileInfo&) { return reachable_allow(); };
+    const std::vector<ProfileInfo> two{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)};
+
+    SECTION("HKLM that hit its own cap is one `hklm:budget_exceeded` row") {
+        run.budget.profile_exhausted = true; // as the HKLM walk leaves it when its cap was hit
+        run.go({}, win::ConsentWalk{}, allow);
+        CHECK(with_raw("hklm:budget_exceeded") == 1);
+    }
+    SECTION("a profile that hit its own cap is one `<profile>:budget_exceeded` row; the next is untouched") {
+        run.go(two, hklm_camera_deny(), [&](const ProfileInfo& p) {
+            if (p.sid == kSidAlice) run.budget.profile_exhausted = true; // set after begin_profile()
+            return reachable_allow();
+        });
+        CHECK(with_raw("alice:budget_exceeded") == 1);
+        CHECK(with_raw("bobby:budget_exceeded") == 0);
+        CHECK(run.rows_of("bobby\\-") == kCategories.size());
+    }
+    SECTION("an HKLM root that failed to open is a row (a refused one is a denial)") {
+        win::ConsentWalk h;
+        h.root_rc = win::kErrorAccessDenied;
+        run.go({}, h, allow);
+        CHECK(with_raw("hklm:access_denied") == 1);
+        CHECK(any_denied(run.rows));
+    }
+    SECTION("an HKLM root that is merely missing is not a failure row") {
+        win::ConsentWalk h;
+        h.root_rc = win::kErrorFileNotFound;
+        run.go({}, h, allow);
+        CHECK(with_raw("hklm:win32_2") == 0);
+        CHECK_FALSE(any_denied(run.rows));
+    }
+    SECTION("an HKLM store refused as unstable is one `hklm:<token>` row") {
+        win::ConsentWalk h;
+        h.refused = "changed_during_read";
+        run.go({}, h, allow);
+        CHECK(with_raw("hklm:changed_during_read") == 1);
+    }
+    SECTION("a reachable profile's own root failure and structural failure are rows") {
+        run.go({profile_of("alice", kSidAlice)}, win::ConsentWalk{}, [](const ProfileInfo&) {
+            auto rd = reachable_allow();
+            rd.walk.root_rc = 1234;
+            rd.walk.structural.push_back(
+                win::structural_failure("-", "camera", "capability:win32_9", false));
+            return rd;
+        });
+        CHECK(with_raw("alice:win32_1234") == 1);
+        CHECK(run.count([](const PermissionRow& r) {
+                  return r.raw.find("capability:win32_9") != std::string::npos && !r.read_denied;
+              }) == 1);
+    }
+    SECTION("discovery rows lead the run and count toward the output budget") {
+        AssembledRun bare;
+        bare.go({}, hklm_camera_deny(), allow);
+        const std::vector<PermissionRow> discovery{
+            failure_row("windows", "-", "-", false, "profile_list:win32_5", run.acc)};
+        run.go({}, hklm_camera_deny(), allow, discovery);
+        REQUIRE_FALSE(run.rows.empty());
+        CHECK(run.rows.front().raw == "profile_list:win32_5");
+        CHECK(run.output.bytes - bare.output.bytes == OutputBudget::cost(discovery));
+    }
+    SECTION("a profile refused with `timeout` ends the run: one collection:timeout row, no later read") {
+        run.go(two, hklm_camera_deny(), [&](const ProfileInfo&) {
+            run.budget.timed_out = true; // what the guard's budget.expired() leaves behind
+            return unreachable(HiveAccessStatus::file_refused, "timeout");
+        });
+        CHECK(run.reads == 1);
+        CHECK(with_raw("alice:timeout") == 1);
+        CHECK(run.markers(win::kTimeoutToken) == 1);
     }
 }
 
