@@ -65,7 +65,9 @@
        }.
 
 -type 'yuzu.gateway.v1.BatchHeartbeatResponse'() ::
-      #{acknowledged_count      => integer()        % = 1, optional, 32 bits
+      #{acknowledged_count      => integer(),       % = 1, optional, 32 bits
+        unknown_session_ids     => [unicode:chardata()], % = 2, repeated
+        unknown_session_ids_truncated => boolean() | 0 | 1 % = 3, optional
        }.
 
 -type 'yuzu.gateway.v1.StreamStatusNotification'() ::
@@ -318,15 +320,33 @@ encode_msg(Msg, MsgName, Opts) ->
 
 
 'encode_msg_yuzu.gateway.v1.BatchHeartbeatResponse'(#{} = M, Bin, TrUserData) ->
+    B1 = case M of
+             #{acknowledged_count := F1} ->
+                 begin
+                     TrF1 = id(F1, TrUserData),
+                     if TrF1 =:= 0 -> Bin;
+                        true -> e_type_int32(TrF1, <<Bin/binary, 8>>, TrUserData)
+                     end
+                 end;
+             _ -> Bin
+         end,
+    B2 = case M of
+             #{unknown_session_ids := F2} ->
+                 TrF2 = id(F2, TrUserData),
+                 if TrF2 == [] -> B1;
+                    true -> 'e_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(TrF2, B1, TrUserData)
+                 end;
+             _ -> B1
+         end,
     case M of
-        #{acknowledged_count := F1} ->
+        #{unknown_session_ids_truncated := F3} ->
             begin
-                TrF1 = id(F1, TrUserData),
-                if TrF1 =:= 0 -> Bin;
-                   true -> e_type_int32(TrF1, <<Bin/binary, 8>>, TrUserData)
+                TrF3 = id(F3, TrUserData),
+                if TrF3 =:= false -> B2;
+                   true -> e_type_bool(TrF3, <<B2/binary, 24>>, TrUserData)
                 end
             end;
-        _ -> Bin
+        _ -> B2
     end.
 
 'encode_msg_yuzu.gateway.v1.StreamStatusNotification'(Msg, TrUserData) -> 'encode_msg_yuzu.gateway.v1.StreamStatusNotification'(Msg, <<>>, TrUserData).
@@ -1474,6 +1494,12 @@ encode_msg(Msg, MsgName, Opts) ->
     'e_field_yuzu.gateway.v1.BatchHeartbeatRequest_heartbeats'(Rest, Bin3, TrUserData);
 'e_field_yuzu.gateway.v1.BatchHeartbeatRequest_heartbeats'([], Bin, _TrUserData) -> Bin.
 
+'e_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'([Elem | Rest], Bin, TrUserData) ->
+    Bin2 = <<Bin/binary, 18>>,
+    Bin3 = e_type_string(id(Elem, TrUserData), Bin2, TrUserData),
+    'e_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(Rest, Bin3, TrUserData);
+'e_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'([], Bin, _TrUserData) -> Bin.
+
 'e_field_yuzu.gateway.v1.StreamStatusNotification_wire_capabilities'([Elem | Rest], Bin, TrUserData) ->
     Bin2 = <<Bin/binary, 50>>,
     Bin3 = e_type_string(id(Elem, TrUserData), Bin2, TrUserData),
@@ -1933,50 +1959,69 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
 
 'skip_64_yuzu.gateway.v1.BatchHeartbeatRequest'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatRequest'(Rest, Z1, Z2, F, F@_1, F@_2, TrUserData).
 
-'decode_msg_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, 0, 0, 0, id(0, TrUserData), TrUserData).
+'decode_msg_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, 0, 0, 0, id(0, TrUserData), id([], TrUserData), id(false, TrUserData), TrUserData).
 
-'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, Z1, Z2, F, F@_1, TrUserData);
-'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<>>, 0, 0, _, F@_1, _) -> #{acknowledged_count => F@_1};
-'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Other, Z1, Z2, F, F@_1, TrUserData) -> 'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Other, Z1, Z2, F, F@_1, TrUserData).
+'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<8, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<18, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<24, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) ->
+    'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids_truncated'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
+'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<>>, 0, 0, _, F@_1, R1, F@_3, TrUserData) -> #{acknowledged_count => F@_1, unknown_session_ids => lists_reverse(R1, TrUserData), unknown_session_ids_truncated => F@_3};
+'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
 
-'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 32 - 7 -> 'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, TrUserData) ->
+'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
+'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        8 -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, 0, 0, 0, F@_1, TrUserData);
+        8 -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
+        18 -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
+        24 -> 'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids_truncated'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                1 -> 'skip_64_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                3 -> 'skip_group_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData);
-                5 -> 'skip_32_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, TrUserData)
+                0 -> 'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
+                1 -> 'skip_64_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
+                3 -> 'skip_group_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData);
+                5 -> 'skip_32_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<>>, 0, 0, _, F@_1, _) -> #{acknowledged_count => F@_1}.
+'dg_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(<<>>, 0, 0, _, F@_1, R1, F@_3, TrUserData) -> #{acknowledged_count => F@_1, unknown_session_ids => lists_reverse(R1, TrUserData), unknown_session_ids_truncated => F@_3}.
 
-'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 57 ->
-    'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, TrUserData) ->
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_acknowledged_count'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, TrUserData) ->
     {NewFValue, RestF} = {begin <<Res:32/signed-native>> = <<(X bsl N + Acc):32/unsigned-native>>, id(Res, TrUserData) end, Rest},
-    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(RestF, 0, 0, F, NewFValue, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, TrUserData).
 
-'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, TrUserData);
-'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, Prev, F@_3, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(RestF, 0, 0, F, F@_1, cons(NewFValue, Prev, TrUserData), F@_3, TrUserData).
 
-'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) when N < 57 -> 'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, TrUserData);
-'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, TrUserData) ->
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids_truncated'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 ->
+    'd_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids_truncated'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
+'d_field_yuzu.gateway.v1.BatchHeartbeatResponse_unknown_session_ids_truncated'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, TrUserData) ->
+    {NewFValue, RestF} = {id(X bsl N + Acc =/= 0, TrUserData), Rest},
+    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, TrUserData).
+
+'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData);
+'skip_varint_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
+
+'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, TrUserData);
+'skip_length_delimited_yuzu.gateway.v1.BatchHeartbeatResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest2, 0, 0, F, F@_1, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, TrUserData).
 
-'skip_group_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, _, Z2, FNum, F@_1, TrUserData) ->
+'skip_group_yuzu.gateway.v1.BatchHeartbeatResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, Z2, FNum, F@_1, TrUserData).
+    'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, TrUserData).
 
-'skip_32_yuzu.gateway.v1.BatchHeartbeatResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'skip_32_yuzu.gateway.v1.BatchHeartbeatResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
 
-'skip_64_yuzu.gateway.v1.BatchHeartbeatResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, TrUserData).
+'skip_64_yuzu.gateway.v1.BatchHeartbeatResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData) -> 'dfp_read_field_def_yuzu.gateway.v1.BatchHeartbeatResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, TrUserData).
 
 'decode_msg_yuzu.gateway.v1.StreamStatusNotification'(Bin, TrUserData) ->
     'dfp_read_field_def_yuzu.gateway.v1.StreamStatusNotification'(Bin,
@@ -4334,12 +4379,23 @@ merge_msgs(Prev, New, MsgName, Opts) ->
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.gateway.v1.BatchHeartbeatResponse'/3}).
-'merge_msg_yuzu.gateway.v1.BatchHeartbeatResponse'(PMsg, NMsg, _) ->
+'merge_msg_yuzu.gateway.v1.BatchHeartbeatResponse'(PMsg, NMsg, TrUserData) ->
     S1 = #{},
+    S2 = case {PMsg, NMsg} of
+             {_, #{acknowledged_count := NFacknowledged_count}} -> S1#{acknowledged_count => NFacknowledged_count};
+             {#{acknowledged_count := PFacknowledged_count}, _} -> S1#{acknowledged_count => PFacknowledged_count};
+             _ -> S1
+         end,
+    S3 = case {PMsg, NMsg} of
+             {#{unknown_session_ids := PFunknown_session_ids}, #{unknown_session_ids := NFunknown_session_ids}} -> S2#{unknown_session_ids => 'erlang_++'(PFunknown_session_ids, NFunknown_session_ids, TrUserData)};
+             {_, #{unknown_session_ids := NFunknown_session_ids}} -> S2#{unknown_session_ids => NFunknown_session_ids};
+             {#{unknown_session_ids := PFunknown_session_ids}, _} -> S2#{unknown_session_ids => PFunknown_session_ids};
+             {_, _} -> S2
+         end,
     case {PMsg, NMsg} of
-        {_, #{acknowledged_count := NFacknowledged_count}} -> S1#{acknowledged_count => NFacknowledged_count};
-        {#{acknowledged_count := PFacknowledged_count}, _} -> S1#{acknowledged_count => PFacknowledged_count};
-        _ -> S1
+        {_, #{unknown_session_ids_truncated := NFunknown_session_ids_truncated}} -> S3#{unknown_session_ids_truncated => NFunknown_session_ids_truncated};
+        {#{unknown_session_ids_truncated := PFunknown_session_ids_truncated}, _} -> S3#{unknown_session_ids_truncated => PFunknown_session_ids_truncated};
+        _ -> S3
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.gateway.v1.StreamStatusNotification'/3}).
@@ -5028,7 +5084,22 @@ verify_msg(Msg, MsgName, Opts) ->
         #{acknowledged_count := F1} -> v_type_int32(F1, [acknowledged_count | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{unknown_session_ids := F2} ->
+            if is_list(F2) ->
+                   _ = [v_type_string(Elem, [unknown_session_ids | Path], TrUserData) || Elem <- F2],
+                   ok;
+               true -> mk_type_error({invalid_list_of, string}, F2, [unknown_session_ids | Path])
+            end;
+        _ -> ok
+    end,
+    case M of
+        #{unknown_session_ids_truncated := F3} -> v_type_bool(F3, [unknown_session_ids_truncated | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (acknowledged_count) -> ok;
+                      (unknown_session_ids) -> ok;
+                      (unknown_session_ids_truncated) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -6115,7 +6186,10 @@ get_msg_defs() ->
      {{enum, 'yuzu.common.v1.ScopeCombinator.Op'}, [{'AND', 0}, {'OR', 1}, {'NOT', 2}]},
      {{msg, 'yuzu.gateway.v1.BatchHeartbeatRequest'},
       [#{name => heartbeats, fnum => 1, rnum => 2, type => {msg, 'yuzu.agent.v1.HeartbeatRequest'}, occurrence => repeated, opts => []}, #{name => gateway_node, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []}]},
-     {{msg, 'yuzu.gateway.v1.BatchHeartbeatResponse'}, [#{name => acknowledged_count, fnum => 1, rnum => 2, type => int32, occurrence => optional, opts => []}]},
+     {{msg, 'yuzu.gateway.v1.BatchHeartbeatResponse'},
+      [#{name => acknowledged_count, fnum => 1, rnum => 2, type => int32, occurrence => optional, opts => []},
+       #{name => unknown_session_ids, fnum => 2, rnum => 3, type => string, occurrence => repeated, opts => []},
+       #{name => unknown_session_ids_truncated, fnum => 3, rnum => 4, type => bool, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.gateway.v1.StreamStatusNotification'},
       [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => session_id, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},
@@ -6319,7 +6393,10 @@ fetch_enum_def(EnumName) ->
 
 find_msg_def('yuzu.gateway.v1.BatchHeartbeatRequest') ->
     [#{name => heartbeats, fnum => 1, rnum => 2, type => {msg, 'yuzu.agent.v1.HeartbeatRequest'}, occurrence => repeated, opts => []}, #{name => gateway_node, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []}];
-find_msg_def('yuzu.gateway.v1.BatchHeartbeatResponse') -> [#{name => acknowledged_count, fnum => 1, rnum => 2, type => int32, occurrence => optional, opts => []}];
+find_msg_def('yuzu.gateway.v1.BatchHeartbeatResponse') ->
+    [#{name => acknowledged_count, fnum => 1, rnum => 2, type => int32, occurrence => optional, opts => []},
+     #{name => unknown_session_ids, fnum => 2, rnum => 3, type => string, occurrence => repeated, opts => []},
+     #{name => unknown_session_ids_truncated, fnum => 3, rnum => 4, type => bool, occurrence => optional, opts => []}];
 find_msg_def('yuzu.gateway.v1.StreamStatusNotification') ->
     [#{name => agent_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => session_id, fnum => 2, rnum => 3, type => string, occurrence => optional, opts => []},
