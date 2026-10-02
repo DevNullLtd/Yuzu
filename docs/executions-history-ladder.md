@@ -198,7 +198,7 @@ first, then bus.
 
 ### Publisher invariant
 
-Three `ExecutionTracker` mutators publish onto the bus when set:
+Four `ExecutionTracker` mutators publish onto the bus when set:
 
 - `update_agent_status` → `agent-transition` (one event per agent state
   change; payload is the `AgentExecStatus` JSON).
@@ -207,6 +207,15 @@ Three `ExecutionTracker` mutators publish onto the bus when set:
   `execution-completed` (status=succeeded|completed). The progress event
   precedes the terminal event so an SSE client receives counts then status.
 - `mark_cancelled` → terminal `execution-completed` (status=cancelled).
+- `reap_stuck_running_executions` (#4982 Part B, the clock-guarded background
+  sweep) → terminal `execution-completed` (status=cancelled), same shape as
+  `mark_cancelled`'s row above — it reproduces `mark_cancelled`'s state/event
+  coupling INLINE, inside its own advisory-lock-held transaction, rather than
+  calling `mark_cancelled` itself (never a new taxonomy, satisfying this
+  file's "one bus, one taxonomy" rule). The append sits inside the SAME
+  transaction as the cancelling `UPDATE`, so the clause-3 "outbox appends are
+  atomic inside the paired state-write txn" invariant below holds by the same
+  mechanism `mark_cancelled` already uses.
 
 ### Bounded ring buffer
 
@@ -323,9 +332,9 @@ band context.
 
 **Three consumers, one bus, one set of publisher invariants** - the
 publisher list above (`update_agent_status` / `refresh_counts` /
-`mark_cancelled` → `agent-transition` / `execution-progress` /
-`execution-completed`) is the single taxonomy every consumer reads. The
-three live consumers are (1) the dashboard SSE route
+`mark_cancelled` / `reap_stuck_running_executions` → `agent-transition` /
+`execution-progress` / `execution-completed`) is the single taxonomy every
+consumer reads. The three live consumers are (1) the dashboard SSE route
 (`execution.live_subscribe`), (2) the agentic route
 (`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
 progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
@@ -452,9 +461,13 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   transaction connection**, inside the same `with_txn_for` as the state
   mutation that produced it — the `agent_exec_status` upsert
   (`upsert_agent_status_once`), the aggregate recompute / terminal transition
-  (`refresh_counts_once`), and the cancel (`mark_cancelled`). A failed append
-  returns false, which rolls the whole transaction back, so the store can never
-  hold state without its event or an event without its state. The append takes
+  (`refresh_counts_once`), the cancel (`mark_cancelled`), and (#4982 Part B)
+  the stuck-execution reap sweep's own atomic cancel UPDATE
+  (`reap_stuck_running_executions`), which appends inline inside the SAME
+  advisory-lock-held transaction rather than calling `mark_cancelled`. A
+  failed append returns false, which rolls the whole transaction back, so the
+  store can never hold state without its event or an event without its
+  state. The append takes
   no lease of its own (nesting a pool acquire inside an open `with_txn` would
   deadlock). It is decoupled from `event_bus_`: the durable append happens
   regardless of whether a local SSE bus is attached; only the post-commit
