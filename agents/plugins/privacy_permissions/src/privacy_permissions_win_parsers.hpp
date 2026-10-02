@@ -181,8 +181,7 @@ enum class EnumOutcome { complete, truncated, failed };
 struct EnumVerdict {
     EnumOutcome outcome;
     long rc = kErrorSuccess; // the failing code when `failed`
-    /// Child names skipped because they carry an embedded NUL (a counted registry name that no
-    /// c_str() open can address); reported by enum_failure, never read as a prefix sibling.
+    /// Child names skipped for an embedded NUL (see enumerate_subkey_names); enum_failure reports them.
     std::size_t embedded_nul_names = 0;
 };
 
@@ -383,8 +382,8 @@ struct RawGrant {
 }
 
 /// The profile's own grants with every overriding HKLM `Deny` applied (hklm_overrides_profile):
-/// it replaces a successfully-read profile entry for the same (app_id, category) and fills a key
-/// the profile lacks. A FAILED profile entry is never overwritten -- its failure row is kept and
+/// it replaces a successfully-read profile entry's state for the same (app_id, category) -- the
+/// profile's last-used times are kept -- and fills a key the profile lacks. A FAILED profile entry is never overwritten -- its failure row is kept and
 /// the HKLM value is added beside it, so a read failure is never hidden behind a policy value.
 /// Every other HKLM entry is skipped here (the caller reports those once, hklm_emitted_once).
 /// Two profile entries with the same (app_id, category) -- distinct registry keys that decode to
@@ -458,9 +457,7 @@ struct HiveFileFacts {
     std::string profile_sid;
     bool final_path_matches = true;
     std::uint64_t size = 0;
-    /// Facts about the `<hive file name>*` entries beside the leaf (the sidecars the kernel opens
-    /// or creates, following any link, during RegLoadKeyW): a reparse point, a hard-linked file,
-    /// or more than kMaxHiveSidecars of them. A missing sidecar is fine, so none is the default.
+    /// Facts about the `<hive file name>*` sidecars beside the leaf (see read_sidecars).
     bool sidecar_reparse = false;
     bool sidecar_hardlinked = false;
     std::size_t sidecar_count = 0;

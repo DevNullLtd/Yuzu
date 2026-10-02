@@ -1,7 +1,6 @@
 // Unit tests for ScopedOfflineHiveLock (agents/core/include/yuzu/agent/offline_hive_mutex.hpp):
-// the RAII wrapper around the process-wide offline-hive-mount mutex shared by six plugins
-// (autoruns, installed_apps, license_scan, registry, tar, privacy_permissions) via
-// with_user_hive().
+// the RAII wrapper around the process-wide offline-hive-mount mutex shared by every plugin that
+// goes through with_user_hive().
 //
 // Scope note: this covers B1 (acquire-on-construct / release-on-destruct / mutual exclusion)
 // only. The wait/hold-time logging behaviour (constructor and destructor spdlog calls) is
