@@ -133,17 +133,22 @@ build-linux ────────────────────┴─�
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
 - **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
 
-Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any image leg fails or is cancelled (`docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed) and nothing is published.
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any image leg fails or is cancelled (`docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but the image legs that did succeed have already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag).
 
 **Recovery: start a fresh run of the tag. Never use "Re-run failed jobs" on a release run.** A fresh run is always the newest run for the tag, so nothing can supersede it, and its own signed `SHA256SUMS` describes the images it pushes:
 
 ```bash
 TAG=v0.14.0
-gh release view "$TAG" --repo DevNullLtd/Yuzu        # read the output: it must say "release not found"
+# 1. No release run for the tag is queued, waiting or running (this must print nothing):
+gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --json databaseId,status --jq '.[] | select(.status != "completed")'
+# 2. No release exists (read the output: it must say "release not found"):
+gh release view "$TAG" --repo DevNullLtd/Yuzu
+# 3. Start the fresh run, then capture ITS id (gh workflow run prints none):
 gh workflow run release.yml --repo DevNullLtd/Yuzu --ref "$TAG"
+sleep 10; RUN_ID=$(gh run list --workflow release.yml --repo DevNullLtd/Yuzu --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId')
 ```
 
-Start it only when the first command says `release not found` (any other error: stop and investigate) and no other release run for the tag is still in progress (wait for it to finish). If a release already exists, a run has succeeded: do not start another, because it would push new image digests over the published tag. A fresh run rebuilds everything, about 40+ minutes.
+Start it only when step 1 prints nothing (a queued run counts as running: wait for it) and step 2 says `release not found` (any other error: stop and investigate). It is for the newest release only: on an older stable tag, a fresh run would move `:latest` and `:X.Y` back to the older images. If the failure is deterministic, fix it and re-tag instead; a fresh run of the same tag fails the same way. If a release already exists, a run has succeeded: do not start another, because it would push new image digests over the published tag. A fresh run rebuilds everything, about 40+ minutes.
 
 The chisel timeout (120 min) is set in the workflow at the tagged commit, so a fresh run of the same tag cannot change it. Raising it means committing the bump and re-tagging.
 
@@ -185,14 +190,14 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Artifact download failed after 5 retries` on the `release` job, complaining about a `*.dockerbuild` file | Docker buildx provenance/attestation artifacts have unstable names that download-artifact occasionally cannot resolve | Already filtered in workflow with `pattern: 'yuzu-*'` — if regression, re-add filter. v0.10.0 hit this and was assembled manually. |
 | `ccache stats: 0 hits` on a re-run that should have been cached | ccache key changed (any C++ file edit invalidates) | Normal; subsequent build hits. If repeated 0% on identical input, check `~/.cache/ccache` writability on the runner. |
 | `signtool sign /f` fails on Windows | `WINDOWS_SIGNING_CERT` secret missing or expired | The signing step is conditional on `env.HAS_SIGNING_CERT == 'true'` — release proceeds unsigned if absent. Confirm with operator whether unsigned is acceptable for this release; if not, refresh secret and retag. |
-| `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | Re-run the macOS job — `staple` step is idempotent. If consistently failing, post-process: download the .pkg, run `notarytool submit + staple` locally, then upload via `gh release upload`. |
+| `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | Start a fresh run of the tag (see Recovery above; never "Re-run failed jobs" on a release run). If consistently failing, post-process: download the .pkg, run `notarytool submit + staple` locally, then upload via `gh release upload`. |
 | `Build and push` fails with `unauthorized` on GHCR | `GITHUB_TOKEN` `packages: write` scope missing | Verify `permissions: packages: write` at workflow root. |
 | `vcpkg install` fails with version baseline mismatch | `VCPKG_COMMIT` env var in workflow drift from `vcpkg.json` baseline | Sync both — workflow env + manifest baseline must match. Tracked by `.github/workflows/vcpkg-baseline-update.yml`. |
 | `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | Workflow already has the `if grep -q "Failed: 0"` workaround — should pass with warning. If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
 | `actions/cache` save fails with EOF | GitHub cache backend transient | `save-always: true` ensures partial saves; retry the workflow. |
-| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, re-run. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then start a fresh run of the tag (see Recovery above). Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
 
-For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (re-run? skip? abort?).
+For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (a fresh run of the tag per Recovery above, a fix and re-tag, or abort; never "Re-run failed jobs" on a release run).
 
 ## Phase 4 — Post-release verification (~2 min)
 

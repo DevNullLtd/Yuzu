@@ -191,14 +191,14 @@ release when:
   build of another version.
 
 Recovery: find the offending file in the error. For a stale file, clear the
-runner workspace and re-run **all** jobs of the release run ("Re-run failed
-jobs" re-downloads the same build artifacts and fails the same way). A full
-re-run rebuilds everything, so expired build artifacts do not matter; after
-GitHub's re-run window, `gh workflow run release.yml --ref vX.Y.Z` starts a
-fresh run of the same tag instead. For a builder naming defect, a re-run
-builds the tag's original commit again, so fix the builder, then delete and
-re-push the tag at the fixed commit. Either way the images are rebuilt and
-re-pushed under the same tags.
+runner workspace and start a fresh run of the same tag with
+`gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
+Recovery steps (no release exists for the tag, no other run for it is queued
+or running). Never use "Re-run failed jobs" on a release run: an older run can
+be superseded by a newer one and push images over a published release (#5242).
+For a builder naming defect, a fresh run builds the tag's original commit
+again, so fix the builder, then delete and re-push the tag at the fixed commit.
+Either way the images are rebuilt and re-pushed under the same tags.
 
 If the release cannot be fixed promptly on a stable tag, move `:latest` back
 to the previous release's images. The gate has no override; the naming forms
