@@ -87,21 +87,27 @@ The following features are documented within the files listed above:
 
 ### Linux native packages: minimum distribution (0.14.0)
 
-The Linux binaries in the `.deb`, `.rpm` and tarball releases link the system C and C++
-runtimes dynamically, so they need a recent distribution. Measured on the 0.14.0 release
-candidates:
+The Linux binaries in the `.deb`, `.rpm` and tarball releases are built with GCC 15 and link
+the system C and C++ runtimes dynamically, so they need a recent distribution. Measured on
+v0.14.0-rc6 (Pre-release QA, and the binaries' symbol versions):
 
 | Component | Needs | Runs on | Does not run on |
 |---|---|---|---|
-| Server | glibc 2.38 and GCC 15's libstdc++ (`GLIBCXX_3.4.34`) | Ubuntu 26.04, Fedora 42 | Ubuntu 24.04 and 22.04, Debian 12, RHEL/Rocky 9 |
-| Agent | glibc 2.38 and GCC 14's libstdc++ (`GLIBCXX_3.4.32`) | Ubuntu 24.04 and 26.04, Fedora 42 | Ubuntu 22.04, Debian 12, RHEL/Rocky 9 |
-| Gateway | glibc 2.38 | Ubuntu 24.04 and 26.04 (`.deb`) | RHEL/Rocky 9; the `.rpm` also does not start on RHEL-family systems, Fedora included (#5171) |
+| Server | glibc 2.38 and GCC 15's libstdc++ (`GLIBCXX_3.4.34`) | Ubuntu 26.04, Fedora 42 | Ubuntu 24.04 and 22.04, Debian 12 and 13, RHEL/Rocky 9 and 10 |
+| Agent | glibc 2.38 and GCC 14's libstdc++ (`CXXABI_1.3.15`) | Ubuntu 24.04 and 26.04, Fedora 42; Debian 13 and RHEL 10 by symbol versions, not run-tested | Ubuntu 22.04, Debian 12, RHEL/Rocky 9 |
+| Gateway | glibc 2.38 and OpenSSL 3 (`libssl3`/`libssl3t64`) | Ubuntu 24.04 and 26.04 (`.deb`) | RHEL/Rocky 9; the `.rpm` does not start on Fedora 42 (#5171), and no RPM-based distribution is currently validated |
 
-On an older distribution the package may still install, but the program does not start:
-the loader reports a `GLIBC_…` or `GLIBCXX_…` version "not found". The container images
-are self-contained and are not affected; use them for the server and gateway on any other
-distribution. Building the native packages to an older baseline is tracked in #5143 for
-0.14.1.
+What happens on an older distribution depends on the package. The server and agent `.rpm`
+declare these requirements, so `dnf` refuses to install them. The `.deb` packages and the
+gateway `.rpm` do not, so they install and then the program does not start: the loader
+reports a `GLIBC_…`, `GLIBCXX_…` or `CXXABI_…` version "not found". The tarball has the
+same requirements.
+
+The container images (`yuzu-server`, `yuzu-gateway`, `yuzu-agent` and their chisel variants)
+carry their own runtime libraries and are not affected; use them for the server and gateway
+on any other distribution. The exception is `yuzu-agent-bundle-chisel`, which delivers
+agent files: the Linux agent extracted from it has the tarball's requirements. Building the
+native packages to an older baseline is targeted for 0.14.1 (#5143).
 
 ## Quick Start
 
