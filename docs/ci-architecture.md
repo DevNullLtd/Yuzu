@@ -168,11 +168,15 @@ Runs in `release.yml`'s `release` job after the artifacts are downloaded and
 flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
-the `release` job needs `docker-publish` and `docker-publish-postgres`, which
-push `:X.Y.Z` (and, on a stable tag, `:X.Y` and `:latest`) first, the chisel
-images publish independently (the agent-bundle image needs `release`, so it is
-not published), and the build jobs' provenance attestations are already
-recorded. On a stable tag `:latest` therefore points
+the `release` job needs `docker-publish`, `docker-publish-postgres` and
+`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) first (the agent-bundle image needs `release`, so it is not
+published), and the build jobs' provenance attestations are already recorded.
+`docker-publish-chisel` joined the release's needs in #5242, so the release
+waits for the chisel builds (minutes with a warm cache, much longer cold) and
+the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
+before that they were attached only when those jobs finished first, and rc2,
+rc4 and rc6 shipped without some of them. On a stable tag `:latest` therefore points
 at a release that does not exist until the release is fixed. It fails the
 release when:
 

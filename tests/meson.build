@@ -2447,6 +2447,15 @@ test('qa-stack gateway crash signatures',
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
 # that check, and PsLit's quote escaping -- with a mutation self-test.
+# Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
+# against a synthetic complete artifacts directory, then with each chisel
+# image SBOM removed, which must fail. Needs bash; skips without it.
+test('release artifact gate',
+  _python3_test,
+  args: [files('test_check_release_artifacts.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('agent installer trust-anchor ACL lint',
   _python3_test,
   args: [files('test_agent_installer_acl_lint.py')],

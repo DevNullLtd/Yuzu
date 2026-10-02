@@ -1653,8 +1653,14 @@ jobs:
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
-    # Mirror docker-publish's needs (core builds must pass) but stay OUT
-    # of the release job's needs: so this never gates the release.
+    # Mirror docker-publish's needs (core builds must pass). The release job
+    # NEEDS this job (#5242): the three chisel images' SBOMs are release assets
+    # and belong inside the signed SHA256SUMS, and while this job stayed out of
+    # the release's needs they were attached only when it happened to finish
+    # first (rc2, rc4 and rc6 shipped without some of them). Cost: the release
+    # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold buildx
+    # cache can take far longer (the arm64 leg runs under QEMU, hence the 360 min
+    # timeout), and a failed chisel push now blocks the release.
     needs: [build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
@@ -2059,7 +2065,12 @@ jobs:
     # docker-publish-postgres is in the needs: the composes release-pin
     # ghcr.io/.../yuzu-postgres:X.Y.Z (#1318), so publishing a release
     # whose postgres image failed to push would ship broken composes.
-    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres]
+    # docker-publish-chisel is in the needs so its SBOMs are always present and
+    # inside SHA256SUMS (#5242); check-release-artifacts.sh requires them.
+    # docker-publish-agent-bundle is NOT, by design: it builds from this
+    # release's published assets, so it can only run after it, and its SBOM is
+    # not a release asset (it stays a workflow artifact).
+    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish, docker-publish-postgres, docker-publish-chisel]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

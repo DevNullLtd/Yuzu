@@ -176,6 +176,12 @@ jobs:
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
 
+      # Release artifact gate (#5242): the expected SBOM set in
+      # scripts/check-release-artifacts.sh includes the three chisel images,
+      # and a release missing one fails before publishing. Stdlib + bash.
+      - name: Release artifact gate
+        run: python3 tests/test_check_release_artifacts.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The
