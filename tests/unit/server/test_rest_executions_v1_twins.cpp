@@ -19,6 +19,7 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <httplib.h>
 #include <libpq-fe.h>
@@ -483,6 +484,28 @@ TEST_CASE("GET /api/v1/executions/:id/responses: offset is rejected with 400, "
     auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?offset=1");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query parameter is a 400, "
+          "not a different valid-looking filter; -1 'any' and zero-padding still pass (#4644)",
+          "[pg][rest][executions][v1][responses]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto exec_id = h.make_exec_with_agents("def-resp-strict");
+
+    const std::string bad = GENERATE(as<std::string>{}, "status=0x1", "status=-5", "since=1e9",
+                                     "until=100abc", "limit=1e3", "limit=");
+    INFO(bad);
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + bad);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+
+    const std::string good = GENERATE(as<std::string>{}, "status=-1", "status=007", "limit=10");
+    INFO(good);
+    auto ok = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + good);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response:Read, "

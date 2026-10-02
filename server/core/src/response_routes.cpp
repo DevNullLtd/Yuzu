@@ -3,6 +3,7 @@
 #include "authz_model.hpp"
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
+#include "response_query_params.hpp"
 #include "response_store.hpp"
 
 #include <nlohmann/json.hpp>
@@ -82,14 +83,10 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         ResponseQuery filter;
         if (req.has_param("agent_id"))
             filter.agent_id = req.get_param_value("agent_id");
-        try {
-            if (req.has_param("status"))
-                filter.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                filter.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                filter.until = std::stoll(req.get_param_value("until"));
-        } catch (const std::exception&) {
+        // #4644: strict full-consumption numeric parse (stoi/stoll took "0x1", "1e9",
+        // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
+        if (!apply_response_numeric_params(req, filter,
+                                           kRespParamStatus | kRespParamSince | kRespParamUntil)) {
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
@@ -175,24 +172,21 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
-        try {
-            if (req.has_param("status"))
-                q.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
-            else
-                q.limit = 10000; // higher default for exports
-        } catch (const std::exception&) {
+        // #4644: strict full-consumption numeric parse (stoi/stoll took "0x1", "1e9",
+        // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
+        if (!apply_response_numeric_params(req, q,
+                                           kRespParamStatus | kRespParamSince | kRespParamUntil |
+                                               kRespParamLimit)) {
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        // Export default and ceiling (#4703): the old code clamped only the DEFAULT, so
+        // an explicit ?limit=999999999 asked the store for an unbounded fetch.
+        q.limit = req.has_param("limit") ? std::clamp(q.limit, 1, kExportRowLimitCap)
+                                         : kExportRowLimitCap;
 
         // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
         // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
@@ -238,10 +232,15 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
 
         auto format = req.get_param_value("format");
 
+        // Truncation signal (#4703): the row-count cap (limit) OR the total-byte cap below.
+        // Legacy export never signalled either; additive header / envelope field.
+        const std::size_t byte_cap = export_body_byte_cap().load();
+        bool truncated = results.size() == static_cast<std::size_t>(q.limit);
+
         if (format == "csv") {
             std::string csv =
                 "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
-            for (const auto& r : results) {
+            truncated |= append_rows_until_byte_cap(results, byte_cap, [&csv](const auto& r) {
                 csv += std::to_string(r.id) + ",";
                 csv += data_export::csv_escape(r.instruction_id) + ",";
                 csv += data_export::csv_escape(r.agent_id) + ",";
@@ -249,13 +248,17 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                 csv += std::to_string(r.status) + ",";
                 csv += data_export::csv_escape(r.output) + ",";
                 csv += data_export::csv_escape(r.error_detail) + "\r\n";
-            }
+                return csv.size();
+            });
             res.set_header("Content-Disposition",
                            "attachment; filename=\"responses-" + instruction_id + ".csv\"");
+            if (truncated)
+                res.set_header("X-Result-Truncated-By-Cap", "true");
             res.set_content(csv, "text/csv; charset=utf-8");
         } else {
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : results) {
+            std::size_t json_bytes = 0;
+            truncated |= append_rows_until_byte_cap(results, byte_cap, [&](const auto& r) {
                 arr.push_back({{"id", r.id},
                                {"instruction_id", r.instruction_id},
                                {"agent_id", r.agent_id},
@@ -263,10 +266,16 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                                {"status", r.status},
                                {"output", r.output},
                                {"error_detail", r.error_detail}});
-            }
+                // Serialized size of the row just appended (escapes counted), so the cap
+                // bounds the real body rather than an estimate of it.
+                json_bytes += arr.back().dump().size();
+                return json_bytes;
+            });
             nlohmann::json envelope = {{"instruction_id", instruction_id},
-                                       {"count", results.size()},
+                                       {"count", arr.size()},
                                        {"responses", arr}};
+            if (truncated)
+                envelope["result_truncated_by_cap"] = true;
             res.set_header("Content-Disposition",
                            "attachment; filename=\"responses-" + instruction_id + ".json\"");
             res.set_content(envelope.dump(2), "application/json; charset=utf-8");
@@ -299,18 +308,11 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         ResponseQuery q;
         if (req.has_param("agent_id"))
             q.agent_id = req.get_param_value("agent_id");
-        try {
-            if (req.has_param("status"))
-                q.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
-            if (req.has_param("offset"))
-                q.offset = std::stoi(req.get_param_value("offset"));
-        } catch (const std::exception&) {
+        // #4644: strict full-consumption numeric parse (stoi/stoll took "0x1", "1e9",
+        // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
+        if (!apply_response_numeric_params(req, q,
+                                           kRespParamStatus | kRespParamSince | kRespParamUntil |
+                                               kRespParamLimit | kRespParamOffset)) {
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",

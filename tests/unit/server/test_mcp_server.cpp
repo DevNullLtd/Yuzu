@@ -16454,6 +16454,52 @@ TEST_CASE("MCP query_responses: rows carry the widened field set (#2146 A2-R2 --
     }
 }
 
+TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is invalid params, "
+          "never silently read as 'any' or a different value (#4644)",
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-strict", "instr-strict", "agent-1", 0, "ok", 100));
+    store.store(mk_resp("exec-strict", "instr-strict", "agent-2", 1, "other", 101));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":74,"params":{"name":"query_responses","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+
+    for (const char* bad : {R"({"instruction_id":"instr-strict","status":"0x1"})",
+                            R"({"instruction_id":"instr-strict","status":1.5})",
+                            R"({"instruction_id":"instr-strict","status":true})",
+                            R"({"instruction_id":"instr-strict","status":-5})",
+                            R"({"instruction_id":"instr-strict","status":4294967296})",
+                            R"({"instruction_id":"instr-strict","limit":"100abc"})",
+                            R"({"instruction_id":"instr-strict","limit":1.5})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+
+    // -1 (documented "any"), omitted, and a real status all still work.
+    auto any = call(R"({"instruction_id":"instr-strict","status":-1})");
+    REQUIRE(any.contains("result"));
+    CHECK(nlohmann::json::parse(any["result"]["content"][0]["text"].get<std::string>()).size() == 2);
+    auto one = call(R"({"instruction_id":"instr-strict","status":1})");
+    REQUIRE(one.contains("result"));
+    auto rows = nlohmann::json::parse(one["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0]["output"] == "other");
+}
+
 TEST_CASE("MCP query_responses: rejects when neither id provided",
           "[pg][mcp][integration][response][fanout]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

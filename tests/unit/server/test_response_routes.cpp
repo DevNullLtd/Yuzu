@@ -20,6 +20,7 @@
 /// key/schema as test_response_store.cpp — the registry replay-verifies the
 /// resulting schema, not the setup lambda's literal text).
 
+#include "response_query_params.hpp"
 #include "response_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -30,6 +31,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
@@ -365,6 +367,131 @@ TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.audits.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4644 / #4703: strict numeric parameters, export limit ceiling, export byte cap
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400, not a "
+          "different valid-looking filter (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict", "agent-1", 1);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=0x1", "status=1e0",
+                                       "status=-5", "status=", "since=1e9", "since=100abc",
+                                       "until=0x10", "status=99999999999");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/responses/instr-strict" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["message"] == "invalid numeric query parameter");
+}
+
+TEST_CASE("legacy response routes: limit/offset reject trailing garbage where accepted (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict-lim", "agent-1", 1);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/export");
+    const std::string query =
+        GENERATE(as<std::string>{}, "limit=100abc", "limit=1e3", "limit=0x10", "limit=",
+                 "offset=1e1", "offset=2abc");
+    INFO("route=" << route << " query=" << query);
+    // /export has no offset param (it ignores it); only assert the 400 where it is read.
+    if (route == "/export" && query.starts_with("offset"))
+        return;
+    auto res = h.sink.Get("/api/responses/instr-strict-lim" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("legacy response routes: well-formed numerics still pass, incl. zero-padding and "
+          "the -1 'any' sentinel (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict-ok", "agent-1", 1);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=007", "status=-1", "status=1",
+                                       "since=0&until=0");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/responses/instr-strict-ok" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("GET /api/responses/:id/export: a caller-supplied limit is clamped to [1,10000], "
+          "like the v1 twin (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-exp-lim", "agent-1", 1);
+    h.seed("instr-exp-lim", "agent-2", 1);
+
+    // 999999999 used to reach ResponseStore::query as-is; now it is pinned to the route's
+    // own ceiling and still serves the two rows.
+    auto big = h.sink.Get("/api/responses/instr-exp-lim/export?limit=999999999");
+    REQUIRE(big);
+    CHECK(big->status == 200);
+    CHECK(json::parse(big->body)["responses"].size() == 2);
+
+    // A non-positive limit is raised to 1 (never the store's "unbounded" reading).
+    auto neg = h.sink.Get("/api/responses/instr-exp-lim/export?limit=-5");
+    REQUIRE(neg);
+    CHECK(neg->status == 200);
+    auto neg_body = json::parse(neg->body);
+    CHECK(neg_body["responses"].size() == 1);
+    // limit=1 against two rows is a row-cap truncation, signalled like the byte cap.
+    CHECK(neg_body.value("result_truncated_by_cap", false) == true);
+
+    auto all = h.sink.Get("/api/responses/instr-exp-lim/export");
+    REQUIRE(all);
+    CHECK_FALSE(json::parse(all->body).contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and CSV and "
+          "signals it (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-bytecap";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'x');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+
+    struct CapGuard {
+        std::size_t saved;
+        explicit CapGuard(std::size_t cap) : saved(export_body_byte_cap().exchange(cap)) {}
+        ~CapGuard() { export_body_byte_cap().store(saved); }
+    };
+    {
+        CapGuard cap(600);
+        auto res_json = h.sink.Get("/api/responses/instr-bytecap/export");
+        REQUIRE(res_json);
+        REQUIRE(res_json->status == 200);
+        auto body = json::parse(res_json->body);
+        CHECK(body["responses"].size() >= 1);
+        CHECK(body["responses"].size() < 5);
+        CHECK(body["count"] == body["responses"].size()); // count reports what was served
+        CHECK(body.value("result_truncated_by_cap", false) == true);
+
+        auto res_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
+        REQUIRE(res_csv);
+        CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    }
+    auto res_full = h.sink.Get("/api/responses/instr-bytecap/export");
+    REQUIRE(res_full);
+    auto full = json::parse(res_full->body);
+    CHECK(full["responses"].size() == 5);
+    CHECK_FALSE(full.contains("result_truncated_by_cap"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

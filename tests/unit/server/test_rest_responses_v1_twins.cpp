@@ -14,20 +14,24 @@
 
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
+#include "response_query_params.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -516,4 +520,172 @@ TEST_CASE("GET /api/v1/responses/:id/export: management-group scope filters anot
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body["data"].size() == 1);
     CHECK(body["data"][0]["agent_id"] == "agent-A");
+}
+
+// ── #4644: strict numeric query parameters ─────────────────────────────────
+
+TEST_CASE("response routes: a malformed numeric query parameter is a 400, never a different "
+          "valid-looking filter (#4644)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(mk_resp("instr-strict", "agent-A", 0, "ok", 100));
+
+    // route suffix x malformed query. stoi/stoll used to read these as 0, 1, 100, 1 and
+    // -5 (a "filter" the store ignores because it only applies status >= 0).
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=0x1", "status=1e0",
+                                       "status=-5", "status=", "status=+1",
+                                       "since=1e9", "since=100abc", "until=0x10", "until=",
+                                       "status=99999999999");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/v1/responses/instr-strict" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "invalid numeric query parameter");
+}
+
+TEST_CASE("response routes: limit rejects trailing garbage on the routes that accept it (#4644)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/export");
+    const std::string query =
+        GENERATE(as<std::string>{}, "limit=100abc", "limit=1e3", "limit=0x10", "limit=");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/v1/responses/instr-strict-limit" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("response routes: well-formed numerics still pass, including zero-padding and the "
+          "-1 'any' sentinel (the fix is not over-strict) (#4644)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(mk_resp("instr-strict-ok", "agent-A", 0, "ok", 100));
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=007", "status=-1", "status=0",
+                                       "since=0&until=0", "since=50&until=200");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/v1/responses/instr-strict-ok" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("response export: status filter matches the row it names, so a malformed value can no "
+          "longer silently widen it (#4644)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(mk_resp("instr-strict-st", "agent-A", 0, "success-row", 100));
+    h.response_store->store(mk_resp("instr-strict-st", "agent-B", 1, "other-row", 101));
+
+    auto res = h.sink.Get("/api/v1/responses/instr-strict-st/export?status=1");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["output"] == "other-row");
+}
+
+// ── #4703: total export body byte cap ──────────────────────────────────────
+
+namespace {
+// Lowers the shared export byte cap for one test, restoring it on scope exit so a failed
+// REQUIRE cannot leak a tiny cap into later tests in the same process.
+struct ExportByteCapGuard {
+    std::size_t saved;
+    explicit ExportByteCapGuard(std::size_t cap)
+        : saved(yuzu::server::export_body_byte_cap().exchange(cap)) {}
+    ~ExportByteCapGuard() { yuzu::server::export_body_byte_cap().store(saved); }
+};
+} // namespace
+
+TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON and CSV and "
+          "sets the same truncation signal as the row cap (#4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    for (int i = 0; i < 5; ++i)
+        h.response_store->store(mk_resp("instr-bytecap", "agent-" + std::to_string(i), 0,
+                                        std::string(400, 'x'), 100 + i));
+
+    {
+        ExportByteCapGuard cap(600); // < two rows
+        auto res_json = h.sink.Get("/api/v1/responses/instr-bytecap/export");
+        REQUIRE(res_json);
+        REQUIRE(res_json->status == 200);
+        auto body = nlohmann::json::parse(res_json->body);
+        CHECK(body["data"].size() >= 1);        // progress: at least one row always lands
+        CHECK(body["data"].size() < 5);         // and the cap actually cut the export
+        REQUIRE(body["pagination"].contains("result_truncated_by_cap"));
+        CHECK(body["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+
+        auto res_csv = h.sink.Get("/api/v1/responses/instr-bytecap/export?format=csv");
+        REQUIRE(res_csv);
+        CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+        CHECK(res_csv->body.size() < 5 * 400);
+    }
+
+    // Default cap restored: the same export is complete and unmarked.
+    auto res_full = h.sink.Get("/api/v1/responses/instr-bytecap/export");
+    REQUIRE(res_full);
+    auto full = nlohmann::json::parse(res_full->body);
+    CHECK(full["data"].size() == 5);
+    CHECK_FALSE(full["pagination"].contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte cap is not a "
+          "truncation (nothing was dropped) (#4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(mk_resp("instr-bytecap-one", "agent-A", 0, std::string(400, 'y'), 100));
+
+    ExportByteCapGuard cap(10); // the single row alone exceeds this
+    auto res = h.sink.Get("/api/v1/responses/instr-bytecap-one/export");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"].size() == 1);
+    CHECK_FALSE(body["pagination"].contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (#4644, #4703)",
+          "[rest][responses][v1]") {
+    using yuzu::server::append_rows_until_byte_cap;
+    using yuzu::server::parse_query_int;
+
+    CHECK(parse_query_int<int>("42") == 42);
+    CHECK(parse_query_int<int>("-1") == -1);
+    CHECK(parse_query_int<int>("007") == 7);
+    CHECK_FALSE(parse_query_int<int>("").has_value());
+    CHECK_FALSE(parse_query_int<int>("+1").has_value());
+    CHECK_FALSE(parse_query_int<int>(" 1").has_value());
+    CHECK_FALSE(parse_query_int<int>("1 ").has_value());
+    CHECK_FALSE(parse_query_int<int>("0x1").has_value());
+    CHECK_FALSE(parse_query_int<int>("1e9").has_value());
+    CHECK_FALSE(parse_query_int<int>("100abc").has_value());
+    CHECK_FALSE(parse_query_int<int>("99999999999").has_value()); // int overflow: no wrap
+    CHECK(parse_query_int<std::int64_t>("99999999999") == 99999999999LL);
+    CHECK_FALSE(parse_query_int<std::int64_t>("9223372036854775808").has_value());
+
+    const std::vector<int> rows{10, 10, 10, 10};
+    std::size_t total = 0;
+    CHECK(append_rows_until_byte_cap(rows, 25, [&](int r) { return total += static_cast<std::size_t>(r); }));
+    CHECK(total == 30); // stops after the row that reached the cap
+    total = 0;
+    CHECK_FALSE(append_rows_until_byte_cap(rows, 1000, [&](int r) { return total += static_cast<std::size_t>(r); }));
+    CHECK(total == 40);
+    total = 0;
+    CHECK_FALSE(append_rows_until_byte_cap(rows, 40, [&](int r) { return total += static_cast<std::size_t>(r); }));
 }

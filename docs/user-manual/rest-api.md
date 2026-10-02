@@ -6051,22 +6051,34 @@ semantics below mirror them exactly, but the legacy handlers themselves are unmo
 (`response_query_row_json`, `docs/api-twin-recipe.md` Rule 1); `GET /api/v1/responses/{id}/aggregate`
 and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 
-**Two deliberate corrections vs. the legacy routes**, both scoped to the new v1/MCP surfaces only
-(the legacy routes are unmodified and keep their pre-existing behavior):
+**Numeric query parameters are parsed strictly (#4644), on these routes AND the legacy
+`GET /api/responses/{id}[/aggregate|/export]` routes.** `status`, `since`, `until`, `limit` (and the
+legacy catch-all route's `offset`) must each be one complete base-10 integer. Trailing characters
+(`100abc`, `1e9`, `0x1`), whitespace, a leading `+`, an empty value (`?limit=`) and out-of-range
+values (no wraparound) return `400` `invalid numeric query parameter`. These used to be read by
+`std::stoi`/`std::stoll`, which stopped at the first non-digit and returned a different, valid-looking
+filter (`?since=1e9` meant "since epoch second 1", `?status=0x1` meant status `0`). Zero-padding
+(`status=007`) is still a valid `7`. `status` has one extra rule: `-1` is the documented "any status"
+sentinel and stays accepted, but any value below `-1` (for example `status=-5`) is rejected `400` —
+the store only applies the filter for `status >= 0`, so it previously behaved exactly like "no
+filter" while looking like one. The same applies to MCP `query_responses` (a non-integer or `< -1`
+`status`, or a non-integer `limit`, is `-32602`; `limit` is still clamped to `[1,1000]`).
+`GET /api/v1/executions/{id}/responses` shares the parser.
+
+**Two deliberate differences vs. the legacy routes:**
 
 - `limit` is clamped on **both** bounds on the two routes below that accept it — `GET
   /api/v1/responses/{id}` (`[1,1000]`, default 100 when omitted) and `GET
   /api/v1/responses/{id}/export` (`[1,10000]`, default 10000 when omitted);
   `GET /api/v1/responses/{id}/aggregate` has no `limit` parameter. The legacy export route
-  (`GET /api/responses/{id}/export`) only floors its own *default* at 10000 — a caller-supplied
-  `?limit=` there has no ceiling at all and can attempt an unbounded fetch. Not fixed on the legacy
-  route (out of scope for this PR); not propagated to `GET /api/v1/responses/{id}/export`.
+  (`GET /api/responses/{id}/export`) now clamps the same way (#4703): it used to floor only its
+  *default* at 10000, so an explicit `?limit=999999999` asked the store for an unbounded fetch.
 - `offset` is rejected with `400` on `GET /api/v1/responses/{id}` and `GET
   /api/v1/responses/{id}/export` (the two routes below with a row-level result set), matching
   `GET /api/v1/executions/{id}/responses` and MCP `query_responses` above: the result set orders by
   a non-unique, actively-growing `timestamp`, so offset-based paging can silently skip or duplicate
-  rows. The legacy routes accept (and silently mis-serve) `offset` today — a pre-existing gap this
-  PR does not fix on those routes.
+  rows. The legacy catch-all route still accepts `offset` today (a pre-existing gap this change does
+  not fix).
 
 `status` is the response status enum (`1`=SUCCESS, `2`=FAILURE; `0` is an in-flight RUNNING frame),
 same enum as the bundle-steps `status` field documented above.
@@ -6077,6 +6089,17 @@ A caller cannot tell a complete result from a capped one from row count alone: `
 the export route's CSV format, which has no JSON envelope to carry the field in) when the served row
 count equals `limit` — matching MCP `query_responses`' own `hit_cap` convention. Page past a
 truncated result with `since`/`until`, not `offset` (rejected, see above).
+
+**Export body size cap (#4703).** Both export routes (this family's `GET /api/v1/responses/{id}/export`
+and the legacy `GET /api/responses/{id}/export`) also stop appending rows once the response body
+reaches 50 MiB, on top of the row-count cap: each response's `output`/`error_detail` is capped at
+2 MiB at ingest, so a row-count cap alone still let a 10,000-row export reach tens of GB, built in
+memory on a request worker. A body cut by the byte cap carries the SAME truncation signal as a row-cap
+hit (`pagination.result_truncated_by_cap` on the v1 JSON, the `X-Result-Truncated-By-Cap: true`
+header on CSV, and — new on the legacy route, which previously signalled neither cap — a top-level
+`result_truncated_by_cap: true` on its JSON envelope plus the same CSV header). At least one row is
+always served, and a body that merely ends on the row that crosses the cap is not truncated. The cut
+is on whole rows, so the body can exceed 50 MiB by at most one row.
 
 Audit posture: all three routes below emit a `response.read` audit event, **REST fail-closed** (503
 on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the legacy
@@ -6145,8 +6168,9 @@ compatible. Both formats set `Content-Disposition: attachment`. The JSON format'
 standard v1 `{data, pagination, meta}` shape (same as `GET /api/v1/responses/{id}` above) -
 distinct from the legacy export's bespoke `{instruction_id, count, responses}` body. A cap-hit
 (served rows == `limit`) is most consequential here since bulk export is this route's whole
-purpose — see `pagination.result_truncated_by_cap`/`X-Result-Truncated-By-Cap` above; there is no
-built-in way to page past 10,000 rows other than narrowing with `since`/`until`/`agent_id`/`status`.
+purpose — see `pagination.result_truncated_by_cap`/`X-Result-Truncated-By-Cap` above (also set when the 50 MiB
+body cap cut the export); there is no built-in way to page past 10,000 rows other than narrowing
+with `since`/`until`/`agent_id`/`status`.
 
 **Response** (`format=json`):
 
@@ -10010,7 +10034,12 @@ Aggregate response data for a command (counts, summaries).
 
 #### `GET /api/responses/{id}/export`
 
-Export response data in CSV format.
+Export response data in CSV format (`format=csv`) or JSON. `limit` defaults to 10000 and is clamped
+to `[1,10000]`; the body is also cut at 50 MiB (see "Export body size cap" under Command/Instruction
+Responses). A truncated export sets `X-Result-Truncated-By-Cap: true` (CSV) or a top-level
+`result_truncated_by_cap: true` (JSON envelope). Numeric query parameters (`status`, `since`,
+`until`, `limit`) are parsed strictly and a malformed value is `400` — see the Command/Instruction
+Responses section.
 
 **Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.
 

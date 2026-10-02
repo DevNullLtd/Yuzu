@@ -117,6 +117,7 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+#include <limits>   // numeric_limits (query_responses status range, #4644)
 #include <optional> // param_int_strict (#2970B)
 #include <string>
 #include <string_view>
@@ -635,7 +636,7 @@ static const ToolDef kTools[] = {
      "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
      "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
      "(#2146 A2-R2).",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","minimum":-1,"description":"CommandResponse status enum; omit or -1 for any. A non-integer or a value below -1 is rejected (invalid params), never read as any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
      R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
@@ -8621,7 +8622,31 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
-                rq.status = param_int32(args, "status", -1);
+                // #4644: param_int32 swallowed a wrong-typed status (a string, a float)
+                // into the default and wrapped an out-of-int32 value, so a malformed
+                // filter silently meant "any" or a different status. Strict like
+                // op_column/aggregate on aggregate_responses; -1 is the documented
+                // "any" sentinel, anything below it is neither a status nor "any".
+                const auto status_opt = param_int_strict(args, "status", -1);
+                if (!status_opt || *status_opt < -1 ||
+                    *status_opt > std::numeric_limits<int>::max()) {
+                    // retry-hint-exempt: malformed client input, not a store/query fault --
+                    // resending the same value fails identically.
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "status must be a JSON integer >= -1 (-1 or omitted = any)"),
+                        "application/json");
+                    return;
+                }
+                rq.status = static_cast<int>(*status_opt);
+                const auto limit_opt = param_int_strict(args, "limit", 100);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON type), not a
+                    // store/query fault -- resending the same value fails identically.
+                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
                 // Clamp BOTH bounds. Upper alone is insufficient: a negative
                 // limit (or one that wraps negative through param_int32's
                 // int64->int32 cast) binds as SQLite `LIMIT -1`, which means
@@ -8637,8 +8662,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // int64->int cast wraps a limit > INT_MAX negative, which std::clamp
                 // would then pin to 1 (silently under-serving). Read the raw int64,
                 // clamp to [1,1000] first; the result always fits an int.
-                rq.limit = static_cast<int>(
-                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                rq.limit = static_cast<int>(std::clamp<std::int64_t>(*limit_opt, 1, 1000));
                 // When execution_id is supplied, route to the exact-correlation
                 // path so the agentic dispatch->collect loop closes cleanly:
                 // execute_instruction mints the execution_id, stamps it onto
