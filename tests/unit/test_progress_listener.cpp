@@ -8,6 +8,16 @@
 // Session::run() return followed by teardown corruption, #1648/#3507 - not this
 // mid-run kill scenario; don't conflate the two.)
 //
+// Every line carries a `pid=<n>` column right after the `[progress]` tag (#5073): the
+// agent suite runs as several concurrent test processes in one job, all appending to the
+// ONE file named by YUZU_TEST_PROGRESS_FILE (the nightly upload globs name
+// `meson-logs/progress.log` literally, so the filename is not salted). Without the pid
+// the per-process "last START with no END = the hung case" diagnosis is ambiguous once
+// lines interleave; with it, `grep 'pid=<n> '` isolates one process. Line shapes:
+//   [progress] pid=<pid> RUN <name> seed=<seed>
+//   [progress] pid=<pid> START <test case>
+//   [progress] pid=<pid> END <test case> <ms> ms
+//
 // One dedicated TU, same reasoning as test_pg_template_cleanup.cpp's listener: a
 // CATCH_REGISTER_LISTENER in a header would register once per including TU.
 
@@ -20,13 +30,35 @@
 #include <string_view>
 
 #include <catch2/catch_get_random_seed.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_test_case_info.hpp>
 #include <catch2/catch_test_run_info.hpp>
 #include <catch2/interfaces/catch_interfaces_reporter.hpp>
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
 
+#ifdef _WIN32
+#include <process.h> // _getpid
+#else
+#include <unistd.h> // getpid
+#endif
+
 namespace {
+
+long current_pid() {
+#ifdef _WIN32
+    return static_cast<long>(::_getpid());
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
+// `[progress] pid=<pid> <body>\n`. Pure so the line shape is unit-testable without the
+// listener or the environment; every emitted line goes through it so the pid column
+// cannot be forgotten on one event type.
+std::string format_progress_line(long pid, std::string_view body) {
+    return std::format("[progress] pid={} {}\n", pid, body);
+}
 
 class ProgressListener : public Catch::EventListenerBase {
 public:
@@ -36,16 +68,16 @@ public:
     void testRunStarting(Catch::TestRunInfo const& info) override {
         if (!enabled_)
             return;
-        emit(std::format("[progress] RUN {} seed={}\n",
-                          std::string_view(info.name.data(), info.name.size()),
-                          Catch::getSeed()));
+        emit(format_progress_line(
+            pid_, std::format("RUN {} seed={}", std::string_view(info.name.data(), info.name.size()),
+                              Catch::getSeed())));
     }
 
     void testCaseStarting(Catch::TestCaseInfo const& info) override {
         if (!enabled_)
             return;
         start_ = clock::now();
-        emit(std::format("[progress] START {}\n", info.name));
+        emit(format_progress_line(pid_, std::format("START {}", info.name)));
     }
 
     void testCaseEnded(Catch::TestCaseStats const& stats) override {
@@ -53,7 +85,7 @@ public:
             return;
         const auto ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start_).count();
-        emit(std::format("[progress] END {} {} ms\n", stats.testInfo->name, ms));
+        emit(format_progress_line(pid_, std::format("END {} {} ms", stats.testInfo->name, ms)));
     }
 
 private:
@@ -93,9 +125,21 @@ private:
     }
 
     bool enabled_;
+    long pid_ = current_pid();
     clock::time_point start_{};
 };
 
 } // namespace
 
 CATCH_REGISTER_LISTENER(ProgressListener)
+
+TEST_CASE("progress listener: every line carries a pid column (#5073)", "[progress_listener]") {
+    REQUIRE(format_progress_line(4242, "START some case") ==
+            "[progress] pid=4242 START some case\n");
+    REQUIRE(format_progress_line(1, "END some case 12 ms") ==
+            "[progress] pid=1 END some case 12 ms\n");
+    REQUIRE(format_progress_line(77, "RUN yuzu_agent_tests seed=5") ==
+            "[progress] pid=77 RUN yuzu_agent_tests seed=5\n");
+    // The live process id is positive.
+    REQUIRE(current_pid() > 0);
+}
