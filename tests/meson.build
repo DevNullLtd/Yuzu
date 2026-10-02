@@ -2918,7 +2918,10 @@ if _bash_test.found()
     _bash_test,
     args: [files('shell/test_agent_ota_wiring_lexical.sh')],
     suite: 'agent',
-    timeout: 60,
+    # 90 s (was 60): this script spawns perl/grep per mutation and per invariant, so it is
+    # slow on Windows (17 s on a quiet MSVC box vs 1.4 s on Linux, 2026-10-02) and timed out
+    # at 60.23 s on a busy Windows CI leg (PR #5267) while running beside the agent shards.
+    timeout: 90,
   )
 endif
 
