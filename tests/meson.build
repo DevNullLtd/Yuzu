@@ -653,7 +653,12 @@ agent_test_exe = executable(
              # CAPTURE tree manifest via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
-             '"'],
+             '"'] +
+            # /bigobj: test_spark_mechanism.cpp (15k lines) and test_guardian_spark_runtime.cpp
+            # hit MSVC's hard C1128 limit (65,279 sections per object) in the nightly
+            # windows-asan build. Same cliff, same fix as the yuzu_server_tests target
+            # below. Free on every other compiler.
+            (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
