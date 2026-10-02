@@ -215,9 +215,9 @@ jobs:
           # relocations out of range, displacements 2.15-2.64 GB against the +/-2 GiB
           # small-code-model limit; CI nightly 2026-10-01 up to 2.62 GB, local GCC 15 -O0
           # 2.64 GB). The null and alignment checks account for most of UBSan's per-site
-          # data. Measured locally: with them off the binary links at about 0.70 GB .text
-          # plus 0.42 GB .data; -O1, -fno-sanitize=vptr and outlined ASan checks each
-          # still overflowed.
+          # data. Measured locally: with them off the binary links with about 1.13 GB of
+          # allocated sections (0.70 GB text including rodata, 0.42 GB data); -O1,
+          # -fno-sanitize=vptr and outlined ASan checks each still overflowed.
           # Cost: null and alignment UB is NOT detected for any C++ in this leg (agent,
           # plugins, server), and no other leg runs those checks. ASan and the remaining
           # UBSan checks are unchanged.
