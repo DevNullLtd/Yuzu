@@ -1,4 +1,4 @@
-# Vendored grpcbox (Yuzu patches — PKI PR5c + #1422)
+# Vendored grpcbox (Yuzu patches — PKI PR5c + #1422 + connection accessor)
 
 This is a **vendored copy of grpcbox v0.17.1** (`github.com/tsloughter/grpcbox`,
 the tag the gateway pins in `rebar.config` / `rebar.lock`), carried in `_checkouts/`
@@ -6,7 +6,7 @@ so rebar3 uses it in place of the fetched dependency. Only the **source** is
 vendored (`src/`, `include/`, `rebar.config`, `LICENSE`); grpcbox's own deps
 (chatterbox, ctx, acceptor_pool, gproc) are still fetched normally.
 
-## The patch — two places
+## The patch — three places
 
 ### 1. `src/grpcbox_pool.erl` — configurable listener mTLS strictness (PKI PR5c)
 
@@ -59,6 +59,33 @@ an authorization bypass: the client sees status 16 while the RPC's side effects
 (command fan-out!) still run. The guard drops all data on a terminated stream.
 Regression-pinned by `yuzu_gw_authz_rpc_tests` ("handler never runs" cases).
 
+### 3. `src/grpcbox_stream.erl` — typed accessors for the connection pid
+
+Two exported functions, placed just above `ctx_with_stream/2` (search `YUZU PATCH`):
+
+```erlang
+-spec connection_pid(t()) -> pid().
+connection_pid(#state{connection=Conn}) ->
+    h2_stream_set:connection(Conn).
+
+-spec connection_pid_from_ctx(ctx:t()) -> pid() | undefined.
+connection_pid_from_ctx(Ctx) ->
+    case ctx:get(Ctx, ctx_stream_key, undefined) of
+        State=#state{} -> connection_pid(State);
+        _ -> undefined
+    end.
+```
+
+The stream state record is private to `grpcbox_stream`, so a service handler cannot
+read the connection out of it. These accessors return the pid of the HTTP/2
+connection process that carries the stream: every stream of one connection reports
+the same pid and streams of different connections report different pids. A bidi
+handler receives the stream state itself (use `connection_pid/1`); a unary handler
+receives a ctx wrapping it (use `connection_pid_from_ctx/1`, which answers
+`undefined` for a ctx with no stream such as `ctx:background()`). The gateway's
+`yuzu_gw_conn` module is the only caller. The accessors read state only: they install
+no authenticator and do not touch `auth_fun` (which stays forbidden on `:50051`).
+
 ## Integrity gate (machine-verifiable)
 
 The exact change is committed as a canonical patch file,
@@ -77,8 +104,8 @@ bash gateway/scripts/verify-vendored-grpcbox.sh
 
 This is intentionally a *minimal* vendor of a *pinned* tag. To move to a newer
 grpcbox: re-copy `src/`+`include/`+`rebar.config`+`LICENSE` from the new tag,
-re-apply `grpcbox.yuzu.patch` (or the two `YUZU PATCH` sites — `grpcbox_pool.erl:init/1`
-and `grpcbox_stream.erl:on_receive_data/2` — by hand), regenerate `grpcbox.yuzu.patch` against the new
+re-apply `grpcbox.yuzu.patch` (or the three `YUZU PATCH` sites — `grpcbox_pool.erl:init/1`,
+`grpcbox_stream.erl:on_receive_data/2` and the `connection_pid` accessors in `grpcbox_stream.erl` — by hand), regenerate `grpcbox.yuzu.patch` against the new
 stock, bump the `{tag, "vX.Y.Z"}` pin in `rebar.config` (grpcbox stays OUT of
 `rebar.lock` — it is a checkout; rebar3 refuses to lock it), update `EXPECTED_SHA`
 in `gateway/scripts/verify-vendored-grpcbox.sh` to the new tag's commit, run the
