@@ -17,7 +17,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% cert-mint helpers shared with yuzu_gw_authz_rpc_tests
--export([setup_certs/0, cleanup_certs/1, der/2]).
+-export([setup_certs/0, setup_certs/1, cleanup_certs/1, der/2]).
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -193,8 +193,13 @@ app_env_entry_point(#{srv_pem := SrvPem} = Certs) ->
 %%%-------------------------------------------------------------------
 
 setup_certs() ->
+    setup_certs("/tmp").
+
+%% BaseDir is where the per-run 0700 directory is created, so a caller can
+%% keep the files off a shared /tmp (for example under $TMPDIR).
+setup_certs(BaseDir) ->
     Rand = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(12))),
-    Dir = filename:join(["/tmp", "yuzu_gw_authz_" ++ Rand]),
+    Dir = filename:join([BaseDir, "yuzu_gw_authz_" ++ Rand]),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     _ = file:change_mode(Dir, 8#700),
     CaK = filename:join(Dir, "ca.key"),

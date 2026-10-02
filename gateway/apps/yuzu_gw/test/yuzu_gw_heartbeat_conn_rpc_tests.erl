@@ -20,9 +20,23 @@
 %%%   - reannounce and replay reads leave the stored binding byte-identical.
 %%%
 %%% Listener ports are OS-assigned-then-probed with retry (shared CI boxes
-%%% run several jobs; fixed ports collide across jobs). The listener is
-%%% plaintext HTTP/2: the connection pid is the same object under TLS, and
-%%% TLS adds nothing to what is being tested.
+%%% run several jobs; fixed ports collide across jobs).
+%%%
+%%% The whole case list runs over three listener transports, each with its
+%%% own listener and client channels:
+%%%   - plaintext HTTP/2 (the original evidence);
+%%%   - one-way TLS: the shipped agent-listener posture of
+%%%     gateway/config/sys.config.prod (`ssl => true', `verify => verify_none',
+%%%     `fail_if_no_peer_cert => false'), clients verify the gateway and
+%%%     present no certificate;
+%%%   - mutual TLS: the same listener with the grpcbox strict defaults, and
+%%%     both client channels presenting the SAME client certificate, so the
+%%%     only thing that differs between them is the connection.
+%%% Over TLS the connection key is still the pid of the HTTP/2 connection
+%%% process, and the cases below observe that rather than assume it. Throwaway
+%%% certificates are minted with the openssl CLI (the helper in
+%%% yuzu_gw_authz_tests) under $TMPDIR; when openssl is unavailable the TLS
+%%% legs report one visibly named skip instead of failing.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_conn_rpc_tests).
@@ -34,13 +48,37 @@
 -define(HEARTBEAT_PATH, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
 -define(SUBSCRIBE_PATH, <<"/yuzu.agent.v1.AgentService/Subscribe">>).
 -define(SESSIONS, yuzu_gw_sessions).
+-define(MISMATCH_TAB, yuzu_gw_hb_conn_rpc_mismatch).
+-define(MISMATCH_HANDLER, yuzu_gw_heartbeat_conn_rpc_mismatch).
+
+-export([handle_mismatch/4]).
 
 rpc_test_() ->
     {setup,
-     fun setup/0,
-     fun cleanup/1,
-     fun(State) ->
-        [{"live Subscribe + Heartbeat on one connection admitted; on another rejected",
+     fun certs/0,
+     fun uncerts/1,
+     fun(Certs) ->
+        [transport_fixture(plain, Certs),
+         transport_fixture(oneway, Certs),
+         transport_fixture(mtls, Certs)]
+     end}.
+
+%% One fixture per transport: its own listener and channels, torn down before
+%% the next one starts. The TLS legs need the minted certificates.
+transport_fixture(plain, _Certs) ->
+    {setup, fun() -> setup(plain, undefined) end, fun cleanup/1, fun cases/1};
+transport_fixture(Mode, {error, Why}) ->
+    {lists:flatten(io_lib:format("~p transport skipped (openssl certificates unavailable): ~p",
+                                 [Mode, Why])),
+     fun() -> ok end};
+transport_fixture(Mode, Certs) ->
+    {setup, fun() -> setup(Mode, Certs) end, fun cleanup/1,
+     fun(State) -> cases(State) ++ tls_cases(State) end}.
+
+cases(State) ->
+    Mode = maps:get(mode, State),
+    [{name(Mode, Title), Fun} || {Title, Fun} <- [
+        {"live Subscribe + Heartbeat on one connection admitted; on another rejected",
           fun() -> same_connection_admitted(State) end},
          {"pending session admits only the connection that registered",
           fun() -> pending_binding(State) end},
@@ -55,8 +93,19 @@ rpc_test_() ->
          {"reannounce and replay reads leave the binding byte-identical",
           fun() -> replay_leaves_binding(State) end},
          {"registry restart: heartbeats fail closed, then a fresh session binds again",
-          fun() -> registry_restart(State) end}]
-     end}.
+          fun() -> registry_restart(State) end}]].
+
+name(Mode, Title) ->
+    lists:flatten(io_lib:format("[~p] ~s", [Mode, Title])).
+
+%% Cases that only make sense on a TLS listener.
+tls_cases(#{mode := Mode} = State) ->
+    Common = [{name(Mode, "the listener completes a verified TLS handshake and serves gRPC"),
+               fun() -> tls_handshake_observed(State) end}],
+    Strict = [{name(Mode, "a client with no certificate is refused"),
+               fun() -> certless_refused(State) end}
+              || Mode =:= mtls],
+    Common ++ Strict.
 
 %%%-------------------------------------------------------------------
 %%% Cases
@@ -64,12 +113,17 @@ rpc_test_() ->
 
 same_connection_admitted(#{chan_a := A, chan_b := B}) ->
     meck:reset(yuzu_gw_heartbeat_buffer),
+    ok = reset_mismatches(),
     {S, Stream} = register_and_subscribe(A, agent_id(<<"same-conn">>)),
     ?assertMatch({ok, _, _}, heartbeat(A, S)),
+    ?assertEqual(0, mismatches()),
     ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(B, S)),
+    %% The connection mismatch was counted once.
+    ?assertEqual(1, mismatches()),
     ?assertMatch({ok, _, _}, heartbeat(A, S)),
     %% Exactly the two admitted heartbeats reached the buffer.
     ?assertEqual(2, queued()),
+    ?assertEqual(1, mismatches()),
     close_stream(Stream),
     ok = await_unbound(S).
 
@@ -133,8 +187,8 @@ stream_end_removes_binding(#{chan_a := A}) ->
     ok = await_unbound(S),
     ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(A, S)).
 
-connection_close_removes_binding(#{port := Port}) ->
-    Chan = start_chan(chan_closing, Port),
+connection_close_removes_binding(#{mode := Mode, endpoint := Endpoint}) ->
+    Chan = start_chan(chan_name(Mode, closing), Endpoint),
     {S, _Holder} = register_and_subscribe(Chan, agent_id(<<"conn-close">>)),
     ?assertMatch({ok, _, _}, heartbeat(Chan, S)),
     %% Closing the client channel closes the HTTP/2 connection; the stream
@@ -142,7 +196,7 @@ connection_close_removes_binding(#{port := Port}) ->
     ok = grpcbox_channel:stop(Chan),
     ok = await_unbound(S),
     %% A fresh connection that presents the same session id is not admitted.
-    Fresh = start_chan(chan_fresh, Port),
+    Fresh = start_chan(chan_name(Mode, fresh), Endpoint),
     try
         ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(Fresh, S))
     after
@@ -285,12 +339,69 @@ subscribe_def() ->
                      agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
 
 %%%-------------------------------------------------------------------
+%%% TLS-only cases
+%%%-------------------------------------------------------------------
+
+%% A raw client handshake against the listener: the server certificate is
+%% verified against the minted CA (verify_peer, so a non-TLS or wrongly signed
+%% listener fails here), the negotiated version is the listener's TLS 1.2, and
+%% HTTP/2 is negotiated for a client that offers it the way the grpcbox client
+%% does (both ALPN and NPN).
+tls_handshake_observed(#{port := Port, client_ssl := ClientSsl}) ->
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             ClientSsl ++ [{mode, binary}, {active, false},
+                                           {alpn_advertised_protocols, [<<"h2">>]},
+                                           {client_preferred_next_protocols,
+                                            {client, [<<"h2">>]}}],
+                             5000),
+    try
+        {ok, Info} = ssl:connection_information(Sock, [protocol]),
+        ?assertEqual([{protocol, 'tlsv1.2'}], Info),
+        ?assertEqual({ok, <<"h2">>}, ssl:negotiated_protocol(Sock)),
+        ?assertMatch({ok, _}, ssl:peercert(Sock))
+    after
+        ssl:close(Sock)
+    end.
+
+%% The strict (mutual TLS) listener refuses a client that presents no
+%% certificate, so the mutual TLS cases above prove something: both of their
+%% channels hold the same certificate and only the connection differs.
+certless_refused(#{port := Port, certs := #{ca := Ca}}) ->
+    Res = ssl:connect("localhost", Port,
+                      [{cacertfile, Ca}, {verify, verify_peer},
+                       {versions, ['tlsv1.2']}, {mode, binary}, {active, false},
+                       {server_name_indication, "localhost"}], 5000),
+    Refused = case Res of
+        {error, _} -> true;
+        {ok, Sock} ->
+            %% A stack may finish the handshake and then end the session; a
+            %% failed first read is equally a refusal.
+            R = ssl:recv(Sock, 0, 2000),
+            catch ssl:close(Sock),
+            element(1, R) =:= error
+    end,
+    ?assert(Refused).
+
+%%%-------------------------------------------------------------------
 %%% Fixture
 %%%-------------------------------------------------------------------
 
-setup() ->
+%% Throwaway certificates (openssl CLI) in a 0700 directory under $TMPDIR.
+certs() ->
+    Base = case os:getenv("TMPDIR") of
+        false -> "/tmp";
+        ""    -> "/tmp";
+        Dir   -> Dir
+    end,
+    yuzu_gw_authz_tests:setup_certs(Base).
+
+uncerts(Certs) ->
+    yuzu_gw_authz_tests:cleanup_certs(Certs).
+
+setup(Mode, Certs) ->
     {ok, _} = application:ensure_all_started(grpcbox),
     {ok, _} = application:ensure_all_started(telemetry),
+    {ok, _} = application:ensure_all_started(ssl),
     ok = yuzu_gw_test_registry:ensure(),
     AgentSup = case whereis(yuzu_gw_agent_sup) of
         undefined ->
@@ -311,16 +422,36 @@ setup() ->
                      end),
     ok = meck:new(yuzu_gw_heartbeat_buffer, [passthrough, no_link]),
     ok = meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
-    {Port, Server} = start_listener(5),
-    #{port => Port,
+    %% The mismatch counter is observed through its telemetry event, recorded in
+    %% a public table: eunit runs this setup and the test bodies in different
+    %% processes.
+    catch ets:delete(?MISMATCH_TAB),
+    ?MISMATCH_TAB = ets:new(?MISMATCH_TAB, [named_table, public, set]),
+    catch telemetry:detach(?MISMATCH_HANDLER),
+    ok = telemetry:attach(?MISMATCH_HANDLER,
+                          [yuzu, gw, heartbeat, session_mismatch],
+                          fun ?MODULE:handle_mismatch/4, none),
+    {ListenerOpts, ClientSsl} = transport(Mode, Certs),
+    {Port, Server} = start_listener(ListenerOpts, 5),
+    Endpoint = case Mode of
+        plain -> {http, "localhost", Port, []};
+        _     -> {https, "localhost", Port, ClientSsl}
+    end,
+    #{mode => Mode,
+      certs => Certs,
+      client_ssl => ClientSsl,
+      port => Port,
+      endpoint => Endpoint,
       server => Server,
       agent_sup => AgentSup,
-      chan_a => start_chan(chan_a, Port),
-      chan_b => start_chan(chan_b, Port)}.
+      chan_a => start_chan(chan_name(Mode, a), Endpoint),
+      chan_b => start_chan(chan_name(Mode, b), Endpoint)}.
 
 cleanup(#{server := Server, agent_sup := AgentSup} = State) ->
     [catch grpcbox_channel:stop(maps:get(C, State)) || C <- [chan_a, chan_b]],
     catch supervisor:terminate_child(grpcbox_services_simple_sup, Server),
+    catch telemetry:detach(?MISMATCH_HANDLER),
+    catch ets:delete(?MISMATCH_TAB),
     catch meck:unload([yuzu_gw_upstream, yuzu_gw_heartbeat_buffer]),
     case AgentSup of
         undefined -> ok;
@@ -328,17 +459,58 @@ cleanup(#{server := Server, agent_sup := AgentSup} = State) ->
     end,
     ok.
 
-start_listener(0) ->
+%% {Listener transport_opts, client channel ssl options} for a transport.
+%% The one-way listener options mirror the agent listener in
+%% gateway/config/sys.config.prod; the mutual TLS listener omits the two
+%% relaxing keys so grpcbox applies its strict defaults (verify_peer plus
+%% fail_if_no_peer_cert). Neither listener has an auth_fun.
+transport(plain, _Certs) ->
+    {#{}, []};
+transport(Mode, #{dir := Dir, ca := Ca, gw_pem := GwPem, agent_pem := AgentPem}) ->
+    GwKey = filename:join(Dir, "gw.key"),
+    AgentKey = filename:join(Dir, "agent.key"),
+    Listener = #{ssl => true, certfile => GwPem, keyfile => GwKey,
+                 cacertfile => Ca},
+    Client = [{cacertfile, Ca}, {verify, verify_peer},
+              {versions, ['tlsv1.2']},
+              {server_name_indication, "localhost"}],
+    case Mode of
+        oneway ->
+            {Listener#{verify => verify_none, fail_if_no_peer_cert => false},
+             Client};
+        mtls ->
+            %% Both channels get this same client certificate.
+            {Listener, Client ++ [{certfile, AgentPem}, {keyfile, AgentKey}]}
+    end.
+
+chan_name(Mode, Role) ->
+    list_to_atom("yuzu_hb_conn_" ++ atom_to_list(Mode) ++ "_" ++ atom_to_list(Role)).
+
+handle_mismatch(_Event, #{count := N}, _Meta, _Config) ->
+    _ = ets:update_counter(?MISMATCH_TAB, count, N, {count, 0}),
+    ok.
+
+mismatches() ->
+    case ets:lookup(?MISMATCH_TAB, count) of
+        [{count, N}] -> N;
+        []           -> 0
+    end.
+
+reset_mismatches() ->
+    true = ets:delete_all_objects(?MISMATCH_TAB),
+    ok.
+
+start_listener(_TransportOpts, 0) ->
     error(no_free_port);
-start_listener(Retries) ->
+start_listener(TransportOpts, Retries) ->
     Port = probe_free_port(),
     GrpcOpts = #{service_protos => [agent_pb],
                  services => #{?SVC => yuzu_gw_agent_service}},
     case grpcbox:start_server(#{grpc_opts => GrpcOpts,
                                 listen_opts => #{port => Port, ip => {127, 0, 0, 1}},
-                                transport_opts => #{}}) of
+                                transport_opts => TransportOpts}) of
         {ok, Pid}  -> {Port, Pid};
-        {error, _} -> start_listener(Retries - 1)
+        {error, _} -> start_listener(TransportOpts, Retries - 1)
     end.
 
 probe_free_port() ->
@@ -349,7 +521,6 @@ probe_free_port() ->
 
 %% sync_start registers the endpoint before start_child returns (see
 %% yuzu_gw_authz_rpc_tests:start_chan/5 for the race it closes).
-start_chan(Name, Port) ->
-    {ok, _} = grpcbox_channel_sup:start_child(
-                Name, [{http, "localhost", Port, []}], #{sync_start => true}),
+start_chan(Name, Endpoint) ->
+    {ok, _} = grpcbox_channel_sup:start_child(Name, [Endpoint], #{sync_start => true}),
     Name.
