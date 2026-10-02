@@ -1182,6 +1182,63 @@ correct action in both cases is today's behaviour (no replay).
   `/health` `agents.online` read 0 throughout, and the server did not recover in the observed windows
   (to about 125 s). An early successful command is therefore not evidence the reconcile is unnecessary.
 
+**Update (2026-10-02, gateway heartbeat admission bound to the session's connection).** A gateway
+session is bound to the connection whose `Subscribe` stream created it; `heartbeat/2` admits a heartbeat
+only on that connection and only for a session the node holds. The `unknown_session_ids` verdict
+(2026-10-01 note) therefore names only sessions the node held at admission time; it remains an advisory
+snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
+rules. No wire, agent or server change; this change does not fix #1197.
+- **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
+  through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
+  (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by
+  `yuzu_gw_conn` (the only module the handlers call for keys). Every stream of one connection reports
+  the same key. A call without a key (`undefined`) never matches, not even a session registered without
+  one.
+- **Admission.** `yuzu_gw_heartbeat_admission` decides from node-local state only (never `pg`, never the
+  upstream server's view): the session index `yuzu_gw_sessions` (`{SessionId, AgentId, Pid, ConnKey}`,
+  created by the registry in `init/1` beside the routing and pending tables), then, on a miss, the
+  pending table. A pending session (Register done, `Subscribe` not yet admitted) is held to the
+  connection that sent the Register (`conn_key` in the pending row; `lookup_pending_session/1` does not
+  consume the row and treats an expired row as absent). Every rejection is the same gRPC `NOT_FOUND`
+  `unknown session` and the heartbeat is never queued; the reason appears only in counters:
+  `yuzu_gw_heartbeat_rejected_total{reason=unknown_session|no_connection|registry_unavailable}` and
+  `yuzu_gw_heartbeat_session_mismatch_total{event="security"}`, all pre-seeded to 0 and ASCII-HELP, plus
+  one rate-limited summary log line that never carries a session id. A rejected heartbeat has no resolved
+  principal, so the observability carve-out applies (metric and sampled log, no audit row). No alert rule
+  ships yet.
+- **Lookup primitive.** `yuzu_gw_registry:lookup_session/1` returns `{ok, #{agent_id, pid, conn_key}}`,
+  `error` (not held on this node, or the process is no longer alive) or `{error, unavailable}` (the
+  index table does not exist, for example while the registry restarts). Callers must treat
+  `{error, unavailable}` as "not admitted", never as "no filter"; admission answers it with the same
+  `NOT_FOUND`. The gateway-side replay change consumes this function and must handle all three shapes.
+- **Lifecycle, as implemented.**
+
+| Event | Index row |
+|---|---|
+| `register/2` succeeds upstream | pending row written with the Register connection's key (TTL 120 s, swept every 60 s) |
+| `subscribe/2`: `take_pending`, then `start_agent` | pending row consumed; for the short interval before the agent process registers neither row exists and a heartbeat gets `NOT_FOUND` (accepted; the agent recovers through its existing re-register path) |
+| `yuzu_gw_agent:init/1` calls `register_agent/7` | row inserted with the Subscribe connection's key; `maybe_cleanup` also removes the superseded process's row; `/5` and `/6` registrations carry `undefined` and admit nothing; an `undefined` session id is not indexed |
+| agent process cleanup | `deregister_agent/3` is fenced on the caller's own pid and session: it always removes that session's row, and removes the routing row and `pg` memberships only while that pid still owns the agent id, so a process superseded by a newer registration cannot remove it. The unfenced `deregister_agent/1` remains (it removes whichever process holds the agent id, with that row's session entry) |
+| registry `DOWN` for an agent pid | the session row goes only if the agent's routing row still names that pid |
+| registry restart | both tables are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents are expected to recover through their re-register path (not exercised end to end) |
+| gateway restart | everything is gone and every connection is dropped; agents reconnect with fresh sessions |
+| upstream replay and `reannounce/2` | untouched: replay never creates, moves or deletes a binding |
+| server-only restart | untouched: admission does not consult the server, so heartbeats are still admitted and the server's verdict stays advisory |
+
+- **Supported topologies.** Agents connect to `:50051` directly, or through an L4 / TLS-passthrough path
+  that keeps one TCP connection per agent. An HTTP/2-terminating or HTTP/2-multiplexing proxy between
+  agents and the gateway is not supported for this check: it can spread one agent's calls over several
+  connections (rejections as `connection_mismatch` and repeated re-registration) and removes the
+  per-agent separation the check relies on. There is no topology knob and no `sys.config` change. A
+  GOAWAY, a connection break or a client-side connection replacement while a stream drains can also
+  put a heartbeat on a different connection than its session; the result is a `NOT_FOUND` and a fresh
+  session, paced by the agent's cooldown.
+- **Deploying.** The index table is created at registry init, so deployment needs a gateway restart;
+  hot code upgrade is not supported for this change (code loaded into a running node has no table and
+  every heartbeat on that node is rejected as `registry_unavailable`).
+- **Limits.** `Subscribe` admission is unchanged by this change. Some log lines still include session
+  ids; two gateway info lines no longer do.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
