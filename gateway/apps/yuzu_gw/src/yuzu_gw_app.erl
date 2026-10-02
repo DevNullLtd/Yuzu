@@ -67,6 +67,8 @@ do_start_services() ->
     application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
     {ok, _} = prometheus_httpd:start(),
     logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
+    logger:info("Heartbeat admission is connection-bound: a heartbeat is "
+                "admitted only on the connection that opened its session"),
 
     %% Start the supervision tree.
     yuzu_gw_sup:start_link().

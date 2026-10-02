@@ -26,6 +26,7 @@
 -define(SESSIONS, yuzu_gw_sessions).
 -define(PENDING,  yuzu_gw_pending).
 -define(HB_HANDLER, yuzu_gw_heartbeat_binding_tests_events).
+-define(EVENTS_TAB, yuzu_gw_heartbeat_binding_tests_events_tab).
 -define(LOG_HANDLER, yuzu_gw_heartbeat_binding_tests_logs).
 -define(CTX_KEY, yuzu_test_conn_key).
 
@@ -101,24 +102,34 @@ setup() ->
                      fun(#{info := #{agent_id := Id}}) ->
                          {ok, #{session_id => <<"reg-session-", Id/binary>>}}
                      end),
-    Self = self(),
+    %% Events are recorded in a public table: eunit runs the fixture setup
+    %% and the test body in different processes, so a pid captured here
+    %% would not be the one the test reads from.
+    catch ets:delete(?EVENTS_TAB),
+    ?EVENTS_TAB = ets:new(?EVENTS_TAB, [named_table, public, ordered_set]),
     catch telemetry:detach(?HB_HANDLER),
     ok = telemetry:attach_many(?HB_HANDLER,
                                [[yuzu, gw, heartbeat, rejected],
                                 [yuzu, gw, heartbeat, session_mismatch]],
-                               fun ?MODULE:handle_event/4, Self),
-    application:set_env(yuzu_gw, heartbeat_reject_log_interval_ms, 600000),
+                               fun ?MODULE:handle_event/4, none),
+    Prev = application:get_env(yuzu_gw, telemetry_gauge_interval_ms),
+    application:set_env(yuzu_gw, telemetry_gauge_interval_ms, 600000),
     flush(),
-    ok.
+    Prev.
 
-cleanup(_) ->
+cleanup(Prev) ->
     catch telemetry:detach(?HB_HANDLER),
-    application:unset_env(yuzu_gw, heartbeat_reject_log_interval_ms),
+    catch ets:delete(?EVENTS_TAB),
+    case Prev of
+        {ok, V}   -> application:set_env(yuzu_gw, telemetry_gauge_interval_ms, V);
+        undefined -> application:unset_env(yuzu_gw, telemetry_gauge_interval_ms)
+    end,
     catch meck:unload([yuzu_gw_conn, yuzu_gw_heartbeat_buffer, yuzu_gw_upstream]),
     ok.
 
-handle_event(Event, Measurements, Meta, Pid) ->
-    Pid ! {hb_event, Event, Measurements, Meta},
+handle_event(Event, Measurements, Meta, _Config) ->
+    true = ets:insert(?EVENTS_TAB, {erlang:unique_integer([monotonic]),
+                                    Event, Measurements, Meta}),
     ok.
 
 %%%===================================================================
@@ -155,17 +166,14 @@ queued() ->
     meck:num_calls(yuzu_gw_heartbeat_buffer, queue_heartbeat, '_').
 
 flush() ->
-    receive {hb_event, _, _, _} -> flush()
-    after 0 -> ok
-    end.
+    true = ets:delete_all_objects(?EVENTS_TAB),
+    ok.
 
-%% All heartbeat telemetry events delivered so far, oldest first.
+%% All heartbeat telemetry events recorded so far, oldest first; clears them.
 events() ->
-    events([]).
-events(Acc) ->
-    receive {hb_event, E, M, Meta} -> events([{E, M, Meta} | Acc])
-    after 50 -> lists:reverse(Acc)
-    end.
+    Events = [{E, M, Meta} || {_, E, M, Meta} <- ets:tab2list(?EVENTS_TAB)],
+    flush(),
+    Events.
 
 reject_event(Reason) ->
     {[yuzu, gw, heartbeat, rejected], #{count => 1}, #{reason => Reason}}.

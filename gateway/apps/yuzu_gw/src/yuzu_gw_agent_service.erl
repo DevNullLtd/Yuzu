@@ -6,7 +6,8 @@
 %%%
 %%% - Register: proxied upstream to C++ server
 %%% - Subscribe: terminated locally, one yuzu_gw_agent process spawned
-%%% - Heartbeat: buffered for batch upstream delivery
+%%% - Heartbeat: admitted per session and connection, then buffered for
+%%%   batch upstream delivery
 %%% - ReportInventory: proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
 %%%
@@ -195,16 +196,29 @@ check_backpressure() ->
 %% Heartbeat — buffer for batch upstream delivery
 %%--------------------------------------------------------------------
 
+%% Admitted only for a session this node holds, on the connection that
+%% opened it (see yuzu_gw_heartbeat_admission). Every rejection is the same
+%% NOT_FOUND "unknown session" the agent already recovers from by
+%% re-registering; a rejected heartbeat is never queued.
 heartbeat(Ctx, HeartbeatReq) ->
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(HeartbeatReq),
+    SessionId = case is_map(HeartbeatReq) of
+        true  -> maps:get(session_id, HeartbeatReq, undefined);
+        false -> undefined
+    end,
+    case yuzu_gw_heartbeat_admission:admit(Ctx, SessionId) of
+        ok ->
+            yuzu_gw_heartbeat_buffer:queue_heartbeat(HeartbeatReq),
 
-    %% Respond immediately — the agent doesn't need to wait for upstream ack.
-    Response = #{
-        acknowledged => true,
-        server_time  => #{millis_epoch => erlang:system_time(millisecond)},
-        pending_commands => []
-    },
-    {ok, Response, Ctx}.
+            %% Respond immediately — the agent doesn't need to wait for upstream ack.
+            Response = #{
+                acknowledged => true,
+                server_time  => #{millis_epoch => erlang:system_time(millisecond)},
+                pending_commands => []
+            },
+            {ok, Response, Ctx};
+        rejected ->
+            {grpc_error, {?GRPC_STATUS_NOT_FOUND, <<"unknown session">>}}
+    end.
 
 %%--------------------------------------------------------------------
 %% ExecuteCommand — not used (Subscribe is the primary channel)
