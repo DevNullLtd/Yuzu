@@ -78,6 +78,7 @@
 
 #if defined(_WIN32)
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -387,9 +388,10 @@ struct LocalFreeGuard {
 /// final path carries one): `requested` is a drive-letter path here (UNC was refused upstream), so
 /// no `\\?\` or UNC prefix can be damaged. Only separator runs: never `.`/`..` or 8.3 names.
 [[nodiscard]] bool final_path_matches(const std::wstring& requested, const std::wstring& final_path) {
-    std::wstring collapsed;
-    for (const wchar_t c : requested)
-        if (c != L'\\' || collapsed.empty() || collapsed.back() != L'\\') collapsed.push_back(c);
+    std::wstring collapsed = requested;
+    collapsed.erase(std::unique(collapsed.begin(), collapsed.end(),
+                                [](wchar_t a, wchar_t b) { return a == L'\\' && b == a; }),
+                    collapsed.end());
     const std::wstring expected = L"\\\\?\\" + collapsed;
     return CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()),
                                 final_path.c_str(), static_cast<int>(final_path.size()),
