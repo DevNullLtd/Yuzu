@@ -263,14 +263,14 @@ if [[ -n "$ADMIN_PASS" ]]; then
         "${SERVER_URL}/api/v1/openapi.json" 2>/dev/null || echo "")
     rm -f "$OPENAPI_COOKIE_JAR"
     assert_eq "GET /api/v1/openapi.json (authenticated) → 200" "200" "$OPENAPI_AUTH_STATUS"
-    # Not assert_contains: that helper's `echo "$haystack" | grep -q "$needle"`
-    # pipeline can spuriously report no-match under `pipefail` when the needle
-    # is found on an early line of a large multi-line haystack — grep(1) exits
-    # the instant it matches, echo(1) is still mid-write of the remaining
-    # ~200KB spec body, SIGPIPE kills echo, and pipefail surfaces THAT
-    # non-zero exit rather than grep's success. The pretty-printed OpenAPI
-    # doc (its "openapi" key is on line 2) triggers this every time. Plain
-    # bash glob match has no subshell/pipe to race.
+    # Not a pipe: `echo "$body" | grep -q "$needle"` can spuriously report
+    # no-match under `pipefail` when the needle is on an early line of a large
+    # multi-line body — grep(1) exits the instant it matches, echo(1) is still
+    # mid-write of the remaining ~200KB spec body, SIGPIPE kills echo, and
+    # pipefail surfaces THAT non-zero exit rather than grep's success. The
+    # pretty-printed OpenAPI doc (its "openapi" key is on line 2) triggers this
+    # every time. Plain bash glob match has no subshell/pipe to race (as does
+    # assert_contains, which uses a here-string for the same reason).
     TESTS=$((TESTS + 1))
     if [[ "$OPENAPI_AUTH_BODY" == *'"openapi"'* ]]; then
         pass "GET /api/v1/openapi.json (authenticated) body has openapi"
@@ -563,13 +563,25 @@ GOT_RETRY_AFTER=false
 # that IS the bug the test catches.
 # Each response is reported as "<status> <retry-after>"; reading the header off
 # the same response avoids the refill race of a serial follow-up (the bucket
-# refills within ~10ms after the burst ends). %header{} needs curl >= 7.84.
+# refills within ~10ms after the burst ends). The burst (-Z --parallel-immediate)
+# needs curl >= 7.68 and %header{} needs >= 7.84: on 7.68-7.83 the status is still
+# read and only the Retry-After assertion is skipped; below 7.68 the probe cannot
+# run, which is reported as such rather than as "limiter not triggered".
 RATELIMIT_ATTEMPTS=500
 RATELIMIT_PARALLELISM=300
-RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
-    -o /dev/null -w '%{http_code} %header{retry-after}\n' \
-    -X POST -d 'username=ratelimit_test&password=bad' \
-    "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null || true)
+IFS=. read -r CURL_MAJOR CURL_MINOR _ <<< "$(curl --version | awk 'NR==1 {print $2}')"
+curl_at_least() { (( CURL_MAJOR > $1 || (CURL_MAJOR == $1 && CURL_MINOR >= $2) )); }
+RATELIMIT_FMT='%{http_code}\n'
+if curl_at_least 7 84; then
+    RATELIMIT_FMT='%{http_code} %header{retry-after}\n'
+fi
+RATELIMIT_OUT=""
+if curl_at_least 7 68; then
+    RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
+        -o /dev/null -w "$RATELIMIT_FMT" \
+        -X POST -d 'username=ratelimit_test&password=bad' \
+        "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null || true)
+fi
 if grep -q '^429 ' <<< "$RATELIMIT_OUT"; then
     GOT_429=true
 fi
@@ -580,17 +592,23 @@ fi
 TESTS=$((TESTS + 1))
 if $GOT_429; then
     pass "Rate limiting triggered (429 returned within $RATELIMIT_ATTEMPTS parallel requests)"
+elif ! curl_at_least 7 68; then
+    fail "Rate-limit probe needs curl >= 7.68 for --parallel-immediate (found ${CURL_MAJOR}.${CURL_MINOR})"
 else
     fail "Rate limiting NOT triggered (no 429 in $RATELIMIT_ATTEMPTS parallel login attempts)"
 fi
 
-TESTS=$((TESTS + 1))
-if $GOT_429 && $GOT_RETRY_AFTER; then
-    pass "429 response includes Retry-After header"
-elif $GOT_429; then
-    fail "429 response missing Retry-After header"
+if ! curl_at_least 7 84; then
+    log "  - Retry-After check skipped: needs curl >= 7.84 for %header{} (found ${CURL_MAJOR}.${CURL_MINOR})"
 else
-    fail "429 never triggered — cannot check Retry-After header"
+    TESTS=$((TESTS + 1))
+    if $GOT_429 && $GOT_RETRY_AFTER; then
+        pass "429 response includes Retry-After header"
+    elif $GOT_429; then
+        fail "429 response missing Retry-After header"
+    else
+        fail "429 never triggered — cannot check Retry-After header"
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════

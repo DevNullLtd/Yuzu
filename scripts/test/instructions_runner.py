@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-instructions_runner.py — schema-driven REST exerciser for the 217
+instructions_runner.py — schema-driven REST exerciser for the
 InstructionDefinitions shipped under content/definitions/.
 
 Companion to scripts/test/instructions-tests.sh (the bash entry that the
@@ -22,15 +22,17 @@ and gate_notes):
                     approval=manual/always/none; not a failure, but not a
                     semantic check either
   skip              definition risk-tag excluded by --risk filter
-                    (destructive/network-disrupt/interactive by default)
+                    (everything but safe and mutating by default)
   error             internal runner error (network, JSON parse, etc.) —
                     distinct from `fail` so flake-watching can separate
                     "instruction broken" from "test infra broken"
 
 Risk classification table is at scripts/test/instructions-risk-classification.json.
-Definitions whose id is NOT in the override map are classified by spec.type:
-  type=question/query -> safe
-  type=action         -> mutating
+Definitions whose id is NOT in the override map are classified by plugin, then spec.type:
+  plugin=_server/server/server_internal -> server-internal (catalog-only; the
+                                           dispatch chokepoint denies them)
+  type=question/query                   -> safe
+  type=action                           -> mutating
 """
 
 from __future__ import annotations
@@ -86,7 +88,7 @@ class Definition:
     parameters: dict     # JSON-Schema-ish object from spec.parameters
     result_columns: list[dict]  # spec.result.columns
     approval_mode: str
-    risk: str            # safe | mutating | destructive | network-disrupt | interactive
+    risk: str            # one of ALL_RISKS
     file: str            # source YAML, for diagnostics
 
 
@@ -122,7 +124,7 @@ def load_risk_table(path: Path) -> dict[str, str]:
 SERVER_ONLY_PLUGINS = ("_server", "server", "server_internal")
 
 
-def classify(def_id: str, spec_type: str, overrides: dict[str, str], plugin: str = "") -> str:
+def classify(def_id: str, spec_type: str, overrides: dict[str, str], plugin: str) -> str:
     if def_id in overrides:
         return overrides[def_id]
     if plugin in SERVER_ONLY_PLUGINS:

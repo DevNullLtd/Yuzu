@@ -8,8 +8,10 @@ requires explicit targets: DispatchClass::Destructive, or the Forensics securabl
 that targets such a row but is classified safe or mutating therefore fails the gate with
 HTTP 400 on every run. The risk table was hand-maintained and lagged the capability
 declarations for months (14 definitions), so this test derives the set from the
-capability_decls fragments and requires every matching definition to be classified into a
-class the default run skips.
+capability_decls fragments and requires every matching definition to carry the opt-in class
+its row implies: `forensic` for a Forensics row, and `destructive` (or the more specific
+`network-disrupt`/`interactive`) for a Destructive row. It also pins the two runner rules the
+table leans on: the server-only plugin spellings and the removed HTTP-200 auto-pass.
 
 Runnable standalone: `python3 tests/test_instructions_risk_table.py`. Hermetic: reads
 source files only (needs PyYAML, as the runner does). No subprocess, network or clock.
@@ -30,21 +32,46 @@ DESTRUCTIVE = re.compile(r"\.dispatch_class\s*=\s*DispatchClass::Destructive")
 FORENSICS = re.compile(r'\.securable\s*=\s*"Forensics"')
 
 
+# The opt-in classes a definition may carry, by the kind of row it targets.
+ALLOWED = {"forensic": ("forensic",), "destructive": ("destructive", "network-disrupt", "interactive")}
+
+
 def explicit_target_rows(texts):
-    """{(plugin, action)} for every row the server refuses to broadcast, plus the row count."""
-    rows, total = set(), 0
+    """({(plugin, action): "forensic"|"destructive"} for every row the server refuses to
+    broadcast, row count)."""
+    rows, total = {}, 0
     for text in texts:
         for plugin, action, body in ROW.findall(text):
             total += 1
-            if DESTRUCTIVE.search(body) or FORENSICS.search(body):
-                rows.add((plugin, action))
+            if FORENSICS.search(body):
+                rows[(plugin, action)] = "forensic"
+            elif DESTRUCTIVE.search(body):
+                rows[(plugin, action)] = "destructive"
     return rows, total
 
 
 def misclassified(rows, defs):
-    """Definitions targeting a row in `rows` whose risk the default run would still dispatch."""
+    """Definitions targeting a row in `rows` whose risk is not an opt-in class for that row."""
     return sorted(d.id for d in defs
-                  if (d.plugin, d.action) in rows and d.risk in ir.DEFAULT_RISKS)
+                  if (d.plugin, d.action) in rows and d.risk not in ALLOWED[rows[(d.plugin, d.action)]])
+
+
+def make_def(plugin="p", risk="mutating", def_id="x.y"):
+    return ir.Definition(id=def_id, plugin=plugin, action="a", type="action", platforms=[],
+                         parameters={}, result_columns=[], approval_mode="auto", risk=risk, file="x.yaml")
+
+
+class FakeClient:
+    """Stands in for YuzuClient: dispatch always succeeds, polling returns `responses`."""
+
+    def __init__(self, responses):
+        self.responses = responses
+
+    def execute_instruction(self, def_id, params):
+        return 200, {"command_id": "c1"}
+
+    def get_responses(self, command_id):
+        return {"responses": self.responses}
 
 
 class RiskTable(unittest.TestCase):
@@ -58,20 +85,49 @@ class RiskTable(unittest.TestCase):
         # A regex that silently stopped matching would make the main check pass on nothing.
         self.assertGreater(self.total, 100, "catalogue row regex found too few rows")
         self.assertGreater(len(self.rows), 10, "no Destructive/Forensics rows found")
+        self.assertEqual(set(self.rows.values()), {"forensic", "destructive"})
 
-    def test_explicit_target_definitions_are_not_in_the_default_run(self):
+    def test_explicit_target_definitions_carry_their_opt_in_class(self):
         bad = misclassified(self.rows, self.defs)
-        self.assertEqual(bad, [], "definitions the server refuses to broadcast are classified "
-                                  "safe/mutating in scripts/test/instructions-risk-classification.json; "
-                                  "classify them destructive or forensic")
+        self.assertEqual(bad, [], "definitions the server refuses to broadcast carry the wrong class in "
+                                  "scripts/test/instructions-risk-classification.json; a Forensics row "
+                                  "needs forensic, a Destructive row destructive")
 
     def test_failure_mode_on_synthetic_data(self):
-        d = ir.Definition(id="x.y", plugin="p", action="a", type="action", platforms=[],
-                          parameters={}, result_columns=[], approval_mode="auto", risk="mutating", file="x.yaml")
-        self.assertEqual(misclassified({("p", "a")}, [d]), ["x.y"])
-        d.risk = "forensic"
-        self.assertEqual(misclassified({("p", "a")}, [d]), [])
-        self.assertEqual(ir.classify("a.b", "action", {}, "server_internal"), "server-internal")
+        rows = {("p", "a"): "destructive", ("p", "b"): "forensic"}
+        d = make_def(risk="mutating")
+        self.assertEqual(misclassified(rows, [d]), ["x.y"])
+        for ok in ("destructive", "network-disrupt", "interactive"):
+            d.risk = ok
+            self.assertEqual(misclassified(rows, [d]), [], ok)
+        d.risk = "forensic"  # reserved for Forensics rows: a label swap must be caught
+        self.assertEqual(misclassified(rows, [d]), ["x.y"])
+        f = make_def(risk="destructive")
+        f.action = "b"
+        self.assertEqual(misclassified(rows, [f]), ["x.y"])
+        f.risk = "forensic"
+        self.assertEqual(misclassified(rows, [f]), [])
+
+    def test_runner_risk_rules(self):
+        for plugin in ("_server", "server", "server_internal"):
+            self.assertEqual(ir.classify("a.b", "action", {}, plugin), "server-internal", plugin)
+        self.assertEqual(ir.classify("a.b", "query", {}, "os_info"), "safe")
+        self.assertEqual(ir.classify("a.b", "action", {}, "os_info"), "mutating")
+        self.assertEqual(ir.classify("a.b", "action", {"a.b": "safe"}, "server"), "safe")  # override wins
+        self.assertIn("forensic", ir.ALL_RISKS)
+        self.assertIn("server-internal", ir.ALL_RISKS)
+        args = ir.parse_args(["--dashboard", "http://x", "--password", "x",
+                              "--risks", "forensic", "server-internal"])
+        self.assertEqual(args.risks, ["forensic", "server-internal"])
+
+    def test_server_side_definition_needs_an_agent_response(self):
+        # HTTP 200 + command_id used to auto-pass server-side plugins without any response, which
+        # hid the dispatch chokepoint denying them. poll_timeout_s=0 skips the poll loop (no sleep).
+        for plugin in ("_server", "server", "server_internal"):
+            outcome = ir.exercise(FakeClient([]), make_def(plugin=plugin), {}, poll_timeout_s=0)
+            self.assertEqual(outcome.status, "fail", plugin)
+        answered = FakeClient([{"output": "x", "status": "ok", "rc": 0}])
+        self.assertEqual(ir.exercise(answered, make_def(plugin="server"), {}, poll_timeout_s=1).status, "pass")
 
 
 if __name__ == "__main__":
