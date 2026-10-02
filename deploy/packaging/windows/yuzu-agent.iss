@@ -414,6 +414,78 @@ begin
   Result := '''' + Result + '''';
 end;
 
+const
+  FileAttrDirectory = $10;
+  FileAttrReparsePoint = $400;
+
+{ True when Path itself (not what it may point to) is a junction or symbolic
+  link. FindFirst on a path with no wildcard returns that entry's own
+  attributes from its parent directory, so it never follows the link. Sets
+  Found to False when the entry could not be read at all. }
+function IsReparsePoint(const Path: string; var Found: Boolean): Boolean;
+var
+  R: TFindRec;
+begin
+  Result := False;
+  Found := FindFirst(Path, R);
+  if Found then
+  begin
+    Result := (R.Attributes and FileAttrReparsePoint) <> 0;
+    FindClose(R);
+  end;
+end;
+
+{ '' when Dir holds only plain files; otherwise why not. Lists Dir's direct
+  entries only. With MustList, a failure to list is itself a refusal. }
+function NotFilesOnly(const Dir: string; MustList: Boolean): string;
+var
+  R: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not FindFirst(Dir + '\*', R) then
+  begin
+    { "." always exists, so a False here is a failure to list, not emptiness. }
+    if MustList then
+      Result := 'its contents could not be listed';
+    Exit;
+  end;
+  try
+    More := True;
+    while More and (Result = '') do
+    begin
+      if (R.Name <> '.') and (R.Name <> '..') then
+      begin
+        if (R.Attributes and FileAttrReparsePoint) <> 0 then
+          Result := 'it contains a junction or symbolic link, which must be removed with ' +
+                    'cmd /c rmdir (never Remove-Item -Recurse): ' + Dir + '\' + R.Name
+        else if (R.Attributes and FileAttrDirectory) <> 0 then
+          Result := 'it contains a subdirectory, and it may hold only files: ' +
+                    Dir + '\' + R.Name;
+      end;
+      if Result = '' then
+        More := FindNext(R);
+    end;
+  finally
+    FindClose(R);
+  end;
+end;
+
+{ The operator-facing refusal, shared by every way the directory can fail. }
+function NotSecuredMessage(const CertDir, Reason: string): string;
+begin
+  Result := 'The update trust-anchor directory is not secured:' + #13#10 +
+            CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
+            'Only Administrators and SYSTEM may have access to it, both need full ' +
+            'control, and it may hold only files. While anyone else can write there, ' +
+            'they can install their own trust bundle and authorise their own agent ' +
+            'updates; while SYSTEM cannot read it, the agent cannot verify updates at ' +
+            'all. Securing it did not take effect -- security software may have ' +
+            'blocked it. The installation has been stopped. If the Yuzu Agent service ' +
+            'was running, it was stopped for the installation and has not been ' +
+            'restarted: run "sc.exe start YuzuAgent" once this is resolved.';
+end;
+
 { Harden the OTA trust-anchor directory, then PROVE it worked.
 
   RUNS BEFORE ANYTHING IS INSTALLED, and that placement is the point. An earlier
@@ -433,13 +505,42 @@ end;
   takeown (which also enables the privilege needed to recover a directory whose
   DACL grants Administrators nothing at all), then /reset to drop every explicit
   ACE, then /inheritance:r /grant:r to drop the inherited ones and grant exactly
-  Administrators and SYSTEM. takeown and /reset run with /T because a file the
-  attacker planted carries its own ACL and its own owner; the GRANT runs on the
-  directory alone, and its children inherit it. It must NOT use /T: (OI)(CI) is
-  invalid on a file, and icacls /T then leaves every existing file -- the
-  operator's update-trust-bundle.pem on every reinstall -- with an empty
-  protected DACL that locks SYSTEM out too, while reporting success. Verified
-  on Windows Server 2022 with the 0.14.0-rc5 installer (#5196).
+  Administrators and SYSTEM -- each on the DIRECTORY ITSELF. Then takeown and
+  /reset on its FILES ("<dir>\*"), because a file the attacker planted carries its
+  own ACL and its own owner. The grant must never reach a file: (OI)(CI) is
+  invalid on a file, and the rc1..rc5 `icacls ... /grant:r ... /T` left every
+  existing file -- the operator's update-trust-bundle.pem on every reinstall --
+  with an empty protected DACL that locks SYSTEM out too, while reporting
+  success. Verified on Windows Server 2022 with the 0.14.0-rc5 installer
+  (#5196).
+
+  NOTHING HERE RECURSES, AND THE DIRECTORY MAY HOLD ONLY FILES (#5255 review).
+  The pre-creating user can also plant a junction -- no privilege is needed --
+  at agent-certs itself or inside it, and a recursive takeown /R or icacls /T
+  follows it, so the elevated re-ACL would land on a tree outside agent-certs;
+  Get-Acl through the link then reads the rewritten target and the check would
+  PASS. Nothing legitimate ever creates a subdirectory here (the agent's own
+  credentials live in <data-dir>\certs; only the trust-bundle files are read from
+  agent-certs), so the rule is "never walk it, and refuse anything that is not
+  a plain file", not "walk it carefully":
+    - agent-certs itself a junction or symbolic link -> abort, before anything
+      runs on it. The installer never deletes anything here; the operator
+      removes the link with cmd /c rmdir (which removes the link, never its
+      target -- never Remove-Item -Recurse, which in Windows PowerShell 5.1
+      deletes the target's contents through a junction).
+    - after the directory is locked (owned by Administrators, BA/SY only, so
+      nobody else can add, rename or replace an entry), any entry that is a
+      junction, link or subdirectory -> abort. That check runs AFTER the lock
+      so the entries it passes are the entries the file-level takeown/reset then
+      act on; an owned EMPTY directory can be turned into a junction in place,
+      which is why subdirectories are refused rather than inspected.
+    - every icacls carries /L, so it acts on a link itself and never its target,
+      and takeown only ever runs on an object just checked not to be a link.
+  Attributes are read with FindFirst, which reports a link's own attributes,
+  never its target's. Verified on Windows Server 2022 (#5255): a root junction,
+  child junctions (to an ordinary and to a protected directory), child
+  directory and file symbolic links and a nested junction each abort with the
+  outside target untouched.
 
   `icacls /grant:r` ALONE IS NOT ENOUGH and this is the bug that shipped: it
   replaces grants only for the SIDs it NAMES, so a third SID's explicit entry
@@ -498,6 +599,7 @@ function SecureTrustAnchorDir(): string;
 var
   ResultCode: Integer;
   Ok: Boolean;
+  Found: Boolean;
   CertDir, ReasonFile, PsExe, Script, Reason: string;
   ReasonText: AnsiString;
 begin
@@ -518,18 +620,62 @@ begin
     Exit;
   end;
 
-  { Best-effort by design: each is VERIFIED below rather than trusted, so a
+  { Nothing below may run on a link: refuse one before touching anything. }
+  if IsReparsePoint(CertDir, Found) or not Found then
+  begin
+    if Found then
+      Reason := 'it is a junction or symbolic link, not a directory. Remove the link with ' +
+                'cmd /c rmdir (which removes the link, never its target; never use ' +
+                'Remove-Item -Recurse)'
+    else
+      Reason := 'it could not be inspected';
+    Result := NotSecuredMessage(CertDir, Reason);
+    Exit;
+  end;
+  { Diagnostic only: before the lock below, this listing may be refused (a
+    directory granting Administrators nothing is a case takeown exists for), so
+    a failure to list is ignored here and re-checked, fail-closed, after it. }
+  Reason := NotFilesOnly(CertDir, False);
+  if Reason <> '' then
+  begin
+    Result := NotSecuredMessage(CertDir, Reason);
+    Exit;
+  end;
+
+  { The directory itself: owner, explicit entries, then exactly BA and SYSTEM.
+    Best-effort by design: each is VERIFIED below rather than trusted, so a
     blocked step surfaces as a specific verification failure, which tells the
-    operator more than this step's own exit code would. }
+    operator more than this step's own exit code would. No /R, no /T -- see the
+    function comment. /L makes icacls act on a link itself, never its target. }
   Ok := Exec(ExpandConstant('{sys}\takeown.exe'),
-             '/F "' + CertDir + '" /A /R /D Y',
+             '/F "' + CertDir + '" /A',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
-             '"' + CertDir + '" /reset /T /C /Q',
+             '"' + CertDir + '" /reset /L /C /Q',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
              '"' + CertDir + '" /inheritance:r /grant:r ' +
-             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /C /Q',
+             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  { Now nobody else can add, rename or replace an entry, so what this sees is
+    what the two file-level steps below act on. Fail-closed this time. }
+  Reason := NotFilesOnly(CertDir, True);
+  if Reason <> '' then
+  begin
+    Result := NotSecuredMessage(CertDir, Reason);
+    Exit;
+  end;
+
+  { Its files: take back any the pre-creating user owns, and drop their
+    explicit entries so they inherit exactly BA and SYSTEM from the directory.
+    "<dir>\*" is direct entries only; on an empty directory both report that
+    nothing matched, which is expected. }
+  Ok := Exec(ExpandConstant('{sys}\takeown.exe'),
+             '/F "' + CertDir + '\*" /A',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+             '"' + CertDir + '\*" /reset /L /C /Q',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   { Built from plain literals so any braces stay literal -- Inno expands a
@@ -549,8 +695,14 @@ begin
     '$d=' + PsLit(CertDir) + ';' +
     '$out=' + PsLit(ReasonFile) + ';' +
     'function Fail($m){Set-Content -LiteralPath $out -Value $m -Encoding ASCII;exit 3};' +
-    '$t=@($d);' +
-    'try{$t+=@(Get-ChildItem -LiteralPath $d -Recurse -Force|ForEach-Object{$_.FullName})}catch{Fail ''its contents could not be listed''};' +
+    'try{$r=Get-Item -LiteralPath $d -Force}catch{Fail ''it could not be opened''};' +
+    'if(($r.Attributes -band 1024) -ne 0){Fail ''it is a junction or symbolic link, not a directory''};' +
+    'try{$c=@(Get-ChildItem -LiteralPath $d -Force)}catch{Fail ''its contents could not be listed''};' +
+    'foreach($i in $c){' +
+      'if(($i.Attributes -band 1024) -ne 0){Fail (''it contains a junction or symbolic link: '' + $i.FullName)};' +
+      'if(($i.Attributes -band 16) -ne 0){Fail (''it contains a subdirectory, and it may hold only files: '' + $i.FullName)}' +
+    '};' +
+    '$t=@($d)+@($c|ForEach-Object{$_.FullName});' +
     'foreach($p in $t){' +
       'try{$s=[string](Get-Acl -LiteralPath $p).Sddl}catch{Fail (''the permissions could not be read on '' + $p)};' +
       'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it is owned by an account other than Administrators or SYSTEM: '' + $p + '' '' + $s)};' +
@@ -593,16 +745,7 @@ begin
   begin
     if Reason = '' then
       Reason := 'the check did not produce a result (exit code ' + IntToStr(ResultCode) + ')';
-    Result := 'The update trust-anchor directory is not secured:' + #13#10 +
-              CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
-              'Only Administrators and SYSTEM may have access to it, and both need full ' +
-              'control. While anyone else can write there, they can install their own ' +
-              'trust bundle and authorise their own agent updates; while SYSTEM cannot ' +
-              'read it, the agent cannot verify updates at all. Securing it did not take ' +
-              'effect -- security software may have blocked it. The installation has ' +
-              'been stopped. If the Yuzu Agent service was running, it was stopped for ' +
-              'the installation and has not been restarted: run "sc.exe start YuzuAgent" ' +
-              'once this is resolved.';
+    Result := NotSecuredMessage(CertDir, Reason);
   end;
 end;
 

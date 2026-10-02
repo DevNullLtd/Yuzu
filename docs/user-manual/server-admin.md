@@ -2262,48 +2262,57 @@ route, neither the directory nor its ACL hardening exists after upgrading. Creat
 it before you enable signing, or `--update-trust-bundle` points at nothing:
 
 ```powershell
-# Windows, elevated. Every step matters, and in this order. Keep each command on ONE
-# line -- a broken continuation runs the earlier steps and silently skips the rest,
-# which is the exact state this block exists to avoid.
-mkdir "C:\ProgramData\Yuzu\agent-certs" -Force
-
-# 1. Take ownership. If the directory ALREADY EXISTS, whoever created it owns it and
-#    holds WRITE_DAC permanently -- stripping their access without taking ownership
-#    lets them put it straight back. takeown also enables the privilege needed to
-#    recover a directory whose permissions grant Administrators nothing at all.
-takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
-
-# 2. Drop every explicit entry. This is the step that removes a pre-existing grant.
-#    Step 3 cannot: /grant:r replaces grants only for the accounts it NAMES, so an
-#    entry held by anyone else survives it untouched.
-icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
-
-# 3. Break inheritance and grant exactly Administrators and SYSTEM, on the DIRECTORY
-#    ONLY. Without the inheritance break, %ProgramData%'s inherited rights let an
-#    unprivileged local user plant the anchor file before you do. Do NOT add /T here:
-#    on a file the (OI)(CI) grant is invalid, and icacls then leaves every existing
-#    file (an update-trust-bundle.pem already in place) with an EMPTY permission list
-#    -- SYSTEM, and so the agent, can no longer read it -- while still reporting
-#    success (#5196).
-icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /C /Q
-
-# 4. Repeat steps 1 and 2 for the CONTENTS only. Between steps 2 and 3 the directory
-#    inherited %ProgramData%'s rights again, so a file a local user created in that
-#    window is still theirs. This takes it back and makes every file inherit step 3's
-#    permissions. Note the \* -- it resets the contents, never the directory itself,
-#    which would undo step 3. On an empty directory it reports that no files were
-#    found; that is expected.
-takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
-icacls "C:\ProgramData\Yuzu\agent-certs\*" /reset /T /C /Q
-
-# 5. Verify -- the same check the installer runs. Every line must say OK. It compares
-#    the security descriptor exactly: owned by Administrators or SYSTEM; the directory
-#    protected and granting exactly those two full control; everything inside it
-#    inheriting exactly that. Accounts are compared by SID, so it works on any language.
-#    A BAD line means something else has access, or SYSTEM cannot read the item: run
-#    steps 1-4 again. An error listing the contents means the same.
+# Windows, elevated, in Windows PowerShell. Every step matters, and in this order.
+# Keep each command on ONE line -- a broken continuation runs the earlier steps and
+# silently skips the rest, which is the exact state this block exists to avoid.
+# Nothing here is recursive: this directory holds only files, and a recursive
+# takeown or icacls would follow a junction planted in it out of the directory.
 $d = "C:\ProgramData\Yuzu\agent-certs"
-foreach ($p in @($d) + @(Get-ChildItem -LiteralPath $d -Recurse -Force | ForEach-Object FullName)) {
+mkdir $d -Force | Out-Null
+
+# 0. Refuse links and subdirectories. If this prints anything, remove that item first
+#    -- a junction or symbolic link with  cmd /c rmdir "<path>"  (which removes the link,
+#    never what it points to; never use Remove-Item -Recurse on a junction in Windows
+#    PowerShell 5.1, which deletes the contents of its target), anything else by moving
+#    it out -- and start again.
+@(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Force) | Where-Object { (($_.Attributes -band 1024) -ne 0) -or (($_.FullName -ne $d) -and (($_.Attributes -band 16) -ne 0)) } | ForEach-Object { 'REMOVE FIRST  {0}' -f $_.FullName }
+
+# 1. Take ownership of the directory itself. If it ALREADY EXISTED, whoever created it
+#    owns it and holds WRITE_DAC permanently -- stripping their access without taking
+#    ownership lets them put it straight back. takeown also enables the privilege needed
+#    to recover a directory whose permissions grant Administrators nothing at all.
+takeown /F "C:\ProgramData\Yuzu\agent-certs" /A
+
+# 2. Drop every explicit entry on the directory. Step 3 cannot: /grant:r replaces grants
+#    only for the accounts it NAMES, so an entry held by anyone else survives it.
+icacls "C:\ProgramData\Yuzu\agent-certs" /reset /L /C /Q
+
+# 3. Break inheritance and grant exactly Administrators and SYSTEM, on the directory
+#    only. Without the inheritance break, %ProgramData%'s inherited rights let an
+#    unprivileged local user plant the anchor file before you do. Never add /T: on a
+#    file the (OI)(CI) grant is invalid, and icacls then leaves every existing file (an
+#    update-trust-bundle.pem already in place) with an EMPTY permission list -- SYSTEM,
+#    and so the agent, can no longer read it -- while still reporting success (#5196).
+icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /L /C /Q
+
+# 4. Run step 0 AGAIN. Nobody else can add to the directory now, so what it shows is
+#    exactly what step 5 acts on. If it prints anything, deal with it and start again.
+
+# 5. Take back and reset its FILES (direct entries only: note the \*, and no /R or /T).
+#    A file a local user created before step 3 is still theirs. On an empty directory
+#    both report that nothing matched; that is expected.
+takeown /F "C:\ProgramData\Yuzu\agent-certs\*" /A
+icacls "C:\ProgramData\Yuzu\agent-certs\*" /reset /L /C /Q
+
+# 6. Verify -- the same check the installer runs. Every line must say OK. It refuses a
+#    link or subdirectory, then compares each security descriptor exactly: owned by
+#    Administrators or SYSTEM; the directory protected and granting exactly those two
+#    full control; each file inheriting exactly that. Accounts are compared by SID, so
+#    it works on any language. A BAD line means something else has access, SYSTEM
+#    cannot read the item, or it is a link or subdirectory: run steps 0-5 again.
+foreach ($i in @(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Force)) {
+    $p = $i.FullName
+    if ((($i.Attributes -band 1024) -ne 0) -or (($p -ne $d) -and (($i.Attributes -band 16) -ne 0))) { 'BAD  {0}  (link or subdirectory)' -f $p; continue }
     $s = (Get-Acl -LiteralPath $p).Sddl
     $e = if ($p -eq $d) { 'D:P[A-Z]*\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$' } else { 'D:[A-Z]*\(A;(?:OICI)?ID;FA;;;(SY|BA)\)\(A;(?:OICI)?ID;FA;;;(SY|BA)\)$' }
     $ok = ($s -match '^O:(BA|SY)G:') -and ($s -match $e) -and ($Matches[1] -ne $Matches[2])
@@ -3098,7 +3107,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. The grant is applied to the directory alone and everything inside it inherits it. A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer refuses the directory if it, or anything in it, is a junction, symbolic link or subdirectory; then takes ownership, resets the ACL outright, breaks inheritance and re-grants those two on the directory itself (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`), and finally takes back and resets its files, which inherit the grant. Nothing is recursive, so a link planted in the directory cannot redirect it. Breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -3166,9 +3175,9 @@ Get these right, because several mistakes are silent:
   after an empty entry.
 - **Names must be exact.** A misspelt name is ignored without any error, and
   signing then stays off. Run the check below after every change.
-- **`YUZU_UPDATE_REQUIRE_SIGNATURE` must be exactly `1`.** A value the agent cannot
-  read as on or off, such as `enabled` or `1` followed by a space, stops it at
-  startup.
+- **Set `YUZU_UPDATE_REQUIRE_SIGNATURE` to `1`.** The check below requires exactly
+  that. A value the agent cannot read as on or off, such as `enabled` or `1`
+  followed by a space, stops it at startup.
 - **If the service will not start after a change** — `sc.exe start YuzuAgent` fails with
   error 1053, and the agent's log has nothing new — the agent refused before
   logging began: `YUZU_UPDATE_REQUIRE_SIGNATURE` without `YUZU_UPDATE_TRUST_BUNDLE`,

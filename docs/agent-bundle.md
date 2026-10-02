@@ -161,6 +161,11 @@ trust-anchor directory is not secured", the installer refused to continue
 because it could not confirm that only Administrators and SYSTEM can write
 `%ProgramData%\Yuzu\agent-certs`, and that both have full control of it and of
 everything in it. The lines after it give the directory and then the reason.
+The directory may hold only files: if it, or anything in it, is a junction,
+symbolic link or subdirectory, the installer refuses and names the item. Remove a
+junction or link with `cmd /c rmdir "<path>"`, which removes the link and never
+its target (not `Remove-Item -Recurse`, which in Windows PowerShell 5.1 deletes
+the target's contents), move anything else out, and run the installer again.
 The agent service was stopped for the install and is not restarted: run
 `sc.exe start YuzuAgent` once you have dealt with the reason. Installers from
 0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
