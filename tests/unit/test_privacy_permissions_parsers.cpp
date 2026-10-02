@@ -1015,6 +1015,14 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         REQUIRE(row_raw("alice:access_denied") == 1);
         CHECK(any_denied(run.rows));
     }
+    SECTION("a refused live peek beneath a hive-file refusal is still the denial") {
+        auto rd = unreachable(HiveAccessStatus::file_refused, "hive_reparse_point");
+        rd.peek_rc = win::kErrorAccessDenied;
+        only(rd);
+        REQUIRE(row_raw("alice:access_denied") == 1);
+        CHECK(row_raw("alice:hive_reparse_point") == 0);
+        CHECK(any_denied(run.rows));
+    }
     SECTION("a missing privilege is a refusal, denied") {
         only(unreachable(HiveAccessStatus::privilege_missing));
         REQUIRE(row_raw("alice:privilege_missing") == 1);

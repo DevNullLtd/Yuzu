@@ -31,9 +31,10 @@
  * never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
  *
  * DEADLINE: ~15 s, COOPERATIVE -- checked before each profile, first thing in the hive-file
- * guard's before_load and at every key read; there is no detached worker (a plugin must not defer
- * work past unload). One blocking call (the offline_hive_mutex wait behind a sibling plugin's
- * offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, so a dispatch can overrun it.
+ * guard's before_load, and before each key open; there is no detached worker (a plugin must not
+ * defer work past unload). One blocking call (the offline_hive_mutex wait behind a sibling
+ * plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor is one enumeration of
+ * at most 4,096 children or one key's value reads, so a dispatch can overrun it.
  *
  * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
  * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
@@ -381,9 +382,15 @@ struct LocalFreeGuard {
 /// VOLUME_NAME_DOS) is the path that was asked for (`requested`, which gets the `\\?\` prefix a
 /// DOS-volume final path carries). CompareStringOrdinal is the ordinal case-insensitive primitive
 /// the file system itself is defined against, so a non-ASCII case-only difference is the same path.
-/// A failed comparison (0) is "not equal": the safe side.
+/// A failed comparison (0) is "not equal": the safe side. Runs of `\` in `requested` collapse to
+/// one first (a ProfileImagePath with a trailing separator yields `..\\NTUSER.DAT`; the kernel's
+/// final path carries one): `requested` is a drive-letter path here (UNC was refused upstream), so
+/// no `\\?\` or UNC prefix can be damaged. Only separator runs: never `.`/`..` or 8.3 names.
 [[nodiscard]] bool final_path_matches(const std::wstring& requested, const std::wstring& final_path) {
-    const std::wstring expected = L"\\\\?\\" + requested;
+    std::wstring collapsed;
+    for (const wchar_t c : requested)
+        if (c != L'\\' || collapsed.empty() || collapsed.back() != L'\\') collapsed.push_back(c);
+    const std::wstring expected = L"\\\\?\\" + collapsed;
     return CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()),
                                 final_path.c_str(), static_cast<int>(final_path.size()),
                                 TRUE) == CSTR_EQUAL;
@@ -451,7 +458,9 @@ struct HiveFileGuard {
             n = GetFinalPathNameByHandleW(leaf.h, fin.data(), static_cast<DWORD>(fin.size()),
                                           FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         }
-        if (n == 0 || n >= fin.size()) return stat_failed(GetLastError());
+        // n >= size is a sizing result (the path grew between the two calls), not an API failure:
+        // GetLastError is stale then, so name the documented "buffer still too small" code.
+        if (n == 0 || n >= fin.size()) return stat_failed(n == 0 ? GetLastError() : ERROR_MORE_DATA);
         fin.resize(n);
         f.final_path_matches = final_path_matches(path, fin);
 
@@ -581,18 +590,26 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         // Synchronous, like every other with_user_hive consumer: no detached worker can outlive
         // the dispatch (sdk plugin.hpp: a plugin must not defer work past unload). The walk
         // re-checks the deadline after with_user_hive's lock wait and mount, which count toward it.
-        rd.status = yuzu::win::with_user_hive(
-            profile.sid, profile.profile_path,
-            [&](HKEY root) { rd.walk = walk_consent_store(root, budget); }, &report, &check);
-        rd.refusal = std::move(report.refusal);
-        rd.unload_failed = report.unload_failed;
-        if (report.unload_failed) {
+        const auto log_unload_failed = [&] {
             const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
             spdlog::error("privacy_permissions: hive unload failed for profile {} (HKU\\{}): its "
                           "NTUSER.DAT stays locked, and the user's next sign-in may not load the "
                           "profile, until `reg unload HKU\\{}` succeeds",
                           pname, report.mount_name, report.mount_name);
+        };
+        try {
+            rd.status = yuzu::win::with_user_hive(
+                profile.sid, profile.profile_path,
+                [&](HKEY root) { rd.walk = walk_consent_store(root, budget); }, &report, &check);
+        } catch (...) {
+            // The ABI catch turns this into `internal_error`, which carries no row token, so the
+            // agent log is the only place the mount name (the actionable fact) can go.
+            if (report.unload_failed) log_unload_failed();
+            throw;
         }
+        rd.refusal = std::move(report.refusal);
+        rd.unload_failed = report.unload_failed;
+        if (report.unload_failed) log_unload_failed();
         return rd;
     };
 

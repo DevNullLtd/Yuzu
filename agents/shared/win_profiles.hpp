@@ -572,11 +572,12 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
         report->mount_name = from_wide(mount.c_str(), static_cast<int>(mount.size()));
     }
 
-    bool unload_failed = false;
     bool called = false;
     std::string refused;
     {
-        ScopedUserHive hive(mount, ntuser, &unload_failed);
+        // The guard writes report->unload_failed from its destructor on every exit path, an
+        // exception thrown by `fn` included, so the failed-unload fact is never lost.
+        ScopedUserHive hive(mount, ntuser, report ? &report->unload_failed : nullptr);
         if (hive.ok() && check && check->after_load)
             refused = check->after_load(ntuser);
         // A refusal never returns from inside this scope: the unload and its report below
@@ -587,10 +588,7 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
                 called = true;
             });
         }
-    } // ScopedUserHive unloads here -- unload_failed is final after this scope; if `fn` throws the
-      // unload still runs but the report is never written, so only the exception is seen
-    if (report)
-        report->unload_failed = unload_failed;
+    } // ScopedUserHive unloads here
 
     if (!refused.empty()) {
         if (report)

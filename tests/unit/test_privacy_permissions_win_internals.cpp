@@ -26,6 +26,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -271,6 +272,12 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
         HiveFileGuard guard{budget, sid, 0, std::nullopt};
         CHECK(guard.before_load(file.wstring()) == "");
         CHECK(guard.after_load(file.wstring()) == "");
+    }
+    SECTION("a doubled separator before the file name is still the same path") {
+        win::RetentionBudget budget;
+        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        const std::wstring doubled = dir.wstring() + L"\\\\hive.bin";
+        CHECK(guard.before_load(doubled) == "");
     }
     SECTION("a directory is not a regular file") {
         win::RetentionBudget budget;
@@ -551,6 +558,60 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on an after_load toke
     CHECK_FALSE(synthetic_mount_present()); // the refusal fell through to the unload
 }
 
+TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even when fn throws",
+          "[privacy_permissions][win_internals]") {
+    require_live_arm_missed();
+    TestKey saved(false); // RegSaveKeyExW saves only non-volatile keys
+    set_sz(saved.make(L"k").get(), L"v", L"1");
+    yuzu::test::TempDir tmp("yuzu_test_privperm_hive_");
+    fs::create_directories(tmp.path);
+    {
+        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+        if (!backup.ok()) SKIP("saving a mountable hive needs SeBackupPrivilege: not held here");
+        const LONG rc = RegSaveKeyExW(saved.root, (tmp.path / "NTUSER.DAT").c_str(), nullptr,
+                                      REG_LATEST_FORMAT);
+        if (rc == ERROR_PRIVILEGE_NOT_HELD) SKIP("RegSaveKeyExW: privilege not held");
+        REQUIRE(rc == ERROR_SUCCESS);
+    }
+    const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
+
+    // Declared outside the call so the handle outlives with_root's root: the mount cannot unload.
+    yuzu::win::RegKey held;
+    yuzu::win::HiveAccessReport report;
+    // Mandatory cleanup on every path: the shared box must never keep a YUZU_HIVE_* mount.
+    const struct Cleanup {
+        yuzu::win::RegKey& held;
+        yuzu::win::HiveAccessReport& report;
+        void run() const {
+            held.reset();
+            if (report.mounted_offline)
+                RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
+        }
+        ~Cleanup() { run(); }
+    } cleanup{held, report};
+
+    bool threw = false;
+    try {
+        yuzu::win::with_user_hive(
+            kSyntheticSid, profile,
+            [&](HKEY root) {
+                RegOpenKeyExW(root, L"k", 0, KEY_READ, held.put());
+                throw std::runtime_error("fn failed");
+            },
+            &report);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    if (!threw && !report.mounted_offline)
+        SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
+    CHECK(threw);
+    CHECK(report.mounted_offline);
+    CHECK_FALSE(report.mount_name.empty());
+    CHECK(report.unload_failed); // written by the guard's destructor while unwinding
+    cleanup.run();
+    CHECK_FALSE(synthetic_mount_present());
+}
+
 TEST_CASE("privacy_permissions win: final_path_matches is the ordinal case-insensitive comparison "
           "the file system uses, with the \\\\?\\ prefix required",
           "[privacy_permissions][win_internals]") {
@@ -561,6 +622,10 @@ TEST_CASE("privacy_permissions win: final_path_matches is the ordinal case-insen
     SECTION("an ASCII case-only difference is the same path") {
         CHECK(final_path_matches(L"C:\\Users\\jsmith\\NTUSER.DAT",
                                  L"\\\\?\\c:\\USERS\\JSmith\\ntuser.dat"));
+    }
+    SECTION("a doubled separator in the requested path is the same path") {
+        CHECK(final_path_matches(L"C:\\Users\\jsmith\\\\NTUSER.DAT",
+                                 L"\\\\?\\C:\\Users\\jsmith\\NTUSER.DAT"));
     }
     SECTION("a different name is a different path") {
         CHECK_FALSE(final_path_matches(requested, L"\\\\?\\C:\\Users\\Anne\\NTUSER.DAT"));

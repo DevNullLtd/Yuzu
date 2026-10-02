@@ -124,10 +124,11 @@ inline constexpr std::uint32_t kMaxConsentValueBytes = 64;
 inline constexpr std::size_t kMaxProfileGrants = 8192;
 inline constexpr std::size_t kMaxProfileBytes = 2u * 1024u * 1024u;
 
-/// The run's cooperative wall-clock bound, checked before each profile, before any hive-file
-/// syscall and at every key read. A single blocking call (the offline-hive mutex wait behind a
-/// sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, so a dispatch
-/// can overrun it: a cooperative deadline, never a hard cap.
+/// The run's cooperative wall-clock bound, checked before each profile, first thing in the
+/// hive-file guard's before_load, and before each key open. A single blocking call (the
+/// offline-hive mutex wait behind a sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is
+/// not interrupted, nor is one enumeration of at most 4,096 children or one key's value reads,
+/// so a dispatch can overrun it: a cooperative deadline, never a hard cap.
 inline constexpr std::chrono::milliseconds kRunBudget{15'000};
 
 /// The per-source retention budget. charge() is called BEFORE a grant is retained; once the
@@ -676,10 +677,10 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             profile_failed("hive_mount_failed");
             break;
         case profiles::HiveAccessStatus::file_refused:
-            // A hive-file refusal is unreadable, not denied (an unsafe file is not an ACL
-            // refusal); `timeout` also ends the run (budget.expired() already marked it).
-            prof.push_back(failure_row("windows", profile_row_id, "-", false,
-                                       pname + ":" + rd.refusal, acc));
+            // A hive-file refusal alone is unreadable, not denied (an unsafe file is not an ACL
+            // refusal); a refused live root beneath it is the denial. `timeout` also ends the run
+            // (the guard marks the budget, not this branch).
+            profile_failed(rd.refusal);
             break;
         }
 
