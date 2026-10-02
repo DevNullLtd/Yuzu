@@ -576,6 +576,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
     const std::string profile = yuzu::win::from_wide(tmp.path.c_str());
 
     // Declared outside the call so the handle outlives with_root's root: the mount cannot unload.
+    // (The fixture's child `k` is volatile and so is not saved into the hive: hold the ROOT.)
     yuzu::win::RegKey held;
     yuzu::win::HiveAccessReport report;
     // Mandatory cleanup on every path: the shared box must never keep a YUZU_HIVE_* mount.
@@ -584,8 +585,11 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
         yuzu::win::HiveAccessReport& report;
         void run() const {
             held.reset();
-            if (report.mounted_offline)
-                RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
+            if (!report.mounted_offline) return;
+            // with_user_hive's privilege scopes have already reverted: unloading needs both again.
+            const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+            const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+            RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(report.mount_name).c_str());
         }
         ~Cleanup() { run(); }
     } cleanup{held, report};
@@ -595,7 +599,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even 
         yuzu::win::with_user_hive(
             kSyntheticSid, profile,
             [&](HKEY root) {
-                RegOpenKeyExW(root, L"k", 0, KEY_READ, held.put());
+                RegOpenKeyExW(root, nullptr, 0, KEY_READ, held.put());
                 throw std::runtime_error("fn failed");
             },
             &report);
