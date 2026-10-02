@@ -168,6 +168,14 @@ jobs:
       - name: QA-stack gateway crash signatures
         run: python3 tests/test_qa_stack_crash_pat.py
 
+      # Windows agent installer trust-anchor lockdown (#5196). The .iss is
+      # compiled only by release.yml, never on a PR; this lints its source
+      # text (no /T on the icacls grant, a Constrained-Language-safe exact
+      # SDDL check kept in step with the user manual's copy, PsLit's quote
+      # escaping) and mutation-tests itself. Stdlib only.
+      - name: Agent installer trust-anchor ACL lint
+        run: python3 tests/test_agent_installer_acl_lint.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The
