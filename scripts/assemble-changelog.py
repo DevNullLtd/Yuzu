@@ -37,7 +37,9 @@ Modes:
       they are. The header date is kept unless --date is given; pass the
       final release date when folding fragments in before tagging the final.
       Refuses if [Unreleased] still holds legacy subsections (run a plain
-      promote of the next version for those).
+      promote of the next version for those), if <X.Y.Z> is not the newest
+      released section (override: --allow-older-section), or if a fragment's
+      text is already in the section (an interrupted earlier append).
 
   python3 scripts/assemble-changelog.py --extract <base-ref> --id <PR#>
       Convert a branch that edited CHANGELOG.md directly (e.g. a PR opened
@@ -363,7 +365,8 @@ def cmd_promote(version: str, date_str: str | None, changelog: Path, fragments_d
     text = read_text(changelog)
     lines = text.split("\n")
     if any(re.match(rf"^## \[{re.escape(version)}\]", l) for l in lines):
-        print(f"promote: CHANGELOG.md already has a ## [{version}] section", file=sys.stderr)
+        print(f"promote: CHANGELOG.md already has a ## [{version}] section — for fixes that landed "
+              f"after it was promoted, use: promote {version} --append --date YYYY-MM-DD", file=sys.stderr)
         return 1
     header_idx, end_idx, preamble, legacy_sections = parse_unreleased(lines)
 
@@ -434,13 +437,19 @@ def cmd_promote(version: str, date_str: str | None, changelog: Path, fragments_d
     return 0
 
 
-def cmd_promote_append(version: str, date_str: str | None, changelog: Path, fragments_dir: Path) -> int:
+def cmd_promote_append(version: str, date_str: str | None, changelog: Path, fragments_dir: Path,
+                       allow_older: bool = False) -> int:
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         print(f"promote --append: '{version}' is not a base semver (X.Y.Z)", file=sys.stderr)
         return 2
-    if date_str and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
-        print(f"promote --append: --date '{date_str}' is not YYYY-MM-DD", file=sys.stderr)
-        return 2
+    if date_str:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+                raise ValueError
+            _dt.date.fromisoformat(date_str)
+        except ValueError:
+            print(f"promote --append: --date '{date_str}' is not a valid YYYY-MM-DD date", file=sys.stderr)
+            return 2
     errors = check_fragments(fragments_dir)
     if errors:
         for e in errors:
@@ -462,14 +471,42 @@ def cmd_promote_append(version: str, date_str: str | None, changelog: Path, frag
         return 1
     end = next((i for i in range(start + 1, len(lines)) if ANY_VERSION_HEADER_RE.match(lines[i])), len(lines))
 
+    # The target must be the newest released section (the first one below
+    # [Unreleased]): a mistyped version would otherwise fold every fragment,
+    # disclosures included, into an older release and delete them.
+    unreleased_idx = next((i for i, l in enumerate(lines) if UNRELEASED_RE.match(l)), None)
+    newest = next((i for i in range((unreleased_idx or -1) + 1, len(lines))
+                   if ANY_VERSION_HEADER_RE.match(lines[i]) and not UNRELEASED_RE.match(lines[i])), None)
+    if newest != start:
+        newest_header = lines[newest] if newest is not None else "(none)"
+        if not allow_older:
+            print(f"promote --append: ## [{version}] is not the newest released section "
+                  f"(that is: {newest_header}); refusing. Pass --allow-older-section if this "
+                  f"really belongs to an older release.", file=sys.stderr)
+            return 1
+        print(f"promote --append: WARNING — appending to ## [{version}], which is older than "
+              f"{newest_header} (--allow-older-section)", file=sys.stderr)
+
     frags = fragment_files(fragments_dir)
     if not frags:
         print("promote --append: nothing to append — no fragments in changelog.d/", file=sys.stderr)
         return 1
     additions: dict[str, list[str]] = {name: [] for name in CANONICAL_SECTIONS}
+    section_text = "\n".join(lines[start:end])
+    already = []
     for path in frags:
         section = CANONICAL_SECTIONS[SECTION_KEYS.index(FRAGMENT_NAME_RE.match(path.name).group("section"))]
-        additions[section].extend(read_text(path).strip().split("\n"))
+        body = read_text(path).strip().split("\n")
+        # A re-run after an interrupted append (CHANGELOG written, fragment
+        # not deleted) would otherwise duplicate the bullets.
+        if body and body[0].strip() and body[0].strip() in section_text:
+            already.append(path.name)
+        additions[section].extend(body)
+    if already:
+        print("promote --append: these fragments are already in ## [" + version + "] (a previous append was "
+              "interrupted?) — refusing so nothing is duplicated; delete them if so: " + ", ".join(already),
+              file=sys.stderr)
+        return 1
 
     # Split the existing section body into its preamble and ### subsections.
     body = lines[start + 1:end]
@@ -539,11 +576,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--date", help="override release date (YYYY-MM-DD, promote mode)")
     parser.add_argument("--append", action="store_true",
                         help="promote mode: append fragments to an EXISTING ## [X.Y.Z] section")
+    parser.add_argument("--allow-older-section", action="store_true",
+                        help="with --append: allow a section that is not the newest release")
     parser.add_argument("--id", help="PR or issue number for the fragment filename (extract mode)")
     args = parser.parse_args(argv[1:])
 
     if args.append and args.promote != "promote":
         parser.error("--append is only valid with promote")
+    if args.allow_older_section and not args.append:
+        parser.error("--allow-older-section is only valid with promote --append")
     if args.check:
         return cmd_check(args.fragments_dir)
     if args.guard:
@@ -555,7 +596,8 @@ def main(argv: list[str]) -> int:
     if args.promote != "promote" or not args.version:
         parser.error("usage: assemble-changelog.py promote <X.Y.Z> [--append] [--date YYYY-MM-DD]")
     if args.append:
-        return cmd_promote_append(args.version, args.date, args.changelog, args.fragments_dir)
+        return cmd_promote_append(args.version, args.date, args.changelog, args.fragments_dir,
+                                  args.allow_older_section)
     return cmd_promote(args.version, args.date, args.changelog, args.fragments_dir)
 
 

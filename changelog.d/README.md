@@ -101,6 +101,8 @@ Each fragment's bullets are appended to the end of their `###` subsection in
 `## [X.Y.Z]` (a missing subsection is created in canonical order), the
 fragment files are deleted, and the header takes the given date (omit
 `--date` to keep the existing one). Commit the result. It refuses if
-`[Unreleased]` still holds legacy subsections, or if there is nothing to
-append. Fragments for the *next* version must not be on the branch you fold
-from; promote those with a plain `promote` of that version.
+`[Unreleased]` still holds legacy subsections, if there is nothing to append,
+if `X.Y.Z` is not the newest released section (so a mistyped version cannot
+fold fragments into an older release; `--allow-older-section` overrides), or
+if a fragment's text is already in the section (an interrupted earlier
+append). Everything on `main` at tag time ships in `X.Y.Z`.

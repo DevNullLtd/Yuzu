@@ -122,11 +122,82 @@ class PromoteAppend(unittest.TestCase):
         self.frag("10-a.fixed.md", "not a bullet")
         r = self.run_append()
         self.assertNotEqual(r.returncode, 0)
+        self.assertIn("lint errors", r.stderr)
         self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
 
     def test_append_requires_promote(self):
         r = subprocess.run([sys.executable, str(SCRIPT), "--check", "--append"], capture_output=True, text=True)
         self.assertEqual(r.returncode, 2)
+        self.assertIn("--append is only valid with promote", r.stderr)
+
+    def run_version(self, version: str, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--changelog", str(self.changelog),
+             "--fragments-dir", str(self.frags), "promote", version, "--append", *extra],
+            capture_output=True, text=True)
+
+    def test_refuses_older_section(self):
+        f = self.frag("10-a.fixed.md", "- **New fixed bullet.**")
+        r = self.run_version("1.1.0")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not the newest released section", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+        self.assertTrue(f.exists())
+
+    def test_older_section_with_override(self):
+        self.frag("10-a.fixed.md", "- **New fixed bullet.**")
+        r = self.run_version("1.1.0", "--allow-older-section")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WARNING", r.stderr)
+        older = self.changelog.read_text(encoding="utf-8").split("## [1.1.0]")[1]
+        self.assertIn("New fixed bullet", older)
+
+    def test_refuses_already_folded_fragment(self):
+        f = self.frag("10-a.fixed.md", "- **Existing fixed bullet.**")
+        r = self.run_append()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already in", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+        self.assertTrue(f.exists())
+
+    def test_rerun_after_interrupted_append_does_not_duplicate(self):
+        f = self.frag("10-a.fixed.md", "- **New fixed bullet.**")
+        self.assertEqual(self.run_append().returncode, 0)
+        f.write_text("- **New fixed bullet.**\n", encoding="utf-8")   # as if the unlink had failed
+        before = self.changelog.read_text(encoding="utf-8")
+        r = self.run_append()
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), before)
+        self.assertEqual(before.count("New fixed bullet"), 1)
+
+    def test_invalid_date_refused(self):
+        self.frag("10-a.fixed.md", "- **x.**")
+        r = self.run_append("--date", "2026-02-30")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not a valid YYYY-MM-DD date", r.stderr)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"), CHANGELOG)
+
+    def test_preserves_preamble_noncanonical_and_newline(self):
+        text = CHANGELOG.replace("## [1.2.0] - 2026-09-01\n\n### Added",
+                                 "## [1.2.0] - 2026-09-01\n\nSection preamble line.\n\n### Notes\n\n- A note.\n\n### Added")
+        self.changelog.write_text(text, encoding="utf-8")
+        self.frag("10-a.fixed.md", "- **New fixed bullet.**")
+        self.assertEqual(self.run_append().returncode, 0)
+        out = self.changelog.read_text(encoding="utf-8")
+        sec = self.section()
+        self.assertIn("Section preamble line.", sec)
+        self.assertIn("### Notes", sec)
+        self.assertIn("- A note.", sec)
+        self.assertTrue(out.endswith("\n"))
+
+    def test_same_subsection_order_and_multiline(self):
+        self.frag("20-b.fixed.md", "- **Second.**")
+        self.frag("10-a.fixed.md", "- **First, multi-line,**\n  continued here.")
+        self.assertEqual(self.run_append().returncode, 0)
+        sec = self.section()
+        self.assertLess(sec.index("Existing fixed bullet"), sec.index("First, multi-line"))
+        self.assertLess(sec.index("First, multi-line"), sec.index("Second."))
+        self.assertIn("  continued here.", sec)
 
 
 if __name__ == "__main__":
