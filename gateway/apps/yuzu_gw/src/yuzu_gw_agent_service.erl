@@ -59,8 +59,7 @@ register(Ctx, RegisterReq) ->
                                   conn_key   => yuzu_gw_conn:key_from_ctx(Ctx),
                                   registered_at => erlang:system_time(millisecond)}),
 
-            logger:info("Agent ~s registered (session=~s), awaiting Subscribe",
-                        [AgentId, SessionId]),
+            logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
             {ok, Response, Ctx};
 
         {error, Reason} ->

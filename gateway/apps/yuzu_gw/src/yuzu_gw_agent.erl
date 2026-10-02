@@ -164,8 +164,7 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
                       #{agent_id => AgentId, node => node(),
                         session_id => SessionId}),
 
-    logger:info("Agent ~s connected from ~s (session=~s)",
-                [AgentId, PeerAddr, SessionId]),
+    logger:info("Agent ~s connected from ~s", [AgentId, PeerAddr]),
 
     %% Notify C++ server about the stream connection.
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
