@@ -2487,6 +2487,17 @@ test('capability gate consistency',
   timeout: 30,
 )
 
+# The /test --instructions gate broadcasts every default-risk definition; the server refuses a
+# broadcast for any Destructive or Forensics capability row. This derives those rows from the
+# capability_decls fragments and requires every matching definition to be classified into an
+# opt-in risk class in scripts/test/instructions-risk-classification.json. Hermetic.
+test('instructions risk table',
+  _python3_test,
+  args: [files('test_instructions_risk_table.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # firmware_posture's definition-column contract (content/definitions/firmware_posture.yaml):
 # row_kind must be the first result column and the order must match the wire row
 # firmware_posture_parsers.hpp emits. Parses the YAML directly -- catches a reordered or

@@ -69,7 +69,8 @@ DEFAULT_POLL_TIMEOUT_S = 30
 DEFAULT_PARALLELISM = 4
 DEFAULT_RISKS = ("safe", "mutating")  # what runs in the default gate
 
-ALL_RISKS = ("safe", "mutating", "destructive", "network-disrupt", "interactive")
+ALL_RISKS = ("safe", "mutating", "destructive", "forensic", "server-internal", "network-disrupt",
+             "interactive")
 
 
 # ── data classes ───────────────────────────────────────────────────────────
@@ -116,9 +117,16 @@ def load_risk_table(path: Path) -> dict[str, str]:
     return raw.get("_overrides", {})
 
 
-def classify(def_id: str, spec_type: str, overrides: dict[str, str]) -> str:
+# Plugins that name no agent plugin: the definition is catalog-only and the dispatch chokepoint
+# denies it (reason=unclassified), so it can never pass by dispatch.
+SERVER_ONLY_PLUGINS = ("_server", "server", "server_internal")
+
+
+def classify(def_id: str, spec_type: str, overrides: dict[str, str], plugin: str = "") -> str:
     if def_id in overrides:
         return overrides[def_id]
+    if plugin in SERVER_ONLY_PLUGINS:
+        return "server-internal"
     if spec_type in ("question", "query"):
         return "safe"
     return "mutating"
@@ -149,7 +157,7 @@ def load_definitions(content_dir: Path, risk_table: dict[str, str]) -> list[Defi
                     parameters=params,
                     result_columns=result.get("columns", []) or [],
                     approval_mode=approval.get("mode", "auto"),
-                    risk=classify(def_id, spec.get("type", ""), risk_table),
+                    risk=classify(def_id, spec.get("type", ""), risk_table, exec_blk.get("plugin", "")),
                     file=yaml_path.name,
                 ))
     return defs
@@ -408,22 +416,6 @@ def exercise(client: YuzuClient, defn: Definition,
                        http_code=code,
                        execution_id=execution_id,
                        note="dispatch ok but no command_id returned")
-
-    # Server-side instructions (those whose plugin starts with `_server` or
-    # `server_internal`) execute synchronously inside the dispatch handler;
-    # there's no agent round-trip and /api/responses/<id> may stay empty.
-    # Treat HTTP 200 + command_id as PASS for these.
-    is_server_side = (defn.plugin.startswith("_server")
-                      or defn.plugin.startswith("server")
-                      or defn.plugin.startswith("server_internal"))
-
-    if is_server_side:
-        return Outcome(defn.id, defn.risk, "pass",
-                       int((time.monotonic() - started) * 1000),
-                       http_code=code,
-                       command_id=command_id,
-                       execution_id=execution_id,
-                       note="server-side (no agent round-trip)")
 
     deadline = time.monotonic() + poll_timeout_s
     last_payload: dict = {}

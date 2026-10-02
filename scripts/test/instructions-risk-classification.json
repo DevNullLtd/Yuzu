@@ -11,8 +11,18 @@
     "  network-disrupt   - disconnects host network; only run inside the quarantine",
     "                      ceremony (PR B).",
     "  interactive       - pops UI on the host; opt-in only.",
+    "  forensic          - the server refuses a broadcast and requires exactly one explicit",
+    "                      in-scope agent_id (dispatch_destructive_gate.hpp); the runner",
+    "                      broadcasts, so these are opt-in only. Source of truth: the Forensics",
+    "                      rows in server/core/src/capability_decls/*.hpp.",
+    "  server-internal   - catalog-only definitions with no agent plugin (plugin _server,",
+    "                      server, server_internal). The dispatch chokepoint denies them",
+    "                      (reason=unclassified or forbidden), so they cannot pass by dispatch.",
+    "                      The plugin rule classifies them; list an id here only to override it",
+    "                      (for example a destructive server definition).",
     "",
     "Default rule (applied if id not listed below):",
+    "  - plugin _server, server or server_internal -> server-internal",
     "  - spec.type=question or spec.type=query -> safe",
     "  - spec.type=action                      -> mutating",
     "",
@@ -69,6 +79,28 @@
     "server.directory.configure_group_mappings":    "destructive",
 
     "testing.chargen.start":                  "destructive",
-    "testing.chargen.stop":                   "mutating"
+    "testing.chargen.stop":                   "mutating",
+
+    "agent.content_dist.stage":                  "destructive",
+    "agent.content_dist.cleanup":                "destructive",
+    "agent.content_dist.upload_file":            "destructive",
+    "agent.storage.clear":                       "destructive",
+    "device.tags.clear":                         "destructive",
+    "crossplatform.power.set_power_plan":        "destructive",
+    "crossplatform.printing.clear_queue":        "destructive",
+    "crossplatform.tar.rollup":                  "destructive",
+
+    "crossplatform.app_usage.summary":           "forensic",
+    "crossplatform.app_usage.foreground":        "forensic",
+    "crossplatform.app_usage.last_used":         "forensic",
+    "crossplatform.browser_inventory.browsers":  "forensic",
+    "crossplatform.browser_inventory.profiles":  "forensic",
+    "crossplatform.privacy_permissions.permissions":"forensic",
+    "windows.execution_artifacts.shimcache":     "forensic",
+    "windows.execution_artifacts.amcache":       "forensic",
+    "windows.execution_artifacts.prefetch":      "forensic",
+
+    "device.asset_tags.sync":                    "server-internal",
+    "crossplatform.tar.fleet_snapshot":          "server-internal"
   }
 }
