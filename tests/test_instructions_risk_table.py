@@ -77,15 +77,38 @@ class FakeClient:
 class RiskTable(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.rows, cls.total = explicit_target_rows(p.read_text(encoding="utf-8") for p in FRAGMENTS)
-        table = ir.load_risk_table(ROOT / "scripts/test/instructions-risk-classification.json")
-        cls.defs = ir.load_definitions(ROOT / "content/definitions", table)
+        texts = [p.read_text(encoding="utf-8") for p in FRAGMENTS]
+        cls.rows, cls.total = explicit_target_rows(texts)
+        # Independent counts straight off the text, so a regex that drops rows cannot hide.
+        cls.raw_rows = sum(len(re.findall(r"\.plugin\s*=", t)) for t in texts)
+        cls.raw_forensics = sum(len(FORENSICS.findall(t)) for t in texts)
+        cls.table = ir.load_risk_table(ROOT / "scripts/test/instructions-risk-classification.json")
+        cls.defs = ir.load_definitions(ROOT / "content/definitions", cls.table)
 
     def test_parse_is_not_vacuous(self):
-        # A regex that silently stopped matching would make the main check pass on nothing.
-        self.assertGreater(self.total, 100, "catalogue row regex found too few rows")
-        self.assertGreater(len(self.rows), 10, "no Destructive/Forensics rows found")
+        # A regex that silently dropped rows would make the main check pass on nothing.
+        self.assertTrue(FRAGMENTS, "no capability_decls fragments found")
+        self.assertGreater(self.total, 0)
+        self.assertEqual(self.total, self.raw_rows, "ROW regex dropped or invented catalogue rows")
+        self.assertEqual(list(self.rows.values()).count("forensic"), self.raw_forensics,
+                         "a Forensics row was not parsed as one")
         self.assertEqual(set(self.rows.values()), {"forensic", "destructive"})
+
+    def test_definitions_side_is_not_vacuous(self):
+        # The main check compares definitions to rows; empty definitions (moved content dir) or a
+        # renamed `plugin` key would leave it green with nothing compared.
+        matched = [d for d in self.defs if (d.plugin, d.action) in self.rows]
+        self.assertGreaterEqual(len(matched), 20, "too few definitions matched an explicit-target row")
+        self.assertEqual({self.rows[(d.plugin, d.action)] for d in matched}, {"forensic", "destructive"})
+
+    def test_default_run_excludes_every_opt_in_class(self):
+        opt_in = {"destructive", "forensic", "server-internal", "network-disrupt", "interactive"}
+        self.assertEqual(set(ir.DEFAULT_RISKS) & opt_in, set())
+
+    def test_risk_table_matches_definitions(self):
+        ids = {d.id for d in self.defs}
+        self.assertEqual(sorted(set(self.table) - ids), [], "risk-table entries naming no definition")
+        self.assertEqual(sorted(set(self.table.values()) - set(ir.ALL_RISKS)), [], "unknown risk class")
 
     def test_explicit_target_definitions_carry_their_opt_in_class(self):
         bad = misclassified(self.rows, self.defs)
@@ -97,6 +120,9 @@ class RiskTable(unittest.TestCase):
         rows = {("p", "a"): "destructive", ("p", "b"): "forensic"}
         d = make_def(risk="mutating")
         self.assertEqual(misclassified(rows, [d]), ["x.y"])
+        for bad in ("safe", "server-internal"):
+            d.risk = bad
+            self.assertEqual(misclassified(rows, [d]), ["x.y"], bad)
         for ok in ("destructive", "network-disrupt", "interactive"):
             d.risk = ok
             self.assertEqual(misclassified(rows, [d]), [], ok)
@@ -126,8 +152,10 @@ class RiskTable(unittest.TestCase):
         for plugin in ("_server", "server", "server_internal"):
             outcome = ir.exercise(FakeClient([]), make_def(plugin=plugin), {}, poll_timeout_s=0)
             self.assertEqual(outcome.status, "fail", plugin)
+            self.assertIn("no response within", outcome.note)
+        # The pass case breaks on its first poll; 30s is never reached, so a stalled VM cannot flip it.
         answered = FakeClient([{"output": "x", "status": "ok", "rc": 0}])
-        self.assertEqual(ir.exercise(answered, make_def(plugin="server"), {}, poll_timeout_s=1).status, "pass")
+        self.assertEqual(ir.exercise(answered, make_def(plugin="server"), {}, poll_timeout_s=30).status, "pass")
 
 
 if __name__ == "__main__":

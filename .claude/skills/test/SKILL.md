@@ -42,6 +42,8 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — cross-platform; the historical `start-UAT.sh` name is a back-compat shim.
 - Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
 
+**Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
+
 **macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
 
 **What skips on macOS without a running Docker daemon:**
@@ -67,8 +69,9 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  through Phase 8 so humans can poke at the
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
-                                 e2e-api / e2e-mcp / e2e-security /
-                                 synthetic UAT / puppeteer / instructions)
+                                 e2e-api / e2e-mcp / synthetic UAT /
+                                 puppeteer / instructions; e2e-security runs
+                                 alone after the fan-out)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,

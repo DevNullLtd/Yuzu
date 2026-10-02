@@ -12,7 +12,9 @@
 # prints the exact counts). Opt-in classes, via --risks: destructive and forensic
 # (the server refuses a broadcast for these and the runner broadcasts),
 # server-internal (catalog-only definitions the dispatch chokepoint denies),
-# interactive, and network-disrupt (the quarantine ceremony, PR B). The destructive
+# interactive, and network-disrupt (the quarantine ceremony, PR B). The runner
+# supplies no explicit targets, so selecting destructive, forensic or server-internal
+# is expected to fail (HTTP 400/503) until it can. The destructive
 # instructions are the candidate pool for PR C's hand-written semantic-correctness
 # overrides. scripts/test/instructions-risk-classification.json is the authority.
 #
@@ -61,7 +63,9 @@ Optional:
   --risks LIST             comma-separated risk classes to run
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
-                           network-disrupt, interactive)
+                           network-disrupt, interactive; destructive,
+                           forensic and server-internal cannot pass yet:
+                           the runner sends no explicit targets)
   --match REGEX            run only definition ids matching this regex
   --only-id ID             run exactly one definition (debugging)
   --parallelism N          concurrent dispatches (default: 4)

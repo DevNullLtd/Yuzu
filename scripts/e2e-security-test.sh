@@ -556,11 +556,15 @@ GOT_RETRY_AFTER=false
 # to exceed that bucket from a cold start, so it must be OPEN-loop: a single
 # curl process (-Z) opens every transfer up front and does not wait on earlier
 # responses. A closed-loop fan-out (xargs -P N, one curl per request) is paced
-# by the handler's latency instead - every login serialises on the per-user
-# lock, so a slow handler holds the offered rate under the refill rate and the
-# bucket never empties (passed alone by 17 requests, failed 40 of 43 recorded
-# runs). If the limiter is OFF entirely none of the requests returns 429 -
-# that IS the bug the test catches.
+# by the handler's latency instead: logins for the same username serialise on a
+# per-username mutex, so a slow handler held the offered rate under the refill
+# rate and the bucket never emptied (the old probe failed most recorded runs).
+# If the limiter is OFF entirely none of the requests returns 429 - that IS the
+# bug the test catches.
+# The first wave of arrivals does the work, so this relies on the server's
+# worker pool (264 by default) exceeding the login bucket (200, start-UAT.sh's
+# --login-rate-limit): shrinking the pool below the bucket silently brings the
+# closed-loop failure back.
 # Each response is reported as "<status> <retry-after>"; reading the header off
 # the same response avoids the refill race of a serial follow-up (the bucket
 # refills within ~10ms after the burst ends). The burst (-Z --parallel-immediate)
@@ -570,17 +574,26 @@ GOT_RETRY_AFTER=false
 RATELIMIT_ATTEMPTS=500
 RATELIMIT_PARALLELISM=300
 IFS=. read -r CURL_MAJOR CURL_MINOR _ <<< "$(curl --version | awk 'NR==1 {print $2}')"
+[[ $CURL_MAJOR =~ ^[0-9]+$ ]] || CURL_MAJOR=0
+[[ $CURL_MINOR =~ ^[0-9]+$ ]] || CURL_MINOR=0
 curl_at_least() { (( CURL_MAJOR > $1 || (CURL_MAJOR == $1 && CURL_MINOR >= $2) )); }
 RATELIMIT_FMT='%{http_code}\n'
 if curl_at_least 7 84; then
     RATELIMIT_FMT='%{http_code} %header{retry-after}\n'
 fi
 RATELIMIT_OUT=""
+RATELIMIT_RC=0
 if curl_at_least 7 68; then
+    # 300 concurrent sockets need more than macOS's default 256 descriptors: without
+    # headroom most transfers come back 000 and the failure reads as "limiter off".
+    FD_LIMIT=$(ulimit -n)
+    if [[ $FD_LIMIT =~ ^[0-9]+$ ]] && (( FD_LIMIT < 1024 )); then
+        ulimit -n 1024 2>/dev/null || true
+    fi
     RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
-        -o /dev/null -w "$RATELIMIT_FMT" \
+        --max-time 60 -o /dev/null -w "$RATELIMIT_FMT" \
         -X POST -d 'username=ratelimit_test&password=bad' \
-        "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null || true)
+        "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null) || RATELIMIT_RC=$?
 fi
 if grep -Eq '^429( |$)' <<< "$RATELIMIT_OUT"; then
     GOT_429=true
@@ -596,6 +609,8 @@ elif ! curl_at_least 7 68; then
     fail "Rate-limit probe needs curl >= 7.68 for --parallel-immediate (found ${CURL_MAJOR}.${CURL_MINOR})"
 else
     fail "Rate limiting NOT triggered (no 429 in $RATELIMIT_ATTEMPTS parallel login attempts)"
+    # all-000 means transport trouble (fds, connect), all-401 a missing limiter, 5xx a sick server
+    log "  statuses: $(awk '{print $1}' <<< "$RATELIMIT_OUT" | sort | uniq -c | tr '\n' ' ')(curl exit $RATELIMIT_RC)"
 fi
 
 if ! curl_at_least 7 84; then

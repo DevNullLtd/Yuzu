@@ -21,7 +21,7 @@ and gate_notes):
   pending_approval  HTTP 202 with status=pending_approval — expected for
                     approval=manual/always/none; not a failure, but not a
                     semantic check either
-  skip              definition risk-tag excluded by --risk filter
+  skip              definition risk-tag excluded by the --risks filter
                     (everything but safe and mutating by default)
   error             internal runner error (network, JSON parse, etc.) —
                     distinct from `fail` so flake-watching can separate
@@ -33,6 +33,10 @@ Definitions whose id is NOT in the override map are classified by plugin, then s
                                            dispatch chokepoint denies them)
   type=question/query                   -> safe
   type=action                           -> mutating
+
+The runner broadcasts: it sends no agent_ids and no scope. A definition on a Destructive or
+Forensics capability row (the server requires an explicit target) and a server-internal one
+therefore cannot pass when selected with --risks; they are classified, not exercisable yet.
 """
 
 from __future__ import annotations
@@ -120,7 +124,7 @@ def load_risk_table(path: Path) -> dict[str, str]:
 
 
 # Plugins that name no agent plugin: the definition is catalog-only and the dispatch chokepoint
-# denies it (reason=unclassified), so it can never pass by dispatch.
+# denies it (reason=unclassified or forbidden), so it can never pass by dispatch.
 SERVER_ONLY_PLUGINS = ("_server", "server", "server_internal")
 
 
