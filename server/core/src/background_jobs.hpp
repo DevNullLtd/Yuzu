@@ -92,10 +92,11 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (44 passes). Verified against the source sweep
+/// The exhaustive inventory (45 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
-/// `gateway_route_store.reap_stale_routes`, 2026-09-11, and the HA WS-8 addition
-/// of `pg_reachability_probe.tick`, 2026-09-24); keep the count
+/// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
+/// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
+/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -125,6 +126,27 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "authority. Runs on the single replica today; the class gates a 2nd replica on the fix"},
     {"execution_tracker.reap_event_outbox", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + pg_try_advisory_xact_lock"},
+    {"execution_tracker.reap_stuck_running_executions", "result_set_maint_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + pg_try_advisory_xact_lock, all-but-holder skip (#4982 fix round 2 — was "
+     "a BLOCKING pg_advisory_xact_lock in Part B; the candidate select, would-wipe check, and "
+     "the atomic cancel UPDATE now all sit inside the SAME lock-held transaction, so a "
+     "blocking lock would stall a losing replica's whole maintenance tick, matching this "
+     "thread's reap_event_outbox sibling). The mutation is a single atomic "
+     "UPDATE ... RETURNING id re-checking the FULL candidate predicate at cancel time (not "
+     "just a terminal-status guard), so the claim+mutate sequence is genuinely single-writer "
+     "and the row cap is an honest per-pass bound, never fleet-wide-exceedable. CLOCK-AUTHORITY "
+     "CAVEAT (PR #5226 review round 2, Doomgoose): the cutoff this sweep computes is PG now() "
+     "in-SQL, but the dispatched_at it compares against is written from the replica's own "
+     "system_clock in the common case (create_execution's `now` fallback) — the same "
+     "clock-domain split that holds reconcile_stale_concurrency_claims at DisabledUntilFixed "
+     "below, NOT yet the fully-shared-clock SINGLE-WRITER rule clock-guarded-retention.md "
+     "describes. Unlike that reconciler, this sweep's blast radius on a multi-replica deployment "
+     "is still bounded by the would-wipe ratio/floor and the per-pass row cap either way, which "
+     "is why it stays ReplicaSafe rather than DisabledUntilFixed — but a replica meaningfully "
+     "behind on system_clock could still see a fresh dispatch as already past the stuck-exec "
+     "window. Not yet fixed; stamping dispatched_at from DB time is the closing move, tracked "
+     "alongside the concurrency_claims migration (#4093-shape)"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
     {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
