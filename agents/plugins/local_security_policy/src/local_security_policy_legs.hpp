@@ -4,34 +4,17 @@
  * CFPropertyList bridge). Every decision lives in local_security_policy_parsers.hpp.
  * Each collect_* is defined by exactly one leg TU; a read returns 0, degradation is the status.
  *
- * Linux and macOS ship in this PR. Windows (secedit) and the `sudoers` action are PLANNED,
- * follow as their own PR -- until then `execute()` reports both as the honest planned state
- * inline (no collect_windows_policy leg exists in this PR at all; see plugin.cpp), same
- * "report planned, never claim an empty success" property as browser_policy's
- * mark_result_planned (browser_policy_legs.hpp) -- the one PLANNED-leg precedent actually
- * present in this tree; privacy_permissions (#5064) also ships the same pattern and now
- * lives in this repo at agents/plugins/privacy_permissions/.
- * The portable TU already builds a `local_security_policy.dll` on Windows even in this PR, and
- * deploy/packaging/windows/yuzu-agent.iss now installs it (adversarial-review finding: an
- * installed Windows agent previously could not reach even the planned-state row, since the
- * installer's per-DLL Sources list had no entry for this plugin at all).
+ * All three legs and all four actions are real: Linux and macOS read files (macOS also
+ * pwpolicy), Windows decodes `secedit /export` (local_security_policy_win.cpp), and `sudoers`
+ * reads /etc/sudoers and /etc/sudoers.d on Linux and macOS (Windows has no sudoers: it reports
+ * `unsupported`). Every leg reports degradation as the status, never an empty success.
  *
- * WHEN THE WINDOWS LEG LANDS: add local_security_policy_win.cpp back to meson.build's
- * files() list and the advapi32 dependency branch, add collect_windows_policy's declaration
- * back here, restore plugin.cpp's #if defined(_WIN32) dispatch to call it, flip the three
- * actions' windows_leg descriptors off YUZU_SUPPORT_PLANNED, then grep the tree for
- * "planned" and "follows as its own PR" and update every hit.
- *
- * WHEN THE SUDOERS ACTION LANDS: restore local_security_policy_parsers.hpp's sudoers block
- * (lines 310-845 of the pre-split file: detail::SudoersLexer, parse_sudoers,
- * sudoers_dir_entry_ignored), format_sudoers_row, and detail::sudoers_file; replace
- * collect_file_policy's `case LocalPolicyAction::Sudoers:` stub with the real body; restore
- * the 4th kActionDescriptors entry and the `execute()` guard that currently treats Sudoers
- * as unregistered; add the 4th plugin_action_catalogue_local_security_policy.hpp row; restore
- * the sudoers-specific test cases in test_local_security_policy_parsers.cpp; re-derive
- * EXPECTED_TOTAL_ROWS; restore a 7-field branch to Tally::truncation_marker() in
- * local_security_policy_parsers.hpp (removed in this PR since only the 4-field kv shape is
- * reachable here -- see that function's own doc comment).
+ * Sites that still name a leg's support level and must be revisited if one changes: the per-OS
+ * descriptors in local_security_policy_plugin.cpp (support level, mechanism, fallback; the
+ * leg-hash changes, so run `plugin_doc_gen.py --stamp`), the yaml `platforms` column and row
+ * descriptions, the README (How it works, Privileges, Result status, Sample, Caveats),
+ * docs/agent-privilege-model.md's row, the capability matrix row, the capability-map cell, the
+ * .claude/routed-concerns-security-posture.md row, and the capability catalogue header.
  */
 #pragma once
 
@@ -43,6 +26,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -89,9 +73,8 @@ inline RunEnd to_run_end(yuzu::agent::TerminationReason r) noexcept {
 
 int collect_linux_policy(yuzu::CommandContext& ctx, std::string_view action);
 int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action);
-// collect_windows_policy is PLANNED, follows as its own PR (see this header's banner) -- no
-// declaration here yet; plugin.cpp's Windows branch reports the planned state inline instead
-// of calling a leg, so nothing needs to link against it in this PR.
+int collect_windows_policy(yuzu::CommandContext& ctx, std::string_view action,
+                           std::string_view data_dir);
 
 /// Writes the rows and the one status every leg reports (PERMISSION_DENIED only
 /// when nothing existing was readable -- see select_status). `action_prefix` is
@@ -119,7 +102,7 @@ int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action);
 /// its row, this fallback would write a 4-field row into a 7-field contract. Keep the
 /// pairing, or give this function the action-shaped fallback before you break it.
 /// No direct test pins this specific pairing: the empty-rows fallback (the `if (c.rows.empty())`
-/// arms above) is reachable only from a real pwpolicy subprocess failure, which
+/// arms below) is reachable only from a real pwpolicy subprocess failure, which
 /// LocalDispatcher-based tests can't force deterministically, and a bare CommandContext
 /// can't be cheaply constructed outside that harness for a standalone call. The `sudoers.d`
 /// truncation arm was the one site that counted without emitting, and it no longer does.
@@ -152,23 +135,33 @@ inline int apply_collected(yuzu::CommandContext& ctx, const Collected& c,
 
 #if !defined(_WIN32)
 
-/// Bounded regular-file read. Symlinks ARE followed: /etc/pam.d/system-auth is a symlink
-/// into /etc/authselect on RHEL-family hosts (real capture, fedora:40); all paths are under /etc.
+/// Bounded regular-file read. On the non-strict path symlinks ARE followed:
+/// /etc/pam.d/system-auth is a symlink into /etc/authselect on RHEL-family hosts (real capture,
+/// fedora:40); all paths are under /etc. `strict` (the sudoers sources, see is_sudoers_source)
+/// is the opposite: the leaf is opened O_NOFOLLOW (a link is kReadSymlink) and the opened object
+/// must be owned by `owner_uid` (uid 0 in production) and not group/other-writable
+/// (kReadInsecure; stricter than sudo), so a planted link or a loose file can never be read back to a
+/// Security:Read caller as policy content. Only the LEAF is checked: a symlinked parent
+/// directory is followed (root-owned /etc is the trust anchor).
 ///
 /// O_NONBLOCK is LOAD-BEARING, the same way certificates_linux_store.hpp's
 /// read_cert_entry and guardian_state_reader.cpp's state read say it is: open(2)
 /// on a FIFO with no writer blocks forever, and the S_ISREG check below cannot
 /// run until open returns, so a blocking open would wedge the dispatch thread
-/// before the type filter ever got to reject the node. Symlinks are followed
-/// here by design, so the node need not sit under /etc itself. Once fstat proves
+/// before the type filter ever got to reject the node. On the non-strict path a followed
+/// symlink means the node need not sit under /etc itself. Once fstat proves
 /// S_ISREG the flag is inert (POSIX: reads of a regular file never block), so
 /// nothing clears it afterwards and no real host behaves differently.
-inline FileRead posix_read_file(const std::string& path) {
-    yuzu::agent::ScopedFd fd(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
-    if (!fd) return {errno, {}};
+inline FileRead posix_read_file_at(const std::string& path, bool strict,
+                                   uid_t owner_uid = kSudoersOwnerUid) {
+    yuzu::agent::ScopedFd fd(
+        ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | (strict ? O_NOFOLLOW : 0)));
+    if (!fd) return {strict && errno == ELOOP ? kReadSymlink : errno, {}};
     struct stat st{};
     if (::fstat(fd.get(), &st) != 0) return {errno, {}};
     if (!S_ISREG(st.st_mode)) return {kReadNotRegular, {}};
+    if (strict && (st.st_uid != owner_uid || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+        return {kReadInsecure, {}};
     FileRead out;
     char buf[8192];
     for (;;) {
@@ -182,6 +175,16 @@ inline FileRead posix_read_file(const std::string& path) {
         if (out.data.size() > kMaxFileBytes) return {kReadOversized, {}};
     }
     return out;
+}
+
+/// The production reader: sudoers sources strict, everything else lenient. `root` and
+/// `sudoers_owner_uid` exist so a test can drive this exact routing over a temporary tree
+/// (`<root>/etc/sudoers.d/x`) as any user; production passes neither (real /etc, uid 0).
+inline FileReader make_posix_reader(std::string root = {},
+                                    uid_t sudoers_owner_uid = kSudoersOwnerUid) {
+    return [root = std::move(root), sudoers_owner_uid](const std::string& path) {
+        return posix_read_file_at(root + path, is_sudoers_source(path), sudoers_owner_uid);
+    };
 }
 
 inline DirList posix_list_dir(const std::string& path) {

@@ -28,7 +28,7 @@ namespace yuzu::local_security_policy {
 int collect_linux_policy(yuzu::CommandContext& ctx, std::string_view action) {
     const auto which = parse_local_policy_action(action);
     return apply_collected(
-        ctx, collect_file_policy(FileFlavor::Linux, which, posix_read_file, posix_list_dir),
+        ctx, collect_file_policy(FileFlavor::Linux, which, make_posix_reader(), posix_list_dir),
         action_row_prefix(which));
 }
 
