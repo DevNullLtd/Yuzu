@@ -11,6 +11,11 @@
 # server.cpp alone carries ~1,400 lines of non-ASCII COMMENT prose (box-
 # drawing, em dashes) that #2128 explicitly says to leave alone.
 #
+# The Erlang gateway is NOT scanned here. There a non-ASCII HELP literal is
+# fatal (every scrape returns HTTP 500, #5177), and it is covered by
+# yuzu_gw_telemetry_tests:metrics_scrape_renders_test_, which renders the
+# whole registry. Don't assume this lint covers gateway/**.
+#
 # Two scan surfaces, kept in one constant (SCAN_TARGETS below) so adding a
 # future HELP table is a one-line change:
 #

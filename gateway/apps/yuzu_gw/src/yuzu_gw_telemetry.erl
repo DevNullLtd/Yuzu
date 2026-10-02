@@ -11,6 +11,7 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
+-export([mgmt_auth_reject_reasons/0]).
 
 %% All telemetry event names used by the gateway.
 -define(EVENTS, [
@@ -250,6 +251,13 @@ handle_event(_Event, _Measurements, _Meta, _Config) ->
 %%% Internal
 %%%===================================================================
 
+%% The closed set of reasons yuzu_gw_authz:reject/1 is called with.
+%% yuzu_gw_telemetry_tests checks it against yuzu_gw_authz's source.
+-spec mgmt_auth_reject_reasons() -> [atom()].
+mgmt_auth_reject_reasons() ->
+    [internal_error, no_pins_configured, no_pins_resolved, pin_mismatch,
+     missing_server_auth_eku, bad_peer_cert, bad_pin_config].
+
 declare_metrics() ->
     %% Counters
     prometheus_counter:declare([
@@ -302,7 +310,7 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_connect_failures_total},
         {labels, []},
         {help, "Total net_kernel:connect_node/1 failures from the cluster "
-               "discovery redial loop (#4555) — a sustained non-zero rate "
+               "discovery redial loop (#4555) - a sustained non-zero rate "
                "alongside a resolved/connected gap most often means a "
                "distribution-cookie mismatch across replicas"}]),
     prometheus_counter:declare([
@@ -310,7 +318,7 @@ declare_metrics() ->
         {labels, []},
         {help, "Total times the cluster discovery redial loop's lifetime "
                "distinct-address cap (1024) refused to atomize a "
-               "never-before-seen address (#4555 review round 2) — any "
+               "never-before-seen address (#4555 review round 2) - any "
                "non-zero value means the seed DNS name is returning an "
                "unexpectedly large or rotating/hostile answer set and "
                "should be investigated immediately, not just noted"}]),
@@ -346,6 +354,14 @@ declare_metrics() ->
                "by reason atom (closed set; no certificate contents). Sustained "
                "non-zero = probing by a CA-cert holder, or a misrotated pin "
                "killing server command forwarding"}]),
+    %% Create every rejection-reason series at 0 now. A series that first
+    %% appears already at 1 is invisible to increase(), so without this the
+    %% FIRST rejection per reason (after the first scrape) never raised the
+    %% YuzuGatewayMgmtAuthRejected alert (#5177 review). The list is the closed
+    %% set of reject/1 reasons in yuzu_gw_authz; a test keeps the two in step.
+    [prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- mgmt_auth_reject_reasons()],
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},
@@ -391,7 +407,7 @@ declare_metrics() ->
         {buckets, [1, 10, 100, 1000, 10000, 100000, 1000000]},
         {help, "Number of agents dispatched to a DIFFERENT node than the "
                "dispatching one per fanout (HA WS-4 4.3a cross-node routing "
-               "— counts a cast SEND, not a confirmed delivery; see #4555)"}]),
+               "- counts a cast SEND, not a confirmed delivery; see #4555)"}]),
 
     %% Gauges
     prometheus_gauge:declare([
@@ -424,7 +440,7 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_peers_resolved},
         {labels, [node]},
         {help, "Peer addresses found by the cluster discovery redial loop's "
-               "most recent tick (#4555) — 0 means the seed name/list "
+               "most recent tick (#4555) - 0 means the seed name/list "
                "resolved nothing, which is expected for a genuinely "
                "single-node deployment"}]),
     prometheus_gauge:declare([
@@ -432,7 +448,7 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Distribution-connected peer nodes (length(nodes())) as of "
                "the cluster discovery redial loop's most recent tick "
-               "(#4555) — compare against peers_resolved to distinguish a "
+               "(#4555) - compare against peers_resolved to distinguish a "
                "wrong seed name (resolved=0) from a partial mesh (resolved "
                "> connected > 0, most often a cookie mismatch)"}]),
 
