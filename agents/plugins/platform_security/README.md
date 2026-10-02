@@ -175,5 +175,4 @@ code_integrity|linux|lockdown|-|unreadable
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp`
 - Tests: `tests/unit/test_platform_security_local_dispatcher.cpp` · `tests/unit/test_platform_security_parsers.cpp` · `tests/unit/test_platform_security_win_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave8-pr81a1-platform_security.added.md`
 <!-- END GENERATED -->

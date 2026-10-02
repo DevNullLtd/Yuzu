@@ -1,8 +1,9 @@
 /**
- * test_privacy_permissions_parsers.cpp -- pure tests for privacy_permissions_parsers.hpp and
- * privacy_permissions_linux_parsers.hpp (this plugin's Linux leg; macOS/Windows parsers are
- * covered by their own test file once those legs ship). No OS call, no platform guard. The one
- * file read is the committed YAML definition (the row_kind/column pin).
+ * test_privacy_permissions_parsers.cpp -- pure tests for privacy_permissions_parsers.hpp,
+ * privacy_permissions_macos_parsers.hpp and privacy_permissions_linux_parsers.hpp (this
+ * plugin's Linux and macOS legs; Windows parsers are covered by their own test file once
+ * that leg ships). No OS call, no platform guard. The one file read is the committed YAML
+ * definition (the row_kind/column pin).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "privacy_permissions_linux_parsers.hpp"
+#include "privacy_permissions_macos_parsers.hpp"
 #include "privacy_permissions_parsers.hpp"
 
 using namespace yuzu::privacy_permissions;
@@ -463,4 +465,337 @@ TEST_CASE("portal::finish_portal_rows: ServiceUnknown on EVERY lookup is whole-m
         CHECK(format_row(rows[2]) == "permissions|linux|-|full_disk_access|unsupported|-|-|-");
         CHECK(acc.reason() == "location:service_unknown");
     }
+}
+
+// ── macOS-specific pure layer (shapes from real TCC.db captures, see the header) ────────
+
+TEST_CASE("macos: the documented bounds and the tokens a bound produces",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxSchemaBytes == 64 * 1024);
+    CHECK(macos::kMaxValueBytes == 1024);
+    CHECK(macos::kMaxRowsPerService == 1024);
+    CHECK(macos::kMaxSourceBytes == 1024u * 1024u);
+    CHECK(macos::kMaxDbBytes == 4LL * 1024 * 1024);
+    CHECK(macos::kSourceBudget == std::chrono::milliseconds{500});
+    CHECK(macos::kRunBudget == std::chrono::seconds{10});
+    CHECK(macos::kCutRowCap == "row_cap");
+    CHECK(macos::kCutByteCap == "byte_cap");
+    CHECK(macos::kCutValueOversized == "value_oversized");
+    CHECK(macos::kCutTimeout == "timeout");
+}
+
+TEST_CASE("macos::decode_auth_value: 0 denied, 2/3 allowed, other prompt_undetermined, a "
+          "NULL/non-integer column unreadable (never a fabricated 0 = denied)",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::decode_auth_value(0) == PermissionState::denied);
+    CHECK(macos::decode_auth_value(2) == PermissionState::allowed);
+    CHECK(macos::decode_auth_value(3) == PermissionState::allowed);
+    CHECK(macos::decode_auth_value(1) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(std::nullopt) == PermissionState::unreadable);
+    // Past int32: the low bits must not wrap onto 0/2/3.
+    CHECK(macos::decode_auth_value(4294967296) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(4294967298) == PermissionState::prompt_undetermined);
+    CHECK(macos::decode_auth_value(-2) == PermissionState::prompt_undetermined);
+}
+
+TEST_CASE("macos::classify_tcc_missing: a missing per-user db is absent, a missing system db is "
+          "unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    const auto user_missing = macos::classify_tcc_missing(true);
+    CHECK(user_missing.outcome == macos::SourceOutcome::absent);
+    CHECK(user_missing.cause.empty());
+    const auto sys_missing = macos::classify_tcc_missing(false);
+    CHECK(sys_missing.outcome == macos::SourceOutcome::unreadable);
+    CHECK(sys_missing.cause == "missing");
+    // Every other failure of the first open goes through the errno classifier: a refusal is
+    // denied, a symlink anywhere in the path (ELOOP) is refused, anything else is unreadable.
+    for (const int e : {EPERM, EACCES})
+        CHECK(macos::classify_tcc_open_errno(e).outcome == macos::SourceOutcome::denied);
+    CHECK(macos::classify_tcc_open_errno(ELOOP).cause == "open_failed:symlink");
+    CHECK(macos::classify_tcc_open_errno(EIO).outcome == macos::SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_sqlite_rc: AUTH/PERM denied; CANTOPEN denied only when the VFS "
+          "syscall failed EPERM/EACCES; any other code or errno unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    using macos::SourceOutcome;
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EPERM) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EACCES) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen | (1 << 8), EACCES) ==
+          SourceOutcome::denied); // extended code, primary byte compared
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, 0) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, ENOENT) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteCantOpen, EMFILE) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqliteAuth, 0) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(macos::kSqlitePerm, 0) == SourceOutcome::denied);
+    CHECK(macos::classify_tcc_sqlite_rc(1 /* SQLITE_ERROR */, EPERM) == SourceOutcome::unreadable);
+    CHECK(macos::classify_tcc_sqlite_rc(26 /* SQLITE_NOTADB */, 0) == SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_sqlite_failure: the stage names the cause; a failed PRAGMA "
+          "query_only is always unreadable, never a refusal",
+          "[privacy_permissions][macos_parsers]") {
+    using macos::SqliteStage;
+    const auto open_denied = macos::classify_tcc_sqlite_failure(
+        SqliteStage::open, macos::kSqliteCantOpen, EPERM, "unable to open database file");
+    CHECK(open_denied.outcome == macos::SourceOutcome::denied);
+    CHECK(open_denied.cause == "open_failed:unable to open database file");
+    const auto prep = macos::classify_tcc_sqlite_failure(SqliteStage::prepare, 1, 0,
+                                                         "no such table: access");
+    CHECK(prep.outcome == macos::SourceOutcome::unreadable);
+    CHECK(prep.cause == "prepare_failed:no such table: access");
+    const auto pragma = macos::classify_tcc_sqlite_failure(
+        SqliteStage::query_only, macos::kSqliteCantOpen, EPERM, "unable to open database file");
+    CHECK(pragma.outcome == macos::SourceOutcome::unreadable);
+    CHECK(pragma.cause == "query_only_failed:unable to open database file");
+    // As a whole-source row, the pragma failure is a token-bearing unreadable row.
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto row = macos::tcc_source_failed_row("alice", pragma, acc);
+    CHECK(row.state == PermissionState::unreadable);
+    CHECK(row.raw == "alice:tcc_db:query_only_failed:unable to open database file");
+    CHECK(acc.reason() == row.raw);
+}
+
+TEST_CASE("macos::immutable_uri: only % ? # are encoded, so every hostile spelling round-trips",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::immutable_uri("/Users/Jane Doe/TCC.db") ==
+          "file:/Users/Jane Doe/TCC.db?immutable=1");
+    CHECK(macos::immutable_uri("/Users/a%20b/q?x#h/TCC.db") ==
+          "file:/Users/a%2520b/q%3Fx%23h/TCC.db?immutable=1");
+}
+
+TEST_CASE("macos::classify_tcc_open_errno: a refused open is denied, a symlink and every other "
+          "errno unreadable",
+          "[privacy_permissions][macos_parsers]") {
+    for (const int e : {EPERM, EACCES})
+        CHECK(macos::classify_tcc_open_errno(e).outcome == macos::SourceOutcome::denied);
+    CHECK(macos::classify_tcc_open_errno(ELOOP).cause == "open_failed:symlink");
+    CHECK(macos::classify_tcc_open_errno(ENOENT).outcome == macos::SourceOutcome::unreadable);
+}
+
+TEST_CASE("macos::classify_tcc_header: WAL is either version byte; the change counter is bytes "
+          "24..27 big-endian",
+          "[privacy_permissions][macos_parsers]") {
+    std::array<unsigned char, macos::kSqliteHeaderBytes> h{};
+    for (std::size_t i = 0; i < macos::kSqliteMagic.size(); ++i)
+        h[i] = static_cast<unsigned char>(macos::kSqliteMagic[i]);
+    h[18] = h[19] = 1;
+    CHECK_FALSE(macos::classify_tcc_header(h));
+    h[24] = 1, h[27] = 4;
+    CHECK(macos::header_change_counter(h) == 0x01000004u);
+    const auto refusal = [](std::span<const unsigned char> bytes) {
+        const auto f = macos::classify_tcc_header(bytes);
+        REQUIRE(f);
+        return f->cause;
+    };
+    for (const std::size_t i : {18, 19}) {
+        auto wal = h;
+        wal[i] = 2;
+        CHECK(refusal(wal) == "wal_mode");
+    }
+    CHECK(refusal(std::span{h}.first(99)) == "not_sqlite");
+    h[0] = 'X';
+    CHECK(refusal(h) == "not_sqlite");
+}
+
+TEST_CASE("macos::FileStamp: every field of the file stamp matters",
+          "[privacy_permissions][macos_parsers]") {
+    const macos::FileStamp base{7, 4096, 1700000000, 500, 12};
+    CHECK(base == base);
+    const auto changed = [&](auto mutate) {
+        auto other = base;
+        mutate(other);
+        return base != other;
+    };
+    CHECK(changed([](auto& s) { s.inode += 1; }));
+    CHECK(changed([](auto& s) { s.size += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_sec += 1; }));
+    CHECK(changed([](auto& s) { s.mtime_nsec += 1; }));
+    CHECK(changed([](auto& s) { s.change_counter += 1; }));
+    // A same-size write that restores mtime and the header counter still moves ctime.
+    CHECK(changed([](auto& s) { s.ctime_sec += 1; }));
+    CHECK(changed([](auto& s) { s.ctime_nsec += 1; }));
+}
+
+TEST_CASE("macos::OutputBudget: counts the formatted row, escapes and separator included, and is "
+          "spent at the cap",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::kMaxRunOutputBytes == 16u * 1024u * 1024u);
+    CHECK(macos::kBudgetExceededToken == "collection:budget_exceeded");
+    macos::OutputBudget b;
+    b.max_bytes = 10;
+    const std::vector<PermissionRow> rows{
+        {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
+    b.charge(rows);
+    CHECK(b.bytes == format_row(rows[0]).size() + 1);
+    CHECK(b.exhausted()); // 45 bytes against a 10-byte cap: every field counts, not two of them
+    // Escape expansion is charged: a pipe-dense client costs its escaped length.
+    macos::OutputBudget plain, dense;
+    const std::vector<PermissionRow> p{{"macos", "aaaa", "camera", PermissionState::allowed, "2",
+                                        "-", "-", false}};
+    const std::vector<PermissionRow> d{{"macos", "||||", "camera", PermissionState::allowed, "2",
+                                        "-", "-", false}};
+    plain.charge(p);
+    dense.charge(d);
+    CHECK(dense.bytes == plain.bytes + 4);
+    CHECK_FALSE(macos::OutputBudget{}.exhausted());
+}
+
+TEST_CASE("macos::path_under_network_mount: a network mount at or above the path refuses it, on a "
+          "segment boundary only",
+          "[privacy_permissions][macos_parsers]") {
+    const std::vector<macos::MountEntry> mounts{{"/", "apfs"},
+                                                {"/Users/alice", "nfs"},
+                                                {"/Users/carol", "smbfs"},
+                                                {"/Volumes/web", "webdav"},
+                                                {"/Users/dave", "apfs"}};
+    const auto refused = [&](std::string_view path) {
+        return macos::path_under_network_mount(path, mounts);
+    };
+    CHECK(refused("/Users/alice"));
+    CHECK(refused("/Users/alice/Library/Application Support/com.apple.TCC/TCC.db"));
+    CHECK(refused("/Users/carol/Library"));
+    CHECK(refused("/Volumes/web/x"));
+    CHECK_FALSE(refused("/Users/alicia"));   // prefix of the name, not of a segment
+    CHECK_FALSE(refused("/Users/al"));
+    CHECK_FALSE(refused("/Users/dave/Library")); // a local mount is never a reason
+    CHECK_FALSE(refused("/Library/Application Support/com.apple.TCC/TCC.db"));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/alice", {}));
+    // The shapes the kernel really reports: a mount the system creates on the firmlinked volume
+    // (autofs's /home, captured on macOS 26.6.2) carries the /System/Volumes/Data prefix.
+    const std::vector<macos::MountEntry> real{{"/", "apfs"},
+                                              {"/System/Volumes/Data", "apfs"},
+                                              {"/System/Volumes/Data/home", "autofs"},
+                                              {"/System/Volumes/Data/Users/carol", "smbfs"}};
+    CHECK(macos::path_under_network_mount("/home/dave/Library", real));
+    CHECK(macos::path_under_network_mount("/Users/carol/Library/x", real));
+    CHECK(macos::path_under_network_mount("/System/Volumes/Data/home/dave", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/carolyn/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/Users/alex/Library", real));
+    CHECK_FALSE(macos::path_under_network_mount("/homework", real));
+    // A network root covers every path.
+    CHECK(macos::path_under_network_mount("/Users/x", std::vector<macos::MountEntry>{{"/", "nfs"}}));
+    CHECK(macos::is_network_mount_fstype("nfs"));
+    CHECK(macos::is_network_mount_fstype("smbfs"));
+    CHECK(macos::is_network_mount_fstype("webdav"));
+    CHECK(macos::is_network_mount_fstype("afpfs"));
+    CHECK(macos::is_network_mount_fstype("macfuse"));
+    CHECK(macos::is_network_mount_fstype("osxfuse"));
+    CHECK_FALSE(macos::is_network_mount_fstype("apfs"));
+    CHECK_FALSE(macos::is_network_mount_fstype("devfs"));
+}
+
+TEST_CASE("macos::is_user_home_entry: a real home is a non-dot name, a directory seen without "
+          "following a symlink, owned by uid >= 500",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::is_user_home_entry("alice", true, 501));
+    CHECK(macos::is_user_home_entry("bob", true, 500));
+    CHECK_FALSE(macos::is_user_home_entry("Shared", true, 0));      // root-owned
+    CHECK_FALSE(macos::is_user_home_entry("daemon", true, 499));    // below the user range
+    CHECK_FALSE(macos::is_user_home_entry("linked", false, 501));   // a symlink (NOFOLLOW) or file
+    CHECK_FALSE(macos::is_user_home_entry(".localized", false, 0)); // dotfile
+    CHECK_FALSE(macos::is_user_home_entry(".hidden", true, 501));
+    CHECK_FALSE(macos::is_user_home_entry("", true, 501));
+    CHECK(macos::home_name_eligible("alice"));
+    CHECK_FALSE(macos::home_name_eligible("."));
+    CHECK_FALSE(macos::home_name_eligible(".."));
+}
+
+TEST_CASE("macos::append_tcc_source_rows: per-user rows qualified; every category is a row -- "
+          "decoded grants, absent when clean and empty, unreadable when the step failed",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    // Shaped on the real per-user TCC.db rows this Mac returned on 2026-09-23
+    // (kTCCServiceMicrophone|com.microsoft.teams2|2).
+    const std::vector<macos::TccServiceRead> reads{
+        {"camera", {}, false},
+        {"microphone", {{"com.microsoft.teams2", 2}, {"com.example.Broken", std::nullopt}}, false},
+        {"full_disk_access", {}, true},
+    };
+    macos::append_tcc_source_rows("alice", reads, rows, acc);
+    REQUIRE(rows.size() == 4);
+    CHECK(format_row(rows[0]) == "permissions|macos|alice/-|camera|absent|-|-|-");
+    CHECK(format_row(rows[1]) == "permissions|macos|alice/com.microsoft.teams2|microphone|allowed|2|-|-");
+    CHECK(rows[2].state == PermissionState::unreadable);
+    CHECK(rows[2].raw == "alice:tcc_db:microphone:auth_value_unreadable");
+    CHECK(rows[3].category == "full_disk_access");
+    CHECK(rows[3].state == PermissionState::unreadable);
+    CHECK(rows[3].raw == "alice:tcc_db:full_disk_access:query_step_failed");
+    CHECK(acc.reason() ==
+          "alice:tcc_db:microphone:auth_value_unreadable,alice:tcc_db:full_disk_access:query_step_failed");
+
+    // The system db (empty owner) keeps its unqualified rows.
+    std::vector<PermissionRow> sys;
+    const std::vector<macos::TccServiceRead> sys_reads{
+        {"full_disk_access", {{"com.microsoft.VSCode", 2}}, false}};
+    macos::append_tcc_source_rows({}, sys_reads, sys, acc);
+    REQUIRE(sys.size() == 1);
+    CHECK(format_row(sys[0]) == "permissions|macos|com.microsoft.VSCode|full_disk_access|allowed|2|-|-");
+}
+
+TEST_CASE("macos::append_tcc_source_rows: a failed bind is one unreadable row for that category "
+          "and never an absent one",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows;
+    const std::vector<macos::TccServiceRead> reads{{"camera", {}, false, true}};
+    macos::append_tcc_source_rows({}, reads, rows, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].category == "camera");
+    CHECK(rows[0].state == PermissionState::unreadable);
+    CHECK(rows[0].raw == "tcc_db:camera:query_bind_failed");
+    CHECK(acc.reason() == "tcc_db:camera:query_bind_failed");
+}
+
+TEST_CASE("macos::tcc_source_failed_row: absent carries no token; denied/unreadable carry "
+          "`<source>:<cause>` and are never absent",
+          "[privacy_permissions][macos_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    const auto absent = macos::tcc_source_failed_row("bob", {macos::SourceOutcome::absent, {}}, acc);
+    CHECK(format_row(absent) == "permissions|macos|bob/-|-|absent|-|-|-");
+    CHECK_FALSE(acc.any_failure());
+
+    const auto denied = macos::tcc_source_failed_row(
+        "bob", {macos::SourceOutcome::denied, "open_failed:errno_1"}, acc);
+    CHECK(denied.state == PermissionState::denied);
+    CHECK(denied.read_denied);
+    CHECK(denied.raw == "bob:tcc_db:open_failed:errno_1");
+
+    const auto sys = macos::tcc_source_failed_row(
+        {}, {macos::SourceOutcome::unreadable, "open_failed:disk I/O error"}, acc);
+    CHECK(sys.app_id == "-");
+    CHECK(sys.state == PermissionState::unreadable);
+    CHECK(sys.raw == "tcc_db:open_failed:disk I/O error");
+}
+
+TEST_CASE("macos::token_safe and tcc_source_key: a name in a provenance token carries no delimiter "
+          "or control character",
+          "[privacy_permissions][macos_parsers]") {
+    CHECK(macos::token_safe("alice") == "alice");
+    CHECK(macos::token_safe("a,b|c\\d\ne\x7f") == "a/b/c/d e ");
+    CHECK(macos::tcc_source_key({}) == "tcc_db");
+    CHECK(macos::tcc_source_key("bob") == "bob:tcc_db");
+    // A home named to forge a second token cannot: the comma is folded.
+    CHECK(macos::tcc_source_key("x,evil:tcc_db:open_failed:errno_1") == "x/evil:tcc_db:open_failed:errno_1:tcc_db");
+}
+
+TEST_CASE("macos::sort_grants: client order, ties broken by auth_value (NULL first), so the wire "
+          "order is a total order",
+          "[privacy_permissions][macos_parsers]") {
+    std::vector<macos::TccGrant> g{{"b", 2}, {"a", 3}, {"a", std::nullopt}, {"a", 0}};
+    macos::sort_grants(g);
+    REQUIRE(g.size() == 4);
+    CHECK(g[0].client == "a");
+    CHECK_FALSE(g[0].auth_value.has_value());
+    CHECK(g[1].auth_value == 0);
+    CHECK(g[2].auth_value == 3);
+    CHECK(g[3].client == "b");
+}
+
+TEST_CASE("macos::OutputBudget::charge allocates (format_row), so it must not be noexcept",
+          "[privacy_permissions][macos_parsers]") {
+    macos::OutputBudget b;
+    static_assert(!noexcept(b.charge(std::span<const PermissionRow>{})));
+    CHECK(b.bytes == 0);
 }

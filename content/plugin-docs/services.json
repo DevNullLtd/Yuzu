@@ -640,10 +640,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [
-      "changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md",
-      "changelog.d/4513-macos-services-malformed-capture-constrained.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/services.yaml"
     ],

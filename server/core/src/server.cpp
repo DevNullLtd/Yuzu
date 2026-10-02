@@ -30,6 +30,7 @@
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/enrollment_cfg_import.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -187,11 +188,13 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
@@ -479,6 +482,45 @@ std::optional<std::int64_t> legacy_sqlite_row_count(const std::filesystem::path&
     if (sqlite3_step(stmt.get()) != SQLITE_ROW)
         return std::nullopt;
     return sqlite3_column_int64(stmt.get(), 0);
+}
+
+// WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg import
+// (system principal, like the other boot-time posture rows). One row per file
+// kind that did something noteworthy: `imported` (result=success),
+// `fingerprint_mismatch` (result=warning: a restored/edited file was REFUSED)
+// or `error` (result=failure). `absent` / `already_imported` are the steady
+// state and deliberately write no row. Shared by the normal successful-boot
+// drain AND the fatal-import one-shot write (PR #5107 review, Should-fix) —
+// EXTEND this, never fork a second copy of the event shape.
+void write_enrollment_import_audit_rows(
+    yuzu::server::AuditStore& audit_store,
+    const std::vector<yuzu::server::enrollment_import::KindReport>& reports) {
+    using yuzu::server::enrollment_import::Outcome;
+    for (const auto& r : reports) {
+        if (r.outcome == Outcome::absent || r.outcome == Outcome::already_imported)
+            continue;
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "system";
+        ev.principal_role = "system";
+        ev.action = "enrollment.import";
+        ev.target_type = "Enrollment";
+        ev.target_id = r.kind;
+        ev.detail = "source=" + r.source.string() + " sha256=" + r.fingerprint +
+                    " imported=" + std::to_string(r.counts.imported) +
+                    " skipped_existing=" + std::to_string(r.counts.skipped_existing) +
+                    " skipped_garbled=" + std::to_string(r.parse.garbled) +
+                    " recovered_colon=" + std::to_string(r.parse.recovered) +
+                    " id_disambiguated=" + std::to_string(r.counts.id_disambiguated) +
+                    " renamed=" + (r.renamed ? "true" : "false") +
+                    (r.detail.empty() ? "" : " reason=" + r.detail);
+        ev.result = r.outcome == Outcome::imported
+                        ? "success"
+                        : (r.outcome == Outcome::fingerprint_mismatch ? "warning" : "failure");
+        (void)audit_store.log(ev);
+    }
 }
 } // namespace
 } // namespace yuzu::server
@@ -3003,6 +3045,51 @@ public:
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
                         "invalidate_user", "invalidate", "mark_mfa", "elevate"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
+        // shared by every replica) and fail CLOSED on any store failure. This
+        // counts each degrade so an operator can tell "agents cannot enroll /
+        // the approval queue is unreadable" from a quiet fleet. `op` = the
+        // AuthManager call; `reason` = no_store (no AuthDB attached: shutdown /
+        // never wired) | pool_acquire_timeout (no PG lease) | query_error (a
+        // statement/txn ran and failed). Bad caller input is NOT a degrade.
+        metrics_.describe("yuzu_auth_enrollment_store_degrade_total",
+                          "Enrollment-token / pending-agent store calls that failed closed "
+                          "(labelled by op and reason: no_store / pool_acquire_timeout / "
+                          "query_error); Register returns UNAVAILABLE and the admin views "
+                          "return 503 or an unknown state, never an empty or zero result",
+                          "counter");
+        for (auto op : {"create_token", "consume", "list_tokens", "revoke_token", "add_pending",
+                        "ensure_enrolled", "pending_status", "list_pending", "approve", "deny",
+                        "bulk_approve", "bulk_deny", "remove"})
+            for (auto reason : {"no_store", "pool_acquire_timeout", "query_error"})
+                metrics_.counter("yuzu_auth_enrollment_store_degrade_total",
+                                 {{"op", op}, {"reason", reason}});
+        // WS-6 6.2: the one-time legacy enrollment .cfg import. `kind` = tokens |
+        // pending; `outcome` = imported | already_imported | fingerprint_mismatch |
+        // absent | error. A steady-state boot is `absent` (nothing to import) or
+        // `already_imported` (file survived a failed rename). fingerprint_mismatch means
+        // a restored old backup / edited file was REFUSED (Postgres state stands); error
+        // means the server refused to start.
+        metrics_.describe("yuzu_server_enrollment_import_total",
+                          "One-time legacy enrollment .cfg import outcomes per file kind "
+                          "(kind: tokens / pending; outcome: imported / already_imported / "
+                          "fingerprint_mismatch / absent / error)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto outcome : {"imported", "already_imported", "fingerprint_mismatch",
+                                 "absent", "error"})
+                metrics_.counter("yuzu_server_enrollment_import_total",
+                                 {{"kind", kind}, {"outcome", outcome}});
+        metrics_.describe("yuzu_server_enrollment_import_rows_total",
+                          "Rows handled by the one-time legacy enrollment .cfg import "
+                          "(result: imported / skipped_existing / skipped_garbled / "
+                          "recovered_colon / id_disambiguated / unplaceable)",
+                          "counter");
+        for (auto kind : {"tokens", "pending"})
+            for (auto result : {"imported", "skipped_existing", "skipped_garbled",
+                                "recovered_colon", "id_disambiguated", "unplaceable"})
+                metrics_.counter("yuzu_server_enrollment_import_rows_total",
+                                 {{"kind", kind}, {"result", result}});
         metrics_.describe("yuzu_auth_session_reap_total",
                           "Expired durable operator-session rows deleted by the clock-guarded "
                           "retention sweep",
@@ -3161,6 +3248,90 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
+        // log-only on failure at every REST/MCP call site — a sustained
+        // pool/query degrade on either had no Prometheus signal, only an
+        // spdlog::error line. `op` names which call failed, `surface` which
+        // family of handler hit it. Pre-seeded below so absent() stays
+        // meaningful (same closed-label-set convention as
+        // yuzu_exec_correlation_read_degrade_total above). A sustained
+        // mark_cancelled failure specifically can leave an execution row
+        // stranded at status='running' forever (#4982) — see the stuck-row
+        // sweep this issue also adds for the recovery side.
+        //
+        // #4982 fix round 2 (Fix 5): the identical swallowed-failure pattern
+        // also existed, uninstrumented, at the equivalent call sites in
+        // workflow_routes.cpp, schedule_runner.cpp and
+        // command_outbox_delivery.cpp — three more dispatch/redispatch
+        // surfaces than the original REST/MCP pair. `surface` widens to 5
+        // values (rest|mcp|workflow|schedule|outbox); 2 ops x 5 surfaces = 10
+        // pre-seeded series, but {op=set_agents_targeted,surface=outbox}
+        // (governance Gate 4 finding, happy-path) can fire on neither success
+        // nor failure and reads 0 forever by construction, not drift:
+        // command_outbox_delivery.cpp's set_agents_targeted write moved into
+        // the atomic CommandDeliveryFinalizationOwner::mark_sent_with_target,
+        // whose own failure counts via the pre-existing
+        // yuzu_server_command_outbox_deliver_degrade_total instead.
+        // {op=set_agents_targeted,surface=schedule} is dead for the same
+        // reason: schedule_runner.cpp never calls set_agents_targeted at all
+        // (grepped - it only ever calls mark_cancelled with surface=schedule;
+        // dispatch for a schedule-originated command sets agents_targeted,
+        // if at all, via the outbox delivery path above, which counts under
+        // surface=outbox). 8 of the 10 pre-seeded series are reachable
+        // (review round 2, Doomgoose PR #5226).
+        metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
+                          "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
+                          "failed (pool exhaustion or a failed statement) at a dispatch call "
+                          "site, by op (set_agents_targeted|mark_cancelled) and surface "
+                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
+                          "retrying in an already-degraded-store request handler/background "
+                          "worker risks doubling request latency or delaying the next tick for "
+                          "no reliability gain.",
+                          "counter");
+        for (auto op : {"set_agents_targeted", "mark_cancelled"})
+            for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
+                metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", op}, {"surface", surface}});
+        // #4982 Part B — the recovery side of the counter above:
+        // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
+        // execution row permanently wedged at status='running',
+        // agents_targeted=0, via ONE atomic in-transaction `UPDATE ...
+        // RETURNING id` that re-checks the full candidate predicate at
+        // mutation time — NOT a separate post-commit mark_cancelled() call
+        // (fix round 2 TOCTOU close; see that method's own comment).
+        // outcome="cancelled" counts by the number of rows the RETURNING set
+        // actually confirmed transitioned this pass; outcome="not_cancelled"
+        // counts candidates the earlier SELECT chose that the atomic UPDATE's
+        // RETURNING set excluded — the row no longer matched the predicate at
+        // mutation time (a genuine dispatch landed, the outbox row moved back
+        // to pending, or the row otherwise changed between the SELECT and the
+        // UPDATE), never a failed write (the UPDATE statement failing outright
+        // aborts the whole pass as outcome="degraded" instead — see below);
+        // outcome="clock_anomaly"/"would_wipe" each count once per pass
+        // DECLINED for that reason (an implausible now()/anchor reading, or
+        // candidates being an implausibly large fraction of all running
+        // executions — likely a systemic bug, not a genuine backlog);
+        // outcome="degraded" counts a pass that failed outright (pool/query
+        // degradation). Bounded 5-value closed set, pre-seeded below so
+        // absent() stays meaningful (same convention as the gateway-route
+        // reap outcome family).
+        metrics_.describe("yuzu_exec_tracker_stuck_reap_total",
+                          "reap_stuck_running_executions() pass outcomes (#4982 Part B), by "
+                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded|"
+                          "capped|skipped). cancelled/not_cancelled increment by the per-row "
+                          "count for an accepted pass; would_wipe/clock_anomaly/degraded "
+                          "increment once per declined/failed pass; capped increments once per "
+                          "ACCEPTED pass whose true backlog exceeded the per-pass cap - a "
+                          "sustained non-zero capped rate means the reaper is chronically behind "
+                          "even though it is successfully cancelling every pass, same meaning as "
+                          "the gateway-route-reap sibling's ok_capped; skipped increments once "
+                          "when another replica already held the advisory lock this tick - "
+                          "routine on a multi-replica deployment, same meaning as that sibling's "
+                          "own skipped.",
+                          "counter");
+        for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
+                                     "degraded", "capped", "skipped"})
+            metrics_.counter("yuzu_exec_tracker_stuck_reap_total", {{"outcome", outcome}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
         // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
@@ -4697,6 +4868,49 @@ public:
                         startup_failed_ = true;
                     } else {
                         auth_mgr_.set_auth_db(auth_db_.get());
+
+                        // WS-6 6.2: one-time import of the legacy per-replica
+                        // enrollment-tokens.cfg / pending-agents.cfg into Postgres.
+                        // Runs HERE - right after the auth store is wired and
+                        // before any listener binds, so no Register can be served
+                        // against a half-imported enrollment set - and never from a
+                        // main.cpp one-shot (--mfa-reset / --generate-tokens must
+                        // not import or rename). A missing file is a no-op; a PG
+                        // error with a file present refuses to start (like the
+                        // first-boot admin seed): a half-known enrollment set is
+                        // worse than no boot. On a normal boot the reports are
+                        // kept and drained into the audit store once it's built
+                        // below (audit_store_ isn't constructed yet at this point
+                        // in the boot sequence).
+                        auto imported = enrollment_import::run_legacy_enrollment_import(
+                            *auth_db_,
+                            enrollment_import::Locations{cfg_.data_dir,
+                                                         cfg_.auth_config_path.parent_path()},
+                            &metrics_);
+                        if (imported.fatal) {
+                            spdlog::error("[PG] Refusing to start: the one-time legacy enrollment "
+                                          ".cfg import failed with a file present (see the "
+                                          "[enrollment-import] lines above)");
+                            startup_failed_ = true;
+                            // The refusal above means `audit_store_` (below) is
+                            // never constructed on THIS boot, and a later boot's
+                            // reports are a fresh, unrelated import attempt — so
+                            // the documented enrollment.import failure row
+                            // (docs/observability-conventions.md) would otherwise
+                            // never be written for the failure that actually
+                            // caused this refusal (PR #5107 review, Should-fix).
+                            // A one-shot AuditStore over the same still-open
+                            // pg_pool_ writes it here, best-effort (a dead audit
+                            // store is exactly the kind of failure this row would
+                            // have described anyway; the loud spdlog::error above
+                            // is the primary signal either way).
+                            AuditStore one_shot_audit(*pg_pool_, cfg_.audit_retention_days);
+                            if (one_shot_audit.is_open())
+                                write_enrollment_import_audit_rows(one_shot_audit,
+                                                                   imported.reports);
+                        } else {
+                            enrollment_import_reports_ = std::move(imported.reports);
+                        }
                     }
                 }
             }
@@ -5247,6 +5461,18 @@ public:
                              .detail = detail_json,
                              .result = failure ? "failure" : "success"});
                     });
+            }
+
+            // WS-6 6.2 - durable evidence of the one-time legacy enrollment .cfg
+            // import (system principal, like the other boot-time posture rows).
+            // Shared with the fatal-import one-shot write above
+            // (write_enrollment_import_audit_rows) — a `startup_failed_` boot
+            // never reaches here (audit_store_ isn't built), which is exactly
+            // why that path writes its own row via a throwaway AuditStore
+            // instead of relying on this drain.
+            if (audit_store_ && audit_store_->is_open()) {
+                write_enrollment_import_audit_rows(*audit_store_, enrollment_import_reports_);
+                enrollment_import_reports_.clear();
             }
 
             // Gate 7 compliance F-1 — durable evidence that the viz
@@ -14779,6 +15005,16 @@ private:
                              .audit_fn = audit_fn,
                              .fleet_read_fn = fleet_read_fn,
                              .all_agent_ids_fn = [this] { return registry_.all_ids(); },
+                             // #5047: same belt as the /api/v1/result-sets JSON
+                             // write routes — these fragments are plain HTTP
+                             // endpoints too, not cookie-session-only. The
+                             // SOLE production factory (see its own doc
+                             // comment, auth_routes.hpp) — never re-inline
+                             // this as a local lambda; a second copy is
+                             // exactly how the original clause-5 violation
+                             // this belt exists to prevent could recur
+                             // unreviewed at a 9th call site.
+                             .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),
                              .store = result_set_store_.get(),
                              .metrics = &metrics_,
                          });
@@ -15929,6 +16165,16 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // #4982 Part B: the stuck-running-execution sweep. Tighter than
+                // the 60m correlation-table cadence above — this recovers a
+                // CORRECTNESS bug (an execution wedged at status='running'
+                // forever), not routine hygiene on an opaque-id table, so a
+                // ~15m cadence (matching the session-reap cadence) surfaces a
+                // genuinely wedged row reasonably promptly without hammering
+                // the pool for what should be a rare event. See
+                // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
+                // PlausibleSkewSecs for how this cadence sizes those constants.
+                constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -16183,6 +16429,104 @@ private:
                                         .increment();
                             } else {
                                 metrics_.counter("yuzu_exec_correlation_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2e2) #4982 Part B: the stuck-running-execution sweep —
+                        // recovers an execution row permanently wedged at
+                        // status='running', agents_targeted=0 (see
+                        // ExecutionTracker::reap_stuck_running_executions's own
+                        // doc comment for the full false-positive-avoidance
+                        // reasoning: the outbox-pending exclusion, the
+                        // would-wipe ratio gate, and the clock-guard shape).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kStuckExecReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_stuck_running_executions()) {
+                                if (reaped->cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "cancelled"}})
+                                        .increment(static_cast<double>(reaped->cancelled));
+                                if (reaped->not_cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "not_cancelled"}})
+                                        .increment(static_cast<double>(reaped->not_cancelled));
+                                if (reaped->would_wipe)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "would_wipe"}})
+                                        .increment();
+                                if (reaped->clock_anomaly)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "clock_anomaly"}})
+                                        .increment();
+                                if (reaped->capped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "capped"}})
+                                        .increment();
+                                if (reaped->skipped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "skipped"}})
+                                        .increment();
+                                // governance Gate 2 fix (security-guardian, SHOULD): this
+                                // sweep force-cancels executions the same way the
+                                // operator-initiated DELETE route does (execution_routes.cpp's
+                                // "execution.cancel" audit action) — a background actor
+                                // silently transitioning a command's terminal state is exactly
+                                // the class audit coverage exists to catch. principal="system"
+                                // (no HTTP session/token principal; matches this file's own
+                                // server.viz_disabled precedent), principal_class left at its
+                                // documented "" default (AuditEvent's own doc comment: that
+                                // field is reserved for a session/token principal this program
+                                // CAN attribute, which a background writer is not).
+                                if (audit_store_ && audit_store_->is_open()) {
+                                    const std::int64_t audit_now_s =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    // governance Gate 6 fix (sre, HIGH): a degraded audit
+                                    // pool makes every log() call wait out the full
+                                    // kWriteTimeout (4s) before failing — up to 500
+                                    // sequential calls on a capped pass could stall THIS
+                                    // thread (which also runs poll_event_outbox_once's
+                                    // every-tick cross-replica SSE delivery and the
+                                    // sibling reaps) for ~33 minutes. A pool-exhaustion
+                                    // timeout does not recover call-to-call, so break on
+                                    // the FIRST failure rather than retrying the same
+                                    // degraded pool up to 500 times; the audit gap itself
+                                    // is already counted (AuditStore::log increments
+                                    // yuzu_server_audit_emit_failed_total internally) and
+                                    // the store-degrade metric below.
+                                    for (const auto& cancelled_id : reaped->cancelled_ids) {
+                                        AuditEvent ev;
+                                        ev.timestamp = audit_now_s;
+                                        ev.principal = "system";
+                                        ev.action = "execution.cancel";
+                                        ev.target_type = "execution";
+                                        ev.target_id = cancelled_id;
+                                        ev.detail = "reap_stuck_running_executions";
+                                        ev.result = "success";
+                                        if (!audit_store_->log(ev)) {
+                                            spdlog::warn(
+                                                "stuck-execution reap: audit write failed for "
+                                                "execution_id={} -- stopping this pass's audit "
+                                                "loop early (degraded pool), remaining "
+                                                "cancellations in this pass are unaudited",
+                                                cancelled_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                spdlog::warn("stuck-execution reap failed: {}", reaped.error());
+                                metrics_
+                                    .counter("yuzu_exec_tracker_stuck_reap_total",
+                                             {{"outcome", "degraded"}})
                                     .increment();
                             }
                         }
@@ -19188,7 +19532,17 @@ private:
             // degrades when its own backing store is absent, the exact same
             // per-route degrade the old `!guaranteed_state_store`/
             // `!baseline_store` guards produced.
-            guardian_api);
+            guardian_api,
+            // #5047: closes the cross-transport MCP-tier bypass on the 4
+            // result-set write routes — the SAME belt `require_permission`
+            // applies to every RBAC-gated route, threaded here because this
+            // family has no `perm_fn` call at all (ownership-only by
+            // design). The SOLE production factory (see its own doc
+            // comment, auth_routes.hpp) — never re-inline this as a local
+            // lambda; a second copy is exactly how the original clause-5
+            // violation this belt exists to prevent could recur unreviewed
+            // at a 9th call site.
+            auth_routes_->gateless_tier_policy_fn());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -20066,11 +20420,13 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
         yuzu::server::capdecls::plugin_action_catalogue_printing(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
+        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
         yuzu::server::capdecls::plugin_action_catalogue_app_control(),
         yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
         yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
         yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
+        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
         yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
         yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
         yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
@@ -20523,6 +20879,10 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // WS-6 6.2: outcome of the one-time legacy enrollment .cfg import (see the
+    // boot block after set_auth_db). Held until audit_store_ is constructed, then
+    // emitted as `enrollment.import` rows.
+    std::vector<enrollment_import::KindReport> enrollment_import_reports_;
     // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
     // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
     // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via

@@ -37,7 +37,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
-| `--data-dir` | *(config dir)* | Directory for runtime state files (enrollment tokens, pending agents, auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
+| `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories. All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
@@ -92,6 +92,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mfa-step-up-window-secs` | `300` | Seconds after a successful TOTP proof during which 24 high-risk REST + Settings endpoints (PR2 of the MFA ladder, since extended) accept the session as "stepped up" without re-prompting. Set to `0` to disable the gate entirely (emits a startup `WARN`). Env: `YUZU_MFA_STEP_UP_WINDOW_SECS`. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state is per-process (lost on restart, not shared across HA replicas without sticky sessions). Env: `YUZU_MFA_LOGIN_PENDING_SECS`. |
 | `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`), and the same `--config` the service uses if it is not at the platform default (`/etc/yuzu/yuzu-server.cfg` on Linux and root macOS; `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows) — the container images run with `--config /var/lib/yuzu/yuzu-server.cfg`, and without it the binary falls into interactive first-run setup and exits. No TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| `--generate-tokens <N>` | *(none)* | Mint `N` enrollment tokens directly into the same PostgreSQL `auth.enrollment_tokens` store the running server reads (WS-6 6.2), and exit **without starting the server** — the recovery/scripting equivalent of the dashboard "Generate Token" button. Requires the Postgres auth store (`--postgres-dsn` / `YUZU_POSTGRES_DSN`); refuses with the same style of message as `--mfa-reset` when it is absent or unreachable. Tokens are attributed `created_by = "cli:<OS account that ran the CLI>"` (kernel-authoritative identity, `getpwuid(geteuid())`/`GetUserNameA`, not `getenv("USER")` — the same anti-forgery rule the break-glass audit rows use), so a dashboard operator reviewing the token list can tell a CLI-minted batch apart from one minted through `POST /api/settings/enrollment-tokens`. Companions: `--token-label` (label prefix, default `batch-<n>`), `--token-max-uses` (default `1`; `0` = unlimited), `--token-ttl-hours` (default `0` = never expires). Prints `{"count":N,"tokens":[...]}` to stdout (each raw token shown once — capture it now) and exits non-zero if any token fails to persist, naming how many of the batch minted before the failure (those remain valid; revoke via the dashboard). Does **not** run the one-time legacy `.cfg` import (that only ever runs from the server's own boot path, immediately after the auth store is wired — never from a CLI one-shot). |
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
 | `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
@@ -169,8 +170,6 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 | File | Purpose |
 |---|---|
 | `yuzu-server.cfg` | First-boot seed for the initial admin. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt, which is seeded into the PostgreSQL `auth` schema on first boot. After that the `auth` schema is authoritative — keep this file as the seed for disaster recovery. |
-| `enrollment-tokens.cfg` | Live Tier-2 enrollment-token store. Holds token hashes, never plaintext tokens. |
-| `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 | `auto-approve.cfg` | Auto-approve enrollment policy rules and match mode. |
 | `nvd_cves.db` | NVD CVE cache. The one remaining server SQLite store — a recorded deferral, not a permanent exemption (`docs/postgres-migration-ladder.md`). |
 | `agent-updates/` | Agent OTA package binaries. The package records (`update_registry.update_packages`) are in PostgreSQL; the files they name live here. Relocated by `--update-dir` when that flag is set. |
@@ -183,7 +182,9 @@ The server's configuration file (`--config`, default `/etc/yuzu/yuzu-server.cfg`
 > - **SAN limitation.** Default leaf SANs cover `localhost`, `127.0.0.1`, `::1`, and the boot-time hostname only. Reaching the dashboard/agent listener by a LAN IP or a different FQDN needs operator-provided certs (or DNS that resolves to a covered name). A host rename invalidates the SAN — rotate the certs after renaming.
 > - **No silent re-root.** If `ca_store` (the internal-CA Postgres store, ADR-0053) already holds a CA root but the on-disk certs in `--ca-dir` are missing/corrupt (e.g. a wiped cert dir on a persistent data volume, or ordinary later damage to an established install — a bad partial restore, a lost leaf file), the server **refuses to start** rather than mint a new CA that would orphan every enrolled agent — **unless this exact instance can prove it minted the still-incomplete root** (its local CA key file still resolves and cryptographically pairs with the stored root), in which case it resumes automatically and re-mints its own default leaves under the same root (ADR-0053). When that self-heal condition does not hold, restore `default-*.{pem,key}` from backup (matching the `ca_store` root), or perform a deliberate clean re-root by clearing `ca_store.ca_root`/`ca_issued`/`ca_crl_versions` directly against Postgres — see `docs/pki-architecture.md` "Operator runbook" for the full procedure.
 
-> **File permissions (Unix):** `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are `0600` after every write, and the KEK files in `--ca-dir` are created `0600`. No manual `chmod` is required.
+> **Enrollment tokens and the pending-agent approval queue are in PostgreSQL** (WS-6 6.2, `auth.enrollment_tokens` / `auth.pending_agents` — see [PostgreSQL Substrate](#postgresql-substrate)), not `--data-dir` files: every server replica shares one authoritative view, and `--generate-tokens` mints straight into the same store the running server reads. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported once, automatically, at the first 6.2 boot, then renamed to `<name>.cfg.imported` and never read again (see the `enrollment.import` audit action and the `yuzu_server_enrollment_import_total` metric).
+
+> **File permissions (Unix):** `yuzu-server.cfg` is `0600` after every write, and the KEK files in `--ca-dir` are created `0600`. No manual `chmod` is required.
 
 > **Windows Defender:** No authentication-file exclusion applies — authentication state is in PostgreSQL, not a local database file. See `docs/ops-runbooks/auth-db-recovery.md`.
 
@@ -222,6 +223,35 @@ separately.
 ---
 
 ## Upgrade Notes
+
+### vNEXT — a new always-on background sweep auto-cancels executions already stuck at `running` (#4982, NOT breaking)
+
+**What changed.** A new clock-guarded background pass, `ExecutionTracker::reap_stuck_running_executions`
+(~15-minute cadence, no CLI flag or env var — same unconfigurable-by-design posture as its
+sibling reapers), recovers an execution row left permanently stranded at `status='running'`
+because a post-dispatch bookkeeping write (`set_agents_targeted`/`mark_cancelled`) itself failed.
+It excludes any execution with a still-pending outbox entry or with at least one real per-agent
+response already recorded — only a genuinely-orphaned row (never reached, or genuinely abandoned
+by a dispatch that failed its own cleanup) is cancelled.
+
+**What an operator sees on this upgrade.** Any execution rows ALREADY stranded at `running`
+before this build started will usually auto-cancel within roughly 15–30 minutes of the first
+post-upgrade tick that reaches them, each writing a new `execution.cancel` audit row with
+`principal="system"` on a best-effort basis (if the audit store is unavailable, that pass's
+cancellations go unaudited — see `yuzu_server_audit_emit_failed_total`) — the first system-sourced
+row that action has ever carried; a SIEM rule or dashboard filter keyed only on human/session
+principals for `execution.cancel` will not see these. The 15–30 minute figure assumes a normal-sized
+backlog: if the pre-existing stranded population is unusually large, the sweep caps itself at 500
+cancellations per pass (`capped`, draining the rest over following passes) or, if stranded rows
+exceed half of all currently-running executions, declines to act at all (`would_wipe`) on the
+assumption that something more systemic is wrong rather than a one-time backlog — in that case the
+rows stay `running` and `yuzu_exec_tracker_stuck_reap_total{outcome="would_wipe"}` holds nonzero
+until an operator investigates and, if the backlog really is benign, cancels it by hand to bring the
+ratio back under the sweep's own threshold. This is otherwise a one-time settling period for
+pre-existing stuck rows, not an ongoing behaviour change for new dispatches.
+See `docs/user-manual/metrics.md` "Execution bookkeeping + stuck-execution reap metrics" for the
+new `yuzu_exec_tracker_stuck_reap_total{outcome}` counter and `docs/clock-guarded-retention.md`
+for the full design.
 
 ### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
 
@@ -346,6 +376,37 @@ MCP caller pattern-matching the old `RESULT_SET_STORE_UNAVAILABLE` token string 
 post-dispatch branch should update to the new token (the 3 MCP tool descriptions in `kTools[]`
 document both tokens explicitly).
 
+### vNEXT — the 4 result-set write routes now enforce MCP tier/approval, closing a cross-transport bypass (#5047, breaking)
+
+**What changed.** `POST /api/v1/result-sets`, `/{id}/pin`, `/{id}/unpin`, and `DELETE
+/api/v1/result-sets/{id}` — and their dashboard-fragment equivalents — previously had no RBAC or
+MCP-tier gate at all beyond ownership; only their MCP tool twins (`create_result_set`,
+`pin_result_set`, `unpin_result_set`, `delete_result_set`) enforced the tier/approval belt every
+other MCP-tiered operation gets. An MCP-tiered bearer token could reach the identical mutation
+its own tool is gated for simply by calling REST or a dashboard fragment instead of `/mcp/v1/`.
+All 8 sites now apply the same belt MCP already did: a `readonly`- or `operator`-tier bearer is
+denied `Infrastructure:Write`/`Infrastructure:Delete` outright; a `supervised`-tier bearer
+deleting a set must use the MCP ticket-then-recall flow (REST/fragment delete now requires
+approval on every transport except `/mcp/v1/` itself, matching create/pin/unpin's own approval
+posture — the routes never granted approval, they simply had no gate to enforce it). Ownership
+remains the primary, and for a plain (untiered) session the ONLY, gate — this is not a new RBAC
+securable and does not change who can reach their own result sets; see
+[rbac.md's "Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets).
+The still-open, separately-tracked [#4309](https://github.com/Tr3kkR/Yuzu/issues/4309) gap — a
+plain RBAC session or an API token minted with no `mcp_tier` skips this belt entirely, on every
+transport, including MCP itself — is unaffected by this change.
+
+**Who this affects.** Any integration that mints MCP-tiered bearer tokens (readonly/operator/
+supervised) and calls the JSON `/api/v1/result-sets*` routes or the dashboard fragments directly,
+rather than going through `/mcp/v1/`. A `readonly`- or `operator`-tier caller that previously
+reached create/pin/unpin/delete on their own result sets via REST now gets `403`
+(`"MCP token tier does not allow Infrastructure:Write"` or `:Delete`). A `supervised`-tier caller
+deleting via REST now gets `403` with a `remediation` pointing at the MCP ticket-then-recall
+flow, instead of succeeding directly. A `supervised`-tier caller's create/pin/unpin is unaffected
+(never approval-gated at any tier). An untiered caller (a plain cookie session, or an API token
+minted with no `mcp_tier`) sees no behavior change. See [rest-api.md](rest-api.md)'s per-route
+Errors tables for the exact new status codes.
+
 ### vNEXT — `POST /api/policies/{id}/evaluate` and `/remediate` can now answer `503` where they previously answered `409`/`400` (#4981; breaking)
 
 **What changed.** Both routes previously classified a degraded scope evaluation — a `from_result_set:`
@@ -405,13 +466,15 @@ Retiring or gating these lines once the benchmark concludes is recorded in `docs
 New, non-breaking, purely additive. No operator action required.
 
 Before this change, a gateway that lost and regained its connection to the
-server (a core restart, replica failover, or an ordinary network blip) would
+server (a replica failover or an ordinary network blip) would
 replay its held agent registrations — and on EVERY such replay, the server
 wiped that agent's placement (`gateway_node`/capabilities) before deciding
 whether to reuse or refuse the session, silently making the agent
 unreachable via that gateway until it happened to reconnect on its own. This
 was reachable on a single, otherwise-healthy replica; no core restart was
 required.
+
+This section applies to circuit-recovery replays, not to a server-only restart while a gateway stays connected; for that case see the known limitation under [Server-Side Setup](gateway.md#server-side-setup).
 
 **What changes:** the server now decides adopt-vs-refuse for a replayed
 session before installing anything, the gateway re-announces the agent's own
@@ -2262,33 +2325,101 @@ route, neither the directory nor its ACL hardening exists after upgrading. Creat
 it before you enable signing, or `--update-trust-bundle` points at nothing:
 
 ```powershell
-# Windows, elevated. All three commands matter, and in this order. Keep each on ONE
-# line -- a broken continuation runs the earlier steps and silently skips the rest,
-# which is the exact state this block exists to avoid.
-mkdir "C:\ProgramData\Yuzu\agent-certs"
+# Windows, elevated, in Windows PowerShell. Paste the WHOLE block. It runs only once its
+# closing brace arrives, so a broken paste runs nothing, and it stops at the first check
+# that fails. Nothing in it is recursive: the directory holds only files, and a recursive
+# takeown or icacls would follow a junction planted in it out of the directory.
+& {
+    $ErrorActionPreference = 'Stop'
+    $d = 'C:\ProgramData\Yuzu\agent-certs'
+    # True when $p is a plain directory, owned by Administrators or SYSTEM, protected from
+    # inheritance, and granting exactly those two full control. Accounts are compared by
+    # SID, so this works on any language.
+    function Test-Locked($p) {
+        if (((Get-Item -LiteralPath $p -Force).Attributes -band 1024) -ne 0) { return $false }
+        $s = (Get-Acl -LiteralPath $p).Sddl
+        ($s -match '^O:(BA|SY)G:') -and ($s -match 'D:P[A-Z]*\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$') -and ($Matches[1] -ne $Matches[2])
+    }
 
-# 1. Take ownership. If the directory ALREADY EXISTS, whoever created it owns it and
-#    holds WRITE_DAC permanently -- stripping their access without taking ownership
-#    lets them put it straight back. takeown also enables the privilege needed to
-#    recover a directory whose permissions grant Administrators nothing at all.
-takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
+    if (Test-Path -LiteralPath $d) {
+        # 1. An existing directory must ALREADY be secured, and is not re-locked. This
+        #    procedure does not take over one someone else created: whatever is in it
+        #    already decides which updates the agent trusts. If it stops here, check what
+        #    the directory contains, move any update-trust-bundle.pem you placed there
+        #    yourself somewhere safe, delete the directory -- removing any junction or
+        #    link first with cmd /c rmdir (directory) or cmd /c del (file), which remove
+        #    the link, never its target; never Remove-Item -Recurse, which in Windows
+        #    PowerShell 5.1 deletes a junction target's contents -- run this again, then
+        #    copy the bundle back in.
+        if (-not (Test-Locked $d)) { throw "$d already exists and is not secured. See the step 1 comment." }
 
-# 2. Drop every explicit entry. This is the step that removes a pre-existing grant.
-#    Step 3 cannot: /grant:r replaces grants only for the accounts it NAMES, so an
-#    entry held by anyone else survives it untouched.
-icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
+        # 2. Its contents: plain files only, each already owned by Administrators or
+        #    SYSTEM and not a hard link -- nothing here takes ownership of a file, so it
+        #    only ever repairs files an administrator placed. Then reset them so they
+        #    inherit exactly Administrators and SYSTEM. This repairs the rc1..rc5
+        #    lock-out (#5196).
+        $c = @(Get-ChildItem -LiteralPath $d -Force)
+        $bad = @($c | Where-Object { ($_.Attributes -band 1040) -ne 0 })
+        if ($bad) { throw ("Only files may be in $d. Remove these first (a junction or directory link with cmd /c rmdir, a file link with cmd /c del): " + (($bad | ForEach-Object { $_.FullName }) -join ', ')) }
+        foreach ($i in $c) {
+            if ($i.LinkType -eq 'HardLink') { throw "$($i.FullName) is a hard link. Remove it and copy the file in again." }
+            if ((Get-Acl -LiteralPath $i.FullName).Sddl -notmatch '^O:(BA|SY)G:') { throw "$($i.FullName) is not owned by Administrators or SYSTEM, so it cannot be confirmed you placed it. Inspect it; if it is yours, run: icacls `"$($i.FullName)`" /setowner *S-1-5-32-544 /L" }
+        }
+        if ($c) { icacls "$d\*" /reset /L /C /Q | Out-Null }
+    } else {
+        # 3. A new directory is built and locked in your own temporary folder, which no
+        #    other account can reach, then moved into place, so it never exists unlocked.
+        #    The lock: make Administrators the owner, drop every explicit entry (/grant:r
+        #    alone replaces only the accounts it names), then break inheritance and grant
+        #    exactly Administrators and SYSTEM; /L on each, so icacls acts on the path
+        #    itself. Never /T: on a file the (OI)(CI) grant is invalid, and icacls then
+        #    leaves every existing file with an EMPTY permission list -- SYSTEM, and so
+        #    the agent, can no longer read it -- while still reporting success (#5196).
+        #    If something takes the name first, the checks around the move stop it; see
+        #    step 1 for how to clear it.
+        $stage = Join-Path $env:TEMP ('yuzu-agent-certs-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $stage | Out-Null
+        icacls $stage /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
+        icacls $stage /reset /L /C /Q | Out-Null
+        icacls $stage /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /L /C /Q | Out-Null
+        if (-not (Test-Locked $stage)) { throw "The new directory could not be secured." }
+        if (-not (Test-Path -LiteralPath (Split-Path $d))) { New-Item -ItemType Directory -Path (Split-Path $d) | Out-Null }
+        if (Test-Path -LiteralPath $d) { throw "$d appeared while it was being prepared. Check it and run this again." }
+        Move-Item -LiteralPath $stage -Destination $d
+        if (-not (Test-Locked $d) -or @(Get-ChildItem -LiteralPath $d -Force)) { throw "$d is not as prepared. Remove it and run this again." }
+    }
 
-# 3. Break inheritance and grant exactly Administrators and SYSTEM. Without the
-#    inheritance break, %ProgramData%'s inherited rights let an unprivileged local
-#    user plant the anchor file before you do.
-icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q
-
-# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F),
-# and nothing marked (I). Check the OWNER too -- an unexpected owner can restore its own
-# access at any time, so "the list looks right" is not on its own sufficient.
-icacls "C:\ProgramData\Yuzu\agent-certs"
-(Get-Acl "C:\ProgramData\Yuzu\agent-certs").Owner
+    # 4. Verify -- the same check the installer runs. Every line must say OK: the directory
+    #    protected and granting exactly Administrators and SYSTEM full control, each file
+    #    inheriting exactly that, all owned by Administrators or SYSTEM. A BAD line means
+    #    something else has access or SYSTEM cannot read the item.
+    foreach ($i in @(Get-Item -LiteralPath $d -Force) + @(Get-ChildItem -LiteralPath $d -Force)) {
+        $p = $i.FullName
+        if ((($i.Attributes -band 1024) -ne 0) -or (($p -ne $d) -and (($i.Attributes -band 16) -ne 0))) { 'BAD  {0}  (link or subdirectory)' -f $p; continue }
+        $s = (Get-Acl -LiteralPath $p).Sddl
+        $e = if ($p -eq $d) { 'D:P[A-Z]*\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$' } else { 'D:[A-Z]*\(A;(?:OICI)?ID;FA;;;(SY|BA)\)\(A;(?:OICI)?ID;FA;;;(SY|BA)\)$' }
+        $ok = ($s -match '^O:(BA|SY)G:') -and ($s -match $e) -and ($Matches[1] -ne $Matches[2])
+        '{0}  {1}' -f $(if ($ok) { 'OK ' } else { 'BAD' }), $p
+    }
+}
 ```
+
+Put the bundle in only once the directory exists and is secured, by the installer or
+by this block: copy it in as an administrator, then check that its owner is Administrators or
+SYSTEM (`(Get-Acl <file>).Owner`). Some admin accounts make themselves the owner of files
+they create; if so, inspect the file and make Administrators its owner with
+`icacls "<file>" /setowner *S-1-5-32-544 /L`, or the installer and this block refuse it.
+A directory created or pre-staged any other way is refused by the installer, which
+leaves the agent service as it was, and by this block.
+
+**Endpoints that ran an agent installer from 0.14.0-rc1 to rc5:** those installers took
+over an `agent-certs` that already existed, including anything in it. If you did not
+place the `update-trust-bundle.pem` there yourself, delete it and copy in a fresh one
+before relying on signature checking.
+
+What this does not cover: the parent directory `C:\ProgramData\Yuzu` is not itself
+locked down (#5257), and a process that opened the directory or a file in it before
+it was locked keeps the access it opened with (#5258).
 
 ```bash
 # macOS, as root.
@@ -3126,7 +3257,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. A post-install check verifies the resulting owner and entry set exactly and aborts the install if anything else can write there. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -3152,7 +3283,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | Add the flag to the service's **binary path**. **`sc.exe config binPath=` REPLACES THE ENTIRE COMMAND LINE — it does not append.** Capture the current one first with `sc qc YuzuAgent`, then re-issue it in full with the flag added, keeping the escaped inner quotes exactly as shown under **Windows Service Installation → Agent: `--install-service`** below. Passing only the new flag drops `--server`, `--data-dir`, `--plugin-dir` and `--log-file`; the service then reaches RUNNING, fails closed on startup with no server or CA to pin, and the endpoint silently leaves the fleet while you believe you enabled signing. Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
+| Windows | Set them in the service's own environment, a `REG_MULTI_SZ` value named `Environment` under the service's registry key, then restart the service. **Not in its binary path:** every installer run rewrites that path and drops them, and signing is then silently off (#5196). See *Windows: the service's `Environment` value* below for the commands and the cases that remove the value. |
 
 Every flag below has the environment variable shown beside it:
 
@@ -3163,6 +3294,96 @@ Every flag below has the environment variable shown beside it:
 
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
+
+#### Windows: the service's `Environment` value
+
+The Service Control Manager merges a service's `Environment` value into the
+environment it starts the service with, so the agent sees these variables beside
+the usual `Path`, `SystemRoot` and so on. Elevated, for the trust bundle alone
+(stage 1 of *Rolling signing out to a live fleet*):
+
+```powershell
+reg add HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment /t REG_MULTI_SZ /d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem" /f
+Restart-Service YuzuAgent
+```
+
+For stage 2, give both variables, separated by `\0`:
+`/d "YUZU_UPDATE_TRUST_BUNDLE=C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem\0YUZU_UPDATE_REQUIRE_SIGNATURE=1"`.
+
+Get these right, because several mistakes are silent:
+
+- **`reg add /f` replaces the whole value, and it must stay `REG_MULTI_SZ`.** If
+  the service already has an `Environment` value, read it first with
+  `reg query HKLM\SYSTEM\CurrentControlSet\Services\YuzuAgent /v Environment`.
+  Give its other entries again in the same command (`YUZU_UPDATE_CHECK_INTERVAL`,
+  for example), but leave out any existing `YUZU_UPDATE_TRUST_BUNDLE` and
+  `YUZU_UPDATE_REQUIRE_SIGNATURE` entry and write only the ones for the stage you
+  want: with two entries of the same name, such as `=0` from a rollback and a new
+  `=1`, which one the agent sees is undefined. Group Policy Preferences or another
+  tool must write the value as a properly terminated multi-string too, every
+  entry in `name=value` form and **no empty entry**: the service sees nothing
+  after an empty entry.
+- **Names must be exact.** A misspelt name is ignored without any error, and
+  signing then stays off. Run the check below after every change.
+- **Set `YUZU_UPDATE_REQUIRE_SIGNATURE` to `1`.** The check below requires exactly
+  that. A value the agent cannot read as on or off, such as `enabled` or `1`
+  followed by a space, stops it at startup.
+- **If the service will not start after a change** — `sc.exe start YuzuAgent` fails with
+  error 1053, and the agent's log has nothing new — the agent refused before
+  logging began: `YUZU_UPDATE_REQUIRE_SIGNATURE` without `YUZU_UPDATE_TRUST_BUNDLE`,
+  or a value it cannot read. Correct the value and start the service again.
+- **Installing over the existing agent keeps the value; uninstalling deletes it.**
+  An upgrade or reinstall over an installed agent leaves the service's registry key
+  alone. Uninstalling removes the service, and the value with it. That includes an
+  SCCM or Intune deployment set to uninstall the previous version first. Set it
+  again after any uninstall, and put the bundle file back if it is gone.
+- **Remove any signing flags you put in the binary path earlier,** in either form:
+  `--update-trust-bundle` or the Windows-style `/update-trust-bundle:<path>`, which
+  the agent also accepts (and likewise for `--update-require-signature`). A flag
+  there takes precedence over the variable, until the next installer run silently
+  drops it.
+- **Do not set these variables machine-wide,** with `setx /M` or otherwise.
+  Services inherit the machine environment from `services.exe`, which caches it at
+  boot, so a machine variable is typically NOT visible to a merely-restarted
+  service. The service's own value overrides a machine variable of the same name,
+  and the check below reads only the service's own value.
+
+To check an endpoint, use the script below. Run it elevated, or as SYSTEM (as
+Intune and Configuration Manager compliance scripts run): the bundle directory is
+readable only by Administrators and SYSTEM, so an unelevated run reports NOT
+CONFIGURED. It prints `OK` and exits 0 only when all of these hold:
+
+- the value is a multi-string with no empty entry;
+- its `YUZU_UPDATE_TRUST_BUNDLE` and `YUZU_UPDATE_REQUIRE_SIGNATURE` entries are
+  exactly the ones for the stage set on its first line, with no duplicates (other
+  variables are ignored);
+- the bundle file exists;
+- the binary path carries neither signing flag, in either form.
+
+Otherwise it prints `NOT CONFIGURED` and exits 1. Save it as a `.ps1` and run that,
+or use it as a configuration-management compliance script, comparing its output
+with `OK`. Pasted into an interactive PowerShell window, its `exit` closes the
+window.
+
+```powershell
+$stage = 1   # 2 once the endpoint also refuses unsigned packages
+$b = 'C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem'
+$want = @("YUZU_UPDATE_TRUST_BUNDLE=$b") + @(if ($stage -eq 2) { 'YUZU_UPDATE_REQUIRE_SIGNATURE=1' })
+$k = Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\YuzuAgent
+$have = @($k.Environment | Where-Object { $_ -match '^YUZU_UPDATE_(TRUST_BUNDLE|REQUIRE_SIGNATURE)=' })
+$ok = ($k.Environment -is [string[]]) -and -not ($k.Environment -contains '') -and ($have.Count -eq $want.Count) -and (@($want | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (($k.ImagePath -replace '"', '') -notmatch '(--|/)update-(trust-bundle|require-signature)') -and (Test-Path -LiteralPath $b -PathType Leaf)
+if ($ok) { 'OK'; exit 0 } else { 'NOT CONFIGURED'; exit 1 }
+```
+
+**What `OK` does and does not mean.** It means the service is configured the way
+this section describes. It is not proof that the agent loaded that configuration,
+because the agent does not yet log its signing mode at startup, and it assumes an
+agent recent enough to have these options (`yuzu-agent.exe --help` lists
+`--update-trust-bundle`). It does not check the other entries' contents, only that
+none is empty, and it compares names case-insensitively, so type them in plain ASCII. It also does not
+check that the bundle file holds the right certificates: a wrong bundle makes the
+agent refuse signed updates, which shows in
+`yuzu_agent_ota_signature_refused_total` and the agent log.
 
 ### The verifier's catastrophic invariants
 
@@ -3591,7 +3812,7 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 — backup tooling, Grafana's data source, ad-hoc `psql`. Sized this way the servers cannot exhaust the database by themselves; only other clients can. To keep *them* out of the servers' share, the shipped `yuzu-postgres` images (single-node and the HA Patroni profile) set **`reserved_connections`** (PostgreSQL 16+; default **40**, env `YUZU_PG_RESERVED_CONNECTIONS`, `0` disables) and **grant `pg_use_reserved_connections` to the app role** at first boot. Once the free slots fall to `superuser_reserved_connections + reserved_connections`, only the app role (and superusers) can still connect — so a backup job or a stray session can never take the slot the `/readyz` probe needs to reconnect, which would otherwise turn a replica red on a database that still serves (the probe holds its connection in steady state and reconnects only after a failure; at the limit that reconnect was the connection refused first). The reserve covers the pool and the probe alike — the probe connects exactly as a pool connection does, so it is never green while the pool is refused. Set `YUZU_PG_RESERVED_CONNECTIONS` to `N_servers × (pool_size + 2)` (the default fits two servers at the default pool, e.g. 2 × (16 + 2) = 36 ≤ 40). **Never set it to `max_connections` minus `superuser_reserved_connections` or higher** — both scripts refuse to boot on that value (the boot-time check reads the live `max_connections`; the Patroni entrypoint checks against its own literal 200), because it would leave zero connection slots any ordinary (non-privileged) client could ever use, not merely under load. **On the single-node image this refusal happens AFTER the role/database/grant already exist** on the now-initialized data directory (Postgres's initdb-only-runs-once convention means those steps ran before this check) — restarting the SAME container with a corrected value does **not** retroactively apply anything; either start over on a fresh (wiped) data volume, or apply the fix by hand per "Existing databases" just below. The Patroni entrypoint's check runs before ANY of that (at bootstrap, before the cluster exists), so a Patroni refusal is a clean, no-op-safe retry. **This check runs once, at bootstrap.** A later `patronictl edit-config --set postgresql.parameters.max_connections=...` on an already-running Patroni cluster is not re-validated against the `reserved_connections` value already in force — re-check the arithmetic by hand after any live `max_connections` change (tracked for a real runtime check: #4943 fast-follow). **Existing databases:** first-boot init does not re-run; apply it by hand — `ALTER SYSTEM SET reserved_connections = 40;` (restart required; under Patroni, `patronictl edit-config --set postgresql.parameters.reserved_connections=40` then `patronictl restart <scope>` — `edit-config` alone only writes the DCS config and marks the member pending-restart, it does not apply a postmaster-context GUC like this one; the GRANT below is unchanged either way) and `GRANT pg_use_reserved_connections TO yuzu;`. Verify with `SHOW reserved_connections` and `SELECT pg_has_role('yuzu', 'pg_use_reserved_connections', 'MEMBER')`. On PostgreSQL 15 or older the grant is skipped with a notice and only the formula protects you. **Re-run this same verification** after anything that can silently undo it: a first boot interrupted between the `GRANT` and the `ALTER SYSTEM` (the init script never re-runs once the data directory exists, so a kill in that narrow window leaves the grant in place but the GUC at Postgres's own default of 0 — inert, not incorrect, but not protecting anything either), or any role recreation, credential rotation, or disaster-recovery restore that can drop and re-add the app role without this script running again.
 
-**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+**Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. `Register` also draws a short-lived lease per call, and a mass-reconnect event (a fleet-wide server restart, or a network partition healing across many agents at once) can spike concurrent `Register` calls well above the steady-state heartbeat rate — size with that burst in mind, not just steady-state. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing`, `YuzuServerPostgresUnreachable` in `docs/prometheus/yuzu-alerts.yml`). Pool saturation never affects `/readyz` — a busy but healthy server must stay in rotation — while an unreachable database turns `/readyz` red within seconds, well before those alerts' `for:` windows page. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
 **Saturation fast-fail (not operator-configurable).** When the pool is already saturated at the moment of acquire (no idle connection, no spare capacity to open one), every bounded acquire across every Postgres-backed store now gives up after a short, fixed ceiling (~500 ms) instead of running to the caller's own, often much longer, timeout, freeing the calling worker thread for other routes rather than pinning it on a connection unlikely to free up in time. This substantially reduces, but does not eliminate, the risk of a saturated pool cascading into broader worker-thread exhaustion (including on unrelated routes such as auth) under sustained load; the underlying pool-to-worker sizing ratio is unchanged, so a large enough sustained saturation event can still exhaust worker capacity, just at a materially higher load threshold than before this mitigation. This ceiling is a compiled-in default, not exposed via a CLI flag or environment variable; if it proves wrong for your deployment's connection-hold-time distribution, that is a code change, not a config change. The metrics and alert rules named above (particularly `yuzu_pg_acquire_wait_seconds` and `YuzuPgAcquireWaitHigh`) remain the right signals to watch; a rising rate of fast-failed acquires under this ceiling is visible via the same `yuzu_pg_acquire_timeout_total` counter as a genuine full-timeout exhaustion (the counter does not currently distinguish the two).
 
@@ -4354,7 +4575,9 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/fragments/settings/pending` | Render the pending agents fragment (HTMX). |
 | `POST` | `/api/settings/pending-agents/{id}/approve` | Approve a pending agent. |
 | `POST` | `/api/settings/pending-agents/{id}/deny` | Deny a pending agent. |
-| `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. |
+| `DELETE` | `/api/settings/pending-agents/{id}` | Remove a pending agent from the queue. `409` if the row is no longer `pending` (already `approved`/`denied`) — removal only succeeds against a genuinely pending row, by design (WS-6 6.2). |
+
+The agent-supplied `agent_id` (accepted at gRPC `Register`, not at these admin routes) may not contain an ASCII control character or a comma — both are rejected before the row is ever created, closing an audit-log injection path (WS-6 6.2). A UUID, hostname, or MAC-derived id is unaffected.
 
 ### Auto-Approval Policies
 
@@ -4954,7 +5177,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Important:** the `--service` flag tells the binary to speak the SCM control protocol (`ServiceMain`/`SetServiceStatus`) instead of running as a console program — it is added automatically by `--install-service` and must be present in any `sc.exe`/manually-crafted binPath for the agent. Omitting it reproduces the pre-fix behavior: `sc start` fails with error 1053. Do **not** add `--service` when wrapping the agent with NSSM (below) — NSSM launches the agent as an ordinary child process, not via the SCM itself, so the agent would try (and fail) to connect to a dispatcher that isn't there.
 
-> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
+> **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install. The installer has parameters for those three settings only, so any other flag you added to the binary path -- notably `--update-trust-bundle` and `--update-require-signature` -- is dropped by every installer run with nothing to show it; set those through the service's `Environment` registry value instead, which installing over the existing agent leaves alone, though uninstalling deletes it (see *Windows: the service's `Environment` value*).
 
 **If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 

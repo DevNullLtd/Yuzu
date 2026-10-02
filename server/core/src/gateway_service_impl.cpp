@@ -1,6 +1,8 @@
 #include "gateway_service_impl.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
@@ -165,9 +167,19 @@ void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view
 // this counter as a false "session_mismatch" desync.
 void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op,
                              std::string_view outcome, double count = 1.0) {
-    spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, count={}) "
-                 "— directory may be out of sync with the in-memory session map",
-                 op, outcome, count);
+    if (op == "batch_heartbeat" && outcome == "malformed_session_id") {
+        // No store write is attempted for this outcome, so the guard-rejection
+        // wording below would mislead. The offending id is deliberately not
+        // logged (it is externally supplied and unbounded in content).
+        spdlog::warn("[gateway] BatchHeartbeat: {} entries carried an over-length session_id "
+                     "this replica does not hold (outcome={}); no write was attempted. Likely a "
+                     "buggy gateway or an agent sending a malformed session_id",
+                     count, outcome);
+    } else {
+        spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, "
+                     "count={}) — directory may be out of sync with the in-memory session map",
+                     op, outcome, count);
+    }
     if (metrics) {
         metrics
             ->counter("yuzu_server_gateway_route_desync_total",
@@ -243,7 +255,13 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "DIFFERENT cluster_id than the agent's durably-bound home affinity, refused "
             "fail-closed. ANY non-zero rate is worth investigating (a misconfigured/renamed "
             "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
-            "to tolerate like the others.",
+            "to tolerate like the others. #1197: op=\"batch_heartbeat\", "
+            "outcome=\"malformed_session_id\" counts BatchHeartbeat entries whose session_id "
+            "is over-length and not held by this replica, counted per entry and not deduped "
+            "(no write is attempted and the id is never echoed in unknown_session_ids); the "
+            "expected rate is zero, so a sustained rate means a buggy gateway, or an agent "
+            "sending a malformed session_id (the gateway forwards agent heartbeats "
+            "verbatim).",
             "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
         // only the (op,outcome) pairs this file ACTUALLY emits (see the
@@ -302,6 +320,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // ProxyRegister's adopt/refuse decision above).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_superseded"}});
+        // #1197: BatchHeartbeat's over-length unknown session_id, same shape
+        // as malformed_home_id / malformed_cluster_id above.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}});
     }
 }
 
@@ -384,7 +406,15 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
 
     // Fast path: agent already enrolled from a prior connection
     {
-        auto prior = auth_mgr_.get_pending_status(info.agent_id());
+        // WS-6 6.2: five-state read — a store ERROR fails closed with UNAVAILABLE,
+        // never falls through as "absent" (mirror of the direct Register path).
+        auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
+        if (!prior_result) {
+            spdlog::error("[gateway] Register: enrollment status read failed for agent {}",
+                          info.agent_id());
+            return enrollment_store_status(prior_result.error());
+        }
+        const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", info.agent_id());
             goto gw_enrolled;
@@ -449,10 +479,47 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             }
 
             // -- W1.4 / #827 atomic consume (mirror of AgentServiceImpl) ------
-            auto claim_result =
-                auth_mgr_.consume_enrollment_token(enrollment_token, info.agent_id());
-            if (!claim_result.has_value()) {
-                auto err = claim_result.error();
+            // WS-6 6.2: shape pre-check BEFORE the consume (pre-auth Postgres
+            // amplification: a caller-supplied junk token must not cost a write
+            // txn). A shape-invalid token cannot exist, so it is answered exactly
+            // like a well-formed token that matched nothing: a synthetic
+            // `not_found` flows through the SAME rejection block below (same
+            // metric, audit row, analytics event and uniform public message), and
+            // is therefore not an oracle. Descriptive fields are sanitised, not
+            // rejected (see sanitize_enrollment_text).
+            std::expected<auth::ConsumeEnrollResult, StoreError> consumed =
+                yuzu::server::enrollment_token_shape_valid(enrollment_token)
+                    ? auth_mgr_.consume_and_enroll(
+                          enrollment_token, info.agent_id(),
+                          yuzu::server::sanitize_enrollment_text(info.hostname()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                          yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                    : std::expected<auth::ConsumeEnrollResult, StoreError>{
+                          auth::ConsumeEnrollResult{
+                              .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
+                              .token_error = auth::EnrollmentTokenError::not_found,
+                              .already_consumed_by = {}}};
+            if (!consumed) {
+                spdlog::error("[gateway] Register: enrollment consume failed for agent {}",
+                              info.agent_id());
+                return enrollment_store_status(consumed.error());
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
+                // Valid token, admin-denied agent: the store rolled the use back.
+                if (metrics_) {
+                    metrics_
+                        ->counter("yuzu_register_denied_total",
+                                  {{"source", "gateway_proxy"}, {"event", "security"}})
+                        .increment();
+                }
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::token_rejected) {
+                auto err = consumed->token_error;
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("[gateway] Agent {} enrollment-token consume rejected: variant={}",
@@ -467,11 +534,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     }
                 }
 
-                std::string already_consumed_by;
-                if (err == auth::EnrollmentTokenError::already_consumed) {
-                    auto hash = auth::AuthManager::sha256_hex(enrollment_token);
-                    already_consumed_by = auth_mgr_.last_consumer_for_token_hash(hash);
-                }
+                // WS-6 6.2: classified + last consumer returned by the store txn.
+                const std::string already_consumed_by = consumed->already_consumed_by;
 
                 bool audit_ok = true;
                 if (audit_store_ && audit_store_->is_open()) {
@@ -533,7 +597,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
-            const auto& claim = claim_result.value();
+            // The token use was counted AND the agent enrolled in ONE store
+            // transaction, so the success audit row below only describes a
+            // completed enrollment.
+            const auto& claim = consumed->claim;
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          info.agent_id(), claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -582,13 +649,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 }
             }
 
-            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
-                                           info.platform().arch(), info.agent_version())) {
-                response->set_accepted(false);
-                response->set_reject_reason("enrollment denied by administrator");
-                response->set_enrollment_status("denied");
-                return grpc::Status::OK;
-            }
+            // (Enrollment was persisted by consume_and_enroll above.)
         } else {
             // Auto-approve policies (no peer IP available from gateway yet)
             auth::ApprovalContext approval_ctx;
@@ -599,9 +660,18 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             if (!matched_rule.empty()) {
                 spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
                              matched_rule);
-                if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
-                                               info.platform().os(), info.platform().arch(),
-                                               info.agent_version())) {
+                auto enrolled_auto = auth_mgr_.ensure_enrolled(
+                    info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                    yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                    yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
+                if (!enrolled_auto) {
+                    spdlog::error("[gateway] Register: auto-approve enroll failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(enrolled_auto.error());
+                }
+                if (!*enrolled_auto) {
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
@@ -609,16 +679,31 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 }
             } else {
                 // Tier 1: pending queue
-                auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+                auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
+                if (!pending_result) {
+                    spdlog::error("[gateway] Register: pending-status read failed for agent {}",
+                                  info.agent_id());
+                    return enrollment_store_status(pending_result.error());
+                }
+                const auto& pending_status = *pending_result;
 
                 if (!pending_status) {
-                    auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
-                                                info.platform().os(), info.platform().arch(),
-                                                info.agent_version());
+                    auto added = auth_mgr_.add_pending_agent(
+                        info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().os()),
+                        yuzu::server::sanitize_enrollment_text(info.platform().arch()),
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
+                    if (!added) {
+                        spdlog::error("[gateway] Register: add_pending failed for agent {}",
+                                      info.agent_id());
+                        return enrollment_store_status(added.error());
+                    }
 
                     response->set_accepted(false);
                     response->set_reject_reason("awaiting admin approval");
                     response->set_enrollment_status("pending");
+                    if (!*added)
+                        return grpc::Status::OK; // queued concurrently: the winner publishes
                     bus_.publish("pending-agent", info.agent_id());
                     spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
                     return grpc::Status::OK;
@@ -1024,18 +1109,40 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     int acked = 0;
+    // #1197: distinct session ids this replica does not hold, reported back to
+    // the gateway in the response, plus a count of over-length unknown ids.
+    // ORDER IS LOAD-BEARING: the gateway_sessions_ lookup runs FIRST and the
+    // length cap applies only on a MISS. A reclaim-absent ProxyRegister adopts
+    // a gateway-presented id of any length, so a known session may be longer
+    // than kMaxGatewaySessionIdLen; capping before the lookup would silently
+    // drop that session's heartbeats (no ingest, no renew, no presence).
+    std::unordered_set<std::string> unknown_ids;
+    std::size_t malformed_session_ids = 0;
     for (const auto& hb : request->heartbeats()) {
         // Validate that the session is known
         std::string agent_id;
+        bool known = false;
         {
             std::lock_guard lock(sessions_mu_);
             auto it = gateway_sessions_.find(hb.session_id());
             if (it != gateway_sessions_.end()) {
                 agent_id = it->second;
+                known = true;
+            }
+        }
+        if (!known) {
+            const auto& sid = hb.session_id();
+            if (sid.empty()) {
+                // neither acked nor listed
+            } else if (sid.size() > kMaxGatewaySessionIdLen) {
+                ++malformed_session_ids; // counted below; never echoed or logged in full
+            } else {
+                unknown_ids.insert(sid);
             }
         }
         if (agent_id.empty()) {
-            spdlog::debug("[gateway] BatchHeartbeat: unknown session {}", hb.session_id());
+            spdlog::debug("[gateway] BatchHeartbeat: unknown session {}",
+                          std::string_view{hb.session_id()}.substr(0, kMaxGatewaySessionIdLen));
             continue;
         }
         // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
@@ -1105,8 +1212,17 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         // condition (or, once multi-replica routing exists, an LB handing a
         // batch to a replica that never registered the session) stays
         // visible rather than silently dropped — the exact signal #4246 #8
-        // exists for.
-        std::unordered_set<std::string> unknown_sessions;
+        // exists for. #1197: the unknown set is NOT recomputed here; it is the
+        // first loop's `unknown_ids`, which also feeds the response verdict.
+        // It is a snapshot taken in the first loop, not atomic with this
+        // block's lookup: an id that registers in between is renewed AND
+        // listed/counted unknown for that batch; an id that is erased in
+        // between was acked and ingested but is neither renewed nor counted.
+        // Over-length unknown ids are excluded from the set (counted as
+        // batch_heartbeat/malformed_session_id instead), so a session that
+        // legitimately holds a >64-byte presented id (reclaim-absent adopt)
+        // is counted malformed and never listed after a server restart; that
+        // is by design (ids this server mints are 43 bytes).
         {
             std::lock_guard lock(sessions_mu_);
             for (const auto& hb : request->heartbeats()) {
@@ -1115,8 +1231,6 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 auto it = gateway_sessions_.find(hb.session_id());
                 if (it != gateway_sessions_.end())
                     session_to_agent.emplace(hb.session_id(), it->second);
-                else
-                    unknown_sessions.insert(hb.session_id());
             }
             // PR #4299 review (SHOULD 2): a session that lost its
             // register_fresh epoch race (lost_race_sessions_) is EXPECTED to
@@ -1153,9 +1267,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         // unknown session id must not inflate this beyond the actual number
         // of un-correlatable sessions, matching the dedup already applied to
         // the eligible/shortfall accounting below.
-        if (!unknown_sessions.empty()) {
+        if (!unknown_ids.empty()) {
             record_directory_desync(metrics_, "renew_leases", "unknown_session",
-                                    static_cast<double>(unknown_sessions.size()));
+                                    static_cast<double>(unknown_ids.size()));
         }
         if (!session_to_agent.empty()) {
             // A `std::unordered_map` keyed on session_id already collapses a
@@ -1193,6 +1307,37 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 }
             }
         }
+    }
+
+    // #1197: the verdict. Reported regardless of whether a route store is
+    // wired (it reflects only this replica's in-memory gateway_sessions_).
+    // The listed subset under truncation is arbitrary (unordered_set order,
+    // deliberately not sorted); omitted ids are typically reported again when
+    // those agents next heartbeat (not guaranteed when a batch carries a very
+    // large number of distinct unknown ids). No presence marker by design.
+    if (!unknown_ids.empty()) {
+        const auto total = unknown_ids.size();
+        const auto cap = static_cast<std::size_t>(kMaxUnknownSessionIdsPerResponse);
+        response->mutable_unknown_session_ids()->Reserve(static_cast<int>(std::min(total, cap)));
+        std::size_t listed = 0;
+        for (const auto& id : unknown_ids) {
+            if (listed == cap)
+                break;
+            response->add_unknown_session_ids(id);
+            ++listed;
+        }
+        if (total > cap) {
+            response->set_unknown_session_ids_truncated(true);
+            spdlog::warn("[gateway] BatchHeartbeat from node '{}': unknown-session verdict "
+                         "truncated, listed {} of {} distinct unknown ids",
+                         request->gateway_node(), listed, total);
+        }
+    }
+    if (malformed_session_ids > 0) {
+        // One call per batch with count = N, mirroring malformed_home_id /
+        // malformed_cluster_id, so the warn line fires at most once per flush.
+        record_directory_desync(metrics_, "batch_heartbeat", "malformed_session_id",
+                                static_cast<double>(malformed_session_ids));
     }
 
     response->set_acknowledged_count(acked);

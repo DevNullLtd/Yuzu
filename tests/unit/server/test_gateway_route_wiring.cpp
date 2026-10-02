@@ -29,6 +29,7 @@
 // the existing ProxyRegister suite in test_agent_service_impl.cpp.
 
 #include "gateway_service_impl.hpp"
+#include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -55,9 +56,11 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
@@ -81,6 +84,18 @@ yuzu::test::PgTestTemplate gwroutewiring_tpl{"gwroutewiring", [](const std::stri
         throw std::runtime_error("gwroutewiring template: store failed to migrate");
 }};
 
+/// An AuthManager wired to a PG-backed AuthDB (WS-6 6.2: enrollment/pending state
+/// lives only in Postgres, so ProxyRegister needs one). The DB member is
+/// destroyed BEFORE the AuthManager base, which only holds a non-owning pointer
+/// it never dereferences in its destructor.
+class PgAuthManager : public yuzu::server::auth::AuthManager {
+public:
+    PgAuthManager() { set_auth_db(db_.get()); }
+
+private:
+    yuzu::test::AuthDbPgShared db_;
+};
+
 // A minimal-but-valid gateway-proxied RegisterRequest, carrying a fresh
 // unlimited-use enrollment token so ProxyRegister accepts it outright. Mirrors
 // make_gw_register in test_agent_service_impl.cpp (PR5d).
@@ -91,7 +106,12 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
     req.mutable_info()->set_hostname("gw-wiring-host");
     req.mutable_info()->mutable_platform()->set_os("linux");
     req.mutable_info()->mutable_platform()->set_arch("x86_64");
-    req.set_enrollment_token(auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    {
+        // WS-6 6.2: enrollment tokens are minted through the PG-backed AuthDB.
+        auto created = auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1), "test-admin");
+        REQUIRE(created.has_value());
+        req.set_enrollment_token(created->raw_token);
+    }
     return req;
 }
 
@@ -149,7 +169,7 @@ struct LiveGatewayWiringHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
 
@@ -207,6 +227,64 @@ struct LiveGatewayWiringHarness {
     }
 };
 
+/// Direct-call fixture for the BatchHeartbeat unknown-session verdict cases
+/// (#1197): a PG-backed GatewayRouteStore wired into a GatewayUpstreamServiceImpl
+/// the test drives without a real grpc::Server (BatchHeartbeat reads no client
+/// metadata). Postgres-gated through PgAuthManager; the no-store case below that
+/// needs no database builds its own bare service instead.
+struct BatchHbFixture {
+    PgPool pool;
+    GatewayRouteStore store;
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
+
+    explicit BatchHbFixture(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, store{pool} {
+        REQUIRE(store.is_open());
+        svc.set_gateway_route_store(&store);
+    }
+
+    /// ProxyRegister a fresh agent and return its minted session id.
+    std::string register_live(const std::string& agent_id) {
+        auto req = make_gw_register(auth_mgr, agent_id);
+        apb::RegisterResponse resp;
+        REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        return resp.session_id();
+    }
+
+    gw::BatchHeartbeatResponse heartbeat(const std::vector<std::string>& session_ids) {
+        gw::BatchHeartbeatRequest batch;
+        batch.set_gateway_node("node-hb-verdict");
+        for (const auto& id : session_ids)
+            batch.add_heartbeats()->set_session_id(id);
+        gw::BatchHeartbeatResponse resp;
+        REQUIRE(svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+        return resp;
+    }
+
+    double desync(const char* op, const char* outcome) {
+        return metrics
+            .counter("yuzu_server_gateway_route_desync_total", {{"op", op}, {"outcome", outcome}})
+            .value();
+    }
+};
+
+std::vector<std::string> listed_unknown(const gw::BatchHeartbeatResponse& r) {
+    return {r.unknown_session_ids().begin(), r.unknown_session_ids().end()};
+}
+
+// Mirrors kMaxUnknownSessionIdsPerResponse / kMaxGatewaySessionIdLen in
+// gateway_service_impl.hpp; pinned to them below so a changed bound forces a
+// deliberate edit of these cases.
+constexpr int kTestUnknownCap = 4096;
+constexpr std::size_t kTestMaxSessionIdLen = 64;
+static_assert(kTestUnknownCap == yuzu::server::detail::kMaxUnknownSessionIdsPerResponse);
+static_assert(kTestMaxSessionIdLen == yuzu::server::detail::kMaxGatewaySessionIdLen);
+
 } // namespace
 
 // ── ProxyRegister: fresh path (no live server needed — context=nullptr means
@@ -223,7 +301,7 @@ TEST_CASE("ProxyRegister: fresh register mints a route row; a second fresh regis
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -734,7 +812,7 @@ TEST_CASE("NotifyStreamStatus: a STALE CONNECTED for a session already supersede
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -827,7 +905,7 @@ TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race doe
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -926,7 +1004,7 @@ TEST_CASE("NotifyStreamStatus: CONNECTED fills cluster_id/gateway_node for the m
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -969,7 +1047,7 @@ TEST_CASE("NotifyStreamStatus: a CONNECTED claiming a DIFFERENT cluster than the
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1087,7 +1165,7 @@ TEST_CASE("a rogue's ORIGINAL still-live session resending CONNECTED after the r
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1240,7 +1318,7 @@ TEST_CASE("AgentRegistry::unpublish_gateway_route reverts exactly what set_gatew
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1312,7 +1390,7 @@ TEST_CASE("#4669: a refused cross-cluster claim emits an audited gateway.cluster
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1378,7 +1456,7 @@ TEST_CASE("NotifyStreamStatus: single-gateway/non-multi-cluster deployments are 
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1435,7 +1513,7 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1514,7 +1592,7 @@ TEST_CASE("NotifyStreamStatus #4324: a fresh session's OWN DISCONNECTED reaching
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1736,7 +1814,7 @@ TEST_CASE("NotifyStreamStatus #4324: a legacy (empty stream_home_id) DISCONNECTE
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1796,7 +1874,7 @@ TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id is treated as m
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1853,7 +1931,7 @@ TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id on DISCONNECTED
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1923,7 +2001,7 @@ TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -1972,7 +2050,7 @@ TEST_CASE("BatchHeartbeat: a duplicate session id in one batch and a lost-epoch-
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2053,7 +2131,7 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2097,6 +2175,282 @@ TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't re
               .counter("yuzu_server_gateway_route_desync_total",
                        {{"op", "renew_leases"}, {"outcome", "unknown_session"}})
               .value() == 1);
+    // #1197: the verdict names exactly the session this replica does not
+    // hold; the live session is absent; nothing was truncated.
+    CHECK(batch_resp.acknowledged_count() == 1);
+    CHECK(listed_unknown(batch_resp) ==
+          std::vector<std::string>{"gw-session-never-registered-here"});
+    CHECK_FALSE(batch_resp.unknown_session_ids_truncated());
+}
+
+// ── #1197: BatchHeartbeatResponse.unknown_session_ids ───────────────────────
+//
+// A concurrent BatchHeartbeat-vs-ProxyRegister/Deregister test is deliberately
+// not written here: the unknown set and counters are function-local and
+// sessions_mu_ use is unchanged. The nightly TSan lane runs the existing
+// BatchHeartbeat cases.
+
+TEST_CASE("BatchHeartbeat verdict: a batch of only known sessions lists nothing and is not "
+          "truncated (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    const auto s1 = f.register_live("agent-verdict-known-1");
+    const auto s2 = f.register_live("agent-verdict-known-2");
+
+    auto resp = f.heartbeat({s1, s2});
+    CHECK(resp.acknowledged_count() == 2);
+    CHECK(resp.unknown_session_ids_size() == 0);
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+    CHECK(f.desync("renew_leases", "unknown_session") == 0);
+}
+
+TEST_CASE("BatchHeartbeat verdict: the same unknown id repeated is listed once and counted once "
+          "(#1197)",
+          "[pg][gateway_route_wiring]") {
+    // The Erlang buffer retains a failed batch and prepends the next with no
+    // dedup, so duplicates are a real input shape.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+
+    auto resp = f.heartbeat(
+        {"gw-session-dup-unknown", "gw-session-dup-unknown", "gw-session-dup-unknown"});
+    CHECK(resp.acknowledged_count() == 0);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-dup-unknown"});
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+    CHECK(f.desync("renew_leases", "unknown_session") == 1);
+}
+
+TEST_CASE("BatchHeartbeat verdict: the listed unknown set is capped, truncation is flagged, and "
+          "exactly the cap is NOT truncation (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+
+    auto make_ids = [](int n) {
+        std::vector<std::string> ids;
+        ids.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i)
+            ids.push_back("gw-session-unk-" + std::to_string(i));
+        return ids;
+    };
+
+    SECTION("exactly the cap: all listed, not truncated") {
+        auto resp = f.heartbeat(make_ids(kTestUnknownCap));
+        CHECK(resp.unknown_session_ids_size() == kTestUnknownCap);
+        CHECK_FALSE(resp.unknown_session_ids_truncated());
+        CHECK(f.desync("renew_leases", "unknown_session") == kTestUnknownCap);
+    }
+    SECTION("cap + 1: cap listed (distinct), truncated, desync counts the full set") {
+        const auto input = make_ids(kTestUnknownCap + 1);
+        auto resp = f.heartbeat(input);
+        CHECK(resp.unknown_session_ids_size() == kTestUnknownCap);
+        CHECK(resp.unknown_session_ids_truncated());
+        auto listed = listed_unknown(resp);
+        // Every listed id came from the input (nothing invented or mangled).
+        const std::set<std::string> input_set(input.begin(), input.end());
+        CHECK(std::all_of(listed.begin(), listed.end(),
+                          [&](const std::string& id) { return input_set.contains(id); }));
+        std::sort(listed.begin(), listed.end());
+        CHECK(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
+        CHECK(f.desync("renew_leases", "unknown_session") == kTestUnknownCap + 1);
+    }
+}
+
+TEST_CASE("BatchHeartbeat verdict: an empty session id is neither acked nor listed (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    const auto live = f.register_live("agent-verdict-empty-1");
+
+    auto resp = f.heartbeat({live, "", "gw-session-unknown-beside-empty"});
+    CHECK(resp.acknowledged_count() == 1);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-unknown-beside-empty"});
+    CHECK(f.desync("renew_leases", "unknown_session") == 1);
+}
+
+TEST_CASE("BatchHeartbeat verdict: an over-length UNKNOWN id is neither acked nor listed and is "
+          "counted malformed_session_id, never unknown_session (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    const auto live = f.register_live("agent-verdict-long-1");
+    const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
+    const std::string at_limit(kTestMaxSessionIdLen, 'y');
+
+    auto resp = f.heartbeat({live, too_long, too_long, at_limit});
+    CHECK(resp.acknowledged_count() == 1);
+    // The boundary: exactly 64 bytes is still a listable unknown.
+    CHECK(listed_unknown(resp) == std::vector<std::string>{at_limit});
+    // The counter is advanced by the number of malformed entries (the
+    // duplicate over-length id is two entries).
+    CHECK(f.desync("batch_heartbeat", "malformed_session_id") == 2);
+    CHECK(f.desync("renew_leases", "unknown_session") == 1);
+}
+
+TEST_CASE("BatchHeartbeat verdict: a lost-race session is KNOWN, so it is never listed "
+          "(#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+
+    // Same deterministic lost-race stand-in as the dedup case above.
+    f.register_live("agent-verdict-race-1");
+    auto row = f.store.lookup_route("agent-verdict-race-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    raw_bump_epoch(db.dsn(), "agent-verdict-race-1", (*row)->connection_epoch + 1000,
+                   "gw-session-already-won");
+    const auto losing = f.register_live("agent-verdict-race-1");
+
+    auto resp = f.heartbeat({losing});
+    CHECK(resp.unknown_session_ids_size() == 0);
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+    CHECK(f.desync("renew_leases", "unknown_session") == 0);
+}
+
+TEST_CASE("BatchHeartbeat verdict: a KNOWN session holding an over-length gateway-presented id "
+          "is still acked and never listed or counted malformed (#1197, lookup-before-cap)",
+          "[pg][gateway_route_wiring][grpc]") {
+    // Lookup-before-cap discriminator. A reclaim-absent ProxyRegister ADOPTS the id the
+    // gateway presented, whatever its length, so gateway_sessions_ can hold a
+    // known id longer than the unknown-id cap. A length check BEFORE the
+    // lookup would silently drop this session's heartbeats (no ingest, no
+    // renew, no presence) while the agent stays registered.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    // Store WIRED: the no-store branch refuses an unknown presented id.
+    LiveGatewayWiringHarness h(store);
+
+    const std::string long_id = "gw-session-" + std::string(kTestMaxSessionIdLen + 1 - 11, 'z');
+    REQUIRE(long_id.size() == kTestMaxSessionIdLen + 1);
+    auto reg = h.register_agent("agent-verdict-longknown", long_id);
+    REQUIRE(reg.accepted());
+    REQUIRE(reg.session_id() == long_id); // adopted verbatim
+
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-longknown");
+    batch.add_heartbeats()->set_session_id(long_id);
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(h.svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    CHECK(resp.acknowledged_count() == 1);
+    CHECK(resp.unknown_session_ids_size() == 0);
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}})
+              .value() == 0);
+}
+
+TEST_CASE("BatchHeartbeat verdict: a mixed batch lists exactly the distinct unknown ids and "
+          "counts the rest correctly (#1197)",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    // known: a normally minted session.
+    const auto known = h.register_agent("agent-mixed-known").session_id();
+    // known: a gateway-presented id over the cap, adopted verbatim.
+    const std::string long_id = "gw-session-" + std::string(kTestMaxSessionIdLen + 1 - 11, 'q');
+    REQUIRE(h.register_agent("agent-mixed-longknown", long_id).session_id() == long_id);
+    // known: a session that lost its register_fresh epoch race.
+    h.register_agent("agent-mixed-race");
+    auto row = store.lookup_route("agent-mixed-race");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    raw_bump_epoch(db.dsn(), "agent-mixed-race", (*row)->connection_epoch + 1000,
+                   "gw-session-mixed-already-won");
+    const auto losing = h.register_agent("agent-mixed-race").session_id();
+    auto row_after_race = store.lookup_route("agent-mixed-race");
+    REQUIRE(row_after_race.has_value());
+    REQUIRE(row_after_race->has_value());
+    CHECK((*row_after_race)->session_id == "gw-session-mixed-already-won"); // the loser did NOT win
+
+    const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-mixed");
+    for (const auto& id : std::vector<std::string>{known, long_id, "gw-session-mixed-unknown",
+                                                   "gw-session-mixed-unknown", losing, "",
+                                                   too_long, too_long})
+        batch.add_heartbeats()->set_session_id(id);
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(h.svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    // The three known sessions are acked; the empty, over-length and unknown
+    // entries are not.
+    CHECK(resp.acknowledged_count() == 3);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-mixed-unknown"});
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+    // Counted per entry (the duplicate over-length id is two entries).
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "batch_heartbeat"}, {"outcome", "malformed_session_id"}})
+              .value() == 2);
+    // Distinct unknown ids only.
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "unknown_session"}})
+              .value() == 1);
+}
+
+TEST_CASE("BatchHeartbeat verdict: with no route store and no metrics the verdict is still "
+          "filled for unknown, over-length and empty ids (#1197)",
+          "[gateway_route_wiring]") {
+    // The verdict reflects only the in-memory session map, so it must not be
+    // gated on a wired GatewayRouteStore or MetricsRegistry. Non-PG: a bare
+    // AuthManager is enough because nothing is registered.
+    EventBus bus;
+    yuzu::MetricsRegistry registry_metrics;
+    AgentRegistry registry{bus, registry_metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, /*metrics=*/nullptr};
+
+    const std::string too_long(kTestMaxSessionIdLen + 1, 'x');
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-nostore");
+    for (const auto& id : std::vector<std::string>{"gw-session-nostore-a", "gw-session-nostore-a",
+                                                   "", too_long, "gw-session-nostore-b"})
+        batch.add_heartbeats()->set_session_id(id);
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    CHECK(resp.acknowledged_count() == 0);
+    auto listed = listed_unknown(resp);
+    std::sort(listed.begin(), listed.end());
+    CHECK(listed == std::vector<std::string>{"gw-session-nostore-a", "gw-session-nostore-b"});
+    CHECK_FALSE(resp.unknown_session_ids_truncated());
+}
+
+TEST_CASE("BatchHeartbeat verdict: with no route store a KNOWN session is still acked and the "
+          "unknown one still listed (#1197)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr; // PG only for the enrollment token; NO route store is wired
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl svc{registry, bus, auth_mgr, auto_approve, &metrics};
+
+    auto req = make_gw_register(auth_mgr, "agent-nostore-known");
+    apb::RegisterResponse reg;
+    REQUIRE(svc.ProxyRegister(/*context=*/nullptr, &req, &reg).ok());
+
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-nostore-known");
+    batch.add_heartbeats()->set_session_id(reg.session_id());
+    batch.add_heartbeats()->set_session_id("gw-session-nostore-unknown");
+    gw::BatchHeartbeatResponse resp;
+    REQUIRE(svc.BatchHeartbeat(/*context=*/nullptr, &batch, &resp).ok());
+
+    CHECK(resp.acknowledged_count() == 1);
+    CHECK(listed_unknown(resp) == std::vector<std::string>{"gw-session-nostore-unknown"});
 }
 
 // ── Fail-open posture ────────────────────────────────────────────────────────
@@ -2121,7 +2475,7 @@ TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAIL
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&broken_store);
@@ -2268,7 +2622,7 @@ TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race sti
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);
@@ -2316,7 +2670,7 @@ TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore announce_connected w
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
-    yuzu::server::auth::AuthManager auth_mgr;
+    PgAuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&store);

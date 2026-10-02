@@ -872,6 +872,96 @@ TEST_CASE("from-tar-query: dispatch throw is 500, execution cancelled",
     REQUIRE(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
+// #4982: mark_cancelled / set_agents_targeted were log-only on failure at
+// every call site. These two tests force each call to fail deterministically
+// (the established LOCK TABLE + short lock_timeout_ms technique, against
+// execution_tracker.executions this time — a different table/store than the
+// result_set_store.* locks every other test in this file uses) and assert
+// the new yuzu_exec_tracker_bookkeeping_failed_total{op,surface="rest"}
+// counter.
+TEST_CASE("from-tar-query: zero agents reached AND mark_cancelled itself failing counts "
+          "yuzu_exec_tracker_bookkeeping_failed_total{op=mark_cancelled,surface=rest} (#4982)",
+          "[pg][result_set][async][tar][4982]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    h.dispatch_sent = 0; // dispatch reaches nobody -> handler calls mark_cancelled
+
+    // Lock execution_tracker.executions from a second connection INSIDE the
+    // fake dispatch closure -- fires after the (already-passed) quota check,
+    // strictly before the handler's own mark_cancelled UPDATE runs.
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.on_dispatch = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 503); // unchanged -- mark_cancelled's own failure is silent to the caller
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "rest"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("from-tar-query: set_agents_targeted failing after a real dispatch counts "
+          "yuzu_exec_tracker_bookkeeping_failed_total{op=set_agents_targeted,surface=rest} "
+          "(#4982)",
+          "[pg][result_set][async][tar][4982]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool); // default dispatch_sent = 2 (a real dispatch)
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    h.on_dispatch = [&] {
+        REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(pg::exec_params(locker.get(),
+                                "LOCK TABLE execution_tracker.executions IN ACCESS "
+                                "EXCLUSIVE MODE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    };
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query",
+          R"({"sql":"SELECT 1","name":"targetedfail"})", status);
+    // set_agents_targeted's own failure is swallowed to the caller too -- the
+    // row still lands pending (create_pending only touches result_set_store's
+    // own, unlocked, schema).
+    REQUIRE(status == 202);
+
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                       {{"op", "mark_cancelled"}, {"surface", "rest"}})
+              .value() == 0.0);
+}
+
 TEST_CASE("from-tar-query: 503 when command dispatch is unwired", "[pg][result_set][async][tar]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

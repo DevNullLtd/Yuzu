@@ -43,6 +43,7 @@
 #include "result_set_routes.hpp"
 #include "test_route_sink.hpp"
 
+#include "mcp_policy.hpp" // mcp::tier_allows/requires_approval — #5047 fake tier_policy_fn
 #include "result_set_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -88,7 +89,20 @@ struct Harness {
 
     bool session_present{true};
     std::string session_username{"alice"};
+    std::string session_mcp_tier; // empty = not an MCP token (default, matches production)
     bool auth_fn_called{false};
+
+    // #5047: a fake tier_policy_fn wired through the REAL mcp::tier_allows/
+    // requires_approval logic (mcp_policy.hpp) so these route-level tests
+    // exercise the actual tier rules, not a hand-rolled stand-in that could
+    // drift from them. `AuthRoutes::require_tier_policy` itself (the
+    // production implementation this mirrors) is unit-tested directly in
+    // test_auth_routes.cpp; this harness tests the WIRING — is it called,
+    // with the right (securable_type, operation), in the right order
+    // relative to auth_fn/the store.
+    bool tier_policy_fn_wired{true};
+    bool tier_policy_fn_called{false};
+    std::string last_tier_securable, last_tier_operation;
 
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
@@ -140,8 +154,41 @@ struct Harness {
             auth::Session s;
             s.username = session_username;
             s.role = auth::Role::user;
+            s.mcp_tier = session_mcp_tier;
             return s;
         };
+        if (tier_policy_fn_wired) {
+            deps.tier_policy_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                         const auth::Session& session,
+                                         const std::string& securable_type,
+                                         const std::string& operation) -> bool {
+                tier_policy_fn_called = true;
+                last_tier_securable = securable_type;
+                last_tier_operation = operation;
+                if (session.mcp_tier.empty())
+                    return true;
+                if (!mcp::tier_allows(session.mcp_tier, securable_type, operation)) {
+                    res.status = 403;
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"MCP token tier does not allow this"}})",
+                        "application/json");
+                    return false;
+                }
+                // Never /mcp/v1/ here — every route in this module is a
+                // dashboard fragment (`req.path` always starts with
+                // /fragments/), so the ticket-then-recall exemption never
+                // applies, mirroring AuthRoutes::require_tier_policy exactly.
+                if (mcp::requires_approval(session.mcp_tier, securable_type, operation)) {
+                    res.status = 403;
+                    res.set_content(
+                        R"({"error":{"code":403,"message":"operation requires approval for )"
+                        R"(this MCP tier on this transport"}})",
+                        "application/json");
+                    return false;
+                }
+                return true;
+            };
+        }
         deps.audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& ti, const std::string& d) -> bool {
@@ -171,6 +218,7 @@ struct Harness {
     void reset_gate_tracking() {
         deny_scoped_fn_called = false;
         auth_fn_called = false;
+        tier_policy_fn_called = false;
     }
 };
 
@@ -289,6 +337,159 @@ TEST_CASE("result_set_routes: an unauthenticated caller 401s on all 6 routes "
         CHECK(h.auth_fn_called);
     }
     CHECK(h.audits.empty()); // every branch above is unaudited
+}
+
+// ── #5047: tier/approval belt on the 4 mutating fragments ──────────────────
+// (pin/unpin/delete/create) — closes the cross-transport gap where an
+// MCP-tiered bearer could skip C8's tier/approval check by hitting these
+// plain-HTTP fragment routes instead of /mcp/v1/. `store` stays null in
+// every case below: tier_ok runs BEFORE the store-null check (see
+// result_set_routes.cpp), so these are testable without Postgres.
+
+TEST_CASE("result_set_routes: tier_policy_fn is called on all 4 mutating "
+          "fragments, AFTER auth_fn and BEFORE the store is touched, with "
+          "the correct (securable_type, operation)",
+          "[server][routes][result_set_routes]") {
+    Harness h; // store stays null
+    h.wire();
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    CHECK(h.auth_fn_called);
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/unpin", "");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/" + kFakeId + "/delete", "");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Delete");
+
+    h.reset_gate_tracking();
+    h.sink.Post("/fragments/result-sets/create", "", "application/x-www-form-urlencoded");
+    CHECK(h.tier_policy_fn_called);
+    CHECK(h.last_tier_securable == "Infrastructure");
+    CHECK(h.last_tier_operation == "Write");
+}
+
+TEST_CASE("result_set_routes: tier_policy_fn is NOT called on the 2 read "
+          "fragments (sidebar/detail) — provable no-op there",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.wire();
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/sidebar");
+    CHECK_FALSE(h.tier_policy_fn_called);
+
+    h.reset_gate_tracking();
+    h.sink.Get("/fragments/result-sets/" + kFakeId + "/detail");
+    CHECK_FALSE(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: a supervised-tier session pinning/creating its "
+          "own result set is allowed (Infrastructure:Write is on "
+          "tier_allows' supervised path — this asserts the WIRING calls "
+          "through correctly, not just tier_allows in isolation); only a "
+          "false tier_policy_fn return would halt the handler before the "
+          "store is touched",
+          "[server][routes][result_set_routes]") {
+    // Sanity: supervised tier DOES allow Infrastructure:Write per
+    // tier_allows() -- so pin/create should NOT be blocked by tier_allows.
+    // What SHOULD block a supervised caller is delete (Infrastructure:Delete
+    // requires_approval() on a non-MCP transport) -- covered below. This
+    // case pins that pin/create succeed for supervised (regression net for
+    // the operator-tier-denied case immediately after).
+    Harness h;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 200); // null store -> 200 empty body (degrade asymmetry), not 403
+    CHECK(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: an operator-tier session is denied "
+          "create/pin/unpin (Infrastructure:Write is not on tier_allows' "
+          "operator allow-list) — 403 before the store is touched",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.session_mcp_tier = "operator";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 403);
+    CHECK(pin->body.find("tier") != std::string::npos);
+
+    auto create =
+        h.sink.Post("/fragments/result-sets/create", "", "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 403);
+}
+
+TEST_CASE("result_set_routes: a readonly-tier session is denied all 4 "
+          "mutating fragments",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.session_mcp_tier = "readonly";
+    h.wire();
+
+    for (const auto& [method, path] : std::vector<std::pair<std::string, std::string>>{
+             {"POST", "/fragments/result-sets/" + kFakeId + "/pin"},
+             {"POST", "/fragments/result-sets/" + kFakeId + "/unpin"},
+             {"POST", "/fragments/result-sets/" + kFakeId + "/delete"},
+             {"POST", "/fragments/result-sets/create"},
+         }) {
+        INFO("path: " << path);
+        auto r = h.sink.dispatch(method, path);
+        REQUIRE(r);
+        CHECK(r->status == 403);
+    }
+}
+
+TEST_CASE("result_set_routes: an empty (untiered) session's owner-scoped "
+          "create/pin/unpin/delete is untouched by the tier belt — no "
+          "regression",
+          "[server][routes][result_set_routes]") {
+    Harness h; // session_mcp_tier defaults to "" — matches every pre-#5047 test above
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 200); // null-store degrade, not a tier denial
+    CHECK(h.tier_policy_fn_called);
+}
+
+TEST_CASE("result_set_routes: an unwired tier_policy_fn fails CLOSED (503) "
+          "for a TIERED session but passes through for an untiered one "
+          "(misconfiguration posture, TierPolicyFn's own contract)",
+          "[server][routes][result_set_routes]") {
+    Harness h;
+    h.tier_policy_fn_wired = false;
+    h.session_mcp_tier = "supervised";
+    h.wire();
+
+    auto pin = h.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin);
+    CHECK(pin->status == 503);
+
+    // Untiered session, still unwired: passes through to the null-store
+    // degrade (200), not a 503 — nothing this belt enforces on it.
+    Harness h2;
+    h2.tier_policy_fn_wired = false;
+    h2.wire();
+    auto pin2 = h2.sink.Post("/fragments/result-sets/" + kFakeId + "/pin", "");
+    REQUIRE(pin2);
+    CHECK(pin2->status == 200);
 }
 
 // ── Null-store degrade — THREE distinct shapes, preserved verbatim

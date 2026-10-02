@@ -1,12 +1,12 @@
 /**
  * test_capability_catalogue.cpp — PR1.9's cross-cutting invariant gate over
- * the WHOLE capability catalogue: the eight independently-authored sources
- * (the seven per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
+ * the WHOLE capability catalogue: the independently-authored sources
+ * (the per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
  * fragments plus the core-owned `capability_decls/core_dispatch_capabilities
  * .hpp`) composed into one `CommandCapabilityRegistry`, exactly as a real
  * dispatch chokepoint eventually will.
  *
- * Nobody who authors a single fragment can see the other seven, so nobody is
+ * Nobody who authors a single fragment can see the others, so nobody is
  * positioned to catch a row that under-declares risk for its operation, uses
  * a securable or operation that was never seeded, calls itself Destructive
  * without being Irreversible, or falsely claims `system_reserved`. This file
@@ -33,11 +33,13 @@
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
+#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
+#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
@@ -150,11 +152,13 @@ struct LabeledSpan {
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"browser_policy", capdecls::plugin_action_catalogue_browser_policy(), false},
+        {"update_source_trust", capdecls::plugin_action_catalogue_update_source_trust(), false},
         {"app_control", capdecls::plugin_action_catalogue_app_control(), false},
         {"firmware_posture", capdecls::plugin_action_catalogue_firmware_posture(), false},
         {"runtimes", capdecls::plugin_action_catalogue_runtimes(), false},
         {"platform_security", capdecls::plugin_action_catalogue_platform_security(), false},
         {"browser_inventory", capdecls::plugin_action_catalogue_browser_inventory(), false},
+        {"local_security_policy", capdecls::plugin_action_catalogue_local_security_policy(), false},
         {"privacy_permissions", capdecls::plugin_action_catalogue_privacy_permissions(), false},
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
@@ -166,7 +170,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-four sources exactly as a live composition site would use.
+    // literally, twenty-six sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -183,11 +187,13 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::plugin_action_catalogue_browser_policy(),
+        capdecls::plugin_action_catalogue_update_source_trust(),
         capdecls::plugin_action_catalogue_app_control(),
         capdecls::plugin_action_catalogue_firmware_posture(),
         capdecls::plugin_action_catalogue_runtimes(),
         capdecls::plugin_action_catalogue_platform_security(),
         capdecls::plugin_action_catalogue_browser_inventory(),
+        capdecls::plugin_action_catalogue_local_security_policy(),
         capdecls::plugin_action_catalogue_privacy_permissions(),
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
@@ -344,8 +350,28 @@ TEST_CASE("capability catalogue: system_reserved is true only for core_dispatch_
     }
 }
 
-TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all eight "
-          "sources",
+/// Exact-row pin for `update_source_trust.sources` (Wave 10 PR10.1-d). The
+/// action is a read-only supply-chain-POSTURE fact under `Security`:Read with
+/// no execute gate. Pinning it directly means a silent drift to a mutating
+/// class, a different securable, or a gate on a facts-only read fails here.
+TEST_CASE("capability catalogue: update_source_trust.sources pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_update_source_trust();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "update_source_trust");
+    CHECK(row.action == "sources");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across every "
+          "source",
           "[server][dispatch][capability]") {
     auto registry = build_registry(all_labeled_sources());
     for (const auto& source : all_labeled_sources()) {
@@ -550,6 +576,39 @@ TEST_CASE("capability catalogue: browser_inventory's two actions pin their exact
         CHECK(it->execute_gate == ExecuteGate::AdminOrApproval);
         CHECK_FALSE(it->system_reserved);
     }
+}
+
+/// Exact-row pin for the four `local_security_policy` rows: read-only posture class, so
+/// `Security` (the antivirus/bitlocker/firewall/autoruns class), never Inventory. Literals,
+/// not derived from the fragment, so a securable/gate/tier change fails here. `sudoers` is
+/// Medium risk tier (the owner's 2026-09-22 decision): its rows carry the NOPASSWD flag and
+/// the command allowlist, a map of where an account could already run something as root
+/// without a password; the other three are Low.
+TEST_CASE("capability catalogue: local_security_policy rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_local_security_policy();
+    REQUIRE(rows.size() == 4);
+    const char* const expected[4] = {"password_policy", "lockout_policy", "audit_policy",
+                                     "sudoers"};
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto& row = rows[i];
+        INFO("action=" << expected[i]);
+        CHECK(row.plugin == "local_security_policy");
+        CHECK(row.action == expected[i]);
+        CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+        CHECK(row.mutability == Mutability::None);
+        CHECK(row.securable == "Security");
+        CHECK(row.operation == authz::Operation::Read);
+        CHECK(row.risk_tier == (i == 3 ? authz::RiskTier::Medium : authz::RiskTier::Low));
+        CHECK_FALSE(row.system_reserved);
+        CHECK(row.execute_gate == ExecuteGate::None);
+    }
+
+    auto registry = build_registry(all_labeled_sources());
+    const auto sudoers = registry.classify("local_security_policy", "sudoers");
+    REQUIRE(sudoers.has_value());
+    CHECK(sudoers->risk_tier == authz::RiskTier::Medium);
+    CHECK_FALSE(registry.classify("local_security_policy", "set_policy").has_value());
 }
 
 /// Exact-row pin for `privacy_permissions` (Wave 8 PR8.5, Forensics-class): the same

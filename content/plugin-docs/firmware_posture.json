@@ -314,9 +314,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave8-pr84-firmware_posture.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/firmware_posture.yaml"
     ],

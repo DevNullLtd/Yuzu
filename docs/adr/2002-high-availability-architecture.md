@@ -583,7 +583,8 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
-  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+  cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
+  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
@@ -1124,6 +1125,63 @@ WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
 not a WS-4 gate item.
 
+**Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
+`BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
+`bool unknown_session_ids_truncated = 3` (`proto/yuzu/gateway/v1/gateway.proto` and its two gateway
+mirrors; field 4 left free), and `GatewayUpstreamServiceImpl::BatchHeartbeat` now fills them. **No
+gateway code reads them yet** - the consumer (replaying the sessions the gateway holds locally through
+the existing replay drip) is a separate change tracked in #1197, so this change does not fix #1197: a
+server that restarts and loses its in-memory `gateway_sessions_` still does not learn the gateway's
+sessions until the gateway-side replay lands. An old gateway ignores the new fields (proto3 unknown
+fields), so the wire is unchanged in behaviour. There is deliberately no presence marker: a server that
+predates the fields and a server with nothing unknown are indistinguishable, and the gateway's only
+correct action in both cases is today's behaviour (no replay).
+- **What the list means.** It is the per-replica "I do not hold this session" verdict: the distinct
+  session ids in this batch that THIS replica's in-memory `gateway_sessions_` does not hold. It says
+  nothing about the other replicas or about the durable `GatewayRouteStore` directory. It is reported
+  whether or not a route store is wired.
+- **Bounds.** At most `kMaxUnknownSessionIdsPerResponse` = 4096 ids are listed (about 260 KiB at 64
+  bytes each); past that `unknown_session_ids_truncated` is set and one warn names listed/total. The
+  listed subset is unordered-set order, deliberately not sorted, so an omitted id is typically reported
+  again when that agent next heartbeats (30 s by default), not on the next gateway flush; that is not
+  guaranteed when a batch carries a very large number of distinct unknown ids (only 4096 are listed per
+  response, an arbitrary subset; the gateway forwards agent heartbeats verbatim, so one agent can
+  contribute many ids). The 64-byte per-id cap
+  (`kMaxGatewaySessionIdLen`) is applied only AFTER the `gateway_sessions_` lookup misses: a
+  reclaim-absent `ProxyRegister` adopts a gateway-presented id of any length, so capping first would
+  silently stop ingesting a known session. An empty unknown id is skipped; an over-length unknown id is
+  never listed and is counted per entry under
+  `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}`. A
+  session that legitimately holds a longer-than-64-byte presented id is therefore counted malformed and
+  never listed after a server restart (by design; ids this server mints are 43 bytes).
+- **Multi-replica statement (design intent, inferred from code reading; no multi-replica run exists;
+  not verified until the gateway-side replay ships).** The verdict-then-replay reconcile is intended to
+  be correct and bounded on one core replica. On several replicas it would converge in one round only if
+  the gateway's `BatchHeartbeat`, the replay `ProxyRegister` and the reannounce `NotifyStreamStatus` all
+  reach the SAME replica during the reconcile. The shipped gateway uses ONE gRPC channel and therefore
+  one HTTP/2 connection per upstream endpoint, so behind a layer-4 VIP it is connection-sticky; but
+  stickiness lasts only for the lifetime of that HTTP/2 connection (a reconnect mid-reconcile, a GOAWAY
+  or a load-balancer idle timeout can move the stream to another replica). Behind a multi-endpoint node
+  list (the channel then picks an endpoint per RPC, round-robin) or a layer-7 per-RPC balancer it would
+  converge only probabilistically: the replica that lacks the session keeps listing it, an arbitrary
+  replica receives each replay, and a replica that ALREADY holds the session re-installs it through
+  `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
+  guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
+  signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
+  until it lands the safe-to-scale gate still forbids a second replica.
+- **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
+  reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
+  an agent the new server does not know was still delivered while the lease and presence rows written
+  when the OLD server last ingested that agent's heartbeat were unexpired (remaining = 90 s, minus the
+  age of that heartbeat at the moment of the kill, minus the downtime); heartbeats the new server
+  receives for an unknown session extend neither, and an agent with no heartbeat ingested before the
+  kill was refused from the first probe. Delivery was observed at 20, 50 and 80 s after the last
+  ingested heartbeat and refusal at 125 s; the exact edge between 80 s and 125 s was not probed. The
+  directory-fallback and presence-row mechanism is inferred from the forwarding log line, not traced.
+  `/health` `agents.online` read 0 throughout, and the server did not recover in the observed windows
+  (to about 125 s). An early successful command is therefore not evidence the reconcile is unnecessary.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
@@ -1458,6 +1516,40 @@ below)*:
   frozen mid-transaction is cut off by a transaction-scoped `idle_in_transaction_session_timeout`.
 - **Enrollment → Postgres** (slice 6.2) imports the existing `enrollment-tokens.cfg` /
   `pending-agents.cfg` once at first boot rather than starting fresh.
+
+**Update (2026-09-29, slice 6.2 done — commits 97e24ec6e..a81938ada; no PR number yet).** Enrollment
+tokens and pending-agent approvals are now PG-authoritative, mirroring 6.1's shape:
+- **`AuthDB` migration v2** replaces the dead v1 `enrollment_tokens`/`pending_agents` tables with the
+  live shape (`token_id`/`token_hash` UNIQUE, `max_uses`/`use_count` CHECK, `revoked`, `expires_at`
+  NULL=never; `agent_id` UNIQUE, five-state-ready `status` CHECK) plus `auth.import_meta`. The v1 step
+  is untouched — those tables never had a production writer, so there was nothing to carry.
+- **File mode is deleted, not deprecated.** `AuthManager`'s `save_/load_tokens`, `save_/load_pending`,
+  `reload_state` and the two in-memory maps are gone; every enrollment/pending call routes to
+  `AuthDB` and fails CLOSED (a typed `StoreError`, never `accepted=false`) with no store attached —
+  the case `server.cpp`'s `set_auth_db(nullptr)` at shutdown creates for an in-flight `Register`,
+  mirroring the existing #3401 fail-closed-on-a-failed-dependency-call precedent (`register_agent`'s
+  own fail-closed behaviour on a failed device-token revoke sweep), not a scenario #3401 itself
+  tracks.
+- **`consume_and_enroll` is one guarded-UPDATE transaction**: the token-use count and the
+  admin-denial check happen in the SAME transaction, so a denied agent's use is rolled back rather
+  than refunded (closing #1135) — the exact shape §8's original slice-6.1-era design note anticipated
+  for enrollment, one transaction rather than a check-then-act pair.
+- **One-time `.cfg` import**, structurally identical to 6.1's shared-custody stance: a pre-6.2
+  install's `enrollment-tokens.cfg`/`pending-agents.cfg` are imported exactly once, under a dedicated
+  advisory-lock key, with a per-file content-fingerprint marker stamped in the SAME transaction as the
+  imported rows — never on file absence. A marker whose fingerprint matches skips (idempotent,
+  including after a same-bytes restore of an already-removed/denied/revoked row — nothing is
+  resurrected); a mismatched fingerprint is REFUSED, not merged (the restored-old-backup case),
+  logged CRITICAL and counted, never failing boot; a genuine store error with the file present DOES
+  fail boot closed. Runs from `Server::create` right after `set_auth_db`, before any listener binds —
+  never from a main.cpp one-shot.
+- **WS-9 evidence**: `scripts/ha/ha-enrollment-concurrent-register.sh` races concurrent Register RPCs
+  from two real, separate `yuzu-server` processes against one shared max_uses=1 token — exactly one
+  accepted, Postgres itself settling at `use_count=1` — the first WS-9 proof this posture holds
+  across processes, not just pooled connections in one (see `docs/ha-delivery-matrix.md`'s WS-9 row).
+- **Rolling-upgrade note**: stop every old-version server before starting the first 6.2 replica (a
+  running old-version replica would keep writing the `.cfg` files the importer has already renamed
+  aside, and its own writes would never be seen by the PG-authoritative new replicas).
 
 ### 9. SQLite tail migration (Q9)
 ADR-0006 Update already mandates every server store migrate to Postgres; HA makes the remaining tail

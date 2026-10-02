@@ -849,6 +849,13 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // example
         {"example.ping", "Returns a 'pong' response"},
         {"example.echo", "Echoes back the supplied message parameter"},
+        // update_source_trust
+        {"update_source_trust.sources",
+         "Package and update-source trust posture, facts only: Linux apt sources (one-line and "
+         "deb822; signed-by, trusted, and allow-insecure for one-line entries) and apt keyrings; "
+         "read-only, no subprocess; "
+         "other package families are not read, so an empty result on them is not evidence of no "
+         "sources"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1021,6 +1028,11 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // platform_security
         {"platform_security.secure_boot", "Report Secure Boot and setup-mode state (efivars on Linux, SecureBoot registry state on Windows; unsupported on macOS)"},
         {"platform_security.code_integrity", "Report code-signing enforcement posture (Linux LSM and lockdown, macOS Gatekeeper and SIP, Windows CI policy and Device Guard)"},
+        // local_security_policy
+        {"local_security_policy.password_policy", "Report local password policy posture: length, age, complexity, history (login.defs/pwquality/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.lockout_policy", "Report local account lockout policy posture: threshold, window, duration (faillock/pam, pwpolicy, secedit; read-only)"},
+        {"local_security_policy.audit_policy", "Report local audit policy posture: auditd rule counts, audit_control flags, secedit legacy audit categories (read-only)"},
+        {"local_security_policy.sudoers", "Report sudoers content: per-entry user, run-as, NOPASSWD tag and command allowlist from /etc/sudoers and /etc/sudoers.d (Linux and macOS, read-only; unsupported on Windows)"},
         // privacy_permissions
         {"privacy_permissions.permissions", "Report per-app sensitive-permission grants: camera, microphone, location, full-disk-access equivalents (read-only)"},
         // system_hardening

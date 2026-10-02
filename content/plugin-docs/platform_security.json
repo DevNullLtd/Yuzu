@@ -506,9 +506,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave8-pr81a1-platform_security.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/platform_security.yaml"
     ],

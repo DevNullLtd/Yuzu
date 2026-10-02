@@ -3,6 +3,7 @@
 #include "authz_model.hpp" // #4983 -- authz::in_scope
 #include "http_route_sink.hpp"
 #include "mcp_input_bounds.hpp" // #4983 Gate 3 SHOULD -- kResultSetDeviceIdMaxLen
+#include "rest_audit.hpp" // detail::try_persist_audit (#5047 Gate 8 fix round, UP-10)
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 
@@ -38,6 +39,38 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
         if (!row || !row->has_value() || (*row)->owner_principal != owner)
             return std::nullopt;
         return **row;
+    };
+
+    // #5047: the C8 tier/approval belt, applied to the 4 mutating fragments
+    // below (pin/unpin/delete/create) even though this whole module is
+    // ownership-only by design (no `perm_fn`/RBAC gate) — these are plain
+    // HTTP endpoints reachable with any Bearer token, not cookie-session-only,
+    // so an MCP-tiered bearer could otherwise reach the identical mutation
+    // its `/api/v1/result-sets` JSON twin now blocks. See
+    // `Deps::TierPolicyFn`'s doc comment for the unwired-fn contract.
+    auto tier_ok = [deps](const httplib::Request& req, httplib::Response& res,
+                          const auth::Session& session, const std::string& securable_type,
+                          const std::string& operation) -> bool {
+        if (deps.tier_policy_fn)
+            return deps.tier_policy_fn(req, res, session, securable_type, operation);
+        if (!session.mcp_tier.empty()) {
+            // Same rule as the REST twin (rest_api_v1.cpp): a degraded
+            // security control must leave an evidence trail, not just a
+            // test-covered response (#5047 governance fix round). Routed
+            // through try_persist_audit (not a bare deps.audit_fn call, Gate 8
+            // UP-10): this handler installs no exception_handler_, so an
+            // audit sink that throws must not be allowed to replace the
+            // intended 503 with httplib's bare, undetailed default 500.
+            (void)detail::try_persist_audit(deps.audit_fn, req, "result_set.tier_policy_unavailable",
+                                            "failure", "ResultSet", "",
+                                            "tier-policy check misconfigured (unwired TierPolicyFn)");
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"tier-policy check misconfigured"}})",
+                "application/json");
+            return false;
+        }
+        return true;
     };
 
     // Owner-scoped sidebar list.
@@ -110,14 +143,18 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
-        [deps, rs_detail_after, rs_get_owned](const httplib::Request& req,
+        [deps, rs_detail_after, rs_get_owned, tier_ok](const httplib::Request& req,
                                               httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.pin.access_denied",
                                             "service-scoped tokens may not pin result sets",
                                             "ResultSet", req.matches[1].str()))
                 return;
             auto session = deps.auth_fn(req, res);
-            if (!session || !deps.store)
+            if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
+                return;
+            if (!deps.store)
                 return;
             auto id = req.matches[1].str();
             auto row = rs_get_owned(id, session->username);
@@ -149,14 +186,18 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
-        [deps, rs_detail_after, rs_get_owned](const httplib::Request& req,
+        [deps, rs_detail_after, rs_get_owned, tier_ok](const httplib::Request& req,
                                               httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.unpin.access_denied",
                                             "service-scoped tokens may not unpin result sets",
                                             "ResultSet", req.matches[1].str()))
                 return;
             auto session = deps.auth_fn(req, res);
-            if (!session || !deps.store)
+            if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
+                return;
+            if (!deps.store)
                 return;
             auto id = req.matches[1].str();
             auto row = rs_get_owned(id, session->username);
@@ -184,13 +225,17 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
 
     sink.Post(
         R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
-        [deps, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+        [deps, rs_get_owned, tier_ok](const httplib::Request& req, httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.delete.access_denied",
                                             "service-scoped tokens may not delete result sets",
                                             "ResultSet", req.matches[1].str()))
                 return;
             auto session = deps.auth_fn(req, res);
-            if (!session || !deps.store)
+            if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Delete"))
+                return;
+            if (!deps.store)
                 return;
             auto id = req.matches[1].str();
             auto row = rs_get_owned(id, session->username);
@@ -215,13 +260,17 @@ void register_result_set_routes(HttpRouteSink& sink, Deps deps) {
     // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
     sink.Post(
         "/fragments/result-sets/create",
-        [deps](const httplib::Request& req, httplib::Response& res) {
+        [deps, tier_ok](const httplib::Request& req, httplib::Response& res) {
             if (deps.deny_service_scoped_fn(req, res, "result_set.create.access_denied",
                                             "service-scoped tokens may not create result sets",
                                             "ResultSet", ""))
                 return;
             auto session = deps.auth_fn(req, res);
-            if (!session || !deps.store)
+            if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
+                return;
+            if (!deps.store)
                 return;
             CreateRequest cr;
             cr.owner_principal = session->username;

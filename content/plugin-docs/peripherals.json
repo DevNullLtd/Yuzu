@@ -776,10 +776,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave9-pr91a-peripherals-bus.added.md",
-      "changelog.d/wave9-pr91a2-peripherals-windows.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/peripherals.yaml"
     ],

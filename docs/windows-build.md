@@ -108,6 +108,15 @@ guard that exits 1 with an actionable message. CI workflow steps use
 `yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
 issue #517 for the migration history.
 
+**Exception: installer helpers run on end-user hosts.** Scripts the
+installers run on the customer's machine, today
+`deploy/packaging/windows/generate-config.ps1` and the inline commands in
+`yuzu-agent.iss` / `yuzu-server.iss`, target the Windows PowerShell 5.1
+(`powershell.exe`) that every Windows host has, and carry no PowerShell 7
+guard. They must stay ASCII-only outside comments (5.1 reads BOM-less files
+in the ANSI codepage), must use .NET Framework APIs, and each must first
+reset `PSModulePath` to `$PSHOME\Modules` plus the machine value (#5176).
+
 ## Running server tests locally (libpq.dll on PATH)
 
 Since #1320 PR 1 the server library links libpq, which is a **DLL** on

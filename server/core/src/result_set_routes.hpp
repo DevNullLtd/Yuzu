@@ -215,6 +215,19 @@ struct Deps {
     /// Empty/default `{}` = the create route answers with its own
     /// misconfiguration toast whenever `device_ids` is non-empty.
     using AllAgentIdsFn = std::function<std::vector<std::string>()>;
+    /// #5047: same shape/contract as `yuzu::server::TierPolicyFn` (auth_routes.hpp)
+    /// — a local typedef, not a reused one, matching this struct's own
+    /// AuthFn/DenyServiceScopedFn/AuditFn convention (no auth_routes.hpp
+    /// include). Applied to the 4 mutating fragments (pin/unpin/delete/
+    /// create) right after `auth_fn`, closing the same cross-transport
+    /// MCP-tier bypass their `/api/v1/result-sets` JSON twins close — these
+    /// dashboard fragments are plain HTTP endpoints reachable with any
+    /// Bearer token, not cookie-session-only. `{}` unwired fails closed
+    /// (503) for a TIERED session, passes through for an untiered one — see
+    /// `TierPolicyFn`'s own doc comment for the rationale.
+    using TierPolicyFn =
+        std::function<bool(const httplib::Request&, httplib::Response&, const auth::Session&,
+                           const std::string& securable_type, const std::string& operation)>;
 
     AuthFn auth_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
@@ -226,6 +239,7 @@ struct Deps {
     /// #4983 — see `AllAgentIdsFn`'s doc comment above. Same consultation
     /// scope as `fleet_read_fn` above.
     AllAgentIdsFn all_agent_ids_fn;
+    TierPolicyFn tier_policy_fn;
     /// `ServerImpl::result_set_store_`. Null -> every route degrades per
     /// this file's "THREE-WAY DEGRADE ASYMMETRY" doc comment above (there is
     /// no `is_open()` check anywhere in this module — matches the original

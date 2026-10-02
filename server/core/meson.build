@@ -374,6 +374,7 @@ yuzu_server_core_lib = static_library(
     'src/gateway_service_impl.cpp',
     'src/auth.cpp',
     'src/auth_db.cpp',
+    'src/enrollment_cfg_import.cpp', # WS-6 6.2: one-time legacy enrollment .cfg -> Postgres import
     'src/auth_routes.cpp',
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
@@ -423,6 +424,7 @@ yuzu_server_core_lib = static_library(
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
     'src/command_outbox_store.cpp',
+    'src/command_delivery_finalization_owner.cpp', # #4982 round 5: ADR-0012 §3 cross-schema owner
     'src/command_outbox_delivery.cpp',
     'src/gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
     'src/execution_event_bus.cpp',

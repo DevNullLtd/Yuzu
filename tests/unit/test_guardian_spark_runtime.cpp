@@ -6120,6 +6120,23 @@ TEST_CASE("rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key 
     // r2's arm on /b dispatches.
     const auto gen = rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
     REQUIRE(gen);
+    // attach_rule() waits only on r2's own arm claim on /b, which is queued behind /b's
+    // retained disarm. The /a prior-generation disarm is submitted off-lock as a separate
+    // task and nothing in attach_rule() waits on it, so it can still be in flight here.
+    // Wait for both disarms to land and both claim queues to drain before asserting on
+    // their effects.
+    const bool disarms_landed = yuzu::test::spin_until(
+        [&] {
+            return b->disarms.load() == 2 &&
+                   rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0 &&
+                   rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))) == 0;
+        },
+        std::chrono::seconds(10));
+    // Sampled after the wait so a timeout reports where it got stuck.
+    INFO("disarms=" << b->disarms.load()
+                    << " depth(/a)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/a")))
+                    << " depth(/b)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))));
+    REQUIRE(disarms_landed);
     CHECK(b->disarms.load() == 2);
     CHECK(b->arms.load() == 3);
     REQUIRE(b->armed_ids().size() == 3);
@@ -7358,6 +7375,11 @@ TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while 
             ::_exit(96);
         if (rt->armed_key_count() != 1 || b->arms.load() != 2)
             ::_exit(97);
+        // Join before _exit: TSan's _exit interceptor runs its finalizer, which reports an
+        // unjoined (even if finished) thread as a "thread leak" and exits 66 - the child
+        // would then fail the parent's exit-0 check on every nightly TSan run. a_done is
+        // already true here, so this returns immediately.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
@@ -7485,6 +7507,9 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
         // without the underlying double-disarm itself being fixed.
         if (b->disarms.load() > 1)
             ::_exit(98); // a second, redundant disarm landed - the double-disarm bug is back
+        // Join before _exit (same reason as Unit 4 above): TSan reports an unjoined thread at
+        // the _exit finalizer and exits 66. a_done is already true, so this is immediate.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
@@ -8295,8 +8320,9 @@ TEST_CASE("rung 9c PR-2 Unit 4: begin_stop() while a compensating disarm is stil
 // (disarm_retained_ real lifecycle + convergence-lane redrive wiring).
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity, before "
-          "any backend arm runs - the accumulation-to-ceiling path is now unreachable",
+TEST_CASE("up-3 (#4221) + #5168: the compensating-disarm reservation defers at capacity before "
+          "any backend arm runs - the accumulation-to-ceiling path stays unreachable and the "
+          "deferred arm is redriven the moment a permit frees",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -8307,6 +8333,16 @@ TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity
     constexpr int kCapacity = 4;
     std::vector<std::thread> threads;
     std::vector<std::expected<std::uint64_t, std::string>> results(static_cast<std::size_t>(kCapacity));
+    struct GateCleanup {
+        FakeBackend* backend;
+        std::vector<std::thread>* ts;
+        ~GateCleanup() {
+            backend->arm_park.open();
+            for (auto& t : *ts)
+                if (t.joinable())
+                    t.join();
+        }
+    } gate_cleanup{b.get(), &threads};
     for (int i = 0; i < kCapacity; ++i) {
         threads.emplace_back([&, i] {
             const auto rid = "r" + std::to_string(i);
@@ -8318,25 +8354,452 @@ TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity
                                    std::chrono::seconds(10)));
 
     // A 5th, distinct-key File attach: capacity is fully reserved by the 4 parked
-    // arms above, so this must be refused BEFORE ever calling backend->arm().
-    const auto res5 = rt->attach_rule("r4", file_spec("/k4"), file_exists_rule("r4"), true);
-    REQUIRE_FALSE(res5.has_value());
-    CHECK(res5.error() == "compensating-disarm reservation exhausted");
+    // arms above, so it is refused reservation BEFORE ever calling backend->arm() -
+    // but (#5168) that is a CONGESTION refusal, so the claim is parked (Accepted,
+    // not Failed) instead of failed, and left for the next permit release to redrive.
+    const auto res5 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r4", file_spec("/k4"),
+                                      file_exists_rule("r4"), true);
+    REQUIRE(res5.has_value());
+    CHECK(res5->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
     CHECK(rt->compensation_reservation_refused() == 1);
+    CHECK(rt->arms_parked() == 1);
+    CHECK(rt->arms_parked_total() == 1);
     CHECK(b->arm_entries.load() == kCapacity); // the 5th never entered arm()
     CHECK(rt->io_executor_stats_for_test().counters[0].rejected_ceiling == 0); // never got that far
 
-    b->arm_park.pulse(); // release all 4 parked arms
+    {
+        std::lock_guard lk(b->arm_park.mu);
+        b->arm_park.park_every = 0; // the redriven 5th arm must not park again
+    }
+    b->arm_park.pulse(); // release all 4 parked arms: their permits free, the 5th redrives
     for (auto& t : threads)
         t.join();
     for (int i = 0; i < kCapacity; ++i)
         CHECK(results[static_cast<std::size_t>(i)].has_value());
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return rt->receipt_status(res5->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed;
+        },
+        std::chrono::seconds(10)));
+    CHECK(b->arm_entries.load() == kCapacity + 1);
+    CHECK(rt->arms_parked() == 0);
+    CHECK(rt->arm_redrives() >= 1);
     CHECK(b->arm_park.watchdog_trips == 0);
-    b->arm_park.park_every = 0; // done parking - the 6th key below must arm normally
 
     // Capacity has recovered: a 6th distinct key now succeeds.
     const auto res6 = rt->attach_rule("r5", file_spec("/k5"), file_exists_rule("r5"), true);
     REQUIRE(res6.has_value());
+}
+
+// #5168 rig: File-class reservation capacity is 4 (Config{}.file_quota). fill_pool()
+// parks four NonWaiting arms inside backend arm() so every permit is held; the next
+// distinct-key attach is then PARKED by the runtime. ~ParkedPoolRig opens the gate
+// before rt is destroyed (members destruct after the destructor body).
+struct ParkedPoolRig {
+    static constexpr int kCapacity = 4;
+    std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
+    std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
+    std::shared_ptr<GuardianSparkRuntime> rt;
+    explicit ParkedPoolRig(GuardianSparkRuntime::Config cfg = {}) : rt(make_rt(r, b, cfg)) {}
+    ~ParkedPoolRig() {
+        b->arm_park.open();
+        // Detached io_executor_ workers may still be finishing (they log and touch the
+        // backend after the gate opens): wait for them, bounded and non-throwing, so no
+        // worker outlives the test body into static destruction.
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (rt->io_executor_stats_for_test().active_total != 0 &&
+               std::chrono::steady_clock::now() < end)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (rt->io_executor_stats_for_test().active_total != 0)
+            std::fputs("ParkedPoolRig: io_executor workers still alive after 10 s\n", stderr);
+    }
+    /// Number of backend calls currently blocked inside the gate.
+    [[nodiscard]] int gate_parked() const {
+        std::lock_guard lk(b->arm_park.mu);
+        return b->arm_park.parked;
+    }
+    void fill_pool() {
+        b->arm_park.park_every = 1;
+        for (int i = 0; i < kCapacity; ++i) {
+            const auto rid = "r" + std::to_string(i);
+            const auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, rid,
+                                             file_spec("/k" + std::to_string(i)),
+                                             file_exists_rule(rid), true);
+            REQUIRE(res.has_value());
+        }
+        // arm_entries is bumped BEFORE the gate, so wait for the calls to actually be parked.
+        REQUIRE(yuzu::test::spin_until([&] { return gate_parked() == kCapacity; }));
+    }
+    /// Attach a distinct-key rule that finds the pool full; it must come back Accepted.
+    GuardianSparkRuntime::ArmReceipt park_rule(const std::string& rid, const std::string& path) {
+        const auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, rid, file_spec(path),
+                                         file_exists_rule(rid), true);
+        REQUIRE(res.has_value());
+        REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+        return res->receipt;
+    }
+    /// Let every parked backend call finish and every later arm run without parking.
+    void release_gate() {
+        {
+            std::lock_guard lk(b->arm_park.mu);
+            b->arm_park.park_every = 0;
+        }
+        b->arm_park.pulse();
+    }
+    /// Wait until no io_executor_ worker is alive, so a negative assertion is not
+    /// racing a completion callback's off-lock dispatch.
+    void settle() {
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return rt->io_executor_stats_for_test().active_total == 0; }));
+    }
+    [[nodiscard]] GuardianSparkRuntime::ReceiptStatus status(const GuardianSparkRuntime::ArmReceipt& rc) const {
+        return rt->receipt_status(rc);
+    }
+};
+
+TEST_CASE("#5168: a parked arm is dropped Stopped by begin_stop and never dispatches",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+
+    const auto stopped_before = rig.rt->claims_dropped_at_stop();
+    rig.rt->begin_stop();
+    CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Stopped);
+    CHECK(rig.rt->claims_dropped_at_stop() == stopped_before + 1);
+    CHECK(rig.rt->arms_parked() == 0);
+    CHECK(rig.rt->parked_arm_waiter_depth_for_test() == 0); // begin_stop cleared the deques
+    rig.release_gate(); // permits free after stop: nothing may redrive the dropped claim
+    rig.settle();
+    CHECK(rig.rt->redrive_parked_arms() == 0);
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+}
+
+TEST_CASE("#5168: detaching a rule whose arm is parked withdraws it and it is never redriven",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+
+    rig.rt->detach_rule("r4");
+    CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Withdrawn);
+    CHECK(rig.rt->arms_parked() == 0);
+    rig.release_gate(); // permits free: a stale waiter entry must not dispatch the withdrawn claim
+    rig.settle();
+    CHECK(rig.rt->redrive_parked_arms() == 0);
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+}
+
+TEST_CASE("#5168: a parked arm that outlives its claim deadline expires CongestionExpired "
+          "and is not dispatched afterwards",
+          "[spark][runtime][liveness]") {
+    GuardianSparkRuntime::Config cfg;
+    cfg.backend_op_deadline = std::chrono::milliseconds{200};
+    ParkedPoolRig rig{cfg};
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+
+    // No clock seam: the deadline is real steady_clock. Poll expiry instead of sleeping.
+    REQUIRE(yuzu::test::spin_until([&] {
+        (void)rig.rt->expire_overdue_claims();
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired;
+    }));
+    CHECK(rig.rt->arms_parked() == 0);
+    rig.release_gate(); // permits free AFTER expiry: the expired claim must stay undispatched
+    rig.settle();
+    CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired);
+    CHECK(rig.rt->redrive_parked_arms() == 0);
+    CHECK(rig.rt->arm_redrives() == 0);
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity);
+}
+
+TEST_CASE("#5168: an arm refused for EXECUTOR capacity (not the reservation pool) is parked "
+          "and redriven by the disarm completion hook",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    constexpr int kQuota = 4; // File class: Config{}.file_quota
+    for (int i = 0; i < kQuota; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true));
+    }
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->disarm_park.open(); }
+    } gate_cleanup{rig.b.get()};
+    rig.b->disarm_park.park_every = 1; // every disarm parks, holding its File-class quota
+    for (int i = 0; i < kQuota; ++i)
+        rig.rt->detach_rule("r" + std::to_string(i));
+    REQUIRE(yuzu::test::spin_until([&] { return rig.b->disarm_entries.load() == kQuota; }));
+
+    // Reservation permits are free (the 4 arms published long ago) but the executor's
+    // File quota is fully held by the parked disarms: CapacityExhausted, parked.
+    const auto rc = rig.park_rule("r9", "/k9");
+    CHECK(rig.rt->arms_parked() == 1);
+    CHECK(rig.rt->compensation_reservation_refused() == 0); // not the reservation pool
+    CHECK(rig.rt->io_executor_stats_for_test().counters[0].rejected_capacity >= 1);
+
+    {
+        std::lock_guard lk(rig.b->disarm_park.mu);
+        rig.b->disarm_park.park_every = 0;
+    }
+    rig.b->disarm_park.pulse(); // disarms finish: on_disarm_complete's hook redrives the arm
+    // No manual redrive_parked_arms() here (and make_rt has no scheduler): only the
+    // completion hook can rescue the claim, so a missing hook leaves it Pending.
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+    CHECK(rig.rt->arms_parked() == 0);
+    CHECK(rig.rt->arm_redrives() >= 1);
+}
+
+TEST_CASE("#5168: a same-key follower behind a parked head is adopted when the head is withdrawn",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    // Two rules on ONE key: ra is the parked head, rb queues behind it.
+    const auto ra = rig.park_rule("ra", "/same");
+    const auto rb = rig.park_rule("rb", "/same");
+    REQUIRE(rig.rt->arms_parked() == 1);
+    CHECK(rig.status(rb) == GuardianSparkRuntime::ReceiptStatus::Pending);
+
+    rig.rt->detach_rule("ra"); // erases the parked head; rb becomes a Queued head
+    CHECK(rig.status(ra) == GuardianSparkRuntime::ReceiptStatus::Withdrawn);
+    CHECK(rig.rt->arms_parked() == 1); // rb was adopted, not stranded
+    rig.release_gate();
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.status(rb) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity + 1);
+}
+
+TEST_CASE("#5168: replacing a rule whose arm is parked dispatches exactly the new claim",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto old_rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+    const auto new_rc = rig.park_rule("r4", "/k4b"); // same rule, new spec: old claim withdrawn
+    CHECK(rig.status(old_rc) == GuardianSparkRuntime::ReceiptStatus::Withdrawn);
+    CHECK(rig.rt->arms_parked() == 1);
+    rig.release_gate();
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.status(new_rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+    rig.settle();
+    CHECK(rig.b->arm_entries.load() == ParkedPoolRig::kCapacity + 1); // the old claim never armed
+    CHECK(rig.status(old_rc) == GuardianSparkRuntime::ReceiptStatus::Withdrawn);
+}
+
+TEST_CASE("#5168: the parked-arm waiter deque stays bounded while the pool stays exhausted",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    for (int i = 0; i < 30; ++i) {
+        const auto rid = "x" + std::to_string(i);
+        (void)rig.park_rule(rid, "/kx" + std::to_string(i));
+        rig.rt->detach_rule(rid); // leaves a stale weak entry behind
+    }
+    // Every push compacts stale entries, so at most the last (detached) one lingers.
+    CHECK(rig.rt->parked_arm_waiter_depth_for_test() <= 1);
+    CHECK(rig.rt->arms_parked() == 0);
+}
+
+TEST_CASE("#5168: a redrive that throws after taking a parked arm hands it back and it is "
+          "dispatched by the next pass",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    constexpr int kQuota = 4;
+    for (int i = 0; i < kQuota; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true));
+    }
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->disarm_park.open(); }
+    } gate_cleanup{rig.b.get()};
+    rig.b->disarm_park.park_every = 1;
+    for (int i = 0; i < kQuota; ++i)
+        rig.rt->detach_rule("r" + std::to_string(i));
+    REQUIRE(yuzu::test::spin_until([&] { return rig.b->disarm_entries.load() == kQuota; }));
+    const auto rc = rig.park_rule("r9", "/k9"); // parked: executor quota held by the disarms
+    REQUIRE(rig.rt->arms_parked() == 1);
+
+    const auto failures_before = rig.rt->claim_drain_failures();
+    rig.rt->set_drain_fault_point_for_test(10); // throws after the take, before the dispatch
+    CHECK_NOTHROW(rig.rt->redrive_parked_arms());
+    CHECK(rig.rt->claim_drain_failures() == failures_before + 1);
+    // Not left Dispatching: the next pass adopts it again, and once the quota frees the
+    // completion hook (or that pass) dispatches it.
+    {
+        std::lock_guard lk(rig.b->disarm_park.mu);
+        rig.b->disarm_park.park_every = 0;
+    }
+    rig.b->disarm_park.pulse();
+    REQUIRE(yuzu::test::spin_until([&] {
+        (void)rig.rt->redrive_parked_arms();
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+}
+
+TEST_CASE("#5168: a failed waiter-deque push leaves the claim adoptable and it is dispatched by "
+          "the next redrive pass",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto failures_before = rig.rt->claim_drain_failures();
+    rig.rt->set_drain_fault_point_for_test(11); // the deque push throws
+    const auto rc = rig.park_rule("r4", "/k4");
+    CHECK(rig.rt->claim_drain_failures() == failures_before + 1);
+    CHECK(rig.rt->arms_parked() == 0); // parking was rolled back: nothing believes it is parked
+    CHECK(rig.rt->arms_parked_total() == 0);
+    rig.release_gate();
+    rig.settle();
+    REQUIRE(yuzu::test::spin_until([&] {
+        (void)rig.rt->redrive_parked_arms(); // adopts the un-parked head, then dispatches it
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+}
+
+TEST_CASE("#5168: a throw dispatching a hook-taken parked arm hands it back and the next redrive "
+          "dispatches it",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+    const auto failures_before = rig.rt->claim_drain_failures();
+    rig.rt->set_drain_fault_point_for_test(10); // throws at the first hook-taken dispatch
+    rig.release_gate();
+    rig.settle();
+    CHECK(rig.rt->claim_drain_failures() == failures_before + 1);
+    CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Pending); // not lost, not dispatched
+    REQUIRE(yuzu::test::spin_until([&] {
+        (void)rig.rt->redrive_parked_arms();
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+}
+
+TEST_CASE("#5168: a taken parked arm whose dispatch throws after begin_stop is resolved Stopped "
+          "and not left Queued",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    const auto rc = rig.park_rule("r4", "/k4");
+    REQUIRE(rig.rt->arms_parked() == 1);
+    // The hook runs at dispatch_arm_off_lock's entry for the hook-taken claim: stop the
+    // runtime there (the claim is Dispatching, so begin_stop's walk skips it), then throw.
+    rig.rt->set_dispatch_entry_hook_for_test([&] {
+        rig.rt->begin_stop();
+        throw std::runtime_error("dispatch threw after stop");
+    });
+    rig.release_gate();
+    rig.settle();
+    CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Stopped);
+    CHECK(rig.rt->arms_parked() == 0);
+    CHECK(rig.rt->claim_queue_depth_for_test(spark_key(file_spec("/k4"))) == 0); // no residue
+    CHECK(rig.rt->redrive_parked_arms() == 0);
+}
+
+TEST_CASE("#5168: terminal refusals of parked arms do not recurse and every parked arm ends "
+          "Failed",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.fill_pool();
+    constexpr int kParked = 40;
+    std::vector<GuardianSparkRuntime::ArmReceipt> receipts;
+    for (int i = 0; i < kParked; ++i)
+        receipts.push_back(rig.park_rule("p" + std::to_string(i), "/kp" + std::to_string(i)));
+    REQUIRE(rig.rt->arms_parked() == static_cast<std::size_t>(kParked));
+    rig.rt->set_io_executor_fail_launch_for_test(true); // every later submit is a terminal refusal
+    rig.release_gate();
+    rig.settle();
+    // Only the four permit-release hooks may have taken a parked arm: a terminal refusal
+    // must not chain into the next parked claim (the old recursive drain would have failed
+    // all 40 here, from one call stack).
+    CHECK(rig.rt->arm_redrives() >= 1); // the hooks did take parked arms (not vacuous)
+    CHECK(rig.rt->arm_redrives() <= static_cast<std::uint64_t>(ParkedPoolRig::kCapacity));
+    CHECK(rig.rt->arms_parked() >= static_cast<std::size_t>(kParked - ParkedPoolRig::kCapacity));
+    REQUIRE(yuzu::test::spin_until([&] {
+        (void)rig.rt->redrive_parked_arms(); // a terminal refusal drains nothing itself
+        return rig.rt->arms_parked() == 0;
+    }));
+    for (const auto& rc : receipts)
+        CHECK(rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Failed);
+}
+
+TEST_CASE("#5168: the normal completion release site redrives a parked arm while other permit "
+          "holders are still parked",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    rig.b->arm_park.park_every = 1;
+    for (int i = 0; i < 3; ++i) { // three permits held inside the gate
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, rid,
+                                    file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true)
+                    .has_value());
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return rig.gate_parked() == 3; }));
+    {
+        std::lock_guard lk(rig.b->arm_park.mu);
+        rig.b->arm_park.park_every = 0; // later arms do not park in the gate
+    }
+    rig.b->hang_next_arm.store(true); // the fourth permit is held by a hung arm()
+    REQUIRE(rig.rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r3", file_spec("/k3"),
+                                file_exists_rule("r3"), true)
+                .has_value());
+    REQUIRE(rig.b->wait_entered_hang(std::chrono::seconds(10)));
+    const auto rc = rig.park_rule("r4", "/k4"); // all four permits held: parked
+    REQUIRE(rig.rt->arms_parked() == 1);
+    rig.b->release_hang(); // ONLY the hung arm finishes; r0..r2 stay parked in the gate
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+    CHECK(rig.rt->arms_parked() == 0);
+}
+
+TEST_CASE("#5168: the convergence scheduler redrives a parked arm that no completion hook can "
+          "reach",
+          "[spark][runtime][liveness]") {
+    ParkedPoolRig rig;
+    constexpr int kQuota = 4;
+    for (int i = 0; i < kQuota; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true));
+    }
+    struct GateCleanup {
+        FakeBackend* backend;
+        ~GateCleanup() { backend->disarm_park.open(); }
+    } gate_cleanup{rig.b.get()};
+    rig.b->disarm_park.park_every = 1;
+    for (int i = 0; i < kQuota; ++i)
+        rig.rt->detach_rule("r" + std::to_string(i));
+    REQUIRE(yuzu::test::spin_until([&] { return rig.b->disarm_entries.load() == kQuota; }));
+    const auto rc = rig.park_rule("r9", "/k9"); // parked: the executor quota is held by disarms
+    REQUIRE(rig.rt->arms_parked() == 1);
+    // A manual redrive takes it (a permit is free) and the injected throw hands it back
+    // un-parked: now it is in no deque, so no completion hook can find it.
+    rig.rt->set_drain_fault_point_for_test(10);
+    (void)rig.rt->redrive_parked_arms();
+    REQUIRE(rig.rt->arms_parked() == 0);
+
+    ConvergenceScheduler::Config cfg;
+    cfg.priority_poll_ms = 5;
+    cfg.jitter_pct = 0;
+    ConvergenceScheduler sched{*rig.rt, cfg};
+    sched.start();
+    {
+        std::lock_guard lk(rig.b->disarm_park.mu);
+        rig.b->disarm_park.park_every = 0;
+    }
+    rig.b->disarm_park.pulse();
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.status(rc) == GuardianSparkRuntime::ReceiptStatus::Committed;
+    }));
+    sched.stop();
 }
 
 TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous submission "
@@ -10176,7 +10639,13 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id target
     auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/b"),
                                 file_exists_rule("r1"), true);
     REQUIRE(res2.has_value());
-    CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted); // off-lock dispatch, ordinary
+    // The /b arm is NOT hung (hang_next_arm was consumed by /a's), so its detached worker
+    // can finish before attach_rule() re-locks registry_mu_. attach_rule(NonWaiting) then
+    // returns Armed with an empty receipt rather than Accepted; both are the ordinary
+    // off-lock-dispatch outcome and this test is about the absence of any wedge
+    // interaction, not about which one the scheduler produces. Only an Accepted result
+    // carries a receipt to poll.
+    const bool res2_accepted = res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted;
     CHECK(rt->wedged_reobservations() == 0);
     CHECK(rt->wedged_refusals() == 0);
     // The old key's wedged head is untouched: detach_rule_locked("r1") (Case 0,
@@ -10185,10 +10654,22 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id target
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 1);
     CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
-    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+    if (res2_accepted) {
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+                                       std::chrono::seconds(10)));
+        CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    } else {
+        // Armed: the arm already committed before attach_rule() returned, so there is no
+        // receipt to poll. The commit evidence the Accepted branch gets from its receipt
+        // comes from the outcome instead: a real generation was assigned, and rule r1 is
+        // registered as the committed generation (rule_active_for_test() is nullopt for
+        // an uncommitted or absent rule).
+        CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed);
+        CHECK(res2->generation != 0);
+        CHECK(rt->rule_active_for_test("r1").has_value());
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
-    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
-    CHECK(rt->rule_count() == 1);
 
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
@@ -10501,8 +10982,16 @@ TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a mono
     REQUIRE(rt->redrive_retained_disarms() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
+    // The backend's disarm counter flips BEFORE the runtime's completion callback
+    // decrements the retained count and pops the claim, so asserting them right after
+    // that spin raced the callback (`disarm_retained() == 0` read 1 under TSan). Wait on
+    // the lifecycle state itself.
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->disarm_retained() == 0 && rt->claim_queue_depth_for_test(key) == 0; },
+        std::chrono::seconds(10)));
     CHECK(rt->disarm_retained() == 0);
-    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
 
 TEST_CASE("up-5 (#4221): the convergence lane's priority loop redrives a retained disarm "

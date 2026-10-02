@@ -505,6 +505,20 @@ flip, with a red-first test each:
   the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
   (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
   `disarms == 200` this row's chaos reproduction disproved.
+- **#5168 flip preconditions (congestion parking; spark path only, dormant until the flip)**: a
+  congestion refusal at arm dispatch now parks the arm and redrives it instead of failing it (see
+  `docs/spark-stage2-guardian-consumer-design.md` R5.2 amendment). Criteria for the flip: (1) a
+  measured Service `watch()` p99 below the 5 s claim deadline (a large surplus of slow arms can
+  still end congestion-expired); (2) the parked-arm signals exported as heartbeat tags -
+  `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`
+  and the current parked depth (`arms_parked()`) are runtime accessors only today, so
+  `arm_pending > 0` cannot yet be told apart from ordinary in-flight arms; (3) a decision on the
+  deferred faster redrive/expiry cadence (expiry lands between the deadline
+  and the deadline plus one heartbeat interval (30 s by default), and the redrive sweep is a ~5 s
+  last resort); (4) Windows and macOS runs of the #5168 tests, which have only been run on Linux.
+  A Linux TSan and ASan/UBSan pass of the #5168 tests was clean; the two PR-2 Unit 4 thread-leak
+  tests (`test_guardian_spark_runtime.cpp`) report identically at merge base 3cf42e3e9, so they are
+  not from this change.
 - **up-3/up-4/ch-1/up-5 status (rung 9c PR-5b, #4221)**: up-3 fixed via a runtime-owned
   compensating-disarm reservation reserved per claim BEFORE its arm dispatches (not routed through
   `GuardianIoExecutor`'s own admission - it has no compensation-priority `IoClass` and rejects

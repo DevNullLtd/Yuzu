@@ -97,11 +97,13 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_update_source_trust.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_control.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_firmware_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_runtimes.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_platform_security.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_browser_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_local_security_policy.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
@@ -148,10 +150,21 @@ FRAGMENT_FILES = [
 # arithmetic, which has drifted before (206, then 203, then repeatedly since). Dev
 # landed at 222 here (219 baseline + system_hardening 1 + pkg_inventory 2); dev's own
 # browser_policy (+1) landed on top of that: 222 + 1 = 223. This branch's own
-# privacy_permissions (+1) lands on top of dev's 223: 223 + 1 = 224. Verified directly
-# by running parse_fragment_gate_rows over FRAGMENT_FILES with privacy_permissions'
-# fragment added, not by hand arithmetic.
-EXPECTED_TOTAL_ROWS = 224
+# dev merged privacy_permissions (+1) on top of the 223 baseline: dev is now at 224.
+# This branch's own local_security_policy (+3: password_policy/lockout_policy/
+# audit_policy -- sudoers is PLANNED, follows as its own PR, not counted here) lands on
+# top of dev's CURRENT 224 (not the pre-merge 223): 224 + 3 = 227. Verified directly by
+# running parse_fragment_gate_rows over FRAGMENT_FILES with both plugins' fragments
+# present, not by hand arithmetic -- see the merge-arithmetic trap this comment exists
+# to name (adding this branch's own delta to a stale baseline undercounts by the other
+# side's own delta).
+# Wave 10 PR10.1-d: +1 update_source_trust (sources) on top of dev's 227 = 228, verified by
+# running parse_fragment_gate_rows over all 26 FRAGMENT_FILES and by a `grep -c` sum
+# (both 228), not by adding to a possibly-stale baseline.
+# local_security_policy's `sudoers` action (+1, Medium risk tier) on top of that 228: the total is
+# 229, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a
+# baseline.
+EXPECTED_TOTAL_ROWS = 229
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
