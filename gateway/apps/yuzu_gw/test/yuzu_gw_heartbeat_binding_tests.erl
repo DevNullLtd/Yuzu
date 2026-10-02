@@ -382,9 +382,9 @@ reannounce_leaves_binding() ->
 registry_restart_fails_closed() ->
     S = uid(<<"s">>),
     bind(uid(<<"a">>), S, conn_a),
-    Reg = whereis(yuzu_gw_registry),
-    unlink(Reg),
-    exit(Reg, kill),
+    %% A normal stop drops the registry's tables without sending a kill
+    %% signal down its links (the process that started it is not ours).
+    ok = gen_server:stop(whereis(yuzu_gw_registry)),
     ok = wait_until(fun() ->
         ets:info(?SESSIONS, size) =:= undefined andalso
         ets:info(?PENDING, size) =:= undefined

@@ -7,6 +7,13 @@
 %%%   connection re-establishes (the server comes back with an empty
 %%%   registry and must relearn every agent the gateway already holds).
 %%% ETS (`yuzu_gw_pending`): pending Register→Subscribe state with TTL.
+%%% ETS (`yuzu_gw_sessions`): session index `{SessionId, AgentId, Pid, ConnKey}`
+%%%   for heartbeat admission. ConnKey is the connection key (see
+%%%   `yuzu_gw_conn') of the Subscribe stream that created the session, or
+%%%   `undefined' for a registration made without one (such a session is held
+%%%   but admits no heartbeat). The index is node-local by construction (it
+%%%   never consults `pg'); a row is removed with the agent process that owns
+%%%   it, and only ever by that process's own session id.
 %%% pg (`yuzu_gw` scope):   cluster-aware process groups for broadcast
 %%%   and plugin-targeted fanout.
 %%%
@@ -21,9 +28,13 @@
 -export([start_link/0,
          register_agent/5,
          register_agent/6,
+         register_agent/7,
          deregister_agent/1,
+         deregister_agent/3,
          lookup/1,
          lookup_local_session/1,
+         lookup_session/1,
+         lookup_pending_session/1,
          all_agents/0,
          all_agent_pids/0,
          all_register_reqs/0,
@@ -39,6 +50,7 @@
 -define(SERVER, ?MODULE).
 -define(TABLE,  yuzu_gw_agents).
 -define(PENDING_TABLE, yuzu_gw_pending).
+-define(SESSIONS_TABLE, yuzu_gw_sessions).
 -define(PG_SCOPE, yuzu_gw).
 -define(PENDING_TTL_MS, 120000).     %% 2 minutes
 -define(PENDING_SWEEP_MS, 60000).    %% 1 minute
@@ -77,14 +89,42 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
 -spec register_agent(binary(), pid(), binary() | undefined,
                      [binary()], binary(), map()) -> ok.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
+    register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, undefined).
+
+%% @doc Register an agent process and bind its session to ConnKey.
+%%
+%% ConnKey is the connection key of the Subscribe stream that created the
+%% session (`yuzu_gw_conn:key_from_stream/1'); heartbeat admission admits a
+%% heartbeat for SessionId only on that connection. The /5 and /6 forms
+%% register with `undefined', which admits nothing. A session id of
+%% `undefined' is not indexed at all.
+-spec register_agent(binary(), pid(), binary() | undefined,
+                     [binary()], binary(), map(), yuzu_gw_conn:key()) -> ok.
+register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey) ->
     gen_server:call(?SERVER,
-                    {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq},
+                    {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq,
+                     ConnKey},
                     30000).
 
 %% @doc Remove an agent from the routing table.
+%%
+%% Unfenced: deletes whatever process currently holds AgentId, together with
+%% that row's session index entry. Production cleanup uses deregister_agent/3.
 -spec deregister_agent(binary()) -> ok.
 deregister_agent(AgentId) ->
     gen_server:cast(?SERVER, {deregister, AgentId}).
+
+%% @doc Remove the agent process Pid, and its session SessionId, if it is
+%% still the registered owner.
+%%
+%% Fenced: called by an agent process from its own cleanup. A process that
+%% has been superseded by a newer registration of the same agent id (the
+%% agent reconnected under a new session before the old stream was torn
+%% down) removes only its own session index entry and leaves the newer
+%% registration, in both tables, untouched.
+-spec deregister_agent(binary(), pid(), binary() | undefined) -> ok.
+deregister_agent(AgentId, Pid, SessionId) ->
+    gen_server:cast(?SERVER, {deregister, AgentId, Pid, SessionId}).
 
 %% @doc Lookup an agent by ID. Returns {ok, Pid} or error.
 %%
@@ -185,6 +225,52 @@ lookup_local_session(AgentId) ->
         [] ->
             error
     end.
+
+%% @doc The session this node holds under SessionId, for heartbeat admission.
+%%
+%% Reads the node-local session index only (never `pg'): a session held by
+%% another node is not found here. `error' also covers a row whose process is
+%% no longer alive. `{error, unavailable}' means the index does not exist
+%% (the registry is not running or is restarting); callers must treat that
+%% as "not admitted", never as "no filter".
+-spec lookup_session(term()) ->
+    {ok, #{agent_id := binary(), pid := pid(), conn_key := yuzu_gw_conn:key()}}
+    | error
+    | {error, unavailable}.
+lookup_session(SessionId) ->
+    try ets:lookup(?SESSIONS_TABLE, SessionId) of
+        [{_, AgentId, Pid, ConnKey}] ->
+            case is_local_alive(Pid) of
+                true  -> {ok, #{agent_id => AgentId, pid => Pid, conn_key => ConnKey}};
+                false -> error
+            end;
+        [] ->
+            error
+    catch
+        error:badarg -> {error, unavailable}
+    end.
+
+%% @doc The connection key recorded by Register for a session that is still
+%% pending (Register done, Subscribe not yet admitted). Does not consume the
+%% row. A row past its TTL is reported as absent even if the periodic sweep
+%% has not removed it yet. `{ok, undefined}' means the row carries no key.
+-spec lookup_pending_session(term()) ->
+    {ok, yuzu_gw_conn:key()} | error | {error, unavailable}.
+lookup_pending_session(SessionId) ->
+    try ets:lookup(?PENDING_TABLE, SessionId) of
+        [{_, Info, StoredAt}] ->
+            case erlang:system_time(millisecond) - StoredAt > ?PENDING_TTL_MS of
+                true  -> error;
+                false -> {ok, maps:get(conn_key, Info, undefined)}
+            end;
+        [] ->
+            error
+    catch
+        error:badarg -> {error, unavailable}
+    end.
+
+is_local_alive(Pid) ->
+    node(Pid) =:= node() andalso is_process_alive(Pid).
 
 %% @doc Return all agent IDs.
 -spec all_agents() -> [binary()].
@@ -335,11 +421,12 @@ take_pending(SessionId) ->
 init([]) ->
     ets:new(?TABLE, [named_table, set, public, {read_concurrency, true}]),
     ets:new(?PENDING_TABLE, [named_table, set, public]),
+    ets:new(?SESSIONS_TABLE, [named_table, set, public, {read_concurrency, true}]),
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
     {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
 
-handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq}, _From,
-            #state{monitor_refs = Mons} = State) ->
+handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey},
+            _From, #state{monitor_refs = Mons} = State) ->
     %% Remove any stale entry for this agent_id (returns cleaned Mons).
     Mons1 = maybe_cleanup(AgentId, Mons),
 
@@ -348,6 +435,10 @@ handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq},
     Now = erlang:system_time(millisecond),
     ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
                         Hostname, RegisterReq}),
+
+    %% Index the session for heartbeat admission. A session id of
+    %% `undefined' (the routing-focused test path) is not indexed.
+    index_session(SessionId, AgentId, Pid, ConnKey),
 
     %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
     %% location-transparency group `lookup/1`'s fallback reads — see that
@@ -370,13 +461,22 @@ handle_call(_Request, _From, State) ->
 handle_cast({deregister, AgentId}, State) ->
     do_deregister(AgentId, State);
 
+handle_cast({deregister, AgentId, Pid, SessionId}, State) ->
+    do_deregister_fenced(AgentId, Pid, SessionId, State);
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'DOWN', MonRef, process, _Pid, _Reason},
+handle_info({'DOWN', MonRef, process, Pid, _Reason},
             #state{monitor_refs = Mons} = State) ->
     case maps:find(MonRef, Mons) of
         {ok, AgentId} ->
+            %% Drop this process's session index entry (read from its own
+            %% routing row) before the row itself goes.
+            case ets:lookup(?TABLE, AgentId) of
+                [{_, Pid, _, SessionId, _, _, _, _}] -> unindex_session(SessionId, Pid);
+                _                                    -> ok
+            end,
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes dead processes, but we clean ETS explicitly.
             {noreply, State#state{monitor_refs = maps:remove(MonRef, Mons)}};
@@ -426,14 +526,10 @@ code_change(_OldVsn, State, _Extra) ->
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, Plugins, _, _, _}] ->
+        [{_, Pid, _, SessionId, Plugins, _, _, _}] ->
             ets:delete(?TABLE, AgentId),
-            %% pg auto-removes on process exit, but leave explicitly for clarity.
-            catch pg:leave(?PG_SCOPE, all_agents, Pid),
-            catch pg:leave(?PG_SCOPE, {agent, AgentId}, Pid),
-            lists:foreach(fun(Plugin) ->
-                catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
-            end, Plugins),
+            unindex_session(SessionId, Pid),
+            leave_groups(AgentId, Pid, Plugins),
             %% Find and remove the monitor ref.
             Mons2 = maps:filter(fun(_Ref, Id) -> Id =/= AgentId end, Mons),
             {noreply, State#state{monitor_refs = Mons2}};
@@ -441,16 +537,54 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
             {noreply, State}
     end.
 
+%% Fenced removal for an agent process cleaning up after itself. Its own
+%% session index entry always goes (that entry can only be its own: it is
+%% matched on this pid). The routing-table row and the pg memberships go only
+%% while this pid is still the registered owner of AgentId; if a newer
+%% registration replaced it, that registration is left alone.
+do_deregister_fenced(AgentId, Pid, SessionId, #state{monitor_refs = Mons} = State) ->
+    unindex_session(SessionId, Pid),
+    case ets:lookup(?TABLE, AgentId) of
+        [{_, Pid, _, _, Plugins, _, _, _}] ->
+            ets:delete(?TABLE, AgentId),
+            leave_groups(AgentId, Pid, Plugins),
+            Mons2 = maps:filter(fun(_Ref, Id) -> Id =/= AgentId end, Mons),
+            {noreply, State#state{monitor_refs = Mons2}};
+        _ ->
+            {noreply, State}
+    end.
+
+%% pg auto-removes on process exit, but leave explicitly for clarity.
+leave_groups(AgentId, Pid, Plugins) ->
+    catch pg:leave(?PG_SCOPE, all_agents, Pid),
+    catch pg:leave(?PG_SCOPE, {agent, AgentId}, Pid),
+    lists:foreach(fun(Plugin) ->
+        catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
+    end, Plugins).
+
+index_session(undefined, _AgentId, _Pid, _ConnKey) ->
+    ok;
+index_session(SessionId, AgentId, Pid, ConnKey) ->
+    ets:insert(?SESSIONS_TABLE, {SessionId, AgentId, Pid, ConnKey}),
+    ok.
+
+%% Delete the index entry for SessionId only if it belongs to Pid. The key is
+%% bound in the match head, so this is a single-key operation.
+unindex_session(undefined, _Pid) ->
+    ok;
+unindex_session(SessionId, Pid) ->
+    ets:select_delete(?SESSIONS_TABLE,
+                      [{{SessionId, '_', Pid, '_'}, [], [true]}]),
+    ok.
+
 %% @doc Clean up a stale agent entry and return the updated monitor map.
 maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, OldPid, _, _, OldPlugins, _, _, _}] ->
-            catch pg:leave(?PG_SCOPE, all_agents, OldPid),
-            catch pg:leave(?PG_SCOPE, {agent, AgentId}, OldPid),
-            lists:foreach(fun(Plugin) ->
-                catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)
-            end, OldPlugins),
+        [{_, OldPid, _, OldSessionId, OldPlugins, _, _, _}] ->
+            leave_groups(AgentId, OldPid, OldPlugins),
             ets:delete(?TABLE, AgentId),
+            %% The superseded session stops admitting heartbeats with its row.
+            unindex_session(OldSessionId, OldPid),
             %% Demonitor old refs and remove them from the map.
             maps:fold(fun(Ref, Id, AccMons) ->
                 case Id of

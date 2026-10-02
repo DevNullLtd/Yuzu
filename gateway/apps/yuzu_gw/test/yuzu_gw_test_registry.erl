@@ -8,7 +8,7 @@
 %%% death is *asynchronous*. So when the next module's `setup/0' runs
 %%% there is a window where `whereis(yuzu_gw_registry) =:= undefined' but
 %%% the named tables the dead registry owned (`yuzu_gw_agents' /
-%%% `yuzu_gw_pending') are not yet reaped. A naive `start_link' in that
+%%% `yuzu_gw_pending' / `yuzu_gw_sessions') are not yet reaped. A naive `start_link' in that
 %%% window crashes in `init/1' with
 %%%
 %%%     ets:new(yuzu_gw_pending, ...) → {badarg, ... table name already exists}
@@ -36,6 +36,7 @@
 %% Tables owned by the registry gen_server (see yuzu_gw_registry:init/1).
 -define(AGENTS_TABLE,  yuzu_gw_agents).
 -define(PENDING_TABLE, yuzu_gw_pending).
+-define(SESSIONS_TABLE, yuzu_gw_sessions).
 
 -define(START_RETRIES,    20).
 -define(REAP_TIMEOUT_MS, 1000).
@@ -116,7 +117,8 @@ do_start_fresh(Retries) ->
     %% the named tables — once they are gone, start_link is clean.
     _ = wait_until(fun() ->
         ets:info(?AGENTS_TABLE, size) =:= undefined andalso
-        ets:info(?PENDING_TABLE, size) =:= undefined
+        ets:info(?PENDING_TABLE, size) =:= undefined andalso
+        ets:info(?SESSIONS_TABLE, size) =:= undefined
     end, ?REAP_TIMEOUT_MS),
     case yuzu_gw_registry:start_link() of
         {ok, _Pid} ->
