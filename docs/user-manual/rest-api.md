@@ -6660,7 +6660,7 @@ A store-level read failure now answers `503 RESULT_SET_STORE_UNAVAILABLE` (fail-
 
 Create a result set directly from a pre-computed device-id list (e.g. an operator with a CSV of device ids). Synchronous — lands `materialized` immediately, no dispatch involved.
 
-**Permission:** Session-authenticated (owner-scoped). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets) for what that does and doesn't mean. An MCP-tiered bearer token additionally passes through the same tier/approval belt its `create_result_set` MCP twin enforces (#5047) — this is the cross-transport parity check, not an RBAC grant.
+**Permission:** Session-authenticated (owner-scoped). No RBAC securable — see ["Not RBAC-gated: per-operator result sets"](rbac.md#not-rbac-gated-per-operator-result-sets) for what that does and doesn't mean. An MCP-tiered bearer token additionally passes through the same tier/approval belt its `create_result_set` MCP twin enforces (#5047) — this is the cross-transport parity check, not an RBAC grant. When `device_ids` is non-empty, the route additionally gates that field through the admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017, #4983) — a request that omits `device_ids` (or supplies an empty array) is completely unaffected by this gate and pays no extra cost.
 
 **Request body:**
 
@@ -6670,7 +6670,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | `source_kind` | string | No | Defaults to `manual_curate` |
 | `source_payload` | object | No | Stored as JSON; defaults to `{}` — if `parent_id` is also supplied AND `source_payload` is itself a JSON object, a `scope_input_id` key recording it is merged in (overwriting any caller-supplied key of that name), #4306 |
 | `parent_id` | string | No | Must reference a set the caller owns (else `404`) |
-| `device_ids` | array of string | No | The initial member set |
+| `device_ids` | array of string | No | The initial member set. Each entry is capped at 256 bytes (`400 RESULT_SET_DEVICE_ID_TOO_LONG`), checked before the existence/scope lookup below. **#4983:** every entry must name a device that both exists (checked against the presence-merged fleet, not just this replica's local connections — HA WS-5) and is visible to the caller's own scope (management-group confinement, service-scope confinement); a nonexistent id and a real-but-out-of-scope id are indistinguishable in the response, matching `GET /api/v1/devices/{id}`'s own oracle-safety posture. On any invalid STRING entry the WHOLE request is rejected (`400`) — never a silent drop or a partial create for a string entry that fails the check. (A non-string array entry, e.g. `{"device_ids":["dev-1",7]}`, is silently skipped during parsing rather than rejected — a pre-existing, separate gap, not introduced or closed by #4983.) |
 
 **Response (201):** A `ResultSet` object (see above).
 
@@ -6681,11 +6681,15 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_UNKNOWN_DEVICE_ID` (#4983) — a non-empty `device_ids` contains an id that does not exist, or exists but is outside the caller's own scope; the offending id(s) are named in the error message (the caller's own submitted list, so echoing them back is not a disclosure) — checked after the size cap and before `create_materialized`, so an oversized array is rejected for that reason first |
+| 400 | `RESULT_SET_DEVICE_ID_TOO_LONG` (#4983) — a `device_ids` entry exceeds 256 bytes; checked before both the per-set member-count cap and the existence/scope lookup above |
 | 403 | Service-scoped API token |
 | 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
+| 403 | (#4983) the caller lacks `Infrastructure:Read` — only reachable when `device_ids` is non-empty; a request without it never consults this gate |
 | 404 | `parent_id` supplied but not owned/found |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
 | 503 | `RESULT_SET_TIER_POLICY_UNAVAILABLE` — the tier/approval check is misconfigured (server-side wiring fault, not a caller error; unreachable in a correctly-configured deployment) |
+| 503 | (#4983) The `device_ids` existence/scope check itself is unwired or its backing agent registry is unavailable — only reachable when `device_ids` is non-empty; a request without it is unaffected |
 
 #### `GET /api/v1/result-sets/{id}`
 
