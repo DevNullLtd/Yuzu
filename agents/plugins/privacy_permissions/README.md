@@ -6,7 +6,7 @@
 | **What it does** | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.privacy_permissions.permissions) |
-| **Platforms** | Windows 🟡 planned · macOS 🟡 constrained · Linux 🟡 constrained |
+| **Platforms** | Windows 🟡 constrained · macOS 🟡 constrained · Linux 🟡 constrained |
 | **Actions** | `permissions` (definition `crossplatform.privacy_permissions.permissions`) |
 | **Security** | securable `Forensics` · operation Read · risk High · dispatch ReadOnly · approval gate AdminOrApproval |
 | **Roles** | execute: admin · author: content-author |
@@ -35,11 +35,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `permissions` | 🟡 planned · rung 1 · HKLM ProfileList enumeration, then each real profile's SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore via its loaded HKU\\<SID> hive or an offline NTUSER.DAT mount (RegLoadKeyW, SeBackup/SeRestore), plus the same HKLM ConsentStore path | 🟡 constrained · rung 1 · TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI (no lock, no -journal/-wal/-shm ever opened or created; a WAL-mode or journal-bearing file is refused, and a file that changes during the read is discarded): the system /Library/Application Support/com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user Library/Application Support/com.apple.TCC/TCC.db | 🟡 constrained · rung 1 · xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the agent process's own session bus (sd_bus_open_user) |
+| `permissions` | 🟡 constrained · rung 1 · HKLM ProfileList enumeration, then each real profile's SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore via its loaded HKU\\<SID> hive or an offline NTUSER.DAT mount (RegLoadKeyW, SeBackup/SeRestore), plus the same HKLM ConsentStore path | 🟡 constrained · rung 1 · TCC.db read-only, in-process sqlite3 over one descriptor with an immutable URI (no lock, no -journal/-wal/-shm ever opened or created; a WAL-mode or journal-bearing file is refused, and a file that changes during the read is discarded): the system /Library/Application Support/com.apple.TCC/TCC.db plus each /Users/<home> (uid >= 500) per-user Library/Application Support/com.apple.TCC/TCC.db | 🟡 constrained · rung 1 · xdg-desktop-portal org.freedesktop.impl.portal.PermissionStore.Lookup over the agent process's own session bus (sd_bus_open_user) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`permissions` / Windows** — follows as its own PR
+- **`permissions` / Windows** — reads each real profile's ConsentStore from its loaded HKU hive first, else from NTUSER.DAT under SeBackup/SeRestore (a UNC, non-fixed-drive, reparse-point or reparse-ancestor, redirected, oversized or foreign-owned hive file is refused, and one whose identity changes across the load is unloaded unread); a ConsentStore change RegNotifyChangeKeyValue reports during the read refuses that source, never guessed; HKLM Deny overrides a profile (most restrictive wins); per-app NonPackaged rows carry last-used times but no decision; a cooperative 15 s deadline and a 16 MiB output budget
 - **`permissions` / macOS** — every TCC.db is TCC-protected: without Full Disk Access each read is denied; camera and microphone grants normally live in the per-user dbs; per-user rows report what that user's own TCC.db records, not what tccd enforces; homes outside /Users or on a network mount are not read; location is unsupported (locationd, outside TCC)
 - **`permissions` / Linux** — never another user's session: a system-service agent has no session bus in every shipped deployment and reports unavailable, which says nothing about interactive users' grants; only portal-mediated grants are visible (an app opening the device directly never appears); full_disk_access is unsupported (no portal equivalent)
 <!-- END GENERATED -->
@@ -114,7 +114,27 @@ Every token is `<subject>:<cause>`; on a failure row it is also the row's `raw`.
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 9b1bec4e5ba4
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-02 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 6f22f62118ed
+
+```
+== action=permissions
+permissions|windows|jsmith/-|camera|allowed|Allow|-|-
+permissions|windows|jsmith/-|full_disk_access|allowed|Allow|-|-
+permissions|windows|jsmith/-|location|allowed|Allow|-|-
+permissions|windows|jsmith/-|microphone|allowed|Allow|-|-
+permissions|windows|jsmith/5319275A.WhatsAppDesktop_cv1g1gvanyjgm|camera|denied|Deny|-|-
+permissions|windows|jsmith/5319275A.WhatsAppDesktop_cv1g1gvanyjgm|location|allowed|Allow|-|-
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/HdxRtcEngine.exe|camera|absent|-|1699446591317|1699448586363
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/HdxRtcEngine.exe|microphone|absent|-|1699446611274|1699448585475
+permissions|windows|jsmith/C:/PROGRA~2/Citrix/ICACLI~1/wfica32.exe|microphone|absent|-|1727429693627|1727429699770
+permissions|windows|jsmith/C:/Program Files (x86)/Steam/bin/cef/cef.win7x64/steamwebhelper.exe|microphone|absent|-|1672318772321|1672318774367
+permissions|windows|jsmith/C:/Program Files (x86)/Steam/steam.exe|microphone|absent|-|1737300284911|1737312589346
+permissions|windows|jsmith/C:/Program Files (x86)/ZoomCitrixHDXMediaPlugin/Zoom.exe|camera|absent|-|1732527131754|1732528329384
+… 12 of 121 rows shown
+[result_status] OK / FULL
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-29 · euid 501 (ambient FDA, NOT the production agent identity -- see leg banner; account names replaced with jsmith) · leg-hash 6f22f62118ed
 
 ```
 == action=permissions
@@ -134,7 +154,7 @@ permissions|macos|jsmith/org.whispersystems.signal-desktop|microphone|allowed|2|
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-25 · euid 0 · leg-hash 9b1bec4e5ba4
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-25 · euid 0 · leg-hash 6f22f62118ed
 
 ```
 == action=permissions
@@ -158,10 +178,10 @@ permissions|linux|-|full_disk_access|unsupported|-|-|-
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/privacy_permissions/src/privacy_permissions_legs.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_linux.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_linux_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_macos.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_macos_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp`
+- Plugin: `agents/plugins/privacy_permissions/src/privacy_permissions_legs.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_linux.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_linux_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_macos.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_macos_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_parsers.hpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp` · `agents/plugins/privacy_permissions/src/privacy_permissions_win_parsers.hpp`
 - Definitions: `content/definitions/privacy_permissions.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp`
-- Tests: `tests/unit/test_privacy_permissions_local_dispatcher.cpp` · `tests/unit/test_privacy_permissions_macos_internals.cpp` · `tests/unit/test_privacy_permissions_parsers.cpp`
+- Tests: `tests/unit/test_privacy_permissions_local_dispatcher.cpp` · `tests/unit/test_privacy_permissions_macos_internals.cpp` · `tests/unit/test_privacy_permissions_parsers.cpp` · `tests/unit/test_privacy_permissions_win_internals.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-09-29-privacy_permissions-macos-leg.added.md`
+- Changelog: `changelog.d/2026-09-29-privacy_permissions-macos-leg.added.md` · `changelog.d/2026-09-30-privacy_permissions-windows-leg.added.md`
 <!-- END GENERATED -->
