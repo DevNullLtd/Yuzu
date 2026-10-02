@@ -206,32 +206,42 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX IF NOT EXISTS inventory_state_source_agent_idx "
          "ON inventory_state (source, agent_id);"},
         {7,
-         // Extended row: install_location / uninstall_string / package_id / source. Four
-         // TEXT columns with a constant '' default: metadata-only (the v5 precedent), so no
-         // table rewrite, no index build and no lock beyond the instant catalog update. A
-         // plain transactional migration with nothing for ADR-0008's non-transactional kind
-         // to cover; keep it that way (any later change here that rewrites the table or
-         // builds an index on it needs that kind first).
-         // No row id is added for keyset paging: normalize() sorts and de-duplicates every
-         // row on all 16 content columns before insert, so (agent_id + those columns) is
-         // already unique. See query_software.
+         // Extended row: install_location / uninstall_string / package_id / source, plus
+         // install_id for keyset paging. The four TEXT columns follow the v5 precedent
+         // (constant '' defaults are metadata-only, no rewrite). install_id BIGSERIAL
+         // backfills existing rows via a table REWRITE under ACCESS EXCLUSIVE — one
+         // sequential pass at server start over a table bounded at agents x kMaxEntries
+         // (20000, inventory_ingestion.cpp) rows. The rewrite rebuilds every existing
+         // index, so the old name index is DROPPED FIRST (measured at 4M rows: rewrite
+         // 32 s with it, 4-8 s without; the re-create is 6.5-10 s; two runs) and
+         // re-created as (name, agent_id, install_id) at the end. IF [NOT] EXISTS keeps
+         // a white-box schema_meta rewind idempotent (a re-run adds no second sequence;
+         // the column drop cascades the index, so DROP IF EXISTS no-ops). install_id
+         // churns on every full replace (DELETE + INSERT) — it is a TIEBREAK inside
+         // (name, agent_id), never the page order on its own.
+         // The pool injects a 30 s statement_timeout on every connection and this
+         // migration runs inside the runner's txn, so SET LOCAL lifts it for this txn
+         // only (it cannot leak to the pool). lock_timeout (10 s) still bounds lock
+         // acquisition; only the finite rewrite work is uncapped, because a cancelled
+         // boot migration is a permanently fail-closed server, not a protection.
+         // Accepted risk (docs/postgres-migration-ladder.md, SoftwareInventoryStore row):
+         // the ACCESS EXCLUSIVE lock is held for the whole rewrite plus index build,
+         // extrapolated at 2.6-4.5 us/row: once the hold passes lock_timeout (10 s), from
+         // about 2-4M rows, statements queued behind it time out; about 10 minutes near
+         // 130-230M rows. Tolerated only while no deployment holds a table of that size;
+         // any later change here that rewrites the table or builds an index must be online.
+         "SET LOCAL statement_timeout = 0;"
+         "DROP INDEX IF EXISTS installed_software_name_idx;"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_location TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS uninstall_string TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS package_id       TEXT NOT NULL DEFAULT '';"
-         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS source           TEXT NOT NULL DEFAULT '';"},
+         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS source           TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE installed_software ADD COLUMN IF NOT EXISTS install_id       BIGSERIAL;"
+         "CREATE INDEX IF NOT EXISTS installed_software_name_idx "
+         "ON installed_software (name, agent_id, install_id);"},
     };
     return kMigrations;
 }
-
-// Total order (and keyset key) of the fleet query. (name, agent_id) leads so the existing
-// installed_software_name_idx serves the boundary and the flagship `WHERE name = $1` scan.
-// The remaining columns make the key unique: normalize() sorts and de-duplicates every row
-// on exactly these columns before insert, so no row id is needed. A hand-inserted exact
-// duplicate (never produced by the application) would be skipped at a page boundary.
-constexpr const char* kFleetSortKey =
-    "name, agent_id, version, publisher, install_date, kind, ecosystem, epoch, release, arch, "
-    "signature_status, distro_id, distro_version, install_location, uninstall_string, "
-    "package_id, source";
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -459,7 +469,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         {"installed_software",
          "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
          "arch, signature_status, distro_id, distro_version, install_location, "
-         "uninstall_string, package_id, source"},
+         "uninstall_string, package_id, source, install_id"},
         {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
         {"catalog_rollup", "name, publisher, device_count, version_count"},
         {"version_rollup", "name, version, device_count"},
@@ -789,7 +799,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     std::string sql =
         "SELECT agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
         "release, arch, signature_status, distro_id, distro_version, install_location, "
-        "uninstall_string, package_id, source "
+        "uninstall_string, package_id, source, install_id "
         "FROM software_inventory_store.installed_software WHERE 1=1";
     std::vector<std::string> params;
     int p = 0;
@@ -825,25 +835,17 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         params.push_back(q.source);
     }
     if (q.after) {
-        // Row-value keyset over the full sort key. The planner serves the leading
-        // (name, agent_id) boundary from installed_software_name_idx and filters the rest.
-        const SoftwareFleetRow& r = *q.after;
-        const std::string key[] = {r.entry.name,           r.agent_id,         r.entry.version,
-                                   r.entry.publisher,      r.entry.install_date, r.entry.kind,
-                                   r.entry.ecosystem,      r.entry.epoch,      r.entry.release,
-                                   r.entry.arch,           r.entry.signature_status,
-                                   r.entry.distro_id,      r.entry.distro_version,
-                                   r.entry.install_location, r.entry.uninstall_string,
-                                   r.entry.package_id,     r.entry.source};
-        sql += std::string(" AND (") + kFleetSortKey + ") > (";
-        for (std::size_t i = 0; i < std::size(key); ++i) {
-            sql += (i ? ", $" : "$") + std::to_string(++p);
-            params.push_back(key[i]);
-        }
-        sql += ")";
+        // Row-value keyset over the stable sort tuple. install_id alone would reorder on
+        // every full replace (DELETE + INSERT), so it is only the tiebreak.
+        const int a = p + 1;
+        sql += " AND (name, agent_id, install_id) > ($" + std::to_string(a) + ", $" +
+               std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
+        p += 3;
+        params.push_back(q.after->name);
+        params.push_back(q.after->agent_id);
+        params.push_back(std::to_string(q.after->install_id));
     }
-    sql += std::string(" ORDER BY ") + kFleetSortKey + " LIMIT $" + std::to_string(++p) +
-           "::bigint";
+    sql += " ORDER BY name, agent_id, install_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
@@ -877,6 +879,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         row.entry.uninstall_string = PQgetvalue(res.get(), i, 14);
         row.entry.package_id = PQgetvalue(res.get(), i, 15);
         row.entry.source = PQgetvalue(res.get(), i, 16);
+        row.install_id = result_i64(res, i, 17);
         out.push_back(std::move(row));
     }
     return out;

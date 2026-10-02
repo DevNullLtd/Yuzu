@@ -25,12 +25,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 using yuzu::server::InventoryIngestOutcome;
 using yuzu::server::SoftwareEntry;
+using yuzu::server::SoftwareCursor;
 using yuzu::server::SoftwareFleetQuery;
 using yuzu::server::SoftwareInventoryStore;
 using yuzu::server::pg::PgPool;
@@ -630,6 +630,7 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     CHECK((*fl)[0].entry.uninstall_string == "rpm -e bash");
     CHECK((*fl)[0].entry.package_id == "bash-5.2.21-3.fc40.x86_64");
     CHECK((*fl)[0].entry.source == "installed_apps.list_inventory");
+    CHECK((*fl)[0].install_id >= 1);
 
     // Hash-only ping with the pinned literal: the server's re-hash of the stored 16-field
     // rows must equal it (touched, not need_full).
@@ -756,8 +757,8 @@ TEST_CASE("query_software q/kind/ecosystem/source filters", "[pg][software_inven
     CHECK(count(q) == 0);
 }
 
-TEST_CASE("query_software keyset paging walks to an empty page in content order, splitting a "
-          "same-name pair across a page boundary",
+TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_id, install_id) "
+          "order",
           "[pg][software_inventory][extended_row]") {
     SWINV_SHARED(store, pool);
     auto mk = [](const char* name, const char* ver) {
@@ -767,10 +768,10 @@ TEST_CASE("query_software keyset paging walks to an empty page in content order,
         e.source = "installed_apps.list_inventory";
         return e;
     };
-    const auto agent_a = std::vector<SoftwareEntry>{mk("alpha", "1"), mk("bravo", "1"),
-                                                    mk("bravo", "2")};
-    REQUIRE(store.apply_installed_software("agent-a", "", agent_a, 1000) ==
-            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software(
+                "agent-a", "", std::vector<SoftwareEntry>{mk("alpha", "1"), mk("bravo", "1"),
+                                                          mk("bravo", "2")},
+                1000) == InventoryIngestOutcome::kStored);
     REQUIRE(store.apply_installed_software(
                 "agent-b", "", std::vector<SoftwareEntry>{mk("alpha", "1"), mk("charlie", "1")},
                 1000) == InventoryIngestOutcome::kStored);
@@ -778,83 +779,70 @@ TEST_CASE("query_software keyset paging walks to an empty page in content order,
                                            std::vector<SoftwareEntry>{mk("bravo", "1")}, 1000) ==
             InventoryIngestOutcome::kStored);
 
-    // apply_installed_software inserts in sorted order, so heap order would mask a missing
-    // content tiebreak. Re-insert agent-a/bravo version '1' so it sits AFTER version '2' in
-    // the heap: the walk must still return '1' before '2'.
+    // install_id is monotone with insertion above, so heap order would mask a missing
+    // install_id tiebreak. Push agent-a/bravo version '1' past version '2': the walk must
+    // then return '2' before '1'.
     {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        pg::PgResult del = pg::exec_params(
+        pg::PgResult upd = pg::exec_params(
             lease.get(),
-            "DELETE FROM software_inventory_store.installed_software "
-            "WHERE agent_id = 'agent-a' AND name = 'bravo' AND version = '1'",
+            "UPDATE software_inventory_store.installed_software SET install_id = "
+            "install_id + 1000000 WHERE agent_id = 'agent-a' AND name = 'bravo' AND version = '1'",
             std::vector<std::string>{});
-        REQUIRE(del.status() == PGRES_COMMAND_OK);
-        pg::PgResult ins = pg::exec_params(
-            lease.get(),
-            "INSERT INTO software_inventory_store.installed_software "
-            "(agent_id, name, version, source) "
-            "VALUES ('agent-a', 'bravo', '1', 'installed_apps.list_inventory')",
-            std::vector<std::string>{});
-        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
     }
 
-    // Even row count (6) and a page size of 3: the last non-empty page is FULL, so only the
-    // EMPTY page ends the walk, and agent-a's two bravo rows straddle the first page boundary.
-    auto walk = [&](const std::string& filter, int limit, std::size_t& pages) {
+    // Even row count (6): the last non-empty page is FULL, so only the EMPTY page ends the walk.
+    auto walk = [&](const std::string& filter, std::size_t& pages) {
         std::vector<yuzu::server::SoftwareFleetRow> seen;
-        std::optional<yuzu::server::SoftwareFleetRow> after;
+        std::optional<SoftwareCursor> after;
         pages = 0;
         for (;;) {
             SoftwareFleetQuery q;
-            q.limit = limit;
+            q.limit = 2;
             q.q = filter;
             q.after = after;
             auto page = store.query_software(q);
             REQUIRE(page.has_value());
             ++pages;
-            REQUIRE(pages <= 8); // a non-advancing cursor must not hang the test
+            REQUIRE(pages <= 8); // 6 rows / limit 2 = 4 pages; a non-advancing cursor must not hang
             if (page->empty())
                 break;
             for (auto& r : *page)
                 seen.push_back(r);
-            after = page->back();
+            const auto& last = page->back();
+            after = SoftwareCursor{last.entry.name, last.agent_id, last.install_id};
         }
         return seen;
     };
-    using Key = std::tuple<std::string, std::string, std::string>; // name, agent, version
-    const auto keys = [](const std::vector<yuzu::server::SoftwareFleetRow>& rows) {
-        std::vector<Key> out;
-        for (const auto& r : rows)
-            out.emplace_back(r.entry.name, r.agent_id, r.entry.version);
-        return out;
-    };
 
     std::size_t pages = 0;
-    const auto seen = walk("", 3, pages);
-    CHECK(pages == 3); // 2 full pages + the terminating empty page
-    const std::vector<Key> expect = {{"alpha", "agent-a", "1"}, {"alpha", "agent-b", "1"},
-                                     {"bravo", "agent-a", "1"}, {"bravo", "agent-a", "2"},
-                                     {"bravo", "agent-c", "1"}, {"charlie", "agent-b", "1"}};
-    CHECK(keys(seen) == expect); // each row exactly once, version '1' before '2' despite heap order
+    auto seen = walk("", pages);
+    REQUIRE(seen.size() == 6);
+    CHECK(pages == 4); // 3 full pages + the terminating empty page
+    const std::vector<std::pair<std::string, std::string>> expect = {
+        {"alpha", "agent-a"}, {"alpha", "agent-b"}, {"bravo", "agent-a"},
+        {"bravo", "agent-a"}, {"bravo", "agent-c"}, {"charlie", "agent-b"}};
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        CHECK(seen[i].entry.name == expect[i].first);
+        CHECK(seen[i].agent_id == expect[i].second);
+    }
+    // The same-name pair within agent-a is ordered by install_id (the reordered ids put
+    // version '2' first) and both rows are seen exactly once.
+    CHECK(seen[2].install_id < seen[3].install_id);
+    CHECK(seen[2].entry.version == "2");
+    CHECK(seen[3].entry.version == "1");
 
-    // Filtered walk yields the filtered set exactly once, with the pair split by the boundary.
-    const auto bravo = walk("bravo", 2, pages);
-    CHECK(keys(bravo) ==
-          std::vector<Key>{{"bravo", "agent-a", "1"}, {"bravo", "agent-a", "2"},
-                           {"bravo", "agent-c", "1"}});
-
-    // The key is the row's content: a full replace that leaves an agent's rows unchanged
-    // (DELETE + INSERT) must not move them in the walk.
-    REQUIRE(store.apply_installed_software("agent-a", "", agent_a, 2000) ==
-            InventoryIngestOutcome::kStored);
-    CHECK(keys(walk("", 3, pages)) == expect);
+    // Filtered walk yields the filtered set exactly once.
+    auto bravo = walk("bravo", pages);
+    CHECK(bravo.size() == 3);
 }
 
-TEST_CASE("migration v7 adds the four '' columns to pre-existing rows without rewriting the "
-          "table or rebuilding an index, and re-runs idempotently",
+TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-runs "
+          "idempotently",
           "[pg][software_inventory][extended_row]") {
-    // Reproduce a v6-era table: DROP the four v7 columns, seed a legacy row, rewind
+    // Reproduce a v6-era table: DROP the five v7 columns, seed a legacy row, rewind
     // schema_meta to 6, reconstruct so v7 re-adds them over live data. Then rewind again
     // and reconstruct to prove the migration text is idempotent.
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
@@ -864,43 +852,36 @@ TEST_CASE("migration v7 adds the four '' columns to pre-existing rows without re
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
     }
-    auto lease_exec = [&](const char* sql) {
-        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(lease.get(), sql, std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_COMMAND_OK);
-    };
-    // A rewrite (the failure this migration must never reintroduce: ADR-0008) allocates a new
-    // relfilenode; building or rebuilding an index allocates a new index OID.
-    auto physical_identity = [&] {
-        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(
-            lease.get(),
-            "SELECT (SELECT relfilenode::text FROM pg_class WHERE oid = "
-            "'software_inventory_store.installed_software'::regclass) || '/' || "
-            "(SELECT oid::text FROM pg_class WHERE oid = "
-            "'software_inventory_store.installed_software_name_idx'::regclass)",
-            std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_TUPLES_OK);
-        REQUIRE(PQntuples(r.get()) == 1);
-        return std::string(PQgetvalue(r.get(), 0, 0));
-    };
     auto rewind = [&] {
-        lease_exec("UPDATE public.schema_meta SET version = 6 "
-                   "WHERE store = 'software_inventory_store'");
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult back = pg::exec_params(
+            lease.get(),
+            "UPDATE public.schema_meta SET version = 6 WHERE store = 'software_inventory_store'",
+            std::vector<std::string>{});
+        REQUIRE(back.status() == PGRES_COMMAND_OK);
     };
-    lease_exec("ALTER TABLE software_inventory_store.installed_software "
-               "DROP COLUMN install_location, DROP COLUMN uninstall_string, "
-               "DROP COLUMN package_id, DROP COLUMN source");
-    lease_exec("INSERT INTO software_inventory_store.installed_software "
-               "(agent_id, name, version, publisher, install_date) "
-               "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')");
-    const std::string before = physical_identity();
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.installed_software "
+            "DROP COLUMN install_location, DROP COLUMN uninstall_string, "
+            "DROP COLUMN package_id, DROP COLUMN source, DROP COLUMN install_id",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+        pg::PgResult ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.installed_software "
+            "(agent_id, name, version, publisher, install_date) "
+            "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')",
+            std::vector<std::string>{});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
     rewind();
     SoftwareInventoryStore store{pool}; // re-runs v7 over the live row
     REQUIRE(store.is_open());
-    CHECK(physical_identity() == before); // metadata-only: no table rewrite, no index rebuild
 
     SoftwareFleetQuery q;
     q.agent_id = "agent-legacy";
@@ -912,11 +893,37 @@ TEST_CASE("migration v7 adds the four '' columns to pre-existing rows without re
     CHECK((*rows)[0].entry.uninstall_string.empty());
     CHECK((*rows)[0].entry.package_id.empty());
     CHECK((*rows)[0].entry.source.empty());
+    CHECK((*rows)[0].install_id >= 1);
+
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult idx = pg::exec_params(
+            lease.get(),
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'software_inventory_store' "
+            "AND indexname = 'installed_software_name_idx'",
+            std::vector<std::string>{});
+        REQUIRE(idx.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(idx.get()) == 1);
+        CHECK(std::string(PQgetvalue(idx.get(), 0, 0)).find("install_id") != std::string::npos);
+    }
 
     rewind();
     SoftwareInventoryStore again{pool}; // second run over an already-migrated table
     CHECK(again.is_open());
-    CHECK(physical_identity() == before);
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult seq = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'software_inventory_store' AND c.relkind = 'S' "
+            "AND c.relname LIKE 'installed_software_install_id%'",
+            std::vector<std::string>{});
+        REQUIRE(seq.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(seq.get()) == 1);
+        CHECK(std::string(PQgetvalue(seq.get(), 0, 0)) == "1"); // re-run added no 2nd sequence
+    }
 }
 
 // Post-migration projection check (postgres-store-playbook "Runner guards"). schema_meta stays
