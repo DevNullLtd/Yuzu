@@ -114,6 +114,10 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% Defaulted so an agent started without it (older callers, tests)
     %% still works — replay just skips agents whose req is empty.
     RegisterReq = maps:get(register_req, Args, #{}),
+    %% Connection key of the Subscribe stream that created this session
+    %% (yuzu_gw_conn). Defaulted so a caller without one still starts; such
+    %% a session is held but admits no heartbeat.
+    ConnKey = maps:get(conn_key, Args, undefined),
 
     %% Opaque per-process-instance id (HA WS-4, #4324): minted once here,
     %% never regenerated, and reused verbatim on the DISCONNECTED
@@ -148,7 +152,7 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
     yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
-                                    Hostname, RegisterReq),
+                                    Hostname, RegisterReq, ConnKey),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
@@ -409,8 +413,10 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
                   peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
-    %% Deregister from routing table and pg groups.
-    yuzu_gw_registry:deregister_agent(AgentId),
+    %% Deregister from routing table and pg groups. Fenced on this process
+    %% and its own session: if the agent already reconnected under a newer
+    %% session, only this session's index entry goes.
+    yuzu_gw_registry:deregister_agent(AgentId, self(), SessionId),
 
     %% Notify pending command waiters that the agent disconnected,
     %% and notify router so it can complete fanout tracking.
