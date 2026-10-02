@@ -168,6 +168,17 @@ struct OutboxCommand {
 
 class CommandOutboxStore {
 public:
+    /// Lease-acquire write deadline (ADR-0012 §2): this store is a
+    /// leader-driven background surface (a scheduler tick, a delivery loop)
+    /// with no operator waiting on a request, so the deadline is modest and
+    /// the caller always has its own next tick to retry. #4982 round 6
+    /// (Kimi K3): also the deadline `CommandDeliveryFinalizationOwner`'s own
+    /// write uses — that class's write runs on THIS store's pool (it shares
+    /// this store's cross-schema write reasoning exactly), so it references
+    /// this ONE symbol rather than carrying its own independently-declared
+    /// copy that a future tuning change could silently desync.
+    static constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
     /// Borrows the shared pool; runs the `command_outbox_store` schema migration
     /// on a pinned construction lease. `is_open()` is false if the lease was
     /// empty or the migration failed (a fatal startup error at the wiring site,
@@ -235,6 +246,51 @@ public:
     [[nodiscard]] std::expected<bool, CommandOutboxError>
     mark_sent(const std::string& occurrence_id, const std::string& leader_lock_name,
               std::int64_t leader_epoch);
+
+    /// #4982 round 3: the ATOMIC sibling of `mark_sent` for a genuine dispatch
+    /// (`outcome.sent > 0`) — transitions the fenced `pending → sent` outbox row
+    /// AND records the execution's real dispatch target count
+    /// (`execution_tracker.executions.agents_targeted`) in ONE transaction,
+    /// cross-schema, on this store's own pool (the same single Postgres
+    /// instance/database `ExecutionTracker::reap_stuck_running_executions`'s
+    /// own cross-schema `NOT EXISTS command_outbox_store.outbox` read already
+    /// relies on — see that method's candidate predicate).
+    ///
+    /// #4982 round 5: the guarded transaction itself now lives in
+    /// `CommandDeliveryFinalizationOwner::mark_sent_with_target`
+    /// (command_delivery_finalization_owner.{hpp,cpp}) — the ADR-0012 §3
+    /// cross-schema query owner, following `RbacAdminAuthorityOwner`'s own
+    /// established shape. This method is now a THIN delegating forward (see
+    /// the .cpp); the behavioral contract documented below is unchanged.
+    ///
+    /// CLOSES a real, empirically-reproduced race: calling `mark_sent` and
+    /// `ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit
+    /// statements left a window, between the two commits, where the outbox row
+    /// already read `state='sent'` (so the reaper's `NOT EXISTS (... state =
+    /// 'pending')` clause no longer excluded it) while `agents_targeted` was
+    /// STILL 0 — the reaper's `status='running' AND agents_targeted=0` half of
+    /// its candidate predicate then matched a command that was, in truth, still
+    /// being actively delivered/executed, and force-cancelled it with no kill
+    /// RPC ever sent. Folding both writes into one transaction removes the
+    /// window entirely: by the time any reader can observe `state='sent'`,
+    /// `agents_targeted` is already its real, positive value in the SAME
+    /// commit, so the reaper's `agents_targeted=0` clause naturally excludes
+    /// the row.
+    ///
+    /// Returns `true` iff THIS call owns the transition and BOTH writes
+    /// committed — the caller then finalizes as a normal successful delivery.
+    /// Returns `false` iff the outbox row was already terminal or this replica
+    /// was fenced out (same "not ours" semantics as `mark_sent`) — no write
+    /// happened, the row is untouched. A DB/lease failure on EITHER statement
+    /// rolls the WHOLE transaction back, INCLUDING the `sent` transition — the
+    /// occurrence stays `pending` and is re-driven next tick (safe: the wire
+    /// send already happened, and the agent's `command_id` dedup, WS-0,
+    /// absorbs the harmless re-send) — never a partially-applied state where
+    /// `mark_sent` committed but `agents_targeted` did not.
+    [[nodiscard]] std::expected<bool, CommandOutboxError>
+    mark_sent_with_target(const std::string& occurrence_id, const std::string& leader_lock_name,
+                          std::int64_t leader_epoch, const std::string& execution_id,
+                          int agents_targeted);
 
     /// Epoch-fenced `pending → failed` — a PERMANENT failure (e.g. the arming
     /// principal's authority was revoked between enqueue and delivery, so the

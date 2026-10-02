@@ -10989,6 +10989,13 @@ void RestApiV1::register_routes(
             if (!quota.has_value()) {
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982: log-only swallowed the failure with no observable
+                    // signal — count it alongside the log line at every call site.
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
                 // Deliberately minimal, not the full
@@ -11017,6 +11024,12 @@ void RestApiV1::register_routes(
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
                                      " execution_id=" + exec_id);
@@ -11048,6 +11061,12 @@ void RestApiV1::register_routes(
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled also failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 500, "RESULT_SET_DISPATCH_FAILED: dispatch raised");
                 return;
@@ -11073,6 +11092,12 @@ void RestApiV1::register_routes(
                 // confinement rationale above.
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 503,
                        "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
@@ -11082,6 +11107,12 @@ void RestApiV1::register_routes(
             }
             if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
                 spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+                // #4982
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+                        .increment();
             }
 
             CreateRequest cr;
@@ -11101,6 +11132,12 @@ void RestApiV1::register_routes(
                 // was sent (review B5; mirrors the throw / no-agents paths).
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 if (created.error() == ResultSetError::DbError) {
                     // #4306 fold-in B: this is a SERVER fault after a real
