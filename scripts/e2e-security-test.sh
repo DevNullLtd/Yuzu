@@ -56,7 +56,7 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -66,7 +66,7 @@ assert_contains() {
 assert_not_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if ! echo "$haystack" | grep -q "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected NOT to contain '$needle', but it was present)"
@@ -550,41 +550,32 @@ log "Category 7: Rate Limiting"
 GOT_429=false
 GOT_RETRY_AFTER=false
 
-# Drive POST /login in parallel until a 429 fires. The production-default
-# login rate limit is 10/sec per IP; the /test pipeline's UAT bumps that
-# to 200/sec (#1006/#1007) so the parallel Phase 5 fan-out doesn't
-# self-DoS. Sequential curl requests are paced by per-request latency
-# (~30-50ms each, so ~20-30/sec max), never exceeding the high UAT
-# bucket. Fan-out via xargs -P to genuinely exceed the bucket: 500
-# requests at concurrency 64 floods the limiter from a cold bucket
-# within a second on any sane box. If the limiter is OFF entirely none
-# of the 500 returns 429 — that IS the bug the test catches.
+# Fire one open-loop burst of POST /login. The production-default login rate
+# limit is 10/sec per IP; the /test pipeline's UAT bumps that to 200/sec
+# (#1006/#1007) so the parallel Phase 5 fan-out doesn't self-DoS. The burst has
+# to exceed that bucket from a cold start, so it must be OPEN-loop: a single
+# curl process (-Z) opens every transfer up front and does not wait on earlier
+# responses. A closed-loop fan-out (xargs -P N, one curl per request) is paced
+# by the handler's latency instead - every login serialises on the per-user
+# lock, so a slow handler holds the offered rate under the refill rate and the
+# bucket never empties (passed alone by 17 requests, failed 40 of 43 recorded
+# runs). If the limiter is OFF entirely none of the requests returns 429 -
+# that IS the bug the test catches.
+# Each response is reported as "<status> <retry-after>"; reading the header off
+# the same response avoids the refill race of a serial follow-up (the bucket
+# refills within ~10ms after the burst ends). %header{} needs curl >= 7.84.
 RATELIMIT_ATTEMPTS=500
-RATELIMIT_PARALLELISM=64
-RATELIMIT_TMP=$(mktemp -d)
-trap "rm -rf '$RATELIMIT_TMP'" EXIT
-# Each worker writes a full header dump to a per-request file. We then
-# look for any file whose first line is a 429 and inspect its headers
-# for Retry-After. Doing it this way (rather than a serial follow-up
-# after the storm) avoids the refill race — the bucket refills within
-# ~10ms after the storm ends, so a serial follow-up reliably gets a
-# fresh token and we miss the 429 headers.
-seq 1 $RATELIMIT_ATTEMPTS | xargs -P "$RATELIMIT_PARALLELISM" -I{} sh -c "
-    curl -s -D'$RATELIMIT_TMP/h_{}' -o /dev/null \
-        -X POST '${SERVER_URL}/login' \
-        -d 'username=ratelimit_test&password=bad_{}' 2>/dev/null || true
-"
-# Pick any 429 response file and read its headers.
-for h in "$RATELIMIT_TMP"/h_*; do
-    [[ -f "$h" ]] || continue
-    if head -1 "$h" | grep -q "429"; then
-        GOT_429=true
-        if grep -qi "^Retry-After:" "$h"; then
-            GOT_RETRY_AFTER=true
-        fi
-        break
-    fi
-done
+RATELIMIT_PARALLELISM=300
+RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
+    -o /dev/null -w '%{http_code} %header{retry-after}\n' \
+    -X POST -d 'username=ratelimit_test&password=bad' \
+    "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null || true)
+if grep -q '^429 ' <<< "$RATELIMIT_OUT"; then
+    GOT_429=true
+fi
+if grep -Eq '^429 [0-9]+' <<< "$RATELIMIT_OUT"; then
+    GOT_RETRY_AFTER=true
+fi
 
 TESTS=$((TESTS + 1))
 if $GOT_429; then

@@ -13,8 +13,8 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
 /test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
-/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
-                         InstructionDefinitions against a live UAT stack via REST.
+/test --instructions   — content-suite gate (~5-15 min): exercises the safe + mutating
+                         InstructionDefinitions (the runner prints the count) against a live UAT stack via REST.
                          Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
                          only. Skips build/upgrade/sanitizers/coverage. Use when content
                          changes (yaml under `content/definitions/`) or after touching the
@@ -24,7 +24,7 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
                          cluster (isolate / release / status / whitelist) with the
                          self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
                          HOST — see safety section below. PR C will add hand-written
-                         semantic-correctness tests for the 25 destructive instructions
+                         semantic-correctness tests for the destructive instructions
                          (`--instructions-destructive`).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
@@ -451,9 +451,6 @@ gate_run "REST API E2E" "e2e-api.log" \
 gate_run "MCP E2E" "e2e-mcp.log" \
     "bash scripts/e2e-mcp-test.sh"
 
-gate_run "Security E2E" "e2e-security.log" \
-    "bash scripts/e2e-security-test.sh"
-
 # Synthetic UAT — Phase 4's start-UAT.sh already ran its own 6
 # tests; this gate runs them again standalone with timing capture into
 # the test-runs DB. Skip if Phase 4 was the source.
@@ -465,25 +462,34 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --gateway-metrics http://localhost:9568 \
         --run-id $RUN_ID --gate-name phase5-synthetic-uat"
 
-# Puppeteer is warn-only — flaky on first run
+# Puppeteer is warn-only — flaky on first run. Its npm dependency is never installed by
+# the pipeline (tests/puppeteer/node_modules is gitignored), so a missing install is
+# recorded as SKIP with the fix, not as a permanent WARN; a WARN means it ran and failed.
 (
     start=$(date +%s)
-    if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
-        STATUS=PASS
+    if [[ ! -d tests/puppeteer/node_modules/puppeteer ]]; then
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status SKIP --duration 0 \
+            --notes "puppeteer not installed; run: (cd tests/puppeteer && npm ci)"
     else
-        STATUS=WARN  # not FAIL — puppeteer is best-effort
+        if node tests/puppeteer/dashboard-help-test.mjs > "$LOG_DIR/puppeteer.log" 2>&1; then
+            STATUS=PASS
+        else
+            STATUS=WARN  # not FAIL — puppeteer is best-effort
+        fi
+        DUR=$(( $(date +%s) - start ))
+        bash scripts/test/test-db-write.sh gate \
+            --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
+            --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
     fi
-    DUR=$(( $(date +%s) - start ))
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 5 --gate "Puppeteer" \
-        --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
 ) &
 
 # Instructions content-suite gate — schema-driven REST exerciser.
-# Drives every safe + mutating InstructionDefinition (184 of 217) and
+# Drives every safe + mutating InstructionDefinition the runner can dispatch (safe + mutating by default) and
 # records per-instruction pass/fail/timing into the test-runs DB.
-# Destructive (25), interactive (5), and network-disrupting (3) classes
-# are opt-in via --risks; default-mode invocation excludes them.
+# The destructive, forensic, server-internal, interactive and network-disrupt
+# classes are opt-in via --risks; default-mode invocation excludes them.
 gate_run "Instructions" "instructions.log" \
     "bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
@@ -491,6 +497,13 @@ gate_run "Instructions" "instructions.log" \
         --run-id $RUN_ID --gate-name phase5-instructions \
         --output $LOG_DIR/instructions-outcomes.json"
 
+wait
+
+# Security E2E runs AFTER the fan-out, alone. Its Category 7 probe deliberately empties the
+# shared 127.0.0.1 login bucket (start-UAT.sh passes --login-rate-limit 200), which would 429
+# the login of any gate still running. Do not move it back into the fan-out above.
+gate_run "Security E2E" "e2e-security.log" \
+    "bash scripts/e2e-security-test.sh"
 wait
 ```
 
@@ -504,7 +517,7 @@ When the operator runs `/test --instructions`, the orchestration is **truncated*
 - The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
 - Investigating a content regression flagged by the trend tooling.
 
-Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
+Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for the runnable instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
 
 ```bash
 # In --instructions mode:
@@ -512,16 +525,24 @@ if [[ "$MODE" == "instructions" ]]; then
     # Run only Phase 0, 4, the Instructions gate, and Phase 8.
     # Build is not gated — operator should already have $BUILDDIR populated;
     # if not, the start-UAT.sh in Phase 4 will surface the missing binary.
-    bash scripts/test/instructions-tests.sh \
+    start=$(date +%s)
+    if bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
         --user admin --password 'YuzuUatAdmin1!' \
         --run-id "$RUN_ID" --gate-name instructions \
-        --output "$LOG_DIR/instructions-outcomes.json"
+        --output "$LOG_DIR/instructions-outcomes.json" > "$LOG_DIR/instructions.log" 2>&1; then
+        STATUS=PASS
+    else
+        STATUS=FAIL
+    fi
+    bash scripts/test/test-db-write.sh gate \
+        --run-id "$RUN_ID" --phase 5 --gate "Instructions" \
+        --status "$STATUS" --duration $(( $(date +%s) - start )) --log "instructions.log"
     # then jump straight to Phase 8 teardown
 fi
 ```
 
-The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 → PASS; 1 (one or more instruction fail/error) or 2 (login or content-dir error) → FAIL.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 
