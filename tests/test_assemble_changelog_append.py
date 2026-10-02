@@ -86,6 +86,7 @@ class PromoteAppend(unittest.TestCase):
         self.assertNotIn("New fixed bullet", self.changelog.read_text(encoding="utf-8").split("## [1.1.0]")[1])
         for f in (f1, f2, f3):
             self.assertFalse(f.exists())
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["CHANGELOG.md", "changelog.d"])
 
     def test_date_override(self):
         self.frag("10-a.fixed.md", "- **New fixed bullet.**")

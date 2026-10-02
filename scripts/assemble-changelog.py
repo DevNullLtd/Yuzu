@@ -36,7 +36,7 @@ Modes:
       files. Existing bullets and any non-canonical subsections are left as
       they are. The header date is kept unless --date is given; pass the
       final release date when folding fragments in before tagging the final.
-      Refuses if [Unreleased] still holds legacy subsections (run a plain
+      Refuses if [Unreleased] is missing or still holds legacy subsections (run a plain
       promote of the next version for those), if <X.Y.Z> is not the newest
       released section (override: --allow-older-section), if more than one
       `## [X.Y.Z]` header exists, or if a fragment's whole text already
@@ -368,7 +368,7 @@ def cmd_promote(version: str, date_str: str | None, changelog: Path, fragments_d
     lines = text.split("\n")
     if any(re.match(rf"^## \[{re.escape(version)}\]", l) for l in lines):
         print(f"promote: CHANGELOG.md already has a ## [{version}] section — for fixes that landed "
-              f"after it was promoted, use: promote {version} --append --date YYYY-MM-DD", file=sys.stderr)
+              f"after it was promoted, use: promote {version} --append (add --date YYYY-MM-DD only at the final release)", file=sys.stderr)
         return 1
     header_idx, end_idx, preamble, legacy_sections = parse_unreleased(lines)
 
@@ -456,8 +456,12 @@ def valid_date(date_str: str) -> bool:
 def write_atomic(path: Path, text: str) -> None:
     """Replace path in one step, so a failure mid-write never leaves it truncated."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def contains_block(haystack: list[str], block: list[str]) -> bool:
@@ -541,7 +545,8 @@ def cmd_promote_append(version: str, date_str: str | None, changelog: Path, frag
     if already:
         print("promote --append: the full text of these fragments already appears in ## [" + version + "] "
               "(a previous append interrupted before deleting them?) — refusing so nothing is duplicated. "
-              "Compare each with the section (e.g. `git diff CHANGELOG.md`) before deleting it: "
+              "A short fragment can also match an existing line by coincidence, so compare each with the "
+              "section (e.g. `git diff CHANGELOG.md`) before deleting it: "
               + ", ".join(already), file=sys.stderr)
         return 1
 

@@ -103,8 +103,8 @@ Each fragment's bullets are appended to the end of their `###` subsection in
 `## [X.Y.Z]` (a missing subsection is created in canonical order), the
 fragment files are deleted, and the header takes the given date (omit
 `--date` to keep the existing one; pass it only at the final release).
-Commit the result. It refuses if `[Unreleased]` still holds legacy
-subsections, if there is nothing to append, if `X.Y.Z` is not the newest
+Commit the result. It refuses if `[Unreleased]` is missing or still holds
+legacy subsections, if there is nothing to append, if `X.Y.Z` is not the newest
 released section (so a mistyped version cannot fold fragments into an older
 release; `--allow-older-section` overrides), if more than one `## [X.Y.Z]`
 header exists, or if a fragment's whole text already appears in the section

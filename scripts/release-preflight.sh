@@ -55,7 +55,7 @@ FRAG_COUNT=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/de
 if [ "$FRAG_COUNT" -eq 0 ]; then
     pass "changelog.d/ has no unpromoted fragments"
 else
-    if grep -qF "## [$BASE_VERSION]" CHANGELOG.md 2>/dev/null; then
+    if grep -q "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null; then
         if [ "$VERSION" = "$BASE_VERSION" ]; then
             APPEND_DATE=" --date YYYY-MM-DD  (the final release date)"
         else
