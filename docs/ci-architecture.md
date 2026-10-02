@@ -1695,15 +1695,14 @@ databases (thresholds and semantics: "Test-database lifecycle" above).
 ## Chiselled demo images + agent bundle (release-time)
 
 `docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
-`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
-— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
-compile can hold that single runner slot up to its 360-min timeout, so the
-job carries a `cancel-in-progress: true` concurrency group (a re-tagged
-release supersedes a stale build instead of queueing behind it). It is
-**not** in the `release` job's `needs:`, so a slow/failed demo-image build
-never blocks the actual release. The sustainable fix for the QEMU cost is a
-native arm64 runner — the open decision tracked in `docs/demo-environment.md`
-("Publishing").
+`*.chisel` images for linux/amd64 on the self-hosted Linux runner (the
+QEMU-emulated arm64 leg was dropped; re-adding arm64 is the open decision in
+`docs/demo-environment.md`, "Publishing"). It carries a
+`cancel-in-progress: true` concurrency group, so a re-tagged release supersedes
+a stale build instead of queueing behind it, and a 120-min timeout. Since
+#5242 it **is** in the `release` job's `needs:`: the release waits for it
+(1–16 min on rc1–rc6) so the chisel SBOMs are always in `SHA256SUMS`, and a
+failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own signed agent archives) on a GitHub-hosted runner — no

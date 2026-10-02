@@ -128,7 +128,12 @@ build-linux ────────────────────┴─�
 - **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
 - **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
 - **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
+- **docker-publish-postgres** (~5 min) — the `yuzu-postgres` image the composes pin
+- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux + build-gateway) — the `*-chisel` images and their SBOMs
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
+- **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
+
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If a chisel leg fails or is cancelled, the release job is skipped (fail-closed): use "Re-run failed jobs" on the release run while its artifacts are retained (3 days). After that, a full re-run pushes every image again, with new digests.
 
 Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
 

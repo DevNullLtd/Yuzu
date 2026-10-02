@@ -1428,6 +1428,9 @@ jobs:
             yuzu-${{ matrix.image }}-image.cdx.json
             yuzu-${{ matrix.image }}-image.spdx.json
           retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM so the release never signs a stale one (#5242).
+          overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -1595,6 +1598,9 @@ jobs:
             yuzu-postgres-image.cdx.json
             yuzu-postgres-image.spdx.json
           retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM so the release never signs a stale one (#5242).
+          overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -1638,18 +1644,16 @@ jobs:
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Chiselled demo images — server + gateway + agent, multi-arch ─────
+  # ── Chiselled demo images — server + gateway + agent ─────────────────
   # Publishes the FROM-scratch chiselled Ubuntu 26.04 demo images to GHCR
   # under a distinct `-chisel` repo suffix (see docs/demo-environment.md).
-  # Deliberately NOT in the `release` job's needs: a slow or failed
-  # demo-image build must never block the actual GitHub release. Mirrors
-  # docker-publish (login / metadata / cosign / attestation / lowercase
-  # owner) but differs in three ways:
-  #   1. Multi-arch linux/amd64,linux/arm64 (docker-publish is amd64-only).
-  #   2. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
-  #      the vcpkg triplet from buildx's TARGETARCH per-arch; forcing
-  #      x64-linux would bake an x64 binary into the arm64 image.
-  #   3. A distinct local buildcache path (-chisel suffix) so it never
+  # The `release` job NEEDS this job since #5242 (see the comment at its
+  # needs: below). Mirrors docker-publish (login / metadata / cosign /
+  # attestation / lowercase owner) but differs in two ways:
+  #   1. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
+  #      the vcpkg triplet from buildx's TARGETARCH. The build is amd64-only
+  #      today (the QEMU-emulated arm64 leg was dropped; see the buildx step).
+  #   2. A distinct local buildcache path (-chisel suffix) so it never
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
@@ -1658,14 +1662,17 @@ jobs:
     # and belong inside the signed SHA256SUMS, and while this job stayed out of
     # the release's needs they were attached only when it happened to finish
     # first (rc2, rc4 and rc6 shipped without some of them). Cost: the release
-    # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold buildx
-    # cache can take far longer (the arm64 leg runs under QEMU, hence the 360 min
-    # timeout), and a failed chisel push now blocks the release.
+    # waits for these builds -- 1-16 min on rc1..rc6, all green; a cold cache
+    # (vcpkg from source) takes longer, bounded by the timeout below -- and a
+    # failed or cancelled chisel leg now skips the release (fail-closed).
+    # Recovery: "Re-run failed jobs" on the release run, within artifact
+    # retention (see the release skill).
     needs: [build-linux, build-gateway]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
-    # in-flight 6 h QEMU build instead of wedging the single self-hosted
-    # Linux runner slot behind a stale emulated arm64 compile. The
+    # in-flight build instead of wedging the single self-hosted Linux runner
+    # slot behind a stale one (a superseded run's release is then skipped,
+    # since it needs this job). The
     # workflow-level concurrency is cancel-in-progress:false (a real
     # release must run to completion); this narrower group trades that
     # for runner-slot liveness on the demo-image path specifically — SRE
@@ -1680,19 +1687,13 @@ jobs:
     concurrency:
       group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
-    # Generous timeout: the server/agent chisel images compile all of
-    # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
-    # does it under QEMU emulation. docs/demo-environment.md flags up to a
-    # ~240 min cold-cache risk for the emulated arm64 build.
-    #
-    # INTERIM STRATEGY: arm64 is built via QEMU on the amd64 self-hosted
-    # runner. This is slow but needs no extra runner. The sustainable path
-    # is a native arm64 runner (self-hosted or GitHub-hosted
-    # ubuntu-24.04-arm) + per-arch manifest merge — a runner-topology
-    # decision tracked as the "Open decision — arm64 build strategy" note
-    # in docs/demo-environment.md ("Publishing"). Revisit before relying on
-    # the QEMU path for every release.
-    timeout-minutes: 360
+    # The server/agent chisel images compile vcpkg (gRPC/abseil/protobuf/
+    # openssl) from source on a cold cache. The build is amd64-only now (the
+    # 360-min budget was for the dropped QEMU arm64 leg), and since #5242 the
+    # release waits on this job, so the bound is tighter: 120 min. Re-adding
+    # arm64 is tracked as the "Open decision — arm64 build strategy" note in
+    # docs/demo-environment.md ("Publishing").
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -1872,6 +1873,9 @@ jobs:
             yuzu-${{ matrix.image }}-chisel-image.cdx.json
             yuzu-${{ matrix.image }}-chisel-image.spdx.json
           retention-days: 3
+          # A re-run of this job pushes a new digest; replace the earlier
+          # attempt's SBOM so the release never signs a stale one (#5242).
+          overwrite: true
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
@@ -2150,7 +2154,8 @@ jobs:
       - name: Verify release artifact completeness
         run: |
           # Gate: every expected archive must have a sibling CycloneDX +
-          # SPDX SBOM, and both image SBOMs must be present. Missing any
+          # SPDX SBOM, and every image SBOM must be present (server, gateway,
+          # postgres and the three chisel images, #5242). Missing any
           # of the above fails the release before we publish anything
           # customers will have to unwind. Tracked as #362 / #408.
           # With the version it also checks every asset name is one GitHub

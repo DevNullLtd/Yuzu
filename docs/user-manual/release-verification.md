@@ -47,8 +47,8 @@ certificate at build time and cannot be restamped.
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuServerSetup-*.exe`, `YuzuAgent-*.pkg` | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
 | Cosign bundle | `SHA256SUMS.sigstore` (legacy: `SHA256SUMS.bundle` for releases ≤ v0.11.0) | Sigstore OIDC identity |
-| CycloneDX SBOMs | `yuzu-*.cdx.json`, `yuzu-{server,gateway}-image.cdx.json` | `cyclonedx validate` |
-| SPDX SBOMs | `yuzu-*.spdx.json`, `yuzu-{server,gateway}-image.spdx.json` | `spdx-tools validate` |
+| CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
+| SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway}:<tag>` | `cosign verify` |
 
