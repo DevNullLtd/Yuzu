@@ -125,10 +125,10 @@ inline constexpr std::size_t kMaxProfileGrants = 8192;
 inline constexpr std::size_t kMaxProfileBytes = 2u * 1024u * 1024u;
 
 /// The run's cooperative wall-clock bound, checked before each profile, first thing in the
-/// hive-file guard's before_load, and before each key open. A single blocking call (the
+/// hive-file guard's before_load, and before each capability and each app key open. A single blocking call (the
 /// offline-hive mutex wait behind a sibling plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is
-/// not interrupted, nor is one enumeration of at most 4,096 children or one key's value reads,
-/// so a dispatch can overrun it: a cooperative deadline, never a hard cap.
+/// not interrupted, nor is one enumeration of at most 4,096 children, a capability-level key open,
+/// or one key's value reads, so a dispatch can overrun it: a cooperative deadline, never a hard cap.
 inline constexpr std::chrono::milliseconds kRunBudget{15'000};
 
 /// The per-source retention budget. charge() is called BEFORE a grant is retained; once the

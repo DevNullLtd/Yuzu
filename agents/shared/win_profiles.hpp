@@ -493,7 +493,8 @@ using yuzu::agent::offline_hive_mutex;
 // `report`, if non-null, receives what happened -- including
 // `unload_failed`, set (never cleared) when the offline mount's
 // RegUnLoadKeyW fails on the way out, and the `mount_name` that failed to
-// unload. Read it AFTER this call returns. The caller must surface a set
+// unload. Read it AFTER this call returns, or after catching an exception `fn` threw (the
+// guard records the unload while unwinding). The caller must surface a set
 // flag rather than drop it: a failed unload leaves a system-wide mount that
 // survives process death and locks the profile's NTUSER.DAT until it is
 // unloaded or the host reboots (see win_reg_handle.hpp's ScopedUserHive

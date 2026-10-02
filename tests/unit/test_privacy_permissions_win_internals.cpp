@@ -560,6 +560,8 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on an after_load toke
 
 TEST_CASE("privacy_permissions win: with_user_hive reports a failed unload even when fn throws",
           "[privacy_permissions][win_internals]") {
+    // Real RegSaveKeyExW/RegLoadKeyW (privilege-gated, SKIP otherwise): the destructor path under
+    // test only exists when a genuine mount cannot unload, which no fake registry can reach.
     require_live_arm_missed();
     TestKey saved(false); // RegSaveKeyExW saves only non-volatile keys
     set_sz(saved.make(L"k").get(), L"v", L"1");

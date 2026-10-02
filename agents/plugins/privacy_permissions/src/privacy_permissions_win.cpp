@@ -31,10 +31,11 @@
  * never stability. Residual: a RegRestoreKey-style whole-key replacement is not reported.
  *
  * DEADLINE: ~15 s, COOPERATIVE -- checked before each profile, first thing in the hive-file
- * guard's before_load, and before each key open; there is no detached worker (a plugin must not
+ * guard's before_load, and before each capability and each app key open; there is no detached worker (a plugin must not
  * defer work past unload). One blocking call (the offline_hive_mutex wait behind a sibling
  * plugin's offline arm, RegLoadKeyW/RegUnLoadKeyW) is not interrupted, nor is one enumeration of
- * at most 4,096 children or one key's value reads, so a dispatch can overrun it.
+ * at most 4,096 children, the capability-level key opens, or one key's value reads, so a dispatch can
+ * overrun it.
  *
  * PRECEDENCE (win_parsers.hpp merge_with_hklm, unit-tested): Microsoft's documented Settings
  * model, confirmed on the-rig 2026-09-23 (a non-MDM Windows 11 host: HKLM `<capability>` `Value
