@@ -79,9 +79,14 @@ class RiskTable(unittest.TestCase):
     def setUpClass(cls):
         texts = [p.read_text(encoding="utf-8") for p in FRAGMENTS]
         cls.rows, cls.total = explicit_target_rows(texts)
-        # Independent counts straight off the text, so a regex that drops rows cannot hide.
-        cls.raw_rows = sum(len(re.findall(r"\.plugin\s*=", t)) for t in texts)
-        cls.raw_forensics = sum(len(FORENSICS.findall(t)) for t in texts)
+        # Independent counts straight off the text (comment lines stripped), so a regex that
+        # drops rows cannot hide.
+        code = [re.sub(r"(?m)^\s*//.*$", "", t) for t in texts]
+        cls.raw_rows = sum(len(re.findall(r"\.plugin\s*=", t)) for t in code)
+        cls.raw_forensics = sum(len(FORENSICS.findall(t)) for t in code)
+        cls.raw_destructive = sum(len(DESTRUCTIVE.findall(t)) for t in code)
+        cls.parsed_destructive = sum(1 for t in texts for _, _, body in ROW.findall(t)
+                                     if DESTRUCTIVE.search(body))
         cls.table = ir.load_risk_table(ROOT / "scripts/test/instructions-risk-classification.json")
         cls.defs = ir.load_definitions(ROOT / "content/definitions", cls.table)
 
@@ -89,9 +94,12 @@ class RiskTable(unittest.TestCase):
         # A regex that silently dropped rows would make the main check pass on nothing.
         self.assertTrue(FRAGMENTS, "no capability_decls fragments found")
         self.assertGreater(self.total, 0)
-        self.assertEqual(self.total, self.raw_rows, "ROW regex dropped or invented catalogue rows")
+        why = " (or a non-comment line outside a catalogue row matched the raw pattern)"
+        self.assertEqual(self.total, self.raw_rows, "ROW regex dropped or invented catalogue rows" + why)
         self.assertEqual(list(self.rows.values()).count("forensic"), self.raw_forensics,
-                         "a Forensics row was not parsed as one")
+                         "a Forensics row was not parsed as one" + why)
+        self.assertEqual(self.parsed_destructive, self.raw_destructive,
+                         "a Destructive dispatch_class was not parsed inside a row" + why)
         self.assertEqual(set(self.rows.values()), {"forensic", "destructive"})
 
     def test_definitions_side_is_not_vacuous(self):
