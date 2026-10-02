@@ -23,6 +23,15 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected, which is the scenario in the known limitation under [Server-Side Setup](gateway.md#server-side-setup). That limitation was observed on one local rig after a SIGKILL restart (graceful upgrade restarts were not tested): agents behind a gateway can read offline, and dispatch worked only for the remaining route lease (up to about 90 s). The gateway-side fix is tracked in #1197.
 
+## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
+
+Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to
+`installed_software`. The row id is added with a table rewrite under an exclusive lock, so the first
+start after upgrade takes time that grows with the table (about 10-20 s at 4M rows). A rolling upgrade is
+not supported for this migration at this stage: above about 2 million rows stop every server replica,
+then start one and let it finish; below that, start one replica first. The procedure, the row-count query
+and the free-space guidance are in [Installed-Software Inventory](inventory.md) (Upgrading).
+
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
 **Not a Breaking lead for the DEX routes and the management-group MEMBER-read path** — those already documented a `503` response before this release; what changes for them is when it fires, not the documented contract. **This does NOT hold for `GET /api/v1/management-groups/{id}`'s own GROUP-ROW read or its MCP twin `get_management_group`** (governance round-2, #1762): before this release, a degraded group-row read answered the SAME flat, undocumented `404 "group not found"` a genuinely nonexistent group id gets — there was no `503` contract for that case at all. This release adds a NEWLY DOCUMENTED, additive `503`/retryable error path for a degraded group-row read specifically; the `404` contract for a genuine not-found is unchanged. A client that already treats any `503` from these routes as retryable per the A4 contract needs no code change; a client that inferred "management group not found" purely from a `404` status code should note that `404` now unambiguously means "no such group" (never "could not tell") — narrower, not wider, than before.
