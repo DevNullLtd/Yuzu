@@ -158,12 +158,38 @@ struct AsyncHarness {
     /// above (a different gate, same shape). Default nullopt = unconfined,
     /// matching every pre-existing test in this file; set to a present set to
     /// prove the confinement fix actually narrows which agents' inventory
-    /// rows are visible, not just that the gate is called.
+    /// rows are visible, not just that the gate is called. #4983: this SAME
+    /// gate/field is now also consulted by the generic POST /api/v1/result-sets
+    /// create route whenever its own device_ids is non-empty.
     yuzu::server::authz::VisibleSet fleet_read_scope_override{};
 
+    /// #4983: set true the moment fleet_read_fn actually runs — proves a
+    /// device_ids-absent/empty POST /api/v1/result-sets request never reaches
+    /// the gate at all (same idiom as ScopeV1Harness's fleet_read_fn_reached
+    /// in test_rest_scope_v1_routes.cpp).
+    bool fleet_read_fn_reached{false};
+
+    /// #4983: the presence-merged agent-id universe `POST /api/v1/result-sets`
+    /// checks a non-empty device_ids against, via `set_all_agent_ids_fn`.
+    /// Populate before constructing the harness if a test needs specific ids
+    /// to "exist" (default already covers "dev-1"/"dev-2"/"dev-3", the three
+    /// ids this file's existing tests already reference).
+    std::vector<std::string> all_agent_ids_override{"dev-1", "dev-2", "dev-3"};
+
+    /// #4983 (Fix 10 round): leave `fleet_read_fn`/`all_agent_ids_fn` UNWIRED
+    /// at registration -- models a misconfigured call site (the same "unwired
+    /// gate" contract `wire_exec_visible` above already exercises for a
+    /// different gate). Only affects POST /api/v1/result-sets' device_ids
+    /// check and from-inventory-query's own fleet_read_fn use; every other
+    /// route in this harness is unaffected either way.
+    bool wire_fleet_read_fn{true};
+    bool wire_all_agent_ids_fn{true};
+
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
-                          InventoryStore* inv = nullptr, bool with_exec_visible = true)
-        : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible) {
+                          InventoryStore* inv = nullptr, bool with_exec_visible = true,
+                          bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true)
+        : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible),
+          wire_fleet_read_fn(with_fleet_read_fn), wire_all_agent_ids_fn(with_all_agent_ids_fn) {
         permit_exec = true; // each harness starts permissive
 
         store = std::make_unique<ResultSetStore>(pool);
@@ -199,15 +225,19 @@ struct AsyncHarness {
         // fake models the same permit_exec-gated denial/admit shape as perm_fn above, so
         // the two from-inventory-query tests below keep their original meaning rather
         // than universally 503ing on an unwired gate.
-        RestApiV1::FleetReadFn fleet_read_fn =
-            [this](const httplib::Request&, httplib::Response& r, const std::string&,
-                   const std::string&) -> yuzu::server::authz::FleetReadGate {
-            if (!permit_exec) {
-                r.status = 403;
-                return {};
-            }
-            return {.admitted = true, .scope = fleet_read_scope_override};
-        };
+        RestApiV1::FleetReadFn fleet_read_fn;
+        if (wire_fleet_read_fn) {
+            fleet_read_fn = [this](const httplib::Request&, httplib::Response& r,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+                fleet_read_fn_reached = true;
+                if (!permit_exec) {
+                    r.status = 403;
+                    return {};
+                }
+                return {.admitted = true, .scope = fleet_read_scope_override};
+            };
+        }
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
                                const std::string& detail) -> bool {
@@ -239,6 +269,17 @@ struct AsyncHarness {
             exec_visible_fn = [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
                 return exec_visible_override;
             };
+        }
+
+        // #4983: POST /api/v1/result-sets' device_ids[] existence check. Read
+        // LIVE (captured `this`) so a test can mutate all_agent_ids_override
+        // after construction, same idiom as fleet_read_scope_override above.
+        // Left unwired (default {}) when wire_all_agent_ids_fn is false --
+        // models a misconfigured call site, same contract as
+        // wire_exec_visible above.
+        if (wire_all_agent_ids_fn) {
+            api.set_all_agent_ids_fn(
+                [this]() -> std::vector<std::string> { return all_agent_ids_override; });
         }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -3087,6 +3128,229 @@ TEST_CASE("POST /api/v1/result-sets: an oversized parent_id is refused with 400"
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4983: device_ids[] existence + scope check on the generic create route.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("POST /api/v1/result-sets: a fully-valid, all-visible device_ids list "
+          "still succeeds (no regression)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool); // all_agent_ids_override defaults to {dev-1,dev-2,dev-3}
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    R"({"name":"x","device_ids":["dev-1","dev-2"]})", status);
+    CHECK(status == 201);
+    CHECK(j["data"]["device_count"] == 2);
+    CHECK(h.fleet_read_fn_reached);
+}
+
+TEST_CASE("POST /api/v1/result-sets: a device_ids list containing one nonexistent "
+          "id is rejected 400, and no result set is created",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    R"({"name":"x","device_ids":["dev-1","ghost-nonexistent"]})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(j["error"]["message"].get<std::string>().find("ghost-nonexistent") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 7 (governance round): the sibling parent_id denial audits -- this
+    // rejection now does too.
+    REQUIRE_FALSE(h.audits.empty());
+    const auto& last = h.audits.back();
+    CHECK(last.action == "result_set.create");
+    CHECK(last.result == "denied");
+    CHECK(last.detail == "reason=unknown_device_id");
+}
+
+TEST_CASE("POST /api/v1/result-sets: a device_ids list containing one real but "
+          "out-of-scope id is rejected 400 identically to the nonexistent case "
+          "(oracle-safety)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // A management-group-confined caller: "dev-2" genuinely exists (it's in
+    // all_agent_ids_override) but is outside this caller's own visible set.
+    h.fleet_read_scope_override = std::unordered_set<std::string>{"dev-1"};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    R"({"name":"x","device_ids":["dev-1","dev-2"]})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_UNKNOWN_DEVICE_ID") !=
+          std::string::npos);
+    CHECK(j["error"]["message"].get<std::string>().find("dev-2") != std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: fleet_read_fn is never reached when device_ids "
+          "is absent or empty (no regression for callers not using this field)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("device_ids absent") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x"})", status);
+        CHECK(status == 201);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+    SECTION("device_ids empty array") {
+        AsyncHarness h(pool);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", R"({"name":"x","device_ids":[]})", status);
+        CHECK(status == 201);
+        CHECK_FALSE(h.fleet_read_fn_reached);
+    }
+}
+
+TEST_CASE("POST /api/v1/result-sets: a non-empty device_ids with an unwired "
+          "fleet_read_fn fails closed 503, and no result set is created",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/true,
+                  /*with_fleet_read_fn=*/false);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":"x","device_ids":["dev-1"]})", status);
+    CHECK(status == 503);
+    CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round): the fragment's twin of this
+    // misconfiguration branch already audited; REST's didn't until now.
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
+}
+
+TEST_CASE("POST /api/v1/result-sets: a non-empty device_ids with an admitted "
+          "fleet_read_fn but an unwired all_agent_ids_fn fails closed 503, and no "
+          "result set is created",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/true,
+                  /*with_fleet_read_fn=*/true, /*with_all_agent_ids_fn=*/false);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":"x","device_ids":["dev-1"]})", status);
+    CHECK(status == 503);
+    CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+          std::string::npos);
+    CHECK(h.fleet_read_fn_reached); // the gate itself ran and admitted before the 2nd check tripped
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 4 (Gate 4 SHOULD, #4983 fix round).
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=all_agent_ids_fn_unwired");
+}
+
+TEST_CASE("POST /api/v1/result-sets: more than kMaxCitedBadIds=20 bad ids are "
+          "truncated in the error message with a '(+N more)' suffix",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    h.all_agent_ids_override = {}; // nothing exists -- every submitted id is "bad"
+    nlohmann::json ids = nlohmann::json::array();
+    for (int i = 0; i < 25; ++i)
+        ids.push_back("ghost-" + std::to_string(i));
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    nlohmann::json{{"name", "x"}, {"device_ids", ids}}.dump(), status);
+    CHECK(status == 400);
+    const auto msg = j["error"]["message"].get<std::string>();
+    CHECK(msg.find("RESULT_SET_UNKNOWN_DEVICE_ID") != std::string::npos);
+    CHECK(msg.find("ghost-0") != std::string::npos);
+    CHECK(msg.find("ghost-19") != std::string::npos); // the 20th cited id (0-indexed)
+    CHECK(msg.find("ghost-20") == std::string::npos); // the 21st is past the cap
+    CHECK(msg.find("(+5 more)") != std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+// Gate 3 SHOULD (cpp-expert, #4983 fix round): MCP's create_result_set twin
+// already enforces this same kResultSetDeviceIdMaxLen (256 bytes) per entry;
+// this REST route's identical device_ids array-parse loop had no such bound
+// -- up to kMaxCitedBadIds (20) of these caller-supplied strings get echoed
+// back into the RESULT_SET_UNKNOWN_DEVICE_ID body/toast on the sibling
+// dashboard-fragment route, where the echo lands in an HTTP response HEADER
+// (a real protocol/proxy size ceiling a JSON body doesn't share) -- apply the
+// same cap here for consistency with that fix.
+TEST_CASE("POST /api/v1/result-sets: a device_ids entry over 256 bytes is "
+          "rejected 400, and no result set is created (#4983 Gate 3 SHOULD)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string oversized_id(257, 'a');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    nlohmann::json{{"name", "x"},
+                                  {"device_ids", nlohmann::json::array({oversized_id})}}
+                        .dump(),
+                    status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("256 bytes") != std::string::npos);
+    // Rejected before the existence/scope gate ever runs.
+    CHECK_FALSE(h.fleet_read_fn_reached);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    // Fix 1 (BLOCKING, #4983 Gate 4 fix round): the very next fix-round
+    // commit after the sibling unknown_device_id rejection was audited
+    // reproduced the identical unaudited-rejection defect for this new
+    // length-cap branch -- fixed here.
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().action == "result_set.create");
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail == "reason=device_id_too_long");
+}
+
+// Fix 9 (NICE, #4983 fix round): pin the boundary the other direction --
+// exactly kResultSetDeviceIdMaxLen (256) bytes is a `>` comparator, not `>=`,
+// so this must succeed. Only the truncation/257-byte-rejection side had a
+// dedicated test until now.
+TEST_CASE("POST /api/v1/result-sets: a device_ids entry of exactly 256 bytes "
+          "is accepted (#4983 Fix 9)",
+          "[pg][result_set][security][4983]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const std::string boundary_id(256, 'a');
+    h.all_agent_ids_override = {boundary_id};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets",
+                    nlohmann::json{{"name", "x"},
+                                  {"device_ids", nlohmann::json::array({boundary_id})}}
+                        .dump(),
+                    status);
+    CHECK(status == 201);
+    CHECK(j["data"]["device_count"] == 1);
 }
 
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",

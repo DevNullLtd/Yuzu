@@ -2659,6 +2659,55 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* under *systemd Units*, further down this page, for what each code means and how they interact.
 
+### vNEXT — `device_ids` on result-set creation now requires `Infrastructure:Read` (#4983, breaking)
+
+**What changed.** `POST /api/v1/result-sets`, MCP `create_result_set`, and the dashboard CSV-paste
+import (`POST /fragments/result-sets/create`) previously accepted an arbitrary caller-supplied
+`device_ids` array with only a type check and a size cap — no RBAC check of any kind ran when
+`device_ids` was supplied, beyond the ordinary session-authenticated/owner-scoped gate every call
+to these routes already passed. All three now additionally gate a non-empty `device_ids` through
+the admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017) and validate
+that every entry both exists and is visible to the caller's own scope — a nonexistent or
+out-of-scope id now rejects the whole request (`400 RESULT_SET_UNKNOWN_DEVICE_ID` on REST, the
+JSON-RPC equivalent on MCP, an error toast on the dashboard fragment) instead of being silently
+accepted as a member. Each entry is also now capped at 256 bytes (`400
+RESULT_SET_DEVICE_ID_TOO_LONG` on REST, the JSON-RPC equivalent on MCP, an error toast on the
+dashboard fragment) — a separate, additional new rejection path on all three surfaces.
+
+**Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
+result set by supplying `device_ids` directly. Checked against this repository's actual seed
+grants (`RbacStore::seed_defaults`), of the 7 seeded built-in roles only **Administrator** and
+**ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
+ApiTokenManager, and Reviewer do not**. A principal holding one of those five roles who could
+previously create a result set with `device_ids` (the RBAC-enabled default before this release
+carried no permission check on this field at all) will now receive a new `403` on all three
+surfaces. This is a genuine, confirmed regression path, not a hypothetical one. A caller who omits
+`device_ids`, or supplies an empty array, is completely unaffected on any surface — the gate is
+never consulted. **RBAC-disabled deployments (the shipped default) are entirely unaffected** — the
+legacy permission fallback admits every authenticated session regardless of this change.
+
+**Check your automation and your dashboard operators, not just your admins — this is the failure
+that hides.** Before upgrading an RBAC-enabled deployment, identify every non-admin principal
+(API token, service account, or interactive session) that currently calls `POST
+/api/v1/result-sets` / `create_result_set` / the dashboard's CSV-paste import ("New result set
+from a list of device ids") with a non-empty `device_ids`. This includes a dashboard operator
+pasting a CSV of ids just as much as an automation calling the API — both hit the identical new
+gate. Audit your `AuthDB`/API-token principal list and your dashboard-role assignments for holders
+of `Viewer`, `Operator`, `PlatformEngineer`, `ApiTokenManager`, or `Reviewer` who use this
+capability; each will start receiving `403` the moment this release is live, with no advance
+warning from the caller's own side.
+
+**What to do.** Of the 6 fleet-wide-assignable built-in roles, only `Administrator` holds
+`Infrastructure:Read` — `ITServiceOwner` (the 7th, management-group-scoped-only) also holds it. A
+principal who needs to keep creating result sets with `device_ids` after this release needs one of
+those two roles; per `rbac.md`'s own current state, there is **no REST API or Settings UI yet for
+creating a custom role or editing an existing role's permission set** (tracked as planned, not
+implemented) — the only way to grant `Infrastructure:Read` to a role that doesn't already hold it
+is a direct `RbacStore::set_permission()` call against the shared Postgres `rbac_store` schema (see
+`rbac.md`'s "Custom roles" section for the exact mechanism). There is no per-route opt-out; a
+caller that only ever creates result sets via `parent_id`/`source_payload` (no `device_ids`) is
+unaffected and needs no change.
+
 ## Settings Page
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
