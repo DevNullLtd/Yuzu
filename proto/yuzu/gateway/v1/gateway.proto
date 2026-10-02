@@ -68,8 +68,9 @@ message BatchHeartbeatResponse {
   // may have registered or been disconnected since, so a consumer must not
   // treat it as "session is dead". Registering a stale id installs a fresh
   // session for that agent (its current placement is lost until it
-  // re-announces) and re-runs the registration side effects, so verify the
-  // session locally before acting. Read the fields with defaults (the
+  // re-announces) and re-runs the registration side effects, including
+  // invalidating the agent's existing device tokens, so verify the session
+  // locally before acting. Read the fields with defaults (the
   // generated decoder fills [] and false); an absent field means nothing to
   // replay. Field 4 is intentionally unused.
   repeated string unknown_session_ids = 2;
