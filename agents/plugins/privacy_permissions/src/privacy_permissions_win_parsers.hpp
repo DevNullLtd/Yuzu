@@ -1,8 +1,9 @@
 /**
- * privacy_permissions_win_parsers.hpp -- Windows-only PURE layer: the CapabilityName ->
- * category table, the ConsentStore `Value` string -> PermissionState decode, the NonPackaged
- * app-identity unescape, the LastUsedTime* QWORD decode, and the profile-vs-HKLM precedence
- * merge. Separate from privacy_permissions_parsers.hpp (the cross-OS pure layer), same split as
+ * privacy_permissions_win_parsers.hpp -- the Windows leg's PURE layer (OS-free: compiled and
+ * unit-tested on every host; only the shell in privacy_permissions_win.cpp is Windows-only): the
+ * CapabilityName -> category table, the ConsentStore `Value` string -> PermissionState decode, the
+ * NonPackaged app-identity unescape, the LastUsedTime* QWORD decode, the profile-vs-HKLM precedence
+ * merge and the per-run row assembly. Separate from privacy_permissions_parsers.hpp (the cross-OS pure layer), same split as
  * platform_security_win_parsers.hpp. windows.h-free: the Win32 codes it branches on are
  * mirrored below and static_asserted against the real macros in privacy_permissions_win.cpp.
  *
@@ -22,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <span>
@@ -416,9 +418,12 @@ inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
 
 /// What the shell learned about one NTUSER.DAT, every fact taken from an opened HANDLE (or, for
-/// the path facts, from the requested path before any syscall). `final_path` is
-/// GetFinalPathNameByHandleW(VOLUME_NAME_DOS): `\\?\` + the path it was reached by when nothing
-/// redirected it.
+/// the path facts, from the requested path before any syscall). `final_path_matches` is the
+/// shell's verdict that GetFinalPathNameByHandleW(VOLUME_NAME_DOS) equals `\\?\` + the requested
+/// path under Windows' own ordinal case-insensitive comparison (CompareStringOrdinal on the wide
+/// strings: a non-ASCII case-only difference is the same path, which byte-wise ASCII folding on
+/// UTF-8 would misjudge). The default is the neutral `true`, so only the facts gathered so far can
+/// trip a classification.
 struct HiveFileFacts {
     bool path_is_unc = false;
     std::uint32_t drive_type = kDriveFixed;
@@ -429,8 +434,7 @@ struct HiveFileFacts {
     bool is_disk_file = true;
     std::string owner_sid;
     std::string profile_sid;
-    std::string requested_path;
-    std::string final_path;
+    bool final_path_matches = true;
     std::uint64_t size = 0;
 };
 
@@ -465,8 +469,7 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
     if (f.is_reparse) return std::string{kHiveReparsePoint};
     if (f.is_directory || !f.is_disk_file) return std::string{kHiveNotRegular};
     if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
-    if (!profiles::iequals_ascii(f.final_path, "\\\\?\\" + f.requested_path))
-        return std::string{kHivePathRedirected};
+    if (!f.final_path_matches) return std::string{kHivePathRedirected};
     if (f.size > kMaxHiveBytes) return std::string{kHiveOversized};
     return std::nullopt;
 }
@@ -489,6 +492,230 @@ struct StabilityFacts {
     if (f.wait_rc == kWaitTimeout) return std::nullopt;
     if (f.wait_rc == kWaitObject0) return std::string{"changed_during_read"};
     return "notify_wait_failed:win32_" + std::to_string(f.wait_gle);
+}
+
+// ── run assembly (pure: the shell injects what each source read produced) ─────
+
+/// One ConsentStore root's walk (a profile hive or HKLM). `refused` is a classify_stability token:
+/// the read was discarded unread.
+struct ConsentWalk {
+    long root_rc = kErrorSuccess;
+    std::vector<RawGrant> grants;     // keyed by (app_id, category); "-" = capability level
+    std::vector<RawGrant> structural; // never merged -- always emitted as their own rows
+    std::string refused;
+};
+
+/// Emits one grant as a row. `source` is the profile name (or "hklm"); `qualify` = prefix the
+/// row's app_id with it (false only for HKLM's own, machine-wide rows). A failed grant's row `raw`
+/// is `<source>\<app_id>:<category>:<cause>`; the run's constraint set (the agent-log provenance)
+/// gets only the app-less coarse_failure_token.
+inline void emit_grant(std::string_view source, bool qualify, const RawGrant& g,
+                       std::vector<PermissionRow>& rows,
+                       yuzu::shared::ConstraintAccumulator& acc) {
+    const std::string subject = qualify_app_id(source, g.app_id) + ":" + std::string{g.category};
+    PermissionRow row{"windows",
+                      qualify ? qualify_app_id(source, g.app_id) : g.app_id,
+                      g.category,
+                      g.state,
+                      g.raw_value,
+                      g.last_used_start.value,
+                      g.last_used_stop.value,
+                      g.read_denied};
+    if (!g.cause.empty()) {
+        row.raw = subject + ":" + g.cause;
+        acc.add_failure(coarse_failure_token(source, g.category, g.cause));
+    }
+    if (!g.last_used_start.cause.empty())
+        acc.add_failure(
+            coarse_failure_token(source, g.category, "last_used_start_" + g.last_used_start.cause));
+    if (!g.last_used_stop.cause.empty())
+        acc.add_failure(
+            coarse_failure_token(source, g.category, "last_used_stop_" + g.last_used_stop.cause));
+    row.read_denied = row.read_denied || g.last_used_start.denied || g.last_used_stop.denied;
+    rows.push_back(std::move(row));
+}
+
+/// The one whole-source row for a ConsentStore root that could not be opened (not "not there").
+inline void emit_root_failure(std::string_view source, std::string app_id, long rc,
+                              std::vector<PermissionRow>& rows,
+                              yuzu::shared::ConstraintAccumulator& acc) {
+    rows.push_back(failure_row("windows", std::move(app_id), "-", rc == kErrorAccessDenied,
+                               std::string{source} + ":" + win32_cause(rc), acc));
+}
+
+/// What reading ONE profile produced: how its hive was (or was not) reached and, when it was, its
+/// ConsentStore walk. `peek_rc` is the open code of the live HKU\<SID> root, which
+/// with_user_hive's own `== ERROR_SUCCESS` test cannot tell from "not loaded": it recovers a
+/// refused live hive whose offline fallback then also failed.
+struct ProfileRead {
+    profiles::HiveAccessStatus status = profiles::HiveAccessStatus::not_found;
+    std::string refusal;          // the hive-file refusal token when status == file_refused
+    bool unload_failed = false;   // the read completed; a mount was left behind
+    long peek_rc = kErrorSuccess;
+    ConsentWalk walk;             // meaningful only when status == ok
+};
+
+using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
+
+/// Assembles the run's rows from the HKLM walk and one injected read per profile -- every decision
+/// the shell used to make inline, so each is unit-observable on every host: HKLM's rows are
+/// RESERVED in the run-wide `output` before any profile is charged; a profile's rows are charged
+/// as a unit and one that would cross the cap is not emitted; the run stops, with exactly one
+/// `collection:budget_exceeded` row, when the cap is crossed OR already exactly filled with
+/// profiles left (the bytes check at the loop top, not only the commit refusal); an expired
+/// deadline stops it with one `collection:timeout` row; an overriding HKLM Deny is HKLM's own row
+/// only when no profile was reachable to carry it (a profile whose ConsentStore was refused as
+/// unstable is not reachable). `budget` is as the HKLM walk left it; `discovery_rows` (ProfileList
+/// failures, built by the shell) lead the profile rows. The caller runs fill_uncovered_categories
+/// and emits.
+[[nodiscard]] inline std::vector<PermissionRow> assemble_windows_rows(
+    const std::vector<profiles::ProfileInfo>& profile_list, const ConsentWalk& hklm,
+    std::vector<PermissionRow> discovery_rows, const ReadProfileFn& read_profile,
+    RetentionBudget& budget, OutputBudget& output, yuzu::shared::ConstraintAccumulator& acc) {
+    std::vector<PermissionRow> rows = std::move(discovery_rows);
+    // A source that hit its own cap keeps the rows it charged; this row says it is incomplete.
+    const auto truncated_row = [&](std::vector<PermissionRow>& into, const std::string& source,
+                                   const std::string& row_id) {
+        if (budget.profile_exhausted)
+            into.push_back(failure_row("windows", row_id, "-", false,
+                                       source + ":" + std::string{kSourceBudgetExceededSuffix}, acc));
+    };
+
+    // HKLM: only its successfully read `Deny` grants override a profile (hklm_overrides_profile --
+    // the device toggle, most restrictive wins) and are applied into each profile's merge;
+    // everything else HKLM holds is reported once below as HKLM's own unqualified rows.
+    std::vector<PermissionRow> hklm_grant_rows; // one per hklm.grants entry, same index
+    std::vector<PermissionRow> hklm_tail;       // structural, root failure, refusal: always emitted
+    std::vector<RawGrant> hklm_overriding;
+    for (const auto& g : hklm.grants) {
+        if (hklm_overrides_profile(g)) hklm_overriding.push_back(g);
+        emit_grant("hklm", false, g, hklm_grant_rows, acc);
+    }
+    for (const auto& g : hklm.structural) emit_grant("hklm", false, g, hklm_tail, acc);
+    if (hklm.root_rc != kErrorSuccess && hklm.root_rc != kErrorFileNotFound)
+        emit_root_failure("hklm", "-", hklm.root_rc, hklm_tail, acc);
+    if (!hklm.refused.empty())
+        hklm_tail.push_back(failure_row("windows", "-", "-", false, "hklm:" + hklm.refused, acc));
+    truncated_row(hklm_tail, "hklm", "-");
+    // RESERVE HKLM's rows before any profile charges: an upper bound (hklm_emitted_once only
+    // narrows it), so a profile can never starve the machine rows and the machine rows are never
+    // charged twice.
+    output.charge(hklm_grant_rows);
+    output.charge(hklm_tail);
+
+    // Profiles whose rows carried HKLM's overriding grants: when none did, those grants are
+    // emitted directly (unqualified) rather than silently dropped.
+    std::size_t reachable_profiles = 0;
+    bool budget_hit = false;
+    // One profile's rows are charged as a unit; one that would cross the cap is not emitted.
+    const auto commit = [&](std::vector<PermissionRow>& prof, bool reachable) {
+        if (output.would_exceed(prof)) {
+            budget_hit = true;
+            return false;
+        }
+        output.charge(prof);
+        for (auto& r : prof) rows.push_back(std::move(r));
+        if (reachable) ++reachable_profiles;
+        return true;
+    };
+
+    for (const auto& profile : profile_list) {
+        // A cap the previous profile filled EXACTLY is still the budget stopping the run with
+        // profiles left: it must say so, never end silently short.
+        if (output.exhausted()) {
+            budget_hit = true;
+            break;
+        }
+        if (budget.expired()) break; // `timed_out` is sticky: the run-level row is added below
+        budget.begin_profile();
+        const std::string pname = profile.profile_name.empty() ? "-" : profile.profile_name;
+        const std::string profile_row_id = qualify_app_id(pname, "-");
+        std::vector<PermissionRow> prof;
+
+        // The SID is appended to HKEY_USERS by the shell (and by with_user_hive): a malformed or
+        // empty one must never open the HKU root or some other key in place of this profile's own
+        // hive, so it is refused here, before any read is injected.
+        if (!is_valid_sid_string(profile.sid)) {
+            prof.push_back(
+                failure_row("windows", profile_row_id, "-", false, pname + ":invalid_sid", acc));
+            if (!commit(prof, false)) break;
+            continue;
+        }
+
+        ProfileRead rd = read_profile(profile);
+        // The read itself completed; a failed unload is an operational residue (a mount left
+        // behind), reported as a token, not a data gap.
+        if (rd.unload_failed) acc.add_failure(pname + ":hive_unload_failed");
+
+        // Exhaustive over the HiveAccessStatus outcomes: a profile whose hive was never opened
+        // must never read as "this profile has no grants" -- each failure is its own row.
+        // `refused`: the cause is itself a refusal (a missing privilege): denied, token unchanged.
+        const auto profile_failed = [&](std::string_view cause, bool refused = false) {
+            const bool peek_denied = (rd.peek_rc == kErrorAccessDenied);
+            prof.push_back(failure_row("windows", profile_row_id, "-", peek_denied || refused,
+                                       pname + ":" + (peek_denied ? std::string{"access_denied"}
+                                                                  : std::string{cause}),
+                                       acc));
+        };
+        bool reachable = false;
+        switch (rd.status) {
+        case profiles::HiveAccessStatus::ok:
+            reachable = true;
+            break;
+        case profiles::HiveAccessStatus::privilege_missing:
+            profile_failed("privilege_missing", true);
+            break;
+        case profiles::HiveAccessStatus::not_found:
+            // `profile_path_unreadable` (carried from the raw ProfileList record) means even the
+            // PATH itself couldn't be resolved -- named distinctly from "no hive to reach".
+            profile_failed(profile.profile_path_unreadable ? "profile_path_unreadable"
+                                                           : "hive_not_found");
+            break;
+        case profiles::HiveAccessStatus::mount_failed:
+            profile_failed("hive_mount_failed");
+            break;
+        case profiles::HiveAccessStatus::file_refused:
+            // A hive-file refusal is unreadable, not denied (an unsafe file is not an ACL
+            // refusal); `timeout` also ends the run (budget.expired() already marked it).
+            prof.push_back(failure_row("windows", profile_row_id, "-", false,
+                                       pname + ":" + rd.refusal, acc));
+            break;
+        }
+
+        if (reachable) {
+            const ConsentWalk& user = rd.walk;
+            if (!user.refused.empty()) {
+                prof.push_back(failure_row("windows", profile_row_id, "-", false,
+                                           pname + ":" + user.refused, acc));
+                reachable = false; // nothing merged: HKLM's Deny must not be lost with it
+            } else {
+                if (user.root_rc != kErrorSuccess && user.root_rc != kErrorFileNotFound)
+                    emit_root_failure(pname, profile_row_id, user.root_rc, prof, acc);
+                for (const auto& g : merge_with_hklm(user.grants, hklm_overriding))
+                    emit_grant(pname, true, g, prof, acc);
+                for (const auto& g : user.structural) emit_grant(pname, true, g, prof, acc);
+                truncated_row(prof, pname, profile_row_id);
+            }
+        }
+        if (!commit(prof, reachable)) break;
+        if (budget.timed_out) break;
+    }
+
+    // HKLM's own rows, unqualified, once (hklm_emitted_once), already charged: everything it
+    // holds -- failures, Allow and unmodelled values, app-level entries and its definitive
+    // capability-level `absent`s -- and its overriding Deny grants only when no profile was
+    // reachable to carry them.
+    for (std::size_t i = 0; i < hklm.grants.size(); ++i)
+        if (hklm_emitted_once(hklm.grants[i], reachable_profiles > 0))
+            rows.push_back(std::move(hklm_grant_rows[i]));
+    for (auto& r : hklm_tail) rows.push_back(std::move(r));
+    // The run-wide output budget stopped the walk: every row read so far is above; what was never
+    // walked is covered by this one whole-source row.
+    if (budget_hit)
+        rows.push_back(failure_row("windows", "-", "-", false, std::string{kBudgetExceededToken}, acc));
+    if (budget.timed_out)
+        rows.push_back(failure_row("windows", "-", "-", false, std::string{kTimeoutToken}, acc));
+    return rows;
 }
 
 } // namespace yuzu::privacy_permissions::win

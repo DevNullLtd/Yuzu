@@ -201,6 +201,18 @@ TEST_CASE("privacy_permissions: the real Windows dispatch derives its typed stat
           "The oracle admits token-only failures (a hive that would not unload, a LastUsedTime "
           "read) that carry no row, so OK/FULL is never asserted from row shape alone.",
           "[privacy_permissions][dispatcher]") {
+    // CI exposure, stated plainly: this runs the REAL action, so it reads the host's real HKLM
+    // ProfileList and every real profile's ConsentStore, and for a logged-off profile it mounts that
+    // profile's real NTUSER.DAT (RegLoadKeyW) under the shared offline_hive_mutex. On the shared
+    // 4-runner/one-identity box, concurrent jobs running registry-touching tests can collide on a
+    // profile's hive file (ERROR_SHARING_VIOLATION), which surfaces as a `hive_mount_failed` row --
+    // the same exposure test_registry_local_dispatcher already carries. The oracle is therefore
+    // deliberately shape-level, like the macOS arm above: it asserts the status is DERIVED from the
+    // rows (never the placeholder, PERMISSION_DENIED/CONSTRAINED only with their evidence), and it
+    // cannot be satisfied by a hard-coded status, but it does not pin which profiles a host has or
+    // whether they could be read. Value-level behaviour is covered where the inputs are controlled:
+    // the injected-read cases in test_privacy_permissions_parsers.cpp and the fixture-registry and
+    // TempDir cases in test_privacy_permissions_win_internals.cpp.
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;

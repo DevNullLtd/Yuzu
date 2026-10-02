@@ -4,8 +4,10 @@
  * HiveFileGuard. The pure classifiers (classify_stability, classify_hive_file, ...) are covered
  * in test_privacy_permissions_parsers.cpp; these cases prove the production WIRING around them:
  * that the watch is armed and polled, that the walk decodes a ConsentStore subtree and honours the
- * deadline, and that the guard checks the deadline first and verifies the file identity. No fake
- * registry interface: a per-process-salted volatile HKCU key and a TempDir file.
+ * deadline, that the guard checks the deadline first and verifies the file identity, that
+ * with_user_hive reads a loaded hive before ever entering the offline arm, and that the final-path
+ * comparison is Windows' own ordinal one. No fake registry interface: a per-process-salted volatile
+ * HKCU key and a TempDir file.
  *
  * `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere (the same shape as
  * test_execution_artifacts_win_internals.cpp and test_privacy_permissions_macos_internals.cpp).
@@ -248,6 +250,66 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
         win::RetentionBudget budget;
         HiveFileGuard guard{budget, sid, 0, std::nullopt};
         CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
+    }
+}
+
+TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first and never enters "
+          "the offline arm",
+          "[privacy_permissions][win_internals]") {
+    const std::string sid = own_sid_string();
+    {
+        INFO("premise: the test process's own user hive is loaded under HKEY_USERS\\<its SID>; a "
+             "host where it is not cannot exercise the live-first branch");
+        yuzu::win::RegKey own;
+        REQUIRE(RegOpenKeyExW(HKEY_USERS, yuzu::win::to_wide(sid).c_str(), 0, KEY_READ,
+                              own.put()) == ERROR_SUCCESS);
+    }
+    int before_calls = 0, after_calls = 0, fn_calls = 0;
+    const yuzu::win::OfflineHiveFileCheck check{
+        [&](const std::wstring&) {
+            ++before_calls;
+            return std::string{"must_not_run"};
+        },
+        [&](const std::wstring&) {
+            ++after_calls;
+            return std::string{"must_not_run"};
+        }};
+    yuzu::win::HiveAccessReport report;
+    // The profile path is deliberately bogus: if the live branch were skipped, the offline arm
+    // would be entered (and refused by the first hook, or by a missing privilege) instead.
+    const auto status = yuzu::win::with_user_hive(
+        sid, "C:\\yuzu_bogus_profile_path",
+        [&](HKEY root) {
+            ++fn_calls;
+            CHECK(root != nullptr);
+        },
+        &report, &check);
+    CHECK(status == yuzu::win::HiveAccessStatus::ok);
+    CHECK(fn_calls == 1);
+    CHECK(before_calls == 0);
+    CHECK(after_calls == 0);
+    CHECK_FALSE(report.mounted_offline);
+}
+
+TEST_CASE("privacy_permissions win: final_path_matches is the ordinal case-insensitive comparison "
+          "the file system uses, with the \\\\?\\ prefix required",
+          "[privacy_permissions][win_internals]") {
+    const std::wstring requested = L"C:\\Users\\\u00C4nne\\NTUSER.DAT"; // capital A-diaeresis
+    SECTION("a non-ASCII case-only difference is the same path") {
+        CHECK(final_path_matches(requested, L"\\\\?\\C:\\Users\\\u00E4nne\\NTUSER.DAT"));
+    }
+    SECTION("an ASCII case-only difference is the same path") {
+        CHECK(final_path_matches(L"C:\\Users\\jsmith\\NTUSER.DAT",
+                                 L"\\\\?\\c:\\USERS\\JSmith\\ntuser.dat"));
+    }
+    SECTION("a different name is a different path") {
+        CHECK_FALSE(final_path_matches(requested, L"\\\\?\\C:\\Users\\Anne\\NTUSER.DAT"));
+    }
+    SECTION("a different drive is a different path") {
+        CHECK_FALSE(final_path_matches(requested, L"\\\\?\\D:\\Users\\\u00C4nne\\NTUSER.DAT"));
+    }
+    SECTION("a final path without the \\\\?\\ prefix is not the requested path") {
+        CHECK_FALSE(final_path_matches(requested, requested));
     }
 }
 

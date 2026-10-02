@@ -12,6 +12,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -775,8 +776,6 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         f.depth = 3;
         f.profile_sid = profile;
         f.owner_sid = profile;
-        f.requested_path = "C:\\Users\\jsmith\\NTUSER.DAT";
-        f.final_path = "\\\\?\\C:\\Users\\jsmith\\NTUSER.DAT";
         f.size = 1024;
         return f;
     };
@@ -830,26 +829,23 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes;
         CHECK(token(big) == "<accepted>");
     }
-    SECTION("redirection is judged on the final path, case-insensitively") {
+    SECTION("redirection is the shell's final-path verdict (the comparison itself is "
+            "CompareStringOrdinal, tested in test_privacy_permissions_win_internals.cpp)") {
         auto other = stock();
-        other.final_path = "\\\\?\\D:\\Users\\jsmith\\NTUSER.DAT";
+        other.final_path_matches = false;
         CHECK(token(other) == "hive_path_redirected");
-        auto cased = stock();
-        cased.final_path = "\\\\?\\c:\\USERS\\JSmith\\ntuser.dat";
-        CHECK(token(cased) == "<accepted>");
-        auto bare = stock();
-        bare.final_path = bare.requested_path; // missing the \\?\ prefix
-        CHECK(token(bare) == "hive_path_redirected");
+        other.final_path_matches = true;
+        CHECK(token(other) == "<accepted>");
     }
     SECTION("the order is pinned: owner before redirect before size") {
         auto f = stock();
         f.owner_sid = "S-1-5-21-1-2-3-1002";
-        f.final_path = "\\\\?\\D:\\x";
+        f.final_path_matches = false;
         f.size = win::kMaxHiveBytes + 1;
         CHECK(token(f) == "hive_owner_unexpected");
         f.owner_sid = profile;
         CHECK(token(f) == "hive_path_redirected");
-        f.final_path = stock().final_path;
+        f.final_path_matches = true;
         CHECK(token(f) == "hive_oversized");
     }
 }
@@ -870,6 +866,278 @@ TEST_CASE("win::classify_stability: stable only on a created event, an armed wat
     CHECK(token(F{0, 5, win::kWaitTimeout, 0}) == "notify_failed:win32_5");
     CHECK(token(F{0, 87, win::kWaitObject0, 0}) == "notify_failed:win32_87");
     CHECK(token(F{8, 5, win::kWaitObject0, 0}) == "notify_event_failed:win32_8");
+}
+
+// ── win::assemble_windows_rows: the collector's decisions, fed injected per-profile reads ─────
+
+namespace {
+
+using yuzu::profiles::HiveAccessStatus;
+using yuzu::profiles::ProfileInfo;
+
+constexpr const char* kSidAlice = "S-1-5-21-1-2-3-1001";
+constexpr const char* kSidBobby = "S-1-5-21-1-2-3-1002";
+constexpr const char* kSidCarol = "S-1-5-21-1-2-3-1003";
+
+ProfileInfo profile_of(std::string name, std::string sid) {
+    ProfileInfo p;
+    p.sid = std::move(sid);
+    p.profile_name = std::move(name);
+    p.profile_path = "C:\\Users\\" + p.profile_name;
+    return p;
+}
+
+/// HKLM as the-rig reads it, except the camera toggle is Deny: the three other capabilities are
+/// definitive absences.
+win::ConsentWalk hklm_camera_deny() {
+    win::ConsentWalk w;
+    w.grants.push_back({"-", "camera", PermissionState::denied, "Deny"});
+    for (const auto cat : {"microphone", "location", "full_disk_access"})
+        w.grants.push_back({"-", cat, PermissionState::absent, "-"});
+    return w;
+}
+
+/// A reachable profile whose own toggle is Allow on every category.
+win::ProfileRead reachable_allow() {
+    win::ProfileRead rd;
+    rd.status = HiveAccessStatus::ok;
+    for (const auto cat : kCategories) rd.walk.grants.push_back({"-", cat, PermissionState::allowed, "Allow"});
+    return rd;
+}
+
+win::ProfileRead unreachable(HiveAccessStatus st, std::string refusal = {}) {
+    win::ProfileRead rd;
+    rd.status = st;
+    rd.refusal = std::move(refusal);
+    return rd;
+}
+
+/// One assembled run: the budgets are the test's own, so a test can shrink the output cap or move
+/// the deadline, and a fake read can do either mid-run.
+struct AssembledRun {
+    yuzu::shared::ConstraintAccumulator acc;
+    OutputBudget output;
+    win::RetentionBudget budget;
+    std::vector<PermissionRow> rows;
+    std::size_t reads = 0;
+
+    void go(const std::vector<ProfileInfo>& profiles, const win::ConsentWalk& hklm,
+            const std::function<win::ProfileRead(const ProfileInfo&)>& read) {
+        rows = win::assemble_windows_rows(
+            profiles, hklm, {},
+            [&](const ProfileInfo& p) {
+                ++reads;
+                return read(p);
+            },
+            budget, output, acc);
+    }
+
+    [[nodiscard]] std::size_t count(const std::function<bool(const PermissionRow&)>& pred) const {
+        return static_cast<std::size_t>(std::count_if(rows.begin(), rows.end(), pred));
+    }
+    [[nodiscard]] std::size_t markers(std::string_view token) const {
+        return count([&](const PermissionRow& r) {
+            return r.app_id == "-" && r.category == "-" && r.raw == token;
+        });
+    }
+    [[nodiscard]] std::size_t rows_of(std::string_view app_prefix) const {
+        return count([&](const PermissionRow& r) { return r.app_id.rfind(app_prefix, 0) == 0; });
+    }
+};
+
+} // namespace
+
+TEST_CASE("win::assemble_windows_rows: HKLM's overriding Deny is one unqualified row only when no "
+          "profile was reachable to carry it",
+          "[privacy_permissions][win_parsers]") {
+    const auto hklm_row = [](const PermissionRow& r) {
+        return format_row(r) == "permissions|windows|-|camera|denied|Deny|-|-";
+    };
+    AssembledRun run;
+
+    SECTION("every profile unreachable: exactly one unqualified Deny row, plus each profile's failure") {
+        run.go({profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)}, hklm_camera_deny(),
+               [](const ProfileInfo& p) {
+                   return p.sid == kSidAlice
+                              ? unreachable(HiveAccessStatus::file_refused, "hive_path_unc")
+                              : unreachable(HiveAccessStatus::mount_failed);
+               });
+        CHECK(run.count(hklm_row) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:hive_path_unc"; }) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "bobby:hive_mount_failed"; }) == 1);
+        const auto st = select_status(run.acc, any_denied(run.rows), false);
+        CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    }
+    SECTION("one reachable profile carries it: the Deny is that profile's qualified row, never also HKLM's") {
+        run.go({profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)}, hklm_camera_deny(),
+               [](const ProfileInfo& p) {
+                   return p.sid == kSidAlice ? reachable_allow()
+                                             : unreachable(HiveAccessStatus::mount_failed);
+               });
+        CHECK(run.count(hklm_row) == 0);
+        CHECK(run.count([](const PermissionRow& r) {
+                  return r.app_id == "alice\\-" && r.category == "camera" &&
+                         r.state == PermissionState::denied && r.raw == "Deny";
+              }) == 1);
+    }
+    SECTION("a profile refused as unstable is not reachable: nothing merged, so HKLM keeps the Deny") {
+        run.go({profile_of("alice", kSidAlice)}, hklm_camera_deny(), [](const ProfileInfo&) {
+            auto rd = reachable_allow();
+            rd.walk.refused = "changed_during_read";
+            return rd;
+        });
+        CHECK(run.count(hklm_row) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "alice:changed_during_read"; }) == 1);
+        CHECK(run.rows_of("alice\\-") == 1); // the refusal row alone: no Allow row for the discarded read
+    }
+    SECTION("a malformed SID is refused before any read is injected, and is not reachable") {
+        run.go({profile_of("mallory", "S-1-5-"), profile_of("carol", kSidCarol)}, hklm_camera_deny(),
+               [](const ProfileInfo&) { return unreachable(HiveAccessStatus::not_found); });
+        CHECK(run.reads == 1); // carol only
+        CHECK(run.count([](const PermissionRow& r) { return r.raw == "mallory:invalid_sid"; }) == 1);
+        CHECK(run.count(hklm_row) == 1);
+    }
+}
+
+TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, a refused live peek "
+          "is a denial, and a failed unload is a token and no row",
+          "[privacy_permissions][win_parsers]") {
+    AssembledRun run;
+    const auto only = [&](win::ProfileRead rd, ProfileInfo p = profile_of("alice", kSidAlice)) {
+        run.go({p}, win::ConsentWalk{}, [&](const ProfileInfo&) { return rd; });
+    };
+    const auto row_raw = [&](std::string_view raw) {
+        return run.count([&](const PermissionRow& r) { return r.raw == raw; });
+    };
+
+    SECTION("mount_failed is unreadable") {
+        only(unreachable(HiveAccessStatus::mount_failed));
+        REQUIRE(row_raw("alice:hive_mount_failed") == 1);
+        CHECK_FALSE(any_denied(run.rows));
+    }
+    SECTION("a refused live peek turns any failure into access_denied, denied") {
+        auto rd = unreachable(HiveAccessStatus::not_found);
+        rd.peek_rc = win::kErrorAccessDenied;
+        only(rd);
+        REQUIRE(row_raw("alice:access_denied") == 1);
+        CHECK(any_denied(run.rows));
+    }
+    SECTION("a missing privilege is a refusal, denied") {
+        only(unreachable(HiveAccessStatus::privilege_missing));
+        REQUIRE(row_raw("alice:privilege_missing") == 1);
+        CHECK(any_denied(run.rows));
+    }
+    SECTION("not_found names an unreadable ProfileImagePath distinctly") {
+        auto p = profile_of("alice", kSidAlice);
+        p.profile_path_unreadable = true;
+        only(unreachable(HiveAccessStatus::not_found), p);
+        CHECK(row_raw("alice:profile_path_unreadable") == 1);
+    }
+    SECTION("a failed unload after a good read adds a token, never a row") {
+        auto rd = reachable_allow();
+        rd.unload_failed = true;
+        only(rd);
+        CHECK(run.acc.reason().find("alice:hive_unload_failed") != std::string::npos);
+        CHECK(run.count([](const PermissionRow& r) { return r.raw.find("unload") != std::string::npos; }) == 0);
+        CHECK(run.rows_of("alice\\-") == kCategories.size()); // the profile's four rows are all there
+    }
+}
+
+TEST_CASE("win::assemble_windows_rows: the run-wide output budget reserves HKLM's rows, drops the "
+          "profile that would cross the cap, and says so exactly once",
+          "[privacy_permissions][win_parsers]") {
+    const auto hklm = hklm_camera_deny();
+    const auto read = [](const ProfileInfo&) { return reachable_allow(); };
+    // The cost of HKLM's reservation (R) and of one profile's rows (c), measured from real runs.
+    AssembledRun none;
+    none.go({}, hklm, read);
+    const std::size_t reserved = none.output.bytes;
+    AssembledRun one;
+    one.go({profile_of("alice", kSidAlice)}, hklm, read);
+    const std::size_t per_profile = one.output.bytes - reserved;
+    REQUIRE(reserved > 0);
+    REQUIRE(per_profile > 0);
+    CHECK(none.markers(kBudgetExceededToken) == 0);
+    CHECK(one.markers(kBudgetExceededToken) == 0);
+
+    const std::vector<ProfileInfo> two{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby)};
+    AssembledRun run;
+
+    SECTION("a second profile that would cross the cap is absent; the first and HKLM's rows stay") {
+        run.output.max_bytes = reserved + 2 * per_profile - 1;
+        run.go(two, hklm, read);
+        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.rows_of("alice\\-") == kCategories.size());
+        CHECK(run.rows_of("bobby\\") == 0);
+        CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category == "microphone"; }) == 1);
+        const auto st = select_status(run.acc, any_denied(run.rows), false);
+        CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(st.provenance.find(std::string{kBudgetExceededToken}) != std::string::npos);
+    }
+    SECTION("a cap the first profile fills EXACTLY still marks the profiles left unread") {
+        run.output.max_bytes = reserved + per_profile;
+        run.go(two, hklm, read);
+        CHECK(run.output.exhausted());
+        CHECK(run.reads == 1); // bobby is never read
+        CHECK(run.rows_of("alice\\-") == kCategories.size());
+        CHECK(run.rows_of("bobby\\") == 0);
+        CHECK(run.markers(kBudgetExceededToken) == 1);
+    }
+    SECTION("filling the cap exactly with nothing left to read is complete, not truncated") {
+        run.output.max_bytes = reserved + per_profile;
+        run.go({profile_of("alice", kSidAlice)}, hklm, read);
+        CHECK(run.markers(kBudgetExceededToken) == 0);
+        CHECK(run.rows_of("alice\\-") == kCategories.size());
+    }
+    SECTION("HKLM is charged first: a profile that fits alone is dropped when HKLM's rows leave no room") {
+        run.output.max_bytes = per_profile;
+        run.go({profile_of("alice", kSidAlice)}, hklm, read);
+        CHECK(run.markers(kBudgetExceededToken) == 1);
+        CHECK(run.rows_of("alice\\-") == 0);
+        // every HKLM row survived, and its Deny is HKLM's own row since no profile carried it
+        CHECK(run.count([](const PermissionRow& r) {
+                  return r.app_id == "-" && r.category == "camera" && r.raw == "Deny";
+              }) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category != "-"; }) ==
+              kCategories.size());
+    }
+}
+
+TEST_CASE("win::assemble_windows_rows: an expired deadline stops the run with one timeout row and "
+          "no later profile is read",
+          "[privacy_permissions][win_parsers]") {
+    AssembledRun run;
+    const std::vector<ProfileInfo> three{profile_of("alice", kSidAlice), profile_of("bobby", kSidBobby),
+                                         profile_of("carol", kSidCarol)};
+
+    SECTION("the deadline passing during the first profile ends the run after it") {
+        run.go(three, hklm_camera_deny(), [&](const ProfileInfo&) {
+            run.budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+            return reachable_allow();
+        });
+        CHECK(run.reads == 1);
+        CHECK(run.rows_of("alice\\-") == kCategories.size()); // what was read is kept
+        CHECK(run.rows_of("bobby\\") == 0);
+        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.markers(kBudgetExceededToken) == 0);
+        const auto st = select_status(run.acc, any_denied(run.rows), false);
+        CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    }
+    SECTION("a deadline already past reads no profile at all, and HKLM's rows still stand") {
+        run.budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
+        CHECK(run.reads == 0);
+        CHECK(run.markers(win::kTimeoutToken) == 1);
+        CHECK(run.count([](const PermissionRow& r) { return r.app_id == "-" && r.category != "-"; }) ==
+              kCategories.size());
+    }
+    SECTION("a run that finishes in time has no timeout row") {
+        run.go(three, hklm_camera_deny(), [](const ProfileInfo&) { return reachable_allow(); });
+        CHECK(run.reads == 3);
+        CHECK(run.markers(win::kTimeoutToken) == 0);
+    }
 }
 
 // ── Linux-specific pure layer (shapes from a real xdg-permission-store, see the header) ─────
