@@ -28,6 +28,17 @@ Modes:
       fragment files. Run by the /release skill before tagging; commit the
       result.
 
+  python3 scripts/assemble-changelog.py promote <X.Y.Z> --append [--date YYYY-MM-DD]
+      For a fix that lands after <X.Y.Z> was already promoted (a release
+      candidate hotfix): append every fragment's bullets to the EXISTING
+      `## [X.Y.Z]` section, each at the end of its ### subsection (a missing
+      subsection is created in canonical order), and DELETE the fragment
+      files. Existing bullets and any non-canonical subsections are left as
+      they are. The header date is kept unless --date is given; pass the
+      final release date when folding fragments in before tagging the final.
+      Refuses if [Unreleased] still holds legacy subsections (run a plain
+      promote of the next version for those).
+
   python3 scripts/assemble-changelog.py --extract <base-ref> --id <PR#>
       Convert a branch that edited CHANGELOG.md directly (e.g. a PR opened
       before the fragment convention): the bullets this branch ADDED to
@@ -423,6 +434,98 @@ def cmd_promote(version: str, date_str: str | None, changelog: Path, fragments_d
     return 0
 
 
+def cmd_promote_append(version: str, date_str: str | None, changelog: Path, fragments_dir: Path) -> int:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        print(f"promote --append: '{version}' is not a base semver (X.Y.Z)", file=sys.stderr)
+        return 2
+    if date_str and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        print(f"promote --append: --date '{date_str}' is not YYYY-MM-DD", file=sys.stderr)
+        return 2
+    errors = check_fragments(fragments_dir)
+    if errors:
+        for e in errors:
+            print(e, file=sys.stderr)
+        print("\npromote --append aborted — fix the fragment lint errors above first.", file=sys.stderr)
+        return 1
+
+    lines = read_text(changelog).split("\n")
+    _, _, _, legacy_sections = parse_unreleased(lines)
+    if any(any(l.strip() for l in body) for _, body in legacy_sections):
+        print("promote --append: [Unreleased] holds legacy subsections; they belong to the next "
+              "version, so --append refuses rather than fold them into an existing release", file=sys.stderr)
+        return 1
+    header_re = re.compile(rf"^## \[{re.escape(version)}\](?P<rest>.*)$")
+    start = next((i for i, l in enumerate(lines) if header_re.match(l)), None)
+    if start is None:
+        print(f"promote --append: CHANGELOG.md has no ## [{version}] section to append to "
+              f"(use a plain `promote {version}` first)", file=sys.stderr)
+        return 1
+    end = next((i for i in range(start + 1, len(lines)) if ANY_VERSION_HEADER_RE.match(lines[i])), len(lines))
+
+    frags = fragment_files(fragments_dir)
+    if not frags:
+        print("promote --append: nothing to append — no fragments in changelog.d/", file=sys.stderr)
+        return 1
+    additions: dict[str, list[str]] = {name: [] for name in CANONICAL_SECTIONS}
+    for path in frags:
+        section = CANONICAL_SECTIONS[SECTION_KEYS.index(FRAGMENT_NAME_RE.match(path.name).group("section"))]
+        additions[section].extend(read_text(path).strip().split("\n"))
+
+    # Split the existing section body into its preamble and ### subsections.
+    body = lines[start + 1:end]
+    preamble: list[str] = []
+    subs: list[tuple[str, list[str]]] = []
+    for line in body:
+        m = SUBSECTION_RE.match(line)
+        if m:
+            subs.append((m.group("name").strip(), []))
+        elif subs:
+            subs[-1][1].append(line)
+        else:
+            preamble.append(line)
+
+    def trimmed(chunk: list[str]) -> list[str]:
+        chunk = list(chunk)
+        while chunk and not chunk[0].strip():
+            chunk.pop(0)
+        while chunk and not chunk[-1].strip():
+            chunk.pop()
+        return chunk
+
+    existing = {name.capitalize(): i for i, (name, _) in enumerate(subs)}
+    for name in CANONICAL_SECTIONS:
+        if not additions[name]:
+            continue
+        if name in existing:
+            i = existing[name]
+            subs[i] = (subs[i][0], trimmed(subs[i][1]) + additions[name])
+        else:
+            # Insert before the first existing canonical subsection that sorts after it.
+            later = [existing[n] for n in CANONICAL_SECTIONS[CANONICAL_SECTIONS.index(name) + 1:] if n in existing]
+            pos = min(later) if later else len(subs)
+            subs.insert(pos, (name, additions[name]))
+            existing = {n.capitalize(): j for j, (n, _) in enumerate(subs)}
+
+    old_header = lines[start]
+    header = f"## [{version}] - {date_str}" if date_str else old_header
+    rebuilt_section: list[str] = [header, ""]
+    pre = trimmed(preamble)
+    if pre:
+        rebuilt_section += pre + [""]
+    for name, chunk in subs:
+        rebuilt_section += [f"### {name}", ""] + trimmed(chunk) + [""]
+    rebuilt = lines[:start] + rebuilt_section + lines[end:]
+    changelog.write_text("\n".join(rebuilt), encoding="utf-8")
+
+    for path in frags:
+        path.unlink()
+        print(f"promote --append: deleted {path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path}")
+    print(f"promote --append: appended {len(frags)} fragment(s) to {header}"
+          + (f" (header was: {old_header})" if header != old_header else ""))
+    print("promote --append: review the diff, then commit CHANGELOG.md and the deleted fragments together.")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--changelog", type=Path, default=REPO_ROOT / "CHANGELOG.md", help=argparse.SUPPRESS)
@@ -434,9 +537,13 @@ def main(argv: list[str]) -> int:
     group.add_argument("promote", nargs="?", metavar="promote", help="'promote' — assemble fragments into a release section")
     parser.add_argument("version", nargs="?", help="X.Y.Z (promote mode)")
     parser.add_argument("--date", help="override release date (YYYY-MM-DD, promote mode)")
+    parser.add_argument("--append", action="store_true",
+                        help="promote mode: append fragments to an EXISTING ## [X.Y.Z] section")
     parser.add_argument("--id", help="PR or issue number for the fragment filename (extract mode)")
     args = parser.parse_args(argv[1:])
 
+    if args.append and args.promote != "promote":
+        parser.error("--append is only valid with promote")
     if args.check:
         return cmd_check(args.fragments_dir)
     if args.guard:
@@ -446,7 +553,9 @@ def main(argv: list[str]) -> int:
             parser.error("--extract requires --id <PR-or-issue-number>")
         return cmd_extract(args.extract, args.id, args.changelog, args.fragments_dir)
     if args.promote != "promote" or not args.version:
-        parser.error("usage: assemble-changelog.py promote <X.Y.Z> [--date YYYY-MM-DD]")
+        parser.error("usage: assemble-changelog.py promote <X.Y.Z> [--append] [--date YYYY-MM-DD]")
+    if args.append:
+        return cmd_promote_append(args.version, args.date, args.changelog, args.fragments_dir)
     return cmd_promote(args.version, args.date, args.changelog, args.fragments_dir)
 
 

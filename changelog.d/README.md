@@ -86,3 +86,21 @@ the restored `CHANGELOG.md`, and push.
 section, resets `[Unreleased]`, and deletes the fragment files; commit the
 result. `scripts/release-preflight.sh` fails if unpromoted fragments remain
 at tag time. The `/release` skill runs this as part of its pre-tag checklist.
+
+### Fixes that land after a version was promoted
+
+A version is promoted at its first release candidate, so a fix that lands on
+`main` for a later candidate (a hotfix) leaves its fragment in `changelog.d/`,
+and a plain `promote X.Y.Z` refuses because the section already exists. Write
+the fragment as usual. Before tagging the final release, fold all such
+fragments into the existing section:
+
+    python3 scripts/assemble-changelog.py promote X.Y.Z --append --date YYYY-MM-DD
+
+Each fragment's bullets are appended to the end of their `###` subsection in
+`## [X.Y.Z]` (a missing subsection is created in canonical order), the
+fragment files are deleted, and the header takes the given date (omit
+`--date` to keep the existing one). Commit the result. It refuses if
+`[Unreleased]` still holds legacy subsections, or if there is nothing to
+append. Fragments for the *next* version must not be on the branch you fold
+from; promote those with a plain `promote` of that version.

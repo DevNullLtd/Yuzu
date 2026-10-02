@@ -2455,6 +2455,14 @@ test('agent installer trust-anchor ACL lint',
 )
 
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
+# Changelog promote --append (#5221): folds post-promotion hotfix fragments
+# into an already-promoted release section. Stdlib only.
+test('changelog promote append',
+  _python3_test,
+  args: [files('test_assemble_changelog_append.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('changelog order',
   _python3_test,
   args: [files('test_changelog_order.py')],
