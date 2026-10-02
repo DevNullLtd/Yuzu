@@ -3190,7 +3190,7 @@ public:
                           "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
                           "failed (pool exhaustion or a failed statement) at a dispatch call "
                           "site, by op (set_agents_targeted|mark_cancelled) and surface "
-                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline — "
+                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
                           "retrying in an already-degraded-store request handler/background "
                           "worker risks doubling request latency or delaying the next tick for "
                           "no reliability gain.",
@@ -3229,11 +3229,11 @@ public:
                           "count for an accepted pass; would_wipe/clock_anomaly/degraded "
                           "increment once per declined/failed pass; capped increments once per "
                           "ACCEPTED pass whose true backlog exceeded the per-pass cap (governance "
-                          "Gate 3 fix, sre) — a sustained non-zero capped rate means the reaper is "
+                          "Gate 3 fix, sre) - a sustained non-zero capped rate means the reaper is "
                           "chronically behind even though it is successfully cancelling every "
                           "pass, same meaning as the gateway-route-reap sibling's ok_capped; "
                           "skipped (governance Gate 3 fix, sre) increments once when another "
-                          "replica already held the advisory lock this tick — routine on a "
+                          "replica already held the advisory lock this tick - routine on a "
                           "multi-replica deployment, same meaning as that sibling's own skipped.",
                           "counter");
         for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
