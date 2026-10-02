@@ -59,16 +59,19 @@ message BatchHeartbeatResponse {
   // than 4096 distinct unknown ids were seen, unknown_session_ids_truncated is
   // set and the listed subset is arbitrary (not sorted, no fairness); an
   // omitted id is typically reported again when that agent next heartbeats,
-  // though that is not guaranteed under sustained flooding with junk ids. An
-  // empty list means nothing the server asks the gateway to replay, NOT that
-  // nothing is wrong: a server that predates these fields is indistinguishable
-  // from one with nothing unknown (no presence marker by design). The list is
-  // an advisory snapshot and may be stale: a listed id may have registered or
-  // been disconnected since, so a consumer must not treat it as "session is
-  // dead". Re-registering a stale id installs a new session and can revoke the
-  // agent's device tokens, so verify the session locally before acting. Read
-  // the fields with defaults (the generated decoder fills [] and false); an
-  // absent field means nothing to replay. Field 4 is intentionally unused.
+  // though that is not guaranteed when a batch carries a very large number of
+  // distinct unknown ids (only 4096 are listed per response, an arbitrary
+  // subset). An empty list means nothing the server asks the gateway to
+  // replay, NOT that nothing is wrong: a server that predates these fields is
+  // indistinguishable from one with nothing unknown (no presence marker by
+  // design). The list is an advisory snapshot and may be stale: a listed id
+  // may have registered or been disconnected since, so a consumer must not
+  // treat it as "session is dead". Registering a stale id installs a fresh
+  // session for that agent (its current placement is lost until it
+  // re-announces) and re-runs the registration side effects, so verify the
+  // session locally before acting. Read the fields with defaults (the
+  // generated decoder fills [] and false); an absent field means nothing to
+  // replay. Field 4 is intentionally unused.
   repeated string unknown_session_ids = 2;
   bool unknown_session_ids_truncated = 3;
 }

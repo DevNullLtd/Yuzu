@@ -1143,8 +1143,9 @@ correct action in both cases is today's behaviour (no replay).
   bytes each); past that `unknown_session_ids_truncated` is set and one warn names listed/total. The
   listed subset is unordered-set order, deliberately not sorted, so an omitted id is typically reported
   again when that agent next heartbeats (30 s by default), not on the next gateway flush; that is not
-  guaranteed under truncation when many junk ids are sent (one agent can queue many distinct junk ids
-  because the gateway forwards agent heartbeats verbatim). The 64-byte per-id cap
+  guaranteed when a batch carries a very large number of distinct unknown ids (only 4096 are listed per
+  response, an arbitrary subset; the gateway forwards agent heartbeats verbatim, so one agent can
+  contribute many ids). The 64-byte per-id cap
   (`kMaxGatewaySessionIdLen`) is applied only AFTER the `gateway_sessions_` lookup misses: a
   reclaim-absent `ProxyRegister` adopts a gateway-presented id of any length, so capping first would
   silently stop ingesting a known session. An empty unknown id is skipped; an over-length unknown id is

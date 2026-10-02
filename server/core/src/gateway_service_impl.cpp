@@ -170,7 +170,7 @@ void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op
     if (op == "batch_heartbeat" && outcome == "malformed_session_id") {
         // No store write is attempted for this outcome, so the guard-rejection
         // wording below would mislead. The offending id is deliberately not
-        // logged (it is untrusted and unbounded in content).
+        // logged (it is externally supplied and unbounded in content).
         spdlog::warn("[gateway] BatchHeartbeat: {} entries carried an over-length session_id "
                      "this replica does not hold (outcome={}); no write was attempted. Likely a "
                      "buggy gateway or an agent sending a malformed session_id",
@@ -1313,8 +1313,8 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // wired (it reflects only this replica's in-memory gateway_sessions_).
     // The listed subset under truncation is arbitrary (unordered_set order,
     // deliberately not sorted); omitted ids are typically reported again when
-    // those agents next heartbeat (not guaranteed under junk-id flooding). No
-    // presence marker by design.
+    // those agents next heartbeat (not guaranteed when a batch carries a very
+    // large number of distinct unknown ids). No presence marker by design.
     if (!unknown_ids.empty()) {
         const auto total = unknown_ids.size();
         const auto cap = static_cast<std::size_t>(kMaxUnknownSessionIdsPerResponse);
