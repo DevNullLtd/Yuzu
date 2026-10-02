@@ -159,8 +159,26 @@ Service name `YuzuAgent`.
 If a silent install exits with code **7** and its `/LOG=` log says "The update
 trust-anchor directory is not secured", the installer refused to continue
 because it could not confirm that only Administrators and SYSTEM can write
-`%ProgramData%\Yuzu\agent-certs`. The lines after it give the directory and
-then the reason. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+`%ProgramData%\Yuzu\agent-certs`, and that both have full control of it and of
+everything in it. The lines after it give the directory and then the reason.
+The installer refuses when the directory, or anything in it, is a junction,
+symbolic link, subdirectory or hard link; when the directory already existed but
+was not secured; or when a file in it is not owned by Administrators or SYSTEM.
+It never takes such a directory or file over. Remove a junction or directory link
+with `cmd /c rmdir "<path>"` and a file link with `cmd /c del "<path>"` (each
+removes the link, never its target; not `Remove-Item -Recurse`, which in Windows
+PowerShell 5.1 deletes a junction target's contents). For an unsecured directory,
+move any bundle you placed there yourself somewhere safe, delete the directory,
+run the installer again, then copy the bundle back in as an administrator. For a
+file refused because of its owner: inspect it, and if it is yours, run
+`icacls "<file>" /setowner *S-1-5-32-544 /L`. A fresh install also refuses if
+the installing account's TEMP folder is on another drive: set TEMP and TMP to a
+folder on the system drive, or install as SYSTEM. The
+check runs before the agent service is stopped, so the service is left as it was. Installers from
+0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
+Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules
+for an install run by an administrator rather than as SYSTEM (#5196): use a
+later installer. Installers from 0.14.0-rc1 to rc3 also hit this when started from
 PowerShell 7 through another process (#5176): run them from a new
 `powershell.exe` or `cmd.exe` window that was not itself started from
 PowerShell 7, or use a later installer.
