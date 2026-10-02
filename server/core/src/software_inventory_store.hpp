@@ -50,9 +50,9 @@ class PgPool;
 namespace yuzu::server {
 
 /// One installed-software entry. **Machine-scope collection only** (see
-/// ADR-0016 §8): no per-user rows and no username/SID fields. `install_location`
-/// is a machine-scope path; it can carry an account segment when a machine-wide
-/// installer placed it there.
+/// ADR-0016 §8): no per-user rows and no username/SID fields. The wire tail's
+/// `install_location` and `uninstall_string` slots (13-14) are reserved: the server
+/// neither stores nor hashes them until §8 is re-opened for them (#5186).
 ///
 /// Blob contract v2 + extended tail: member order == the wire/hash field order (append-only —
 /// the canonical hash walks this exact sequence; the agent's blob builder walks
@@ -75,10 +75,9 @@ struct SoftwareEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
-    // Extended tail: these four enter the canonical hash ONLY when at least one
-    // is non-empty — a v2 agent's 12-field bytes are unchanged.
-    std::string install_location;
-    std::string uninstall_string;
+    // Extended tail (wire slots 15-16; 13-14 are reserved and have no member): enters the
+    // canonical hash ONLY when package_id or source is non-empty — a v2 agent's 12-field
+    // bytes are unchanged.
     std::string package_id;
     std::string source; // <plugin>.<action> that produced the row
 };

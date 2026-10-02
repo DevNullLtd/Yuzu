@@ -161,23 +161,23 @@ SoftwareEntry full_v2_entry() {
     return e;
 }
 
-// full_v2_entry() plus the four extended-tail fields.
+// full_v2_entry() plus the stored extended-tail fields. Wire slots 13-14 (install_location,
+// uninstall_string) are reserved and have no member: the server never stores or hashes them.
 SoftwareEntry full_extended_entry() {
     SoftwareEntry e = full_v2_entry();
-    e.install_location = "/usr/bin";
-    e.uninstall_string = "rpm -e bash";
     e.package_id = "bash-5.2.21-3.fc40.x86_64";
     e.source = "installed_apps.list_inventory";
     return e;
 }
 
 // Wire record of the first n fields (12 = v2, 16 = extended): 0x1F-separated, 0x1E-terminated.
+// Slots 13-14 are written empty (reserved).
 std::string wire_record(const SoftwareEntry& e, std::size_t n) {
+    static const std::string reserved;
     const std::string* f[] = {
-        &e.name,           &e.version,          &e.publisher,      &e.install_date,
-        &e.kind,           &e.ecosystem,        &e.epoch,          &e.release,
-        &e.arch,           &e.signature_status, &e.distro_id,      &e.distro_version,
-        &e.install_location, &e.uninstall_string, &e.package_id,   &e.source};
+        &e.name,   &e.version,          &e.publisher, &e.install_date, &e.kind,      &e.ecosystem,
+        &e.epoch,  &e.release,          &e.arch,      &e.signature_status, &e.distro_id,
+        &e.distro_version, &reserved,   &reserved,    &e.package_id,   &e.source};
     std::string out;
     for (std::size_t i = 0; i < n; ++i) {
         if (i)
@@ -187,15 +187,24 @@ std::string wire_record(const SoftwareEntry& e, std::size_t n) {
     return out + '\x1e';
 }
 
-// SERVER CONTRACT PIN (16 fields). sha256 of wire_record(full_extended_entry(), 16) bytes:
-//   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037/usr/bin\037rpm -e bash\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
+// A 16-field wire record carrying real values in the reserved slots 13-14.
+std::string wire_record_reserved(const SoftwareEntry& e, const std::string& install_location,
+                                 const std::string& uninstall_string) {
+    std::string r = wire_record(e, 12);
+    r.pop_back(); // the 0x1E terminator
+    return r + '\x1f' + install_location + '\x1f' + uninstall_string + '\x1f' + e.package_id +
+           '\x1f' + e.source + '\x1e';
+}
+
+// SERVER CONTRACT PIN (16 fields, slots 13-14 empty). sha256 of wire_record(full_extended_entry(), 16) bytes:
+//   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037\037\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
 // The agent builder (installed_software_canonical_blob) still emits 12 fields until
 // the agent-side update; that update copies this constant and these fixture bytes into
 // tests/unit/test_inventory_sync.cpp, making it the cross-side pin exactly as
 // kCrossPinHash is today. Until then this proves only that the server hashes stored
 // 16-field rows to the raw blob bytes.
 constexpr const char* kCrossPinHashExtended =
-    "51f283237a7cdbb5e25125322de364ddc65c1b58f88c64f93a9e291276c9a7cf";
+    "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
 
 // Ascending tail-order pin: full_extended_entry() and a copy whose source is
 // "installed_apps.list_apps" (sorts first), hashed as the two 16-field records in that
@@ -203,13 +212,25 @@ constexpr const char* kCrossPinHashExtended =
 // distinctness checks in the hash test prove the other three arms. Recipe as above, two records:
 //   printf '<b: fields 1-15 as above>\037installed_apps.list_apps\036<a: as above>' | shasum -a 256
 constexpr const char* kTailOrderPinHash =
-    "962f1746ef1e188a7a237b25c921475f85b6197946049082fb45bfd2fdafb33f";
+    "ab2abf993a2b0868b9c69397497799920773fd44c29cde86380e8c4369ccbe8d";
 
 // sha256 of the mixed-shape blob built in the mixed-shape test below (12-field
 // "alpha", 16-field full_extended_entry "bash", 16-field source-only "zed"), computed
 // over the raw wire bytes.
 constexpr const char* kMixedBlobHash =
-    "969bb17474bd55c78199c8739dbd439f7412b956233d05d02ce952aa6dc26b9b";
+    "7b37bca935f3ae92a042949ef4280d69b25edc8ee6e518f993ded0eeec7e76f3";
+
+// sha256 of the raw wire bytes a NEWER agent would claim for a 17-field record: the 16-field
+// full_extended_entry() record with a 17th token "ignored" before the terminator. The server
+// drops the 17th token, so its re-hash differs: a bounded need_full per cycle (ADR-0016's
+// inherited mixed-version trait), never an error loop.
+constexpr const char* kSeventeenFieldHash =
+    "f4a4c78f6118451baca197fb103c1765cf17417429916d0f8a26a45c76082aca";
+
+// sha256 of wire_record_reserved(full_extended_entry(), "/Users/alice/Applications/Bash",
+// "bash --uninstall --key=ABC123"): what an agent that fills slots 13-14 would claim.
+constexpr const char* kReservedValuesHash =
+    "5b66424c685875906e1a9b214bcb5678af4abed07ae3191a3736edc6c008c11f";
 } // namespace
 
 TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
@@ -232,9 +253,10 @@ TEST_CASE("server contract pin: 16-field canonical_hash equals kCrossPinHashExte
           kCrossPinHashExtended);
 }
 
-TEST_CASE("hash tail rule: fields 13-16 enter the hash only when one is non-empty",
+TEST_CASE("hash tail rule: the tail enters the hash only when package_id or source is non-empty",
           "[software_inventory][hash][extended_row]") {
-    // Same set as the kCrossPinHash case, tail fields all empty: bytes unchanged.
+    // Same set as the kCrossPinHash case, tail fields all empty: bytes unchanged. Slots
+    // 13-14 are reserved and not stored, so only package_id and source can open the tail.
     const std::vector<SoftwareEntry> v2 = {
         {"Zeta", "9", "", ""},
         full_v2_entry(),
@@ -242,36 +264,25 @@ TEST_CASE("hash tail rule: fields 13-16 enter the hash only when one is non-empt
     };
     CHECK(SoftwareInventoryStore::canonical_hash(v2) == kCrossPinHash);
 
-    // Source-only tail changes the hash (all four tail fields written, three empty).
+    // Source-only tail changes the hash (all four tail slots written, three empty).
     auto with_source = v2;
     with_source[0].source = "installed_apps.list_apps";
     CHECK(SoftwareInventoryStore::canonical_hash(with_source) != kCrossPinHash);
 
-    // Each tail field ALONE (others empty) must also enter the hash: pins every arm of
-    // the "any tail field non-empty" condition, not just source.
-    auto only_loc = v2;
-    only_loc[0].install_location = "/opt/x";
-    auto only_uninst = v2;
-    only_uninst[0].uninstall_string = "rm x";
+    // package_id ALONE (source empty) must also enter the hash: pins both arms of the
+    // "package_id or source non-empty" condition, not just source.
     auto only_pkg = v2;
     only_pkg[0].package_id = "x-1";
-    const auto h_loc = SoftwareInventoryStore::canonical_hash(only_loc);
-    const auto h_uninst = SoftwareInventoryStore::canonical_hash(only_uninst);
     const auto h_pkg = SoftwareInventoryStore::canonical_hash(only_pkg);
-    CHECK(h_loc != kCrossPinHash);
-    CHECK(h_uninst != kCrossPinHash);
     CHECK(h_pkg != kCrossPinHash);
-    CHECK(h_loc != h_uninst);
-    CHECK(h_loc != h_pkg);
-    CHECK(h_uninst != h_pkg);
+    CHECK(h_pkg != SoftwareInventoryStore::canonical_hash(with_source));
 
-    // Rows differing ONLY in one tail field are distinct (entry_equal) and order
+    // Rows differing ONLY in one stored tail field are distinct (entry_equal) and order
     // deterministically (entry_less): for every tail field, {b, a} neither collapses to
     // {a} nor hashes differently from {a, b}.
     const SoftwareEntry base = full_extended_entry();
     const auto one = SoftwareInventoryStore::canonical_hash({base});
-    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::uninstall_string,
-                       &SoftwareEntry::package_id, &SoftwareEntry::source}) {
+    for (auto field : {&SoftwareEntry::package_id, &SoftwareEntry::source}) {
         SoftwareEntry other = base;
         other.*field = "zz-different";
         CHECK(SoftwareInventoryStore::canonical_hash({other, base}) != one);
@@ -573,7 +584,7 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
     CHECK((*got)[0].distro_version.empty());
 }
 
-TEST_CASE("blob contract extended tail: 12-field blob ingests with fields 13-16 empty",
+TEST_CASE("blob contract extended tail: 12-field blob ingests with the tail fields empty",
           "[pg][software_inventory][extended_row]") {
     SWINV_SHARED(store, pool);
     const SoftwareEntry e = full_v2_entry();
@@ -588,8 +599,6 @@ TEST_CASE("blob contract extended tail: 12-field blob ingests with fields 13-16 
     REQUIRE(got.has_value());
     REQUIRE(got->size() == 1);
     CHECK((*got)[0].distro_version == "40");
-    CHECK((*got)[0].install_location.empty());
-    CHECK((*got)[0].uninstall_string.empty());
     CHECK((*got)[0].package_id.empty());
     CHECK((*got)[0].source.empty());
 
@@ -616,8 +625,6 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     auto got = store.get_agent_software("agent-e16");
     REQUIRE(got.has_value());
     REQUIRE(got->size() == 1);
-    CHECK((*got)[0].install_location == "/usr/bin");
-    CHECK((*got)[0].uninstall_string == "rpm -e bash");
     CHECK((*got)[0].package_id == "bash-5.2.21-3.fc40.x86_64");
     CHECK((*got)[0].source == "installed_apps.list_inventory");
 
@@ -626,8 +633,6 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     auto fl = store.query_software(q);
     REQUIRE(fl.has_value());
     REQUIRE(fl->size() == 1);
-    CHECK((*fl)[0].entry.install_location == "/usr/bin");
-    CHECK((*fl)[0].entry.uninstall_string == "rpm -e bash");
     CHECK((*fl)[0].entry.package_id == "bash-5.2.21-3.fc40.x86_64");
     CHECK((*fl)[0].entry.source == "installed_apps.list_inventory");
     CHECK((*fl)[0].install_id >= 1);
@@ -641,7 +646,8 @@ TEST_CASE("blob contract extended tail: 16-field blob ingests and hydrates on bo
     CHECK(ack2.need_full_size() == 0);
 }
 
-TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields survive",
+TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields survive; a newer "
+          "agent's 17-field hash degrades to need_full",
           "[pg][software_inventory][extended_row]") {
     // parse_software_blob lives in an anonymous namespace, so this goes through the
     // ingest seam: a future 17-field row from a newer agent must not break this server.
@@ -651,8 +657,10 @@ TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields s
         r.insert(r.size() - 1, "\x1f" "ignored");
         return r;
     }();
+    // The newer agent claims the hash of ALL 17 fields (kSeventeenFieldHash), not the
+    // server's 16-field form. A full payload stores regardless of the claimed hash.
     agentpb::InventoryReport rep;
-    (*rep.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    (*rep.mutable_content_hashes())["installed_software"] = kSeventeenFieldHash;
     (*rep.mutable_plugin_data())["installed_software"] = rec17;
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-e17", rep, ack);
@@ -660,12 +668,88 @@ TEST_CASE("blob contract extended tail: a 17th token is dropped, the 16 fields s
     auto got = store.get_agent_software("agent-e17");
     REQUIRE(got.has_value());
     REQUIRE(got->size() == 1);
-    CHECK((*got)[0].install_location == "/usr/bin");
-    CHECK((*got)[0].uninstall_string == "rpm -e bash");
     CHECK((*got)[0].package_id == "bash-5.2.21-3.fc40.x86_64");
     CHECK((*got)[0].source == "installed_apps.list_inventory");
     CHECK(SoftwareInventoryStore::canonical_hash(*got) ==
           SoftwareInventoryStore::canonical_hash({full_extended_entry()}));
+
+    // Bounded mixed-version degradation, pinned so it stays a property: the stored hash is
+    // the server's 16-field recompute, so the 17-field claim never matches and every
+    // hash-only report is answered need_full (about one extra full report per cycle until
+    // the server learns the 17th field). Never an error loop, never corruption.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kSeventeenFieldHash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-e17", ping, ack2);
+    REQUIRE(ack2.need_full_size() == 1);
+    CHECK(ack2.need_full(0) == "installed_software");
+
+    // A hash-only claim of the 16-field form is accepted (touched).
+    agentpb::InventoryReport ping16;
+    (*ping16.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack3;
+    yuzu::server::ingest_inventory_report(store, "agent-e17", ping16, ack3);
+    CHECK(ack3.need_full_size() == 0);
+}
+
+TEST_CASE("blob contract extended tail: slots 13-14 are parsed but neither stored nor hashed",
+          "[pg][software_inventory][extended_row]") {
+    // ADR-0016 section 8 has not been re-opened for install_location / uninstall_string
+    // (#5186), so a value an agent sends in those slots must not reach the database or the
+    // hash. An agent that does fill them gets need_full until the server accepts them.
+    SWINV_SHARED(store, pool);
+    const SoftwareEntry e = full_extended_entry();
+    const std::string path = "/Users/alice/Applications/Bash";
+    const std::string cmd = "bash --uninstall --key=ABC123";
+    agentpb::InventoryReport rep;
+    (*rep.mutable_content_hashes())["installed_software"] = kReservedValuesHash;
+    (*rep.mutable_plugin_data())["installed_software"] = wire_record_reserved(e, path, cmd);
+    agentpb::InventoryAck ack;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", rep, ack);
+    CHECK(ack.need_full_size() == 0);
+
+    // The row stores with the later slots intact, and its re-hash is the reserved-empty form.
+    auto got = store.get_agent_software("agent-reserved");
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 1);
+    CHECK((*got)[0].package_id == e.package_id);
+    CHECK((*got)[0].source == e.source);
+    CHECK(SoftwareInventoryStore::canonical_hash(*got) == kCrossPinHashExtended);
+
+    // No value reaches storage: the schema has no such columns, and no stored text holds them.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult cols = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema = 'software_inventory_store' "
+            "AND column_name IN ('install_location', 'uninstall_string')",
+            std::vector<std::string>{});
+        REQUIRE(cols.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "0");
+        pg::PgResult leak = pg::exec_params(
+            lease.get(),
+            "SELECT count(*) FROM software_inventory_store.installed_software t "
+            "WHERE t::text LIKE '%alice%' OR t::text LIKE '%ABC123%'",
+            std::vector<std::string>{});
+        REQUIRE(leak.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(leak.get(), 0, 0)) == "0");
+    }
+
+    // Bounded degradation: the agent's claim includes the values, the server's does not.
+    agentpb::InventoryReport ping;
+    (*ping.mutable_content_hashes())["installed_software"] = kReservedValuesHash;
+    agentpb::InventoryAck ack2;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", ping, ack2);
+    REQUIRE(ack2.need_full_size() == 1);
+    CHECK(ack2.need_full(0) == "installed_software");
+    // ...while a claim of the reserved-empty form is a touch.
+    agentpb::InventoryReport ping_empty;
+    (*ping_empty.mutable_content_hashes())["installed_software"] = kCrossPinHashExtended;
+    agentpb::InventoryAck ack3;
+    yuzu::server::ingest_inventory_report(store, "agent-reserved", ping_empty, ack3);
+    CHECK(ack3.need_full_size() == 0);
 }
 
 TEST_CASE("blob contract extended tail: mixed 12/16-field records in one blob re-hash to the raw "
@@ -867,7 +951,6 @@ TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-
         pg::PgResult drop = pg::exec_params(
             lease.get(),
             "ALTER TABLE software_inventory_store.installed_software "
-            "DROP COLUMN install_location, DROP COLUMN uninstall_string, "
             "DROP COLUMN package_id, DROP COLUMN source, DROP COLUMN install_id",
             std::vector<std::string>{});
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
@@ -889,8 +972,6 @@ TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     CHECK((*rows)[0].entry.name == "OldApp");
-    CHECK((*rows)[0].entry.install_location.empty());
-    CHECK((*rows)[0].entry.uninstall_string.empty());
     CHECK((*rows)[0].entry.package_id.empty());
     CHECK((*rows)[0].entry.source.empty());
     CHECK((*rows)[0].install_id >= 1);
