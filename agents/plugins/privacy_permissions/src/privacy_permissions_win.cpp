@@ -21,7 +21,7 @@
  * is a reparse point (no hop follows a junction/symlink), and the NTUSER.DAT leaf is checked from
  * its own handle (not a reparse point, a regular disk file, owner = the profile / LocalSystem /
  * Administrators, final path == requested path, size cap) and the `<leaf>*` transaction-log
- * sidecars beside it (the kernel follows a planted link there, as SYSTEM) are refused if a
+ * sidecars beside it (a link there would be followed by the load) are refused if a
  * reparse point or hard-linked, or if there are more than 64. RegLoadKeyW is path-based, so the same
  * file identity is re-verified after the load and a mismatch is unloaded unread
  * (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in that
@@ -499,7 +499,7 @@ struct HiveFileGuard {
 
     /// Fills the sidecar facts from the `<leaf>*` entries of `dir` (the kernel's transaction-log
     /// sidecars: `<hive>.LOG1`, `<hive>{guid}.TM.blf`, ...; RegLoadKeyW opens or creates them
-    /// following any link, so a planted symlink is a SYSTEM-privileged create/write primitive).
+    /// following any link, so a link there is not safe to follow for a SYSTEM caller).
     /// A reparse point is read from the find data (no open); a hard link needs an attribute-only
     /// open. A sidecar that does not exist is fine. "" or a token.
     std::string read_sidecars(const std::wstring& dir, const std::wstring& leaf,
