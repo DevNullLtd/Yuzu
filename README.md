@@ -180,6 +180,8 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 - **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
   [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
   recipe, or run `bash scripts/setup-rhel9.sh`.
+  The 0.14.0 release packages do not run there either; see the native-package
+  floor under *Supported Platforms* in [`docs/user-manual/README.md`](docs/user-manual/README.md).
 
 ### Quick Start
 
