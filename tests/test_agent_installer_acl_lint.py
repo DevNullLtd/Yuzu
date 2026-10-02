@@ -14,11 +14,15 @@ What they pin, each verified on Windows Server 2022:
   was also the #5196 bug: (OI)(CI) is invalid on a file, and `icacls /T` gave
   every existing file an empty protected DACL, locking SYSTEM out of the
   operator's update-trust-bundle.pem while reporting success.
-- The directory may hold only files: the installer refuses a reparse point at
-  the root BEFORE its first command, and refuses a link or subdirectory inside
-  it AFTER the directory-level lock and BEFORE the file-level steps; the
-  verification script and the manual check the reparse (1024) and directory
-  (16) attributes and never use -Recurse.
+- The installer never takes over a directory it did not secure: a reparse
+  point at the root is refused BEFORE its first command, and an existing
+  directory must already pass the root-only check BEFORE ForceDirectories /
+  the lock. After the directory-level lock, a fail-closed root-only check must
+  pass BEFORE the contents check, and the contents check (only plain files; a
+  newly created directory empty) BEFORE the file-level steps. The verification
+  script and the manual check the reparse (1024) and directory (16) attributes
+  and never use -Recurse; the manual is one `& { }` block that throws at its
+  checks, so a failed check (or a broken paste) runs nothing after it.
 - The verification script must make no .NET method or static call. Under WDAC /
   AppLocker, PowerShell runs in Constrained Language Mode, which refuses them,
   and the rc1..rc5 check (GetOwner/Translate) aborted every install there.
@@ -100,12 +104,18 @@ def grant_exec_args(iss: str) -> str:
 
 
 def manual_block(md: str) -> str:
-    a = md.index('$d = "C:\\ProgramData\\Yuzu\\agent-certs"\nmkdir')
+    a = md.index("& {\n    $ErrorActionPreference = 'Stop'\n    $d = 'C:\\ProgramData\\Yuzu\\agent-certs'")
     return md[a:md.index("```", a)]
 
 
 def manual_commands(md: str, tool: str) -> list:
-    lines = [l for l in manual_block(md).splitlines() if l.startswith(tool + " ")]
+    lines = []
+    for l in manual_block(md).splitlines():
+        l = re.sub(r"^\s*if \([^)]*\) \{", "", l)
+        for part in l.split(";"):
+            part = part.strip().rstrip("}").strip()
+            if part.startswith(tool + " "):
+                lines.append(part)
     if not lines:
         raise AssertionError(f"no {tool} line in the manual procedure")
     return lines
@@ -151,11 +161,18 @@ def problems(iss: str, md: str) -> list:
     root_check = body.find("IsReparsePoint(CertDir")
     if root_check < 0 or root_check > first_exec:
         found.append("the root reparse-point check does not run before the first command")
+    create = body.index("ForceDirectories(CertDir)")
+    pre_gate = body.find("RunAclCheck(CertDir, True)")
+    if pre_gate < 0 or pre_gate > create:
+        found.append("an existing directory is not required to be secured before it is used")
     grant_at = body.index("/inheritance:r /grant:r")
+    post_gate = body.find("RunAclCheck(CertDir, True)", grant_at)
+    contents = body.find("NotFilesOnly(CertDir, not Existed)")
     files_step = body.index("CertDir + '\\*\" /A'")
-    must_list = body.find("NotFilesOnly(CertDir, True)")
-    if not (grant_at < must_list < files_step):
-        found.append("the fail-closed files-only check does not sit between the directory lock and the file-level steps")
+    if not (grant_at < post_gate < contents < files_step):
+        found.append("the lock gate and the contents check do not sit, in that order, between the directory lock and the file-level steps")
+    if "RunAclCheck(CertDir, False)" not in body[files_step:]:
+        found.append("the full check does not run after the file-level steps")
     script = pascal_script(iss)
     if '"' in script:
         found.append("Script contains a double quote")
@@ -179,6 +196,16 @@ def problems(iss: str, md: str) -> list:
     code = [l for l in manual_block(md).splitlines() if not l.lstrip().startswith("#")]
     if any("-Recurse" in l for l in code):
         found.append("manual procedure uses -Recurse")
+    block = manual_block(md)
+    lock_fn = block[block.index("function Test-Locked"):block.index("# 1. An existing directory")]
+    if "($s -match 'D:P[A-Z]*" + ROOT_ACES + "') -and ($Matches[1] -ne $Matches[2])" not in lock_fn or "-band 1024" not in lock_fn:
+        found.append("manual Test-Locked no longer checks the exact root ACE set and the reparse attribute")
+    for needle, why in (("if ($existed -and -not (Test-Locked)) { throw", "refusal of an existing unsecured directory"),
+                        ("if (-not (Test-Locked)) { throw", "lock gate"),
+                        ("if ($bad) { throw", "files-only check"),
+                        ("if (-not $existed -and $c) { throw", "new-directory-empty check")):
+        if needle not in manual_block(md):
+            found.append(f"manual procedure lost its {why}")
     verify = manual_verify(md)
     for needle, why in (("($i.Attributes -band 1024) -ne 0", "reparse-point check"),
                         ("($i.Attributes -band 16) -ne 0", "subdirectory check"),
@@ -219,16 +246,21 @@ class InstallerAclLint(unittest.TestCase):
                             "'$env:PSModulePath=[Environment]::GetEnvironmentVariable(''X'');'"),
             "root ACEs loosened": ("iss", "'^\\(A;OICI;FA;;;(SY|BA)\\)\\(A;OICI;FA;;;(SY|BA)\\)$'",
                                    "'^\\(A;OICI;FA;;;(SY|BA)\\)'"),
-            "manual verify drifted": ("md", "($Matches[1] -ne $Matches[2])", "($true)"),
+            "manual verify drifted": ("md", "-and ($s -match $e) -and ($Matches[1] -ne $Matches[2])", "-and ($s -match $e) -and ($true)"),
+            "manual lock test loosened": ("md", "($s -match 'D:P[A-Z]*\\(A;OICI;FA;;;(SY|BA)\\)\\(A;OICI;FA;;;(SY|BA)\\)$') -and ($Matches[1] -ne $Matches[2])", "($s -match 'D:P') -and ($Matches[1] -ne $Matches[2])"),
             "installer takeown /R": ("iss", "'/F \"' + CertDir + '\" /A'", "'/F \"' + CertDir + '\" /A /R /D Y'"),
+            "existing directory not checked": ("iss", "      Reason := RunAclCheck(CertDir, True);\n", "      Reason := '';\n"),
+            "lock gate dropped": ("iss", "\n  Reason := RunAclCheck(CertDir, True);", "\n  Reason := '';"),
+            "manual stops throwing": ("md", "if ($bad) { throw", "if ($bad) { Write-Output"),
+            "new directory not required empty": ("md", "if (-not $existed -and $c) { throw", "if ($false) { throw"),
             "installer reset /T": ("iss", "'\"' + CertDir + '\" /reset /L /C /Q'", "'\"' + CertDir + '\" /reset /T /L /C /Q'"),
             "installer icacls without /L": ("iss", "'\"' + CertDir + '\\*\" /reset /L /C /Q'", "'\"' + CertDir + '\\*\" /reset /C /Q'"),
-            "manual takeown /R": ("md", 'takeown /F "C:\\ProgramData\\Yuzu\\agent-certs" /A\n', 'takeown /F "C:\\ProgramData\\Yuzu\\agent-certs" /A /R /D Y\n'),
-            "manual icacls without /L": ("md", 'icacls "C:\\ProgramData\\Yuzu\\agent-certs" /reset /L /C /Q', 'icacls "C:\\ProgramData\\Yuzu\\agent-certs" /reset /C /Q'),
+            "manual takeown /R": ("md", "takeown /F $d /A | Out-Null", "takeown /F $d /A /R /D Y | Out-Null"),
+            "manual icacls without /L": ("md", "icacls $d /reset /L /C /Q", "icacls $d /reset /C /Q"),
             "Script recurses": ("iss", "@(Get-ChildItem -LiteralPath $d -Force)", "@(Get-ChildItem -LiteralPath $d -Recurse -Force)"),
             "Script root reparse check dropped": ("iss", "'if(($r.Attributes -band 1024) -ne 0){Fail ''it is a junction or symbolic link, not a directory''};' +", "'' +"),
-            "root check after first command": ("iss", "  if IsReparsePoint(CertDir, Found) or not Found then", "  if False then"),
-            "fail-closed listing dropped": ("iss", "  Reason := NotFilesOnly(CertDir, True);", "  Reason := '';"),
+            "root check after first command": ("iss", "  if IsReparsePoint(CertDir, Found) then", "  if False then"),
+            "contents check dropped": ("iss", "  Reason := NotFilesOnly(CertDir, not Existed);", "  Reason := '';"),
             "manual verify reparse check dropped": ("md", "if ((($i.Attributes -band 1024) -ne 0) -or", "if ((0 -ne 0) -or"),
             "PsLit U+2019 dropped": ("iss", " or (S[I] = #$2019)", ""),
             "PsLit ASCII quote dropped": ("iss", "if (S[I] = '''') or ", "if "),
