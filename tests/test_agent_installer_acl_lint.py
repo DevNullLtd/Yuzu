@@ -135,7 +135,8 @@ def pslit_body(iss: str) -> str:
 
 def problems(iss: str, md: str) -> list:
     found = []
-    if exec_args(iss, "takeown"):
+    code = re.sub(r"\{[^}]*\}|\(\*.*?\*\)|//[^\n]*|^;[^\n]*", "", iss, flags=re.S | re.M)
+    if re.search(r"(?i)takeown", code) or re.search(r"(?i)takeown", pascal_script(iss)):
         found.append("the installer runs takeown, which has no /L and may act on a link's target")
     if not any("Stage" in a and "/setowner *S-1-5-32-544" in a for a in exec_args(iss, "icacls")):
         found.append("the installer no longer sets the new directory's owner with icacls /setowner")

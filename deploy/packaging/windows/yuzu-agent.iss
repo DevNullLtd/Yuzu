@@ -592,7 +592,7 @@ begin
       'if($m -eq ''files''){' +
         'foreach($i in $c){' +
           'try{$s=[string](Get-Acl -LiteralPath $i.FullName).Sddl}catch{Fail (''the permissions could not be read on '' + $i.FullName)};' +
-          'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it contains a file not owned by Administrators or SYSTEM, so not one an administrator placed there: '' + $i.FullName + '' '' + $s)}' +
+          'if($s -notmatch ''^O:(BA|SY)G:''){Fail (''it contains a file not owned by Administrators or SYSTEM, so it cannot be confirmed that an administrator placed it (inspect it; if it is yours, make Administrators its owner with icacls <file> /setowner *S-1-5-32-544 /L): '' + $i.FullName + '' '' + $s)}' +
         '};' +
         'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;exit 0' +
       '}' +
@@ -797,7 +797,9 @@ begin
     begin
       Result := NotSecuredMessage(CertDir,
         'the prepared directory could not be moved into place (something else ' +
-        'already holds the name, or the temporary folder is on another volume)', True);
+        'already holds the name, or the temporary folder is on another drive). If ' +
+        'TEMP is on another drive, set TEMP and TMP to a folder on the system drive, ' +
+        'or run the installer as SYSTEM, then run it again', True);
       Exit;
     end;
     { 5. In place: still not a link, still exactly locked, still empty. }

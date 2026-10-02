@@ -169,7 +169,11 @@ with `cmd /c rmdir "<path>"` and a file link with `cmd /c del "<path>"` (each
 removes the link, never its target; not `Remove-Item -Recurse`, which in Windows
 PowerShell 5.1 deletes a junction target's contents). For an unsecured directory,
 move any bundle you placed there yourself somewhere safe, delete the directory,
-run the installer again, then copy the bundle back in as an administrator. The
+run the installer again, then copy the bundle back in as an administrator. For a
+file refused because of its owner: inspect it, and if it is yours, run
+`icacls "<file>" /setowner *S-1-5-32-544 /L`. A fresh install also refuses if
+the installing account's TEMP folder is on another drive: set TEMP and TMP to a
+folder on the system drive, or install as SYSTEM. The
 check runs before the agent service is stopped, so the service is left as it was. Installers from
 0.14.0-rc1 to rc5 also hit this wherever PowerShell is restricted to
 Constrained Language Mode -- WDAC script enforcement, or AppLocker script rules

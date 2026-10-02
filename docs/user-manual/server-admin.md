@@ -2300,7 +2300,7 @@ it before you enable signing, or `--update-trust-bundle` points at nothing:
         if ($bad) { throw ("Only files may be in $d. Remove these first (a junction or directory link with cmd /c rmdir, a file link with cmd /c del): " + (($bad | ForEach-Object { $_.FullName }) -join ', ')) }
         foreach ($i in $c) {
             if ($i.LinkType -eq 'HardLink') { throw "$($i.FullName) is a hard link. Remove it and copy the file in again." }
-            if ((Get-Acl -LiteralPath $i.FullName).Sddl -notmatch '^O:(BA|SY)G:') { throw "$($i.FullName) is not owned by Administrators or SYSTEM, so it may not be a file you placed. Check it, delete it, and copy the file in again as an administrator." }
+            if ((Get-Acl -LiteralPath $i.FullName).Sddl -notmatch '^O:(BA|SY)G:') { throw "$($i.FullName) is not owned by Administrators or SYSTEM, so it cannot be confirmed you placed it. Inspect it; if it is yours, run: icacls `"$($i.FullName)`" /setowner *S-1-5-32-544 /L" }
         }
         if ($c) { icacls "$d\*" /reset /L /C /Q | Out-Null }
     } else {
@@ -2312,7 +2312,8 @@ it before you enable signing, or `--update-trust-bundle` points at nothing:
         #    itself. Never /T: on a file the (OI)(CI) grant is invalid, and icacls then
         #    leaves every existing file with an EMPTY permission list -- SYSTEM, and so
         #    the agent, can no longer read it -- while still reporting success (#5196).
-        #    The move fails if something already holds the name; run this again then.
+        #    If something takes the name first, the checks around the move stop it; see
+        #    step 1 for how to clear it.
         $stage = Join-Path $env:TEMP ('yuzu-agent-certs-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $stage | Out-Null
         icacls $stage /setowner '*S-1-5-32-544' /L /C /Q | Out-Null
@@ -2341,7 +2342,10 @@ it before you enable signing, or `--update-trust-bundle` points at nothing:
 ```
 
 Put the bundle in only once the directory exists and is secured, by the installer or
-by this block: copy it in as an administrator, so the copy is owned by Administrators.
+by this block: copy it in as an administrator, then check that its owner is Administrators or
+SYSTEM (`(Get-Acl <file>).Owner`). Some admin accounts make themselves the owner of files
+they create; if so, inspect the file and make Administrators its owner with
+`icacls "<file>" /setowner *S-1-5-32-544 /L`, or the installer and this block refuse it.
 A directory created or pre-staged any other way is refused by the installer, which
 leaves the agent service as it was, and by this block.
 
@@ -2352,7 +2356,7 @@ before relying on signature checking.
 
 What this does not cover: the parent directory `C:\ProgramData\Yuzu` is not itself
 locked down (#5257), and a process that opened the directory or a file in it before
-step 2 keeps the access it opened with (#5258).
+it was locked keeps the access it opened with (#5258).
 
 ```bash
 # macOS, as root.
@@ -3141,7 +3145,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer creates and locks it (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`, on the directory itself), and then requires the lock to have taken effect and a newly created directory to still be empty. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, owned by Administrators (or SYSTEM), and holding only files. The installer builds a new one in its private temporary folder, locks it there (`icacls /setowner /L` → `/reset /L` → `/inheritance:r /grant:r /L`), checks it, moves it into place and checks it again; an existing, secured directory is not re-locked. If it already exists, it must already be secured exactly; the installer refuses rather than take over a directory it did not secure, because whatever is in it already decides which updates are trusted. It also refuses a junction, symbolic link or subdirectory at or in it, and nothing it runs is recursive. Files in an existing, secured directory must already be owned by Administrators or SYSTEM, and not be hard links, before their permissions are reset to inherit the grant (this repairs the rc1..rc5 lock-out); the installer never takes ownership of a file, and refuses one someone else placed. The check runs before the agent service is stopped, so a refusal leaves the service as it was. Not covered: the parent `C:\ProgramData\Yuzu` (#5257), and a handle opened before the install (#5258). A pre-install check compares the security descriptor of the directory and of everything inside it exactly: the owner, and an entry list of Administrators and SYSTEM with full control and nothing else (no deny entries, no other accounts). It aborts the install otherwise. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
