@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -99,47 +100,54 @@ inline std::wstring expand_env_strings(const std::wstring& in) {
     return buf;
 }
 
-// Reads HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList,
-// returning one RawProfileRecord per subkey (SID) found, capped at
-// kMaxProfiles, with ProfileImagePath already environment-expanded. `ok` is
-// set false only when the ProfileList key itself could not be opened -- a
-// per-profile ProfileImagePath read failure is reported as an empty
-// profile_image_path on that one record, never a dropped record. `truncated`,
-// if non-null, is set true when a record was ACTUALLY DROPPED -- the cap was
-// reached AND a probe confirmed a further ProfileList subkey exists (#2771
-// code-review C-M3: "cap reached" alone is not the same fact -- a host with
-// exactly kMaxProfiles subkeys hits the cap without losing anything). A
-// caller that cares about completeness (list_profiles) surfaces this; one
-// that's looking up a single profile (get_user_value) may pass nullptr and
-// ignore it.
-inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
-    bool& ok, bool* truncated = nullptr) {
-    std::vector<yuzu::profiles::RawProfileRecord> out;
-    ok = false;
-    if (truncated)
-        *truncated = false;
+/// One ProfileList walk with the Win32 codes behind it (enumerate_profile_list).
+struct ProfileListEnumeration {
+    std::vector<yuzu::profiles::RawProfileRecord> records;
+    LSTATUS root_rc = ERROR_SUCCESS; // opening ProfileList itself
+    LSTATUS last_rc = ERROR_SUCCESS; // the RegEnumKeyExW code that ended the walk (SUCCESS = the cap)
+    LSTATUS probe_rc = ERROR_NO_MORE_ITEMS; // the extra RegEnumKeyExW run only at the cap
+    bool truncated = false; // == enumerate_profile_records' `truncated` (cap reached AND more exist)
+    struct RecordFailure {
+        std::string sid;
+        LSTATUS rc;
+        bool key_open; // true: the SID subkey itself; false: its ProfileImagePath value
+    };
+    std::vector<RecordFailure> record_failures; // each SID-key/ProfileImagePath read that failed
+};
+
+// The ProfileList walk with every Win32 code it saw kept, for a caller that must classify HOW
+// the walk ended rather than accept a prefix as complete (privacy_permissions: a mid-walk
+// ERROR_ACCESS_DENIED is a refusal, never "every profile enumerated"). enumerate_profile_records
+// below is this function with the codes dropped -- its callers' behaviour is unchanged, except
+// that the one read-only cap probe now also runs when they pass no `truncated` out-param.
+inline ProfileListEnumeration enumerate_profile_list() {
+    ProfileListEnumeration res;
+    auto& out = res.records;
 
     RegKey profiles;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", 0,
-                      KEY_READ | KEY_ENUMERATE_SUB_KEYS, profiles.put()) != ERROR_SUCCESS)
-        return out;
-    ok = true;
+    res.root_rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList", 0,
+                                KEY_READ | KEY_ENUMERATE_SUB_KEYS, profiles.put());
+    if (res.root_rc != ERROR_SUCCESS)
+        return res;
 
     constexpr DWORD kSidBufLen = 256; // WCHAR count, not bytes
     wchar_t sid_buf[kSidBufLen]{};
     DWORD idx = 0;
     DWORD sid_len = kSidBufLen;
     while (out.size() < kMaxProfiles &&
-           RegEnumKeyExW(profiles.get(), idx++, sid_buf, &sid_len, nullptr, nullptr, nullptr,
-                         nullptr) == ERROR_SUCCESS) {
+           (res.last_rc = RegEnumKeyExW(profiles.get(), idx++, sid_buf, &sid_len, nullptr, nullptr,
+                                        nullptr, nullptr)) == ERROR_SUCCESS) {
         yuzu::profiles::RawProfileRecord rec;
         rec.sid = from_wide(sid_buf, static_cast<int>(sid_len));
         sid_len = kSidBufLen;
 
         RegKey sid_key;
-        if (RegOpenKeyExW(profiles.get(), to_wide(rec.sid).c_str(), 0, KEY_READ, sid_key.put()) ==
-            ERROR_SUCCESS) {
+        const LSTATUS key_rc =
+            RegOpenKeyExW(profiles.get(), to_wide(rec.sid).c_str(), 0, KEY_READ, sid_key.put());
+        if (key_rc != ERROR_SUCCESS && key_rc != ERROR_FILE_NOT_FOUND)
+            res.record_failures.push_back({rec.sid, key_rc, true});
+        if (key_rc == ERROR_SUCCESS) {
             // Two-pass (#2771 up-S2). The former fixed 512-wchar buffer made
             // RegQueryValueExW return ERROR_MORE_DATA for a longer
             // ProfileImagePath, which left profile_image_path empty and
@@ -158,10 +166,10 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
                 std::vector<wchar_t> path_buf((path_size + sizeof(wchar_t) - 1) / sizeof(wchar_t) + 1,
                                               L'\0');
                 DWORD read_size = static_cast<DWORD>(path_buf.size() * sizeof(wchar_t));
-                if (RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr, &type,
-                                     reinterpret_cast<LPBYTE>(path_buf.data()), &read_size) ==
-                        ERROR_SUCCESS &&
-                    (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                const LSTATUS read_rc =
+                    RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(path_buf.data()), &read_size);
+                if (read_rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
                     std::size_t nch = read_size / sizeof(wchar_t);
                     if (nch > path_buf.size())
                         nch = path_buf.size();
@@ -177,6 +185,8 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
                     // The value was there a moment ago and is not readable
                     // now (raced delete, ACL, corruption).
                     rec.profile_image_path_unreadable = true;
+                    if (read_rc != ERROR_SUCCESS)
+                        res.record_failures.push_back({rec.sid, read_rc, false});
                 }
             } else if (size_rc == ERROR_SUCCESS) {
                 // Present but unusable: over the cap, zero-length, or a type
@@ -192,31 +202,50 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
                 // value (ERROR_FILE_NOT_FOUND) stays silent below -- a
                 // profile with no ProfileImagePath is not an error.
                 rec.profile_image_path_unreadable = true;
+                res.record_failures.push_back({rec.sid, size_rc, false});
             }
         }
         out.push_back(std::move(rec));
     }
-    if (truncated) {
-        // The DECISION (cap reached AND a next entry actually exists) is
-        // yuzu::profiles::profile_list_actually_truncated, extracted pure so
-        // it is unit-tested without a real registry (#2771 code-review
-        // C-M3 / P2-N3). This Win32 shell's job is only to gather the two
-        // input facts: did we hit the cap, and does one extra RegEnumKeyExW
-        // probe (nothing stored from it) find a next subkey.
-        const bool cap_reached = (out.size() >= kMaxProfiles);
-        if (cap_reached) {
-            wchar_t probe_buf[kSidBufLen]{};
-            DWORD probe_len = kSidBufLen;
-            const bool probe_found_more =
-                (RegEnumKeyExW(profiles.get(), idx, probe_buf, &probe_len, nullptr, nullptr,
-                              nullptr, nullptr) == ERROR_SUCCESS);
-            *truncated = yuzu::profiles::profile_list_actually_truncated(cap_reached,
-                                                                         probe_found_more);
-        } else {
-            *truncated = false;
-        }
+    // The DECISION (cap reached AND a next entry actually exists) is
+    // yuzu::profiles::profile_list_actually_truncated, extracted pure so
+    // it is unit-tested without a real registry (#2771 code-review
+    // C-M3 / P2-N3). This Win32 shell's job is only to gather the two
+    // input facts: did we hit the cap, and does one extra RegEnumKeyExW
+    // probe (nothing stored from it) find a next subkey.
+    const bool cap_reached = (out.size() >= kMaxProfiles);
+    if (cap_reached) {
+        wchar_t probe_buf[kSidBufLen]{};
+        DWORD probe_len = kSidBufLen;
+        res.probe_rc = RegEnumKeyExW(profiles.get(), idx, probe_buf, &probe_len, nullptr, nullptr,
+                                     nullptr, nullptr);
+        res.truncated = yuzu::profiles::profile_list_actually_truncated(
+            cap_reached, res.probe_rc == ERROR_SUCCESS);
     }
-    return out;
+    return res;
+}
+
+// Reads HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList,
+// returning one RawProfileRecord per subkey (SID) found, capped at
+// kMaxProfiles, with ProfileImagePath already environment-expanded. `ok` is
+// set false only when the ProfileList key itself could not be opened -- a
+// per-profile ProfileImagePath read failure is reported as an empty
+// profile_image_path on that one record, never a dropped record. `truncated`,
+// if non-null, is set true when a record was ACTUALLY DROPPED -- the cap was
+// reached AND a probe confirmed a further ProfileList subkey exists (#2771
+// code-review C-M3: "cap reached" alone is not the same fact -- a host with
+// exactly kMaxProfiles subkeys hits the cap without losing anything). A
+// caller that cares about completeness (list_profiles) surfaces this; one
+// that's looking up a single profile (get_user_value) may pass nullptr and
+// ignore it. A caller that must also tell a mid-walk failure from the end of
+// the list uses enumerate_profile_list above.
+inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
+    bool& ok, bool* truncated = nullptr) {
+    auto res = enumerate_profile_list();
+    ok = (res.root_rc == ERROR_SUCCESS);
+    if (truncated)
+        *truncated = res.truncated;
+    return std::move(res.records);
 }
 
 // Subkey names directly under HKEY_USERS -- live-loaded hive roots, plus any
@@ -411,6 +440,17 @@ struct HiveAccessReport {
     bool mounted_offline{false};
     bool unload_failed{false};
     std::string mount_name;
+    std::string refusal; // the OfflineHiveFileCheck token when status == file_refused
+};
+
+/// Opt-in hive-FILE guard for the offline arm of with_user_hive (default: none, so every
+/// existing consumer is unchanged). Each hook returns "" to proceed or a refusal token.
+/// before_load runs after the privileges are enabled, before any RegLoadKeyW; after_load runs
+/// once the hive is mounted, before fn sees it. An after_load refusal skips fn but the mount is
+/// still unloaded and unload_failed still reported.
+struct OfflineHiveFileCheck {
+    std::function<std::string(const std::wstring& ntuser_path)> before_load;
+    std::function<std::string(const std::wstring& ntuser_path)> after_load;
 };
 
 /// Serialises the OFFLINE arm of with_user_hive across the whole process.
@@ -477,7 +517,8 @@ using yuzu::agent::offline_hive_mutex;
 //   OpenThreadToken) would confine this further. Not done here.
 template <typename Fn>
 HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profile_path_utf8,
-                                Fn&& fn, HiveAccessReport* report = nullptr) {
+                                Fn&& fn, HiveAccessReport* report = nullptr,
+                                const OfflineHiveFileCheck* check = nullptr) {
     auto finish = [&](HiveAccessStatus st) {
         if (report)
             report->status = st;
@@ -521,18 +562,39 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
         report->mount_name = from_wide(mount.c_str(), static_cast<int>(mount.size()));
     }
 
+    if (check && check->before_load) {
+        if (std::string token = check->before_load(ntuser); !token.empty()) {
+            if (report)
+                report->refusal = std::move(token);
+            return finish(HiveAccessStatus::file_refused); // nothing is mounted yet
+        }
+    }
+
     bool unload_failed = false;
     bool called = false;
+    std::string refused;
     {
         ScopedUserHive hive(mount, ntuser, &unload_failed);
-        hive.with_root([&](HKEY root) {
-            fn(root);
-            called = true;
-        });
-    } // ScopedUserHive unloads here -- unload_failed is only final after this scope
+        if (hive.ok() && check && check->after_load)
+            refused = check->after_load(ntuser);
+        // A refusal never returns from inside this scope: the unload and its report below
+        // must still run, so the mount is never leaked silently.
+        if (refused.empty()) {
+            hive.with_root([&](HKEY root) {
+                fn(root);
+                called = true;
+            });
+        }
+    } // ScopedUserHive unloads here -- unload_failed is final after this scope; if `fn` throws the
+      // unload still runs but the report is never written, so only the exception is seen
     if (report)
         report->unload_failed = unload_failed;
 
+    if (!refused.empty()) {
+        if (report)
+            report->refusal = std::move(refused);
+        return finish(HiveAccessStatus::file_refused);
+    }
     return finish(called ? HiveAccessStatus::ok : HiveAccessStatus::mount_failed);
 }
 

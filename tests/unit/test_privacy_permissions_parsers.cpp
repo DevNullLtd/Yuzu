@@ -1,8 +1,8 @@
 /**
  * test_privacy_permissions_parsers.cpp -- pure tests for privacy_permissions_parsers.hpp,
- * privacy_permissions_macos_parsers.hpp and privacy_permissions_linux_parsers.hpp (this
- * plugin's Linux and macOS legs; Windows parsers are covered by their own test file once
- * that leg ships). No OS call, no platform guard. The one file read is the committed YAML
+ * privacy_permissions_win_parsers.hpp, privacy_permissions_macos_parsers.hpp and
+ * privacy_permissions_linux_parsers.hpp (all three legs; every header is OS-free, so every case
+ * runs on every host). No OS call, no platform guard. The one file read is the committed YAML
  * definition (the row_kind/column pin).
  */
 #include <catch2/catch_test_macros.hpp>
@@ -19,6 +19,7 @@
 #include "privacy_permissions_linux_parsers.hpp"
 #include "privacy_permissions_macos_parsers.hpp"
 #include "privacy_permissions_parsers.hpp"
+#include "privacy_permissions_win_parsers.hpp"
 
 using namespace yuzu::privacy_permissions;
 
@@ -275,6 +276,601 @@ TEST_CASE("any_denied: true iff at least one row's read was refused", "[privacy_
     CHECK_FALSE(any_denied(rows));
 }
 
+
+// ── Windows-specific pure layer ──────────────────────────────────────────
+
+TEST_CASE("win::kCapabilities: the four mapped CapabilityName keys, one per category",
+          "[privacy_permissions][win_parsers]") {
+    REQUIRE(win::kCapabilities.size() == kCategories.size());
+    CHECK(win::kCapabilities[0].capability_name == "webcam");
+    CHECK(win::kCapabilities[3].capability_name == "broadFileSystemAccess");
+    for (std::size_t i = 0; i < kCategories.size(); ++i)
+        CHECK(win::kCapabilities[i].category == kCategories[i]);
+}
+
+TEST_CASE("win::decode_consent_value: Allow/Deny decode, wrong type or empty is unreadable, "
+          "an unknown literal is prompt_undetermined (never silently allowed/denied)",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::decode_consent_value("Allow", true) == PermissionState::allowed);
+    CHECK(win::decode_consent_value("Deny", true) == PermissionState::denied);
+    CHECK(win::decode_consent_value("Allow", false) == PermissionState::unreadable); // wrong type
+    CHECK(win::decode_consent_value("", true) == PermissionState::unreadable);       // empty
+    CHECK(win::decode_consent_value("Prompt", true) == PermissionState::prompt_undetermined);
+}
+
+TEST_CASE("win::unescape_nonpackaged_app_id: '#' is the path separator and nothing else is "
+          "rewritten (the drive colon is literal; a `#3A` stays as written)",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::unescape_nonpackaged_app_id("C:#Program Files#App.exe") ==
+          "C:\\Program Files\\App.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C#3AUsers#name#app.exe") ==
+          "C\\3AUsers\\name\\app.exe");
+}
+
+TEST_CASE("win::filetime_to_epoch_ms_string: zero and pre-epoch are '-', a real value converts",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::filetime_to_epoch_ms_string(0) == "-");
+    CHECK(win::filetime_to_epoch_ms_string(1) == "-"); // far before the Unix epoch
+    // The 1601->1970 epoch boundary itself: exactly epoch_ms=0, and one more 100ns-tick
+    // interval (10000 ticks = 1ms) past it converts to exactly 1ms -- both self-verifying
+    // (derived from the function's own documented constant, not a separately hand-computed
+    // calendar date, which is the trap the first version of this test fell into).
+    constexpr std::uint64_t kEpochDiff100ns = 116444736000000000ULL;
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns) == "0");
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns + 10000) == "1");
+    CHECK(win::filetime_to_epoch_ms_string(kEpochDiff100ns + 86400ULL * 10000000ULL) == "86400000"); // +1 day
+}
+
+TEST_CASE("win::decode_last_used: only a REG_QWORD of exactly 8 bytes converts; not-found is "
+          "'-'; every other outcome is a visible `unreadable` with a cause",
+          "[privacy_permissions][win_parsers]") {
+    constexpr std::uint64_t kEpochDiff100ns = 116444736000000000ULL;
+    const auto ok = win::decode_last_used(win::kErrorSuccess, win::kRegQword, 8, kEpochDiff100ns + 10000);
+    CHECK(ok.value == "1");
+    CHECK(ok.cause.empty());
+
+    const auto missing = win::decode_last_used(win::kErrorFileNotFound, 0, 0, 0);
+    CHECK(missing.value == "-");
+    CHECK(missing.cause.empty());
+
+    const auto short_q = win::decode_last_used(win::kErrorSuccess, win::kRegQword, 4, 0);
+    CHECK(short_q.value == "unreadable");
+    CHECK(short_q.cause == "size_4");
+
+    const auto wrong_t = win::decode_last_used(win::kErrorSuccess, win::kRegSz, 8, 0);
+    CHECK(wrong_t.value == "unreadable");
+    CHECK(wrong_t.cause == "type_1");
+
+    const auto denied = win::decode_last_used(win::kErrorAccessDenied, 0, 0, 0);
+    CHECK(denied.value == "unreadable");
+    CHECK(denied.cause == "access_denied");
+    CHECK(denied.denied);
+
+    const auto more_data = win::decode_last_used(234, 3 /* REG_BINARY */, 16, 0);
+    CHECK(more_data.cause == "win32_234");
+    CHECK_FALSE(more_data.denied);
+}
+
+TEST_CASE("win::merge_with_hklm: most restrictive wins -- a successfully read HKLM Deny overrides "
+          "the profile, an HKLM Allow never overrides a user Deny/Prompt nor invents a grant, a "
+          "failed HKLM read never overrides, and a failed profile entry is never hidden",
+          "[privacy_permissions][win_parsers]") {
+    using win::RawGrant;
+    const auto grant = [](std::string app, PermissionState st, std::string raw,
+                          bool read_denied = false, std::string cause = {}) {
+        RawGrant g{std::move(app), "camera", st, std::move(raw)};
+        g.read_denied = read_denied;
+        g.cause = std::move(cause);
+        return g;
+    };
+    const auto merged_state = [&](const RawGrant& user, const RawGrant& machine) {
+        const std::vector<RawGrant> profile{user};
+        const std::vector<RawGrant> hklm{machine};
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == 1);
+        return std::pair{m[0].state, m[0].raw_value};
+    };
+    const auto allow = grant("app", PermissionState::allowed, "Allow");
+    const auto deny = grant("app", PermissionState::denied, "Deny");
+    const auto prompt = grant("app", PermissionState::prompt_undetermined, "Prompt");
+
+    SECTION("HKLM Deny (read OK) wins over every successfully read user value") {
+        for (const auto& user : {allow, deny, prompt})
+            CHECK(merged_state(user, deny) == std::pair{PermissionState::denied, std::string{"Deny"}});
+    }
+    SECTION("HKLM Allow defers to the user's own value") {
+        CHECK(merged_state(deny, allow) == std::pair{PermissionState::denied, std::string{"Deny"}});
+        CHECK(merged_state(prompt, allow) ==
+              std::pair{PermissionState::prompt_undetermined, std::string{"Prompt"}});
+        CHECK(merged_state(allow, allow) == std::pair{PermissionState::allowed, std::string{"Allow"}});
+    }
+    SECTION("an unmodelled HKLM literal overrides nothing") {
+        CHECK(merged_state(allow, prompt) == std::pair{PermissionState::allowed, std::string{"Allow"}});
+    }
+    SECTION("an absent, unreadable or refused HKLM entry overrides nothing") {
+        for (const auto& h : {grant("app", PermissionState::absent, "-"),
+                              grant("app", PermissionState::unreadable, "-", false, "value_empty"),
+                              grant("app", PermissionState::denied, "-", true, "value_access_denied")})
+            CHECK(merged_state(deny, h) == std::pair{PermissionState::denied, std::string{"Deny"}});
+    }
+    SECTION("HKLM Deny fills a key the profile lacks; HKLM Allow never invents a user grant") {
+        const std::vector<RawGrant> profile{};
+        const std::vector<RawGrant> hklm_deny{deny};
+        const auto m = win::merge_with_hklm(profile, hklm_deny);
+        REQUIRE(m.size() == 1);
+        CHECK(m[0].state == PermissionState::denied);
+        const std::vector<RawGrant> hklm_allow{allow};
+        CHECK(win::merge_with_hklm(profile, hklm_allow).empty());
+    }
+    SECTION("a failed profile entry is kept, and an overriding HKLM Deny is added beside it") {
+        const std::vector<RawGrant> profile{
+            grant("app", PermissionState::unreadable, "-", false, "value_empty")};
+        const std::vector<RawGrant> hklm{deny};
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == 2);
+        CHECK(m[0].state == PermissionState::unreadable);
+        CHECK(m[1].state == PermissionState::denied);
+        CHECK(m[1].raw_value == "Deny");
+    }
+}
+
+TEST_CASE("win: the three ConsentStore levels on the-rig's real shapes -- the NonPackaged toggle is "
+          "its own row, a Value-less per-app NonPackaged key is absent, `Executables` is a "
+          "container, and most-restrictive applies key by key",
+          "[privacy_permissions][win_parsers]") {
+    using win::RawGrant;
+    // Measured 2026-09-23 (HKU\<sid>\...\ConsentStore\location and HKLM\...\ConsentStore\location):
+    //   location                      Value REG_SZ Allow   (user capability toggle)
+    //   location\NonPackaged          Value REG_SZ Allow   (user "let desktop apps access")
+    //   location\NonPackaged\C:#Program Files#Mozilla Firefox#firefox.exe   LastUsedTime* only
+    //   location\NonPackaged\Executables\firefox.exe   GlobalPromptShown only (a container)
+    //   location\OpenAI.Codex_2p2nqsd0c76g0            Value REG_SZ Prompt
+    //   HKLM location Value Allow; HKLM location\NonPackaged (no Value);
+    //   HKLM location\NonPackaged\C:#Windows#System32#svchost.exe   LastUsedTime* only
+    CHECK(win::kNonPackagedToggleAppId == "NonPackaged");
+    CHECK(win::is_nonpackaged_container_key("Executables"));
+    CHECK_FALSE(win::is_nonpackaged_container_key("C:#Program Files#Mozilla Firefox#firefox.exe"));
+    const std::string firefox =
+        win::unescape_nonpackaged_app_id("C:#Program Files#Mozilla Firefox#firefox.exe");
+    CHECK(firefox == "C:\\Program Files\\Mozilla Firefox\\firefox.exe");
+    CHECK(win::unescape_nonpackaged_app_id("C:#PROGRA~2#Citrix#ICACLI~1#HdxRtcEngine.exe") ==
+          "C:\\PROGRA~2\\Citrix\\ICACLI~1\\HdxRtcEngine.exe");
+
+    const auto g = [](std::string app, PermissionState st, std::string raw) {
+        return RawGrant{std::move(app), "location", st, std::move(raw)};
+    };
+    const std::string toggle{win::kNonPackagedToggleAppId};
+    const std::vector<RawGrant> profile{
+        g("-", PermissionState::allowed, "Allow"), g(toggle, PermissionState::allowed, "Allow"),
+        g(firefox, PermissionState::absent, "-"),
+        g("OpenAI.Codex_2p2nqsd0c76g0", PermissionState::prompt_undetermined, "Prompt")};
+    const std::vector<RawGrant> hklm{
+        g("-", PermissionState::allowed, "Allow"), g(toggle, PermissionState::absent, "-"),
+        g("C:\\Windows\\System32\\svchost.exe", PermissionState::absent, "-")};
+
+    SECTION("the real host: nothing overrides, every profile level survives as stored") {
+        const auto m = win::merge_with_hklm(profile, hklm);
+        REQUIRE(m.size() == profile.size());
+        for (const auto& row : m) {
+            INFO(row.app_id);
+            const auto it = std::find_if(profile.begin(), profile.end(),
+                                         [&](const RawGrant& p) { return p.app_id == row.app_id; });
+            REQUIRE(it != profile.end());
+            CHECK(row.state == it->state);
+        }
+        // Every HKLM level is reported once as HKLM's own row (the device toggle included);
+        // none was applied into the profile.
+        for (const auto& h : hklm) CHECK(win::hklm_emitted_once(h, true));
+    }
+    SECTION("an HKLM NonPackaged Deny overrides only the user's NonPackaged toggle") {
+        const std::vector<RawGrant> hklm_deny{g(toggle, PermissionState::denied, "Deny")};
+        const auto m = win::merge_with_hklm(profile, hklm_deny);
+        REQUIRE(m.size() == profile.size());
+        for (const auto& row : m) {
+            INFO(row.app_id);
+            if (row.app_id == toggle) {
+                CHECK(row.state == PermissionState::denied);
+                CHECK(row.raw_value == "Deny");
+            } else {
+                CHECK(row.state != PermissionState::denied);
+            }
+        }
+        CHECK_FALSE(win::hklm_emitted_once(hklm_deny[0], true)); // carried by the profile row
+    }
+    SECTION("on the wire the toggle is qualified like every per-user row") {
+        CHECK(format_row({"windows", qualify_app_id("jsmith", toggle), "location",
+                          PermissionState::allowed, "Allow", "-", "-", false}) ==
+              "permissions|windows|jsmith/NonPackaged|location|allowed|Allow|-|-");
+        CHECK(format_row({"windows", qualify_app_id("jsmith", firefox), "location",
+                          PermissionState::absent, "-", "1783980629480", "1783980638651", false}) ==
+              "permissions|windows|jsmith/C:/Program Files/Mozilla Firefox/firefox.exe|location|"
+              "absent|-|1783980629480|1783980638651");
+    }
+}
+
+TEST_CASE("win::hklm_emitted_once: an overriding Deny is HKLM's own row only with no reachable "
+          "profile; Allow, failures, app-level entries and a capability-level absent always",
+          "[privacy_permissions][win_parsers]") {
+    win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
+    win::RawGrant allow{"-", "camera", PermissionState::allowed, "Allow"};
+    win::RawGrant absent_cap{"-", "camera", PermissionState::absent, "-"};
+    win::RawGrant absent_app{"C:\\app.exe", "camera", PermissionState::absent, "-"};
+    win::RawGrant refused{"-", "camera", PermissionState::denied, "-"};
+    refused.read_denied = true;
+    refused.cause = "value_access_denied";
+    CHECK(win::hklm_overrides_profile(deny));
+    CHECK_FALSE(win::hklm_overrides_profile(refused));
+    CHECK_FALSE(win::hklm_emitted_once(deny, true));
+    CHECK(win::hklm_emitted_once(deny, false));
+    CHECK(win::hklm_emitted_once(allow, true));
+    CHECK(win::hklm_emitted_once(refused, true));
+    CHECK(win::hklm_emitted_once(absent_app, true));
+    CHECK(win::hklm_emitted_once(absent_cap, true));
+    CHECK(win::hklm_emitted_once(absent_cap, false));
+}
+
+TEST_CASE("win: failed profile discovery never suppresses HKLM's definitive capability-level "
+          "absences -- they are HKLM's own rows, not left to the backstop",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    std::vector<PermissionRow> rows{
+        failure_row("windows", "-", "-", false, "profiles:profile_list_unreadable", acc)};
+    for (const auto& cap : win::kCapabilities) { // HKLM ConsentStore root: ERROR_FILE_NOT_FOUND
+        const win::RawGrant g{"-", cap.category, PermissionState::absent, "-"};
+        if (win::hklm_emitted_once(g, false))
+            rows.push_back({"windows", g.app_id, g.category, g.state, g.raw_value, "-", "-", false});
+    }
+    fill_uncovered_categories("windows", rows); // suppressed by the whole-source row
+    REQUIRE(rows.size() == 1 + kCategories.size());
+    for (std::size_t i = 0; i < kCategories.size(); ++i) {
+        CHECK(rows[i + 1].category == kCategories[i]);
+        CHECK(rows[i + 1].state == PermissionState::absent);
+    }
+}
+
+TEST_CASE("win::profile_discovery_failure: a refused root or mid-walk enumeration is denied; any "
+          "other root failure, terminating error or cap overflow is unreadable; only a clean end "
+          "(or exactly the cap) is complete",
+          "[privacy_permissions][win_parsers]") {
+    const long ok = win::kErrorSuccess, done = win::kErrorNoMoreItems, refused = win::kErrorAccessDenied;
+    const auto check = [](std::optional<win::EnumFailure> f, std::string cause, bool denied) {
+        REQUIRE(f);
+        CHECK(f->cause == cause);
+        CHECK(f->denied == denied);
+    };
+    check(win::profile_discovery_failure(refused, ok, done), "profiles:profile_list_access_denied", true);
+    check(win::profile_discovery_failure(2, ok, done), "profiles:profile_list_unreadable", false);
+    CHECK_FALSE(win::profile_discovery_failure(ok, done, done));       // walk ended cleanly
+    CHECK_FALSE(win::profile_discovery_failure(ok, ok, done));         // exactly the cap
+    check(win::profile_discovery_failure(ok, ok, ok), "profiles:truncated", false);
+    check(win::profile_discovery_failure(ok, refused, done), "profiles:enum_access_denied", true);
+    check(win::profile_discovery_failure(ok, 1018, done), "profiles:enum_win32_1018", false);
+    check(win::profile_discovery_failure(ok, ok, refused), "profiles:enum_access_denied", true);
+    const auto key = win::profile_record_failure(true, refused);
+    CHECK(key.cause == "profiles:profile_key_access_denied");
+    CHECK(key.denied);
+    const auto path = win::profile_record_failure(false, 1018);
+    CHECK(path.cause == "profiles:profile_image_path_win32_1018");
+    CHECK_FALSE(path.denied);
+}
+
+TEST_CASE("win::RetentionBudget: one source at its own cap stops only its own walk -- the next "
+          "source starts from zero and retains its Deny; refusal is sticky and never wraps",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::kMaxConsentValueBytes == 64);
+    CHECK(win::kMaxConsentValueBytes >= (std::string_view{"Prompt"}.size() + 1) * 2);
+    const win::RetentionBudget defaults;
+    CHECK(defaults.max_profile_grants == 8192);
+    CHECK(defaults.max_profile_bytes == 2u * 1024u * 1024u);
+
+    win::RetentionBudget b;
+    b.max_profile_grants = 2;
+    b.begin_profile();
+    CHECK(b.charge(1));
+    CHECK(b.charge(1));
+    CHECK_FALSE(b.charge(1)); // the cap-th grant fits, one more is refused
+    CHECK(b.profile_exhausted);
+    CHECK(b.walk_stopped());
+    CHECK_FALSE(b.charge(0)); // sticky for the rest of this source
+
+    b.begin_profile(); // the next source starts from zero
+    CHECK_FALSE(b.walk_stopped());
+    const win::RawGrant deny{"-", "camera", PermissionState::denied, "Deny"};
+    CHECK(b.charge(win::retained_bytes(deny)));
+    CHECK(b.profile_grants == 1);
+
+    win::RetentionBudget bytes;
+    bytes.max_profile_bytes = 10;
+    CHECK(bytes.charge(6));
+    CHECK(bytes.charge(4)); // exactly the cap fits
+    CHECK(bytes.profile_bytes == 10);
+    CHECK_FALSE(bytes.charge(1));
+    CHECK(bytes.profile_exhausted);
+    bytes.begin_profile();
+    CHECK_FALSE(bytes.charge(static_cast<std::size_t>(-1))); // an oversized grant never wraps
+    CHECK(bytes.profile_exhausted);
+
+    const win::RawGrant g{"C:\\a.exe", "camera", PermissionState::allowed, "Allow"};
+    CHECK(win::retained_bytes(g) == std::string_view{"C:\\a.exe"}.size() + 5);
+}
+
+TEST_CASE("win::RetentionBudget: the run deadline is injectable, inclusive and sticky",
+          "[privacy_permissions][win_parsers]") {
+    using Clock = std::chrono::steady_clock;
+    CHECK(win::kRunBudget == std::chrono::seconds{15});
+    CHECK(win::kTimeoutToken == "collection:timeout");
+
+    win::RetentionBudget b;
+    b.deadline = Clock::time_point::max();
+    CHECK_FALSE(b.walk_stopped());
+    const auto t = Clock::time_point{} + std::chrono::seconds{100};
+    b.deadline = t;
+    CHECK_FALSE(b.expired(t - std::chrono::nanoseconds{1}));
+    CHECK_FALSE(b.timed_out);
+    CHECK(b.expired(t));
+    b.deadline = Clock::time_point::max();
+    CHECK(b.expired(t - std::chrono::nanoseconds{1})); // once tripped it stays tripped
+    CHECK(b.walk_stopped());
+}
+
+TEST_CASE("win::coarse_failure_token: one token per kind of failure, however many apps share it",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    for (int i = 0; i < 1000; ++i)
+        acc.add_failure(win::coarse_failure_token("alice", "camera", "value_oversized"));
+    CHECK(acc.reason() == "alice:camera:value_oversized");
+
+    // A number the ConsentStore owner chooses (a value's type, a LastUsedTime size) is not kept.
+    yuzu::shared::ConstraintAccumulator typed;
+    for (int i = 0; i < 1000; ++i) {
+        typed.add_failure(
+            win::coarse_failure_token("alice", "camera", "value_type_" + std::to_string(i)));
+        typed.add_failure(win::coarse_failure_token("alice", "camera",
+                                                    "last_used_start_size_" + std::to_string(i)));
+    }
+    CHECK(typed.reason() == "alice:camera:value_type,alice:camera:last_used_start_size");
+    CHECK(win::coarse_failure_token("alice", "camera", "value_win32_1450") ==
+          "alice:camera:value_win32_1450");
+}
+
+TEST_CASE("win::nonpackaged_open_failure: a missing NonPackaged key is the toggle row reading "
+          "absent; a refusal is denied, any other code unreadable",
+          "[privacy_permissions][win_parsers]") {
+    const auto missing = win::nonpackaged_open_failure("camera", win::kErrorFileNotFound);
+    CHECK(missing.app_id == win::kNonPackagedToggleAppId);
+    CHECK(missing.state == PermissionState::absent);
+    CHECK(missing.cause.empty());
+    CHECK_FALSE(win::grant_failed(missing));
+    const auto refused = win::nonpackaged_open_failure("camera", win::kErrorAccessDenied);
+    CHECK(refused.app_id == "-");
+    CHECK(refused.read_denied);
+    CHECK(refused.cause == "nonpackaged_container:access_denied");
+    const auto other = win::nonpackaged_open_failure("camera", 1);
+    CHECK(other.state == PermissionState::unreadable);
+    CHECK(other.cause == "nonpackaged_container:win32_1");
+}
+
+TEST_CASE("win::merge_with_hklm: two registry keys decoding to one app id keep both rows plus a "
+          "duplicate_app_id row -- neither silently replaces the other",
+          "[privacy_permissions][win_parsers]") {
+    const std::string id = "X"; // a packaged key `X` and a NonPackaged key `X`
+    const std::vector<win::RawGrant> profile{{id, "camera", PermissionState::allowed, "Allow"},
+                                             {id, "camera", PermissionState::denied, "Deny"}};
+    const auto m = win::merge_with_hklm(profile, {});
+    REQUIRE(m.size() == 3);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Allow"; }) == 1);
+    CHECK(std::count_if(m.begin(), m.end(), [](const win::RawGrant& g) { return g.raw_value == "Deny"; }) == 1);
+    const auto collision = std::find_if(m.begin(), m.end(), [](const win::RawGrant& g) {
+        return g.cause == "duplicate_app_id";
+    });
+    REQUIRE(collision != m.end());
+    CHECK(collision->app_id == id);
+    CHECK(collision->state == PermissionState::unreadable);
+}
+
+TEST_CASE("win::classify_subkey_enum + enum_failure: exactly the cap is complete (no token), more "
+          "than the cap is truncated, a genuine error or a failed probe is a failure",
+          "[privacy_permissions][win_parsers]") {
+    using win::EnumOutcome;
+    // Stopped on its own: NO_MORE_ITEMS is the only clean end.
+    const auto clean = win::classify_subkey_enum(win::kErrorNoMoreItems, win::kErrorSuccess);
+    CHECK(clean.outcome == EnumOutcome::complete);
+    CHECK_FALSE(win::enum_failure("packaged", clean).has_value());
+    // Exactly kMaxEnumeratedSubkeys children: the loop stops at the cap (SUCCESS) and the probe
+    // finds nothing more -- the false `packaged_enum_0` this used to emit.
+    const auto exact = win::classify_subkey_enum(win::kErrorSuccess, win::kErrorNoMoreItems);
+    CHECK(exact.outcome == EnumOutcome::complete);
+    CHECK_FALSE(win::enum_failure("packaged", exact).has_value());
+    // Over the cap: the probe finds a real next child.
+    const auto over = win::classify_subkey_enum(win::kErrorSuccess, win::kErrorSuccess);
+    CHECK(over.outcome == EnumOutcome::truncated);
+    const auto over_f = win::enum_failure("nonpackaged", over);
+    REQUIRE(over_f);
+    CHECK(over_f->cause == "nonpackaged_enum_truncated");
+    CHECK_FALSE(over_f->denied);
+    // A genuine mid-walk error, refused and otherwise.
+    const auto refused = win::enum_failure(
+        "packaged", win::classify_subkey_enum(win::kErrorAccessDenied, win::kErrorSuccess));
+    REQUIRE(refused);
+    CHECK(refused->cause == "packaged_enum_access_denied");
+    CHECK(refused->denied);
+    const auto more_data = win::enum_failure("packaged", win::classify_subkey_enum(234, 0));
+    REQUIRE(more_data);
+    CHECK(more_data->cause == "packaged_enum_win32_234");
+    CHECK_FALSE(more_data->denied);
+    // The cap-boundary probe itself failed: never read as complete.
+    const auto probe = win::enum_failure(
+        "packaged", win::classify_subkey_enum(win::kErrorSuccess, win::kErrorAccessDenied));
+    REQUIRE(probe);
+    CHECK(probe->cause == "packaged_enum_access_denied");
+    CHECK(probe->denied);
+}
+
+TEST_CASE("win::is_valid_sid_string: only an S-1-<digits>(-<digits>)* SID may be appended to "
+          "HKEY_USERS -- empty or malformed never opens the HKU root",
+          "[privacy_permissions][win_parsers]") {
+    CHECK(win::is_valid_sid_string("S-1-5-21-1111111111-2222222222-3333333333-1013"));
+    CHECK(win::is_valid_sid_string("S-1-5-18"));
+    CHECK_FALSE(win::is_valid_sid_string(""));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5--21"));
+    CHECK_FALSE(win::is_valid_sid_string("S-2-5-21"));
+    CHECK_FALSE(win::is_valid_sid_string("s-1-5-21"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-21\\Software"));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-21 "));
+    CHECK_FALSE(win::is_valid_sid_string("S-1-5-" + std::string(300, '1')));
+}
+
+TEST_CASE("OutputBudget reserve: rows charged first always fit, and a later source that would "
+          "cross the cap reports it before it is emitted",
+          "[privacy_permissions][win_parsers]") {
+    const std::vector<PermissionRow> machine{
+        {"windows", "-", "camera", PermissionState::allowed, "Allow", "-", "-", false}};
+    const std::vector<PermissionRow> profile{
+        {"windows", "jsmith/-", "camera", PermissionState::denied, "Deny", "-", "-", false}};
+    OutputBudget b;
+    b.max_bytes = OutputBudget::cost(machine) + OutputBudget::cost(profile) - 1;
+    b.charge(machine); // reserved first
+    CHECK_FALSE(b.exhausted());
+    CHECK(b.would_exceed(profile)); // the profile does not fit beside the reservation...
+    CHECK(b.bytes == OutputBudget::cost(machine)); // ...and the reservation is untouched
+    b.max_bytes += 1;
+    CHECK_FALSE(b.would_exceed(profile)); // exactly the cap fits
+    b.charge(profile);
+    CHECK(b.exhausted());
+    CHECK(b.would_exceed(machine)); // spent: nothing further fits, and no unsigned wrap
+}
+
+TEST_CASE("select_status: a token-only failure with no denied row and no unreadable row is "
+          "CONSTRAINED/PARTIAL, never OK",
+          "[privacy_permissions][win_parsers]") {
+    yuzu::shared::ConstraintAccumulator acc;
+    acc.add_failure("jsmith:hive_unload_failed");
+    const auto st = select_status(acc, false, false);
+    CHECK(st.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(st.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(st.provenance == "jsmith:hive_unload_failed");
+}
+
+TEST_CASE("win::hive_owner_allowed: exactly the profile SID, LocalSystem and Administrators",
+          "[privacy_permissions][win_parsers]") {
+    const std::string profile = "S-1-5-21-1-2-3-1001";
+    CHECK(win::hive_owner_allowed(profile, profile));
+    CHECK(win::hive_owner_allowed("S-1-5-18", profile));
+    CHECK(win::hive_owner_allowed("S-1-5-32-544", profile));
+    CHECK_FALSE(win::hive_owner_allowed("S-1-5-19", profile));
+    CHECK_FALSE(win::hive_owner_allowed("S-1-5-20", profile));
+    CHECK_FALSE(win::hive_owner_allowed("S-1-5-21-1-2-3-1002", profile));
+    CHECK_FALSE(win::hive_owner_allowed("", profile));
+    CHECK_FALSE(win::hive_owner_allowed("", ""));
+}
+
+TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires in its fixed "
+          "order",
+          "[privacy_permissions][win_parsers]") {
+    const std::string profile = "S-1-5-21-1-2-3-1001";
+    const auto stock = [&] {
+        win::HiveFileFacts f;
+        f.depth = 3;
+        f.profile_sid = profile;
+        f.owner_sid = profile;
+        f.requested_path = "C:\\Users\\jsmith\\NTUSER.DAT";
+        f.final_path = "\\\\?\\C:\\Users\\jsmith\\NTUSER.DAT";
+        f.size = 1024;
+        return f;
+    };
+    const auto token = [](const win::HiveFileFacts& f) {
+        const auto t = win::classify_hive_file(f);
+        return t ? *t : std::string{"<accepted>"};
+    };
+
+    CHECK(token(stock()) == "<accepted>");
+    for (const char* owner : {"S-1-5-18", "S-1-5-32-544"}) {
+        auto f = stock();
+        f.owner_sid = owner;
+        CHECK(token(f) == "<accepted>");
+    }
+    SECTION("path facts") {
+        auto unc = stock();
+        unc.path_is_unc = true;
+        unc.drive_type = 4; // would also be refused later: the UNC verdict comes first
+        CHECK(token(unc) == "hive_path_unc");
+        for (const std::uint32_t remote : {4u, 0u, 1u, 2u, 5u}) { // REMOTE, UNKNOWN, NO_ROOT_DIR, ...
+            auto f = stock();
+            f.drive_type = remote;
+            CHECK(token(f) == "hive_path_not_fixed");
+        }
+        auto deep = stock();
+        deep.depth = win::kMaxHivePathDepth + 1;
+        CHECK(token(deep) == "hive_path_too_deep");
+        deep.depth = win::kMaxHivePathDepth;
+        CHECK(token(deep) == "<accepted>");
+        auto anc = stock();
+        anc.ancestor_reparse = true;
+        anc.is_reparse = true; // a leaf fact: the ancestor verdict comes first
+        CHECK(token(anc) == "hive_path_reparse_ancestor");
+    }
+    SECTION("leaf facts") {
+        auto rp = stock();
+        rp.is_reparse = true;
+        CHECK(token(rp) == "hive_reparse_point");
+        auto dir = stock();
+        dir.is_directory = true;
+        CHECK(token(dir) == "hive_not_regular");
+        auto pipe = stock();
+        pipe.is_disk_file = false;
+        CHECK(token(pipe) == "hive_not_regular");
+        auto own = stock();
+        own.owner_sid = "S-1-5-21-1-2-3-1002";
+        CHECK(token(own) == "hive_owner_unexpected");
+        auto big = stock();
+        big.size = win::kMaxHiveBytes + 1;
+        CHECK(token(big) == "hive_oversized");
+        big.size = win::kMaxHiveBytes;
+        CHECK(token(big) == "<accepted>");
+    }
+    SECTION("redirection is judged on the final path, case-insensitively") {
+        auto other = stock();
+        other.final_path = "\\\\?\\D:\\Users\\jsmith\\NTUSER.DAT";
+        CHECK(token(other) == "hive_path_redirected");
+        auto cased = stock();
+        cased.final_path = "\\\\?\\c:\\USERS\\JSmith\\ntuser.dat";
+        CHECK(token(cased) == "<accepted>");
+        auto bare = stock();
+        bare.final_path = bare.requested_path; // missing the \\?\ prefix
+        CHECK(token(bare) == "hive_path_redirected");
+    }
+    SECTION("the order is pinned: owner before redirect before size") {
+        auto f = stock();
+        f.owner_sid = "S-1-5-21-1-2-3-1002";
+        f.final_path = "\\\\?\\D:\\x";
+        f.size = win::kMaxHiveBytes + 1;
+        CHECK(token(f) == "hive_owner_unexpected");
+        f.owner_sid = profile;
+        CHECK(token(f) == "hive_path_redirected");
+        f.final_path = stock().final_path;
+        CHECK(token(f) == "hive_oversized");
+    }
+}
+
+TEST_CASE("win::classify_stability: stable only on a created event, an armed watch and a timed-out "
+          "wait -- every other outcome refuses the source",
+          "[privacy_permissions][win_parsers]") {
+    using F = win::StabilityFacts;
+    const auto token = [](const F& f) {
+        const auto t = win::classify_stability(f);
+        return t ? *t : std::string{"<stable>"};
+    };
+    CHECK(token(F{0, 0, win::kWaitTimeout, 0}) == "<stable>");
+    CHECK(token(F{0, 0, win::kWaitObject0, 0}) == "changed_during_read");
+    CHECK(token(F{0, 0, 0xFFFFFFFFul /* WAIT_FAILED */, 6}) == "notify_wait_failed:win32_6");
+    CHECK(token(F{0, 0, 0x80ul /* WAIT_ABANDONED */, 0}) == "notify_wait_failed:win32_0");
+    CHECK(token(F{8, 0, win::kWaitTimeout, 0}) == "notify_event_failed:win32_8");
+    CHECK(token(F{0, 5, win::kWaitTimeout, 0}) == "notify_failed:win32_5");
+    CHECK(token(F{0, 87, win::kWaitObject0, 0}) == "notify_failed:win32_87");
+    CHECK(token(F{8, 5, win::kWaitObject0, 0}) == "notify_event_failed:win32_8");
+}
 
 // ── Linux-specific pure layer (shapes from a real xdg-permission-store, see the header) ─────
 
@@ -617,12 +1213,12 @@ TEST_CASE("macos::FileStamp: every field of the file stamp matters",
     CHECK(changed([](auto& s) { s.ctime_nsec += 1; }));
 }
 
-TEST_CASE("macos::OutputBudget: counts the formatted row, escapes and separator included, and is "
+TEST_CASE("OutputBudget: counts the formatted row, escapes and separator included, and is "
           "spent at the cap",
           "[privacy_permissions][macos_parsers]") {
-    CHECK(macos::kMaxRunOutputBytes == 16u * 1024u * 1024u);
-    CHECK(macos::kBudgetExceededToken == "collection:budget_exceeded");
-    macos::OutputBudget b;
+    CHECK(kMaxRunOutputBytes == 16u * 1024u * 1024u);
+    CHECK(kBudgetExceededToken == "collection:budget_exceeded");
+    OutputBudget b;
     b.max_bytes = 10;
     const std::vector<PermissionRow> rows{
         {"macos", "abcd", "camera", PermissionState::allowed, "12", "-", "-", false}};
@@ -630,7 +1226,7 @@ TEST_CASE("macos::OutputBudget: counts the formatted row, escapes and separator 
     CHECK(b.bytes == format_row(rows[0]).size() + 1);
     CHECK(b.exhausted()); // 45 bytes against a 10-byte cap: every field counts, not two of them
     // Escape expansion is charged: a pipe-dense client costs its escaped length.
-    macos::OutputBudget plain, dense;
+    OutputBudget plain, dense;
     const std::vector<PermissionRow> p{{"macos", "aaaa", "camera", PermissionState::allowed, "2",
                                         "-", "-", false}};
     const std::vector<PermissionRow> d{{"macos", "||||", "camera", PermissionState::allowed, "2",
@@ -638,7 +1234,7 @@ TEST_CASE("macos::OutputBudget: counts the formatted row, escapes and separator 
     plain.charge(p);
     dense.charge(d);
     CHECK(dense.bytes == plain.bytes + 4);
-    CHECK_FALSE(macos::OutputBudget{}.exhausted());
+    CHECK_FALSE(OutputBudget{}.exhausted());
 }
 
 TEST_CASE("macos::path_under_network_mount: a network mount at or above the path refuses it, on a "
@@ -793,9 +1389,9 @@ TEST_CASE("macos::sort_grants: client order, ties broken by auth_value (NULL fir
     CHECK(g[3].client == "b");
 }
 
-TEST_CASE("macos::OutputBudget::charge allocates (format_row), so it must not be noexcept",
+TEST_CASE("OutputBudget::charge allocates (format_row), so it must not be noexcept",
           "[privacy_permissions][macos_parsers]") {
-    macos::OutputBudget b;
+    OutputBudget b;
     static_assert(!noexcept(b.charge(std::span<const PermissionRow>{})));
     CHECK(b.bytes == 0);
 }

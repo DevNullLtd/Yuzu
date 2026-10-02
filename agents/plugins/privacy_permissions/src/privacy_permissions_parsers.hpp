@@ -39,6 +39,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -214,6 +215,31 @@ inline void fill_uncovered_categories(std::string_view os, std::vector<Permissio
         if (!covered) rows.push_back({os, "-", cat, PermissionState::absent, "-", "-", "-", false});
     }
 }
+
+// ── run-wide output budget (shared by every leg) ────────────────────────
+
+inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
+inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
+
+/// Run-wide bound on the bytes a leg puts on the wire: each row is charged at its formatted
+/// length (every field, escaping and separator). macOS checks it between sources, so the one
+/// source that crosses it (itself bounded) is kept; Windows asks would_exceed() before a
+/// profile's rows are emitted, and charges the machine-wide rows first so they always fit.
+struct OutputBudget {
+    std::size_t max_bytes = kMaxRunOutputBytes;
+    std::size_t bytes = 0;
+
+    [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
+    [[nodiscard]] static std::size_t cost(std::span<const PermissionRow> rows) {
+        std::size_t n = 0;
+        for (const auto& r : rows) n += format_row(r).size() + 1; // +1: the row separator
+        return n;
+    }
+    [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
+        return cost(rows) > max_bytes - std::min(bytes, max_bytes);
+    }
+    void charge(std::span<const PermissionRow> rows) { bytes += cost(rows); } // allocates
+};
 
 // ── status selection (pure; the one decision every leg shares) ──────────
 
