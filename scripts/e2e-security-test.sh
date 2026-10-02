@@ -582,7 +582,7 @@ if curl_at_least 7 68; then
         -X POST -d 'username=ratelimit_test&password=bad' \
         "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null || true)
 fi
-if grep -q '^429 ' <<< "$RATELIMIT_OUT"; then
+if grep -Eq '^429( |$)' <<< "$RATELIMIT_OUT"; then
     GOT_429=true
 fi
 if grep -Eq '^429 [0-9]+' <<< "$RATELIMIT_OUT"; then
