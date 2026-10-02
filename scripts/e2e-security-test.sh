@@ -586,9 +586,9 @@ RATELIMIT_RC=0
 if curl_at_least 7 68; then
     # 300 concurrent sockets need more than macOS's default 256 descriptors: without
     # headroom most transfers come back 000 and the failure reads as "limiter off".
-    FD_LIMIT=$(ulimit -n)
+    FD_LIMIT=$(ulimit -Sn)
     if [[ $FD_LIMIT =~ ^[0-9]+$ ]] && (( FD_LIMIT < 1024 )); then
-        ulimit -n 1024 2>/dev/null || true
+        ulimit -Sn 1024 2>/dev/null || true
     fi
     RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
         --max-time 60 -o /dev/null -w "$RATELIMIT_FMT" \
