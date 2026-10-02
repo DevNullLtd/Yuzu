@@ -10949,8 +10949,8 @@ TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a mono
                                    std::chrono::seconds(10)));
     // The backend's disarm counter flips BEFORE the runtime's completion callback
     // decrements the retained count and pops the claim, so asserting them right after
-    // that spin raced the callback (3 of 60 idle TSan runs: `disarm_retained() == 0`
-    // read 1). Wait on the lifecycle state itself.
+    // that spin raced the callback (`disarm_retained() == 0` read 1 under TSan). Wait on
+    // the lifecycle state itself.
     const auto key = spark_key(file_spec("/a"));
     REQUIRE(yuzu::test::spin_until(
         [&] { return rt->disarm_retained() == 0 && rt->claim_queue_depth_for_test(key) == 0; },
