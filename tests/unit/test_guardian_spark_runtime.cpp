@@ -7375,6 +7375,11 @@ TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while 
             ::_exit(96);
         if (rt->armed_key_count() != 1 || b->arms.load() != 2)
             ::_exit(97);
+        // Join before _exit: TSan's _exit interceptor runs its finalizer, which reports an
+        // unjoined (even if finished) thread as a "thread leak" and exits 66 - the child
+        // would then fail the parent's exit-0 check on every nightly TSan run. a_done is
+        // already true here, so this returns immediately.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
@@ -7502,6 +7507,9 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
         // without the underlying double-disarm itself being fixed.
         if (b->disarms.load() > 1)
             ::_exit(98); // a second, redundant disarm landed - the double-disarm bug is back
+        // Join before _exit (same reason as Unit 4 above): TSan reports an unjoined thread at
+        // the _exit finalizer and exits 66. a_done is already true, so this is immediate.
+        a_thread.join();
         rt->begin_stop();
         ::_exit(0);
     }
@@ -10974,8 +10982,16 @@ TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a mono
     REQUIRE(rt->redrive_retained_disarms() == 1);
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
+    // The backend's disarm counter flips BEFORE the runtime's completion callback
+    // decrements the retained count and pops the claim, so asserting them right after
+    // that spin raced the callback (`disarm_retained() == 0` read 1 under TSan). Wait on
+    // the lifecycle state itself.
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->disarm_retained() == 0 && rt->claim_queue_depth_for_test(key) == 0; },
+        std::chrono::seconds(10)));
     CHECK(rt->disarm_retained() == 0);
-    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
 
 TEST_CASE("up-5 (#4221): the convergence lane's priority loop redrives a retained disarm "
