@@ -50,7 +50,7 @@ CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
 # case-name specs still never match (no leading '['), so a case name is never
 # mistaken for a strippable spec — the invariant _cmd_without_test_specs and
 # the isolated retry rely on (a recognised spec is always stripped, so it can
-# never OR with the retried case name).
+# never be combined with the retried case name).
 CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
@@ -248,8 +248,9 @@ def introspect_tests(builddir):
 
 def match_suite(failed_name, tests):
     """Map a meson-junit failed-suite name to its introspected test (cmd/env)."""
-    # meson junit names look like "agent - yuzu:agent unit tests"; the
-    # introspect `name` ("agent unit tests") is a substring. Longest match wins.
+    # meson junit names look like "agent - yuzu:agent unit tests shard A"; the
+    # introspect `name` ("agent unit tests shard A") is a substring. Longest match
+    # wins (so an entry name must never be a substring of another entry's name).
     best = None
     for t in tests:
         n = t.get("name", "")
@@ -263,8 +264,10 @@ def _cmd_without_test_specs(cmd):
     """cmd minus positional Catch2 tag-filter specs.
 
     Sharded meson entries (#2092) carry a tag spec ('~[pg]' / '[pg]') in their
-    args, and Catch2 ORs positional test specs — appending a case name to the
-    introspected cmd would re-run the whole shard ∪ case. The isolated retry
+    args, and Catch2 ANDs positional test specs (verified: `'[spark]' '[guardian]'`
+    lists only the cases carrying BOTH). Appending a case name to the introspected
+    cmd would run only the cases matching both the shard filter and the name, so a
+    retried case outside the shard's filter would zero-match. The isolated retry
     must REPLACE the shard filter with the case name. argv[0] and option args
     are never touched."""
     if not cmd:

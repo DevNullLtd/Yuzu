@@ -6120,6 +6120,23 @@ TEST_CASE("rung 9c R5.2 (governance Gate 4 hp-1): a rule re-pushed from one key 
     // r2's arm on /b dispatches.
     const auto gen = rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
     REQUIRE(gen);
+    // attach_rule() waits only on r2's own arm claim on /b, which is queued behind /b's
+    // retained disarm. The /a prior-generation disarm is submitted off-lock as a separate
+    // task and nothing in attach_rule() waits on it, so it can still be in flight here.
+    // Wait for both disarms to land and both claim queues to drain before asserting on
+    // their effects.
+    const bool disarms_landed = yuzu::test::spin_until(
+        [&] {
+            return b->disarms.load() == 2 &&
+                   rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0 &&
+                   rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))) == 0;
+        },
+        std::chrono::seconds(10));
+    // Sampled after the wait so a timeout reports where it got stuck.
+    INFO("disarms=" << b->disarms.load()
+                    << " depth(/a)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/a")))
+                    << " depth(/b)=" << rt->claim_queue_depth_for_test(spark_key(file_spec("/b"))));
+    REQUIRE(disarms_landed);
     CHECK(b->disarms.load() == 2);
     CHECK(b->arms.load() == 3);
     REQUIRE(b->armed_ids().size() == 3);
@@ -10614,7 +10631,13 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id target
     auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/b"),
                                 file_exists_rule("r1"), true);
     REQUIRE(res2.has_value());
-    CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted); // off-lock dispatch, ordinary
+    // The /b arm is NOT hung (hang_next_arm was consumed by /a's), so its detached worker
+    // can finish before attach_rule() re-locks registry_mu_. attach_rule(NonWaiting) then
+    // returns Armed with an empty receipt rather than Accepted; both are the ordinary
+    // off-lock-dispatch outcome and this test is about the absence of any wedge
+    // interaction, not about which one the scheduler produces. Only an Accepted result
+    // carries a receipt to poll.
+    const bool res2_accepted = res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted;
     CHECK(rt->wedged_reobservations() == 0);
     CHECK(rt->wedged_refusals() == 0);
     // The old key's wedged head is untouched: detach_rule_locked("r1") (Case 0,
@@ -10623,10 +10646,22 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id target
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 1);
     CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
-    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+    if (res2_accepted) {
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+                                       std::chrono::seconds(10)));
+        CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    } else {
+        // Armed: the arm already committed before attach_rule() returned, so there is no
+        // receipt to poll. The commit evidence the Accepted branch gets from its receipt
+        // comes from the outcome instead: a real generation was assigned, and rule r1 is
+        // registered as the committed generation (rule_active_for_test() is nullopt for
+        // an uncommitted or absent rule).
+        CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed);
+        CHECK(res2->generation != 0);
+        CHECK(rt->rule_active_for_test("r1").has_value());
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
-    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
-    CHECK(rt->rule_count() == 1);
 
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
