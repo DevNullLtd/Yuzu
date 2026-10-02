@@ -1918,7 +1918,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1935,7 +1935,8 @@ void RestApiV1::register_routes(
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn),
                     std::move(verify_api), std::move(device_api),
-                    std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api));
+                    std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api),
+                    std::move(tier_policy_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1961,7 +1962,7 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -10724,6 +10725,47 @@ void RestApiV1::register_routes(
             return row;
         };
 
+        // #5047: the C8 tier/approval belt, applied to the 4 write routes
+        // below (create/pin/unpin/delete) even though this family has no
+        // `perm_fn`/RBAC gate at all — ownership is the primary gate, by
+        // design (see the "Per-operator, owner-scoped result sets" comment
+        // above). Without this, an MCP-tiered bearer token (e.g. supervised,
+        // which is approval-gated for Delete via MCP's ticket-then-recall
+        // flow) could reach the identical mutation unrestricted by calling
+        // REST instead — TierPolicyFn's doc comment (auth_routes.hpp) has
+        // the full contract; `{}` unwired fails closed (503) for a TIERED
+        // caller only, since an untiered/plain-RBAC session has nothing this
+        // belt enforces.
+        auto tier_ok = [tier_policy_fn, rs_err, audit_fn](const httplib::Request& req,
+                                                          httplib::Response& res,
+                                                          const auth::Session& session,
+                                                          const std::string& securable_type,
+                                                          const std::string& operation) -> bool {
+            if (tier_policy_fn)
+                return tier_policy_fn(req, res, session, securable_type, operation);
+            if (!session.mcp_tier.empty()) {
+                // A degraded/misconfigured security control (the belt this
+                // whole route family exists to add just stopped being
+                // enforceable) MUST leave an evidence trail, not just a
+                // test-covered response — audited so a SOC 2 review of
+                // "does every access-control degradation get logged" finds
+                // this branch (#5047 governance fix round). Routed through
+                // try_persist_audit (not a bare audit_fn call, Gate 8 UP-10):
+                // this handler installs no exception_handler_ of its own, so
+                // an audit sink that throws must not be allowed to replace
+                // the intended 503 with httplib's bare, undetailed default
+                // 500 (see `deny_fleet_wide_service_scoped`'s identical
+                // rationale above for the precedent).
+                (void)detail::try_persist_audit(
+                    audit_fn, req, "result_set.tier_policy_unavailable", "failure", "ResultSet",
+                    "", "tier-policy check misconfigured (unwired TierPolicyFn)");
+                rs_err(res, 503,
+                       "RESULT_SET_TIER_POLICY_UNAVAILABLE: tier-policy check misconfigured");
+                return false;
+            }
+            return true;
+        };
+
         // Resolve a parent reference (canonical `rs_` id OR a per-operator
         // alias — design §2 "Source query" / §4.1) to a canonical owned id.
         // Alias pre-resolution at the dispatch layer is the right place: the
@@ -11205,7 +11247,7 @@ void RestApiV1::register_routes(
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
                   [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
-                   load_owned, deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   load_owned, deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                                httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding — same cross-
             // service reach as the GET list above (session->username-keyed,
@@ -11220,6 +11262,8 @@ void RestApiV1::register_routes(
                 return;
             auto session = auth_fn(req, res);
             if (!session)
+                return;
+            if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                 return;
             // #2437-class guard: check nesting on the RAW body BEFORE parse.
             // A parsed-then-dumped subtree still crashes on the dump - the
@@ -12449,7 +12493,7 @@ void RestApiV1::register_routes(
         // POST /api/v1/result-sets/{id}/pin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
                   [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
-                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                    httplib::Response& res) {
                       // guardian-confinement-2298 PR3 §3e sweep finding: see the
                       // GET list handler above for the cross-service-reach reasoning.
@@ -12461,6 +12505,8 @@ void RestApiV1::register_routes(
                           return;
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                           return;
                       auto id = req.matches[1].str();
                       auto row = load_owned(req, id, session->username, res);
@@ -12479,7 +12525,7 @@ void RestApiV1::register_routes(
         // POST /api/v1/result-sets/{id}/unpin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
                   [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
-                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                   deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                    httplib::Response& res) {
                       // guardian-confinement-2298 PR3 §3e sweep finding: see the
                       // GET list handler above for the cross-service-reach reasoning.
@@ -12491,6 +12537,8 @@ void RestApiV1::register_routes(
                           return;
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      if (!tier_ok(req, res, *session, "Infrastructure", "Write"))
                           return;
                       auto id = req.matches[1].str();
                       auto row = load_owned(req, id, session->username, res);
@@ -12508,7 +12556,7 @@ void RestApiV1::register_routes(
         // DELETE /api/v1/result-sets/{id}
         sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
                     [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
-                     deny_fleet_wide_service_scoped](const httplib::Request& req,
+                     deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
                                                      httplib::Response& res) {
                         // guardian-confinement-2298 PR3 §3e sweep finding: see the
                         // GET list handler above for the cross-service-reach reasoning.
@@ -12520,6 +12568,8 @@ void RestApiV1::register_routes(
                             return;
                         auto session = auth_fn(req, res);
                         if (!session)
+                            return;
+                        if (!tier_ok(req, res, *session, "Infrastructure", "Delete"))
                             return;
                         auto id = req.matches[1].str();
                         auto row = load_owned(req, id, session->username, res);

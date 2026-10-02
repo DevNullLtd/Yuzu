@@ -436,17 +436,28 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
         // 1h-window loop), system.* (process_health_sampler).
         if (is_authenticated) {
             int pending_count = 0;
+            // WS-6 6.2: an unreadable store is UNKNOWN (JSON null), never 0 — a 0
+            // would tell the operator nothing is awaiting approval when the truth
+            // is that the enrollment store could not be read.
+            bool pending_known = true;
             // `deps.auth_mgr` null-guarded — deliberate non-verbatim
             // addition, same rationale as `default_cert_set` above
             // (`auth_mgr_` was a reference member, never null).
             if (deps.auth_mgr) {
                 auto pending_agents = deps.auth_mgr->list_pending_agents();
-                for (const auto& a : pending_agents) {
-                    if (a.status == auth::PendingStatus::pending)
-                        ++pending_count;
+                if (pending_agents) {
+                    for (const auto& a : *pending_agents) {
+                        if (a.status == auth::PendingStatus::pending)
+                            ++pending_count;
+                    }
+                } else {
+                    pending_known = false;
                 }
             }
-            health["agents"]["pending"] = pending_count;
+            if (pending_known)
+                health["agents"]["pending"] = pending_count;
+            else
+                health["agents"]["pending"] = nullptr;
 
             int in_flight = 0;
             int completed_last_hour = 0;

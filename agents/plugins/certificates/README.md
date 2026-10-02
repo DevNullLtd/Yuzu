@@ -244,5 +244,4 @@ error|thumbprint parameter required
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
 - Tests: `tests/unit/test_certificates_linux_store.cpp` · `tests/unit/test_certificates_macos.cpp` · `tests/unit/test_certificates_macos_actions.cpp` · `tests/unit/test_certificates_store_honesty.cpp` · `tests/unit/test_certificates_x509.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/20260817-wave2-certificates-in-process-x509.changed.md` · `changelog.d/20260914-certificates-store-honesty-sentinels.changed.md` · `changelog.d/2318-certificates-keychain-honesty.fixed.md` · `changelog.d/3245-certificates-linux-delete-toctou.fixed.md` · `changelog.d/3246-certificates-bounded-keychain-read.fixed.md` · `changelog.d/3247-certificates-windows-thumbprint-case.fixed.md` · `changelog.d/3406-certificates-login-keychain-argv.changed.md` · `changelog.d/4374-certificates-macos-orchestration-tests.added.md` · `changelog.d/4377-certificates-windows-delete-fail-closed.fixed.md` · `changelog.d/4446-certificates-linux-windows-followups.fixed.md`
 <!-- END GENERATED -->

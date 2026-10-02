@@ -364,12 +364,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/20260817-wave2-discovery-native-arp-icmp.changed.md",
-      "changelog.d/3064-discovery-scan-honest-failure.changed.md",
-      "changelog.d/3064-discovery-store-postgres.changed.md",
-      "changelog.d/3253-discovery-degrade-tie-break.fixed.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/discovery.yaml"
     ],

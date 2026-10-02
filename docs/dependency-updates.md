@@ -12,7 +12,7 @@ tells you where it belongs.
 |-------------------|-----------------------------------------------|----------------------------------------------------------------------------------------------|
 | GitHub Actions    | `uses: ...@vX` in every `.github/workflows/*` | Dependabot (weekly) — `.github/dependabot.yml` `github-actions` entry                         |
 | Windows SDK       | `10.0.26100.0` in the Windows build/provisioning contract | Deliberate reviewed PR; `tests/test_windows_sdk_contract.py` prevents drift (Dependabot tracks the MSVC action, not its `with.sdk` input) |
-| Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry                                 |
+| Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry. Digest refreshes flow; the `erlang` major, the `ubuntu` major/minor and the `alpine` major/minor are ignored there and moved by hand. The gateway's `alpine` runtime must stay on the `erlang:28-alpine` builder's Alpine release until the gateway is on OTP 29.1 or newer (#2150; `Dockerfile.gateway`'s abi-guard enforces it) |
 | Python tooling    | `requirements-ci.txt` (repo root)             | Dependabot (weekly) — `.github/dependabot.yml` `pip` entry                                    |
 | npm tooling       | `package-lock.json` in `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` | Dependabot (weekly, grouped per directory) — `.github/dependabot.yml` `npm` entry; see "npm tooling" below |
 | vcpkg baseline    | `vcpkg.json` `builtin-baseline`               | Scheduled workflow — `.github/workflows/vcpkg-baseline-update.yml` (monthly PR, hands-off)     |
@@ -65,9 +65,15 @@ is stored in two files at the repo root:
 
 These are consumed by:
 
-- `.github/workflows/ci.yml` — all six jobs `pip3/pip/pipx install` from it
-  (with `--require-hashes` so a tampered package breaks the install).
-- `.github/workflows/release.yml` — Windows and macOS release builds.
+- `.github/workflows/ci.yml` — the Linux and macOS jobs `pip3/pip/pipx install`
+  from it (with `--require-hashes` so a tampered package breaks the install).
+- `.github/workflows/release.yml` — the Linux and macOS release builds.
+
+The Windows jobs in both workflows install nothing from it: they use the
+runner's pre-provisioned toolchain, whose meson is pinned separately by
+`deploy/windows/toolchain-contract.json` (see `docs/windows-build.md`). A
+meson bump here therefore does not reach Windows until the contract and the
+runner are updated to match.
 
 `scripts/setup.sh` assumes a `meson` binary is already on PATH and does
 not install one — local developers are responsible for matching the

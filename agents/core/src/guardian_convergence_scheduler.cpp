@@ -139,6 +139,12 @@ void ConvergenceScheduler::priority_loop() {
         if (now >= next_redrive_) {
             next_redrive_ = now + std::chrono::milliseconds(std::max<std::uint64_t>(1, cfg_.priority_poll_ms));
             firewalled_sweep([this] { rt_.redrive_retained_disarms(); });
+            // #5168: last-resort sweep for arms parked after a congestion refusal. The
+            // prompt paths are the runtime's permit-release / quota-release hooks; this
+            // pass adopts and redrives a parked arm that nothing else released a permit
+            // for. Its cadence (~5 s, jittered) is NOT shorter than the claim deadline,
+            // so it cannot promise to beat it. Own firewalled sweep, as above.
+            firewalled_sweep([this] { rt_.redrive_parked_arms(); });
         }
     }
 }

@@ -763,17 +763,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [
-      "changelog.d/1788-quarantine-rest-scoped-gate.security.md",
-      "changelog.d/20260814-quarantine-store-postgres.changed.md",
-      "changelog.d/20260818-wave2-quarantine-native-argv.changed.md",
-      "changelog.d/3127-mcp-quarantine-phantom-isolation.fixed.md",
-      "changelog.d/3282-linux-ipv6-quarantine.security.md",
-      "changelog.d/3284-windows-quarantine-precedence.security.md",
-      "changelog.d/3286-quarantine-mutation-serialization.fixed.md",
-      "changelog.d/3425-quarantine-reapply-on-reconnect.security.md",
-      "changelog.d/881-quarantine-dispatch-enforcement.security.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/quarantine.yaml"
     ],

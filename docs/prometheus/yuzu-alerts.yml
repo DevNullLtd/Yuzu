@@ -120,10 +120,17 @@ groups:
         annotations:
           summary: "Gateway metrics endpoint is down"
           description: >-
-            Prometheus cannot scrape the gateway (:9568). The gateway process
-            is down, crash-looping, or refusing to boot — including a #1422
+            Prometheus cannot scrape the gateway (:9568). Either /metrics
+            itself is failing while the gateway runs (check
+            `curl -i http://<gateway-host>:9568/metrics`; 0.14.0-rc1..rc3
+            returned 500 on every scrape, #5177; agents are unaffected in that
+            case), or the gateway process is down, crash-looping, or refusing
+            to boot — including a #1422
             mgmt-listener posture refusal (gateway log: "Refusing to start:
-            management listener"). While it is down, agents through this
+            management listener"), or, on an AMX-capable Intel host with a
+            0.13.0..0.14.0-rc4 image, beam aborting at boot (gateway log:
+            "sys_sigaltstack(): Internal error", #2150; see "Gateway
+            Disconnections" in docs/operations/troubleshooting.md). While it is down, agents through this
             gateway are stranded and command forwarding is dead.
 
       # #1422 mgmt-plane peer pin: any rejection is either a probing CA-cert
@@ -4174,6 +4181,24 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+      - alert: YuzuEnrollmentStoreDegraded
+        expr: |
+          increase(yuzu_auth_enrollment_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable enrollment store degraded on the auth hot path (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            An enrollment/pending-agent store operation ({{ $labels.op }}) hit a
+            degraded PostgreSQL read/write for 10m (WS-6 6.2). Every enrollment/
+            pending call fails CLOSED on a degrade — agent `Register` returns
+            gRPC `UNAVAILABLE` instead of silently enrolling/denying, and the
+            admin dashboard/REST surface returns 503 rather than an empty or
+            stale list. Caller-input rejections are not counted here (`reason`
+            is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
+            case). Usually PostgreSQL pool saturation / failover — correlate
+            with the pool metrics.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416

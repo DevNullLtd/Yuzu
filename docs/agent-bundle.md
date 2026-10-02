@@ -128,6 +128,10 @@ LD_LIBRARY_PATH="$PWD/bin" ./bin/yuzu-agent \
 Persistent: `sudo apt-get install ./installers/<deb>` (or `dnf install ./installers/<rpm>`),
 then `sudo systemctl edit yuzu-agent` to set `--server`/`--enrollment-token`
 (+ `--no-tls` for the demo) and `sudo systemctl enable --now yuzu-agent`.
+Two known limits: the RPM installs but its service does not start yet (the
+unit expects `/usr/local/bin`, the RPM installs to `/usr/bin`, #4916), and the
+Linux binaries need glibc 2.38 or newer, so neither package nor the payload
+runs on RHEL/Rocky 9, Ubuntu 22.04 or Debian 12 yet (#5143).
 
 **macOS** — foreground (demo):
 ```bash
@@ -152,6 +156,27 @@ config page), or fully unattended —
 `installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
 Service name `YuzuAgent`.
+If a silent install exits with code **7** and its `/LOG=` log says "The update
+trust-anchor directory is not secured", the installer refused to continue
+because it could not confirm that only Administrators and SYSTEM can write
+`%ProgramData%\Yuzu\agent-certs`. The lines after it give the directory and
+then the reason. Installers from 0.14.0-rc1 to rc3 also hit this when started from
+PowerShell 7 through another process (#5176): run them from a new
+`powershell.exe` or `cmd.exe` window that was not itself started from
+PowerShell 7, or use a later installer.
+
+Uninstall: `"C:\Program Files\Yuzu\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES`
+(add `/LOG=<path>` to keep a log; if the agent was installed to another
+directory, use the path in its `UninstallString` registry value). A silent
+uninstall removes the program but **keeps `%ProgramData%\Yuzu`**, which holds
+the agent's identity and its mTLS private key; an interactive uninstall asks. To
+decommission a device, revoke its certificate on the server (find its serial in
+`GET /api/v1/ca/issued`, then `POST /api/v1/ca/revoke`; see
+`docs/user-manual/device-management.md`) and delete that directory. Revocation
+alone does not disconnect an agent that reaches the server through a gateway;
+see "Gateway-proxied agents: revocation scope" in `docs/auth-architecture.md`.
+Uninstallers from releases up to 0.14.0-rc2 hang on a silent uninstall (#5147) —
+upgrade first.
 
 ## Verify integrity
 

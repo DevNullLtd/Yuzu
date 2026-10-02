@@ -330,9 +330,7 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_browser_policy.hpp"
     ],
-    "changelog": [
-      "changelog.d/wave10-pr10.2b-browser_policy.added.md"
-    ],
+    "changelog": [],
     "definitions": [
       "content/definitions/browser_policy.yaml"
     ],
