@@ -486,7 +486,7 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
 ) &
 
 # Instructions content-suite gate — schema-driven REST exerciser.
-# Drives every safe + mutating InstructionDefinition the runner can dispatch (safe + mutating by default) and
+# Drives every default-risk (safe + mutating) InstructionDefinition and
 # records per-instruction pass/fail/timing into the test-runs DB.
 # The destructive, forensic, server-internal, interactive and network-disrupt
 # classes are opt-in via --risks; default-mode invocation excludes them.
