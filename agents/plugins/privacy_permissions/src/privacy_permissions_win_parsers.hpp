@@ -429,6 +429,9 @@ struct RawGrant {
 inline constexpr std::uint32_t kDriveFixed = 3; // DRIVE_FIXED
 inline constexpr std::size_t kMaxHivePathDepth = 32;
 inline constexpr std::uint64_t kMaxHiveBytes = 512ull * 1024ull * 1024ull;
+/// A stock profile directory holds a handful of `<hive>*` transaction-log sidecars (.LOG1/.LOG2,
+/// .TM.blf, .TMContainer*.regtrans-ms); more than this is refused rather than walked.
+inline constexpr std::size_t kMaxHiveSidecars = 64;
 inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
 
@@ -455,6 +458,12 @@ struct HiveFileFacts {
     std::string profile_sid;
     bool final_path_matches = true;
     std::uint64_t size = 0;
+    /// Facts about the `<hive file name>*` entries beside the leaf (the sidecars the kernel opens
+    /// or creates, following any link, during RegLoadKeyW): a reparse point, a hard-linked file,
+    /// or more than kMaxHiveSidecars of them. A missing sidecar is fine, so none is the default.
+    bool sidecar_reparse = false;
+    bool sidecar_hardlinked = false;
+    std::size_t sidecar_count = 0;
 };
 
 /// Hive-refusal token literals (the cause after `<profile>:`).
@@ -468,6 +477,9 @@ inline constexpr std::string_view kHiveNotResident = "hive_not_resident";
 inline constexpr std::string_view kHiveOwnerUnexpected = "hive_owner_unexpected";
 inline constexpr std::string_view kHivePathRedirected = "hive_path_redirected";
 inline constexpr std::string_view kHiveOversized = "hive_oversized";
+inline constexpr std::string_view kHiveSidecarReparse = "hive_sidecar_reparse";
+inline constexpr std::string_view kHiveSidecarHardlinked = "hive_sidecar_hardlinked";
+inline constexpr std::string_view kHiveSidecarCount = "hive_sidecar_count";
 inline constexpr std::string_view kHiveIdentityChanged = "hive_identity_changed";
 inline constexpr std::string_view kHiveTimeout = "timeout";
 
@@ -492,6 +504,9 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
     if (!hive_owner_allowed(f.owner_sid, f.profile_sid)) return std::string{kHiveOwnerUnexpected};
     if (!f.final_path_matches) return std::string{kHivePathRedirected};
     if (f.size > kMaxHiveBytes) return std::string{kHiveOversized};
+    if (f.sidecar_reparse) return std::string{kHiveSidecarReparse};
+    if (f.sidecar_hardlinked) return std::string{kHiveSidecarHardlinked};
+    if (f.sidecar_count > kMaxHiveSidecars) return std::string{kHiveSidecarCount};
     return std::nullopt;
 }
 

@@ -433,6 +433,40 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hive file over the s
     CHECK(guard.before_load(hd.file.wstring()) == "hive_oversized");
 }
 
+TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or hard-linked sidecar "
+          "and an over-cap sidecar count, and accepts a regular one",
+          "[privacy_permissions][win_internals]") {
+    HiveDir hd;
+    const std::string sid = own_sid_string();
+    const fs::path log1 = hd.dir / "hive.bin.LOG1"; // `<hive file name>.LOG1`, as the kernel names it
+    win::RetentionBudget budget;
+    HiveFileGuard guard{budget, sid, 0, std::nullopt};
+
+    SECTION("a regular sidecar is what the kernel creates: accepted") {
+        { std::ofstream(log1, std::ios::binary) << "log"; }
+        CHECK(guard.before_load(hd.file.wstring()) == "");
+    }
+    SECTION("a hard-linked sidecar is refused") {
+        if (!CreateHardLinkW(log1.c_str(), hd.file.c_str(), nullptr))
+            SKIP("the temp volume cannot hard-link (win32 " << GetLastError() << ")");
+        CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_hardlinked");
+    }
+    SECTION("a dangling symlink sidecar is refused and its target is never created") {
+        const fs::path target = hd.dir / "dangling.bin";
+        std::error_code ec;
+        fs::create_symlink(target, log1, ec);
+        if (ec)
+            SKIP("a symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode: " << ec.message());
+        CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_reparse");
+        CHECK_FALSE(fs::exists(target));
+    }
+    SECTION("more than kMaxHiveSidecars sidecar-named entries are refused") {
+        for (std::size_t i = 0; i <= win::kMaxHiveSidecars; ++i)
+            std::ofstream(hd.dir / ("hive.bin.LOG" + std::to_string(i)), std::ios::binary) << "log";
+        CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_count");
+    }
+}
+
 TEST_CASE("privacy_permissions win: HiveFileGuard reads the owner from the file, not the profile",
           "[privacy_permissions][win_internals]") {
     HiveDir hd;

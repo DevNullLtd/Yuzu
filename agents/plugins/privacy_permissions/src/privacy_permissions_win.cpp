@@ -20,10 +20,12 @@
  * is refused, every ancestor directory is opened hop by hop from the drive root and refused if it
  * is a reparse point (no hop follows a junction/symlink), and the NTUSER.DAT leaf is checked from
  * its own handle (not a reparse point, a regular disk file, owner = the profile / LocalSystem /
- * Administrators, final path == requested path, size cap). RegLoadKeyW is path-based, so the same
+ * Administrators, final path == requested path, size cap) and the `<leaf>*` transaction-log
+ * sidecars beside it (the kernel follows a planted link there, as SYSTEM) are refused if a
+ * reparse point or hard-linked, or if there are more than 64. RegLoadKeyW is path-based, so the same
  * file identity is re-verified after the load and a mismatch is unloaded unread
  * (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in that
- * window, as it does for every `reg load`.
+ * window, as it does for every `reg load`; a sidecar swapped in after its check is likewise open.
  *
  * STABILITY: a RegNotifyChangeKeyValue watch is armed on each ConsentStore root before its walk
  * and polled after; a change the API reports refuses that source (`changed_during_read`), and a
@@ -376,6 +378,18 @@ struct UniqueHandle {
     [[nodiscard]] bool ok() const noexcept { return h != INVALID_HANDLE_VALUE; }
 };
 
+/// Owns a FindFirstFileExW search handle: FindClose (not CloseHandle) on every exit path.
+struct FindHandle {
+    HANDLE h;
+    explicit FindHandle(HANDLE x) noexcept : h(x) {}
+    ~FindHandle() {
+        if (h != INVALID_HANDLE_VALUE) FindClose(h);
+    }
+    FindHandle(const FindHandle&) = delete;
+    FindHandle& operator=(const FindHandle&) = delete;
+    [[nodiscard]] bool ok() const noexcept { return h != INVALID_HANDLE_VALUE; }
+};
+
 /// Owns an allocation the OS handed back to be released with LocalFree (a security descriptor from
 /// GetSecurityInfo, a string from ConvertSidToStringSidW); null is a no-op.
 struct LocalFreeGuard {
@@ -483,6 +497,46 @@ struct HiveFileGuard {
         return {};
     }
 
+    /// Fills the sidecar facts from the `<leaf>*` entries of `dir` (the kernel's transaction-log
+    /// sidecars: `<hive>.LOG1`, `<hive>{guid}.TM.blf`, ...; RegLoadKeyW opens or creates them
+    /// following any link, so a planted symlink is a SYSTEM-privileged create/write primitive).
+    /// A reparse point is read from the find data (no open); a hard link needs an attribute-only
+    /// open. A sidecar that does not exist is fine. "" or a token.
+    std::string read_sidecars(const std::wstring& dir, const std::wstring& leaf,
+                              win::HiveFileFacts& f) {
+        const std::wstring base = dir.ends_with(L'\\') ? dir : dir + L"\\";
+        WIN32_FIND_DATAW fd{};
+        const FindHandle find{FindFirstFileExW((base + leaf + L"*").c_str(), FindExInfoBasic, &fd,
+                                               FindExSearchNameMatch, nullptr, 0)};
+        if (!find.ok()) {
+            const DWORD rc = GetLastError();
+            return (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_NO_MORE_FILES) ? std::string{}
+                                                                             : stat_failed(rc);
+        }
+        do {
+            const std::wstring name = fd.cFileName;
+            if (name == L"." || name == L".." ||
+                CompareStringOrdinal(name.c_str(), static_cast<int>(name.size()), leaf.c_str(),
+                                     static_cast<int>(leaf.size()), TRUE) == CSTR_EQUAL)
+                continue;
+            if (++f.sidecar_count > win::kMaxHiveSidecars) return {}; // classify_hive_file refuses
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                f.sidecar_reparse = true;
+                return {};
+            }
+            const UniqueHandle h = open_attr(base + name, FILE_READ_ATTRIBUTES);
+            if (!h.ok()) return stat_failed(GetLastError());
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(h.h, &info)) return stat_failed(GetLastError());
+            if (info.nNumberOfLinks > 1) {
+                f.sidecar_hardlinked = true;
+                return {};
+            }
+        } while (FindNextFileW(find.h, &fd));
+        const DWORD rc = GetLastError();
+        return rc == ERROR_NO_MORE_FILES ? std::string{} : stat_failed(rc);
+    }
+
     std::string before_load(const std::wstring& path) {
         // FIRST: the deadline (after the lock wait and privilege enable, before any file syscall).
         if (budget.expired()) return std::string{win::kHiveTimeout};
@@ -532,6 +586,8 @@ struct HiveFileGuard {
 
         FILE_ID_INFO id{};
         if (auto t = read_leaf(path, f, id); !t.empty()) return t;
+        // `cur` is the leaf's directory, already hop-verified above.
+        if (auto t = read_sidecars(cur, parts.back(), f); !t.empty()) return t;
         if (const auto t = win::classify_hive_file(f)) return *t;
         snapshot = id;
         return {}; // the leaf handle is closed here: RegLoadKeyW needs exclusive access

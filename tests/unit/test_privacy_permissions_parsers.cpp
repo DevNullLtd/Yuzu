@@ -857,7 +857,21 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes;
         CHECK(token(big) == "<accepted>");
     }
-    SECTION("the order is pinned: owner before redirect before size") {
+    SECTION("sidecar facts") {
+        auto rp = stock();
+        rp.sidecar_reparse = true;
+        CHECK(token(rp) == "hive_sidecar_reparse");
+        auto hl = stock();
+        hl.sidecar_hardlinked = true;
+        CHECK(token(hl) == "hive_sidecar_hardlinked");
+        auto many = stock();
+        many.sidecar_count = win::kMaxHiveSidecars;
+        CHECK(win::kMaxHiveSidecars == 64);
+        CHECK(token(many) == "<accepted>");
+        many.sidecar_count = win::kMaxHiveSidecars + 1;
+        CHECK(token(many) == "hive_sidecar_count");
+    }
+    SECTION("the order is pinned: owner before redirect before size before the sidecars") {
         auto f = stock();
         f.owner_sid = "S-1-5-21-1-2-3-1002";
         f.final_path_matches = false;
@@ -866,6 +880,16 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         f.owner_sid = profile;
         CHECK(token(f) == "hive_path_redirected");
         f.final_path_matches = true;
+        CHECK(token(f) == "hive_oversized");
+        f.size = 1024;
+        f.sidecar_reparse = f.sidecar_hardlinked = true;
+        f.sidecar_count = win::kMaxHiveSidecars + 1;
+        CHECK(token(f) == "hive_sidecar_reparse");
+        f.sidecar_reparse = false;
+        CHECK(token(f) == "hive_sidecar_hardlinked");
+        f.sidecar_hardlinked = false;
+        CHECK(token(f) == "hive_sidecar_count");
+        f.size = win::kMaxHiveBytes + 1; // every earlier refusal outranks a sidecar fact
         CHECK(token(f) == "hive_oversized");
     }
 }
