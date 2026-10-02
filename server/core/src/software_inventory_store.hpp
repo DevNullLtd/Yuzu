@@ -87,14 +87,6 @@ struct SoftwareEntry {
 struct SoftwareFleetRow {
     std::string agent_id;
     SoftwareEntry entry;
-    std::int64_t install_id{0}; ///< row id (BIGSERIAL); keyset tiebreak, churns on full replace
-};
-
-/// Keyset position for `SoftwareFleetQuery::after`: the last row of the previous page.
-struct SoftwareCursor {
-    std::string name;
-    std::string agent_id;
-    std::int64_t install_id{0};
 };
 
 /// One fleet-catalogue row — a software title rolled up across the WHOLE fleet
@@ -139,7 +131,8 @@ struct CatalogRollupMeta {
 };
 
 /// Fleet-wide software query. Empty filters match all; results are ordered by
-/// (name, agent_id, install_id).
+/// (name, agent_id, then the remaining entry columns in SoftwareEntry member order), which is
+/// a total order: ingest de-duplicates rows on exactly those columns.
 struct SoftwareFleetQuery {
     std::string agent_id; ///< exact agent filter ("" = all agents)
     std::string name;     ///< exact software-name filter ("" = all names)
@@ -150,11 +143,11 @@ struct SoftwareFleetQuery {
     std::string kind;      ///< exact kind filter
     std::string ecosystem; ///< exact ecosystem filter
     std::string source;    ///< exact source filter
-    /// Resume strictly after this (name, agent_id, install_id) in result order. Page with
-    /// `after = {last.entry.name, last.agent_id, last.install_id}` until an empty page.
-    /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
-    /// one agent's resync can repeat or skip that agent's same-name rows.
-    std::optional<SoftwareCursor> after;
+    /// Resume strictly after this row in result order. Page with `after = <last row of the
+    /// previous page>` until an empty page. The key is the row's content, so an agent resync
+    /// that leaves a row unchanged does not move it; a walk concurrent with a resync that
+    /// changes or removes rows can still skip or repeat those rows.
+    std::optional<SoftwareFleetRow> after;
 };
 
 class SoftwareInventoryStore {
