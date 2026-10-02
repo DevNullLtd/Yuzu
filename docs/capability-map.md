@@ -1166,11 +1166,11 @@ Not implemented. Named repositories per type (inventory, compliance, entitlement
 
 ### 26.2 Inventory Consolidation :x: `T2`
 
-Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records.
+Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records. *(Planned, narrower scope: ADR-3007 consolidates multiple software-discovery mechanisms into one row per installed item per host with a provenance list — not device-identity deduplication across sources.)*
 
 ### 26.3 Software Normalization :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-Partial. `SoftwareCatalogRollup` (`server/core/src/software_catalog_rollup.{hpp,cpp}`) canonicalizes vendor/title/version from the ADR-0016 `installed_software` daily-sync source for the `/inventory` dashboard's catalogue view. This is the `/inventory`-scoped normalization pipeline (§35.4), not a general-purpose, repository-model-backed consolidation pipeline (§26.1/26.2 remain Not Started — no `Repository` model, no multi-source dedup-by-device-identity). *(Evidence: `server/core/src/software_catalog_rollup.cpp`; verified 2026-09-07 — previously mis-graded Not Started.)*
+Partial. `SoftwareCatalogRollup` (`server/core/src/software_catalog_rollup.{hpp,cpp}`) canonicalizes vendor/title/version from the ADR-0016 `installed_software` daily-sync source for the `/inventory` dashboard's catalogue view. This is the `/inventory`-scoped normalization pipeline (§35.4), not a general-purpose, repository-model-backed consolidation pipeline (§26.1/26.2 remain Not Started — no `Repository` model, no multi-source dedup-by-device-identity). *(Evidence: `server/core/src/software_catalog_rollup.cpp`; verified 2026-09-07 — previously mis-graded Not Started.)* *(Planned: ADR-3007 replaces this raw-name grouping with a proper vendor/product/version identity match against an open, versioned reference catalogue, with coverage measured as a metric.)*
 
 ### 26.4 WSUS / CSV / File Upload Connectors :x: `T2`
 
@@ -1457,7 +1457,7 @@ Background catalogue rollup (`server/core/src/software_catalog_rollup.{hpp,cpp}`
 
 ### 35.5 Multi-Source Consolidation :x: `T2` *(verified 2026-09-07)*
 
-Not implemented — connector-fed sources and identity-merge consolidation remain the §25/§26 gap; confirmed no `Repository`/consolidation model exists (§26.1/26.2 stay Not Started).
+Not implemented — connector-fed sources and identity-merge consolidation remain the §25/§26 gap; confirmed no `Repository`/consolidation model exists (§26.1/26.2 stay Not Started). *(Planned, narrower scope: see §26.2's ADR-3007 note — same-host, multi-mechanism software consolidation, not connector-fed cross-system identity merge.)*
 
 Sources #2 (app_perf) and licensing also confirmed present but out of this domain's scope: `agents/core/src/sync_source_app_perf.{hpp,cpp}` feeds §32 DEX; `sync_source_software_licensing.{hpp,cpp}` feeds §27 SLE.
 
