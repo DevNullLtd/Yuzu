@@ -1755,7 +1755,7 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> `withheld_quarantined`, (#3424/#3511) `withheld_unknown_plugin` and (#5294) `withheld_kill_switched_os` — all
 > always present, `0` on a clean dispatch — so `agents_reached: 97` on a
 > 100-device group is distinguishable from three devices being offline, and a
 > MIXED partial dispatch (some reached, some plugin-absent) is never silently

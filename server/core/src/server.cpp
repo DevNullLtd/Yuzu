@@ -12494,6 +12494,8 @@ private:
         audit_kill_switched_os_dispatch("dispatch_closure", caller.principal,
                                         caller.principal_role, command_id, plugin,
                                         outcome.kill_switched_os_count);
+        if (outcome.os_gate_unreadable)
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -13497,6 +13499,32 @@ private:
                                          std::size_t count) {
         audit_dispatch_withheld(route, principal, principal_role, command_id, plugin, count,
                                 yuzu::server::kReasonKillSwitchedOs, "kill_switched_os");
+    }
+
+    // #5294: a dispatch refused BEFORE targeting because presence could not be
+    // read while a per-OS kill switch is OFF. Like the fail-closed quarantine
+    // row it is ONE aggregate decision with no per-agent count. Audit row only:
+    // the scheduled-path outbox already counts the cause
+    // (`yuzu_server_command_outbox_deliver_retry_cause_total`), and
+    // `yuzu_server_dispatch_target_rejected_total` is the caller-mistake family.
+    void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
+                                  const std::string& command_id, const std::string& plugin) {
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "command.dispatch_withheld";
+        ev.target_type = "Command";
+        ev.target_id = "*";
+        ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
+                    " reason=os_gate_unreadable";
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
+                          "os_gate_unreadable)",
+                          command_id, plugin);
     }
 
     // Shared body of the two emitters above: `metric_reason` is the
@@ -15671,6 +15699,11 @@ private:
                                const std::string& plugin, std::size_t count) {
                         audit_kill_switched_os_dispatch(route, principal, principal_role,
                                                         command_id, plugin, count);
+                    },
+                    .audit_os_gate_unreadable_fn =
+                        [this](const std::string& principal, const std::string& principal_role,
+                               const std::string& command_id, const std::string& plugin) {
+                        audit_os_gate_unreadable(principal, principal_role, command_id, plugin);
                     },
                     .audit_scope_resolution_failed_fn =
                         [this](const std::string& principal, const std::string& principal_role,
@@ -20363,6 +20396,7 @@ private:
             spdlog::error("legacy dispatch {}:{} refused: presence unreadable while a per-OS "
                           "kill switch is OFF",
                           plugin, action);
+            audit_os_gate_unreadable(caller.principal, caller.principal_role, command_id, plugin);
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",

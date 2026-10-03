@@ -74,6 +74,7 @@ struct Deps {
     using AuditQuarantineFailClosedFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, std::size_t)>;
     using AuditQuarantineDeniedBatchFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, const std::vector<std::string>&)>;
     using AuditUnknownPluginFn = std::function<void(std::string_view, const std::string&, const std::string&, const std::string&, const std::string&, std::size_t)>;
+    using AuditOsGateUnreadableFn = std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)>;
     using AuditScopeResolutionFailedFn = std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)>;
     using AuditScopeEvaluationAbortedFn = std::function<void(const std::string&, const std::string&, const std::string&, const std::string&)>;
 
@@ -97,6 +98,10 @@ struct Deps {
     /// #5294: same signature/shape as the plugin-absence sibling, for ids
     /// withheld by a per-OS kill switch.
     AuditUnknownPluginFn audit_kill_switched_os_dispatch_fn;
+    /// #5294: (principal, principal_role, command_id, plugin) -- the one
+    /// aggregate audit row for a dispatch refused because presence was
+    /// unreadable while a per-OS switch is OFF.
+    AuditOsGateUnreadableFn audit_os_gate_unreadable_fn;
     AuditScopeResolutionFailedFn audit_scope_resolution_failed_fn;
     AuditScopeEvaluationAbortedFn audit_scope_evaluation_aborted_fn;
 };

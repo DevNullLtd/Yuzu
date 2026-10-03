@@ -427,24 +427,37 @@ PluginConfigStore::get_kill_switch(std::string_view plugin, std::string_view act
     const bool effective =
         decision.has_value() && (scope->os.empty() || !decision->contains(scope->os));
 
-    // Specificity order: (action,os), ('',os), (action,''), ('','').
-    const std::pair<std::string_view, std::string_view> order[] = {
-        {scope->action, scope->os}, {"", scope->os}, {scope->action, ""}, {"", ""}};
-    const PluginConfigStore::KillSwitchEntry* first_existing = nullptr;
-    const PluginConfigStore::KillSwitchEntry* first_off = nullptr;
-    for (const auto& [a, o] : order) {
-        for (const auto& row : rows) {
-            if (row.action != a || row.os != o)
-                continue;
-            if (!first_existing)
-                first_existing = &row;
-            if (!row.enabled && !first_off)
-                first_off = &row;
-        }
+    // Per-layer winners, using the resolver's own fallback inside each layer
+    // (action row, else plugin row). A row that a more specific row of the same
+    // layer overrides never decided anything, so it is never attributed.
+    const auto find = [&rows](std::string_view a,
+                              std::string_view o) -> const PluginConfigStore::KillSwitchEntry* {
+        for (const auto& row : rows)
+            if (row.action == a && row.os == o)
+                return &row;
+        return nullptr;
+    };
+    const PluginConfigStore::KillSwitchEntry* os_win = nullptr;
+    if (!scope->os.empty()) {
+        os_win = find(scope->action, scope->os);
+        if (!os_win)
+            os_win = find("", scope->os);
     }
+    const PluginConfigStore::KillSwitchEntry* base_win = find(scope->action, "");
+    if (!base_win)
+        base_win = find("", "");
 
-    // Attribute to the disabling row when off, else the most specific row.
-    const auto* pick = effective ? first_existing : first_off;
+    // Attribute to the first disabling layer (OS layer first) when off, else the
+    // most specific winner.
+    const PluginConfigStore::KillSwitchEntry* pick = nullptr;
+    if (!effective) {
+        if (os_win && !os_win->enabled)
+            pick = os_win;
+        else if (base_win && !base_win->enabled)
+            pick = base_win;
+    } else {
+        pick = os_win ? os_win : base_win;
+    }
     KillSwitchEntry out;
     if (pick)
         out = *pick;

@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 using yuzu::server::FileKeyProvider;
 using yuzu::server::PluginConfigStore;
@@ -866,6 +867,22 @@ TEST_CASE("PluginConfigStore: a per-OS ON row never widens an OFF plugin row, an
     CHECK(e->os == "windows");
 }
 
+TEST_CASE("PluginConfigStore: attribution skips a plugin@os row that an action@os row overrides",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set_kill_switch("p", "a", false, "base-off", "base-admin").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "", false, "os-off", "os-admin", "windows").has_value());
+    REQUIRE(w.store.set_kill_switch("p", "a", true, "act-on", "act-admin", "windows").has_value());
+
+    auto e = w.store.get_kill_switch("p", "a", "windows");
+    REQUIRE(e.has_value());
+    CHECK_FALSE(e->enabled);
+    CHECK(e->source == "p.a"); // p@windows is overridden by p.a@windows and decided nothing
+    CHECK(e->reason == "base-off");
+    CHECK(e->set_by == "base-admin");
+}
+
 TEST_CASE("PluginConfigStore: with no per-OS rows no OS is withheld; an action@os row wins over "
           "a plugin@os row",
           "[pg][store][plugin_config][killswitch]") {
@@ -908,4 +925,31 @@ TEST_CASE("PluginConfigStore: a degraded store yields no kill-switch decision (f
     REQUIRE_FALSE(store.is_open());
     CHECK_FALSE(store.kill_switch_decision("firewall", "block").has_value());
     CHECK_FALSE(store.action_allowed("firewall", "block"));
+}
+
+// An OPEN store whose read fails must collapse to "no decision" too, never to an
+// empty (allowed) OS set. Two distinct failure arms of kill_switch_decision.
+TEST_CASE("PluginConfigStore: an exhausted lease yields no kill-switch decision (fail closed)",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    std::vector<PgPool::Lease> held; // hold every connection; the store waits its own 300 ms
+    for (std::size_t i = 0; i < w.pool.size(); ++i) {
+        auto lease = w.pool.try_acquire_for(std::chrono::milliseconds{1000});
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+    REQUIRE(w.store.is_open());
+    CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
+    CHECK_FALSE(w.store.action_allowed("p", "a"));
+}
+
+TEST_CASE("PluginConfigStore: a failed kill-switch query yields no decision (fail closed)",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    exec_sql(db.dsn(), "DROP TABLE plugin_config_store.kill_switches");
+    REQUIRE(w.store.is_open());
+    CHECK_FALSE(w.store.kill_switch_decision("p", "a").has_value());
+    CHECK_FALSE(w.store.action_allowed("p", "a"));
 }

@@ -489,7 +489,8 @@ kill_switch_denial(const CommandCapability& cap, const KillSwitchFn& action_allo
 /// (`test_dispatch_confined_arms.cpp`'s K-1 case) keeps compiling against
 /// `send_to`'s narrowed signature.
 struct ClassifiedCommandTestAccess {
-    [[nodiscard]] static ClassifiedCommand make(pb::CommandRequest cmd);
+    [[nodiscard]] static ClassifiedCommand make(pb::CommandRequest cmd,
+                                                std::unordered_set<std::string> kill_switched_os = {});
 };
 
 // -- Plugin metadata ----------------------------------------------------------

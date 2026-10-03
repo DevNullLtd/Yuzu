@@ -39,6 +39,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -136,6 +137,11 @@ struct CommandHarness {
     bool audit_quarantine_throws = false;
     bool audit_unknown_plugin_throws = false;
     int emit_event_calls = 0;
+    // #5294: the OS set the classified command carries, and what the two
+    // per-OS audit seams were called with.
+    std::unordered_set<std::string> kill_switched_os;
+    std::vector<std::size_t> kill_switched_os_audit_counts;
+    int os_gate_unreadable_audit_calls = 0;
     int publish_calls = 0;
     int forward_gateway_calls = 0;
 
@@ -241,7 +247,7 @@ struct CommandHarness {
             cmd.set_command_id(command_id);
             cmd.set_plugin(plugin);
             cmd.set_action(action);
-            return ClassifiedCommandTestAccess::make(cmd);
+            return ClassifiedCommandTestAccess::make(cmd, kill_switched_os);
         };
         deps.make_containment_gate_fn = [this](const std::string&,
                                                const std::string&) -> ContainmentGate {
@@ -312,8 +318,14 @@ struct CommandHarness {
                     throw std::runtime_error("audit_unknown_plugin_dispatch threw");
             };
         deps.audit_kill_switched_os_dispatch_fn =
-            [](std::string_view, const std::string&, const std::string&, const std::string&,
-               const std::string&, std::size_t) {};
+            [this](std::string_view, const std::string&, const std::string&, const std::string&,
+                   const std::string&, std::size_t count) {
+                kill_switched_os_audit_counts.push_back(count);
+            };
+        deps.audit_os_gate_unreadable_fn = [this](const std::string&, const std::string&,
+                                                  const std::string&, const std::string&) {
+            ++os_gate_unreadable_audit_calls;
+        };
         deps.audit_scope_resolution_failed_fn =
             [](const std::string&, const std::string&, const std::string&,
               const std::string&) {};
@@ -640,6 +652,46 @@ TEST_CASE("/api/command: audit_unknown_plugin_dispatch throwing still returns 20
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j.contains("command_id"));
+}
+
+// #5294: a classified command carrying a switched-off OS withholds exactly the
+// targets of that OS; the route reports the count and audits it once.
+TEST_CASE("/api/command: targets on a kill-switched OS are withheld and counted",
+          "[command_routes][5294]") {
+    CommandHarness h;
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+
+    auto res = h.sink.Post(
+        "/api/command",
+        R"({"plugin":"noop","action":"run","agent_ids":["windows-agent","dev-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["withheld_kill_switched_os"] == 1);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"dev-B"});
+    CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
+}
+
+TEST_CASE("/api/command: only kill-switched-OS targets reports 503 reason=kill_switched_os",
+          "[command_routes][5294]") {
+    CommandHarness h;
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["windows-agent"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["reason"] == "kill_switched_os");
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
 }
 
 TEST_CASE("/api/command: audit_quarantine_dispatch_denied_batch throwing still returns 200 "
