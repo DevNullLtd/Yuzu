@@ -35,8 +35,11 @@
 %%% Over TLS the connection key is still the pid of the HTTP/2 connection
 %%% process, and the cases below observe that rather than assume it. Throwaway
 %%% certificates are minted with the openssl CLI (the helper in
-%%% yuzu_gw_authz_tests) under $TMPDIR; when openssl is unavailable the TLS
-%%% legs report one visibly named skip instead of failing.
+%%% yuzu_gw_authz_tests) under $TMPDIR. When openssl is unavailable the TLS
+%%% legs contribute no tests and announce the skip on the console, unless the
+%%% environment variable YUZU_REQUIRE_TLS_TESTS is `1', in which case each
+%%% unavailable leg is one failing test. A CI leg that is expected to carry
+%%% openssl should set it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_conn_rpc_tests).
@@ -68,9 +71,9 @@ rpc_test_() ->
 transport_fixture(plain, _Certs) ->
     {setup, fun() -> setup(plain, undefined) end, fun cleanup/1, fun cases/1};
 transport_fixture(Mode, {error, Why}) ->
-    {lists:flatten(io_lib:format("~p transport skipped (openssl certificates unavailable): ~p",
-                                 [Mode, Why])),
-     fun() -> ok end};
+    yuzu_gw_authz_tests:certs_unavailable(
+        lists:flatten(io_lib:format("yuzu_gw_heartbeat_conn_rpc_tests ~p transport", [Mode])),
+        Why);
 transport_fixture(Mode, Certs) ->
     {setup, fun() -> setup(Mode, Certs) end, fun cleanup/1,
      fun(State) -> cases(State) ++ tls_cases(State) end}.

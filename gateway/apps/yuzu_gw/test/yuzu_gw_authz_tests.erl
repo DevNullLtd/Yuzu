@@ -16,8 +16,10 @@
 -module(yuzu_gw_authz_tests).
 -include_lib("eunit/include/eunit.hrl").
 
-%% cert-mint helpers shared with yuzu_gw_authz_rpc_tests
--export([setup_certs/0, setup_certs/1, cleanup_certs/1, der/2]).
+%% cert-mint helpers shared with yuzu_gw_authz_rpc_tests and the
+%% connection-binding transport tests
+-export([setup_certs/0, setup_certs/1, cleanup_certs/1, der/2,
+         certs_unavailable/2]).
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -56,11 +58,10 @@ authz_test_() ->
                   fun() -> file_pin_rotation(Certs) end},
                  {"check_mgmt_peer reads pins from app env",
                   fun() -> app_env_entry_point(Certs) end}];
-            _ ->
-                %% openssl unavailable / mint failed — same skip posture as
-                %% yuzu_gw_mtls_tests (openssl is present on every CI leg
-                %% that runs the gateway suite).
-                []
+            {error, Why} ->
+                %% openssl unavailable / mint failed: no tests, announced, or
+                %% a failing test when YUZU_REQUIRE_TLS_TESTS=1.
+                certs_unavailable("yuzu_gw_authz_tests", Why)
         end
      end}.
 
@@ -197,6 +198,9 @@ setup_certs() ->
 
 %% BaseDir is where the per-run 0700 directory is created, so a caller can
 %% keep the files off a shared /tmp (for example under $TMPDIR).
+%%
+%% On an error return the directory is removed here, so a caller that gets
+%% `{error, _}' has nothing to clean up (cleanup_certs/1 on an error is a no-op).
 setup_certs(BaseDir) ->
     Rand = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(12))),
     Dir = filename:join([BaseDir, "yuzu_gw_authz_" ++ Rand]),
@@ -237,7 +241,7 @@ setup_certs(BaseDir) ->
             agent_pem => filename:join(Dir, "agent.pem"),
             collide_pem => filename:join(Dir, "collide.pem"),
             selfs_pem => filename:join(Dir, "selfs.pem")},
-    case run_all(Cmds) of
+    Result = case run_all(Cmds) of
         ok ->
             %% openssl mostly succeeds silently — verify the artifacts exist
             %% (same detection strategy as yuzu_gw_mtls_tests).
@@ -248,6 +252,30 @@ setup_certs(BaseDir) ->
             end;
         {error, _} = E ->
             E
+    end,
+    case Result of
+        {error, _} -> _ = os:cmd("rm -rf " ++ q(Dir)), Result;
+        _          -> Result
+    end.
+
+%% @doc The test list a fixture returns in place of its TLS cases when
+%% setup_certs/0,1 returned `{error, Why}'. EUnit has no skip primitive, so
+%% the choices are no tests (the case count visibly drops, and the skip is
+%% announced on the console) or a failing test. It fails when the environment
+%% variable YUZU_REQUIRE_TLS_TESTS is `1', which a CI leg that is expected to
+%% carry openssl sets, so a broken toolchain cannot pass as a green run.
+-spec certs_unavailable(string(), term()) -> [eunit:test()].
+certs_unavailable(Label, Why) ->
+    Reason = lists:flatten(io_lib:format("~p", [Why])),
+    case os:getenv("YUZU_REQUIRE_TLS_TESTS") of
+        "1" ->
+            [{Label ++ ": TLS tests are required (YUZU_REQUIRE_TLS_TESTS=1) but "
+                       "the openssl certificates are unavailable: " ++ Reason,
+              fun() -> erlang:error({tls_test_certificates_unavailable, Why}) end}];
+        _ ->
+            io:format(user, "SKIPPED ~s: openssl certificates unavailable: ~s~n",
+                      [Label, Reason]),
+            []
     end.
 
 leaf_cmds(Dir, Name, Subj, Ext, Ca, CaK) ->
