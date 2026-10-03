@@ -67,8 +67,11 @@ drain_test_() ->
      fun setup/0,
      fun cleanup/1,
      fun(State) ->
-        {timeout, 60,
-         [{"GOAWAY ends the Subscribe stream and the binding; a late heartbeat is unknown session",
+        %% Each case gets its own 60 s; the outer bound covers all six, since
+        %% a group timeout is shared by the cases inside it.
+        {timeout, 360,
+         [{timeout, 60, T} || T <- [
+          {"GOAWAY ends the Subscribe stream and the binding; a late heartbeat is unknown session",
            fun() -> goaway_ends_binding(State) end},
           {"after GOAWAY the agent reconnects: a fresh session binds to the new connection",
            fun() -> reconnect_binds_new_connection(State) end},
@@ -79,7 +82,7 @@ drain_test_() ->
           {"repeated connection mismatch does not end the Subscribe; re-Register recovers",
            fun() -> mismatch_streak_then_reregister(State) end},
           {"a GOAWAY on the wire is followed by the connection closing",
-           fun() -> goaway_then_close_on_wire(State) end}]}
+           fun() -> goaway_then_close_on_wire(State) end}]]}
      end}.
 
 %%%-------------------------------------------------------------------
@@ -499,16 +502,40 @@ cleanup(#{server := Server, agent_sup := AgentSup, handler_id := HandlerId,
 %% Two fresh client channels (two HTTP/2 connections) per case, with zeroed
 %% rejection counters and an empty heartbeat buffer history.
 with_channels(#{port := Port, counts := Counts}, Fun) ->
-    true = ets:delete_all_objects(Counts),
-    meck:reset(yuzu_gw_heartbeat_buffer),
     Endpoint = {http, "localhost", Port, []},
     A = start_chan(chan_name(a), Endpoint),
     B = start_chan(chan_name(b), Endpoint),
     try
+        ok = warm_chan(A),
+        ok = warm_chan(B),
+        true = ets:delete_all_objects(Counts),
+        meck:reset(yuzu_gw_heartbeat_buffer),
         Fun(A, B, Counts)
     after
         catch grpcbox_channel:stop(A),
         catch grpcbox_channel:stop(B)
+    end.
+
+%% Cold-start guard: the first call on a fresh channel dials the listener, and
+%% under CPU oversubscription grpcbox's internal 5 s call into the subchannel
+%% can time out. Retry a harmless unary call (an unknown session is answered
+%% with a gRPC status, which proves the connection works) until it gets an
+%% answer, so the case bodies only ever see a warm connection.
+warm_chan(Chan) ->
+    warm_chan(Chan, 5).
+
+warm_chan(Chan, 0) ->
+    error({channel_not_ready, Chan});
+warm_chan(Chan, Left) ->
+    Result = try heartbeat(Chan, <<"warm-up">>)
+             catch _:_ -> {error, exception}
+             end,
+    case Result of
+        {ok, _, _}                    -> ok;
+        {error, {<<_/binary>>, _}, _} -> ok;
+        _ ->
+            timer:sleep(1000),
+            warm_chan(Chan, Left - 1)
     end.
 
 chan_name(Role) ->

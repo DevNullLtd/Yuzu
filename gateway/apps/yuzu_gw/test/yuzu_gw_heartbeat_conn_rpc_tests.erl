@@ -80,7 +80,7 @@ transport_fixture(Mode, Certs) ->
 
 cases(State) ->
     Mode = maps:get(mode, State),
-    [{name(Mode, Title), Fun} || {Title, Fun} <- [
+    [{timeout, 60, {name(Mode, Title), Fun}} || {Title, Fun} <- [
         {"live Subscribe + Heartbeat on one connection admitted; on another rejected",
           fun() -> same_connection_admitted(State) end},
          {"pending session admits only the connection that registered",
@@ -110,7 +110,7 @@ tls_cases(#{mode := Mode} = State) ->
     Strict = [{name(Mode, "a client with no certificate is refused"),
                fun() -> certless_refused(State) end}
               || Mode =:= mtls],
-    Common ++ Strict.
+    [{timeout, 60, T} || T <- Common ++ Strict].
 
 %%%-------------------------------------------------------------------
 %%% Cases
@@ -474,8 +474,8 @@ setup(Mode, Certs) ->
       endpoint => Endpoint,
       server => Server,
       agent_sup => AgentSup,
-      chan_a => start_chan(chan_name(Mode, a), Endpoint),
-      chan_b => start_chan(chan_name(Mode, b), Endpoint)}.
+      chan_a => warmed(start_chan(chan_name(Mode, a), Endpoint)),
+      chan_b => warmed(start_chan(chan_name(Mode, b), Endpoint))}.
 
 cleanup(#{server := Server, agent_sup := AgentSup} = State) ->
     [catch grpcbox_channel:stop(maps:get(C, State)) || C <- [chan_a, chan_b]],
@@ -507,6 +507,32 @@ transport(Mode, #{dir := Dir, ca := Ca, gw_pem := GwPem, agent_pem := AgentPem})
         mtls ->
             %% Both channels get this same client certificate.
             {Listener, Client ++ [{certfile, AgentPem}, {keyfile, AgentKey}]}
+    end.
+
+warmed(Chan) ->
+    ok = warm_chan(Chan),
+    Chan.
+
+%% Cold-start guard: the first call on a fresh channel dials the listener, and
+%% under CPU oversubscription grpcbox's internal 5 s call into the subchannel
+%% can time out. Retry a harmless unary call (an unknown session is answered
+%% with a gRPC status, which proves the connection works) until it gets an
+%% answer, so the case bodies only ever see a warm connection.
+warm_chan(Chan) ->
+    warm_chan(Chan, 5).
+
+warm_chan(Chan, 0) ->
+    error({channel_not_ready, Chan});
+warm_chan(Chan, Left) ->
+    Result = try heartbeat(Chan, <<"warm-up">>)
+             catch _:_ -> {error, exception}
+             end,
+    case Result of
+        {ok, _, _}                    -> ok;
+        {error, {<<_/binary>>, _}, _} -> ok;
+        _ ->
+            timer:sleep(1000),
+            warm_chan(Chan, Left - 1)
     end.
 
 chan_name(Mode, Role) ->
