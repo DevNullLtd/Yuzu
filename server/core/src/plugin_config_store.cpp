@@ -437,15 +437,12 @@ PluginConfigStore::get_kill_switch(std::string_view plugin, std::string_view act
                 return &row;
         return nullptr;
     };
-    const PluginConfigStore::KillSwitchEntry* os_win = nullptr;
-    if (!scope->os.empty()) {
-        os_win = find(scope->action, scope->os);
-        if (!os_win)
-            os_win = find("", scope->os);
-    }
-    const PluginConfigStore::KillSwitchEntry* base_win = find(scope->action, "");
-    if (!base_win)
-        base_win = find("", "");
+    const auto layer = [&find, &scope](std::string_view o) {
+        const auto* r = find(scope->action, o);
+        return r ? r : find("", o);
+    };
+    const PluginConfigStore::KillSwitchEntry* os_win = scope->os.empty() ? nullptr : layer(scope->os);
+    const PluginConfigStore::KillSwitchEntry* base_win = layer("");
 
     // Attribute to the first disabling layer (OS layer first) when off, else the
     // most specific winner.

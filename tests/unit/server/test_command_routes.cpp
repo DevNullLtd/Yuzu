@@ -141,7 +141,6 @@ struct CommandHarness {
     // per-OS audit seams were called with.
     std::unordered_set<std::string> kill_switched_os;
     std::vector<std::size_t> kill_switched_os_audit_counts;
-    int os_gate_unreadable_audit_calls = 0;
     int publish_calls = 0;
     int forward_gateway_calls = 0;
 
@@ -322,10 +321,8 @@ struct CommandHarness {
                    const std::string&, std::size_t count) {
                 kill_switched_os_audit_counts.push_back(count);
             };
-        deps.audit_os_gate_unreadable_fn = [this](const std::string&, const std::string&,
-                                                  const std::string&, const std::string&) {
-            ++os_gate_unreadable_audit_calls;
-        };
+        deps.audit_os_gate_unreadable_fn =
+            [](const std::string&, const std::string&, const std::string&, const std::string&) {};
         deps.audit_scope_resolution_failed_fn =
             [](const std::string&, const std::string&, const std::string&,
               const std::string&) {};

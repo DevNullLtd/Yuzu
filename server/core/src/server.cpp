@@ -13509,22 +13509,7 @@ private:
     // `yuzu_server_dispatch_target_rejected_total` is the caller-mistake family.
     void audit_os_gate_unreadable(const std::string& principal, const std::string& principal_role,
                                   const std::string& command_id, const std::string& plugin) {
-        if (!audit_store_)
-            return;
-        AuditEvent ev{};
-        ev.timestamp = std::time(nullptr);
-        ev.principal = principal.empty() ? "unknown" : principal;
-        ev.principal_role = principal_role;
-        ev.action = "command.dispatch_withheld";
-        ev.target_type = "Command";
-        ev.target_id = "*";
-        ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
-                    " reason=os_gate_unreadable";
-        ev.result = "denied";
-        if (!audit_store_->log(ev))
-            spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
-                          "os_gate_unreadable)",
-                          command_id, plugin);
+        write_withheld_row(principal, principal_role, command_id, plugin, "os_gate_unreadable");
     }
 
     // Shared body of the two emitters above: `metric_reason` is the
@@ -13542,6 +13527,15 @@ private:
             .increment(static_cast<double>(count));
         spdlog::warn("dispatch withheld: route={} command={} plugin={} reason={} agents={}", route,
                      command_id, plugin, metric_reason, count);
+        write_withheld_row(principal, principal_role, command_id, plugin,
+                           std::string(detail_reason) + " agents=" + std::to_string(count));
+    }
+
+    // The one `command.dispatch_withheld` audit row; `reason_tail` is the
+    // text after `reason=` (the cause token, plus `agents=N` where counted).
+    void write_withheld_row(const std::string& principal, const std::string& principal_role,
+                            const std::string& command_id, const std::string& plugin,
+                            const std::string& reason_tail) {
         if (!audit_store_)
             return;
         AuditEvent ev{};
@@ -13552,13 +13546,12 @@ private:
         ev.target_type = "Command";
         ev.target_id = "*";
         ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
-                    " reason=" + std::string(detail_reason) +
-                    " agents=" + std::to_string(count);
+                    " reason=" + reason_tail;
         ev.result = "denied";
         if (!audit_store_->log(ev))
             spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
-                          "agents={})",
-                          command_id, plugin, count);
+                          "reason={})",
+                          command_id, plugin, reason_tail);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
