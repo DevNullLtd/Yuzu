@@ -597,6 +597,11 @@ jobs:
       # ERL_EPMD_PORT isolation (each runner's .env) removes the cross-runner
       # EPMD collision that triggers the transient distribution in the first place.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
+      # The gateway TLS test legs mint certificates with the openssl CLI. With
+      # this set, an unavailable or failing openssl FAILS those tests instead of
+      # silently skipping them. Linux (Big Tam) only: the Windows and macOS legs
+      # are deliberately not covered (docs/erlang-gateway-build.md).
+      YUZU_REQUIRE_TLS_TESTS: "1"
     strategy:
       fail-fast: false
       # max-parallel: 3, not 4 — Big Tam has exactly 4 yuzu-bigtam-linux runner
