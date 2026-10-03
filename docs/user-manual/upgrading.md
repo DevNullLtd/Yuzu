@@ -37,7 +37,7 @@ and the free-space guidance are in [Installed-Software Inventory](inventory.md) 
 On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
 
 - **Affected:** scripts that index `summary` positionally or assert six rows; CEL or severity filters (a "no critical/high" policy passes a host it could not measure); dashboards keyed on MEDIUM counts on RHEL-family hosts where a non-root agent cannot read a mode-0600 `sshd_config`.
-- **Do:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.
+- **Recommended:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.
 - No operator action is required, and rollback is safe (output strings only).
 
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
