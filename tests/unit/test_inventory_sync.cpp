@@ -36,6 +36,7 @@ using yuzu::agent::parse_windows_optional_features_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SwEntry;
+using yuzu::agent::SyncPluginMap;
 using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 
@@ -746,7 +747,7 @@ TEST_CASE("SyncScheduler: a forced source's own RPC failure retries next tick, "
 }
 
 // ============================================================================
-// M.1: extended tail pins, action adapters and the multi-action collector
+// Extended tail pins, action adapters and the multi-action collector
 // ============================================================================
 
 namespace {
@@ -773,7 +774,8 @@ SwEntry full_extended_entry() {
 
 // Lines strictly between `== action=<action>` and the next `== action=` /
 // `[result_status]` line of a committed real capture. Never skips: a missing
-// sample is a failure.
+// sample is a failure. The record counts pinned in the collector tests below are
+// tied to the committed captures: re-measure them when a sample is refreshed.
 std::string capture_section(const char* plugin, const char* sample, std::string_view action) {
     const fs::path p = fs::path(YUZU_PLUGIN_SRC_DIR) / plugin / "docs" / "samples" / sample;
     REQUIRE(fs::exists(p));
@@ -833,6 +835,7 @@ std::vector<std::string> fields_of(const std::string& rec) {
 // --- fake in-process plugins: canned output per action, test-set rc ---
 struct FakeOut {
     std::map<std::string, std::string> out;
+    std::map<std::string, std::string> overflow; // optional 2nd write, after `out`
     std::map<std::string, int> rc;
 };
 FakeOut g_fake[3]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features
@@ -843,6 +846,9 @@ int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /
     const auto it = g_fake[I].out.find(action);
     if (it != g_fake[I].out.end())
         yuzu_ctx_write_output(ctx, it->second.c_str());
+    const auto more = g_fake[I].overflow.find(action);
+    if (more != g_fake[I].overflow.end())
+        yuzu_ctx_write_output(ctx, more->second.c_str());
     const auto rc = g_fake[I].rc.find(action);
     return rc == g_fake[I].rc.end() ? 0 : rc->second;
 }
@@ -860,9 +866,7 @@ YUZU_FAKE_DESC(kFakePkg, "pkg_inventory", kFakePkgActions, 1);
 YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
 #undef YUZU_FAKE_DESC
 
-using PluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::less<>>;
-
-PluginMap all_plugins() {
+SyncPluginMap all_plugins() {
     return {{"installed_apps", &kFakeIa},
             {"pkg_inventory", &kFakePkg},
             {"windows_optional_features", &kFakeWof}};
@@ -871,6 +875,7 @@ PluginMap all_plugins() {
 void reset_fakes() {
     for (auto& f : g_fake) {
         f.out.clear();
+        f.overflow.clear();
         f.rc.clear();
     }
 }
@@ -895,7 +900,7 @@ void fake_windows() {
     g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
 }
 
-std::optional<std::pair<std::string, std::string>> collect_with(PluginMap plugins) {
+std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap plugins) {
     return make_installed_software_source(std::move(plugins)).collect();
 }
 
@@ -1080,6 +1085,12 @@ TEST_CASE("pkg_inventory adapters: status grammar", "[sync][parse][adapter]") {
         REQUIRE(r.status == Status::ok);
         CHECK(r.entries.size() == 1);
     }
+    SECTION("a status row for the other action is not accepted") {
+        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}))
+                  .status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}))
+                  .status == Status::failed);
+    }
     SECTION("empty input") {
         CHECK(parse_pkg_inventory_packages_output("").status == Status::failed);
         CHECK(parse_pkg_inventory_managers_output("").status == Status::failed);
@@ -1193,7 +1204,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
 
 TEST_CASE("collector: an absent plugin is skipped", "[sync][collector]") {
     fake_mac();
-    PluginMap m = all_plugins();
+    SyncPluginMap m = all_plugins();
     m.erase("pkg_inventory");
     m.erase("windows_optional_features");
     const auto got = collect_with(m);
@@ -1206,7 +1217,7 @@ TEST_CASE("collector: an absent plugin is skipped", "[sync][collector]") {
 
 TEST_CASE("collector: installed_apps absent idles the source (UP-IN6)", "[sync][collector]") {
     fake_mac();
-    PluginMap m = all_plugins();
+    SyncPluginMap m = all_plugins();
     m.erase("installed_apps");
     CHECK_FALSE(collect_with(m).has_value());
 }
@@ -1232,6 +1243,15 @@ TEST_CASE("collector: one failing action skips the whole cycle", "[sync][collect
     SECTION("installed_apps empty while brew has rows (UP-IN6 per plugin)") {
         fake_mac();
         g_fake[0].out["list_inventory"] = "";
+        CHECK_FALSE(collect_with(all_plugins()).has_value());
+    }
+    SECTION("a truncated capture (rc 0, over the capture cap)") {
+        fake_mac();
+        // A first write the adapter accepts, then one write past kInventoryCaptureCap
+        // (3'670'016): the real capture path drops it and flags truncation, leaving a
+        // parseable prefix, so only the collector's truncation check can skip the cycle.
+        g_fake[1].out["packages"] = supported_status("packages") + "\n";
+        g_fake[1].overflow["packages"] = std::string(3'700'000, 'x');
         CHECK_FALSE(collect_with(all_plugins()).has_value());
     }
 }
@@ -1301,16 +1321,20 @@ TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collec
 
 TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector skips above it",
           "[sync][collector][cap]") {
-    const auto lines = [](std::size_t n) {
+    const auto lines = [](std::size_t n, std::size_t name_width = 0) {
         std::string out;
-        for (std::size_t i = 0; i < n; ++i)
-            out += "inv|n" + std::to_string(i) + "|1|\n";
+        for (std::size_t i = 0; i < n; ++i) {
+            std::string name = "n" + std::to_string(i);
+            if (name.size() < name_width)
+                name.append(name_width - name.size(), 'x');
+            out += "inv|" + name + "|1|\n";
+        }
         return out;
     };
     CHECK(parse_installed_apps_output(lines(20001)).size() == 20001);
 
     reset_fakes();
-    PluginMap only_ia = {{"installed_apps", &kFakeIa}};
+    SyncPluginMap only_ia = {{"installed_apps", &kFakeIa}};
     g_fake[0].out["list_inventory"] = lines(20001);
     CHECK_FALSE(collect_with(only_ia).has_value());
 
@@ -1318,4 +1342,16 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
     const auto got = collect_with(only_ia);
     REQUIRE(got.has_value());
     CHECK(records_of(got->first).size() == 20000);
+
+    // Byte cap: the entry cap runs first, so the over-cap input stays <= 20,000
+    // rows and under the raw capture cap, but its canonical blob exceeds kMaxBlobBytes.
+    // 12,000 x 200 B names is proven under the cap by the test itself.
+    const std::string under = lines(12000, 200);
+    CHECK(installed_software_canonical_blob(parse_installed_apps_output(under)).size() <
+          3u * 1024 * 1024);
+    g_fake[0].out["list_inventory"] = under;
+    REQUIRE(collect_with(only_ia).has_value());
+
+    g_fake[0].out["list_inventory"] = lines(16000, 200);
+    CHECK_FALSE(collect_with(only_ia).has_value());
 }

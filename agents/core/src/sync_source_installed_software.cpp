@@ -142,8 +142,10 @@ AdaptedRows failed(std::string reason) {
 // `pkg_inventory` grammar (pkg_inventory_parsers.hpp format_status_row /
 // format_manager_row / format_package_row): exactly one
 // `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
-// data rows. Status decides success; malformed DATA rows are dropped.
-template <class OnRow> AdaptedRows adapt_pkg_inventory(const std::string& out, OnRow on_row) {
+// data rows. Status decides success; malformed DATA rows are dropped. A status
+// row answering a different action is not counted (-> "bad status").
+template <class OnRow>
+AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row) {
     AdaptedRows res;
     int status_rows = 0;
     std::string level;
@@ -151,9 +153,11 @@ template <class OnRow> AdaptedRows adapt_pkg_inventory(const std::string& out, O
     for_each_line(out, [&](std::string_view line) {
         const auto tok = split_tokens(line, 8);
         if (tok[0] == "status") {
-            ++status_rows;
-            level = tok.size() >= 3 ? std::string(tok[2]) : std::string{};
-            reason = tok.size() >= 4 ? std::string(tok[3]) : std::string{};
+            if (tok.size() >= 4 && tok[1] == action) {
+                ++status_rows;
+                level = std::string(tok[2]);
+                reason = std::string(tok[3]);
+            }
             return true;
         }
         on_row(tok, res.entries);
@@ -241,8 +245,9 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
     // package|homebrew|<id>|<version>|<formula|cask>
-    return adapt_pkg_inventory(out, [](const std::vector<std::string_view>& tok,
-                                       std::vector<SwEntry>& entries) {
+    return adapt_pkg_inventory(out, "packages",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
         if (tok[0] != "package" || tok.size() != 5 || tok[1] != "homebrew")
             return;
         SwEntry e;
@@ -267,8 +272,9 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
     // prefixes collapse to one row after dedup). Homebrew-only: any other manager
     // name (dpkg/apt/rpm/dnf/pacman/apk) is dropped — the Linux/Windows managers
     // legs must add a deliberate mapping, and manager facts belong to facet rows.
-    return adapt_pkg_inventory(out, [](const std::vector<std::string_view>& tok,
-                                       std::vector<SwEntry>& entries) {
+    return adapt_pkg_inventory(out, "managers",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
         if (tok[0] != "manager" || tok.size() != 7 || tok[2] != "present")
             return;
         if (tok[1] != "homebrew") {
@@ -370,8 +376,7 @@ std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
     return canon;
 }
 
-SyncSource make_installed_software_source(
-    std::map<std::string, const YuzuPluginDescriptor*, std::less<>> plugins) {
+SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
@@ -422,8 +427,10 @@ SyncSource make_installed_software_source(
                 all.push_back(std::move(e));
             }
         }
-        if (all.empty())
+        if (all.empty()) {
+            spdlog::debug("sync: installed_software collected no rows — skipping this cycle");
             return std::nullopt;
+        }
         normalize_installed_software(all);
         if (all.size() > kMaxEntries) {
             // The server keeps the first kMaxEntries in blob order, so its hash would

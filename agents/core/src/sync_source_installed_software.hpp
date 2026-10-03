@@ -5,7 +5,7 @@
 /// agent sync framework. Collects the machine-wide installed-software inventory
 /// by invoking the inventory actions in-process (`LocalDispatcher`) and renders
 /// them into the canonical wire form the server expects. The actions (one table
-/// in the .cpp; M.3/M.7/M.8 add a row + a pure adapter):
+/// in the .cpp; a new inventory action adds one row + one pure adapter):
 ///   installed_apps.list_inventory           blob contract v2 rows
 ///   pkg_inventory.packages                  Homebrew formulae/casks (ecosystem `brew`)
 ///   pkg_inventory.managers                  one `homebrew` presence row
@@ -48,6 +48,9 @@ struct SwEntry {
     std::string source; // "<plugin>.<action>" that produced the row
 };
 
+/// Loaded plugins by `descriptor->name`, as the collector consumes them.
+using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::less<>>;
+
 /// Result of a pure action adapter. `ok` with zero entries is a legitimate
 /// answer ("brew present, no formulae"); `unsupported` = the action answered
 /// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
@@ -63,7 +66,9 @@ struct AdaptedRows {
 /// signature_status|distro_id|distro_version` lines) into machine-scope
 /// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
 /// ignored; missing trailing tokens read as empty fields (tolerant), tokens
-/// beyond the 12th field are dropped (fields never shift).
+/// beyond the 12th field are dropped (fields never shift). Bounded at
+/// kMaxEntries + 1 entries: the collector's merged-size check, not this parser,
+/// rejects an over-cap host.
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
 /// Adapt `pkg_inventory` `managers` output (`status|managers|<level>|...` plus
@@ -96,8 +101,8 @@ YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> e
 /// Build the `installed_software` SyncSource. `plugins` maps `descriptor->name`
 /// to the loaded descriptor; an absent key = plugin not loaded on this OS (e.g.
 /// `build_agent=false`, or windows_optional_features on macOS) -> that action is
-/// skipped. A failing action skips the cycle (nothing is deleted).
-YUZU_EXPORT SyncSource make_installed_software_source(
-    std::map<std::string, const YuzuPluginDescriptor*, std::less<>> plugins);
+/// skipped, except installed_apps: without it the source stays idle (it anchors
+/// the report, UP-IN6). A failing action skips the cycle (nothing is deleted).
+YUZU_EXPORT SyncSource make_installed_software_source(SyncPluginMap plugins);
 
 } // namespace yuzu::agent

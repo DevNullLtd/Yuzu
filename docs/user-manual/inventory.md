@@ -16,10 +16,11 @@ cadences.
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
   `windows_optional_features` `list`. An action whose plugin is not loaded, or
-  that answers "unsupported on this OS", is skipped; an action that fails (non-zero
-  exit, truncated output, a constrained or unavailable answer, or no
-  applications at all from `installed_apps`) skips that day's report and keeps
-  the last good state — nothing is deleted. Every row's `source` names the
+  that answers "unsupported on this OS", is skipped (except `installed_apps`:
+  without it the source stays idle, because it anchors the report); an action
+  that fails (non-zero exit, truncated output, a constrained or unavailable
+  answer, or no applications at all from `installed_apps`) skips that day's
+  report and keeps the last good state — nothing is deleted. Every row's `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
   empty for these producers. The operator-facing `list` action keeps its

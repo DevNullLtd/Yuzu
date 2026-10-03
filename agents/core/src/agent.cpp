@@ -2146,7 +2146,7 @@ public:
                 {
                     // installed_software (ADR-0016): every loaded plugin by name; the source
                     // picks the inventory actions it needs and skips absent ones.
-                    std::map<std::string, const YuzuPluginDescriptor*, std::less<>> sync_plugins;
+                    SyncPluginMap sync_plugins;
                     const YuzuPluginDescriptor* tar_descriptor = nullptr;
                     // device_ci source plugins (ADR-0016): hardware / device_identity /
                     // os_info / network_config, reused in-process via LocalDispatcher.

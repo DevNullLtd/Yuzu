@@ -654,7 +654,7 @@ agent_test_exe = executable(
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"',
-             # M.1: test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
+             # test_inventory_sync.cpp reads the plugins' REAL CAPTURE samples
              # (agents/plugins/*/docs/samples/*.txt) at run time via this define.
              '-DYUZU_PLUGIN_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'plugins').replace('\\', '/') +
