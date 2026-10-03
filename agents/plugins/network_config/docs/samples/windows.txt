@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-03 · LocalSystem (elevated; addresses redacted) · leg-hash pending
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-03 · LocalSystem (elevated; addresses redacted) · leg-hash 440c7ee170cd
 == action=adapters
 adapter|Tailscale|-|100000|up
 adapter|Ethernet|FC:34:97:65:1E:0A|1000|up
@@ -89,16 +89,16 @@ arp|Local Area Connection* 2|224.0.0.22|01:00:5e:00:00:16|static
 arp|Local Area Connection* 2|224.0.0.252|01:00:5e:00:00:fc|static
 arp|Bluetooth Network Connection|224.0.0.22|01:00:5e:00:00:16|static
 arp|Bluetooth Network Connection|224.0.0.252|01:00:5e:00:00:fc|static
-arp|Ethernet|203.0.113.1|b0:5b:99:ee:d0:32|dynamic
-arp|Ethernet|203.0.113.61|1c:53:f9:73:22:6c|dynamic
-arp|Ethernet|203.0.113.66|d0:11:e5:c0:a0:99|dynamic
-arp|Ethernet|203.0.113.71|00:17:88:a6:b2:13|dynamic
+arp|Ethernet|203.0.113.1|00:00:5e:00:53:30|dynamic
+arp|Ethernet|203.0.113.61|00:00:5e:00:53:31|dynamic
+arp|Ethernet|203.0.113.66|00:00:5e:00:53:32|dynamic
+arp|Ethernet|203.0.113.71|00:00:5e:00:53:33|dynamic
 arp|Ethernet|203.0.113.146|00:00:00:00:00:00|incomplete
 arp|Ethernet|203.0.113.199|00:00:00:00:00:00|incomplete
-arp|Ethernet|203.0.113.210|5c:3e:1b:ef:97:02|dynamic
+arp|Ethernet|203.0.113.210|00:00:5e:00:53:34|dynamic
 arp|Ethernet|203.0.113.223|00:00:00:00:00:00|incomplete
 arp|Ethernet|203.0.113.237|00:00:00:00:00:00|incomplete
-arp|Ethernet|203.0.113.246|d8:8c:79:47:1d:43|dynamic
+arp|Ethernet|203.0.113.246|00:00:5e:00:53:35|dynamic
 arp|Ethernet|203.0.113.255|ff:ff:ff:ff:ff:ff|static
 arp|Ethernet|224.0.0.22|01:00:5e:00:00:16|static
 arp|Ethernet|224.0.0.251|01:00:5e:00:00:fb|static

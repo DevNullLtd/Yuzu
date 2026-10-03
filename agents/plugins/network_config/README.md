@@ -3,11 +3,11 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Reports network adapter configuration, IP addresses, DNS servers, and proxy settings |
+| **What it does** | Reports network adapter configuration, IP addresses, DNS servers, proxy settings, and the routing table |
 | **Version** | 1.0.0 |
-| **Kind** | Collector · read-only · gathered (device.network_config.adapters, device.network_config.ip_addresses, device.network_config.dns_servers, device.network_config.proxy, device.network_config.dns_cache, device.network_config.arp) |
+| **Kind** | Collector · read-only · gathered (device.network_config.adapters, device.network_config.ip_addresses, device.network_config.dns_servers, device.network_config.proxy, device.network_config.dns_cache, device.network_config.arp, device.network_config.routes) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `adapters` (definition `device.network_config.adapters`) · `arp` (definition `device.network_config.arp`) · `dns_cache` (definition `device.network_config.dns_cache`) · `dns_servers` (definition `device.network_config.dns_servers`) · `ip_addresses` (definition `device.network_config.ip_addresses`) · `proxy` (definition `device.network_config.proxy`) |
+| **Actions** | `adapters` (definition `device.network_config.adapters`) · `arp` (definition `device.network_config.arp`) · `dns_cache` (definition `device.network_config.dns_cache`) · `dns_servers` (definition `device.network_config.dns_servers`) · `ip_addresses` (definition `device.network_config.ip_addresses`) · `proxy` (definition `device.network_config.proxy`) · `routes` (definition `device.network_config.routes`) |
 | **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -51,6 +51,7 @@ flowchart LR
 | `dns_servers` | ✅ supported · rung 1 · GetAdaptersAddresses | ✅ supported · rung 1 · SCDynamicStore | ✅ supported · rung 1 · /etc/resolv.conf read |
 | `ip_addresses` | ✅ supported · rung 1 · GetAdaptersAddresses | ✅ supported · rung 1 · getifaddrs + PF_ROUTE sysctl | ✅ supported · rung 1 · rtnetlink (RTM_GETADDR/RTM_GETROUTE) |
 | `proxy` | ✅ supported · rung 1 · WinHttpGetIEProxyConfigForCurrentUser | 🟡 constrained · rung 1 · SCDynamicStoreCopyProxies | 🟡 constrained · rung 1 · environment variables |
+| `routes` | 🟡 constrained · rung 1 · GetIpForwardTable2 | 🟡 constrained · rung 1 · PF_ROUTE sysctl NET_RT_DUMP | 🟡 constrained · rung 1 · rtnetlink RTM_GETROUTE (AF_UNSPEC) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -59,6 +60,9 @@ flowchart LR
 - **`dns_cache` / Linux** — falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent
 - **`proxy` / macOS** — reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none
 - **`proxy` / Linux** — reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported
+- **`routes` / Windows** — IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length prefix) and the multicast prefixes are not reported, connected-subnet routes are; the metric is the route metric alone, without the interface metric
+- **`routes` / macOS** — IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the origin is only the RTF_STATIC/RTF_DYNAMIC bit; entries flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported (the limited-broadcast 255.255.255.255/32 route carries none of those flags and is)
+- **`routes` / Linux** — main and custom routing tables, IPv4 and IPv6; the local table, cloned entries and host-local route types are not reported; a multipath route reports its first nexthop only and an `ip nexthop` object route carries no resolved gateway (both flagged in the result status)
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -144,6 +148,20 @@ distinguished from failure by the typed result status).
 | `proxy_type` | string | - | Windows, Linux, macOS | `auto_detect` | Proxy mode. Windows and macOS emit a normalized type; Linux instead emits the literal environment-variable name it read (e.g. 'http_proxy', 'HTTPS_PROXY'), and can emit several proxy_type/proxy_address row pairs in one response if more than one variable is set — see Caveats. Values: none, http, pac, auto_detect (Windows); none, http, pac (macOS); none, or a literal *_proxy/ALL_PROXY variable name (Linux). |
 | `proxy_address` | string | - | Windows, Linux, macOS | `not observed in the captured samples — omitted whenever proxy_type is none or auto_detect` | The proxy host:port (http), the PAC URL (pac), or the raw environment-variable value (Linux). Row is omitted entirely when proxy_type is none/auto_detect. Values: 'host:port', a URL, or a raw environment-variable value. |
 | `bypass` | string | - | Windows, Linux, macOS | `*.local,169.254/16` | Comma-separated proxy-exception/bypass list; the row is omitted entirely when the list is empty. Values: comma-separated free text. |
+
+**`device.network_config.routes` — `family|destination|prefix_len|gateway|interface|metric|table|route_type|origin`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `family` | string | - | Windows, Linux, macOS | `ipv4` | Address family of the route. Values: ipv4, ipv6. |
+| `destination` | string | - | Windows, Linux, macOS | `192.0.2.0` | Destination network address; the default route is 0.0.0.0 or ::. Values: IPv4 or IPv6 literal. |
+| `prefix_len` | int32 | - | Windows, Linux, macOS | `24` | Destination prefix length in bits; 0 is the default route, 32 or 128 a host route. Values: 0-32 (ipv4), 0-128 (ipv6). |
+| `gateway` | string | - | Windows, Linux, macOS | `192.0.2.1` | Next-hop address; '-' when the route is on-link (directly attached). Linux reports 'nhid:<n>' for a route that references an `ip nexthop` object whose gateway is not resolved, and the first nexthop's gateway for a multipath route. Values: IPv4 or IPv6 literal, 'nhid:<n>' (Linux only), or '-'. |
+| `interface` | string | - | Windows, Linux, macOS | `eth0` | Outgoing interface name; '-' when the interface index no longer resolves (or, for a Linux blackhole/unreachable/prohibit/throw route, when the route has none). Values: interface name, or '-'. |
+| `metric` | string | - | Windows, Linux, macOS | `100` | Route metric (the Linux priority; the Windows route metric, without the interface metric); '-' on macOS, which has no route metric. Values: decimal integer, or '-' (macOS, always). |
+| `table` | string | - | Windows, Linux, macOS | `main` | Linux routing table; '-' on Windows and macOS, which have a single table. Values: main, default, or a decimal table id (Linux); '-' (Windows, macOS). |
+| `route_type` | string | - | Windows, Linux, macOS | `unicast` | Kind of route. Values: unicast, blackhole, unreachable, prohibit, throw, nat, xresolve, or type<N> for an unknown Linux rtm_type (Linux); unicast, blackhole, reject (macOS); unicast (Windows, always). |
+| `origin` | string | - | Windows, Linux, macOS | `kernel` | Who installed the route. Linux: the rtm_protocol name (kernel, boot, static, dhcp, ra, bgp, ospf, ...) or proto<N>. Windows: the NL_ROUTE_PROTOCOL name (local, netmgmt, dhcp, ...) or proto<N>. macOS: static or dynamic when the kernel set RTF_STATIC/RTF_DYNAMIC, else other (the routing socket carries no protocol field). Values: protocol name, or proto<N>. |
 <!-- END GENERATED -->
 
 **`proxy` — not one row per record.** Each configured value is its own row: `proxy_type|<value>`,
@@ -197,7 +215,7 @@ entries), `dns_cache|not_available|<reason>` (W/L, tool missing or query failed)
 | `CONSTRAINED` / `PARTIAL` | partial | `network_config:pf_route_dump_truncated` | macOS `routes`, a malformed record or a non-contiguous netmask was met; the rest of the table is reported |
 | `UNAVAILABLE` / `PARTIAL` | partial | `network_config:routes_table_unavailable` | Windows `routes`, `GetIpForwardTable2` failed |
 | `CONSTRAINED` / `PARTIAL` | partial | `network_config:routes_row_unformattable` | Windows `routes`, a route's destination could not be rendered and was left out |
-| `CONSTRAINED` / `PARTIAL` (rc 1) | partial | `network_config:routes_internal_error` | `routes` on any OS, an exception escaped a leg (e.g. an allocation failure); an `error|routes: internal error` row is written |
+| `CONSTRAINED` / `PARTIAL` (rc 1) | partial | `network_config:routes_internal_error` | `routes` on any OS, an exception escaped a leg (e.g. an allocation failure); an `error\|routes: internal error` row is written |
 | `UNAVAILABLE` / `PARTIAL` | partial | `subprocess_runner:spawn_error` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` child process could not be spawned at all |
 | `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:deadline` | Linux `dns_cache`, the runner's deadline elapsed while `resolvectl`/`systemd-resolve` was still running, and it was killed |
 | `CONSTRAINED` / `PARTIAL` | partial | `subprocess_runner:cancelled` | Linux `dns_cache`, the `resolvectl`/`systemd-resolve` run was cancelled before it finished |
@@ -251,11 +269,10 @@ unavailable table, an unformattable row). No action on any OS ever sets
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 3b5c27bfec23
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-03 · LocalSystem (elevated; addresses redacted) · leg-hash 440c7ee170cd
 
 ```
 == action=adapters
-adapter|Ethernet 2|FC:34:97:65:1E:0B|18446744073709|down
 adapter|Tailscale|-|100000|up
 adapter|Ethernet|FC:34:97:65:1E:0A|1000|up
 adapter|OpenVPN Data Channel Offload for NordVPN|-|1000|down
@@ -264,12 +281,11 @@ adapter|WiFi|84:1B:77:2B:DC:FC|18446744073709|down
 adapter|Local Area Connection* 1|84:1B:77:2B:DC:FD|18446744073709|down
 adapter|Local Area Connection* 2|86:1B:77:2B:DC:FC|18446744073709|down
 adapter|Bluetooth Network Connection|84:1B:77:2B:DD:00|3|down
+adapter|Ethernet 2|FC:34:97:65:1E:0B|0|down
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
-ip|Ethernet 2|fe80::24d2:a5ae:f55b:9132|64|-
-ip|Ethernet 2|169.254.54.245|16|-
-ip|Tailscale|fd7a:115c:a1e0::1c32:357a|128|-
+ip|Tailscale|fd7a:115c:a1e0::77|128|-
 ip|Tailscale|fe80::c5b0:bd45:79bc:bd97|64|-
 ip|Tailscale|198.51.100.121|32|-
 ip|Ethernet|fe80::d459:2883:492c:f3fc|64|203.0.113.1
@@ -279,22 +295,24 @@ ip|OpenVPN Data Channel Offload for NordVPN|169.254.133.126|16|-
 ip|Local Area Connection|fe80::669f:e4fb:4130:c7de|64|-
 ip|Local Area Connection|169.254.70.46|16|-
 ip|WiFi|fe80::72f7:7266:9da0:e23c|64|-
+ip|WiFi|169.254.225.27|16|-
+ip|Local Area Connection* 1|fe80::a60d:9224:f8d0:abf7|64|-
 … 12 of 19 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
-dns|Ethernet 2|192.0.2.100|IPv4
-dns|Ethernet 2|192.0.2.101|IPv4
 dns|Tailscale|fec0:0:0:ffff::1|IPv6
 dns|Tailscale|fec0:0:0:ffff::2|IPv6
 dns|Tailscale|fec0:0:0:ffff::3|IPv6
-dns|Ethernet|192.0.2.100|IPv4
-dns|Ethernet|192.0.2.101|IPv4
+dns|Ethernet|194.168.4.100|IPv4
+dns|Ethernet|194.168.8.100|IPv4
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::1|IPv6
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::2|IPv6
 dns|OpenVPN Data Channel Offload for NordVPN|fec0:0:0:ffff::3|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::1|IPv6
 dns|Local Area Connection|fec0:0:0:ffff::2|IPv6
+dns|Local Area Connection|fec0:0:0:ffff::3|IPv6
+dns|WiFi|194.168.4.100|IPv4
 … 12 of 24 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
@@ -303,39 +321,43 @@ proxy_type|auto_detect
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_cache
-cache_entry|66.24.104.213.in-addr.arpa|PTR|0|
-cache_entry|array514.prod.do.dsp.mp.microsoft.com|A|0|
-cache_entry|37.43.127.100.in-addr.arpa|PTR|0|
-cache_entry|121.53.123.100.in-addr.arpa|PTR|0|
-cache_entry|desktop-04dnsig.mshome.net|A|0|
-cache_entry|desktop-04dnsig.mshome.net|AAAA|0|
-cache_entry|77.177.109.100.in-addr.arpa|PTR|0|
-cache_entry|kubernetes.docker.internal|A|0|
-cache_entry|kubernetes.docker.internal|AAAA|0|
-cache_entry|ocsp.comodoca.com|A|0|
-cache_entry|buildhost1.tail0a0a0a.ts.net|A|0|
-cache_entry|buildhost1.tail0a0a0a.ts.net|AAAA|0|
-… 12 of 52 rows shown
+dns_cache|not_available|query failed
 [result_status] UNDECLARED / UNKNOWN
 
 == action=arp
 arp|Loopback Pseudo-Interface 1|224.0.0.22|-|static
+arp|Loopback Pseudo-Interface 1|224.0.0.252|-|static
 arp|Loopback Pseudo-Interface 1|239.255.255.250|-|static
 arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.22|-|static
+arp|OpenVPN Data Channel Offload for NordVPN|224.0.0.252|-|static
 arp|WiFi|224.0.0.22|01:00:5e:00:00:16|static
+arp|WiFi|224.0.0.252|01:00:5e:00:00:fc|static
 arp|Local Area Connection|224.0.0.22|01:00:5e:00:00:16|static
-arp|Tailscale|198.51.100.98|-|incomplete
+arp|Local Area Connection|224.0.0.252|01:00:5e:00:00:fc|static
 arp|Tailscale|100.100.100.100|-|incomplete
 arp|Tailscale|198.51.100.77|-|dynamic
 arp|Tailscale|224.0.0.22|-|static
-arp|Tailscale|224.0.0.251|-|static
-arp|Tailscale|239.255.255.250|-|static
-arp|Local Area Connection* 1|224.0.0.22|01:00:5e:00:00:16|static
-… 12 of 67 rows shown
+… 12 of 100 rows shown
 [result_status] UNDECLARED / UNKNOWN
+
+== action=routes
+route|ipv4|0.0.0.0|0|203.0.113.1|Ethernet|0|-|unicast|netmgmt
+route|ipv4|198.51.100.98|32|-|Tailscale|0|-|unicast|netmgmt
+route|ipv4|100.100.100.100|32|-|Tailscale|0|-|unicast|netmgmt
+route|ipv4|198.51.100.77|32|-|Tailscale|0|-|unicast|netmgmt
+route|ipv4|198.51.100.37|32|-|Tailscale|0|-|unicast|netmgmt
+route|ipv4|127.0.0.0|8|-|Loopback Pseudo-Interface 1|256|-|unicast|local
+route|ipv4|203.0.113.0|24|-|Ethernet|256|-|unicast|local
+route|ipv6|fd7a:115c:a1e0::|48|fd7a:115c:a1e0::53|Tailscale|0|-|unicast|netmgmt
+route|ipv6|fd7a:115c:a1e0::53|128|-|Tailscale|0|-|unicast|netmgmt
+route|ipv6|fe80::|64|-|OpenVPN Data Channel Offload for NordVPN|256|-|unicast|local
+route|ipv6|fe80::|64|-|Local Area Connection|256|-|unicast|local
+route|ipv6|fe80::|64|-|Ethernet 2|256|-|unicast|local
+… 12 of 17 rows shown
+[result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 3b5c27bfec23
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-03 · euid 501 (addresses redacted) · leg-hash 440c7ee170cd
 
 ```
 == action=adapters
@@ -355,25 +377,25 @@ adapter|en3|00:00:5e:00:53:09|0|up
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
-ip|en0|fe80::9e:c46b:750c:b2eb|64|203.0.113.1
+ip|en0|fe80::200:5eff:fe00:5301|64|203.0.113.1
 ip|en0|203.0.113.66|24|203.0.113.1
-ip|llw0|fe80::58a0:84ff:fe32:a9a3|64|203.0.113.1
-ip|utun0|fe80::93eb:5451:9abf:3695|64|203.0.113.1
-ip|utun1|fe80::313e:505c:4e40:16c8|64|203.0.113.1
-ip|utun2|fe80::fa0e:b15e:9046:683d|64|203.0.113.1
-ip|utun3|fe80::ce81:b1c:bd2c:69e|64|203.0.113.1
-ip|utun4|fe80::d211:e5ff:fec0:a099|64|203.0.113.1
-ip|utun4|198.51.100.77|32|203.0.113.1
-ip|utun4|fd7a:115c:a1e0::1234:5678|48|203.0.113.1
-ip|utun5|fe80::b145:6483:7c96:77fa|64|203.0.113.1
-ip|utun6|fe80::68ce:f640:7c7a:bb05|64|203.0.113.1
+ip|llw0|fe80::200:5eff:fe00:5302|64|203.0.113.1
+ip|utun0|fe80::200:5eff:fe00:5303|64|203.0.113.1
+ip|utun1|fe80::200:5eff:fe00:5304|64|203.0.113.1
+ip|utun2|fe80::200:5eff:fe00:5305|64|203.0.113.1
+ip|utun3|fe80::200:5eff:fe00:5306|64|203.0.113.1
+ip|utun4|fe80::200:5eff:fe00:5307|64|203.0.113.1
+ip|utun5|fe80::200:5eff:fe00:5308|64|203.0.113.1
+ip|utun6|fe80::200:5eff:fe00:5309|64|203.0.113.1
+ip|utun6|198.51.100.77|32|203.0.113.1
+ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
 dns|system|100.100.100.100|IPv4
 dns|system|fd7a:115c:a1e0::53|IPv6
-dns|system|192.0.2.100|IPv4
-dns|system|192.0.2.101|IPv4
+dns|system|194.168.4.100|IPv4
+dns|system|194.168.8.100|IPv4
 [result_status] UNDECLARED / UNKNOWN
 
 == action=proxy
@@ -387,22 +409,38 @@ dns_cache|unsupported|macOS does not expose DNS resolver cache contents
 
 == action=arp
 arp|-|203.0.113.1|00:00:5e:00:53:0e|-
-arp|-|203.0.113.61|00:00:5e:00:53:0f|-
-arp|-|203.0.113.71|00:00:5e:00:53:10|-
-arp|-|203.0.113.131|00:00:5e:00:53:11|-
-arp|-|203.0.113.138|00:00:5e:00:53:12|-
+arp|-|203.0.113.30|00:00:5e:00:53:0f|-
+arp|-|203.0.113.61|00:00:5e:00:53:10|-
+arp|-|203.0.113.66|00:00:5e:00:53:04|-
+arp|-|203.0.113.71|00:00:5e:00:53:11|-
+arp|-|203.0.113.131|00:00:5e:00:53:12|-
 arp|-|203.0.113.140|00:00:5e:00:53:13|-
-arp|-|203.0.113.179|00:00:5e:00:53:14|-
-arp|-|203.0.113.197|00:00:5e:00:53:15|-
-arp|-|203.0.113.210|00:00:5e:00:53:16|-
-arp|-|203.0.113.222|00:00:5e:00:53:17|-
-arp|-|203.0.113.238|00:00:5e:00:53:18|-
-arp|-|203.0.113.246|00:00:5e:00:53:19|-
-… 12 of 15 rows shown
+arp|-|203.0.113.197|00:00:5e:00:53:14|-
+arp|-|203.0.113.210|00:00:5e:00:53:15|-
+arp|-|203.0.113.238|00:00:5e:00:53:16|-
+arp|-|203.0.113.246|00:00:5e:00:53:17|-
+arp|-|203.0.113.255|ff:ff:ff:ff:ff:ff|-
+… 12 of 14 rows shown
 [result_status] UNDECLARED / UNKNOWN
+
+== action=routes
+route|ipv4|0.0.0.0|0|203.0.113.1|en0|-|-|unicast|static
+route|ipv4|0.0.0.0|0|-|utun6|-|-|unicast|static
+route|ipv4|100.64.0.0|10|-|utun6|-|-|unicast|static
+route|ipv4|100.100.100.100|32|-|utun6|-|-|unicast|static
+route|ipv4|127.0.0.0|8|127.0.0.1|lo0|-|-|unicast|static
+route|ipv4|169.254.0.0|16|-|en0|-|-|unicast|static
+route|ipv4|203.0.113.0|24|-|en0|-|-|unicast|static
+route|ipv4|203.0.113.1|32|-|en0|-|-|unicast|static
+route|ipv4|203.0.113.66|32|-|en0|-|-|unicast|static
+route|ipv4|255.255.255.255|32|-|en0|-|-|unicast|static
+route|ipv4|255.255.255.255|32|-|utun6|-|-|unicast|static
+route|ipv6|::|0|fe80::|utun0|-|-|unicast|other
+… 12 of 29 rows shown
+[result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 3b5c27bfec23
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-03 · euid 0 · leg-hash 440c7ee170cd
 
 ```
 == action=adapters
@@ -415,11 +453,11 @@ adapter|ip6_vti0|-|0|down
 adapter|sit0|-|0|down
 adapter|ip6tnl0|-|0|down
 adapter|ip6gre0|-|0|down
-adapter|eth0|8e:8c:e7:4b:5d:b5|10000|up
+adapter|eth0|a6:a7:66:e2:7d:f6|10000|up
 [result_status] UNDECLARED / UNKNOWN
 
 == action=ip_addresses
-ip|eth0|172.17.0.4|16|172.17.0.1
+ip|eth0|172.17.0.3|16|172.17.0.1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers
@@ -436,6 +474,11 @@ dns_cache|not_available|no systemd-resolved
 
 == action=arp
 [result_status] UNDECLARED / UNKNOWN
+
+== action=routes
+route|ipv4|0.0.0.0|0|172.17.0.1|eth0|0|main|unicast|boot
+route|ipv4|172.17.0.0|16|-|eth0|0|main|unicast|kernel
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
@@ -489,9 +532,9 @@ not assert row count for the same reason: `tests/unit/test_network_config_local_
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/network_config/src/network_config_parsers.hpp` · `agents/plugins/network_config/src/network_config_plugin.cpp`
+- Plugin: `agents/plugins/network_config/src/network_config_netlink.hpp` · `agents/plugins/network_config/src/network_config_parsers.hpp` · `agents/plugins/network_config/src/network_config_plugin.cpp` · `agents/plugins/network_config/src/network_config_routes_ifname.hpp` · `agents/plugins/network_config/src/network_config_routes_legs.hpp` · `agents/plugins/network_config/src/network_config_routes_linux.cpp` · `agents/plugins/network_config/src/network_config_routes_macos.cpp` · `agents/plugins/network_config/src/network_config_routes_parsers.hpp` · `agents/plugins/network_config/src/network_config_routes_win.cpp`
 - Definitions: `content/definitions/network_config.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/unit/test_network_config_local_dispatcher.cpp` · `tests/unit/test_network_config_parsers.cpp`
+- Tests: `tests/test_network_config_routes_definition.py` · `tests/unit/test_network_config_local_dispatcher.cpp` · `tests/unit/test_network_config_parsers.cpp` · `tests/unit/test_network_config_routes.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
