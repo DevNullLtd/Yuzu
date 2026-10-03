@@ -17,10 +17,14 @@
  * datagram) — the cases where a hand-built packed struct is the point.
  */
 #include "network_config_routes_parsers.hpp"
+#if defined(__linux__)
+#include "network_config_netlink.hpp"
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -616,6 +620,184 @@ TEST_CASE("route type and protocol names fall back to a numbered token, never an
     const auto row2 = linux_route_to_row(r, "eth0");
     CHECK(row2.type == "xresolve");
     CHECK(row2.origin == "bgp");
+}
+
+
+// ── netlink::dump drain, driven by scripted datagrams and a scripted clock ─────────────────
+//
+// KernelIo is the only thing these tests replace; the drain logic under test — the
+// kernel-origin check, the foreign-datagram count and deadline bounds, MSG_TRUNC, the cap trim,
+// short reads — is the production code, fed the REAL captured datagrams.
+
+namespace {
+
+struct FakeStep {
+    std::vector<unsigned char> bytes;
+    std::uint32_t from_pid = 0; // 0 = the kernel
+    int flags = 0;              // recvmsg flags, e.g. MSG_TRUNC
+    int elapsed_s = 0;          // the scripted clock advances this much BEFORE the recv returns
+    bool fail = false;          // recv returns -1 (error / timeout)
+};
+
+struct FakeIo {
+    std::vector<FakeStep> steps;
+    bool open_ok = true;
+    bool send_ok = true;
+    std::size_t* consumed = nullptr; // how many recv() calls the drain made
+    std::size_t next = 0;
+    std::chrono::steady_clock::time_point t{std::chrono::hours{1}};
+
+    bool open() { return open_ok; }
+    bool send(const void*, std::size_t) { return send_ok; }
+    ssize_t recv(unsigned char* buf, std::size_t cap, std::uint32_t& from_pid, int& flags) {
+        if (consumed)
+            *consumed = next;
+        if (next >= steps.size())
+            return -1; // script exhausted = a timeout
+        const FakeStep& st = steps[next++];
+        if (consumed)
+            *consumed = next;
+        t += std::chrono::seconds{st.elapsed_s};
+        if (st.fail)
+            return -1;
+        REQUIRE(st.bytes.size() <= cap);
+        std::memcpy(buf, st.bytes.data(), st.bytes.size());
+        from_pid = st.from_pid;
+        flags = st.flags;
+        return static_cast<ssize_t>(st.bytes.size());
+    }
+    std::chrono::steady_clock::time_point now() const { return t; }
+};
+
+struct DumpRequest {
+    struct nlmsghdr nlh{};
+    struct rtmsg rtm{};
+};
+
+constexpr std::uint32_t kDumpSeq = 3; // the seq the real capture was taken with
+
+auto run_dump(FakeIo io, std::size_t cap = static_cast<std::size_t>(-1)) {
+    DumpRequest req;
+    return netlink::dump(req, kDumpSeq, parse_rtnetlink_routes_chunk, cap, std::move(io));
+}
+
+std::vector<FakeStep> capture_steps() {
+    std::vector<FakeStep> steps;
+    for (auto& d : read_hex_lines(fixture_dir("linux") / "rtm_getroute_dump.hex"))
+        steps.push_back(FakeStep{std::move(d)});
+    return steps;
+}
+
+} // namespace
+
+TEST_CASE("netlink dump of the real capture completes with every route and no cap",
+          "[network_config][routes][netlink_dump]") {
+    const auto r = run_dump(FakeIo{capture_steps()});
+    CHECK(r.ok);
+    CHECK_FALSE(r.capped);
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump discards a datagram that did not come from the kernel",
+          "[network_config][routes][netlink_dump]") {
+    // A local process sends a forged copy of the route datagram. If the origin check were
+    // missing its 16 routes would be parsed and merged, doubling the table.
+    auto steps = capture_steps();
+    FakeStep forged = steps.front();
+    forged.from_pid = 4242;
+    steps.insert(steps.begin(), forged);
+    const auto r = run_dump(FakeIo{steps});
+    CHECK(r.ok);
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump gives up on a foreign-datagram flood instead of waiting forever",
+          "[network_config][routes][netlink_dump]") {
+    std::vector<FakeStep> steps;
+    for (int i = 0; i < netlink::kMaxForeignDatagrams + 5; ++i) {
+        FakeStep f = capture_steps().front();
+        f.from_pid = 99;
+        steps.push_back(std::move(f));
+    }
+    std::size_t consumed = 0;
+    FakeIo io{steps};
+    io.consumed = &consumed;
+    const auto r = run_dump(std::move(io));
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+    CHECK(consumed == static_cast<std::size_t>(netlink::kMaxForeignDatagrams) + 1); // the bound, not the script
+}
+
+TEST_CASE("netlink dump bounds the discard loop by wall-clock too, not just by count",
+          "[network_config][routes][netlink_dump]") {
+    // Each foreign datagram arrives 3 s after the last: the count (64) is nowhere near spent,
+    // but the 4 s deadline is, by the second one. A paced local sender must not pin the thread.
+    std::vector<FakeStep> steps;
+    for (int i = 0; i < 10; ++i) {
+        FakeStep f = capture_steps().front();
+        f.from_pid = 99;
+        f.elapsed_s = 3;
+        steps.push_back(std::move(f));
+    }
+    std::size_t consumed = 0;
+    FakeIo io{steps};
+    io.consumed = &consumed;
+    const auto r = run_dump(std::move(io));
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+    CHECK(consumed == 2);
+}
+
+TEST_CASE("netlink dump treats a truncated datagram as incomplete and does not parse it",
+          "[network_config][routes][netlink_dump]") {
+    auto steps = capture_steps();
+    steps.front().flags = MSG_TRUNC; // the kernel dropped the tail: a parse could not see it
+    const auto r = run_dump(FakeIo{steps});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+}
+
+TEST_CASE("netlink dump keeps what it decoded when the read then fails",
+          "[network_config][routes][netlink_dump]") {
+    auto steps = capture_steps();
+    steps.pop_back();               // no NLMSG_DONE
+    steps.push_back(FakeStep{{}, 0, 0, 0, /*fail=*/true});
+    const auto r = run_dump(FakeIo{steps});
+    CHECK_FALSE(r.ok); // never complete without NLMSG_DONE
+    CHECK(r.records.size() == 16);
+}
+
+TEST_CASE("netlink dump reports NLMSG_ERROR as incomplete", "[network_config][routes][netlink_dump]") {
+    std::vector<unsigned char> err(sizeof(struct nlmsghdr), 0);
+    auto* h = reinterpret_cast<struct nlmsghdr*>(err.data());
+    h->nlmsg_len = sizeof(struct nlmsghdr);
+    h->nlmsg_type = NLMSG_ERROR;
+    h->nlmsg_seq = kDumpSeq;
+    const auto r = run_dump(FakeIo{{FakeStep{err}}});
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+}
+
+TEST_CASE("netlink dump fails closed when it cannot open or send",
+          "[network_config][routes][netlink_dump]") {
+    FakeIo no_open{capture_steps()};
+    no_open.open_ok = false;
+    CHECK_FALSE(run_dump(std::move(no_open)).ok);
+    FakeIo no_send{capture_steps()};
+    no_send.send_ok = false;
+    const auto r = run_dump(std::move(no_send));
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.empty());
+}
+
+TEST_CASE("netlink dump trims to the record cap and says so",
+          "[network_config][routes][netlink_dump]") {
+    // The first datagram alone holds 16 records; a cap of 5 trims it, flags the cut, and is
+    // never reported as a clean completion.
+    const auto r = run_dump(FakeIo{capture_steps()}, 5);
+    CHECK(r.capped);
+    CHECK_FALSE(r.ok);
+    CHECK(r.records.size() == 5);
 }
 
 TEST_CASE("routes decode flags a malformed nested multipath gateway instead of reporting on-link",

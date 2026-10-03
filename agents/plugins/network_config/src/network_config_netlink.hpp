@@ -37,6 +37,7 @@
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 
 #include <yuzu/agent/scoped_fd.hpp>
@@ -82,6 +83,66 @@ template <typename Record> struct DumpResult {
     bool capped = false;
 };
 
+/// The kernel side of a dump: a NETLINK_ROUTE socket with a bounded receive wait.
+///
+/// dump() is written against this four-method shape so a test can drive every branch of the
+/// drain (foreign origin, flood bound, deadline, MSG_TRUNC, error, short read, cap) with
+/// scripted datagrams and a scripted clock — nothing here is reachable from a unit test
+/// otherwise, and the kernel-origin check is a security control.
+class KernelIo {
+public:
+    bool open() {
+        fd_ = open_rtnetlink_socket();
+        return static_cast<bool>(fd_);
+    }
+
+    bool send(const void* data, std::size_t len) {
+        struct sockaddr_nl sa {};
+        sa.nl_family = AF_NETLINK;
+        // sendmsg takes a non-const iov_base; the kernel does not write through it.
+        struct iovec iov {
+            const_cast<void*>(data), len
+        };
+        struct msghdr m {};
+        m.msg_name = &sa;
+        m.msg_namelen = sizeof(sa);
+        m.msg_iov = &iov;
+        m.msg_iovlen = 1;
+        ssize_t sent;
+        do {
+            sent = ::sendmsg(fd_.get(), &m, 0);
+        } while (sent < 0 && errno == EINTR); // symmetry with the recvmsg loop
+        return sent > 0;
+    }
+
+    /// One datagram into `buf`. Returns the byte count, or <= 0 on error / timeout / EOF.
+    /// `from_pid` is the sender's netlink portid (0 = the kernel) and `msg_flags` the recvmsg
+    /// flags (MSG_TRUNC = the datagram did not fit `cap`).
+    ssize_t recv(unsigned char* buf, std::size_t cap, std::uint32_t& from_pid, int& msg_flags) {
+        struct sockaddr_nl rsa {};
+        struct iovec iov {
+            buf, cap
+        };
+        struct msghdr rm {};
+        rm.msg_name = &rsa;
+        rm.msg_namelen = sizeof(rsa);
+        rm.msg_iov = &iov;
+        rm.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            n = ::recvmsg(fd_.get(), &rm, 0);
+        } while (n < 0 && errno == EINTR);
+        from_pid = rsa.nl_pid;
+        msg_flags = rm.msg_flags;
+        return n;
+    }
+
+    std::chrono::steady_clock::time_point now() const { return std::chrono::steady_clock::now(); }
+
+private:
+    yuzu::agent::ScopedFd fd_;
+};
+
 /**
  * Send `req` (a standard-layout request whose first member is an nlmsghdr with
  * nlmsg_len / nlmsg_type / nlmsg_flags / nlmsg_seq already filled in) and drain
@@ -101,54 +162,27 @@ template <typename Record> struct DumpResult {
  * first. The check runs after each datagram is merged, so the buffer overshoots
  * the cap by at most one datagram's worth before it is trimmed to `max_records`
  * and `capped` is set.
+ *
+ * `io` is KernelIo in production; see that class for why it is injectable.
  */
-template <typename Request, typename ParseFn>
+template <typename Request, typename ParseFn, typename Io = KernelIo>
 auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk,
-          std::size_t max_records = static_cast<std::size_t>(-1)) {
+          std::size_t max_records = static_cast<std::size_t>(-1), Io io = Io{}) {
     using Chunk = std::invoke_result_t<ParseFn&, std::span<const unsigned char>, std::uint32_t>;
     using Record = typename decltype(std::declval<Chunk&>().records)::value_type;
     DumpResult<Record> result;
 
-    auto fd = open_rtnetlink_socket();
-    if (!fd)
-        return result;
-
-    struct sockaddr_nl sa {};
-    sa.nl_family = AF_NETLINK;
-    // sendmsg takes a non-const iov_base; the kernel does not write through it.
-    struct iovec iov {
-        const_cast<Request*>(&req), sizeof(req)
-    };
-    struct msghdr m {};
-    m.msg_name = &sa;
-    m.msg_namelen = sizeof(sa);
-    m.msg_iov = &iov;
-    m.msg_iovlen = 1;
-    ssize_t sent;
-    do {
-        sent = ::sendmsg(fd.get(), &m, 0);
-    } while (sent < 0 && errno == EINTR); // symmetry with the recvmsg loop below
-    if (sent <= 0)
+    if (!io.open() || !io.send(&req, sizeof(req)))
         return result;
 
     alignas(NLMSG_ALIGNTO) unsigned char buf[kRecvBufSize];
     bool truncated = false;
     int foreign_datagrams = 0;
-    const auto discard_deadline = std::chrono::steady_clock::now() + kDiscardDeadline;
+    const auto discard_deadline = io.now() + kDiscardDeadline;
     for (;;) {
-        struct sockaddr_nl rsa {};
-        struct iovec riov {
-            buf, sizeof(buf)
-        };
-        struct msghdr rm {};
-        rm.msg_name = &rsa;
-        rm.msg_namelen = sizeof(rsa);
-        rm.msg_iov = &riov;
-        rm.msg_iovlen = 1;
-        ssize_t n;
-        do {
-            n = ::recvmsg(fd.get(), &rm, 0);
-        } while (n < 0 && errno == EINTR);
+        std::uint32_t from_pid = 0;
+        int msg_flags = 0;
+        const ssize_t n = io.recv(buf, sizeof(buf), from_pid, msg_flags);
         if (n <= 0)
             return result;
 
@@ -158,13 +192,13 @@ auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk,
         // numbers are small fixed literals, so a local unprivileged process
         // could otherwise inject forged RTM_NEWROUTE records into the fleet-
         // reported routing table. Only the kernel sends from portid 0.
-        if (rsa.nl_pid != 0) {
+        if (from_pid != 0) {
             // BOUNDED discard: SO_RCVTIMEO only fires on SILENCE, so an
             // unbounded `continue` would let that same local process pin this
             // thread indefinitely by keeping the socket busy.
             if (++foreign_datagrams > kMaxForeignDatagrams)
                 return result; // ok stays false — honest incomplete read
-            if (std::chrono::steady_clock::now() >= discard_deadline)
+            if (io.now() >= discard_deadline)
                 return result; // count alone is not enough — see kDiscardDeadline
             continue;          // not from the kernel — discard, do not parse
         }
@@ -174,7 +208,7 @@ auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk,
         // boundary the parser cannot see the loss, and a later NLMSG_DONE would
         // set ok=true over a short record set. The syscall's own signal is
         // authoritative.
-        if ((rm.msg_flags & MSG_TRUNC) != 0)
+        if ((msg_flags & MSG_TRUNC) != 0)
             return result; // ok stays false — records were dropped
 
         auto chunk = parse_chunk(std::span<const unsigned char>(buf, static_cast<std::size_t>(n)), seq);
