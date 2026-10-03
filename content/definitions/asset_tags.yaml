@@ -152,6 +152,16 @@ spec:
         description: 'Number of entries currently in the change log (in memory and persisted, capped at the last 50). Values: integer 0-50.'
         example: "0"
         platforms: [windows, linux, darwin]
+      - name: persist_failures
+        type: int64
+        description: Number of sync persistence failures since the plugin started; not persisted across restarts.
+        example: "0"
+        platforms: [windows, linux, darwin]
+      - name: last_persist_error
+        type: string
+        description: Message of the most recent persistence failure or write warning, or - when none.
+        example: "-"
+        platforms: [windows, linux, darwin]
 
   readablePayload: "Query asset tag status"
 
