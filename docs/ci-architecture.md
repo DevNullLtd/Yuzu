@@ -482,7 +482,11 @@ than the tag under test (#5150). The other jobs check the following:
   gateway logs fail the job. For the gateway that includes OTP process crashes
   (`crasher: initial call`) and supervisor restarts (`Supervisor: ...
   Context: child_terminated`), in the header-less format the reference
-  `sys.config` logger writes. Postgres logs are not checked.
+  `sys.config` logger writes. It also includes the VM dying outright: an ERTS
+  abort (`<file>.c:<line>:<func>(): Internal error`), a failed boot
+  (`Kernel pid terminated`) and a crash dump (`GW_CRASH_PAT` in
+  `scripts/ci/qa-stack.sh`, locked by `tests/test_qa_stack_crash_pat.py`).
+  Postgres logs are not checked.
 - **upgrade-test**: brings up the previous stable release and upgrades every
   service in place, keeping the Postgres volume, CA and agent data dir. The
   same agent must reconnect running the new version. All services must be
@@ -1603,6 +1607,48 @@ to `known-flaky.json`), grep the junit failure text for
 (`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
+
+## Agent unit-test shards (#5073)
+
+The agent suite's single `agent unit tests` entry (one serial Catch2 process,
+240 s budget) is three entries over the same `yuzu_agent_tests` binary:
+`agent unit tests shard A`, `shard B`, `shard C`, each `suite: ['agent',
+'agent-shard']`, one positional tag spec, `timeout: 240` (unchanged per shard,
+and conservative headroom rather than a measured need: the only measured
+contention figure is for the server `~[pg]` suite, 289 s with no other test
+phase running (c0) to 603 s with four overlapping (c4), about 2.1x, across jobs on
+the pre-#3443 combined step, per "Windows test-phase
+concurrency gate"; it has not been re-measured for the agent shards) and
+`--allow-running-no-tests`. That flag is what stops the zero-match shard C from
+failing when `meson test --suite agent --test-args '[tag]'` appends a second
+positional spec. It does not make that a targeted run: Catch2 binds the extra
+spec to the LAST comma-separated OR term only, so it is exact only for shard C,
+it widens shards A and B, and a mistyped tag is no longer loud. Run the binary
+directly for a targeted run (`build-*/tests/yuzu_agent_tests '[tag]'`, see
+`docs/build-guide.md` "Direct binary invocation"). Repro (2026-10-01, Linux
+`build-linux/tests/yuzu_agent_tests`, `<shard spec> '[nonexistent_zzz]'
+--list-tests --allow-running-no-tests`): shard A lists 319 cases, B 437, C 0.
+Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
+nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
+sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
+is unsharded and unchanged.
+
+Partition rule and measured balance live in the comment above the entries in
+`tests/meson.build`: a case runs in the lowest-numbered shard holding any of its
+tags, shard C is the AND-NOT complement so new tests land there, and every
+inclusion term ends `~[.]~[tsan-heavy]~[flaky-4086]` because an inclusion term
+does not drop hidden cases by itself. `'agent shard partition invariant'`
+(`suite: ['agent', 'agent-checks']`, defined outside `if build_server`) runs
+`scripts/ci/check-pg-shard-partition.py --family agent`, the same script and
+`check_partition()` as the server shards: it proves against the real binary that
+every case of `~[.]~[tsan-heavy]~[flaky-4086]` is in exactly one shard. It also
+fails if a shard spec term does not end with that suffix (the meson
+`agent_shard_suffix` and the script literal are hand-synced), if a spec is not a
+shape flake-retry's isolated retry can strip, or if two shard entry names are
+equal or one contains another. It proves exactness, not balance: it prints per-shard case counts as an informational
+notice, and the drift signal is the 80%-of-budget table above. Per-entry history
+in `test-runs.db` / `ci_test_suites` is keyed by entry name, so it restarts under
+the new names.
 
 ## Workflow-PR canary
 

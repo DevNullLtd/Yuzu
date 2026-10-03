@@ -3248,6 +3248,90 @@ public:
                           "counter");
         for (auto reason : {"pool_exhausted", "query_failed"})
             metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
+        // #4982: ExecutionTracker::set_agents_targeted / ::mark_cancelled were
+        // log-only on failure at every REST/MCP call site — a sustained
+        // pool/query degrade on either had no Prometheus signal, only an
+        // spdlog::error line. `op` names which call failed, `surface` which
+        // family of handler hit it. Pre-seeded below so absent() stays
+        // meaningful (same closed-label-set convention as
+        // yuzu_exec_correlation_read_degrade_total above). A sustained
+        // mark_cancelled failure specifically can leave an execution row
+        // stranded at status='running' forever (#4982) — see the stuck-row
+        // sweep this issue also adds for the recovery side.
+        //
+        // #4982 fix round 2 (Fix 5): the identical swallowed-failure pattern
+        // also existed, uninstrumented, at the equivalent call sites in
+        // workflow_routes.cpp, schedule_runner.cpp and
+        // command_outbox_delivery.cpp — three more dispatch/redispatch
+        // surfaces than the original REST/MCP pair. `surface` widens to 5
+        // values (rest|mcp|workflow|schedule|outbox); 2 ops x 5 surfaces = 10
+        // pre-seeded series, but {op=set_agents_targeted,surface=outbox}
+        // (governance Gate 4 finding, happy-path) can fire on neither success
+        // nor failure and reads 0 forever by construction, not drift:
+        // command_outbox_delivery.cpp's set_agents_targeted write moved into
+        // the atomic CommandDeliveryFinalizationOwner::mark_sent_with_target,
+        // whose own failure counts via the pre-existing
+        // yuzu_server_command_outbox_deliver_degrade_total instead.
+        // {op=set_agents_targeted,surface=schedule} is dead for the same
+        // reason: schedule_runner.cpp never calls set_agents_targeted at all
+        // (grepped - it only ever calls mark_cancelled with surface=schedule;
+        // dispatch for a schedule-originated command sets agents_targeted,
+        // if at all, via the outbox delivery path above, which counts under
+        // surface=outbox). 8 of the 10 pre-seeded series are reachable
+        // (review round 2, Doomgoose PR #5226).
+        metrics_.describe("yuzu_exec_tracker_bookkeeping_failed_total",
+                          "ExecutionTracker::set_agents_targeted / ::mark_cancelled calls that "
+                          "failed (pool exhaustion or a failed statement) at a dispatch call "
+                          "site, by op (set_agents_targeted|mark_cancelled) and surface "
+                          "(rest|mcp|workflow|schedule|outbox). No retry is attempted inline - "
+                          "retrying in an already-degraded-store request handler/background "
+                          "worker risks doubling request latency or delaying the next tick for "
+                          "no reliability gain.",
+                          "counter");
+        for (auto op : {"set_agents_targeted", "mark_cancelled"})
+            for (auto surface : {"rest", "mcp", "workflow", "schedule", "outbox"})
+                metrics_.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                 {{"op", op}, {"surface", surface}});
+        // #4982 Part B — the recovery side of the counter above:
+        // reap_stuck_running_executions() (execution_tracker.cpp) cancels an
+        // execution row permanently wedged at status='running',
+        // agents_targeted=0, via ONE atomic in-transaction `UPDATE ...
+        // RETURNING id` that re-checks the full candidate predicate at
+        // mutation time — NOT a separate post-commit mark_cancelled() call
+        // (fix round 2 TOCTOU close; see that method's own comment).
+        // outcome="cancelled" counts by the number of rows the RETURNING set
+        // actually confirmed transitioned this pass; outcome="not_cancelled"
+        // counts candidates the earlier SELECT chose that the atomic UPDATE's
+        // RETURNING set excluded — the row no longer matched the predicate at
+        // mutation time (a genuine dispatch landed, the outbox row moved back
+        // to pending, or the row otherwise changed between the SELECT and the
+        // UPDATE), never a failed write (the UPDATE statement failing outright
+        // aborts the whole pass as outcome="degraded" instead — see below);
+        // outcome="clock_anomaly"/"would_wipe" each count once per pass
+        // DECLINED for that reason (an implausible now()/anchor reading, or
+        // candidates being an implausibly large fraction of all running
+        // executions — likely a systemic bug, not a genuine backlog);
+        // outcome="degraded" counts a pass that failed outright (pool/query
+        // degradation). Bounded 5-value closed set, pre-seeded below so
+        // absent() stays meaningful (same convention as the gateway-route
+        // reap outcome family).
+        metrics_.describe("yuzu_exec_tracker_stuck_reap_total",
+                          "reap_stuck_running_executions() pass outcomes (#4982 Part B), by "
+                          "outcome (cancelled|not_cancelled|would_wipe|clock_anomaly|degraded|"
+                          "capped|skipped). cancelled/not_cancelled increment by the per-row "
+                          "count for an accepted pass; would_wipe/clock_anomaly/degraded "
+                          "increment once per declined/failed pass; capped increments once per "
+                          "ACCEPTED pass whose true backlog exceeded the per-pass cap - a "
+                          "sustained non-zero capped rate means the reaper is chronically behind "
+                          "even though it is successfully cancelling every pass, same meaning as "
+                          "the gateway-route-reap sibling's ok_capped; skipped increments once "
+                          "when another replica already held the advisory lock this tick - "
+                          "routine on a multi-replica deployment, same meaning as that sibling's "
+                          "own skipped.",
+                          "counter");
+        for (const char* outcome : {"cancelled", "not_cancelled", "would_wipe", "clock_anomaly",
+                                     "degraded", "capped", "skipped"})
+            metrics_.counter("yuzu_exec_tracker_stuck_reap_total", {{"outcome", outcome}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `cfg_.auth_fresh_start_seeded` is set — main.cpp sets it
         // from `RbacStore::provision_first_admin`'s outcome (the fresh-start
@@ -14905,11 +14989,22 @@ private:
         // sibling) because this module needs auth_fn + the just-defined
         // deny_service_scoped_fn + audit_fn, none of which is in scope yet
         // at that earlier point.
+        // #4983: this fragment's `device_ids` (the dashboard CSV-paste
+        // import) had the identical unchecked-existence/scope gap the REST
+        // and MCP twins were fixed for in the same PR -- threads the SAME
+        // `fleet_read_fn` lambda defined above (already reused by several
+        // other Deps-based route modules) plus a direct
+        // `registry_.all_ids()` closure, the identical presence-merged
+        // domain RestApiV1's own `AllAgentIdsFn` wraps (HA WS-5) -- NOT
+        // `registry_.to_json_obj()`'s local-only snapshot, same #4981
+        // precedent reasoning as the REST fix's own wiring comment below.
         yuzu::server::result_set::register_result_set_routes(
             inline_sink, yuzu::server::result_set::Deps{
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .all_agent_ids_fn = [this] { return registry_.all_ids(); },
                              // #5047: same belt as the /api/v1/result-sets JSON
                              // write routes — these fragments are plain HTTP
                              // endpoints too, not cookie-session-only. The
@@ -16070,6 +16165,16 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // #4982 Part B: the stuck-running-execution sweep. Tighter than
+                // the 60m correlation-table cadence above — this recovers a
+                // CORRECTNESS bug (an execution wedged at status='running'
+                // forever), not routine hygiene on an opaque-id table, so a
+                // ~15m cadence (matching the session-reap cadence) surfaces a
+                // genuinely wedged row reasonably promptly without hammering
+                // the pool for what should be a rare event. See
+                // execution_tracker.cpp's kStuckExecWindowSecs/kStuckExecMax-
+                // PlausibleSkewSecs for how this cadence sizes those constants.
+                constexpr int kStuckExecReapEveryNTicks = 450; // ~15 minutes at 2s/tick
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
@@ -16324,6 +16429,104 @@ private:
                                         .increment();
                             } else {
                                 metrics_.counter("yuzu_exec_correlation_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2e2) #4982 Part B: the stuck-running-execution sweep —
+                        // recovers an execution row permanently wedged at
+                        // status='running', agents_targeted=0 (see
+                        // ExecutionTracker::reap_stuck_running_executions's own
+                        // doc comment for the full false-positive-avoidance
+                        // reasoning: the outbox-pending exclusion, the
+                        // would-wipe ratio gate, and the clock-guard shape).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kStuckExecReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_stuck_running_executions()) {
+                                if (reaped->cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "cancelled"}})
+                                        .increment(static_cast<double>(reaped->cancelled));
+                                if (reaped->not_cancelled > 0)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "not_cancelled"}})
+                                        .increment(static_cast<double>(reaped->not_cancelled));
+                                if (reaped->would_wipe)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "would_wipe"}})
+                                        .increment();
+                                if (reaped->clock_anomaly)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "clock_anomaly"}})
+                                        .increment();
+                                if (reaped->capped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "capped"}})
+                                        .increment();
+                                if (reaped->skipped)
+                                    metrics_
+                                        .counter("yuzu_exec_tracker_stuck_reap_total",
+                                                 {{"outcome", "skipped"}})
+                                        .increment();
+                                // governance Gate 2 fix (security-guardian, SHOULD): this
+                                // sweep force-cancels executions the same way the
+                                // operator-initiated DELETE route does (execution_routes.cpp's
+                                // "execution.cancel" audit action) — a background actor
+                                // silently transitioning a command's terminal state is exactly
+                                // the class audit coverage exists to catch. principal="system"
+                                // (no HTTP session/token principal; matches this file's own
+                                // server.viz_disabled precedent), principal_class left at its
+                                // documented "" default (AuditEvent's own doc comment: that
+                                // field is reserved for a session/token principal this program
+                                // CAN attribute, which a background writer is not).
+                                if (audit_store_ && audit_store_->is_open()) {
+                                    const std::int64_t audit_now_s =
+                                        std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                                    // governance Gate 6 fix (sre, HIGH): a degraded audit
+                                    // pool makes every log() call wait out the full
+                                    // kWriteTimeout (4s) before failing — up to 500
+                                    // sequential calls on a capped pass could stall THIS
+                                    // thread (which also runs poll_event_outbox_once's
+                                    // every-tick cross-replica SSE delivery and the
+                                    // sibling reaps) for ~33 minutes. A pool-exhaustion
+                                    // timeout does not recover call-to-call, so break on
+                                    // the FIRST failure rather than retrying the same
+                                    // degraded pool up to 500 times; the audit gap itself
+                                    // is already counted (AuditStore::log increments
+                                    // yuzu_server_audit_emit_failed_total internally) and
+                                    // the store-degrade metric below.
+                                    for (const auto& cancelled_id : reaped->cancelled_ids) {
+                                        AuditEvent ev;
+                                        ev.timestamp = audit_now_s;
+                                        ev.principal = "system";
+                                        ev.action = "execution.cancel";
+                                        ev.target_type = "execution";
+                                        ev.target_id = cancelled_id;
+                                        ev.detail = "reap_stuck_running_executions";
+                                        ev.result = "success";
+                                        if (!audit_store_->log(ev)) {
+                                            spdlog::warn(
+                                                "stuck-execution reap: audit write failed for "
+                                                "execution_id={} -- stopping this pass's audit "
+                                                "loop early (degraded pool), remaining "
+                                                "cancellations in this pass are unaudited",
+                                                cancelled_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                spdlog::warn("stuck-execution reap failed: {}", reaped.error());
+                                metrics_
+                                    .counter("yuzu_exec_tracker_stuck_reap_total",
+                                             {{"outcome", "degraded"}})
                                     .increment();
                             }
                         }
@@ -18924,6 +19127,14 @@ private:
         // BEFORE register_routes(), same timing contract as the two setters
         // immediately above.
         rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
+        // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
+        // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
+        // registry_.to_json_obj() (the local-only agents_fn snapshot passed
+        // to register_routes below), which would reintroduce the #4981
+        // local-vs-presence mismatch one route over. MUST run BEFORE
+        // register_routes(), same timing contract as the setters above.
+        rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
