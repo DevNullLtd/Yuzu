@@ -97,6 +97,7 @@ boot_creates_summary_state_before_listener_and_sup_test() ->
     Mods = [yuzu_gw_telemetry, prometheus_httpd, yuzu_gw_sup],
     persistent_term:erase(Key),
     %% rebar3 runs eunit on a named node with a short cookie.
+    PrevCookieFlag = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
     os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", "1"),
     ok = meck:new(Mods, [non_strict, no_link]),
     Self = self(),
@@ -112,6 +113,9 @@ boot_creates_summary_state_before_listener_and_sup_test() ->
         ?assertEqual(true, receive {booted, supervisor, S2} -> S2 after 0 -> missing end)
     after
         meck:unload(Mods),
-        os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE"),
+        case PrevCookieFlag of
+            false -> os:unsetenv("YUZU_GW_ALLOW_DEFAULT_COOKIE");
+            Prev  -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Prev)
+        end,
         persistent_term:erase(Key)
     end.

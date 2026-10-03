@@ -398,7 +398,8 @@ declare_metrics() ->
                "unknown_session = not held by this node, no_connection = "
                "no connection key to compare, registry_unavailable = the "
                "session index does not exist). The agent re-registers on the "
-               "NOT_FOUND answer. A held session whose heartbeat arrived on "
+               "NOT_FOUND answer (agents 0.13.0 and newer; older agents "
+               "only log it). A held session whose heartbeat arrived on "
                "a different connection is counted in "
                "yuzu_gw_heartbeat_session_mismatch_total instead"}]),
     prometheus_counter:declare([

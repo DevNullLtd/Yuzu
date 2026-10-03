@@ -396,21 +396,37 @@ tls_handshake_observed(#{port := Port, client_ssl := ClientSsl}) ->
 %% The strict (mutual TLS) listener refuses a client that presents no
 %% certificate, so the mutual TLS cases above prove something: both of their
 %% channels hold the same certificate and only the connection differs.
-certless_refused(#{port := Port, certs := #{ca := Ca}}) ->
-    Res = ssl:connect("localhost", Port,
-                      [{cacertfile, Ca}, {verify, verify_peer},
-                       {versions, ['tlsv1.2']}, {mode, binary}, {active, false},
-                       {server_name_indication, "localhost"}], 5000),
-    Refused = case Res of
-        {error, _} -> true;
-        {ok, Sock} ->
-            %% A stack may finish the handshake and then end the session; a
-            %% failed first read is equally a refusal.
-            R = ssl:recv(Sock, 0, 2000),
-            catch ssl:close(Sock),
-            element(1, R) =:= error
+%%
+%% The case has a control: the same raw connection WITH the client certificate
+%% completes the handshake, so a refusal below cannot come from a broken test
+%% client. The certless attempt must be refused during the handshake itself
+%% (the client is pinned to TLS 1.2, where the server's alert arrives before
+%% connect returns). Anything else fails: a completed handshake, or a timeout
+%% from a listener that took the connection and sat idle (verify_none).
+certless_refused(#{port := Port, client_ssl := ClientSsl}) ->
+    Base = [{mode, binary}, {active, false}, {server_name_indication, "localhost"}],
+    CertlessSsl = [O || {K, _} = O <- ClientSsl, K =/= certfile, K =/= keyfile],
+    ?assertEqual(length(ClientSsl) - 2, length(CertlessSsl)),
+    %% Control: with the certificate the handshake completes. No read follows:
+    %% a listener that speaks HTTP/2 closes a raw client that sends no preface,
+    %% so a closed read would not tell a refusal from that.
+    {ok, Ok} = ssl:connect("localhost", Port, ClientSsl ++ Base, 5000),
+    try
+        ?assertEqual([{protocol, 'tlsv1.2'}],
+                     element(2, ssl:connection_information(Ok, [protocol])))
+    after
+        ssl:close(Ok)
     end,
-    ?assert(Refused).
+    %% Without it the listener ends the handshake.
+    Res = case ssl:connect("localhost", Port, CertlessSsl ++ Base, 5000) of
+        {ok, Sock} -> catch ssl:close(Sock), handshake_completed;
+        Other      -> Other
+    end,
+    ?assertEqual(refused, classify_refusal(Res)).
+
+classify_refusal({error, closed})         -> refused;
+classify_refusal({error, {tls_alert, _}}) -> refused;
+classify_refusal(Other)                   -> {not_refused, Other}.
 
 %%%-------------------------------------------------------------------
 %%% Fixture

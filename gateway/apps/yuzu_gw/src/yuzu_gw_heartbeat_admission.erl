@@ -147,9 +147,11 @@ slot(Reason) ->
 slot(Reason, [Reason | _], N) -> N;
 slot(Reason, [_ | Rest], N)   -> slot(Reason, Rest, N + 1).
 
-%% Normally created at boot by init_summary_state/0. The lazy path only
-%% covers a caller that runs before that (unit tests): a concurrent first call
-%% may create the state more than once, which only affects the log lines.
+%% Normally created at boot by init_summary_state/0. The lazy path covers a
+%% caller that runs before that (unit tests, and the window in which the
+%% grpcbox dependency application serves heartbeats before yuzu_gw_app:start/2
+%% has run): a concurrent first call may create the state more than once,
+%% which only affects the log lines.
 summary_state() ->
     case persistent_term:get(?STATE_KEY, undefined) of
         undefined -> new_summary_state();
