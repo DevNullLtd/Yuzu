@@ -242,11 +242,10 @@ struct FileRead {
 /// order never depends on readdir order. Records an entry-cap truncation
 /// (`<prefix>:entry_cap`: the directory holds more entries than the cap —
 /// distinct from the per-leg `row_cap`) and real readdir errors
-/// (`<prefix>:readdir_error`) on `acc`, and through `on_failure(token)` (the caller's
+/// (`<prefix>:readdir_error`) through `on_failure(token)` (the caller's accumulator and
 /// per-path attribution: it knows the directory's logical path, this kit does not).
 template <typename Keep, typename OnFailure>
 [[nodiscard]] std::vector<std::string> list_names(const Dir& dir, Keep&& keep,
-                                                  yuzu::shared::ConstraintAccumulator& acc,
                                                   std::string_view prefix, OnFailure&& on_failure,
                                                   std::size_t max_entries = kMaxEntriesPerDir) {
     std::vector<std::string> names;
@@ -358,7 +357,6 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
             base += '/';
             base += part;
         }
-        base += '/';
 
         posix::DirOpen policies = posix::open_dir_chain(root_open.dir.fd(), chain);
         if (policies.status == posix::OpenStatus::failed)
@@ -368,7 +366,7 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
 
         for (const auto& lvl : kLevelDirs) {
             posix::DirOpen level_dir = posix::open_dir_at(policies.dir.fd(), lvl.dir);
-            const std::string level_path = base + lvl.dir;
+            const std::string level_path = base + '/' + lvl.dir;
             if (level_dir.status == posix::OpenStatus::failed)
                 fail(linux_token(level_dir.detail), level_path);
             if (level_dir.status != posix::OpenStatus::ok)
@@ -376,7 +374,7 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
 
             const auto names = posix::list_names(
                 level_dir.dir,
-                [](const struct dirent* e) { return std::string_view{e->d_name}.ends_with(".json"); }, acc,
+                [](const struct dirent* e) { return std::string_view{e->d_name}.ends_with(".json"); },
                 "linux", [&](std::string token) { fail(std::move(token), level_path); },
                 limits.max_entries_per_dir);
             for (const auto& fname : names) {

@@ -204,7 +204,7 @@ std::vector<std::string> check_outcome_rows(const yuzu::agent::LocalDispatcher::
             const auto fields = split_fields_escape_aware(status_rows[i]);
             REQUIRE(fields.size() == kPolicyFieldCount);
             CHECK(fields[6] == "constrained");
-            CHECK(fields[7].rfind("/etc/", 0) == 0); // a logical path, never "-" or a test root
+            CHECK(fields[7].rfind("/etc", 0) == 0); // a logical path ("/etc" for a root-open failure), never "-" or a test root
         }
     } else if (result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE) {
         REQUIRE(status_rows.size() == 1);

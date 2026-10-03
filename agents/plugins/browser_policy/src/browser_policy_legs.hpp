@@ -73,13 +73,14 @@ template <typename Leg>
         return leg(ctx);
     } catch (...) {
         // exception_category() is noexcept, but the string build can throw on allocation
-        // failure: a failed build falls back to the bare prefix.
-        std::string token;
+        // failure: a failed build keeps the non-allocating bare-prefix view.
+        std::string owned;
+        std::string_view token = kExceptionToken;
         try {
-            token.reserve(kExceptionToken.size() + 14);
-            token.append(kExceptionToken).append(1, ':').append(yuzu::shared::exception_category());
+            owned.reserve(kExceptionToken.size() + 14);
+            owned.append(kExceptionToken).append(1, ':').append(yuzu::shared::exception_category());
+            token = owned;
         } catch (...) {
-            token.assign(kExceptionToken); // SSO-sized in practice; best effort
         }
         // Each report is its own guard: building or writing the row, and the typed status
         // itself (the SDK copies the provenance into a std::string), can each throw on an
