@@ -239,6 +239,7 @@ jobs:
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined \
             -Dcpp_args=-fno-sanitize=null,alignment
+          python3 scripts/ci/assert-gateway-tests.py build-linux-asan
 
       - name: Build (ASan+UBSan)
         run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-asan-build.log
@@ -391,6 +392,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-tsan \
             -Dbuild_tests=true \
             -Db_sanitize=thread
+          python3 scripts/ci/assert-gateway-tests.py build-linux-tsan
 
       - name: Build (TSan)
         run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-tsan-build.log

@@ -770,10 +770,18 @@ jobs:
       # build runs fine on 26.04 (same libcrypto.so.3 soname). Do NOT change to
       # ubuntu26 until setup-beam ships a 26.04 build — it would fail to resolve
       # the asset. Verified by gateway eunit on the Big Tam leg.
+      # RUNNER_TOOL_CACHE is re-pointed for this step only, as on the macOS leg
+      # (see its step for the full reasoning, #4852): a trusted-fork run must not
+      # write a persistent erl into a cache later normal jobs on this agent
+      # execute (the "Do not read or write runner.tool_cache" rule above), so it
+      # gets a per-run temp dir; normal runs keep a per-agent subdir of the tool
+      # cache (Big Tam's tool cache is already per agent, so that costs one cold
+      # install per agent and no new sharing).
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: ubuntu24
+          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
         with:
           otp-version: '28'
           rebar3-version: '3.24'
@@ -871,6 +879,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Cross-OS capture certification guard (PR #4112 review, blocker),
@@ -1701,6 +1710,7 @@ jobs:
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
 
       - name: Build
         # Affinity controls placement, not Ninja's processor-count discovery;
@@ -2131,6 +2141,32 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
+      # OTP + rebar3 for the gateway build and its eunit/ct tests, identical pin to
+      # the Linux leg (and release.yml's gateway job) so an OTP bump moves every
+      # leg together. Until #4841 this job had NO Erlang: meson's
+      # find_program('rebar3', required: false) silently skipped the gateway, so
+      # macOS stayed green without ever compiling or testing it. The Configure step
+      # below now runs scripts/ci/assert-gateway-tests.py, which fails the leg when
+      # the gateway tests were not registered.
+      # ImageOS is required because setup-beam cannot auto-detect a self-hosted
+      # runner's OS; macos26 matches the BigMags Mac Minis (macOS 26, arm64).
+      # Step-scoped so the rest of the job does not see it.
+      # RUNNER_TOOL_CACHE is re-pointed for this step only. Both BigMags agents
+      # share /opt/ci/tool_cache, and setup-beam populates it with rmRF + copy, so a
+      # concurrent debug/release pair on one box could race while populating or
+      # copying from the shared cache (the OTP each job then RUNS is its own copy
+      # under RUNNER_TEMP): scope it per agent. A trusted-fork run must not write
+      # a persistent erl into a cache later normal jobs execute (the "Do not read
+      # or write runner.tool_cache" rule above), so it gets a per-run temp dir.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        env:
+          ImageOS: macos26
+          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
       # BigMags runner, which persists in the runner user's home between
       # jobs by definition. No actions/cache round-trip needed — paying the
@@ -2189,6 +2225,7 @@ jobs:
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+          python3 scripts/ci/assert-gateway-tests.py build-macos
 
       - name: Build
         # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the

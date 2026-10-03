@@ -534,16 +534,31 @@ mgmt_get_agent(_Config) ->
 %%%===================================================================
 
 upstream_register_error_handling(Config) ->
-    %% Test error handling when upstream returns failure.
+    %% Test error handling when upstream returns a real gRPC status.
+    %%
+    %% #4708 contract decision: the GATEWAY side is authoritative. A genuine
+    %% (non-transport) gRPC status reaches yuzu_gw_upstream:do_rpc/4 in
+    %% grpcbox_client:unary/5's REAL shape -- `{error, {Status, Message},
+    %% Trailers}`, Status being the raw `grpc-status` trailer as a binary
+    %% digit string (grpcbox_stream:grpc_error_response()) -- and do_rpc
+    %% surfaces it UNWRAPPED as `{error, {Status, Message}}`, which is what
+    %% callers such as do_replay_one/6's FAILED_PRECONDITION branch match
+    %% on. `{error, {internal, Bin}}` is reserved for transport-level
+    %% `{error, Reason}` and HTTP-layer errors. This mock previously returned
+    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape grpcbox never
+    %% produces, so it fell through to the transport arm; HA WS-4 4.4
+    %% (e0e4f6a17) corrected the eunit twin (yuzu_gw_upstream_tests
+    %% proxy_register_error) but this CT copy was hidden by #4800 (the ct
+    %% gate ran zero suites).
     meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
-            _ -> {error, {14, <<"UNAVAILABLE">>, #{}}}
+            _ -> {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
         end
     end),
 
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    ?assertMatch({error, {14, _}}, Result),
+    ?assertEqual({error, {<<"14">>, <<"UNAVAILABLE">>}}, Result),
     Config.
 
 upstream_batch_heartbeat_flush(Config) ->

@@ -433,7 +433,7 @@ gate_run "CT suites" "ct.log" \
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
-# apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
+# apps/yuzu_gw/test/ct` discovery does NOT pick it up). Requires:
 #   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
 #      this up via start-UAT.sh).
 #   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR

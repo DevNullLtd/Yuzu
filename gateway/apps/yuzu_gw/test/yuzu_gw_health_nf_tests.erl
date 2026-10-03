@@ -279,8 +279,9 @@ readyz_503_circuit_open(Port) ->
     ?assert(binary:match(Body, <<"\"circuit_breaker\":false">>) =/= nomatch),
 
     %% Restore the circuit to closed for other tests.
-    %% Wait for half_open, then succeed a probe.
-    timer:sleep(350),
+    %% Wait for the timer-driven half_open, then succeed a probe. A fixed
+    %% sleep(350) here raced the timer on a loaded runner (see await_state/1).
+    ?assertEqual(half_open, await_state(half_open)),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"recovered">>}, #{}}
     end),
@@ -332,6 +333,29 @@ readyz_response_time(Port) ->
     AvgUs = lists:sum(Timings) / length(Timings),
     %% Average should be under 20ms (20000 us) — includes gen_server call.
     ?assert(AvgUs < 20000).
+
+%% The open -> half_open transition is driven by an erlang:send_after timer in
+%% yuzu_gw_upstream (the 200ms reset timeout set in setup), so on a loaded
+%% runner the timer can fire late, or its message can queue behind this test's
+%% circuit_state call. A fixed `timer:sleep(350)` then `half_open` check is an
+%% UPPER-bound race of the kind that flaked on the first macOS CI runs (#4841,
+%% #4851; BigMags shares its CPU between two agents, and macOS coalesces
+%% background timers). Poll every 10ms up to a 2s deadline instead. The caller only
+%% needs the circuit restored for later tests, so the deadline changes
+%% nothing it asserts (the backoff AMOUNTS are pinned in
+%% yuzu_gw_circuit_breaker_nf_tests).
+await_state(Want) ->
+    poll_state(Want, erlang:monotonic_time(millisecond) + 2000).
+
+poll_state(Want, Deadline) ->
+    case yuzu_gw_upstream:circuit_state() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), poll_state(Want, Deadline)
+            end
+    end.
 
 %%%===================================================================
 %%% HTTP client helper (minimal, no deps)

@@ -286,6 +286,13 @@ mgmt_auth_reject_reasons() ->
 heartbeat_reject_reasons() ->
     [unknown_session, no_connection, registry_unavailable].
 
+%% Every `{help, ...}` string below MUST be plain ASCII (#4707, #5177). This
+%% source file is UTF-8, so a literal em dash or smart quote becomes a charlist
+%% element > 255, and prometheus_text_format:escape_string/2 calls
+%% iolist_to_binary/1 on it, which raises badarg on EVERY scrape: :9568/metrics
+%% answers a bare inets HTTP 500 for the whole registry, not just the one
+%% metric. yuzu_gw_telemetry_tests:metrics_scrape_renders_test_/0 renders the
+%% real registry through the real formatter to catch this.
 declare_metrics() ->
     %% Counters
     prometheus_counter:declare([

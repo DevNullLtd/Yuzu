@@ -806,13 +806,13 @@ rebar3 compile
 
 ```bash
 cd gateway
-rebar3 ct --dir apps/yuzu_gw/test
+rebar3 ct --dir apps/yuzu_gw/test/ct
 ```
 
 To run a specific test suite:
 
 ```bash
-rebar3 ct --dir apps/yuzu_gw/test --suite yuzu_gw_agent_SUITE
+rebar3 ct --dir apps/yuzu_gw/test/ct --suite yuzu_gw_integration_SUITE
 ```
 
 ### Create a Release

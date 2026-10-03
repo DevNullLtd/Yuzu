@@ -71,7 +71,7 @@ deregister_removes() ->
     ok = yuzu_gw_registry:register_agent(<<"agent-2">>, Pid, <<"s">>, [], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-2">>)),
     yuzu_gw_registry:deregister_agent(<<"agent-2">>),
-    timer:sleep(20),  %% cast is async
+    registry_barrier(),  %% the deregister cast is async
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"agent-2">>)),
     kill_dummy(Pid).
 
@@ -81,8 +81,7 @@ monitor_cleanup() ->
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-3">>)),
     %% Kill the process — registry should auto-clean via DOWN monitor.
     kill_dummy(Pid),
-    timer:sleep(50),
-    ?assertEqual(error, yuzu_gw_registry:lookup(<<"agent-3">>)).
+    ?assertEqual(error, await(fun() -> yuzu_gw_registry:lookup(<<"agent-3">>) end, error)).
 
 reregister_replaces() ->
     Pid1 = spawn_dummy(),
@@ -115,8 +114,8 @@ agent_count_accurate() ->
     ?assertEqual(InitialCount + 10, yuzu_gw_registry:agent_count()),
     %% Cleanup
     lists:foreach(fun(Pid) -> kill_dummy(Pid) end, Pids),
-    timer:sleep(100),
-    ?assertEqual(InitialCount, yuzu_gw_registry:agent_count()).
+    ?assertEqual(InitialCount,
+                 await(fun yuzu_gw_registry:agent_count/0, InitialCount)).
 
 pg_plugin_groups() ->
     Pid = spawn_dummy(),
@@ -162,7 +161,7 @@ pagination_cursor() ->
 deregister_nonexistent() ->
     %% Should not crash.
     yuzu_gw_registry:deregister_agent(<<"does-not-exist">>),
-    timer:sleep(20),
+    registry_barrier(),  %% also proves the registry survived the cast
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"does-not-exist">>)).
 
 lookup_dead_process() ->
@@ -245,7 +244,7 @@ pending_sweep_expired() ->
 
     %% Trigger sweep.
     yuzu_gw_registry ! sweep_pending,
-    timer:sleep(50),
+    registry_barrier(),
 
     %% Expired entry should be gone.
     ?assertEqual([], ets:lookup(yuzu_gw_pending, <<"sweep-expired-1">>)).
@@ -261,7 +260,7 @@ pending_sweep_preserves_fresh() ->
 
     %% Trigger sweep.
     yuzu_gw_registry ! sweep_pending,
-    timer:sleep(50),
+    registry_barrier(),
 
     %% Fresh entry should still exist.
     ?assertMatch([{_, _, _}], ets:lookup(yuzu_gw_pending, <<"sweep-fresh-1">>)),
@@ -296,6 +295,38 @@ reregister_no_monitor_leak() ->
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
+
+%% Two ways to wait for the registry, replacing fixed `timer:sleep(N)` calls
+%% that are UPPER-bound races on a loaded runner (#4851 runs this suite on
+%% macOS CI for the first time; BigMags shares its CPU between two agents, and
+%% fixed sleeps have already flaked twice there).
+%%
+%% registry_barrier/0 is for a cast or message THIS process sent the registry
+%% (deregister_agent/1, sweep_pending). sys:get_state/1 is a system message
+%% queued behind it, so its reply proves the handler has fully run, and the
+%% registry's ETS writes are visible as soon as they are made. No deadline is
+%% involved, so it also backs the negative checks that follow a sweep.
+%%
+%% await/2 is for effects driven by ANOTHER process: the registry's monitor
+%% 'DOWN' when a dummy agent exits. It polls Fun every 10ms until it returns
+%% Want or a 2s deadline passes, and returns the last value. Callers only claim
+%% "the cleanup happens", so the deadline changes nothing they assert.
+registry_barrier() ->
+    _ = sys:get_state(yuzu_gw_registry),
+    ok.
+
+await(Fun, Want) ->
+    await(Fun, Want, erlang:monotonic_time(millisecond) + 2000).
+
+await(Fun, Want, Deadline) ->
+    case Fun() of
+        Want -> Want;
+        Other ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Other;
+                false -> timer:sleep(10), await(Fun, Want, Deadline)
+            end
+    end.
 
 spawn_dummy() ->
     spawn(fun() -> receive stop -> ok end end).

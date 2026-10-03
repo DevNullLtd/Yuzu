@@ -247,9 +247,9 @@ assert_eq "Test name" "expected" "$actual"
 ### Erlang tests
 1. Add test function to existing `*_tests.erl` or create new module
 2. Add to test fixture list
-3. Run with `rebar3 as test eunit`
+3. Run with `rebar3 as test eunit --dir apps/yuzu_gw/test` (#337)
 
 ### Common Test
 1. Add test function to `*_SUITE.erl`
 2. Add to `all/0` or appropriate group
-3. Run with `rebar3 as test ct`
+3. Run with `rebar3 as test ct --dir apps/yuzu_gw/test/ct` (ct does not recurse; without `--dir` it runs zero suites and still exits 0, #4800)
