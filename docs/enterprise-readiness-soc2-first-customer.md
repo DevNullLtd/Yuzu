@@ -593,8 +593,9 @@ kept invoking `rebar3 ct` without that directory, so it discovered zero suites, 
 `gateway ct … OK` with no Common Test case executed, so they are **not** evidence that the
 gateway's integration, end-to-end, metrics or performance suites passed. Two real defects
 shipped behind it on `dev` (#4707, the gateway `/metrics` endpoint returning HTTP 500, and
-#4708, a stale test); neither reached a tagged release. The gateway's EUnit check was
-unaffected and did run.
+#4708, a stale test). #4707 reached tagged releases: it was in 0.14.0-rc1 through rc3 and
+was fixed by the hotfix #5177/#5199. #4708 is a test-only defect.
+The gateway's EUnit check was unaffected and did run.
 
 #4800 closes it: the check now runs the suites on the Linux, Windows and macOS legs (52
 Common Test cases were measured on Linux and on Windows when it merged; the macOS count
