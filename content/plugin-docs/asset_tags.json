@@ -264,7 +264,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "d276d67e9d65",
+  "leg_hash": "a1484e310c73",
   "manifest_version": 1,
   "name": "asset_tags",
   "outputs": [
@@ -438,6 +438,30 @@
           ],
           "type": "int32",
           "values": null
+        },
+        {
+          "description": "Number of sync persistence failures since the plugin started; not persisted across restarts.",
+          "example": "0",
+          "name": "persist_failures",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "int64",
+          "values": null
+        },
+        {
+          "description": "Message of the most recent persistence failure or write warning, or - when none.",
+          "example": "-",
+          "name": "last_persist_error",
+          "platforms": [
+            "windows",
+            "linux",
+            "darwin"
+          ],
+          "type": "string",
+          "values": null
         }
       ],
       "definition_id": "device.asset_tags.status"
@@ -548,6 +572,18 @@
       "provenance": "`asset_tags:persist_failed`",
       "status": "`CONSTRAINED`",
       "when": "`sync`: the temp-file write or the rename over `asset_tags.json` failed (data dir not creatable, not a directory, disk error, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log"
+    },
+    {
+      "completeness": "full",
+      "provenance": "`asset_tags:persist_mode_unrestricted`",
+      "status": "`CONSTRAINED`",
+      "when": "`sync`: the file was written but re-asserting owner-only mode (`fchmod` to 0600) failed, so it sits at a wider mode; outranks `persist_dir_unsynced` when both occur (the status row's `last_persist_error` carries both causes)"
+    },
+    {
+      "completeness": "full",
+      "provenance": "`asset_tags:persist_dir_unsynced`",
+      "status": "`CONSTRAINED`",
+      "when": "`sync`: the file was written and renamed but the parent-directory fsync failed, so the rename is durable only after the next OS flush"
     }
   ],
   "samples": {
@@ -619,7 +655,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "container",
-        "leg_hash": "d276d67e9d65",
+        "leg_hash": "pending",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -693,7 +729,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "d276d67e9d65",
+        "leg_hash": "pending",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -767,7 +803,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "d276d67e9d65",
+        "leg_hash": "pending",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
