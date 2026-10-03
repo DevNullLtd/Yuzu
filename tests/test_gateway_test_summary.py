@@ -21,6 +21,8 @@ import glob
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -223,6 +225,92 @@ class CancelTolerantVerdict(unittest.TestCase):
             p = subprocess.run([sys.executable, script, 'strict', 'ct', '0'],
                                capture_output=True, text=True)
             self.assertEqual(p.returncode, 2)
+
+
+@unittest.skipUnless(shutil.which('bash') and os.name != 'nt',
+                     'needs bash and a POSIX host (gateway/test_runner.sh is never run on Windows)')
+class LocalRunnerBehaviour(unittest.TestCase):
+    # The source-text pin above cannot see `rebar_rc=${PIPESTATUS[0]}` become
+    # `$?` or `verdict=$?` become `verdict=0`. This runs the real script
+    # against a stub `rebar3` on PATH and asserts its exit code. The runner is
+    # executed in place (it resolves the parser relative to itself and cd's
+    # into gateway/); only rebar3 is faked, and TMPDIR is a private dir.
+
+    RUNNER = os.path.join(ROOT, 'gateway', 'test_runner.sh')
+    STUB = (
+        '#!/usr/bin/env bash\n'
+        'case "$1" in compile) exit 0;; esac\n'
+        'for a in "$@"; do\n'
+        '  if [ "$a" = ct ]; then printf \'%s\\n\' "$STUB_CT_OUT"; exit "$STUB_CT_RC"; fi\n'
+        '  if [ "$a" = eunit ]; then printf \'%s\\n\' "$STUB_EUNIT_OUT"; exit "$STUB_EUNIT_RC"; fi\n'
+        'done\n'
+        'exit 99\n')
+
+    CT_PASS = ('All 5 tests passed.', 0)
+    EU_PASS = ('  All 300 tests passed.', 0)
+
+    # Copies stdin like the real tee, then exits non-zero.
+    FAILING_TEE = '#!/bin/sh\ncommand -p tee "$@"\nexit 1\n'
+
+    def _run(self, args, ct=CT_PASS, eunit=EU_PASS, tee_fails=False):
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            stubs = [('rebar3', self.STUB)] + ([('tee', self.FAILING_TEE)] if tee_fails else [])
+            for name, body in stubs:
+                stub = os.path.join(d, name)
+                with open(stub, 'w', encoding='utf-8') as f:
+                    f.write(body)
+                os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], TMPDIR=d,
+                       STUB_CT_OUT=ct[0], STUB_CT_RC=str(ct[1]),
+                       STUB_EUNIT_OUT=eunit[0], STUB_EUNIT_RC=str(eunit[1]))
+            p = subprocess.run(['bash', self.RUNNER] + args, env=env,
+                               capture_output=True, text=True, timeout=120)
+            return p.returncode, p.stdout + p.stderr
+
+    def test_ct_verdict_comes_from_the_summary(self):
+        cases = [
+            # (stub ct output, stub rebar3 rc, expected exit, why)
+            ('All 0 tests passed.', 0, 1, 'zero-test ct (the #4800 false green)'),
+            ('Failed 1 tests. Passed 4 tests. ', 1, 1, 'ct failed'),
+            ('===> Compiling yuzu_gw', 0, 1, 'ct printed no summary'),
+            ('All 5 tests passed.', 1, 1, 'strict: rebar3 non-zero stays a failure'),
+            ('All 5 tests passed.', 0, 0, 'ct pass'),
+        ]
+        for out, rc, want, why in cases:
+            with self.subTest(why=why):
+                got, log = self._run(['ct'], ct=(out, rc))
+                self.assertEqual(got, want, log)
+
+    def test_eunit_verdict_comes_from_the_summary(self):
+        cancelled = '\nOne or more tests were cancelled.'
+        cases = [
+            ('  Failed: 0.  Skipped: 0.  Passed: 0.' + cancelled, 1, 1, 'every set cancelled'),
+            ('  Failed: 0.  Skipped: 0.  Passed: 309.' + cancelled, 1, 0, 'cancel-tolerated (#1005)'),
+            ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1, 1, 'real failure'),
+            ('  All 300 tests passed.', 1, 1, 'rc != 0 without a Failed: line'),
+            ('  There were no tests to run.', 0, 1, 'nothing discovered'),
+            ('  All 300 tests passed.', 0, 0, 'eunit pass'),
+        ]
+        for out, rc, want, why in cases:
+            with self.subTest(why=why):
+                got, log = self._run(['eunit'], eunit=(out, rc))
+                self.assertEqual(got, want, log)
+
+    def test_verdict_uses_rebar3_status_not_the_pipeline_status(self):
+        # Under `set -o pipefail` a bare `$?` equals PIPESTATUS[0] unless the
+        # pipeline's other stage (tee) fails, so only a failing tee tells
+        # `rebar_rc=${PIPESTATUS[0]}` from `rebar_rc=$?`: a green ct run whose
+        # capture was copied intact must still pass, and a red one still fail.
+        self.assertEqual(self._run(['ct'], tee_fails=True)[0], 0)
+        self.assertEqual(self._run(['ct'], ct=('All 5 tests passed.', 1), tee_fails=True)[0], 1)
+
+    def test_default_runs_both_and_counts_either_failure(self):
+        zero = ('All 0 tests passed.', 0)
+        bad_eunit = ('  Failed: 2.  Skipped: 0.  Passed: 307.', 1)
+        self.assertEqual(self._run([])[0], 0)
+        self.assertEqual(self._run([], ct=zero)[0], 1)
+        self.assertEqual(self._run([], eunit=bad_eunit)[0], 1)
+        self.assertEqual(self._run([], ct=zero, eunit=bad_eunit)[0], 2)
 
 
 class WrapperWiring(unittest.TestCase):
