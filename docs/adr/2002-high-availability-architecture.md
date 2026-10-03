@@ -1267,7 +1267,7 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   docs); later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
   `026830cd9` summary log state created at boot, and the round-2 code commits `e139c5e86` boot test and
   two comments, `9ad473534` counter HELP wording, `942fe5770` and `c2d040a66` test changes, `ab3986ec1`
-  comments) are covered by eunit only (fix-agent runs, not rig runs), and the boot path of the final tip
+  comments, and the round-3 code commit `21125cc3b` comment, HELP and test changes) are covered by eunit only (fix-agent runs, not rig runs), and the boot path of the final tip
   has not been exercised on a rig. The run record is
   [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 - **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the

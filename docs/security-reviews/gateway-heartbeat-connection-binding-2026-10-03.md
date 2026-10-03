@@ -77,6 +77,7 @@ At the post-round-2 tip `ab3986ec1`, run by the fix agents (these are not rig ru
 
 - eunit: 401 of 401 passed, three runs from a fresh `_build/test`.
 - dialyzer: clean.
+
 At the first Gate 8 tip `255b63c40` (not re-run after it unless listed above):
 
 - eunit: 399 of 399 passed, three runs from a fresh `_build/test`, no flake. Alphabetical and reverse-alphabetical `--module=` runs also pass.
@@ -88,7 +89,7 @@ At the first Gate 8 tip `255b63c40` (not re-run after it unless listed above):
 ## Mutation checks
 
 - Gate 3 (quality-engineer): 34 mutants run; 18 of the 24 security-relevant mutants were killed. The survivors (compare order when the key is `undefined`, the fence asserted on the routing table instead of the agents row, `Subscribe` taking its key from the pending row, a replay adopt writing the index row, and missing storm and churn coverage) were fixed in the fix round with new tests, each re-proved to fail (RED) with a scratch mutant.
-- Gate 8 re-run: 9 mutants, 6 killed. The three survivors, as they stand after fix round 2:
+- Gate 8 re-run: 9 mutants, 6 killed. Of the three survivors, two were killed by tests added in fix round 2; status after that round:
   - the pid-blind unindex is now killed by `non_owner_cleanup_keeps_session` (`c2d040a66`); a fix agent saw the test fail against the pid-blind mutant;
   - the boot wiring is now killed by `boot_creates_summary_state_before_listener_and_sup_test` (`e139c5e86`); a fix agent saw it fail when the init call was deleted and when it was moved after `yuzu_gw_sup:start_link`;
   - `index_session` catching every error class stays an equivalent mutant, because `ets:insert` raises only `badarg`.
@@ -96,7 +97,7 @@ At the first Gate 8 tip `255b63c40` (not re-run after it unless listed above):
 
 ## Agent compatibility
 
-The `NOT_FOUND` recovery (escalating cooldown, then a forced `Subscribe` cancel and re-register) is in agent v0.13.0 and newer. In v0.12.0 the heartbeat path only logs `Heartbeat failed`. This was checked in `agents/core/src/agent.cpp` at the `v0.12.0` and `v0.13.0` tags. An older agent therefore does not re-register by itself if its heartbeats are rejected, and stays rejected until it is restarted or upgraded. This matters only when its heartbeats are rejected, which happens in three cases: a topology that breaks the one-connection assumption, a gateway running without the session index, and a gateway registry process restart or crash while connections stay up (run 1, step 8a: the registry recreates its tables empty and every heartbeat for the agents it held is rejected until they re-register; a node failover that leaves the session not held by the surviving node is expected to behave the same, inferred, not tested). The 25 s recovery of step 8a was observed with agents built from the branch (0.14.0-rc6 or newer). The released agents tested in run 1 (v0.13.0 and v0.14.0-rc6) were not driven into a rejection, and v0.12.0 was not run.
+The `NOT_FOUND` recovery (escalating cooldown, then a forced `Subscribe` cancel and re-register) is in agent v0.13.0 and newer. In v0.12.0 the heartbeat path only logs `Heartbeat failed`. This was checked in `agents/core/src/agent.cpp` at the `v0.12.0` and `v0.13.0` tags. An older agent therefore does not re-register by itself if its heartbeats are rejected, and stays rejected until it is restarted or upgraded. This matters only when its heartbeats are rejected, which happens in three cases: a topology that breaks the one-connection assumption, a gateway running without the session index, and a gateway registry process restart or crash while connections stay up (run 1, step 8a: the registry recreates its tables empty and every heartbeat for the agents it held is rejected until they re-register; a node failover that leaves the session not held by the surviving node is expected to behave the same, inferred, not tested). The 25 s recovery of step 8a was observed with agents built from the branch tree (version 0.14.0, which carries the 0.13.0 recovery). The released agents tested in run 1 (v0.13.0 and v0.14.0-rc6) were not driven into a rejection, and v0.12.0 was not run.
 
 ## Not tested
 
