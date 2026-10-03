@@ -445,10 +445,11 @@ missing_session_index_keeps_routing() ->
         ?assertEqual(0, queued()),
         assert_events([reject_event(registry_unavailable)]),
         %% re-register the same agent id (supersede path)
-        PY2 = bind(Y, uid(<<"sy2">>), conn_a),
+        SY2 = uid(<<"sy2">>),
+        PY2 = bind(Y, SY2, conn_a),
         ?assertEqual({ok, PY2}, yuzu_gw_registry:lookup(Y)),
         %% fenced and unfenced deregistration
-        ok = yuzu_gw_registry:deregister_agent(Y, PY2, undefined),
+        ok = yuzu_gw_registry:deregister_agent(Y, PY2, SY2),
         sync_registry(),
         ?assertEqual(error, yuzu_gw_registry:lookup(Y)),
         yuzu_gw_registry:deregister_agent(X),

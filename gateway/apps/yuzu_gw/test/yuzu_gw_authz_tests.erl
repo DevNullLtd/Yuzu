@@ -264,7 +264,7 @@ setup_certs(BaseDir) ->
 %% announced on the console) or a failing test. It fails when the environment
 %% variable YUZU_REQUIRE_TLS_TESTS is `1', which a CI leg that is expected to
 %% carry openssl sets, so a broken toolchain cannot pass as a green run.
--spec certs_unavailable(string(), term()) -> [eunit:test()].
+-spec certs_unavailable(string(), term()) -> [{string(), fun(() -> any())}].
 certs_unavailable(Label, Why) ->
     Reason = lists:flatten(io_lib:format("~p", [Why])),
     case os:getenv("YUZU_REQUIRE_TLS_TESTS") of

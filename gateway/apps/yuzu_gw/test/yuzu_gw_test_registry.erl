@@ -81,10 +81,8 @@ ensure_fresh() ->
 %% @doc Stop an agent supervisor that a fixture started, and wait until it is
 %% gone. `undefined' (the fixture reused a supervisor it did not start) is a
 %% no-op. The next fixture's setup reuses `yuzu_gw_agent_sup' when the name is
-%% registered, so it must not find one that is still shutting down. Fixtures
-%% unlink the supervisor after starting it, so the stop request goes to it
-%% directly rather than as an exit signal from a process that is not its
-%% parent (a supervisor ignores those). Returns `ok'.
+%% registered, so it must not find one that is still shutting down: stop it
+%% synchronously and wait for its exit. Returns `ok'.
 -spec stop_agent_sup(pid() | undefined) -> ok.
 stop_agent_sup(undefined) ->
     ok;
