@@ -57,8 +57,8 @@ if [ "$FRAG_COUNT" -eq 0 ]; then
     if [ "$VERSION" = "$BASE_VERSION" ]; then
         # A final release whose RCs already folded every fragment still needs
         # its own date on the header (#5221); 4b cannot tell, so say it.
-        HEADER=$(grep -m1 "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null || true)
-        echo "        note: header is '${HEADER:-missing}' — if that is not the release date, run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append --date YYYY-MM-DD"
+        HEADER=$(grep -m1 "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null | tr -d '\r' || true)
+        echo "        note: header is '${HEADER:-missing}' — if that is not the release date, run: python3 scripts/assemble-changelog.py promote $BASE_VERSION --append --date YYYY-MM-DD, commit, and re-run preflight"
     fi
 else
     if grep -q "^## \[${BASE_VERSION//./\\.}\]" CHANGELOG.md 2>/dev/null; then

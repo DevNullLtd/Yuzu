@@ -117,6 +117,13 @@ class PromoteAppend(unittest.TestCase):
                          CHANGELOG.replace("## [1.2.0] - 2026-09-01", "## [1.2.0] - 2026-10-10"))
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["CHANGELOG.md", "changelog.d"])
 
+    def test_redate_keeps_text_after_the_date(self):
+        text = CHANGELOG.replace("## [1.2.0] - 2026-09-01", "## [1.2.0] - 2026-09-01 [YANKED]")
+        self.changelog.write_text(text, encoding="utf-8")
+        self.assertEqual(self.run_append("--date", "2026-10-10").returncode, 0)
+        self.assertEqual(self.changelog.read_text(encoding="utf-8"),
+                         text.replace("## [1.2.0] - 2026-09-01 [YANKED]", "## [1.2.0] - 2026-10-10 [YANKED]"))
+
     def test_date_only_same_date_is_a_noop(self):
         r = self.run_append("--date", "2026-09-01")
         self.assertEqual(r.returncode, 0, r.stderr)

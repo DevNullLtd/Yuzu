@@ -38,7 +38,9 @@ Modes:
       final release date when folding fragments in before tagging the final.
       With no fragments, --date alone re-dates the header (the final release
       after an RC that already folded every fragment); nothing else changes.
-      Refuses if [Unreleased] is missing or still holds legacy subsections (run a plain
+      Text after an existing header date (e.g. [YANKED]) is kept.
+      Refuses if there are no fragments and no --date, if [Unreleased] is
+      missing or still holds legacy subsections (run a plain
       promote of the next version for those), if <X.Y.Z> is not the newest
       released section (override: --allow-older-section), if more than one
       `## [X.Y.Z]` header exists, or if a fragment's whole text already
@@ -474,6 +476,13 @@ def contains_block(haystack: list[str], block: list[str]) -> bool:
     return n > 0 and any(hay[i:i + n] == blk for i in range(len(hay) - n + 1))
 
 
+def redated_header(old: str, version: str, date_str: str) -> str:
+    """`## [X.Y.Z] - <date_str>`, keeping any text after an existing date
+    (e.g. a ` [YANKED]` marker); a non-canonical header is rewritten whole."""
+    m = re.match(rf"^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}(?P<suffix>.*)$", old)
+    return f"## [{version}] - {date_str}" + (m.group("suffix") if m else "")
+
+
 def cmd_promote_append(version: str, date_str: str | None, changelog: Path, fragments_dir: Path,
                        allow_older: bool = False) -> int:
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -532,19 +541,20 @@ def cmd_promote_append(version: str, date_str: str | None, changelog: Path, frag
     frags = fragment_files(fragments_dir)
     if not frags:
         if not date_str:
-            print("promote --append: nothing to append — no fragments in changelog.d/ (to only change the "
-                  f"## [{version}] header date, pass --date YYYY-MM-DD)", file=sys.stderr)
+            print("promote --append: nothing to append — no fragments in changelog.d/ (at the final release, "
+                  f"pass --date YYYY-MM-DD to re-date the ## [{version}] header; an RC needs no append)",
+                  file=sys.stderr)
             return 1
         # No hotfixes since the last append: the final release still needs its
         # own date on the header, so --date alone re-dates it. Nothing else changes.
         old_header = lines[start]
-        header = f"## [{version}] - {date_str}"
+        header = redated_header(old_header, version, date_str)
         if old_header == header:
             print(f"promote --append: {header} already carries that date; nothing to do")
             return 0
         lines[start] = header
         write_atomic(changelog, "\n".join(lines))
-        print(f"promote --append: no fragments; re-dated {old_header} -> {header}")
+        print(f"promote --append: no fragments; re-dated {old_header!r} -> {header!r}")
         print("promote --append: review the diff, then commit CHANGELOG.md.")
         return 0
     additions: dict[str, list[str]] = {name: [] for name in CANONICAL_SECTIONS}
@@ -605,7 +615,7 @@ def cmd_promote_append(version: str, date_str: str | None, changelog: Path, frag
             existing = {n.capitalize(): j for j, (n, _) in enumerate(subs)}
 
     old_header = lines[start]
-    header = f"## [{version}] - {date_str}" if date_str else old_header
+    header = redated_header(old_header, version, date_str) if date_str else old_header
     rebuilt_section: list[str] = [header, ""]
     pre = trimmed(preamble)
     if pre:
