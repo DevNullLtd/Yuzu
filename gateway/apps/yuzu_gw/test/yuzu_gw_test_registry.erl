@@ -87,11 +87,31 @@ ensure_pg() ->
     end,
     ok.
 
+%% A kill signal travels down every link the target process still holds, and a
+%% registry started by an earlier module's fixture process is linked to that
+%% (possibly still running) process: killing it cancels that module's tests.
+%% So a real registry is first stopped with a normal exit reason, which a
+%% non-trapping linked process ignores. The kill remains the fallback for a
+%% process that is not a gen_server (the #336 `mock_loop' impostor) or that
+%% does not stop in time.
 evict(Pid) ->
     catch unlink(Pid),
     catch unregister(yuzu_gw_registry),
-    catch exit(Pid, kill),
+    case started_by_proc_lib(Pid) of
+        true ->
+            try gen_server:stop(Pid, normal, 1000)
+            catch _:_ -> catch exit(Pid, kill)
+            end;
+        false ->
+            catch exit(Pid, kill)
+    end,
     ok.
+
+%% True for a process started through proc_lib (every OTP behaviour, so the
+%% real registry); false for a plain `spawn' such as the `mock_loop' impostor,
+%% which would swallow the stop request and only burn the timeout.
+started_by_proc_lib(Pid) ->
+    proc_lib:initial_call(Pid) =/= false.
 
 %% `start_link' can race a dying registry that still owns the named ETS
 %% tables; the fresh `init/1' then crashes with a `{badarg, ...}' EXIT
