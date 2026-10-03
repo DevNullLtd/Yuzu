@@ -94,7 +94,7 @@ For real isolation, either `rm -rf gateway/_build/test` between runs, or drop in
   - `yuzu_gw_agent_handler.erl` — Per-agent connection process
   - `yuzu_gw_upstream.erl` — Server-side gRPC client
   - `yuzu_gw_metrics.erl` — Prometheus metrics
-- `gateway/apps/yuzu_gw/test/` — Standard CT suites (no external prerequisites)
+- `gateway/apps/yuzu_gw/test/` — EUnit test modules; `gateway/apps/yuzu_gw/test/ct/` — standard CT suites (no external prerequisites)
 - `gateway/apps/yuzu_gw/integration_test/` — CT suites that require a real running upstream + enrollment token
 - `gateway/rebar.config` — Build and dependency configuration
 - `docs/erlang-gateway-blueprint.md` — Architecture reference
@@ -319,7 +319,7 @@ When reviewing another agent's Change Summary:
 - [ ] New gateway modules use OTP behaviors
 - [ ] Supervisor child specs have correct restart strategies
 - [ ] ETS table access patterns are concurrent-safe
-- [ ] Tests use Common Test with `--dir apps/yuzu_gw/test` (or `--dir apps/yuzu_gw/integration_test` for real-upstream suites)
+- [ ] Common Test invocations pass `--dir apps/yuzu_gw/test/ct` (or `--dir apps/yuzu_gw/integration_test` for real-upstream suites); `ct` does not recurse, so `--dir apps/yuzu_gw/test` runs zero suites and passes (#4800)
 - [ ] Eunit invocations pass `--dir apps/yuzu_gw/test` (#337 workaround)
 - [ ] `rebar3 dialyzer` was run and is clean — not just `rebar3 compile`
 - [ ] prometheus_httpd pitfall handled correctly

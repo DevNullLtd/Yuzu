@@ -34,7 +34,7 @@ You ensure that every new store, manager, engine, and plugin ships with comprehe
 - `scripts/run-tests.sh` — Test orchestrator script
 - `scripts/integration-test.sh` — Integration test script
 - `.github/workflows/ci.yml` — CI test execution
-- `gateway/apps/yuzu_gw/test/` — Erlang Common Test suites
+- `gateway/apps/yuzu_gw/test/ct/` — Erlang Common Test suites (`gateway/apps/yuzu_gw/test/` holds the EUnit modules)
 - `docs/test-coverage.md` — Coverage tracking document
 
 ## Test Standards
