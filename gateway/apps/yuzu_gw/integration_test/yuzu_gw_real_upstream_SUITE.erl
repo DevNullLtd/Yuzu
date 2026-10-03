@@ -11,7 +11,7 @@
 %%%                 --no-tls --no-https --web-port 8080
 %%%
 %%% Run:
-%%%   rebar3 as test ct --dir apps/yuzu_gw/test \
+%%%   rebar3 as test ct --dir apps/yuzu_gw/integration_test \
 %%%       --suite yuzu_gw_real_upstream_SUITE --verbose
 %%% @end
 %%%-------------------------------------------------------------------
