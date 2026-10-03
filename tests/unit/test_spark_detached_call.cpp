@@ -965,51 +965,55 @@ struct ThreadJoiner {
     }
 };
 
-// A Gate whose workers did not retire in time is parked here, forever, rather than being
-// destroyed under a worker that still holds a pointer to it. Heap-allocated and never
-// freed on purpose: a static with a destructor would free the Gates during process exit,
-// which is exactly the use-after-free this exists to avoid. Only the failure path of an
-// AdmissionRig touches it, and tests in this binary run serially.
-std::vector<std::shared_ptr<Gate>>& gate_graveyard() {
-    static auto* graveyard = new std::vector<std::shared_ptr<Gate>>();
-    return *graveyard;
-}
+// Everything a detached worker of an admission case touches. It is owned by shared_ptr and
+// every worker closure holds a reference, so a worker that outlives the test frame (a failed
+// drain after a REQUIRE unwind) can never touch a destroyed Gate or counter: nothing a
+// worker reads or writes lives on a test's stack.
+struct WorkerShared {
+    Gate gate;
+    std::atomic<int> running{0};     // ChurnWork: workers executing right now
+    std::atomic<int> max_running{0}; // ChurnWork: the most that ever ran at once
+    std::atomic<std::uint64_t> spin_sink{0}; // ChurnWork: the busy-spin's side effect
+};
 
-// One lane, its shared F3 counter, and the Gate its parked workers wait on, with the
-// cleanup every admission case needs: on ANY exit path (including a failed REQUIRE) the
-// gate is released and the workers are waited for. A drain that times out fails the test
-// loudly (CHECK, never REQUIRE: this runs from a destructor) and parks the Gate in the
-// graveyard so a worker that is still alive cannot outlive it. The F3 counter is awaited
-// first: CountGuard lowers `active` and then F3, so F3 == 0 means the last worker has
-// finished everything it was going to do with the Gate.
+// One lane, its shared F3 counter, and the WorkerShared its workers use, with the cleanup
+// every admission case needs: on ANY exit path (including a failed REQUIRE) the gate is
+// released and the workers are waited for. A drain that times out fails the test loudly
+// (CHECK, never REQUIRE: this runs from a destructor); the workers keep what they touch
+// alive through their own references. The F3 counter is awaited first: CountGuard lowers
+// `active` and then F3, so F3 == 0 means the last worker has finished.
 struct AdmissionRig {
     std::shared_ptr<std::atomic<std::size_t>> f3 =
         std::make_shared<std::atomic<std::size_t>>(0);
-    std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+    std::shared_ptr<WorkerShared> shared = std::make_shared<WorkerShared>();
     SparkDetachedLane lane;
 
     explicit AdmissionRig(std::size_t cap) : lane(f3, cap) {}
     AdmissionRig(const AdmissionRig&) = delete;
     AdmissionRig& operator=(const AdmissionRig&) = delete;
     ~AdmissionRig() {
-        gate->release();
-        const bool f3_drained = spin_until([&] { return f3->load() == 0; }, 5s);
-        const bool active_drained = spin_until([&] { return lane.active_workers() == 0; }, 5s);
-        CHECK(f3_drained);
-        CHECK(active_drained);
-        if (!f3_drained || !active_drained)
-            gate_graveyard().push_back(gate);
+        shared->gate.release();
+        CHECK(spin_until([&] { return f3->load() == 0; }, 5s));
+        CHECK(spin_until([&] { return lane.active_workers() == 0; }, 5s));
     }
 
-    // Launches one worker that parks on the gate until the rig is destroyed or release()d.
-    [[nodiscard]] DetachedLaunch launch_parked() {
-        auto r = lane.launch([g = gate.get()]() -> int {
-            g->wait();
-            return 0;
-        });
-        return r.status;
+    // Launches one worker that parks on the gate until the rig is destroyed or released.
+    [[nodiscard]] DetachedLaunch launch_parked();
+};
+
+// The worker body most cases launch: park on the rig's gate until it is released.
+struct ParkedWork {
+    std::shared_ptr<WorkerShared> state;
+    int operator()() const {
+        state->gate.wait();
+        return 0;
     }
 };
+
+DetachedLaunch AdmissionRig::launch_parked() {
+    auto r = lane.launch(ParkedWork{shared});
+    return r.status;
+}
 
 // Fills the lane with `n` parked workers on the calling thread. No other thread is alive.
 struct FillResult {
@@ -1028,30 +1032,23 @@ FillResult fill(AdmissionRig& rig, std::size_t n) {
     return f;
 }
 
-// The worker body most cases launch: park on the rig's gate until it is released.
-struct ParkedWork {
-    Gate* gate;
-    int operator()() const {
-        gate->wait();
-        return 0;
-    }
-};
-
 // A short-lived worker that records how many workers are running AT THE SAME TIME, so an
 // implementation that over-admits (two threads both seeing the last free slot) is caught by
 // real concurrency, not only by the gauge, which a lost update can also under-count.
 struct ChurnWork {
-    std::atomic<int>* running;
-    std::atomic<int>* max_running;
+    std::shared_ptr<WorkerShared> state;
     int operator()() const {
-        const int now = running->fetch_add(1, std::memory_order_acq_rel) + 1;
-        int seen = max_running->load(std::memory_order_relaxed);
+        const int now = state->running.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int seen = state->max_running.load(std::memory_order_relaxed);
         while (now > seen &&
-               !max_running->compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+               !state->max_running.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
         }
-        for (int i = 0; i < 20; ++i) // linger so overlapping admissions overlap in time
-            std::this_thread::yield();
-        running->fetch_sub(1, std::memory_order_acq_rel);
+        // Linger briefly so overlapping admissions overlap in time. A busy spin, not a yield:
+        // on a loaded runner a yield gives up the whole timeslice and stretches the case from
+        // milliseconds to minutes.
+        for (int i = 0; i < 2000; ++i)
+            state->spin_sink.fetch_add(1, std::memory_order_relaxed);
+        state->running.fetch_sub(1, std::memory_order_acq_rel);
         return 0;
     }
 };
@@ -1069,13 +1066,24 @@ struct HammerResult {
 // What an optional controller thread sees while a hammer runs.
 struct HammerCtl {
     const std::atomic<std::uint64_t>& calls; // launch() calls completed so far, all launchers
-    const std::atomic<bool>& abort;          // set when the hammer is being torn down early
+    const std::atomic<bool>& abort; // set once every launcher has finished, or on teardown
 };
 
-// Sampler reads (taken after `go`) every launcher keeps running until at least this many have
-// been taken, so a runner that deschedules the sampler for the whole of a fixed iteration
+// Optional behaviour a case adds to a hammer; every member may be left empty.
+struct HammerHooks {
+    // Runs on its own thread alongside the launchers. It must return once `abort` is set.
+    std::function<void(const HammerCtl&)> controller;
+    // Each launcher waits (bounded by the hammer deadline) while this returns true.
+    std::function<bool()> hold;
+    // Launchers keep going until this many launches were admitted (bounded by the deadline).
+    std::uint64_t min_launched{0};
+};
+
+// Every launcher keeps going past `iters` until the sampler has taken at least this many reads
+// after `go`, so a runner that deschedules the sampler for the whole of a fixed iteration
 // count does not turn the check into a false green; the deadline bounds that extension.
 constexpr std::uint64_t kMinSamples = 50000;
+// Scaled by kSpinScale where it is used.
 constexpr auto kHammerDeadline = 10s;
 
 // Runs `threads` launcher threads, each calling lane.launch() at least `iters` times with a
@@ -1087,7 +1095,7 @@ constexpr auto kHammerDeadline = 10s;
 // returned counts.
 template <class Work>
 HammerResult hammer(AdmissionRig& rig, const Work& work, int threads, int iters,
-                    const std::function<void(const HammerCtl&)>& controller = {}) {
+                    const HammerHooks& hooks = {}) {
     HammerResult res;
     std::atomic<bool> go{false};
     std::atomic<bool> abort{false};
@@ -1098,6 +1106,7 @@ HammerResult hammer(AdmissionRig& rig, const Work& work, int threads, int iters,
     std::atomic<std::uint64_t> launched{0};
     std::atomic<std::uint64_t> rejected{0};
     std::atomic<std::uint64_t> other{0};
+    std::atomic<bool> ctl_done{!hooks.controller};
     std::size_t max_active = 0;
     std::size_t max_f3 = 0;
     SparkDetachedLane& lane = rig.lane;
@@ -1137,11 +1146,22 @@ HammerResult hammer(AdmissionRig& rig, const Work& work, int threads, int iters,
                 launchers.threads.emplace_back([&] {
                     while (!go.load(std::memory_order_acquire))
                         std::this_thread::yield();
-                    const auto deadline = std::chrono::steady_clock::now() + kHammerDeadline * yuzu::test::kSpinScale;
+                    const auto deadline = std::chrono::steady_clock::now() +
+                                          kHammerDeadline * yuzu::test::kSpinScale;
+                    const auto past_deadline = [&] {
+                        return std::chrono::steady_clock::now() >= deadline;
+                    };
                     for (int i = 0; !abort.load(std::memory_order_acquire); ++i) {
-                        if (i >= iters &&
-                            (samples_after_go.load(std::memory_order_relaxed) >= kMinSamples ||
-                             std::chrono::steady_clock::now() >= deadline))
+                        if (hooks.hold) {
+                            while (!abort.load(std::memory_order_acquire) && !past_deadline() &&
+                                   hooks.hold())
+                                std::this_thread::yield();
+                        }
+                        const bool enough =
+                            samples_after_go.load(std::memory_order_relaxed) >= kMinSamples &&
+                            ctl_done.load(std::memory_order_acquire) &&
+                            launched.load(std::memory_order_relaxed) >= hooks.min_launched;
+                        if (i >= iters && (enough || past_deadline()))
                             break;
                         auto r = lane.launch(Work(work));
                         switch (r.status) {
@@ -1152,18 +1172,27 @@ HammerResult hammer(AdmissionRig& rig, const Work& work, int threads, int iters,
                             rejected.fetch_add(1, std::memory_order_relaxed);
                             break;
                         default:
+                            // The OS refused a worker thread: stop every launcher and any
+                            // controller now; the caller reports it as a resource failure.
                             other.fetch_add(1, std::memory_order_relaxed);
+                            abort.store(true, std::memory_order_release);
                             break;
                         }
                         calls.fetch_add(1, std::memory_order_relaxed);
                     }
                 });
             }
-            if (controller)
-                ctl.threads.emplace_back([&] { controller(HammerCtl{calls, abort}); });
+            if (hooks.controller)
+                ctl.threads.emplace_back([&] {
+                    hooks.controller(HammerCtl{calls, abort});
+                    ctl_done.store(true, std::memory_order_release);
+                });
             go.store(true, std::memory_order_release);
             for (auto& t : launchers.threads)
                 t.join();
+            // Every launcher is done: release a controller still waiting for a condition
+            // BEFORE joining it, so no join below can wait on a flag that is set later.
+            abort.store(true, std::memory_order_release);
             for (auto& t : ctl.threads)
                 t.join();
             sampler_stop.store(true, std::memory_order_release);
@@ -1217,7 +1246,8 @@ TEST_CASE("admission: a saturated lane's gauge never reads above its cap while m
 
     // The lane is full: every launch below must be rejected, and the gauge must stay at the
     // cap for the whole run - not "usually", every sample.
-    const HammerResult h = hammer(rig, ParkedWork{rig.gate.get()}, kHammerThreads, kHammerIters);
+    const HammerResult h =
+        hammer(rig, ParkedWork{rig.shared}, kHammerThreads, kHammerIters);
     require_hammer_ran(h);
 
     CHECK(h.launched == 0);
@@ -1236,7 +1266,8 @@ TEST_CASE("admission: a cap of 0 never publishes a nonzero gauge under concurren
           "[spark][detachedcall]") {
     AdmissionRig rig(/*cap=*/0);
 
-    const HammerResult h = hammer(rig, ParkedWork{rig.gate.get()}, kHammerThreads, kHammerIters);
+    const HammerResult h =
+        hammer(rig, ParkedWork{rig.shared}, kHammerThreads, kHammerIters);
     require_hammer_ran(h);
 
     CHECK(h.launched == 0);
@@ -1248,6 +1279,12 @@ TEST_CASE("admission: a cap of 0 never publishes a nonzero gauge under concurren
     CHECK(rig.f3->load() == 0);
 }
 
+// Mutation record for the next two cases (author-measured, scratch copies of the header):
+// "no cap re-check after a failed CAS", "load + store instead of CAS" and "check, then
+// fetch_add" are only caught when the launchers really run in parallel. They die on an idle
+// multi-core box and SURVIVE when the process is pinned to two CPUs under load, so a green
+// run on such a runner says nothing about those races. The old fetch_add-and-rollback scheme
+// and the ">" for ">=" mutant die in both modes.
 TEST_CASE("admission: threads racing for a lane's slots admit exactly `cap` workers, never more, "
           "and the gauge never exceeds the cap (#4660)",
           "[spark][detachedcall]") {
@@ -1257,7 +1294,7 @@ TEST_CASE("admission: threads racing for a lane's slots admit exactly `cap` work
     // The lane starts EMPTY: this is the compare-exchange's own race (several threads each
     // observing a count below the cap), not just the rejection path. Fewer iterations - the
     // lane is full after the first kCap admissions and every later launch is a rejection.
-    const HammerResult h = hammer(rig, ParkedWork{rig.gate.get()}, kHammerThreads, 2000);
+    const HammerResult h = hammer(rig, ParkedWork{rig.shared}, kHammerThreads, 2000);
     require_hammer_ran(h);
 
     CHECK(h.launched == kCap);
@@ -1274,51 +1311,75 @@ TEST_CASE("admission: slots that free and refill under contention never run more
           "workers at once (#4660)",
           "[spark][detachedcall]") {
     constexpr std::size_t kCap = 3;
+    // Enough admissions that slots are freed and refilled many times even on a runner with
+    // two CPUs, where the launchers alone would admit only a handful before the iteration
+    // count ran out.
+    constexpr std::uint64_t kMinAdmissions = 300;
     AdmissionRig rig(kCap);
-    std::atomic<int> running{0};
-    std::atomic<int> max_running{0};
 
     // Workers retire on their own here, so slots are released and re-raced continuously: this
     // is the compare-exchange's contended path (a failed exchange must re-check the cap, and
     // two threads must never both take the last slot).
-    const HammerResult h =
-        hammer(rig, ChurnWork{&running, &max_running}, kHammerThreads, 200);
+    HammerHooks hooks;
+    hooks.min_launched = kMinAdmissions;
+    const HammerResult h = hammer(rig, ChurnWork{rig.shared}, kHammerThreads, 200, hooks);
     require_hammer_ran(h);
 
-    INFO("max workers running at once=" << max_running.load() << " max sampled active_workers()="
-                                        << h.max_active_seen << " (cap=" << kCap << ")");
-    CHECK(h.launched > 0); // the case exercised admission, not only rejection
-    CHECK(max_running.load() <= static_cast<int>(kCap));
+    const int max_running = rig.shared->max_running.load();
+    INFO("admitted=" << h.launched << " max workers running at once=" << max_running
+                     << " max sampled active_workers()=" << h.max_active_seen
+                     << " (cap=" << kCap << ")");
+    CHECK(h.launched >= kMinAdmissions); // the refill path was exercised, not only rejection
+    CHECK(max_running <= static_cast<int>(kCap));
     CHECK(h.max_active_seen <= kCap);
     // CountGuard lowers `active` and then the F3 counter: wait for F3 first.
     REQUIRE(spin_until([&] { return rig.f3->load() == 0; }, 5s));
     CHECK(rig.lane.active_workers() == 0);
 }
 
+// Mutation record: an implementation that reads the cap ONCE before the CAS loop instead of
+// on every iteration survives this case (and every other here). It differs from the fixed
+// code only inside a single call's retry loop, and any admission it makes after a lowering is
+// one an in-flight call may also make legally, so no count or gauge assertion separates the
+// two without a test seam between the cap load and the exchange.
 TEST_CASE("admission: a cap lowered while launchers race bounds the later admissions and the "
           "gauge never exceeds the original cap (#4660)",
           "[spark][detachedcall]") {
     constexpr std::size_t kCapOld = 64;
     constexpr std::size_t kCapNew = 2;
+    constexpr std::size_t kTrigger = 8;  // the controller lowers the cap at this many workers
+    constexpr std::size_t kStall = 12;   // launchers wait here until the cap is lowered
     AdmissionRig rig(kCapOld);
-    // Written by the controller thread, read only after hammer() has joined it.
-    std::size_t active_at_lowering = 0;
-    bool lowered = false;
+    std::atomic<std::size_t> active_at_lowering{0};
+    std::atomic<bool> lowered{false};
 
-    const HammerResult h = hammer(
-        rig, ParkedWork{rig.gate.get()}, kHammerThreads, 2000, [&](const HammerCtl& ctl) {
-            // Lower the cap once a few workers are admitted, while launchers are still racing.
-            // Event-driven: poll the gauge, bounded by the hammer's own teardown flag.
-            while (!ctl.abort.load(std::memory_order_acquire) && rig.lane.active_workers() < 8)
-                std::this_thread::yield();
-            if (ctl.abort.load(std::memory_order_acquire))
-                return;
-            rig.lane.set_cap_for_test(kCapNew);
-            active_at_lowering = rig.lane.active_workers(); // read AFTER set_cap_for_test returned
-            lowered = true;
-        });
+    // The launchers must not run the lane up to kCapOld before the controller is scheduled,
+    // or (on a runner with two CPUs) the lowering lands on an already-full lane and the case
+    // checks nothing: they stall at kStall workers until it is lowered. Between kTrigger and
+    // kStall they still race the lowering.
+    HammerHooks hooks;
+    hooks.hold = [&] {
+        return !lowered.load(std::memory_order_acquire) && rig.lane.active_workers() >= kStall;
+    };
+    hooks.controller = [&](const HammerCtl& ctl) {
+        // Event-driven: poll the gauge, bounded by the hammer's own abort flag.
+        while (!ctl.abort.load(std::memory_order_acquire) && rig.lane.active_workers() < kTrigger)
+            std::this_thread::yield();
+        if (ctl.abort.load(std::memory_order_acquire))
+            return;
+        rig.lane.set_cap_for_test(kCapNew);
+        // Read AFTER set_cap_for_test returned.
+        active_at_lowering.store(rig.lane.active_workers(), std::memory_order_relaxed);
+        lowered.store(true, std::memory_order_release);
+    };
+    const HammerResult h = hammer(rig, ParkedWork{rig.shared}, kHammerThreads, 2000, hooks);
     require_hammer_ran(h);
-    REQUIRE(lowered);
+    REQUIRE(lowered.load());
+    const std::size_t at_lowering = active_at_lowering.load();
+    INFO("active at lowering=" << at_lowering << " final=" << h.launched
+                               << " max sampled=" << h.max_active_seen);
+    // The lowering must have landed on a lane that still had room, or the case is vacuous.
+    REQUIRE(at_lowering < kCapOld);
 
     // Workers stay parked for the whole run, so launched == the gauge at the end. A launch
     // admitted after set_cap_for_test returned must have read the old cap before the
@@ -1326,11 +1387,9 @@ TEST_CASE("admission: a cap lowered while launchers race bounds the later admiss
     // documented worst case is cap_old - cap_new; the bound asserted here is the tighter
     // per-launcher one, which an implementation that ignored the lowered cap would blow
     // through (it would keep admitting until the lane held kCapOld workers).
-    INFO("active at lowering=" << active_at_lowering << " final=" << h.launched
-                               << " max sampled=" << h.max_active_seen);
     CHECK(h.max_active_seen <= kCapOld);
     CHECK(h.launched <= kCapOld);
-    CHECK(h.launched - std::min<std::uint64_t>(h.launched, active_at_lowering) <=
+    CHECK(h.launched - std::min<std::uint64_t>(h.launched, at_lowering) <=
           static_cast<std::uint64_t>(kHammerThreads));
     CHECK(rig.lane.active_workers() == h.launched);
 }
@@ -1358,7 +1417,7 @@ TEST_CASE("admission: cap boundaries - 1 admits one then rejects, a freed slot i
     // Free the slot; a later launch is admitted again (the count came back down). CountGuard
     // lowers `active` and THEN the F3 counter, so wait for F3 first: once it reads 0 both
     // have been lowered.
-    rig.gate->release();
+    rig.shared->gate.release();
     REQUIRE(spin_until([&] { return rig.f3->load() == 0; }, 5s));
     CHECK(lane.active_workers() == 0);
     auto third = lane.launch([]() -> int { return 3; });
