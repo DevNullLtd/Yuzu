@@ -75,6 +75,10 @@ binding_test_() ->
        fun reannounce_leaves_binding/0},
       {"registry restart: heartbeats fail closed without raising",
        fun registry_restart_fails_closed/0},
+      {"missing session index: the registry keeps routing, heartbeats fail closed",
+       fun missing_session_index_keeps_routing/0},
+      {"the session index is protected and the pending table stays public",
+       fun table_protection/0},
       {"lookup_session/1 is local, live-checked and reports the key",
        fun lookup_session_contract/0},
       {"Register records the connection key in the pending row",
@@ -406,6 +410,67 @@ registry_restart_fails_closed() ->
         yuzu_gw_test_registry:ensure_fresh()
     end.
 
+%% The session index is a secondary table. If it does not exist (new code
+%% loaded into a node whose registry was started before the table was added),
+%% registering, deregistering and process exit must still maintain the routing
+%% table, and admission must keep failing closed.
+missing_session_index_keeps_routing() ->
+    Reg = whereis(yuzu_gw_registry),
+    X = uid(<<"x">>),
+    PX = bind(X, uid(<<"sx">>), conn_a),
+    drop_sessions_table(),
+    try
+        %% register
+        Y = uid(<<"y">>),
+        SY = uid(<<"sy">>),
+        PY = bind(Y, SY, conn_a),
+        ?assertEqual(Reg, whereis(yuzu_gw_registry)),
+        ?assertEqual({ok, PX}, yuzu_gw_registry:lookup(X)),
+        ?assertEqual({ok, PY}, yuzu_gw_registry:lookup(Y)),
+        %% admission fails closed and is counted as registry_unavailable
+        ?assertEqual({error, unavailable}, yuzu_gw_registry:lookup_session(SY)),
+        flush(),
+        ?assertEqual(rejected(), beat(conn_a, SY)),
+        ?assertEqual(0, queued()),
+        assert_events([reject_event(registry_unavailable)]),
+        %% re-register the same agent id (supersede path)
+        PY2 = bind(Y, uid(<<"sy2">>), conn_a),
+        ?assertEqual({ok, PY2}, yuzu_gw_registry:lookup(Y)),
+        %% fenced and unfenced deregistration
+        ok = yuzu_gw_registry:deregister_agent(Y, PY2, undefined),
+        sync_registry(),
+        ?assertEqual(error, yuzu_gw_registry:lookup(Y)),
+        yuzu_gw_registry:deregister_agent(X),
+        sync_registry(),
+        ?assertEqual(error, yuzu_gw_registry:lookup(X)),
+        %% process exit
+        Z = uid(<<"z">>),
+        PZ = bind(Z, uid(<<"sz">>), conn_a),
+        exit(PZ, kill),
+        ok = wait_until(fun() -> yuzu_gw_registry:lookup(Z) =:= error end, 2000),
+        ?assertEqual(Reg, whereis(yuzu_gw_registry)),
+        ?assert(is_process_alive(Reg))
+    after
+        yuzu_gw_test_registry:ensure_fresh()
+    end,
+    exit(PX, kill).
+
+%% Only the registry process writes the session index; handler processes
+%% (here: this test process) only read it. The pending table is written by
+%% handler processes and stays public.
+table_protection() ->
+    ?assertEqual(protected, ets:info(?SESSIONS, protection)),
+    ?assertEqual(public, ets:info(?PENDING, protection)),
+    ?assertError(badarg, ets:insert(?SESSIONS, {uid(<<"w">>), <<"a">>, self(), conn_a})),
+    ?assertError(badarg, ets:delete(?SESSIONS, uid(<<"w">>))),
+    %% Reads from this non-owner process work.
+    S = uid(<<"s">>),
+    P = bind(uid(<<"a">>), S, conn_a),
+    ?assertMatch([{S, _, P, conn_a}], ets:lookup(?SESSIONS, S)),
+    ?assertMatch({ok, #{pid := P}}, yuzu_gw_registry:lookup_session(S)),
+    ?assertMatch({ok, _, _}, beat(conn_a, S)),
+    exit(P, kill).
+
 lookup_session_contract() ->
     A = uid(<<"a">>),
     S = uid(<<"s">>),
@@ -419,9 +484,16 @@ lookup_session_contract() ->
     Ref = monitor(process, Dead),
     receive {'DOWN', Ref, process, Dead, _} -> ok end,
     DeadS = uid(<<"dead">>),
-    true = ets:insert(?SESSIONS, {DeadS, uid(<<"dead-a">>), Dead, conn_a}),
+    %% The table is protected: the row is written from inside its owner.
+    _ = sys:replace_state(yuzu_gw_registry, fun(State) ->
+        true = ets:insert(?SESSIONS, {DeadS, uid(<<"dead-a">>), Dead, conn_a}),
+        State
+    end),
     ?assertEqual(error, yuzu_gw_registry:lookup_session(DeadS)),
-    true = ets:delete(?SESSIONS, DeadS),
+    _ = sys:replace_state(yuzu_gw_registry, fun(State) ->
+        true = ets:delete(?SESSIONS, DeadS),
+        State
+    end),
     exit(P, kill).
 
 register_records_conn_key() ->
@@ -504,6 +576,13 @@ log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
 %%%===================================================================
 %%% Utilities
 %%%===================================================================
+
+%% The session index is owned by the registry process and protected, so a
+%% test cannot delete it directly: run the delete inside the owner.
+drop_sessions_table() ->
+    _ = sys:replace_state(yuzu_gw_registry,
+                          fun(State) -> ets:delete(?SESSIONS), State end),
+    ok.
 
 %% deregister_agent/1,3 are casts: a synchronous registry call drains them.
 sync_registry() ->

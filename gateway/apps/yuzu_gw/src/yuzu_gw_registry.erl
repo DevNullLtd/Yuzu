@@ -109,7 +109,8 @@ register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq, ConnKey)
 %% @doc Remove an agent from the routing table.
 %%
 %% Unfenced: deletes whatever process currently holds AgentId, together with
-%% that row's session index entry. Production cleanup uses deregister_agent/3.
+%% that row's session index entry. Production code uses deregister_agent/3;
+%% new callers must use /3.
 -spec deregister_agent(binary()) -> ok.
 deregister_agent(AgentId) ->
     gen_server:cast(?SERVER, {deregister, AgentId}).
@@ -421,7 +422,9 @@ take_pending(SessionId) ->
 init([]) ->
     ets:new(?TABLE, [named_table, set, public, {read_concurrency, true}]),
     ets:new(?PENDING_TABLE, [named_table, set, public]),
-    ets:new(?SESSIONS_TABLE, [named_table, set, public, {read_concurrency, true}]),
+    %% protected: only this process writes the session index; heartbeat
+    %% handler processes read it.
+    ets:new(?SESSIONS_TABLE, [named_table, set, protected, {read_concurrency, true}]),
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
     {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
 
@@ -562,20 +565,47 @@ leave_groups(AgentId, Pid, Plugins) ->
         catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
     end, Plugins).
 
+%% The session index is a secondary table: it must never take down the
+%% routing table. If it does not exist (new code loaded into a node whose
+%% registry was started before the table was added), indexing is skipped, the
+%% routing row and pg groups are maintained as usual, and heartbeat admission
+%% keeps failing closed (`lookup_session/1' reports `{error, unavailable}').
+%% Only `badarg' (a missing table) is tolerated; any other error still raises.
 index_session(undefined, _AgentId, _Pid, _ConnKey) ->
     ok;
 index_session(SessionId, AgentId, Pid, ConnKey) ->
-    ets:insert(?SESSIONS_TABLE, {SessionId, AgentId, Pid, ConnKey}),
-    ok.
+    try ets:insert(?SESSIONS_TABLE, {SessionId, AgentId, Pid, ConnKey}) of
+        true -> ok
+    catch
+        error:badarg ->
+            warn_session_index_missing()
+    end.
 
 %% Delete the index entry for SessionId only if it belongs to Pid. The key is
-%% bound in the match head, so this is a single-key operation.
+%% bound in the match head, so this is a single-key operation. A missing table
+%% is tolerated for the reason given at index_session/4.
 unindex_session(undefined, _Pid) ->
     ok;
 unindex_session(SessionId, Pid) ->
-    ets:select_delete(?SESSIONS_TABLE,
-                      [{{SessionId, '_', Pid, '_'}, [], [true]}]),
-    ok.
+    try ets:select_delete(?SESSIONS_TABLE,
+                          [{{SessionId, '_', Pid, '_'}, [], [true]}]) of
+        _ -> ok
+    catch
+        error:badarg ->
+            ok
+    end.
+
+%% One warning per registry process, not one per registration.
+warn_session_index_missing() ->
+    case get(session_index_missing_logged) of
+        true ->
+            ok;
+        _ ->
+            put(session_index_missing_logged, true),
+            logger:warning("Session index table ~s is missing: heartbeats are "
+                           "rejected until the gateway is restarted",
+                           [?SESSIONS_TABLE])
+    end.
 
 %% @doc Clean up a stale agent entry and return the updated monitor map.
 maybe_cleanup(AgentId, Mons) ->
