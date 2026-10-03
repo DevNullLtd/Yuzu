@@ -2675,6 +2675,17 @@ test('capability gate consistency',
   timeout: 30,
 )
 
+# server/core/scripts/embed_content.py must not rewrite an unchanged
+# bundled_content.cpp: the custom_target is build_always_stale, so a rewrite
+# would recompile and relink the server on every ninja run. Runs the real
+# generator against content/ into a temp dir; ~8 s, hence the wider timeout.
+test('embed_content idempotent',
+  _python3_test,
+  args: [files('test_embed_content_idempotent.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # The /test --instructions gate broadcasts every default-risk definition; the server refuses a
 # broadcast for any Destructive or Forensics capability row. This derives those rows from the
 # capability_decls fragments and requires every matching definition to be classified into an
