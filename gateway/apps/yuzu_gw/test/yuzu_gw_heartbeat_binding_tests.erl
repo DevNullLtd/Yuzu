@@ -802,9 +802,13 @@ rejection_lines(Lines) ->
     [L || L <- Lines,
           binary:match(L, <<"Heartbeat admission rejected">>) =/= nomatch].
 
+%% No idle window: the capturing handler runs in the logging process and sends
+%% before the logging call returns, and every capture_logs body waits for the
+%% processes that log (results received, process death observed), so every
+%% captured line is already in the mailbox when the body returns.
 collect_logs(Acc) ->
     receive {captured_log, Text} -> collect_logs([Text | Acc])
-    after 100 -> lists:reverse(Acc)
+    after 0 -> lists:reverse(Acc)
     end.
 
 %% logger handler callback

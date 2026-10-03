@@ -547,7 +547,7 @@ warm_chan(Chan, Left) ->
         {ok, _, _}                    -> ok;
         {error, {<<_/binary>>, _}, _} -> ok;
         _ ->
-            timer:sleep(1000),
+            timer:sleep(250),
             warm_chan(Chan, Left - 1)
     end.
 
