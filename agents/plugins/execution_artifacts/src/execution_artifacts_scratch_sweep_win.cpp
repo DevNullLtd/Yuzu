@@ -210,8 +210,8 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
         }
 
         // Rotated start (#4504): one pass still visits each entry at most
-        // once, but a persistent early failure cannot starve later entries
-        // across passes.
+        // once; rotating the start reduces, but does not eliminate, the chance
+        // that persistently failing entries delay a removable orphan.
         const std::size_t n_entries = root_entries.entries.size();
         const std::size_t start =
             n_entries == 0 ? 0 : static_cast<std::size_t>(pass_counter % n_entries);
