@@ -1219,12 +1219,14 @@ HammerResult hammer(AdmissionRig& rig, const Work& work, int threads, int iters,
 void require_hammer_ran(const HammerResult& h) {
     INFO(h.thread_error);
     REQUIRE(h.thread_error.empty());
-    INFO("sampler reads taken while the launchers ran: " << h.samples_after_go);
-    REQUIRE(h.samples_after_go >= kMinSamples); // a sampler that never ran cannot false-green
     // LaunchFailed means the OS refused a worker thread, which is a resource problem, not
-    // an admission result.
+    // an admission result. Checked BEFORE the sampler count: a LaunchFailed aborts the
+    // hammer, which leaves the sampler too few reads, and the resource cause must be the
+    // message the reader sees.
     INFO("launches that returned LaunchFailed (OS refused a worker thread): " << h.other);
     REQUIRE(h.other == 0);
+    INFO("sampler reads taken while the launchers ran: " << h.samples_after_go);
+    REQUIRE(h.samples_after_go >= kMinSamples); // a sampler that never ran cannot false-green
 }
 
 constexpr int kHammerThreads = 16;
@@ -1374,6 +1376,8 @@ TEST_CASE("admission: a cap lowered while launchers race bounds the later admiss
     };
     const HammerResult h = hammer(rig, ParkedWork{rig.shared}, kHammerThreads, 2000, hooks);
     require_hammer_ran(h);
+    INFO("the controller never lowered the cap (it waits for the gauge to reach the trigger): "
+         "launched=" << h.launched << " max sampled=" << h.max_active_seen);
     REQUIRE(lowered.load());
     const std::size_t at_lowering = active_at_lowering.load();
     INFO("active at lowering=" << at_lowering << " final=" << h.launched
