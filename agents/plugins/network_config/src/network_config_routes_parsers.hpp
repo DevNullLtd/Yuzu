@@ -71,12 +71,13 @@ struct RouteRow {
     bool ipv6 = false;
     std::string destination; // formatted address; never empty on a real row
     unsigned prefix_len = 0;
-    std::string gateway;     // empty = on-link (rendered `-`)
-    std::string interface;   // empty = unknown (rendered `-`)
-    std::string metric = "-";
-    std::string table = "-";
+    std::string gateway;     // empty = on-link
+    std::string interface;   // empty = unknown
+    // Every text field below is rendered `-` when empty (format_route_row): the one "absent" convention.
+    std::string metric;
+    std::string table;
     std::string type = "unicast";
-    std::string origin = "-";
+    std::string origin;
 };
 
 /// Render a RouteRow as the wire row. Every text field passes through
@@ -127,16 +128,17 @@ inline std::string win_protocol_name(int p) {
 
 /// True for the rows Windows generates for the HOST rather than for reachability,
 /// the same noise the Linux leg drops with the local table and the macOS leg with
-/// RTF_LOCAL / RTF_MULTICAST / RTF_BROADCAST:
-///   - a full-length prefix (/32, /128) with Protocol=Local: the host's own
-///     addresses and its broadcast addresses (Windows tags both `Local`);
+/// RTF_LOCAL / RTF_MULTICAST / RTF_BROADCAST. Only Protocol=Local rows qualify — a route
+/// someone configured (NetMgmt: a VPN peer route, a static route) is kept whatever its prefix:
+///   - a full-length prefix (/32, /128): the host's own addresses and its broadcast addresses
+///     (Windows tags both `Local`);
 ///   - a multicast prefix (224.0.0.0/4, ff00::/8), one per interface.
-/// Protocol=Local with a SHORTER prefix is kept: that is the connected-subnet
+/// Protocol=Local with a SHORTER, non-multicast prefix is kept: that is the connected-subnet
 /// route (192.0.2.0/24, fe80::/64, 127.0.0.0/8) and is exactly what a reader wants.
-/// A /32 with any other protocol (NetMgmt: a VPN peer route, a static route) is kept.
 inline bool win_route_is_host_local(const WinRoute& r) {
-    const unsigned full = r.ipv6 ? 128u : 32u;
-    if (r.protocol == kWinProtocolLocal && r.prefix_len == full)
+    if (r.protocol != kWinProtocolLocal)
+        return false;
+    if (r.prefix_len == (r.ipv6 ? 128u : 32u))
         return true;
     if (r.ipv6)
         return r.destination.starts_with("ff") && r.prefix_len == 8;
@@ -203,6 +205,9 @@ struct RtRouteFull {
 };
 
 using RtRoutesParse = RtNetlinkParseChunk<RtRouteFull>;
+
+/// An `ip nexthop` object route: it names a nexthop group by id and carries no gateway of its own.
+inline bool nexthop_unresolved(const RtRouteFull& r) { return r.has_nh_id && r.gateway.empty(); }
 
 namespace routes_detail {
 
@@ -387,11 +392,16 @@ inline RtRoutesParse parse_rtnetlink_routes_chunk(std::span<const unsigned char>
                             NLMSG_ALIGN(sizeof(struct rtnexthop)));
                         for (; sub_len > 0 && RTA_OK(sub, sub_len); sub = RTA_NEXT(sub, sub_len)) {
                             const int sub_type = sub->rta_type & NLA_TYPE_MASK;
-                            if (sub_type == RTA_GATEWAY)
-                                routes_detail::addr_text(RTA_DATA(sub), RTA_PAYLOAD(sub), family,
-                                                         rec.gateway);
-                            else if (sub_type == RTA_VIA)
-                                routes_detail::via_text(sub, rec.gateway);
+                            // A nested gateway that does not decode is a malformed record,
+                            // not an on-link nexthop: the top-level attributes treat it the same.
+                            if (sub_type == RTA_GATEWAY) {
+                                if (!routes_detail::addr_text(RTA_DATA(sub), RTA_PAYLOAD(sub),
+                                                              family, rec.gateway))
+                                    malformed = true;
+                            } else if (sub_type == RTA_VIA) {
+                                if (!routes_detail::via_text(sub, rec.gateway))
+                                    malformed = true;
+                            }
                         }
                     }
                     // RTNH_NEXT is single-argument and does NOT decrement the
@@ -432,7 +442,7 @@ inline RouteRow linux_route_to_row(const RtRouteFull& r, std::string interface) 
     row.ipv6 = r.is_ipv6;
     row.destination = r.destination;
     row.prefix_len = r.prefix_len;
-    row.gateway = r.gateway.empty() && r.has_nh_id ? "nhid:" + std::to_string(r.nh_id) : r.gateway;
+    row.gateway = nexthop_unresolved(r) ? "nhid:" + std::to_string(r.nh_id) : r.gateway;
     row.interface = std::move(interface);
     row.metric = std::to_string(r.metric);
     row.table = routes_detail::table_name(r.table);
@@ -599,6 +609,15 @@ inline MacRoutesParse parse_route_table_dump(std::span<const unsigned char> blob
         }
         off += hdr.rtm_msglen;
 
+        // An advertised sockaddr the record ran out of bytes for is a malformed record. Without
+        // this a missing netmask would read as "no netmask" and emit a /32 host route.
+        const int wanted = hdr.rtm_addrs & (RTA_DST | RTA_GATEWAY | RTA_NETMASK);
+        if (chain_ok && (((wanted & RTA_DST) && sa_dst == nullptr) ||
+                         ((wanted & RTA_GATEWAY) && sa_gw == nullptr) ||
+                         ((wanted & RTA_NETMASK) && sa_mask == nullptr))) {
+            out.truncated = true;
+            continue;
+        }
         if (!chain_ok || sa_dst == nullptr)
             continue;
         if ((hdr.rtm_flags & routes_detail::kMacSkipFlags) != 0)

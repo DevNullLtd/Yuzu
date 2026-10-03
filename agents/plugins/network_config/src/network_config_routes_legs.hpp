@@ -7,7 +7,7 @@
  * `#if defined(__linux__|__APPLE__|_WIN32)`), and the plugin TU calls only the
  * host leg. Each entry point is a READ that returns 0 for every data-level
  * outcome: an unreadable or incomplete table is reported through
- * set_result_status, never as an empty success; the plugin's `execute()` alone
+ * set_result_status, never as an empty success; `do_routes` in the plugin TU alone
  * converts an escaped exception into rc 1.
  */
 #pragma once

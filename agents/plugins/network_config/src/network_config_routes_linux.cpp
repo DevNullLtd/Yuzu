@@ -12,14 +12,7 @@
  * source `ip` uses). An index that no longer resolves (the interface vanished
  * between the dump and the lookup) is rendered `-`, never guessed.
  */
-#if defined(__linux__)
-// glibc's <net/if.h> (if_indextoname, IF_NAMESIZE) MUST come before anything that pulls in
-// <linux/if.h> — network_config_parsers.hpp does, for IFF_UP — or the two redefine IFF_UP /
-// IFF_BROADCAST / struct ifreq. libc-compat.h makes the kernel header skip what glibc already
-// declared, but only in this order.
-#include <net/if.h>
-#endif
-
+#include "network_config_routes_ifname.hpp" // FIRST: see its include-order note
 #include "network_config_routes_legs.hpp"
 
 #if defined(__linux__)
@@ -35,15 +28,6 @@ namespace yuzu::network_config {
 namespace {
 
 constexpr std::uint32_t kRoutesSeq = 4; // the plugin's other dumps use 1..3
-
-std::string interface_name(int ifindex) {
-    if (ifindex <= 0)
-        return {};
-    char name[IF_NAMESIZE]{};
-    if (::if_indextoname(static_cast<unsigned>(ifindex), name) == nullptr)
-        return {};
-    return name;
-}
 
 } // namespace
 
@@ -67,8 +51,8 @@ int collect_routes_linux(yuzu::CommandContext& ctx) {
     bool nexthop_object = false;
     for (const auto& rec : dump.records) {
         multipath_collapsed = multipath_collapsed || rec.multipath_collapsed;
-        nexthop_object = nexthop_object || (rec.has_nh_id && rec.gateway.empty());
-        rows.push_back(linux_route_to_row(rec, interface_name(rec.ifindex)));
+        nexthop_object = nexthop_object || nexthop_unresolved(rec);
+        rows.push_back(linux_route_to_row(rec, interface_name_for_index(rec.ifindex)));
     }
 
     if (dump.capped)

@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -189,7 +190,7 @@ TEST_CASE("windows routes from a real GetIpForwardTable2 capture keep reachabili
         CHECK(rows[i] == expected[i]);
 }
 
-TEST_CASE("windows host-local rule: Local full-length and multicast are dropped, the rest kept",
+TEST_CASE("windows host-local rule: Local full-length and Local multicast are dropped, the rest kept",
           "[network_config][routes][windows_map]") {
     auto route = [](bool v6, const char* dst, unsigned plen, int proto) {
         WinRoute r;
@@ -204,7 +205,7 @@ TEST_CASE("windows host-local rule: Local full-length and multicast are dropped,
     CHECK(win_route_is_host_local(route(false, "192.0.2.255", 32, 2)));
     CHECK(win_route_is_host_local(route(false, "255.255.255.255", 32, 2)));
     CHECK(win_route_is_host_local(route(false, "224.0.0.0", 4, 2)));
-    CHECK(win_route_is_host_local(route(false, "239.255.255.250", 32, 3))); // multicast wins over protocol
+    CHECK(win_route_is_host_local(route(false, "239.255.255.250", 32, 2)));
     CHECK(win_route_is_host_local(route(true, "::1", 128, 2)));
     CHECK(win_route_is_host_local(route(true, "fe80::200:5eff:fe00:5301", 128, 2)));
     CHECK(win_route_is_host_local(route(true, "ff00::", 8, 2)));
@@ -216,6 +217,10 @@ TEST_CASE("windows host-local rule: Local full-length and multicast are dropped,
     CHECK_FALSE(win_route_is_host_local(route(true, "fd7a:115c:a1e0::53", 128, 3)));
     CHECK_FALSE(win_route_is_host_local(route(false, "0.0.0.0", 0, 3)));      // default route
     CHECK_FALSE(win_route_is_host_local(route(false, "223.255.255.255", 32, 3))); // just below multicast
+    // A route someone CONFIGURED is kept whatever its prefix — even a multicast one.
+    CHECK_FALSE(win_route_is_host_local(route(false, "224.0.0.0", 4, 3)));
+    CHECK_FALSE(win_route_is_host_local(route(false, "239.255.255.250", 32, 3)));
+    CHECK_FALSE(win_route_is_host_local(route(true, "ff02::", 16, 3)));
     CHECK_FALSE(win_route_is_host_local(route(true, "fd00::", 8, 3)));        // 'f' but not ff
 }
 
@@ -245,8 +250,6 @@ TEST_CASE("windows row keeps the route metric and renders an on-link next hop as
 }
 
 #if defined(__linux__)
-
-#include <cstring>
 
 namespace {
 
@@ -592,11 +595,42 @@ TEST_CASE("route type and protocol names fall back to a numbered token, never an
     CHECK(row2.origin == "bgp");
 }
 
+TEST_CASE("routes decode flags a malformed nested multipath gateway instead of reporting on-link",
+          "[network_config][routes][rtnetlink]") {
+    // The FIRST nexthop carries an RTA_GATEWAY too short to be an IPv4 address (2 bytes) — and,
+    // separately, an RTA_VIA whose family is neither AF_INET nor AF_INET6. Both used to be
+    // swallowed: the route came out `-` (on-link) with the read still marked clean.
+    constexpr std::uint32_t kSeq = 7;
+    auto with_nested = [&](unsigned short nested_type, const std::vector<unsigned char>& nested) {
+        std::vector<unsigned char> nh;
+        struct rtnexthop hdr {};
+        append_bytes(nh, &hdr, sizeof(hdr));
+        append_attr(nh, Attr{nested_type, nested});
+        auto* h = reinterpret_cast<struct rtnexthop*>(nh.data());
+        h->rtnh_len = static_cast<unsigned short>(nh.size());
+        h->rtnh_ifindex = 12;
+        return route_msg(kSeq, AF_INET, 16, RT_TABLE_MAIN, RTN_UNICAST, 3, 0,
+                         {{RTA_DST, v4(172, 21, 0, 0)}, {RTA_MULTIPATH, nh}});
+    };
+    const auto short_gw = parse_rtnetlink_routes_chunk(with_nested(RTA_GATEWAY, {10, 0}), kSeq);
+    CHECK(short_gw.truncated);
+    REQUIRE(short_gw.records.size() == 1);
+    CHECK(short_gw.records[0].gateway.empty());
+
+    const std::vector<unsigned char> bad_via{0x63, 0x00, 1, 2, 3, 4}; // family 99
+    const auto bad = parse_rtnetlink_routes_chunk(with_nested(RTA_VIA, bad_via), kSeq);
+    CHECK(bad.truncated);
+
+    // and a well-formed nested gateway is still clean
+    const auto ok = parse_rtnetlink_routes_chunk(with_nested(RTA_GATEWAY, v4(10, 77, 0, 1)), kSeq);
+    CHECK_FALSE(ok.truncated);
+    REQUIRE(ok.records.size() == 1);
+    CHECK(ok.records[0].gateway == "10.77.0.1");
+}
+
 #endif // __linux__
 
 #if defined(__APPLE__)
-
-#include <cstring>
 
 namespace {
 
@@ -831,6 +865,24 @@ TEST_CASE("routes decode survives a sockaddr whose sa_len overruns its record",
     const auto out = parse_route_table_dump(msg);
     CHECK(out.records.empty());
     CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode flags a record that advertises a sockaddr it does not contain",
+          "[network_config][routes][pf_route]") {
+    // rtm_addrs says DST|GATEWAY|NETMASK but only the destination is present. Reading that as
+    // "no netmask" would emit a /32 host route with no gateway; it is a malformed record.
+    const auto dst = sin_bytes(10, 9, 0, 0);
+    auto msg = route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, nullptr);
+    reinterpret_cast<rt_msghdr*>(msg.data())->rtm_addrs |= RTA_GATEWAY | RTA_NETMASK;
+    const auto out = parse_route_table_dump(msg);
+    CHECK(out.records.empty());
+    CHECK(out.truncated);
+
+    // the same destination with nothing advertised beyond it is a legitimate host route
+    const auto host = route_msg(RTF_UP | RTF_HOST | RTF_STATIC, 7, dst, nullptr, nullptr);
+    const auto ok = parse_route_table_dump(host);
+    REQUIRE(ok.records.size() == 1);
+    CHECK_FALSE(ok.truncated);
 }
 
 TEST_CASE("routes decode survives a zero-length message", "[network_config][routes][pf_route]") {

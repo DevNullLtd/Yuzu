@@ -13,11 +13,11 @@
  * Interface names come from if_indextoname(rtm_index). An index that no longer
  * resolves is rendered `-`, never guessed.
  */
+#include "network_config_routes_ifname.hpp" // FIRST: see its include-order note
 #include "network_config_routes_legs.hpp"
 
 #if defined(__APPLE__)
 
-#include <net/if.h> // if_indextoname, IF_NAMESIZE
 #include <net/route.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
@@ -60,15 +60,6 @@ Fetch fetch_route_dump(std::vector<unsigned char>& out) {
     return Fetch::Failed;
 }
 
-std::string interface_name(int ifindex) {
-    if (ifindex <= 0)
-        return {};
-    char name[IF_NAMESIZE]{};
-    if (::if_indextoname(static_cast<unsigned>(ifindex), name) == nullptr)
-        return {};
-    return name;
-}
-
 } // namespace
 
 int collect_routes_macos(yuzu::CommandContext& ctx) {
@@ -86,7 +77,7 @@ int collect_routes_macos(yuzu::CommandContext& ctx) {
     std::vector<RouteRow> rows;
     rows.reserve(parsed.records.size());
     for (const auto& rec : parsed.records)
-        rows.push_back(mac_route_to_row(rec, interface_name(rec.ifindex)));
+        rows.push_back(mac_route_to_row(rec, interface_name_for_index(rec.ifindex)));
 
     if (parsed.capped)
         acc.add_failure(kTokRowCap);
