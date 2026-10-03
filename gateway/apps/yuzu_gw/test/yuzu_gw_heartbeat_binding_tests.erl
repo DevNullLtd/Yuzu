@@ -86,7 +86,11 @@ binding_test_() ->
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
-       fun info_logs_carry_no_session_id/0}
+       fun info_logs_carry_no_session_id/0},
+      {"500 concurrent rejections are all counted and produce one summary line",
+       fun rejection_storm_is_counted_and_logs_once/0},
+      {"re-registration churn: one index row per agent, no superseded session admitted",
+       {timeout, 60, fun registration_churn_keeps_one_row_per_agent/0}}
      ]}.
 
 setup() ->
@@ -529,6 +533,131 @@ rejection_log_is_rate_limited_and_id_free() ->
         ?assertEqual(nomatch, binary:match(Line, Id))
     end, Ids),
     ?assertNotEqual(nomatch, binary:match(Line, <<"unknown_session">>)).
+
+%% Many handler processes reject at once. Every rejection is counted exactly
+%% once (telemetry events are what drive the Prometheus counters), and the
+%% rate limit lets exactly one summary line out inside one interval (the fixture
+%% sets the interval to 10 minutes).
+rejection_storm_is_counted_and_logs_once() ->
+    yuzu_gw_heartbeat_admission:reset_summary_state(),
+    N = 500,
+    Ctx = ctx_with(conn_a),
+    flush(),
+    Lines = capture_logs(fun() ->
+        Self = self(),
+        Workers = [spawn_link(fun() ->
+                       receive go -> ok end,
+                       Self ! {admitted, self(),
+                               yuzu_gw_heartbeat_admission:admit(Ctx, uid(<<"storm">>))}
+                   end) || _ <- lists:seq(1, N)],
+        [W ! go || W <- Workers],
+        Results = [receive {admitted, W, R} -> R after 10000 -> timeout end
+                   || W <- Workers],
+        ?assertEqual(lists:duplicate(N, rejected), Results)
+    end),
+    Counted = [R || {[yuzu, gw, heartbeat, rejected], #{count := 1}, #{reason := R}}
+                        <- events()],
+    ?assertEqual(lists:duplicate(N, unknown_session), Counted),
+    ?assertEqual(1, length(Lines)),
+    ?assertNotEqual(nomatch, binary:match(hd(Lines), <<"unknown_session=">>)).
+
+%% Agents re-register under rotating session ids while heartbeats race. Once a
+%% registration call has returned, the session it replaced must not be
+%% admitted by any heartbeat, and at quiescence each agent id has exactly one
+%% index row: the last session.
+registration_churn_keeps_one_row_per_agent() ->
+    Agents = 12,
+    Rounds = 20,
+    Racers = 4,
+    Superseded = ets:new(churn_superseded, [public, bag]),
+    Violations = ets:new(churn_violations, [public, bag]),
+    Ids = [uid(<<"churn">>) || _ <- lists:seq(1, Agents)],
+    Keyed = lists:zip(Ids, [{churn_conn, I} || I <- lists:seq(1, Agents)]),
+    Self = self(),
+    %% Racers: heartbeat for sessions known to be superseded; any admission is
+    %% a violation.
+    RacerPids = [spawn_link(fun() -> racer(Superseded, Violations) end)
+                 || _ <- lists:seq(1, Racers)],
+    Workers = [spawn_link(fun() ->
+                   Last = churn_agent(Id, Key, Rounds, Superseded, Violations),
+                   Self ! {churned, self(), Id, Last}
+               end) || {Id, Key} <- Keyed],
+    Finals = [receive {churned, W, Id, Last} -> {Id, Last} after 30000 -> timeout end
+              || {W, {Id, _}} <- lists:zip(Workers, Keyed)],
+    [R ! stop || R <- RacerPids],
+    try
+        ?assertEqual([], ets:tab2list(Violations)),
+        lists:foreach(fun({Id, {Pid, S}}) ->
+            %% Exactly one row for this agent id, and it is the last session.
+            ?assertMatch([[S, Pid, _]],
+                         [[Sid, P, K] || [Sid, P, K] <- ets:match(?SESSIONS, {'$1', Id, '$2', '$3'})]),
+            ?assertEqual({ok, {Pid, S}}, yuzu_gw_registry:lookup_local_session(Id))
+        end, Finals),
+        %% Every superseded session is gone from the index.
+        Old = [S || {S} <- ets:tab2list(Superseded)],
+        ?assertEqual(Agents * (Rounds - 1), length(Old)),
+        lists:foreach(fun(S) ->
+            ?assertEqual(error, yuzu_gw_registry:lookup_session(S))
+        end, Old)
+    after
+        [exit(P, kill) || {_, {P, _}} <- Finals],
+        ok = wait_until(fun() ->
+            lists:all(fun(Id) ->
+                ets:match(?SESSIONS, {'_', Id, '_', '_'}) =:= []
+            end, Ids)
+        end, 3000),
+        ets:delete(Superseded),
+        ets:delete(Violations)
+    end.
+
+%% One agent: register Rounds times under rotating session ids on its own
+%% connection. Returns {Pid, SessionId} of the last registration.
+churn_agent(Id, Key, Rounds, Superseded, Violations) ->
+    Ctx = ctx_with(Key),
+    churn_agent(Id, Key, Ctx, 1, Rounds, undefined, Superseded, Violations).
+
+churn_agent(_Id, _Key, _Ctx, N, Rounds, Last, _Superseded, _Violations) when N > Rounds ->
+    Last;
+churn_agent(Id, Key, Ctx, N, Rounds, Prev, Superseded, Violations) ->
+    S = iolist_to_binary([Id, "-s", integer_to_list(N)]),
+    Pid = bind(Id, S, Key),
+    case Prev of
+        {_PrevPid, PrevS} ->
+            %% The register call above has returned: the replaced session is
+            %% no longer admitted, and racers may now start probing it.
+            ets:insert(Superseded, {PrevS}),
+            case yuzu_gw_heartbeat_admission:admit(ctx_with(Key), PrevS) of
+                ok       -> ets:insert(Violations, {PrevS, Key, worker});
+                rejected -> ok
+            end;
+        undefined ->
+            ok
+    end,
+    %% The new session is admitted on its own connection straight away.
+    case yuzu_gw_heartbeat_admission:admit(Ctx, S) of
+        ok       -> ok;
+        rejected -> ets:insert(Violations, {S, Key, current_rejected})
+    end,
+    churn_agent(Id, Key, Ctx, N + 1, Rounds, {Pid, S}, Superseded, Violations).
+
+racer(Superseded, Violations) ->
+    receive stop -> ok
+    after 0 ->
+        case ets:tab2list(Superseded) of
+            [] ->
+                ok;
+            Sessions ->
+                {S} = lists:nth(rand:uniform(length(Sessions)), Sessions),
+                %% Probe on every connection: a superseded session is
+                %% admitted on none of them.
+                case yuzu_gw_registry:lookup_session(S) of
+                    error -> ok;
+                    Other -> ets:insert(Violations, {S, Other, racer})
+                end
+        end,
+        erlang:yield(),
+        racer(Superseded, Violations)
+    end.
 
 info_logs_carry_no_session_id() ->
     A = uid(<<"logagent">>),
