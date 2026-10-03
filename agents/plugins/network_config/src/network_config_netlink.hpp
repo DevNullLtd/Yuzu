@@ -76,6 +76,10 @@ inline yuzu::agent::ScopedFd open_rtnetlink_socket() {
 template <typename Record> struct DumpResult {
     std::vector<Record> records;
     bool ok = false; // true iff the dump completed (NLMSG_DONE) without error/truncation
+    // true iff the dump was cut off because it held more than `max_records`
+    // records. `ok` is false in that case; the kept prefix is valid, not partial
+    // garbage, and the caller reports a row-cap constraint rather than a failure.
+    bool capped = false;
 };
 
 /**
@@ -91,9 +95,16 @@ template <typename Record> struct DumpResult {
  * Any failure (socket, send, read, foreign flood, truncation, parse error)
  * returns ok=false with whatever records were decoded so far. Callers must
  * report that as an incomplete read, never as an empty table.
+ *
+ * `max_records` bounds memory: a default-free-zone host can answer a route dump
+ * with ~1M records, and an unbounded accumulate-then-cap would buffer them all
+ * first. The check runs after each datagram is merged, so the buffer overshoots
+ * the cap by at most one datagram's worth before it is trimmed to `max_records`
+ * and `capped` is set.
  */
 template <typename Request, typename ParseFn>
-auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk) {
+auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk,
+          std::size_t max_records = static_cast<std::size_t>(-1)) {
     using Chunk = std::invoke_result_t<ParseFn&, std::span<const unsigned char>, std::uint32_t>;
     using Record = typename decltype(std::declval<Chunk&>().records)::value_type;
     DumpResult<Record> result;
@@ -171,6 +182,12 @@ auto dump(const Request& req, std::uint32_t seq, ParseFn&& parse_chunk) {
                               std::make_move_iterator(chunk.records.end()));
         if (chunk.truncated)
             truncated = true;
+        if (result.records.size() > max_records) {
+            result.records.erase(result.records.begin() + static_cast<std::ptrdiff_t>(max_records),
+                                 result.records.end());
+            result.capped = true;
+            return result; // ok stays false — the table was cut at the cap
+        }
         if (chunk.error)
             return result;
         if (chunk.done) {
