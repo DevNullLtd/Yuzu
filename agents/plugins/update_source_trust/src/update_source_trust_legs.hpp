@@ -24,6 +24,7 @@
 #include "update_source_trust_parsers.hpp"
 
 #include <constraint_accumulator.hpp>
+#include <exception_category.hpp>
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -94,7 +95,9 @@ inline int execute_sources(yuzu::CommandContext& ctx, std::string_view action, L
         }
         return leg(ctx);
     } catch (...) {
-        report_unavailable(ctx, leg_exception_token);
+        // `<os>:leg:exception:<bad_alloc|std_exception|unknown>` -- what() never travels.
+        report_unavailable(ctx, std::string{leg_exception_token} + ':' +
+                                    std::string{yuzu::shared::exception_category()});
         return 0;
     }
 }

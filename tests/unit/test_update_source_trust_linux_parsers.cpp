@@ -51,8 +51,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -378,7 +382,8 @@ TEST_CASE("apt_rows_at over the composite tree: deb822 + one-line sources with s
           "[update_source_trust][walk][apt]") {
     const Tree t;
     yuzu::shared::ConstraintAccumulator acc;
-    const auto rows = lnx::apt_rows_at(t.dir.path, acc);
+    lnx::pio::InputBudget budget;
+    const auto rows = lnx::apt_rows_at(t.dir.path, acc, budget);
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
     // 10 ubuntu one-line + 2 debian deb822 + 2 thirdparty + 3 keyrings.
@@ -485,7 +490,8 @@ TEST_CASE("an empty or absent /etc/yum.repos.d is not a skipped family: supporte
     REQUIRE(fs::remove(repo_dir / "placeholder.repo", ec));
     REQUIRE_FALSE(ec);
     yuzu::shared::ConstraintAccumulator empty_acc;
-    CHECK(lnx::linux_rows_at(t.dir.path, empty_acc).size() == 17);
+    lnx::pio::InputBudget budget;
+    CHECK(lnx::linux_rows_at(t.dir.path, empty_acc, budget).size() == 17);
     CHECK_FALSE(empty_acc.any_failure());
     CHECK_FALSE(empty_acc.incomplete());
 
@@ -493,7 +499,8 @@ TEST_CASE("an empty or absent /etc/yum.repos.d is not a skipped family: supporte
     REQUIRE(fs::remove(repo_dir, ec));
     REQUIRE_FALSE(ec);
     yuzu::shared::ConstraintAccumulator absent_acc;
-    CHECK(lnx::linux_rows_at(t.dir.path, absent_acc).size() == 17);
+    lnx::pio::InputBudget budget2;
+    CHECK(lnx::linux_rows_at(t.dir.path, absent_acc, budget2).size() == 17);
     // MUTATION: dropping the `!names.empty()` guard makes the empty directory
     // constrained; mapping ENOENT to `planned` makes the absent one constrained.
     CHECK_FALSE(absent_acc.any_failure());
@@ -507,7 +514,8 @@ TEST_CASE("a root that does not exist is absent for every family: zero rows, sup
     yuzu::test::TempDir dir{"yuzu_test_update_source_trust_noroot_"};
     const fs::path missing = dir.path / "no-such-root";
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::linux_rows_at(missing, acc).empty());
+    lnx::pio::InputBudget budget;
+    CHECK(lnx::linux_rows_at(missing, acc, budget).empty());
     // MUTATION: mapping ENOENT to a failure token would make a host with no apt
     // configuration (or no rpm directory) read `constrained` forever.
     CHECK_FALSE(acc.any_failure());
@@ -527,7 +535,8 @@ TEST_CASE("an unreadable root is constrained with a token per source, never abse
         SKIP("permission bits do not stop traversal here (root, CAP_DAC_OVERRIDE or a FUSE mount)");
 
     yuzu::shared::ConstraintAccumulator acc;
-    CHECK(lnx::linux_rows_at(t.dir.path, acc).empty());
+    lnx::pio::InputBudget budget;
+    CHECK(lnx::linux_rows_at(t.dir.path, acc, budget).empty());
     // MUTATION: mapping EACCES to `absent` (zero rows, supported) drops these tokens --
     // including the rpm one, which proves the tripwire's own directory read reports an
     // unreadable directory as a real failure rather than as absent or as `planned`.
@@ -536,6 +545,224 @@ TEST_CASE("an unreadable root is constrained with a token per source, never abse
     CHECK(reason_has(acc, "linux:rpm_repo:permission_denied"));
     CHECK_FALSE(reason_has(acc, "linux:rpm_repo:planned")); // unreadable is not "has entries"
     CHECK(acc.incomplete());
+}
+
+// ── injected syscall seam: one case per failure token ───────────────────────
+//
+// PosixOps are plain function pointers, so the injected behaviour lives in one
+// TU-local state block that every case resets. Each case runs the composite tree
+// WITHOUT its rpm placeholder, so acc.reason() is exactly the token under test.
+// errno_detail maps EIO to `io_error` at EVERY stage, so `open_failed` and
+// `read_failed` are produced with EMFILE / EBADF (errnos outside its special set).
+
+namespace {
+
+enum class ReadMode { pass, fail_first, zero_first, eintr_first, burst_then_fail };
+
+struct Inject {
+    std::string open_fail_suffix; // open() of a path ending so fails with `err`
+    int err = 0;
+    int fstat_fail_on = 0; // the Nth fstat call fails with `err`
+    int fstat_calls = 0;
+    ReadMode read_mode = ReadMode::pass;
+    int read_calls = 0;
+    bool fdopendir_null = false;
+    yuzu::shared::DirWalkResult walk_result{};
+    bool walk_injected = false;
+};
+Inject g_inj;
+
+int inj_open(const char* p, int flags, ...) {
+    if (!g_inj.open_fail_suffix.empty() &&
+        lnx::pio::ends_with(p, g_inj.open_fail_suffix)) {
+        errno = g_inj.err;
+        return -1;
+    }
+    return ::open(p, flags);
+}
+int inj_fstat(int fd, struct stat* st) {
+    if (++g_inj.fstat_calls == g_inj.fstat_fail_on) {
+        errno = g_inj.err;
+        return -1;
+    }
+    return ::fstat(fd, st);
+}
+ssize_t inj_read(int fd, void* buf, std::size_t n) {
+    const int call = ++g_inj.read_calls;
+    switch (g_inj.read_mode) {
+    case ReadMode::pass: break;
+    case ReadMode::fail_first:
+        if (call == 1) {
+            errno = g_inj.err;
+            return -1;
+        }
+        break;
+    case ReadMode::zero_first:
+        if (call == 1)
+            return 0;
+        break;
+    case ReadMode::eintr_first:
+        if (call == 1) {
+            errno = EINTR;
+            return -1;
+        }
+        break;
+    case ReadMode::burst_then_fail: { // every file: 48 bytes, then an error
+        if (call % 2 == 0) {
+            errno = g_inj.err;
+            return -1;
+        }
+        const std::size_t k = std::min<std::size_t>(48, n);
+        std::memset(buf, 'x', k);
+        return static_cast<ssize_t>(k);
+    }
+    }
+    return ::read(fd, buf, n);
+}
+DIR* inj_fdopendir(int fd) {
+    if (g_inj.fdopendir_null) {
+        errno = g_inj.err;
+        return nullptr;
+    }
+    return ::fdopendir(fd);
+}
+yuzu::shared::DirWalkResult inj_walk(DIR* d, std::size_t cap,
+                                     const std::function<bool(const dirent*)>& on_entry) {
+    if (g_inj.walk_injected)
+        return g_inj.walk_result; // no names: the listing "failed" before any entry
+    return lnx::pio::detail::real_walk(d, cap, on_entry);
+}
+
+lnx::pio::PosixOps injected_ops() {
+    lnx::pio::PosixOps ops;
+    ops.open = &inj_open;
+    ops.fstat = &inj_fstat;
+    ops.read = &inj_read;
+    ops.fdopendir = &inj_fdopendir;
+    ops.walk = &inj_walk;
+    return ops;
+}
+
+struct Walked {
+    std::vector<std::string> rows;
+    yuzu::shared::ConstraintAccumulator acc;
+    lnx::pio::InputBudget budget;
+};
+
+Walked walk_injected(std::size_t max_input = lnx::pio::kMaxInputBytes) {
+    g_inj.fstat_calls = 0;
+    g_inj.read_calls = 0;
+    const Tree t;
+    std::error_code ec;
+    fs::remove_all(t.dir.path / "etc" / "yum.repos.d", ec);
+    Walked w;
+    w.budget.max_input_bytes = max_input;
+    w.rows = lnx::linux_rows_at(t.dir.path, w.acc, w.budget, injected_ops());
+    g_inj = Inject{};
+    return w;
+}
+
+} // namespace
+
+TEST_CASE("injected ops: open EMFILE on sources.list is open_failed",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.open_fail_suffix = "/etc/apt/sources.list";
+    g_inj.err = EMFILE;
+    const auto w = walk_injected();
+    // MUTATION: IoStage::read_file at the open-failure site reports read_failed.
+    CHECK(w.acc.reason() == "linux:apt_sources:open_failed");
+    CHECK(w.rows.size() == 7); // sources.list's 10 rows are gone, the other 17 - 10 stay
+}
+
+TEST_CASE("injected ops: read EBADF is read_failed, EIO is io_error, a failing fstat is read_failed",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::fail_first;
+    g_inj.err = EBADF;
+    CHECK(walk_injected().acc.reason() == "linux:apt_sources:read_failed");
+
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::fail_first;
+    g_inj.err = EIO;
+    CHECK(walk_injected().acc.reason() == "linux:apt_sources:io_error");
+
+    g_inj = Inject{};
+    g_inj.fstat_fail_on = 1; // the first file's opening fstat
+    g_inj.err = EBADF;
+    CHECK(walk_injected().acc.reason() == "linux:apt_sources:read_failed");
+}
+
+TEST_CASE("injected ops: read returning 0 before the fstat size is short_read",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::zero_first;
+    CHECK(walk_injected().acc.reason() == "linux:apt_sources:short_read");
+}
+
+TEST_CASE("injected ops: a read interrupted by EINTR is retried and is no failure",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::eintr_first;
+    const auto w = walk_injected();
+    // MUTATION: dropping the EINTR `continue` turns it into read_failed.
+    CHECK_FALSE(w.acc.any_failure());
+    CHECK(w.rows.size() == 17);
+}
+
+TEST_CASE("injected ops: fdopendir failure is dir_open_failed for each source",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.fdopendir_null = true;
+    g_inj.err = EMFILE;
+    CHECK(walk_injected().acc.reason() ==
+          "linux:apt_sources:dir_open_failed,linux:apt_keyring:dir_open_failed");
+}
+
+TEST_CASE("injected ops: walk flags surface as enumeration_error and entry_cap",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    g_inj.walk_injected = true;
+    g_inj.walk_result.enumeration_error = true;
+    CHECK(walk_injected().acc.reason() ==
+          "linux:apt_sources:enumeration_error,linux:apt_keyring:enumeration_error");
+
+    g_inj = Inject{};
+    g_inj.walk_injected = true;
+    g_inj.walk_result.truncated = true;
+    CHECK(walk_injected().acc.reason() ==
+          "linux:apt_sources:entry_cap,linux:apt_keyring:entry_cap");
+}
+
+// ── input budget ────────────────────────────────────────────────────────────
+
+TEST_CASE("input budget: a walk past the budget records input_cap and stops",
+          "[update_source_trust][walk][input_cap]") {
+    g_inj = Inject{};
+    // sources.list is 2477 bytes (10 rows) and debian.sources 443: the second read
+    // crosses 2500, so its rows and every later file are dropped.
+    const auto w = walk_injected(2500);
+    // MUTATION: never charging the budget removes the token and restores all 17 rows.
+    CHECK(w.acc.reason() == "linux:apt_sources:input_cap");
+    CHECK(w.rows.size() == 10);
+    CHECK(w.budget.used == 2477 + 443);
+    for (const auto& r : w.rows)
+        CHECK(r.rfind("apt_keyring|", 0) == std::string::npos);
+}
+
+TEST_CASE("input budget: bytes of FAILED reads are charged (a run of failing files cannot bypass it)",
+          "[update_source_trust][walk][input_cap]") {
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::burst_then_fail; // 48 bytes then EBADF, for every file
+    g_inj.err = EBADF;
+    const auto w = walk_injected(100);
+    // Files 1 and 2 fail after 48 bytes each (96 charged, within 100); file 3 fails
+    // too and crosses the budget (144), so the walk stops there: 3 files x 2 reads.
+    // MUTATION: charging on the ok path only leaves used == 0, records no input_cap
+    // and keeps walking.
+    CHECK(w.acc.reason() == "linux:apt_sources:read_failed,linux:apt_sources:input_cap");
+    CHECK(w.budget.used == 144);
+    CHECK(w.rows.empty());
 }
 
 #endif // !defined(_WIN32)

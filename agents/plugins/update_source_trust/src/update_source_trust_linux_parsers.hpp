@@ -33,9 +33,11 @@
  * (kMaxOutputBytes): the per-file and per-directory caps bound each read, not
  * their sum. Past it the newest rows are dropped, no further file is read and
  * `output_cap` is recorded. It bounds the rows KEPT, not the work of reading
- * them: each file is parsed transiently (at most 1 MiB of text, the rows of one
- * file exist before the trim), and a walk may still read every file of a
- * 1,024-entry directory.
+ * them, which has its own INPUT BUDGET: the bytes the walk pulls from the kernel
+ * share one 16 MiB InputBudget (kMaxInputBytes), charged inside read_file on
+ * EVERY outcome after the first read -- bytes read, successful or not -- so a run
+ * of failing files cannot bypass it. Once it is exceeded the walk stops and
+ * `input_cap` is recorded; what was not read is not reported.
  *
  * FILES apt READS. Names in sources.list.d must pass apt's own filter
  * (apt_dir_name_ok: not hidden, only [A-Za-z0-9_.:-]) before the suffix test, so
@@ -100,6 +102,7 @@
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -115,8 +118,39 @@ inline constexpr std::size_t kKeyringHeadBytes = 64;
 /// otherwise build a multi-gigabyte row vector before any downstream cap applies.
 /// A real host reports a few KiB, so this is ~250x headroom.
 inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
+/// One budget for the bytes READ by the whole walk (see the banner's INPUT BUDGET).
+inline constexpr std::size_t kMaxInputBytes = 16 * 1024 * 1024;
 
-enum class Outcome { ok, absent, failed };
+/// `input_cap`: the input budget is spent; the walk must stop (token recorded).
+enum class Outcome { ok, absent, failed, input_cap };
+
+/// Bytes pulled from the kernel so far by one walk. read_file charges it on every
+/// exit after its read loop starts, so a failed or torn read still counts.
+struct InputBudget {
+    std::size_t max_input_bytes = kMaxInputBytes;
+    std::size_t used = 0;
+};
+
+namespace detail {
+/// The real walk_dir_capped behind PosixOps::walk (a template cannot be a plain
+/// function pointer).
+inline yuzu::shared::DirWalkResult real_walk(DIR* d, std::size_t cap,
+                                             const std::function<bool(const dirent*)>& on_entry) {
+    return yuzu::shared::walk_dir_capped(d, cap, on_entry);
+}
+} // namespace detail
+
+/// The syscall seam: production uses the defaults; the unit suite injects failures
+/// no healthy filesystem produces on demand (EMFILE on open, EIO on read, a failed
+/// fdopendir, a readdir fault).
+struct PosixOps {
+    int (*open)(const char*, int, ...) = &::open;
+    int (*fstat)(int, struct stat*) = &::fstat;
+    ssize_t (*read)(int, void*, std::size_t) = &::read;
+    DIR* (*fdopendir)(int) = &::fdopendir;
+    yuzu::shared::DirWalkResult (*walk)(DIR*, std::size_t,
+                                        const std::function<bool(const dirent*)>&) = &detail::real_walk;
+};
 
 /// (size, mtime) of an open file: what two fstat calls on one fd are compared by.
 /// The seconds and nanoseconds stay separate: a flattened nanosecond product
@@ -178,11 +212,12 @@ template <class AfterRead = NoHook>
 inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, bool head_only,
                          std::string& out, std::uint64_t& size_bytes,
                          yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix,
+                         InputBudget& budget, const PosixOps& ops = {},
                          AfterRead&& after_read = AfterRead{}) {
     // O_NONBLOCK: open(2) of a writer-less FIFO blocks forever otherwise, before
     // the S_ISREG guard below can reject it. It is a no-op for regular files.
     yuzu::agent::ScopedFd fd(
-        ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
+        ops.open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC));
     if (!fd.valid()) {
         const int err = errno;
         if (err == ENOENT)
@@ -191,7 +226,7 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
         return Outcome::failed;
     }
     struct stat st{};
-    if (::fstat(fd.get(), &st) != 0) {
+    if (ops.fstat(fd.get(), &st) != 0) {
         note_failure(acc, source_prefix, errno_detail(errno, IoStage::read_file));
         return Outcome::failed;
     }
@@ -208,28 +243,47 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
                                        : static_cast<std::size_t>(size_bytes);
     out.assign(want, '\0');
     std::size_t total = 0;
+    // Charges the bytes pulled from the kernel on EVERY exit below (ok, short_read,
+    // read_failed, the closing fstat failing, modified_during_read): charging only a
+    // successful read would let a run of failing files bypass the budget.
+    struct Charge {
+        InputBudget& b;
+        std::size_t& total;
+        bool done = false;
+        void flush() noexcept {
+            if (!done)
+                b.used += total;
+            done = true;
+        }
+        ~Charge() { flush(); }
+    } charge{budget, total};
+    // A failure token, then (budget now spent) the cap token that stops the walk.
+    const auto fail = [&](std::string_view detail) {
+        note_failure(acc, source_prefix, detail);
+        charge.flush();
+        if (budget.used <= budget.max_input_bytes)
+            return Outcome::failed;
+        note_failure(acc, source_prefix, "input_cap");
+        return Outcome::input_cap;
+    };
     while (total < want) {
-        const ssize_t n = ::read(fd.get(), out.data() + total, want - total);
+        const ssize_t n = ops.read(fd.get(), out.data() + total, want - total);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            note_failure(acc, source_prefix, errno_detail(errno, IoStage::read_file));
-            return Outcome::failed;
+            return fail(errno_detail(errno, IoStage::read_file));
         }
         if (n == 0) {
             // EOF before fstat's size: the file shrank under us. Parsing what is
             // left would silently drop sources, so it is a constraint, not ok.
-            note_failure(acc, source_prefix, "short_read");
-            return Outcome::failed;
+            return fail("short_read");
         }
         total += static_cast<std::size_t>(n);
     }
     after_read();
     struct stat after{};
-    if (::fstat(fd.get(), &after) != 0) {
-        note_failure(acc, source_prefix, errno_detail(errno, IoStage::read_file));
-        return Outcome::failed;
-    }
+    if (ops.fstat(fd.get(), &after) != 0)
+        return fail(errno_detail(errno, IoStage::read_file));
     const FileStamp seen = stamp_of(after);
     // An in-place writer (truncate + write) raced the read: what was read may be an
     // empty or torn file, and an empty sources.list is normal on a host with no apt
@@ -242,9 +296,12 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
     // limit.)
     const auto now_s = static_cast<std::int64_t>(::time(nullptr));
     const bool just_emptied = !head_only && seen.size == 0 && seen.sec >= now_s - 2 && seen.sec <= now_s + 2;
-    if (seen != stamp_of(st) || just_emptied) {
-        note_failure(acc, source_prefix, "modified_during_read");
-        return Outcome::failed;
+    if (seen != stamp_of(st) || just_emptied)
+        return fail("modified_during_read");
+    charge.flush();
+    if (budget.used > budget.max_input_bytes) {
+        note_failure(acc, source_prefix, "input_cap");
+        return Outcome::input_cap;
     }
     return Outcome::ok;
 }
@@ -254,9 +311,10 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
 /// A cap truncation or a mid-scan I/O error is a token (`entry_cap` /
 /// `enumeration_error`) but the names gathered so far are still returned.
 inline Outcome list_dir(const std::filesystem::path& dir, std::vector<std::string>& names,
-                        yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix) {
+                        yuzu::shared::ConstraintAccumulator& acc, std::string_view source_prefix,
+                        const PosixOps& ops = {}) {
     names.clear();
-    yuzu::agent::ScopedFd fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    yuzu::agent::ScopedFd fd(ops.open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
     if (!fd.valid()) {
         const int err = errno;
         if (err == ENOENT)
@@ -264,13 +322,13 @@ inline Outcome list_dir(const std::filesystem::path& dir, std::vector<std::strin
         note_failure(acc, source_prefix, errno_detail(err, IoStage::open_dir));
         return Outcome::failed;
     }
-    std::unique_ptr<DIR, int (*)(DIR*)> d(::fdopendir(fd.get()), &::closedir);
+    std::unique_ptr<DIR, int (*)(DIR*)> d(ops.fdopendir(fd.get()), &::closedir);
     if (!d) {
         note_failure(acc, source_prefix, errno_detail(errno, IoStage::open_dir));
         return Outcome::failed;
     }
     (void)fd.release(); // fdopendir succeeded: closedir() now owns the fd
-    const auto walk = yuzu::shared::walk_dir_capped(d.get(), kMaxDirEntries, [&](const dirent* e) {
+    const auto walk = ops.walk(d.get(), kMaxDirEntries, [&](const dirent* e) {
         names.emplace_back(e->d_name);
         return true;
     });
@@ -317,11 +375,15 @@ namespace detail {
 
 inline bool add_apt_file(const std::filesystem::path& root, const std::string& logical,
                          AptFormat fmt, std::vector<std::string>& rows,
-                         yuzu::shared::ConstraintAccumulator& acc) {
+                         yuzu::shared::ConstraintAccumulator& acc, pio::InputBudget& budget,
+                         const pio::PosixOps& ops) {
     std::string data;
     std::uint64_t size = 0;
-    if (pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false, data, size, acc,
-                       kAptSourcesPrefix) != pio::Outcome::ok)
+    const pio::Outcome got = pio::read_file(pio::under(root, logical), pio::kMaxFileBytes, false,
+                                            data, size, acc, kAptSourcesPrefix, budget, ops);
+    if (got == pio::Outcome::input_cap)
+        return false; // input budget spent (token recorded): stop the walk
+    if (got != pio::Outcome::ok)
         return true; // this file failed (token recorded); the walk goes on
     std::size_t altered = 0;
     const std::size_t malformed = apt_rows_from_text(logical, fmt, data, rows, &altered);
@@ -334,11 +396,15 @@ inline bool add_apt_file(const std::filesystem::path& root, const std::string& l
 
 inline bool add_keyring_file(const std::filesystem::path& root, const std::string& logical,
                              std::string_view scope, std::vector<std::string>& rows,
-                             yuzu::shared::ConstraintAccumulator& acc) {
+                             yuzu::shared::ConstraintAccumulator& acc, pio::InputBudget& budget,
+                             const pio::PosixOps& ops) {
     std::string head;
     std::uint64_t size = 0;
-    if (pio::read_file(pio::under(root, logical), pio::kKeyringHeadBytes, true, head, size, acc,
-                       kAptKeyringPrefix) != pio::Outcome::ok)
+    const pio::Outcome got = pio::read_file(pio::under(root, logical), pio::kKeyringHeadBytes, true,
+                                            head, size, acc, kAptKeyringPrefix, budget, ops);
+    if (got == pio::Outcome::input_cap)
+        return false;
+    if (got != pio::Outcome::ok)
         return true;
     // The row's path field is scrubbed by format_apt_keyring_row; the name only
     // needs the constraint (a keyring name is not filtered by the walk).
@@ -351,15 +417,16 @@ inline bool add_keyring_file(const std::filesystem::path& root, const std::strin
 inline bool add_keyring_dir(const std::filesystem::path& root, std::string_view logical_dir,
                             std::string_view scope, bool gpg_asc_only,
                             std::vector<std::string>& rows,
-                            yuzu::shared::ConstraintAccumulator& acc) {
+                            yuzu::shared::ConstraintAccumulator& acc, pio::InputBudget& budget,
+                            const pio::PosixOps& ops) {
     std::vector<std::string> names;
-    if (pio::list_dir(pio::under(root, logical_dir), names, acc, kAptKeyringPrefix) ==
+    if (pio::list_dir(pio::under(root, logical_dir), names, acc, kAptKeyringPrefix, ops) ==
         pio::Outcome::failed)
         return true;
     for (const auto& n : names) {
         if (gpg_asc_only && !pio::ends_with(n, ".gpg") && !pio::ends_with(n, ".asc"))
             continue; // apt ignores every other suffix in trusted.gpg.d (see apt_dir_name_ok for the name rule)
-        if (!add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc))
+        if (!add_keyring_file(root, std::string{logical_dir} + '/' + n, scope, rows, acc, budget, ops))
             return false;
     }
     return true;
@@ -374,32 +441,39 @@ inline bool add_keyring_dir(const std::filesystem::path& root, std::string_view 
 /// (referenced via Signed-By). A host with no apt configuration returns zero
 /// rows and no failure token. The rows of the whole walk share one budget
 /// (pio::kMaxOutputBytes): once it is spent no further file is read and
-/// `<prefix>:output_cap` is recorded.
+/// `<prefix>:output_cap` is recorded. The bytes read share `budget`
+/// (pio::InputBudget); once it is exceeded the walk stops with `<prefix>:input_cap`.
 [[nodiscard]] inline std::vector<std::string>
-apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
+apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
+            pio::InputBudget& budget, const pio::PosixOps& ops = {}) {
     std::vector<std::string> rows;
 
-    if (!detail::add_apt_file(root, "/etc/apt/sources.list", AptFormat::one_line, rows, acc))
+    if (!detail::add_apt_file(root, "/etc/apt/sources.list", AptFormat::one_line, rows, acc,
+                              budget, ops))
         return rows;
 
     constexpr std::string_view kListDir = "/etc/apt/sources.list.d";
     std::vector<std::string> names;
-    if (pio::list_dir(pio::under(root, kListDir), names, acc, kAptSourcesPrefix) !=
+    if (pio::list_dir(pio::under(root, kListDir), names, acc, kAptSourcesPrefix, ops) !=
         pio::Outcome::failed) {
         for (const auto& n : names) {
             const bool deb822 = pio::ends_with(n, ".sources");
             if (!apt_dir_name_ok(n) || (!deb822 && !pio::ends_with(n, ".list")))
                 continue; // apt skips hidden and oddly named files and any other suffix
             if (!detail::add_apt_file(root, std::string{kListDir} + '/' + n,
-                                      deb822 ? AptFormat::deb822 : AptFormat::one_line, rows, acc))
+                                      deb822 ? AptFormat::deb822 : AptFormat::one_line, rows, acc,
+                                      budget, ops))
                 return rows;
         }
     }
 
-    if (!detail::add_keyring_file(root, "/etc/apt/trusted.gpg", "legacy_trusted_gpg", rows, acc) ||
-        !detail::add_keyring_dir(root, "/etc/apt/trusted.gpg.d", "trusted_gpg_d", true, rows, acc))
+    if (!detail::add_keyring_file(root, "/etc/apt/trusted.gpg", "legacy_trusted_gpg", rows, acc, budget,
+                                  ops) ||
+        !detail::add_keyring_dir(root, "/etc/apt/trusted.gpg.d", "trusted_gpg_d", true, rows, acc,
+                                 budget, ops))
         return rows;
-    detail::add_keyring_dir(root, "/etc/apt/keyrings", "etc_apt_keyrings", false, rows, acc);
+    detail::add_keyring_dir(root, "/etc/apt/keyrings", "etc_apt_keyrings", false, rows, acc, budget,
+                            ops);
     return rows;
 }
 
@@ -411,9 +485,10 @@ apt_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulat
 /// missing or empty directory is silent (nothing was skipped); an unreadable or
 /// over-cap one is the usual `linux:rpm_repo:<detail>` token from list_dir.
 inline void rpm_family_planned_at(const std::filesystem::path& root,
-                                  yuzu::shared::ConstraintAccumulator& acc) {
+                                  yuzu::shared::ConstraintAccumulator& acc,
+                                  const pio::PosixOps& ops = {}) {
     std::vector<std::string> names;
-    if (pio::list_dir(pio::under(root, "/etc/yum.repos.d"), names, acc, kRpmRepoPrefix) ==
+    if (pio::list_dir(pio::under(root, "/etc/yum.repos.d"), names, acc, kRpmRepoPrefix, ops) ==
             pio::Outcome::ok &&
         !names.empty())
         pio::note_failure(acc, kRpmRepoPrefix, "planned");
@@ -423,9 +498,10 @@ inline void rpm_family_planned_at(const std::filesystem::path& root,
 /// family's planned constraint (a token, never a row). run_linux_at is exactly
 /// this call followed by report_sources.
 [[nodiscard]] inline std::vector<std::string>
-linux_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc) {
-    std::vector<std::string> rows = apt_rows_at(root, acc);
-    rpm_family_planned_at(root, acc);
+linux_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumulator& acc,
+              pio::InputBudget& budget, const pio::PosixOps& ops = {}) {
+    std::vector<std::string> rows = apt_rows_at(root, acc, budget, ops);
+    rpm_family_planned_at(root, acc, ops);
     return rows;
 }
 
@@ -439,7 +515,8 @@ linux_rows_at(const std::filesystem::path& root, yuzu::shared::ConstraintAccumul
 /// test_update_source_trust_linux_parsers.cpp.
 inline int run_linux_at(yuzu::CommandContext& ctx, const std::filesystem::path& root) {
     yuzu::shared::ConstraintAccumulator acc;
-    const std::vector<std::string> rows = linux_rows_at(root, acc);
+    pio::InputBudget budget; // fresh per walk
+    const std::vector<std::string> rows = linux_rows_at(root, acc, budget);
     report_sources(ctx, rows, acc);
     return 0;
 }
