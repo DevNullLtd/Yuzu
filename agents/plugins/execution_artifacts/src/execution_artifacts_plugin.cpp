@@ -221,21 +221,30 @@ private:
                 reinterpret_cast<const char8_t*>(data_dir_.data()), data_dir_.size()};
             const std::wstring wide_data_dir = std::filesystem::path{data_dir_u8}.wstring();
 
-            const yuzu::shared::ClockSample now = yuzu::shared::sample_clocks();
-
             // Consecutive-sample forward-step guard (#4503). The startup pass
-            // has no prior sample and is accepted as-is.
+            // has no prior sample and is accepted as-is. The sample is taken
+            // UNDER clock_mu_ so that concurrent passes observe the guard in
+            // the order they sampled (an out-of-order sample could otherwise
+            // regress `last` and re-detect the same step). The lock covers
+            // two non-blocking clock reads and one pure function, nothing
+            // else.
+            yuzu::shared::ClockSample now{};
             bool skip = false;
-            if (std::string_view{trigger} != "startup") {
+            {
                 std::lock_guard<std::mutex> lock{clock_mu_};
-                skip = yuzu::shared::observe_and_should_skip(
-                    clock_guard_, now, yuzu::execution_artifacts::kScratchSweepClockStepToleranceSecs,
-                    yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
+                now = yuzu::shared::sample_clocks();
+                if (std::string_view{trigger} != "startup") {
+                    skip = yuzu::shared::observe_and_should_skip(
+                        clock_guard_, now,
+                        yuzu::execution_artifacts::kScratchSweepClockStepToleranceSecs,
+                        yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
+                }
             }
             if (skip) {
                 spdlog::warn("execution_artifacts: {} scratch sweep skipped: wall clock stepped "
-                             "forward relative to monotonic time; sweeping resumes within {} s of "
-                             "monotonic time",
+                             "forward relative to monotonic time (detected within the last {} s "
+                             "of monotonic time); sweeping resumes at the first pass after that "
+                             "window lapses",
                              trigger, yuzu::execution_artifacts::kScratchDirStaleAfterSecs);
                 return;
             }

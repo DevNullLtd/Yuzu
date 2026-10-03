@@ -677,7 +677,6 @@ TEST_CASE("sweep_stale_scratch_dirs: root entry cap defers visibly; rotation doe
             CHECK(r.deferred >= 1);
             total_removed += r.removed;
         }
-        CHECK(total_removed <= 2);
         CHECK(total_removed == 0);
         CHECK(fs::exists(root.path / ordered_scratch_name(3)));
         CHECK(fs::exists(root.path / ordered_scratch_name(4)));
@@ -761,7 +760,14 @@ TEST_CASE("sweep_stale_scratch_dirs: persistent failures sorting first cannot st
         INFO("pass " << pass);
         const ScratchSweepResult r = sweep_stale_scratch_dirs(
             root.path.wstring(), kSweepNow, kScratchDirStaleAfterSecs, lim, pass);
-        CHECK(r.removed <= lim.max_removals);
+        // Self-check of the name-order enumeration this test relies on: the five
+        // failing entries sort first, so pass 0 hits the failure cap before the
+        // orphan. If a volume enumerated differently the orphan would go on
+        // pass 0 and this test would be vacuous; fail loudly instead.
+        if (pass == 0) {
+            CHECK(r.removed == 0);
+            CHECK(fs::exists(orphan));
+        }
     }
     CHECK_FALSE(fs::exists(orphan));
 }

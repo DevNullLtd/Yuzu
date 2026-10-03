@@ -36,63 +36,75 @@
  *     clock reading) are NOT adopted: there is nothing to probe for and no
  *     prior reading worth persisting when the content being aged out is
  *     disposable scratch space, not a record whose true age matters.
- *   - Part 3 (SANITISE the reading) IS adopted IN-PROCESS (#4503), in the
- *     one shape that needs no persistence: agents/shared/wall_clock_step.hpp
- *     compares CONSECUTIVE (wall, monotonic) samples taken at each
- *     non-startup pass. A forward wall-clock step larger than
- *     kScratchSweepClockStepToleranceSecs between two samples quarantines
- *     sweeping for kScratchDirStaleAfterSecs of MONOTONIC time (the pass is
- *     skipped and logged at warn). After
- *     that, every directory created before the step has a real age beyond
- *     the stale threshold, so cleanup resumes with no restart. Consecutive
- *     comparison (not startup-relative) is deliberate: a backward step that
- *     is later restored shows up as a forward step at a sampled restoration,
- *     and a permanent forward correction is recovered from once the quarantine
- *     lapses. Backward steps alone are not acted on -- they only make
- *     entries look fresher. LIMIT: only the two sampled endpoints are
- *     compared, so a backward excursion of more than an hour that begins and
- *     ends between two passes, and cumulative sub-tolerance drift, are not
- *     detected; a directory created during such an excursion could read stale
- *     in the create-to-open window (the protective handle is not held from
+ *   - Part 3 (SANITISE the reading) is only PARTIALLY adopted, IN-PROCESS
+ *     (#4503): forward-step detection and nothing more. There is no stored
+ *     reading to sanitise and no ahead-of-now/negative clause (a future-dated
+ *     candidate mtime still reads fresh in `is_stale`). In the one shape that
+ *     needs no persistence, agents/shared/wall_clock_step.hpp compares each
+ *     non-startup pass's (wall, monotonic) sample with the previous sample
+ *     (the init() seed, for the first such pass). A forward wall-clock step
+ *     larger than kScratchSweepClockStepToleranceSecs between two samples
+ *     quarantines sweeping for kScratchDirStaleAfterSecs of MONOTONIC time
+ *     (the pass is skipped and logged at warn). After that, every directory
+ *     created before the step has a real age beyond the stale threshold, so
+ *     cleanup resumes with no restart. Consecutive comparison (not
+ *     startup-relative) is deliberate: a backward step that is later restored
+ *     shows up as a forward step at a sampled restoration, and a permanent
+ *     forward correction is recovered from once the quarantine lapses.
+ *     Backward steps alone are not acted on -- they only make entries look
+ *     fresher. LIMIT: only the two sampled endpoints are compared, so a
+ *     backward excursion of more than an hour that begins and ends between
+ *     two passes, and cumulative sub-tolerance drift, are not detected; a
+ *     directory created during such an excursion could read stale in the
+ *     create-to-open window (the protective handle is not held from
  *     creation), which fails closed: the creating dispatch fails, a
- *     re-dispatch succeeds, and the content is a regenerable hive copy. The
- *     STARTUP pass has no prior sample and is accepted as-is: its only
- *     concurrent writer is a plugin-capture process, and the regenerable-copy
- *     argument above bounds the cost of a wrong reading (recorded; same
- *     register row in the doc).
+ *     re-dispatch succeeds, and the content is a regenerable hive copy.
  *   - Part 4 (SUPPRESS only a repeat of the SAME anomaly) is NOT adopted
- *     separately: the quarantine window above is the suppression, keyed on
- *     monotonic time rather than a persisted fact-set.
+ *     separately: the quarantine window above stands in for it as a
+ *     fail-safe time latch (it skips, never deletes), keyed on monotonic
+ *     time rather than a persisted fact-set.
  *   - Part 5 (cap every accepted pass UNCONDITIONALLY) IS adopted, via the
  *     five cap constants below, kScratchSweepMaxRootEntries through
  *     kScratchSweepMaxDirEntries (carried per pass in SweepLimits;
  *     kScratchSweepClockStepToleranceSecs shares the prefix but is part 3's
- *     tolerance, not a cap) -- a pass never opens more than max_root_entries root
- *     entries, never removes more than max_removals candidates, never fails
- *     more than max_failures candidates (a directory entry with no mtime is
- *     counted as a failure but bypasses that check; bounded by the root-entry
- *     cap and the wall deadline; pre-existing shape), never starts a new
- *     candidate once max_wall_ms has elapsed (checked before each root entry
- *     and before each candidate -- not preemptive mid-candidate, since one
- *     candidate's own bounded file-unlink loop is never interrupted once
- *     started), and never trusts
+ *     tolerance, not a cap) -- a pass never opens more than max_root_entries
+ *     root entries, never removes more than max_removals candidates, never
+ *     fails more than max_failures candidates (a directory entry with no
+ *     mtime is counted as a failure but bypasses that check; only the
+ *     root-entry cap bounds it, as it precedes the deadline check;
+ *     pre-existing shape), never starts a new candidate once max_wall_ms has
+ *     elapsed (checked before each root entry and before each candidate --
+ *     not preemptive mid-candidate, since one candidate's own bounded
+ *     file-unlink loop is never interrupted once started), and never trusts
  *     more than max_dir_entries entries inside one candidate.
  *   - Rotation (#4504): each pass starts its walk at index
- *     pass_counter % n and wraps, so a persistently failing run of early
- *     entries cannot starve later ones across passes. STATED LIMIT: rotation
- *     guarantees eventual coverage of every entry WITHIN the first
- *     max_root_entries the root enumeration returns; a data_dir holding more
- *     entries than that reports `deferred` on every pass and entries beyond
- *     the cap are not reached by rotation. A resumable root enumeration
- *     (a confined_fs_walk.hpp change) is the named upgrade path.
- *   - Part 6 (decide deliberately what a missing anchor means) is NOT
- *     adopted: there is no persisted anchor here to be missing.
+ *     pass_counter % n and wraps, which REDUCES -- it does not eliminate --
+ *     the chance that a persistently failing run of early entries delays a
+ *     removable orphan. STATED LIMITS: the pass counter is process-local (it
+ *     restarts at 0 with the agent), advances by one per executed pass
+ *     whatever made it stop (a failure-cap or deadline stop shifts the window
+ *     by one entry only; a pass skipped by the clock guard does not advance
+ *     it), and n counts ALL root entries, a number that changes as
+ *     entries are removed, so no "reached within n passes" bound holds.
+ *     Coverage is also limited to the first max_root_entries the root
+ *     enumeration returns; a data_dir holding more entries than that reports
+ *     `deferred` on every pass and entries beyond the cap are not reached by
+ *     rotation. A resumable root enumeration (a confined_fs_walk.hpp change)
+ *     is the named upgrade path for the cap.
+ *   - Part 6 (decide deliberately what a missing anchor means) is decided
+ *     for the one case that has no anchor, the STARTUP pass (no prior sample;
+ *     accepted as-is, see part 3). Nothing is persisted, so a restart is
+ *     always that case. The decision: "no in-process dispatch can exist yet
+ *     at init(), so this process has no concurrent writer; a second agent
+ *     process sharing agent.data_dir (a service restart or OTA overlap) is
+ *     not excluded, and the cost of a wrong reading there is bounded -- the
+ *     creating dispatch fails closed as `dest_dir_open_<n>`, and the content
+ *     is a regenerable hive copy" (same register row in the doc).
  *   - Part 7 (elapsed-time thresholds are ABSOLUTE, never relative to a
  *     shrinking remainder) HOLDS: `is_stale` below compares `now - mtime`
  *     against one fixed threshold, exactly as part 7 requires.
  * This partial adoption -- and the reasoning above -- is also recorded in
- * docs/clock-guarded-retention.md's own per-store adoption register (a
- * separate integrator task; not this package).
+ * docs/clock-guarded-retention.md's own per-store adoption register.
  *
  * ── The one-hour floor is NOT a data-safety guard ────────────────────────
  * A live scratch directory's safety comes from the OS, not from age: while

@@ -10,9 +10,10 @@
  * restoration looks like a plain return to the startup baseline) and never
  * recovers from a permanent forward correction. Comparing consecutive samples
  * sees a restoration that lands on a sampled endpoint as a forward step, and
- * a detected step quarantines the caller for `quarantine_s` of MONOTONIC time -- long enough
- * that every object created before the step has a real age beyond the
- * caller's staleness threshold, so work resumes by itself without a restart.
+ * a detected step quarantines the caller for `quarantine_s` of MONOTONIC
+ * time -- long enough that every object created before the step has a real
+ * age beyond the caller's staleness threshold, so work resumes by itself
+ * without a restart.
  *
  * LIMIT: only the two sampled endpoints are compared. A backward excursion
  * (larger than the tolerance) that begins and ends between two samples, and

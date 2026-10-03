@@ -248,7 +248,7 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
             }
 
             // Removed and failed are capped SEPARATELY (see
-            // SweepLimits::max_failures' doc comment): a run of persistent
+            // kScratchSweepMaxFailures' doc comment): a run of persistent
             // failures earlier in enumeration order must not be able to
             // starve a later, genuinely-removable orphan out of this same
             // pass by exhausting a shared budget.
