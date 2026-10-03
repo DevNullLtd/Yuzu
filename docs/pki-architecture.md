@@ -394,11 +394,19 @@ source:
 > the UAT/demo/sanitizer rigs (which pass `--no-tls` deliberately), a hand-rolled
 > compose, or one that relied on the still-inert `YUZU_GW_TLS_*` env vars (#1291)
 > instead of a mounted `sys.config` — has an unprotected `:50051`.** For any such
-> gateway exposed to an untrusted network, MUST still do one of: (a) terminate TLS
-> in front of the gateway (reverse proxy on :50051, forwarding plaintext only over
-> loopback/a trusted segment); or (b) keep the agent port on a trusted network
-> (VPN / private subnet / service mesh). The QUIC transport (#376) is the
-> longer-term native path.
+> gateway exposed to an untrusted network, MUST still do one of: (a) front the
+> gateway at L4 or with TLS passthrough only (one TCP connection per agent end to
+> end, with the gateway's own agent-listener TLS enabled; an HTTP/2-terminating
+> reverse proxy, including a service-mesh sidecar that terminates HTTP/2, is not
+> supported for heartbeat admission, see
+> [Heartbeat admission](user-manual/gateway.md#heartbeat-admission)); or (b) keep
+> the agent port on a trusted network (VPN / private subnet / service mesh).
+> Observed in a test with two agents: behind an HTTP/2-terminating proxy (nginx
+> `grpc_pass`) every heartbeat was rejected as a connection mismatch (counted, never
+> forwarded) while the agents still enrolled and received commands; behind an L4 TCP
+> forwarder (nginx `stream`) there were no rejections. The agent sees the same
+> `unknown session` for every rejection reason, so diagnose from the gateway
+> counters and summary log. The QUIC transport (#376) is the longer-term native path.
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +

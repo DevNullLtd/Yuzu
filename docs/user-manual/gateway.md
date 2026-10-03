@@ -181,31 +181,102 @@ again. There is no wire, agent or server change.
 directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
 agent end to end (a plain TCP load balancer, an L4 virtual IP, a TLS-passthrough
 proxy). An HTTP/2-terminating or HTTP/2-multiplexing proxy between agents and the
-gateway is **not supported** for this check: it can spread one agent's calls over
-several connections, which shows up as `connection_mismatch` rejections and
-repeated re-registration, and it removes the per-agent separation the check relies
-on. See [Security Hardening](security-hardening.md#gateway-tls-if-you-deploy-the-erlang-gateway).
+gateway (including a service-mesh sidecar that terminates HTTP/2) is **not
+supported** for this check: it can spread one agent's calls over several
+connections, which shows up as connection mismatches (the `connection_mismatch=`
+count in the gateway summary log line; the counter is
+`yuzu_gw_heartbeat_session_mismatch_total`) and repeated re-registration, and it
+removes the per-agent separation the check relies on. See
+[Security Hardening](security-hardening.md#gateway-tls-if-you-deploy-the-erlang-gateway).
+
+*Observed in testing* (a real C++ agent, a plaintext gateway listener, two agents per
+run):
+
+- Behind an HTTP/2-terminating proxy (nginx `grpc_pass`), every heartbeat was
+  rejected as a connection mismatch: the mismatch counter rose and nothing reached
+  the server. The agents still enrolled and still received commands over their
+  `Subscribe` streams, and they re-registered on their back-off ladder (2 s doubling
+  to a 300 s cap). The server's online count for the two agents flickered between 2,
+  1 and 0. The topology therefore fails loudly in the counters and the gateway
+  summary log, not silently.
+- Behind an L4 TCP forwarder (nginx `stream`), there were zero rejections.
+- A multiplexing HTTP/2 proxy with upstream keepalive was **not tested**.
+
+The agent-facing message is the same `unknown session` for every reason (this is
+deliberate, see above), so the agent log cannot tell the reasons apart. Diagnose from
+the counters and the gateway summary log line, not from the agent log.
+
+**Connection drain.** The gateway's HTTP/2 server closes a connection as soon as it
+sends `GOAWAY`, so a `Subscribe` stream and its binding end with the connection;
+there is no drain period. A heartbeat that reaches the gateway on a different
+connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
+connection mismatch), and the agent recovers by re-registering. This is what the
+gateway's own tests observed with a test HTTP/2 client; the behaviour of the real C++
+agent across a `GOAWAY` has not been tested.
 
 **Observability.** Rejections are counted by two families (see
 [Available Metrics](#available-metrics)): `yuzu_gw_heartbeat_rejected_total{reason}`
 for a heartbeat with no usable binding, and
 `yuzu_gw_heartbeat_session_mismatch_total{event="security"}` for a held session whose
 heartbeat arrived on a different connection. Every series is created at 0 at gateway
-start. There is no per-heartbeat log line. Rejections are folded into one summary
+start, and the counters reset when the gateway restarts (use `increase()` in
+queries). There is no per-heartbeat log line. Rejections are folded into one summary
 line at `info` level, written for the first rejection and then at most once per
 `telemetry_gauge_interval_ms` (10 s by default), for example
 `Heartbeat admission rejected heartbeats since the last summary: unknown_session=3, connection_mismatch=1`.
-It carries reason names and counts only, never a session id. At startup the gateway
-logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
+It carries reason names and counts only, never a session id. The line is written only
+when a rejection arrives, so counts that trail the last line wait for the next
+rejection and the line can lag the counters; the counters are authoritative. The rate
+limit is one state shared by all concurrent rejections (it is created at gateway
+start), so a burst of simultaneous first rejections produces one line. At startup the
+gateway logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
 rejected heartbeat has no resolved principal, so there is no audit row, only the
 counters and the summary line.
 
+**Reading the counters.**
+
+- `yuzu_gw_heartbeat_session_mismatch_total` that keeps rising for more than about
+  15 minutes points to a topology that breaks one connection per agent (an
+  HTTP/2-terminating proxy, or similar). A brief rise around agent reconnects is
+  churn.
+- `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
+  agent after a gateway registry restart or a node failover. Observed: after killing
+  the registry process with 4 agents attached the counter rose by 4, and all 4 agents
+  were admitted again within about 25 s.
+- `yuzu_gw_heartbeat_rejected_total{reason="registry_unavailable"}` stays at 0 on a
+  gateway that was restarted to deploy this change. A non-zero value means the session
+  index table was missing when a heartbeat arrived (new code loaded into a running
+  node, or the registry process was down); `/readyz` reports it (see Upgrading
+  below).
+
+Agents behind a topology that breaks the one-connection-per-agent assumption back off
+from 2 s up to 300 s between re-registrations, but this does not bound the load in
+every case. An admitted heartbeat resets the agent's back-off streak (observed), so a
+topology with only partial affinity, where an occasional heartbeat does land on the
+right connection, would be expected to keep retries frequent (inferred, not tested);
+and each retry is a registration through the gateway to the server. The back-off was
+observed with two agents only, and no storm test was run at fleet scale.
+
 **Upgrading.** Deploy this change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
-is not supported for this change: new code loaded into a running node has no index
-table, so every heartbeat on that node is rejected as `registry_unavailable` until
-the node is restarted. After a restart agents reconnect, register and subscribe
-again, and their sessions are bound to the new connections.
+is not supported for this change. New code loaded into a running node has no index
+table (a unit test exercises this by deleting the table inside the registry; a real
+hot code load was not run): the registry process survives and keeps its routing rows
+and process groups, logs one warning, and every heartbeat on that node is rejected as
+`registry_unavailable` until the node is restarted. `/readyz` reports the table as
+`sessions_index` and answers 503 `not_ready` while it is missing. The table is
+protected: only the registry process writes it. After a restart agents reconnect,
+register and subscribe again, and their sessions are bound to the new connections.
+
+**Tested configurations** (observed, with the rejection counters at 0): a real C++ agent over one-way TLS (it enrolled one-way, received a per-agent
+certificate and reconnected with mutual TLS; a second agent ran steady one-way TLS;
+the counters stayed at 0 through gateway, agent and server restarts; the listener
+advertises `h2` through NPN only and the agent connects without an ALPN error), a
+Windows agent (about 25 minutes, plaintext), the released agents v0.13.0 and
+v0.14.0-rc6 (plaintext), a 31-minute soak with 4 agents plus a run with 25 extra
+agents, and heartbeat intervals of 1 s, 2 s and 120 s. **Not tested:** a multi-node
+gateway, a listener that requires client certificates (the shipped listener does
+not), Windows service mode, a macOS agent, and fleet-scale storms.
 
 ### Subscribe Stream Proxy
 
@@ -384,11 +455,13 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 > exists for the agent listener (PKI PR5c)** — enable it (see below) and distribute
 > the CA to agents. **Until your deployment turns it on (the shipped composes are
 > still plaintext pending PR5b), a gateway exposed to an untrusted network MUST**
-> either (a) terminate TLS in front of the gateway (a reverse proxy doing TLS on
-> `:50051`, forwarding only over loopback / a trusted segment), or (b) keep
+> either (a) front the gateway at L4 or with TLS passthrough only (one TCP
+> connection per agent end to end, with the gateway's own agent-listener TLS
+> enabled; an HTTP/2-terminating reverse proxy, including a service-mesh sidecar
+> that terminates HTTP/2, is not supported for heartbeat admission, see
+> [Heartbeat admission](#heartbeat-admission)), or (b) keep
 > `:50051` on a trusted network (VPN / private subnet / service mesh). Direct
-> agent→server connections use TLS (PR2/PR3), with mutual TLS where client
-> certificates are provisioned — this gap is specific to the gateway edge.
+> agent→server connections use TLS; this gap is specific to the gateway edge.
 
 | Hop | State | Notes |
 |---|---|---|
@@ -471,8 +544,8 @@ yuzu-agent --server gateway:50051 --ca-cert /etc/yuzu/install-ca.pem \
 
 Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
 connects and enrolls; `openssl s_client -connect gateway:50051` presents the
-`default-gateway` leaf. Direct agent→server connections (no gateway) use TLS, with
-mutual TLS where client certificates are provisioned, and need none of this.
+`default-gateway` leaf. Direct agent→server connections (no gateway) use TLS and
+need none of this.
 
 ### Distribution Cookie (Required in Production)
 

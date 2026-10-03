@@ -130,8 +130,7 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) use TLS, with
-mutual TLS where client certificates are provisioned. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
