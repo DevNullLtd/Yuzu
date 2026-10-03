@@ -34,6 +34,8 @@ health_nf_test_() ->
          [
           {"readyz 503 when registry process is dead",
            fun() -> readyz_503_dead_process(Port) end},
+          {"readyz 503 when the registry's session index table is missing",
+           fun() -> readyz_503_missing_session_index(Port) end},
           {"readyz 503 when circuit breaker is open",
            fun() -> readyz_503_circuit_open(Port) end},
           {"concurrent health checks complete without error",
@@ -79,7 +81,7 @@ setup() ->
     MockPids = lists:filtermap(fun(Name) ->
         case whereis(Name) of
             undefined ->
-                Pid = spawn(fun() -> mock_loop() end),
+                Pid = spawn(mock_for(Name)),
                 register(Name, Pid),
                 {true, {Name, Pid, true}};
             Existing ->
@@ -152,6 +154,10 @@ cleanup({_Port, HealthPid, UpPid, MockPids}) ->
     catch meck:unload(telemetry),
     process_flag(trap_exit, false),
     ok.
+
+%% The registry stand-in also owns the session index table readiness checks.
+mock_for(yuzu_gw_registry) -> fun yuzu_gw_test_registry:mock_registry_loop/0;
+mock_for(_Name)            -> fun mock_loop/0.
 
 mock_loop() ->
     receive
@@ -232,9 +238,29 @@ readyz_503_dead_process(Port) ->
     ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
     ?assert(binary:match(Body, <<"\"registry\":false">>) =/= nomatch),
     %% Re-register a mock so cleanup and subsequent tests don't fail.
-    NewPid = spawn(fun() -> mock_loop() end),
+    NewPid = spawn(mock_for(yuzu_gw_registry)),
     register(yuzu_gw_registry, NewPid),
     process_flag(trap_exit, false).
+
+%% The registry process is alive but its session index table is missing (the
+%% state after new code is loaded into a running node): not ready, and the
+%% registry check itself still reports the process as alive.
+readyz_503_missing_session_index(Port) ->
+    Registry = whereis(yuzu_gw_registry),
+    ?assert(is_pid(Registry)),
+    ok = yuzu_gw_test_registry:mock_registry_drop_index(Registry),
+    try
+        {Status, Body} = http_get(Port, "/readyz"),
+        ?assertEqual(503, Status),
+        ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"registry\":true">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"sessions_index\":false">>) =/= nomatch)
+    after
+        ok = yuzu_gw_test_registry:mock_registry_restore_index(Registry)
+    end,
+    {Status2, Body2} = http_get(Port, "/readyz"),
+    ?assertEqual(200, Status2),
+    ?assert(binary:match(Body2, <<"\"sessions_index\":true">>) =/= nomatch).
 
 readyz_503_circuit_open(Port) ->
     %% Trip the circuit breaker to open state.
