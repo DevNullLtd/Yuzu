@@ -2018,7 +2018,7 @@ MI-1b verdict has been measured, not merely inferred.** Run on real MSVC hardwar
 `f7a000fc3`, the same commit PR-4 above merged at: all of MI-1, MI-1b(a), MI-1b(b), MI-3 pass,
 and agree with each other and with `dumpbin` import-table evidence (all four images — the exe,
 `yuzu_agent_core.dll`, `agent_actions.dll`, the test binary — resolve spdlog's registry-wide free
-functions from one shared `spdlogd.dll`). **Windows has ONE shared spdlog registry, the same
+functions from one shared `spdlogd.dll`). **Windows has ONE shared registry, the same
 shape as Linux, not the macOS two-registry shape.** Full evidence, exact commands, and WARN/report
 text verbatim: `docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md`. This closes
 the last open residual named above and in the PR-4 entry: both halves of this precondition (the
@@ -2029,7 +2029,7 @@ original design, not a defect of this measurement — see the fixture's own head
 future regression (a toolchain upgrade, a vcpkg spdlog baseline bump, or a `triplets/x64-windows.cmake`
 static-linkage override added for spdlog) would not fail CI on its own; see the evidence file's
 own "Scope and revisit triggers" section for what would need to change before this claim is
-re-verified.
+re-verified, and issue #5286 for giving the fixture its own enforcement.
 
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on

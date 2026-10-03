@@ -199,9 +199,9 @@ show up in a Job Summary nobody is obliged to read. See "Scope and revisit trigg
 
 ## Scope and revisit triggers
 
-- **Measured on**: weecolin (a personal dev/test rig, Tailscale-reachable, distinct from the CI
-  pool `yuzu-weetam-windows`/"Wee Tam" that the new CI step (`ci.yml`) surfaces this verdict on
-  every run of). The first post-merge Wee Tam run reproduces this verdict on Wee Tam's own image;
+- **Measured on**: weecolin (a personal dev/test rig, Tailscale-reachable), distinct from the CI
+  pool `yuzu-weetam-windows`/"Wee Tam", on which the new CI step (`ci.yml`) surfaces this verdict
+  every run. The first post-merge Wee Tam run reproduces this verdict on Wee Tam's own image;
   until then, "confirmed" rests on weecolin's toolchain matching Wee Tam's.
 - **Build type**: debug only (`spdlogd.dll` naming). The underlying mechanism — dynamic linkage via
   `triplets/x64-windows.cmake`'s default (spdlog excluded from the static-override list) — is
@@ -215,8 +215,9 @@ show up in a Job Summary nobody is obliged to read. See "Scope and revisit trigg
   major version with a different default linkage posture.
 - **Detection signal today**: none automated — the fixture's `WARN`-only design (by original intent,
   not introduced by this run) means a flip would show up only in the Windows CI job's summary.
-  Giving the fixture a platform-conditional `REQUIRE`/`CHECK` on this specific claim is tracked
-  separately rather than folded into this evidence file.
+  Giving the fixture a platform-conditional `REQUIRE`/`CHECK` on this specific claim is tracked as
+  issue #5286 rather than folded into this evidence file — a test-behavior change needs its own
+  review cycle, not a doc fix's.
 
 ## Problems encountered
 
