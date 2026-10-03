@@ -770,10 +770,18 @@ jobs:
       # build runs fine on 26.04 (same libcrypto.so.3 soname). Do NOT change to
       # ubuntu26 until setup-beam ships a 26.04 build — it would fail to resolve
       # the asset. Verified by gateway eunit on the Big Tam leg.
+      # RUNNER_TOOL_CACHE is re-pointed for this step only, as on the macOS leg
+      # (see its step for the full reasoning, #4852): a trusted-fork run must not
+      # write a persistent erl into a cache later normal jobs on this agent
+      # execute (the "Do not read or write runner.tool_cache" rule above), so it
+      # gets a per-run temp dir; normal runs keep a per-agent subdir of the tool
+      # cache (Big Tam's tool cache is already per agent, so that costs one cold
+      # install per agent and no new sharing).
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
           ImageOS: ubuntu24
+          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
         with:
           otp-version: '28'
           rebar3-version: '3.24'
