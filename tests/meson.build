@@ -854,7 +854,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
                           include_directories('../agents/plugins/update_source_trust/src'),
                           include_directories('../agents/shared')],
     cpp_args: test_partial_init_args,
-    dependencies: [yuzu_sdk_dep, catch2_dep],
+    dependencies: [yuzu_sdk_dep, nlohmann_dep, catch2_dep],
   )
   test(
     'plugin ABI containment under allocation failure',

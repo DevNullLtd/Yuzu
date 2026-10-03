@@ -26,7 +26,7 @@
  *
  * NOT PINNED, DELIBERATELY. Which of status/rc survives (whether the bare
  * prefix fits set_result_status's std::string copy depends on the standard
- * library's SSO threshold: it fits libstdc++/libc++, not MSVC), and the
+ * library's SSO threshold: it fits libc++ (22-char SSO) but not libstdc++ (15) or MSVC (15)), and the
  * `unsupported`/`unavailable` row, which is expected to be LOST under sustained
  * failure: its 30+ byte row cannot be built. The typed status or rc 1 is the
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
