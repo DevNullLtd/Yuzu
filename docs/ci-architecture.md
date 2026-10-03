@@ -168,11 +168,15 @@ Runs in `release.yml`'s `release` job after the artifacts are downloaded and
 flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
-the `release` job needs `docker-publish` and `docker-publish-postgres`, which
-push `:X.Y.Z` (and, on a stable tag, `:X.Y` and `:latest`) first, the chisel
-images publish independently (the agent-bundle image needs `release`, so it is
-not published), and the build jobs' provenance attestations are already
-recorded. On a stable tag `:latest` therefore points
+the `release` job needs `docker-publish`, `docker-publish-postgres` and
+`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) first (the agent-bundle image needs `release`, so it is not
+published), and the build jobs' provenance attestations are already recorded.
+`docker-publish-chisel` joined the release's needs in #5242, so the release
+waits for the chisel builds (minutes with a warm cache, much longer cold) and
+the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
+before that they were attached only when those jobs finished first, and rc2,
+rc4 and rc6 shipped without some of them. On a stable tag `:latest` therefore points
 at a release that does not exist until the release is fixed. It fails the
 release when:
 
@@ -187,14 +191,14 @@ release when:
   build of another version.
 
 Recovery: find the offending file in the error. For a stale file, clear the
-runner workspace and re-run **all** jobs of the release run ("Re-run failed
-jobs" re-downloads the same build artifacts and fails the same way). A full
-re-run rebuilds everything, so expired build artifacts do not matter; after
-GitHub's re-run window, `gh workflow run release.yml --ref vX.Y.Z` starts a
-fresh run of the same tag instead. For a builder naming defect, a re-run
-builds the tag's original commit again, so fix the builder, then delete and
-re-push the tag at the fixed commit. Either way the images are rebuilt and
-re-pushed under the same tags.
+runner workspace and start a fresh run of the same tag with
+`gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
+Recovery steps (no release exists for the tag, no other run for it is queued
+or running). Never use "Re-run failed jobs" on a release run: an older run can
+be superseded by a newer one and push images over a published release (#5242).
+For a builder naming defect, a fresh run builds the tag's original commit
+again, so fix the builder, then delete and re-push the tag at the fixed commit.
+Either way the images are rebuilt and re-pushed under the same tags.
 
 If the release cannot be fixed promptly on a stable tag, move `:latest` back
 to the previous release's images. The gate has no override; the naming forms
@@ -1733,15 +1737,14 @@ databases (thresholds and semantics: "Test-database lifecycle" above).
 ## Chiselled demo images + agent bundle (release-time)
 
 `docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
-`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
-— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
-compile can hold that single runner slot up to its 360-min timeout, so the
-job carries a `cancel-in-progress: true` concurrency group (a re-tagged
-release supersedes a stale build instead of queueing behind it). It is
-**not** in the `release` job's `needs:`, so a slow/failed demo-image build
-never blocks the actual release. The sustainable fix for the QEMU cost is a
-native arm64 runner — the open decision tracked in `docs/demo-environment.md`
-("Publishing").
+`*.chisel` images for linux/amd64 on the self-hosted Linux runner (the
+QEMU-emulated arm64 leg was dropped; re-adding arm64 is the open decision in
+`docs/demo-environment.md`, "Publishing"). It carries a
+`cancel-in-progress: true` concurrency group, so a re-tagged release supersedes
+a stale build instead of queueing behind it, and a 120-min timeout. Since
+#5242 it **is** in the `release` job's `needs:`: the release waits for it
+(1–16 min on rc1–rc6) so the chisel SBOMs are always in `SHA256SUMS`, and a
+failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own signed agent archives) on a GitHub-hosted runner — no

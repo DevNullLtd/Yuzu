@@ -2615,6 +2615,16 @@ test('qa-stack gateway crash signatures',
   timeout: 30,
 )
 
+# Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
+# against a synthetic complete artifacts directory, then with each expected
+# SBOM removed, which must fail. Needs a POSIX bash; skips on Windows.
+test('release artifact gate',
+  _python3_test,
+  args: [files('test_check_release_artifacts.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -2627,6 +2637,14 @@ test('agent installer trust-anchor ACL lint',
 )
 
 # ── Repo hygiene tests ─────────────────────────────────────────────────────
+# Changelog promote --append (#5221): folds post-promotion hotfix fragments
+# into an already-promoted release section. Stdlib only.
+test('changelog promote append',
+  _python3_test,
+  args: [files('test_assemble_changelog_append.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('changelog order',
   _python3_test,
   args: [files('test_changelog_order.py')],
