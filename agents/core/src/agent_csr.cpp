@@ -143,16 +143,6 @@ bool write_atomic(const fs::path& dest, const std::string& contents, bool owner_
     return true;
 }
 
-// PUBLIC artifact (leaf / chain): default perms (umask) are fine - not secrets.
-bool write_public_file(const fs::path& dest, const std::string& contents) {
-    return write_atomic(dest, contents, false);
-}
-
-// PRIVATE key: 0600 from creation, re-asserted on the open fd (no umask window).
-bool write_private_key(const fs::path& dest, const std::string& contents) {
-    return write_atomic(dest, contents, true);
-}
-
 } // namespace
 
 std::optional<KeyAndCsr> generate_key_and_csr(const std::string& agent_id) {
@@ -240,11 +230,13 @@ bool persist_provisioned_cert(const fs::path& cert_dir, const std::string& key_p
     const auto paths = provisioned_cert_paths(cert_dir);
     // Key first (the secret), then the public artifacts. A crash between writes
     // leaves the leaf missing → inspect() reports Missing → clean re-enroll.
-    if (!write_private_key(paths.key_path, key_pem))
+    // PRIVATE key: 0600 from creation, re-asserted on the open fd (no umask window).
+    if (!write_atomic(paths.key_path, key_pem, /*owner_only=*/true))
         return false;
-    if (!write_public_file(paths.cert_path, leaf_pem))
+    // PUBLIC artifacts (leaf / chain): default perms (umask) are fine - not secrets.
+    if (!write_atomic(paths.cert_path, leaf_pem, /*owner_only=*/false))
         return false;
-    if (!ca_chain_pem.empty() && !write_public_file(paths.ca_path, ca_chain_pem))
+    if (!ca_chain_pem.empty() && !write_atomic(paths.ca_path, ca_chain_pem, /*owner_only=*/false))
         return false;
     spdlog::info("agent_csr: provisioned per-agent client certificate under {}", cert_dir.string());
     return true;
