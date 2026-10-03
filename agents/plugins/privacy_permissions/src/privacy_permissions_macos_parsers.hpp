@@ -33,6 +33,12 @@
 
 namespace yuzu::privacy_permissions::macos {
 
+// OutputBudget and its marker token moved to privacy_permissions_parsers.hpp (both legs charge one
+// run-wide budget); these keep the existing macos:: spellings in the macOS internals test valid.
+using privacy_permissions::kBudgetExceededToken;
+using privacy_permissions::kMaxRunOutputBytes;
+using privacy_permissions::OutputBudget;
+
 struct TccService {
     std::string_view service; // literal TCC service identifier
     std::string_view category;
@@ -193,22 +199,6 @@ inline constexpr std::string_view kCutValueOversized = "value_oversized";
 inline constexpr std::string_view kCutByteCap = "byte_cap";
 
 inline constexpr std::array<std::string_view, 3> kSidecarSuffixes{"-journal", "-wal", "-shm"};
-
-inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
-inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
-
-/// Run-wide bound on the bytes the sources put on the wire: each row is charged at its formatted
-/// length (every field, escaping and separator). Checked between sources, so the one source that
-/// crosses it (itself bounded) is kept and no further one is read.
-struct OutputBudget {
-    std::size_t max_bytes = kMaxRunOutputBytes;
-    std::size_t bytes = 0;
-
-    [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
-    void charge(std::span<const PermissionRow> rows) { // allocates (format_row): not noexcept
-        for (const auto& r : rows) bytes += format_row(r).size() + 1; // +1: the row separator
-    }
-};
 
 /// sqlite's URI for `path`: immutable=1 takes no lock and touches no sidecar; `%`, `?` and `#` are
 /// the only characters a URI path reads specially.
