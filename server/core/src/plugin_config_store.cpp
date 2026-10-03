@@ -556,16 +556,13 @@ PluginConfigStore::kill_switch_decision(std::string_view plugin, std::string_vie
         return std::nullopt; // query failure — fail closed
 
     const int n = PQntuples(res.get());
-    std::vector<std::string> strs;
-    strs.reserve(static_cast<std::size_t>(n) * 2);
-    for (int i = 0; i < n; ++i) {
-        strs.push_back(col_str(res.get(), i, 0));
-        strs.push_back(col_str(res.get(), i, 1));
-    }
+    // The views point into `res`, which outlives them; resolve_kill_switch
+    // returns an owning set, so nothing escapes this scope.
     std::vector<plugin_config::KillSwitchRowView> views;
     views.reserve(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i)
-        views.push_back({strs[2 * i], strs[2 * i + 1], to_bool(col(res.get(), i, 2))});
+        views.push_back(
+            {col(res.get(), i, 0), col(res.get(), i, 1), to_bool(col(res.get(), i, 2))});
     return plugin_config::resolve_kill_switch(scope->action, views);
 }
 
