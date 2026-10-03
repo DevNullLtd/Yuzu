@@ -6,8 +6,11 @@
  *   A. yuzu::browser_policy::run_guarded
  *   B. yuzu::update_source_trust::execute_sources
  * Their catch arms must build a token, write a status row and set the typed
- * status without letting a second bad_alloc escape; the SDK export wrapper and
- * the agent dispatcher do not catch, so an escape unwinds across the plugin ABI.
+ * status without letting a second bad_alloc escape. The SDK export wrapper
+ * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
+ * escape unwinds across the plugin ABI; the live dispatch path keeps a blast-radius
+ * try/catch around execute (agent.cpp, the `Plugin {} action {} threw` site) that this
+ * test deliberately does not rely on.
  *
  * WHY A SEPARATE EXECUTABLE. It replaces the global operator new/delete
  * (process-wide; same precedent as test_spark_alloc_budget.cpp), so it is not a

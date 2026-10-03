@@ -74,7 +74,7 @@ spec:
     #   status|-|-|-|policies|-|constrained|<logical_path>|<token>
     #
     # A `status` row is written FIRST and only when the read was not complete (a
-    # read that could not be finished, a planned leg, a leg that threw); it
+    # read that could not be finished, a planned leg, a leg that threw -- a leg that throws AFTER reporting appends a second, unavailable row behind its rows, and the last one wins); it
     # repeats the typed result status in band. A CONSTRAINED read writes the
     # summary row first, then one per-path row per failure (at most 64;
     # `linux:status_rows_capped` on the summary when more were due). A complete read writes none, and a
@@ -84,7 +84,7 @@ spec:
       - name: row_kind
         type: string
         values: [policy, status]
-        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-", except source on a per-path status row (the logical path the reason token names).'
+        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete; the one exception is a leg that throws after it has reported, which appends a second, unavailable status row behind its rows -- the last status row is the outcome). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-", except source on a per-path status row (the logical path the reason token names).'
         example: policy
         platforms: [windows, linux, darwin]
       - name: browser
