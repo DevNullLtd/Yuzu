@@ -89,6 +89,8 @@ cases(State) ->
           fun() -> register_and_subscribe_keys_match(State) end},
          {"replacement: the old session stops admitting, the new one binds to its own connection",
           fun() -> replacement_fencing(State) end},
+         {"Register on one connection and Subscribe on another bind the session to the Subscribe connection",
+          fun() -> subscribe_connection_is_the_binding(State) end},
          {"ending the Subscribe stream removes the binding",
           fun() -> stream_end_removes_binding(State) end},
          {"closing the connection removes the binding",
@@ -184,6 +186,29 @@ replacement_fencing(#{chan_a := A, chan_b := B}) ->
     ?assertMatch({ok, _, _}, heartbeat(B, S2)),
     close_stream(Stream2),
     ok = await_unbound(S2).
+
+%% The session is bound to the connection carrying the Subscribe stream, not
+%% to the connection that performed the Register: heartbeats follow the
+%% stream. (Admitting the Subscribe itself from the pending Register record is
+%% unchanged.)
+subscribe_connection_is_the_binding(#{chan_a := A, chan_b := B}) ->
+    meck:reset(yuzu_gw_heartbeat_buffer),
+    S = register_session(A, agent_id(<<"split">>)),
+    {ok, KeyA} = yuzu_gw_registry:lookup_pending_session(S),
+    Stream = subscribe(B, S),
+    ok = await_bound(S),
+    {ok, #{conn_key := Bound}} = yuzu_gw_registry:lookup_session(S),
+    %% B's key, as a Register on B records it.
+    SB = register_session(B, agent_id(<<"split-b">>)),
+    {ok, KeyB} = yuzu_gw_registry:lookup_pending_session(SB),
+    true = ets:delete(yuzu_gw_pending, SB),
+    ?assertNotEqual(KeyA, KeyB),
+    ?assertEqual(KeyB, Bound),
+    ?assertMatch({ok, _, _}, heartbeat(B, S)),
+    ?assertMatch({error, {<<"5">>, <<"unknown session">>}, _}, heartbeat(A, S)),
+    ?assertEqual(1, queued()),
+    close_stream(Stream),
+    ok = await_unbound(S).
 
 stream_end_removes_binding(#{chan_a := A}) ->
     {S, Stream} = register_and_subscribe(A, agent_id(<<"stream-end">>)),
