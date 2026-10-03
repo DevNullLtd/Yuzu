@@ -79,3 +79,45 @@ YUZU_TEST_DB=/srv/ci/work-0/_tool/yuzu-test-runs/yuzu-bigtam-linux-0/test-runs.d
 YUZU_TEST_DB=/srv/ci/work-0/_tool/yuzu-test-runs/yuzu-bigtam-linux-0/test-runs.db \
   bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
 ```
+
+## Package pins and toolchain drift
+
+Big Tam is a self-hosted host whose CI depends on exact tool behaviour, and an
+unattended upgrade can change that behaviour without any repository change. On
+2026-10-03 an unattended update moved coreutils to uutils 0.10.0 and the kernel
+to 7.0.0-38, and every Linux job went red (#5298). The first-order trigger found
+was `/usr/bin/yes`, which uutils 0.10.0 writes in 1 MiB units where 0.8.0 wrote
+16 KiB; the tests that used it as a flood child have since stopped depending on
+it. Other drift of the same kind can recur with any tool a test or script execs.
+
+The pin below is applied by the operator on the host. The package names are
+placeholders: find the real ones first, for example with
+`dpkg -S "$(readlink -f /usr/bin/yes)"`, and repeat for each tool that matters.
+
+```bash
+sudo apt-mark hold <package> [<package> ...]
+apt-mark showhold                      # list current holds
+sudo apt-mark unhold <package>         # release one
+```
+
+Also keep the unattended-upgrades job from moving those packages, by listing
+them in `/etc/apt/apt.conf.d/50unattended-upgrades`:
+
+```
+Unattended-Upgrade::Package-Blacklist {
+    "<package>";
+};
+```
+
+The exact option name, file layout and package list are to be confirmed by the
+operator on the real box; none of this was run on Big Tam.
+
+A held package misses security updates, so holds are a debt, not a fix. Review
+every hold on a stated cadence (suggested: monthly): check what the held
+package's newer versions changed, re-test against them, and release the hold
+once CI is known to pass on the new version.
+
+Suggestion only (no workflow change is made here): have CI log the versions of
+the tools the suite depends on (coreutils flavour and version, kernel, compiler)
+at the start of each job, so that drift shows up in the job log instead of
+having to be inferred after a red run.
