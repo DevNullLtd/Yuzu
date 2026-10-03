@@ -46,13 +46,20 @@
  *     that, every directory created before the step has a real age beyond
  *     the stale threshold, so cleanup resumes with no restart. Consecutive
  *     comparison (not startup-relative) is deliberate: a backward step that
- *     is later restored shows up as a forward step at the restoration, and a
- *     permanent forward correction is recovered from once the quarantine
+ *     is later restored shows up as a forward step at a sampled restoration,
+ *     and a permanent forward correction is recovered from once the quarantine
  *     lapses. Backward steps alone are not acted on -- they only make
- *     entries look fresher. The STARTUP pass has no prior sample and is
- *     accepted as-is: its only concurrent writer is a plugin-capture
- *     process, and the regenerable-copy argument above bounds the cost of a
- *     wrong reading (recorded; same register row in the doc).
+ *     entries look fresher. LIMIT: only the two sampled endpoints are
+ *     compared, so a backward excursion of more than an hour that begins and
+ *     ends between two passes, and cumulative sub-tolerance drift, are not
+ *     detected; a directory created during such an excursion could read stale
+ *     in the create-to-open window (the protective handle is not held from
+ *     creation), which fails closed: the creating dispatch fails, a
+ *     re-dispatch succeeds, and the content is a regenerable hive copy. The
+ *     STARTUP pass has no prior sample and is accepted as-is: its only
+ *     concurrent writer is a plugin-capture process, and the regenerable-copy
+ *     argument above bounds the cost of a wrong reading (recorded; same
+ *     register row in the doc).
  *   - Part 4 (SUPPRESS only a repeat of the SAME anomaly) is NOT adopted
  *     separately: the quarantine window above is the suppression, keyed on
  *     monotonic time rather than a persisted fact-set.
@@ -62,10 +69,13 @@
  *     kScratchSweepClockStepToleranceSecs shares the prefix but is part 3's
  *     tolerance, not a cap) -- a pass never opens more than max_root_entries root
  *     entries, never removes more than max_removals candidates, never fails
- *     more than max_failures, never starts a new candidate once max_wall_ms
- *     has elapsed (checked before each root entry and before each candidate
- *     -- not preemptive mid-candidate, since one candidate's own bounded
- *     file-unlink loop is never interrupted once started), and never trusts
+ *     more than max_failures candidates (a directory entry with no mtime is
+ *     counted as a failure but bypasses that check; bounded by the root-entry
+ *     cap and the wall deadline; pre-existing shape), never starts a new
+ *     candidate once max_wall_ms has elapsed (checked before each root entry
+ *     and before each candidate -- not preemptive mid-candidate, since one
+ *     candidate's own bounded file-unlink loop is never interrupted once
+ *     started), and never trusts
  *     more than max_dir_entries entries inside one candidate.
  *   - Rotation (#4504): each pass starts its walk at index
  *     pass_counter % n and wraps, so a persistently failing run of early
