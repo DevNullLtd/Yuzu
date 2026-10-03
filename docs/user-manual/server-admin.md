@@ -451,7 +451,7 @@ The agent writes `Guardian T_wire event_id=… domain=… sent=… wire_wall_ns=
 - **Today, on the legacy path:** up to one server line and one agent line per Guardian event, so it tracks your Guardian event volume. The agent debounces drift events per rule (default 1000 ms, the rule parameter `event_debounce_ms`), which collapses rapid drifts; a rule configured with `event_debounce_ms` of `0` emits every drift, and a return to compliant is never debounced, so a rule that flaps can still log at its flap rate.
 - **Once the Spark path is live:** up to two agent lines per event (`T_detect` and `T_wire`) plus the server line. Lifecycle events, replayed events and health events raised by a subscription fault or its recovery log `T_wire` with no `T_detect` (health entries raised by an evaluation pass do get one), a retried send logs `T_wire` again, lifecycle journal replays re-send on every reconnect (with no info-level server line), a rule stuck in an unknown or error state re-emits on the errored-refresh cadence (default 5 minutes, and in practice no faster than the rule type's convergence sweep), and each evaluation pass rejected by a full outbox logs another `accepted=0` `T_detect` line with no rate limit of its own.
 - **Where the lines go:** wherever a log file is in use (`--log-file` on the server or the agent; a Windows service agent defaults to `yuzu-agent.log` under its data directory) the file sink rotates at 50 MB and keeps the active file plus up to 5 rotated files by default (up to about 300 MB per sink; `--log-max-size` in bytes, `--log-max-files`), so an event storm shortens how far back your logs reach. Without a log file the lines go to the console and Yuzu applies no rotation: retention and any rate limiting belong to your service manager or container runtime (a journald rate limit can drop lines, including unrelated warnings).
-- **They are written synchronously on the server; the agent side is now asynchronous (#4666 PR-2).** On the server, the thread that reads the agent's stream, or the `ForwardGuardianMessage` handler when the agent is behind a gateway, still writes `T_server` inline, and a blocked sink (an undrained pipe, a stalled network mount) still blocks that thread. On the agent, a guard worker (legacy path) or the Spark consumer, convergence and send threads call the same bare `spdlog::` functions as before, but main.cpp now installs the async hand-off logger (see "Agent logging is now asynchronous" under *systemd Units*, further down this page) as the process's spdlog default logger, so every one of those calls, including the Spark runtime's own arm-committed/late-arm/sweep-residue lines, now enqueues and returns rather than blocking on sink I/O, on any platform where the agent image and `libyuzu_agent_core` share one spdlog registry (confirmed on Linux, inferred but not directly measured on Windows from its dynamic spdlog linkage; see "spdlog registry identity across images" in `docs/darwin-compat.md` for the measured macOS exception — two separate registries there). This is the mechanism, not a dedicated per-line change: the `docs/spark-flip-gate.md` section 7 precondition (synchronous benchmark and Spark-runtime log writes) is addressed by this global default-logger swap, not by threading a bounded-wait call through each individual `T_detect`/`T_wire`/arm-committed site.
+- **`T_server` is now asynchronous too, on its own dedicated logger (#4666 PR-4); the agent side has been asynchronous since PR-2.** The thread that reads the agent's stream, or the `ForwardGuardianMessage` handler when the agent is behind a gateway, resolves `T_server` through a small bounded async logger built solely for this one line (its own 1024-slot queue — a fixed ~408 KiB of RSS, paid once at boot whether or not anything is ever logged (about 1/8 the agent-side hand-off's 3.34 MB, sized for one diagnostic line) — and one worker thread, `overrun_oldest` eviction under sustained overload — the same eviction policy the agent-side hand-off uses, and just as on the agent, `overrun_oldest` drops are silent in this release, with no counter or alert to point at them yet), so that thread now enqueues and returns rather than blocking on sink I/O, mirroring the agent-side mechanism much more lightly (no teardown watchdog: the server's hard-exit machinery is signal-driven, not self-armed — the first `SIGTERM` takes the graceful stop path, so a sink that stalls at exactly the wrong moment leaves a wedged pool join bounded only by a *second* signal or the deployment's external stop deadline, 210 seconds in the shipped systemd/Compose configs — an accepted, not eliminated, exposure). This is a dedicated per-line change, unlike the agent side's global default-logger swap: the server's OTHER Guardian ingest lines on the same code path — the idempotent-redelivery debug line, the event-collision and store/ingest-error warnings, the oversized-`detail_json`/parse-failure warnings, and the observation-only blast-radius/alert-router warning pair (fires only for the ruleless observation event type) — are unaffected and remain on the ordinary synchronous default logger, so a blocked sink still blocks the ingest thread on any of THOSE lines. One consequence: because `T_server` now drains through its own queue and worker, a `T_server` line can now appear later in the log stream than an adjacent Conflict/redelivery/error line from a LATER event on the same code path, even though the events themselves were ingested in order — the existing "never trust log-file line order" guidance above (for `T_wire`/`T_detect`) applies to `T_server` relative to those sibling lines too. On the agent, a guard worker (legacy path) or the Spark consumer, convergence and send threads call the same bare `spdlog::` functions as before, but main.cpp now installs the async hand-off logger (see "Agent logging is now asynchronous" under *systemd Units*, further down this page) as the process's spdlog default logger, so every one of those calls, including the Spark runtime's own arm-committed/late-arm/sweep-residue lines, now enqueues and returns rather than blocking on sink I/O, on any platform where the agent image and `libyuzu_agent_core` share one spdlog registry (confirmed on Linux, inferred but not directly measured on Windows from its dynamic spdlog linkage; see "spdlog registry identity across images" in `docs/darwin-compat.md` for the measured macOS exception — two separate registries there). This is the mechanism, not a dedicated per-line change, for every OTHER agent-side line: the `docs/spark-flip-gate.md` section 7 precondition (synchronous benchmark and Spark-runtime log writes) is addressed by this global default-logger swap on the agent, plus the server's own dedicated `T_server` logger above, not by threading a bounded-wait call through each individual `T_detect`/`T_wire`/arm-committed site.
 
 **If log volume matters.** There is no dedicated switch for these lines. The only lever is the log level, and it is blunt: `warn` also suppresses every other `info` line, including on the server the authentication and session lines (for example `User '…' authenticated`, `Local session created`) and the API-token created/revoked lines, which a SIEM ingesting the server log would then lose, and the Guardian arm/commit messages on an agent. It also silences the agent's own "Received signal, shutting down..." line (an ordinary `info`-level call since #4666 PR-2): at `--log-level warn` or above that line is absent entirely on a clean `SIGINT`/`SIGTERM`/Ctrl-C stop, so if you rely on it to confirm an intentional stop, keep agents at `info` or below, or check the process exit code (0 = clean) instead. The audit log is a separate store and is not affected by the log level. Prefer applying it to agents only, and weigh it before applying it fleet-wide.
 
@@ -466,13 +466,15 @@ Retiring or gating these lines once the benchmark concludes is recorded in `docs
 New, non-breaking, purely additive. No operator action required.
 
 Before this change, a gateway that lost and regained its connection to the
-server (a core restart, replica failover, or an ordinary network blip) would
+server (a replica failover or an ordinary network blip) would
 replay its held agent registrations — and on EVERY such replay, the server
 wiped that agent's placement (`gateway_node`/capabilities) before deciding
 whether to reuse or refuse the session, silently making the agent
 unreachable via that gateway until it happened to reconnect on its own. This
 was reachable on a single, otherwise-healthy replica; no core restart was
 required.
+
+This section applies to circuit-recovery replays, not to a server-only restart while a gateway stays connected; for that case see the known limitation under [Server-Side Setup](gateway.md#server-side-setup).
 
 **What changes:** the server now decides adopt-vs-refuse for a replayed
 session before installing anything, the gateway re-announces the agent's own
@@ -2656,6 +2658,55 @@ A nonzero result means that host's `installed_count` will report a higher number
 **Impact.** Not a breaking change: no flag, wire format, API, or default behavior changes, and no operator action is required. Log output looks the same (same pattern/JSON formatting, same `--log-file`/rotation behavior) with one exception below. The externally-visible differences are: (1) under sustained log-sink overload, the agent can now silently drop older queued lines (`overrun_oldest`) rather than blocking, so a very bursty logger under a stuck sink may show gaps instead of a stall; (2) a shutdown wedge that used to hang or need `SIGKILL` before this and the related #2233 watchdogs landed can now self-exit with code 5 specifically, in addition to the pre-existing 1/3/4; (3) the "Received signal, shutting down..." line the agent prints on `SIGINT`/`SIGTERM`/Ctrl-C used to be a raw, fixed-format write straight to stderr — it is now routed through the same configured logger as everything else, so it picks up the configured pattern (or JSON structure under `--log-format json`) and now also lands in `--log-file` when one is configured, not stderr alone. A plain substring match against the message text (the default text pattern keeps the original words verbatim) is unaffected; a line-anchored or byte-exact matcher, or one that assumed this specific line was stderr-only, needs updating; (4) that same line is now an ordinary `info`-level call rather than an unconditional raw write, so at `--log-level warn` or above — a configuration this page itself recommends for agents to cut noise, see "If log volume matters" above — the line is silently **absent entirely**, whereas before it always printed regardless of level. If you rely on this line's presence to confirm a clean/intentional stop, either keep `--log-level` at `info` or below, or switch to checking the process exit code (0 = clean) instead.
 
 **Who should check.** Any operator running a supervisor script or monitoring rule that pattern-matches the agent's process exit code against a fixed set (`{0,1,3,4}` or similar) should widen it to include `5`. An unrecognised exit code there should not be interpreted as "impossible" or treated as a different failure class than the documented watchdog exits already are. See *Stopping a wedged agent* under *systemd Units*, further down this page, for what each code means and how they interact.
+
+### vNEXT — `device_ids` on result-set creation now requires `Infrastructure:Read` (#4983, breaking)
+
+**What changed.** `POST /api/v1/result-sets`, MCP `create_result_set`, and the dashboard CSV-paste
+import (`POST /fragments/result-sets/create`) previously accepted an arbitrary caller-supplied
+`device_ids` array with only a type check and a size cap — no RBAC check of any kind ran when
+`device_ids` was supplied, beyond the ordinary session-authenticated/owner-scoped gate every call
+to these routes already passed. All three now additionally gate a non-empty `device_ids` through
+the admit-then-filter `Infrastructure:Read` chokepoint (`fleet_read_fn`, ADR-0017) and validate
+that every entry both exists and is visible to the caller's own scope — a nonexistent or
+out-of-scope id now rejects the whole request (`400 RESULT_SET_UNKNOWN_DEVICE_ID` on REST, the
+JSON-RPC equivalent on MCP, an error toast on the dashboard fragment) instead of being silently
+accepted as a member. Each entry is also now capped at 256 bytes (`400
+RESULT_SET_DEVICE_ID_TOO_LONG` on REST, the JSON-RPC equivalent on MCP, an error toast on the
+dashboard fragment) — a separate, additional new rejection path on all three surfaces.
+
+**Who this affects.** Any RBAC-**enabled** deployment where a non-admin principal creates a
+result set by supplying `device_ids` directly. Checked against this repository's actual seed
+grants (`RbacStore::seed_defaults`), of the 7 seeded built-in roles only **Administrator** and
+**ITServiceOwner** hold `Infrastructure:Read` — **Viewer, Operator, PlatformEngineer,
+ApiTokenManager, and Reviewer do not**. A principal holding one of those five roles who could
+previously create a result set with `device_ids` (the RBAC-enabled default before this release
+carried no permission check on this field at all) will now receive a new `403` on all three
+surfaces. This is a genuine, confirmed regression path, not a hypothetical one. A caller who omits
+`device_ids`, or supplies an empty array, is completely unaffected on any surface — the gate is
+never consulted. **RBAC-disabled deployments (the shipped default) are entirely unaffected** — the
+legacy permission fallback admits every authenticated session regardless of this change.
+
+**Check your automation and your dashboard operators, not just your admins — this is the failure
+that hides.** Before upgrading an RBAC-enabled deployment, identify every non-admin principal
+(API token, service account, or interactive session) that currently calls `POST
+/api/v1/result-sets` / `create_result_set` / the dashboard's CSV-paste import ("New result set
+from a list of device ids") with a non-empty `device_ids`. This includes a dashboard operator
+pasting a CSV of ids just as much as an automation calling the API — both hit the identical new
+gate. Audit your `AuthDB`/API-token principal list and your dashboard-role assignments for holders
+of `Viewer`, `Operator`, `PlatformEngineer`, `ApiTokenManager`, or `Reviewer` who use this
+capability; each will start receiving `403` the moment this release is live, with no advance
+warning from the caller's own side.
+
+**What to do.** Of the 6 fleet-wide-assignable built-in roles, only `Administrator` holds
+`Infrastructure:Read` — `ITServiceOwner` (the 7th, management-group-scoped-only) also holds it. A
+principal who needs to keep creating result sets with `device_ids` after this release needs one of
+those two roles; per `rbac.md`'s own current state, there is **no REST API or Settings UI yet for
+creating a custom role or editing an existing role's permission set** (tracked as planned, not
+implemented) — the only way to grant `Infrastructure:Read` to a role that doesn't already hold it
+is a direct `RbacStore::set_permission()` call against the shared Postgres `rbac_store` schema (see
+`rbac.md`'s "Custom roles" section for the exact mechanism). There is no per-route opt-out; a
+caller that only ever creates result sets via `parent_id`/`source_payload` (no `device_ids`) is
+unaffected and needs no change.
 
 ## Settings Page
 

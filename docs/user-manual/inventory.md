@@ -136,8 +136,12 @@ cadences.
   account's home directory (`/Users/<account>/...` on macOS,
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
-  `--inventory-disable`. (The only `HKCU` read is the agent's
-  own service-account hive, which is benign: the agent runs outside any
+  `--inventory-disable`. The sync blob also has `install_location` and
+  `uninstall_string` slots, but they are reserved: the server ignores them and
+  stores neither, until ADR-0016 §8 is re-classified for them with the
+  agent-side change, #5186. No shipped agent fills them; a build that does gets a
+  full-resend request every cycle until the server accepts them. (The only `HKCU`
+  read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
   — a tracked deviation, #1442. The conclusion is unaffected; LocalSystem's
@@ -173,16 +177,72 @@ cadences.
 The data lands in the Postgres schema **`software_inventory_store`**:
 
 - `installed_software(agent_id, name, version, publisher, install_date, kind,
-  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version)`
-  — one row per installed package per device. Every column except `agent_id`
-  and `name` may be empty (`''`) per the honest-empty contract above; rows
+  ecosystem, epoch, release, arch, signature_status, distro_id, distro_version,
+  package_id, source, install_id)`
+  — one row per installed package per device. Every column except `agent_id`,
+  `name` and `install_id` may be empty (`''`) per the honest-empty contract above; rows
   synced by a pre-v2 agent carry `''` in all eight v2 columns until that
-  agent's next full resend.
+  agent's next full resend. Rows from agents that do not yet emit the extended
+  tail carry `''` in `package_id` and `source`; `install_id` (a row id, reassigned
+  on each full report) is always populated.
 - `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` — per
   device sync bookkeeping. `first_seen`/`last_seen` are **server receipt times**
   (epoch seconds, stamped when the report is ingested), **not** the agent-supplied
   `collected_at` — so the recency filters and freshness gauge below are immune to
   agent clock skew (#1685).
+
+**Upgrading.** The first server start after the release that added the extended
+columns (schema v7) rewrites `installed_software` once, under an exclusive lock,
+to add `install_id`, then rebuilds the name index. The time grows with the row
+count: about 10-20 s at 4M rows (roughly 13,000 machines, assuming about 300
+installed items each), measured on one development host with a single-node
+Postgres, and longer beyond that. The pool's 30 s per-statement limit is lifted
+for that migration only. Before upgrading, count the rows:
+
+```sql
+SELECT count(*) FROM software_inventory_store.installed_software;
+```
+
+and check free space: the rewrite needs room for a second copy of the table and
+the rebuilt index and writes about as much WAL; with a synchronous standby,
+expect the lock to be held until the standby confirms the commit.
+
+Start one server replica first and let the migration finish (`migrated to v7` in
+its log) before starting the rest: a second replica waits at most 10 s for the
+migration lock and then refuses to start. Avoid long-running
+`installed_software` readers during that first start. Above about 2 million rows
+(when the lock is held for more than 10 s), also stop every replica before
+starting that one: a replica still running the old version queues its
+`installed_software` reads and writes behind the lock, holding a pooled
+connection for up to 10 s each before erroring, and a custom `options` in the
+database connection string turns off the pool's timeouts, so they then wait for
+the whole migration. If you are unsure of the row count, stop every replica
+first.
+
+The migration is one transaction and logs nothing until `migrated to v7`; watch
+it in `pg_stat_activity`. If a supervisor or health check kills the server before
+it finishes, Postgres rolls the work back only once it notices the lost
+connection, which is when the running statement returns, so the backend can keep
+the lock for the rest of the rewrite. Find it in `pg_stat_activity` and
+`pg_terminate_backend` it before restarting, or the restart waits 10 s at the
+lock and refuses to start. Size start deadlines to the row count: the health
+check in `docker-compose.reference.yml` reports unhealthy after about two
+minutes, and under the shipped systemd unit a replica refused at the lock can
+reach `failed` within a minute and needs `systemctl reset-failed`.
+
+A start refused with `post-migration schema projection check failed` usually
+means a column the software queries need is missing although the recorded schema
+version is current, for example after restoring only the
+`software_inventory_store` schema from an older dump while `public.schema_meta`
+kept its newer version. The log ends with the PostgreSQL error, which names the
+first missing column; a connection, permission or lock-timeout error there is
+not a schema mismatch, so restart. The recorded version is:
+
+```sql
+SELECT version FROM public.schema_meta WHERE store = 'software_inventory_store';
+```
+
+Deploy the server before any agent that emits the new fields.
 
 Today it is queried with **direct SQL**, e.g.:
 

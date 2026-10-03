@@ -14989,11 +14989,22 @@ private:
         // sibling) because this module needs auth_fn + the just-defined
         // deny_service_scoped_fn + audit_fn, none of which is in scope yet
         // at that earlier point.
+        // #4983: this fragment's `device_ids` (the dashboard CSV-paste
+        // import) had the identical unchecked-existence/scope gap the REST
+        // and MCP twins were fixed for in the same PR -- threads the SAME
+        // `fleet_read_fn` lambda defined above (already reused by several
+        // other Deps-based route modules) plus a direct
+        // `registry_.all_ids()` closure, the identical presence-merged
+        // domain RestApiV1's own `AllAgentIdsFn` wraps (HA WS-5) -- NOT
+        // `registry_.to_json_obj()`'s local-only snapshot, same #4981
+        // precedent reasoning as the REST fix's own wiring comment below.
         yuzu::server::result_set::register_result_set_routes(
             inline_sink, yuzu::server::result_set::Deps{
                              .auth_fn = auth_fn,
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .audit_fn = audit_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .all_agent_ids_fn = [this] { return registry_.all_ids(); },
                              // #5047: same belt as the /api/v1/result-sets JSON
                              // write routes — these fragments are plain HTTP
                              // endpoints too, not cookie-session-only. The
@@ -19116,6 +19127,14 @@ private:
         // BEFORE register_routes(), same timing contract as the two setters
         // immediately above.
         rest_api_v1_->set_scope_evaluate_fn(scope_evaluate_fn);
+        // #4983 — `POST /api/v1/result-sets`'s device_ids[] existence check.
+        // registry_.all_ids() is presence-merged (HA WS-5), the SAME domain
+        // scope_evaluate_fn's ScopePopulation::Fleet path above uses — NOT
+        // registry_.to_json_obj() (the local-only agents_fn snapshot passed
+        // to register_routes below), which would reintroduce the #4981
+        // local-vs-presence mismatch one route over. MUST run BEFORE
+        // register_routes(), same timing contract as the setters above.
+        rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)

@@ -583,7 +583,8 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
   new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
-  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+  cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
+  rig; see the known limitation under Server-Side Setup in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
   keep DIFFERENT postures by design — `register_fresh` (ProxyRegister's fresh-registration branch), the
@@ -1123,6 +1124,63 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
 not a WS-4 gate item.
+
+**Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
+`BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
+`bool unknown_session_ids_truncated = 3` (`proto/yuzu/gateway/v1/gateway.proto` and its two gateway
+mirrors; field 4 left free), and `GatewayUpstreamServiceImpl::BatchHeartbeat` now fills them. **No
+gateway code reads them yet** - the consumer (replaying the sessions the gateway holds locally through
+the existing replay drip) is a separate change tracked in #1197, so this change does not fix #1197: a
+server that restarts and loses its in-memory `gateway_sessions_` still does not learn the gateway's
+sessions until the gateway-side replay lands. An old gateway ignores the new fields (proto3 unknown
+fields), so the wire is unchanged in behaviour. There is deliberately no presence marker: a server that
+predates the fields and a server with nothing unknown are indistinguishable, and the gateway's only
+correct action in both cases is today's behaviour (no replay).
+- **What the list means.** It is the per-replica "I do not hold this session" verdict: the distinct
+  session ids in this batch that THIS replica's in-memory `gateway_sessions_` does not hold. It says
+  nothing about the other replicas or about the durable `GatewayRouteStore` directory. It is reported
+  whether or not a route store is wired.
+- **Bounds.** At most `kMaxUnknownSessionIdsPerResponse` = 4096 ids are listed (about 260 KiB at 64
+  bytes each); past that `unknown_session_ids_truncated` is set and one warn names listed/total. The
+  listed subset is unordered-set order, deliberately not sorted, so an omitted id is typically reported
+  again when that agent next heartbeats (30 s by default), not on the next gateway flush; that is not
+  guaranteed when a batch carries a very large number of distinct unknown ids (only 4096 are listed per
+  response, an arbitrary subset; the gateway forwards agent heartbeats verbatim, so one agent can
+  contribute many ids). The 64-byte per-id cap
+  (`kMaxGatewaySessionIdLen`) is applied only AFTER the `gateway_sessions_` lookup misses: a
+  reclaim-absent `ProxyRegister` adopts a gateway-presented id of any length, so capping first would
+  silently stop ingesting a known session. An empty unknown id is skipped; an over-length unknown id is
+  never listed and is counted per entry under
+  `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}`. A
+  session that legitimately holds a longer-than-64-byte presented id is therefore counted malformed and
+  never listed after a server restart (by design; ids this server mints are 43 bytes).
+- **Multi-replica statement (design intent, inferred from code reading; no multi-replica run exists;
+  not verified until the gateway-side replay ships).** The verdict-then-replay reconcile is intended to
+  be correct and bounded on one core replica. On several replicas it would converge in one round only if
+  the gateway's `BatchHeartbeat`, the replay `ProxyRegister` and the reannounce `NotifyStreamStatus` all
+  reach the SAME replica during the reconcile. The shipped gateway uses ONE gRPC channel and therefore
+  one HTTP/2 connection per upstream endpoint, so behind a layer-4 VIP it is connection-sticky; but
+  stickiness lasts only for the lifetime of that HTTP/2 connection (a reconnect mid-reconcile, a GOAWAY
+  or a load-balancer idle timeout can move the stream to another replica). Behind a multi-endpoint node
+  list (the channel then picks an endpoint per RPC, round-robin) or a layer-7 per-RPC balancer it would
+  converge only probabilistically: the replica that lacks the session keeps listing it, an arbitrary
+  replica receives each replay, and a replica that ALREADY holds the session re-installs it through
+  `register_agent` and wipes its placement until its own reannounce lands on it. A per-session replay
+  guard planned for the gateway-side change bounds the replay RATE, not the NUMBER of rounds. Expected
+  signature: `renew_leases`/`unknown_session` desync not decaying on some replica after both sides are
+  upgraded. The durable cross-replica session lookup (WS-5, `#4246` #3) is the real multi-replica fix;
+  until it lands the safe-to-scale gate still forbids a second replica.
+- **Lease window (observed on one local development rig with one agent, dev `3c8ac2c0c`; not
+  reproducible from the repo; tracker #1197).** After a server-only restart a single-target command to
+  an agent the new server does not know was still delivered while the lease and presence rows written
+  when the OLD server last ingested that agent's heartbeat were unexpired (remaining = 90 s, minus the
+  age of that heartbeat at the moment of the kill, minus the downtime); heartbeats the new server
+  receives for an unknown session extend neither, and an agent with no heartbeat ingested before the
+  kill was refused from the first probe. Delivery was observed at 20, 50 and 80 s after the last
+  ingested heartbeat and refusal at 125 s; the exact edge between 80 s and 125 s was not probed. The
+  directory-fallback and presence-row mechanism is inferred from the forwarding log line, not traced.
+  `/health` `agents.online` read 0 throughout, and the server did not recover in the observed windows
+  (to about 125 s). An early successful command is therefore not evidence the reconcile is unnecessary.
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 

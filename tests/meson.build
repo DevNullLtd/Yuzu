@@ -222,7 +222,7 @@ endif
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
 # Test fixtures deliberately partial-aggregate-init wide inventory structs
-# (SwEntry / SoftwareEntry are 12 fields since blob contract v2; a 4-field
+# (SwEntry is 12 fields, SoftwareEntry 14 stored members (16 wire slots); a 4-field
 # init IS the contract — "the rest stays empty"). -Wextra's
 # missing-field-initializers would flag every such fixture; suppress it for
 # the TEST targets only — production code stays fully warned.
@@ -2652,6 +2652,17 @@ test('capability catalogue completeness',
 test('capability gate consistency',
   _python3_test,
   args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The /test --instructions gate broadcasts every default-risk definition; the server refuses a
+# broadcast for any Destructive or Forensics capability row. This derives those rows from the
+# capability_decls fragments and requires every matching definition to be classified into an
+# opt-in risk class in scripts/test/instructions-risk-classification.json. Hermetic.
+test('instructions risk table',
+  _python3_test,
+  args: [files('test_instructions_risk_table.py')],
   suite: 'docs',
   timeout: 30,
 )
