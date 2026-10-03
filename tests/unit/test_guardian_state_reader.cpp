@@ -194,7 +194,14 @@ TEST_CASE("read_service maps a truly absent unit to Stopped (R5)", "[spark][stat
 
 TEST_CASE("read_registry (Windows): SZ/DWORD round-trip, REG_BINARY unsupported, absent value",
           "[spark][statereader]") {
-    const wchar_t* kSub = L"Software\\YuzuStateReaderTest";
+    // Per-process salted key (#1871, #5073): the Windows CI pool shares one HKCU hive across
+    // concurrent runner jobs and, once the agent suite is sharded, across concurrent test
+    // processes in one job, so a fixed key name is a cross-process shared resource. Same salt
+    // as test_guard_registry.cpp (process_random_salt mixes the pid).
+    const auto salt = yuzu::test::process_random_salt();
+    const std::string sub_a = "Software\\YuzuStateReaderTest_" + std::to_string(salt);
+    const std::wstring sub_w = L"Software\\YuzuStateReaderTest_" + std::to_wstring(salt);
+    const wchar_t* kSub = sub_w.c_str();
     HKEY h = nullptr;
     REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, kSub, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &h,
                             nullptr) == ERROR_SUCCESS);
@@ -209,7 +216,7 @@ TEST_CASE("read_registry (Windows): SZ/DWORD round-trip, REG_BINARY unsupported,
 
     GuardianStateReader reader;
     const auto r = reader.read_registry(
-        RegistrySparkParams{.hive = "HKCU", .key = "Software\\YuzuStateReaderTest"},
+        RegistrySparkParams{.hive = "HKCU", .key = sub_a},
         RegistryReadPlan{.value_names = {"Str", "Num", "Bin", "Missing"}});
 
     RegDeleteKeyW(HKEY_CURRENT_USER, kSub); // cleanup (values only, no subkeys)

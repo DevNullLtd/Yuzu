@@ -111,6 +111,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1010,7 +1011,9 @@ static const ToolDef kTools[] = {
      "Create a result set directly from pre-computed device ids. Synchronous — lands "
      "materialized immediately (e.g. \"I have a CSV of device ids\"), unlike the "
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
-     "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
+     "new set onto an owned existing set. A non-empty device_ids is checked against the "
+     "fleet — any id that does not exist or is not visible to the caller rejects the whole "
+     "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
@@ -11735,8 +11738,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // refusing is free. Mirrors REST's run_async fix exactly.
                 auto quota = result_set_store_->count_for_owner_checked(session->username);
                 if (!quota.has_value()) {
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982: log-only swallowed the failure with no observable
+                        // signal — count it alongside the log line at every call site.
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
                     // Deliberately minimal, not the full
                     // <store>_read_degrade_total{reason} convention other
@@ -11762,8 +11773,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (*quota >= ResultSetStore::kMaxPerOwner) {
                     if (metrics)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // retry-hint-exempt: owner is genuinely at the per-owner
                     // quota, not a transient fault.
                     res.set_content(
@@ -11788,9 +11806,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     sent = dispatch_outcome.sent;
                 } catch (const std::exception& e) {
                     spdlog::error("result-set MCP async producer dispatch failed: {}", e.what());
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled also failed for execution_id={}",
                                      exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     // No retry_after_ms: dispatch_fn may have already reached some
                     // agents before throwing, and this producer's own tool
                     // description says NEVER re-send on error - a positive retry
@@ -11810,8 +11835,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // identically to a scope that genuinely matched nobody —
                     // deliberate, so a distinct status never discloses devices
                     // the caller cannot see.
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     res.set_content(
                         a4_error(kInternalError,
                                  "RESULT_SET_NO_AGENTS: no agents reached in the target scope — "
@@ -11822,8 +11854,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!execution_tracker->set_agents_targeted(exec_id, sent))
+                if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
                     spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+                            .increment();
+                }
 
                 CreateRequest cr;
                 cr.owner_principal = session->username;
@@ -11836,8 +11875,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!created) {
                     if (metrics && created.error() == ResultSetError::QuotaExceeded)
                         metrics->counter("yuzu_result_set_quota_rejected").increment();
-                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username)) {
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
+                    }
                     if (created.error() == ResultSetError::DbError) {
                         // No retry_after_ms: dispatch already succeeded above
                         // (sent > 0, set_agents_targeted already called) - only the
@@ -12123,6 +12169,121 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+
+                // #4983 (MCP twin of the identical REST fix, same PR): full
+                // existence + scope check on a non-empty device_ids. Scoped
+                // to fire ONLY when device_ids was actually supplied and
+                // non-empty — a caller who never uses this field (an empty/
+                // nameless-membership set) sees zero behavior change and
+                // pays no extra gate cost. Unlike REST's RestApiV1 (which
+                // deliberately holds only injected Fn-typed closures), this
+                // handler already receives a raw `agent_registry` pointer as
+                // a build_handler() parameter (see e.g. discover_plugins'
+                // identical use a few thousand lines below), so no new
+                // injected closure is needed here — all_ids() is called
+                // directly.
+                if (!members.empty()) {
+                    if (!fleet_read_fn_) {
+                        spdlog::error("create_result_set: fleet_read_fn_ unwired — "
+                                      "misconfigured call site; failing closed");
+                        // Gate 4 SHOULD (#4983 fix round): the fragment's twin
+                        // of this misconfiguration branch already audits;
+                        // this one didn't. "reason=" matches this handler's
+                        // own established convention (see the
+                        // parent_id/unknown_device_id guards above).
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=fleet_read_fn_unwired");
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: device visibility check "
+                                     "unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                    if (!gate.admitted)
+                        return; // gate already wrote the A4 error body + status
+
+                    if (!agent_registry) {
+                        spdlog::error("create_result_set: agent_registry unwired — "
+                                      "misconfigured call site; failing closed");
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=agent_registry_unwired");
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    // Called ONCE (not per-id) and cached in a set for O(1)
+                    // per-id membership checks — device_ids can be up to
+                    // kMaxMembersPerSet (100000) entries, so a per-id backing
+                    // call would be its own DoS. Presence-merged
+                    // (AgentRegistry::all_ids()), NOT a local-only snapshot —
+                    // the SAME domain evaluate_scope's Fleet path and every
+                    // real dispatch already use (see REST's #4983 fix / the
+                    // #4981 local-vs-presence precedent for why this matters).
+                    //
+                    // NICE (cpp-expert, #4983 fix round): `known` is never
+                    // read again after `known_set` is built, so move each
+                    // string in rather than copying it.
+                    std::vector<std::string> known = agent_registry->all_ids();
+                    const std::unordered_set<std::string> known_set(
+                        std::make_move_iterator(known.begin()),
+                        std::make_move_iterator(known.end()));
+
+                    // #3564-style oracle safety (see GET /api/v1/devices/{id}'s
+                    // identical rationale): a nonexistent id and a real-but-
+                    // out-of-scope id are indistinguishable in the response.
+                    // Unlike that route, the ids here are the CALLER'S OWN
+                    // submitted list, so citing which one(s) failed back to
+                    // them is not a disclosure of someone else's device
+                    // existence.
+                    //
+                    // NICE (cpp-expert, #4983 fix round): only the first
+                    // kMaxCitedBadIds are ever displayed (below) -- track the
+                    // total count separately instead of accumulating every
+                    // bad id into `bad_ids` when the caller's device_ids can
+                    // run to kMaxMembersPerSet (100000) entries.
+                    constexpr std::size_t kMaxCitedBadIds = 20;
+                    std::vector<std::string> bad_ids;
+                    std::size_t bad_id_count = 0;
+                    for (const auto& did : members) {
+                        if (!known_set.contains(did) || !authz::in_scope(gate.scope, did)) {
+                            ++bad_id_count;
+                            if (bad_ids.size() < kMaxCitedBadIds)
+                                bad_ids.push_back(did);
+                        }
+                    }
+                    if (bad_id_count > 0) {
+                        std::string cited;
+                        for (std::size_t i = 0; i < bad_ids.size(); ++i) {
+                            if (i)
+                                cited += ", ";
+                            cited += bad_ids[i];
+                        }
+                        if (bad_id_count > kMaxCitedBadIds)
+                            cited += std::format(" (+{} more)", bad_id_count - kMaxCitedBadIds);
+                        // Audited on the same action/outcome as the parent_id
+                        // shape-check guard above (governance #4307/#4734/
+                        // #4983 round) -- the sibling denial a few lines above
+                        // this one (the parent_id ownership/shape checks) is
+                        // audited; this rejection was not, until this fix
+                        // round.
+                        (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                       "reason=unknown_device_id");
+                        // retry-hint-exempt: caller-input rejection (unknown/
+                        // out-of-scope device id), not a transient fault.
+                        res.set_content(
+                            error_response(
+                                id, kInvalidParams,
+                                "RESULT_SET_UNKNOWN_DEVICE_ID: device_ids contains an id that "
+                                "does not exist or is not visible to the caller: " + cited),
+                            "application/json");
+                        return;
+                    }
+                }
+
                 auto created = result_set_store_->create_materialized(cr, members);
                 if (!created) {
                     if (created.error() == ResultSetError::DbError) {
@@ -17332,6 +17493,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         !execution_tracker->mark_cancelled(execution_id, session->username)) {
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     mcp_audit("failure",
                               std::string("dispatch_exception execution_id=") + execution_id);
@@ -17361,6 +17528,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         !execution_tracker->mark_cancelled(execution_id, session->username)) {
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "mark_cancelled"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     // #3424/#3511: "reachable" is no longer the only reason
                     // this can be zero — a target that is QUARANTINED is
@@ -17544,6 +17717,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!execution_tracker->set_agents_targeted(execution_id, agents_reached)) {
                         spdlog::error("mcp_server: set_agents_targeted failed for execution_id={}",
                                       execution_id);
+                        // #4982
+                        if (metrics)
+                            metrics
+                                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                          {{"op", "set_agents_targeted"}, {"surface", "mcp"}})
+                                .increment();
                     }
                     // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
                     // arrived BEFORE set_agents_targeted saw agents_targeted==0

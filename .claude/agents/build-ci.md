@@ -265,7 +265,7 @@ What actually happens: `gateway ct` activates rebar3's `test` profile which pull
 
 **Prior art for pre-fetching** lives in `deploy/docker/Dockerfile.ci-gateway` — the CI image runs `rebar3 compile --deps_only` at image build time in a clone of the gateway, then copies `_build/` into `/opt/rebar3_deps/_build`. Subsequent rebar3 runs inside the image find meck/proper/etc. locally and never hit hex.pm. This mitigation applies to any containerized Linux CI path that uses the ci-gateway image.
 
-**The self-hosted runners are bare-metal** (`yuzu-wsl2-linux`, `yuzu-local-windows`), not containerized, so they don't benefit from the ci-gateway image's pre-fetch. The equivalent runner-side mitigations are:
+**The self-hosted runners are bare-metal** (the Big Tam and Wee Tam pools), not containerized, so they don't benefit from the ci-gateway image's pre-fetch. The equivalent runner-side mitigations are:
 
 1. **Runner-level rebar3 cache seeding** — run `rebar3 as test compile --deps_only` once inside a clone of `gateway/` on the runner. Rebar3 caches the fetched hex packages at `~/.cache/rebar3/hex/hexpm/packages/` (Linux/WSL2) or `%LOCALAPPDATA%\rebar3\hex\hexpm\packages\` (native Windows). This cache is persistent across CI runs and `git clean -ffdx` in `$GITHUB_WORKSPACE` doesn't touch it. One-time bootstrap per runner.
 2. **Retry wrapper in `scripts/test_gateway.py`** — wrap the `rebar3 as test ct` invocation in a bounded retry loop that re-runs on rebar3's fetch-failure exit code. This handles flake transparently without any runner-side state.

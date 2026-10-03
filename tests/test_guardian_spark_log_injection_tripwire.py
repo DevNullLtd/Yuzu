@@ -150,7 +150,27 @@ SEARCH_ROOTS = ["agents/core/src", "server/core/src", "common/include"]
 # paragraph for why this is not a bare three-root scan.
 FILE_BASENAME_RE = re.compile(r"^(guardian_|guard_|spark_|guaranteed_state)[A-Za-z0-9_]*\.(cpp|hpp)$")
 
-SPDLOG_CALL_RE = re.compile(r"\bspdlog::(?:trace|debug|info|warn|error|critical)\s*\(")
+# #4666 PR-4: also matches a call THROUGH a bound `spdlog::logger` handle
+# (`logger->info(...)`), not only the free-function `spdlog::info(...)` form --
+# server/core/src/guardian_ingest.cpp's T_server line resolves its logger
+# through a seam (`t_server_logger_snapshot()`) and calls `->info(...)` on the
+# result, which the free-function-only pattern silently missed (a false green:
+# the scan just finds zero statements in the file, not a scan failure). `\w+->`
+# covers a PLAIN IDENTIFIER holding a logger handle (any name, not anchored to
+# `logger` specifically), so a FUTURE bound-logger call anywhere in this file
+# family is covered the same way without its own scanner change -- this is a
+# regression net, not just a fix for the one site found here. It does NOT
+# match a chained call, e.g. `get_logger()->info(...)` (the `)` immediately
+# before `->` is not a `\w` character) -- a real gap if that idiom appears in
+# this file family later, not claimed closed here.
+# Verified harmless against this file family's existing content: no non-
+# logging `<ident>->info|warn|error|...(` call shape exists in it today (the
+# nearest look-alike, `r->error()` in guardian_spark_runtime.cpp, is a bare
+# no-argument call whose first token after `(` is not a string literal, so
+# parse_call() already returns None for it, the same graceful skip every
+# non-spdlog statement this scanner cannot analyse gets -- see parse_call()'s
+# own docstring).
+SPDLOG_CALL_RE = re.compile(r"\b(?:spdlog::|\w+->)(?:trace|debug|info|warn|error|critical)\s*\(")
 
 # Recognised wrappers that fully neutralise a rule-id/Spark-key-shaped argument.
 # Checked as a substring WITHIN the specific argument's own text slot -- see the
@@ -771,6 +791,12 @@ def _selfcheck() -> None:
         'spdlog::warn("Guardian outbox send stalled (event_id {})", event_id);',
         'spdlog::info("Guardian: file guard armed for rule \'{}\' (path={})", log_id_token(rule.rule_id()), log_path);',
         'spdlog::info("Guardian: service guard armed for rule \'{}\' (service={})", log_id_token(rule.rule_id()), log_service);',
+        # #4666 PR-4: a call through a BOUND logger handle, not the free
+        # function -- guardian_ingest.cpp's T_server line shape (real code is
+        # correctly wrapped; this is the synthetic UNWRAPPED negative-control
+        # version, proving the widened SPDLOG_CALL_RE actually opens this
+        # statement rather than silently skipping it as before).
+        'logger->info("Guardian T_server event_id={} agent={} rule={}", event_id, agent_id, rule_id);',
     ]
     for src in must_match:
         if not flagged(src):
@@ -814,6 +840,9 @@ def _selfcheck() -> None:
         # value_type now wrapped too (was the raw sibling this fixture existed
         # to document before the #4665 Phase-3 fix).
         'spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\\\{} [{}] (detected={}, type={}{})", log_id_token(cfg_.rule_id), d.remediation_action, log_key_token(cfg_.hive), log_key_token(cfg_.key), log_key_token(cfg_.value_name), log_key_token(detected), log_key_token(cfg_.value_type), target.get() ? "" : ", key absent");',
+        # #4666 PR-4: the REAL guardian_ingest.cpp T_server shape (bound
+        # logger handle, all three ids wrapped) -- correctly unflagged.
+        'logger->info("Guardian T_server event_id={} agent={} rule={} recv_ns={} committed_ns={} agent_ns={} store_ms={}", log_id_token(ev_row.event_id), log_id_token(agent_id), log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns, agent_ns, store_ms);',
     ]
     for src in must_not:
         if flagged(src):

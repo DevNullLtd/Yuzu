@@ -105,7 +105,7 @@ files correctly.
 Every shipped `.ps1` begins with a `PSVersionTable.PSVersion.Major -lt 7`
 guard that exits 1 with an actionable message. CI workflow steps use
 `shell: pwsh` rather than `shell: powershell`. The
-`yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
+retired `yuzu-local-windows` runner had `pwsh` 7.6.1 pre-installed; the Wee Tam runners are provisioned per `deploy/windows/README.md`. See
 issue #517 for the migration history.
 
 **Exception: installer helpers run on end-user hosts.** Scripts the

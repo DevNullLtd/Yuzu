@@ -1939,8 +1939,9 @@ adjudicated ACCEPT-WITH-PRECONDITION: the live legacy path and the dormant Spark
 MEDIUM for the #4606 diff, and a flip PR still carrying synchronous writes derives HIGH and is
 BLOCKING. This precondition is tracked in #4666.
 
-**Status update (2026-09-25): #4666 PR-1 and PR-2 have landed; the precondition above is
-substantially addressed, with one residual gap flagged, not fully closed.** PR-1
+**Status update (2026-09-25, Windows since measured — see the 2026-10-03 entry below): #4666
+PR-1 and PR-2 have landed; the precondition above is substantially addressed, with one
+residual gap flagged, not fully closed.** PR-1
 (`agents/core/src/log_handoff.hpp/.cpp`, merged as #4970) built the bounded async log
 hand-off primitive standalone, wired into nothing yet. PR-2 (`main.cpp`/`service_win.cpp`,
 this doc's own #4666 references above) installs that primitive as the process's spdlog
@@ -1956,7 +1957,8 @@ same `--suite agent` binary — so its MI-1b topology verdict is written (Catch2
 a report file) on every Windows run; that output has simply not yet been pulled from a
 CI log and reviewed to turn it into a confirmed finding, which is different from "no
 Windows evidence exists." Absent that review, Windows single-registry status is still
-only inferred from dynamic spdlog linkage, not confirmed. See `docs/darwin-compat.md`'s
+only inferred from dynamic spdlog linkage, not confirmed **[Windows since measured — see
+the 2026-10-03 entry below]**. See `docs/darwin-compat.md`'s
 "spdlog registry identity across images" row for the macOS result, now measured: TWO
 separate registries there, with
 the exe-image swap load-bearing on the teardown side only (install-side logging already
@@ -1971,6 +1973,63 @@ neither file has its own `hard_exit()` call site that would need one; the only p
 F3 orphan-exit checks, and those ARE wired with a breadcrumb. The still-future `T_server`
 piece (server-side, PR-4 in the #4666 ladder) is untouched by either PR-1 or PR-2 and
 remains separately tracked.
+
+**Status update (2026-09-28): #4666 PR-4 adds a dedicated logger closing the `T_server` piece
+named above — the precondition's server-side half is now addressed too, not only the agent
+side. PR-4 is implemented and adversarially reviewed (Kimi + Codex, both PASS) and has since
+merged to `origin/dev` (PR #5281, `f7a000fc3`).**
+`server/core/src/guardian_ingest.{hpp,cpp}` gives the `T_server` line its own dedicated bounded
+async logger (`spdlog::async_logger`, a private 1024-slot `spdlog::details::thread_pool`,
+`overrun_oldest` — the same eviction policy PR-1/PR-2 use, sized down since this backs one
+diagnostic line rather than the whole process's logging), installed once at boot
+(`server/core/src/main.cpp`) over copies of the default logger's own sinks. This is a dedicated
+per-line change, unlike PR-1/PR-2's global default-logger swap on the agent: the server's other
+Guardian-ingest log lines on the same code path (idempotent-redelivery, event-collision/store-
+error, oversized-`detail_json`/parse-failure, and the observation-only blast-radius/alert-router
+warning pair) are unaffected and stay on the ordinary
+synchronous default logger — only `T_server` itself, the one line the architect Gate 8 review
+adjudicated ACCEPT-WITH-PRECONDITION over, moved. Deliberately much lighter than PR-1's
+`LogHandoff`: no teardown watchdog — an ACCEPTED exposure, not an eliminated one (corrected by
+adversarial review; an earlier draft of this entry overclaimed the bound). The server's
+`main.cpp` does have hard-exit machinery (`on_signal_hard_exit`), but it is signal-driven, not
+self-armed: the first `SIGINT`/`SIGTERM` takes the graceful `Server::stop()` path, so a sink
+that stalls mid-drain leaves a wedged pool join bounded only by a *second* signal or the
+deployment's external stop deadline (`TimeoutStopSec=210s` / `stop_grace_period: 210s`, both
+shipped configs), not by "a plain SIGTERM" alone — no heartbeat/metrics surfacing either (out of
+scope, matching PR-3's still-open agent-side equivalent). Construction/registration failure is
+best-effort by design — logged via the default logger and the line is silently skipped, never
+`EXIT_FAILURE`. Resource accounting: `docs/resource-ledgers/4666-t-server-async-logger.md`. With
+this PR-4 update, all five lines the 2026-09-20 precondition named (`T_detect`, `T_wire` on both
+paths, the Spark runtime's own arm-committed/late-arm/sweep-residue lines, and `T_server`) are
+non-blocking — but this precondition does NOT close on that basis alone: the 2026-09-25 entry's
+own residual, the unreviewed Windows MI-1b CI verdict on the agent-side registry-topology claim
+(still only *inferred*, not *confirmed*, per that entry — see above) **[Windows since measured
+— see the 2026-10-03 entry below]**, is untouched by this server-side-only PR and remains open
+as of this entry. This precondition closes once that Windows review lands (or the residual is
+otherwise explicitly discharged), in addition to PR-4 merging. The rest of
+the #4666 ladder (PR-3's agent-side heartbeat/metrics surfacing, PR-5's blocked-sink chaos
+driver/rig evidence, and PR-6/PR-7's `T_detect`/`T_wire`/`T_server` retirement once `gh issue
+view 4606` is closed) is tracked in the `spark-4666-retire-synchronous-log-writes-DELIVERY-PLAN.md`
+plan record, not in this section — none of those remaining PRs gate this precondition or the F14
+flip on their own.
+
+**Status update (2026-10-03): the 2026-09-25 entry's residual is now discharged — the Windows
+MI-1b verdict has been measured, not merely inferred.** Run on real MSVC hardware (weecolin) at
+`f7a000fc3`, the same commit PR-4 above merged at: all of MI-1, MI-1b(a), MI-1b(b), MI-3 pass,
+and agree with each other and with `dumpbin` import-table evidence (all four images — the exe,
+`yuzu_agent_core.dll`, `agent_actions.dll`, the test binary — resolve spdlog's registry-wide free
+functions from one shared `spdlogd.dll`). **Windows has ONE shared registry, the same
+shape as Linux, not the macOS two-registry shape.** Full evidence, exact commands, and WARN/report
+text verbatim: `docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md`. This closes
+the last open residual named above and in the PR-4 entry: both halves of this precondition (the
+agent-side registry-topology claim and PR-4's server-side `T_server` fix) are now satisfied, and
+this precondition for the F14 flip is CLOSED. **This is a point-in-time attestation, not a
+continuously-monitored control**: the measuring fixture's topology verdict is `WARN`-only (by
+original design, not a defect of this measurement — see the fixture's own header comment), so a
+future regression (a toolchain upgrade, a vcpkg spdlog baseline bump, or a `triplets/x64-windows.cmake`
+static-linkage override added for spdlog) would not fail CI on its own; see the evidence file's
+own "Scope and revisit triggers" section for what would need to change before this claim is
+re-verified, and issue #5286 for giving the fixture its own enforcement.
 
 **Precondition for criterion 10 sign-off and the F14 flip (added 2026-09-21, from the #4606
 governance review of the rule-id neutralisation; SATISFIED 2026-09-24 by the #4665 fix landing on

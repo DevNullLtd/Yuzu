@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 32441fb0dddd
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-30 · euid 0 · leg-hash 0168e9d5ae05
 == action=password_policy
 password_policy|PASS_MAX_DAYS|99999|/etc/login.defs
 password_policy|PASS_MIN_DAYS|0|/etc/login.defs
@@ -6,11 +6,7 @@ password_policy|PASS_WARN_AGE|7|/etc/login.defs
 password_policy|ENCRYPT_METHOD|YESCRYPT|/etc/login.defs
 password_policy|minlen|14|/etc/security/pwquality.conf
 password_policy|dcredit|-1|/etc/security/pwquality.conf
-password_policy|ucredit|-1|/etc/security/pwquality.conf
-password_policy|lcredit|-1|/etc/security/pwquality.conf
-password_policy|ocredit|-1|/etc/security/pwquality.conf
-password_policy|pam.password.pam_pwquality.so|requisite retry=3|/etc/pam.d/common-password
-password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure use_authtok try_first_pass yescrypt|/etc/pam.d/common-password
+password_policy|pam.password.pam_unix.so|[success=1 default=ignore] obscure yescrypt|/etc/pam.d/common-password
 [result_status] OK / FULL /
 
 == action=lockout_policy
@@ -21,11 +17,22 @@ lockout_policy|unlock_time|900|/etc/security/faillock.conf
 [result_status] OK / FULL /
 
 == action=audit_policy
-audit_policy|rules|10|/etc/audit/audit.rules
-audit_policy|watch_rules|6|/etc/audit/audit.rules
-audit_policy|syscall_rules|4|/etc/audit/audit.rules
+audit_policy|rules|2|/etc/audit/audit.rules
+audit_policy|watch_rules|1|/etc/audit/audit.rules
+audit_policy|syscall_rules|1|/etc/audit/audit.rules
 audit_policy|unmodelled_lines|0|/etc/audit/audit.rules
-audit_policy|control_lines|5|/etc/audit/audit.rules
+audit_policy|control_lines|3|/etc/audit/audit.rules
 audit_policy|enabled|immutable|/etc/audit/audit.rules
 [result_status] OK / FULL /
 
+== action=sudoers
+sudoers|/etc/sudoers|defaults|-|-|-|env_reset
+sudoers|/etc/sudoers|defaults|-|-|-|mail_badpass
+sudoers|/etc/sudoers|defaults|-|-|-|secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+sudoers|/etc/sudoers|defaults|-|-|-|use_pty
+sudoers|/etc/sudoers|user_spec|root@ALL|ALL:ALL|false|ALL
+sudoers|/etc/sudoers|user_spec|%sudo@ALL|ALL:ALL|false|ALL
+sudoers|/etc/sudoers|includedir|-|-|-|/etc/sudoers.d
+sudoers|/etc/sudoers.d/90-ops|user_spec|%ops@ALL|ALL|true|/usr/bin/systemctl
+sudoers|/etc/sudoers.d/90-ops|defaults|user:ops|-|-|!authenticate
+[result_status] OK / FULL /

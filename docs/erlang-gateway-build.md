@@ -8,11 +8,13 @@ The gateway (`gateway/`) is a standalone rebar3 project. It compiles independent
 ```bash
 cd gateway
 rebar3 compile                               # compile
-rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (309 tests as of HA WS-4 #4555)
+rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (403 tests as of the heartbeat connection-binding change)
 rebar3 dialyzer                              # type analysis — must be warning-free
 rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl in sync with priv/proto
 ```
+
+**TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** The one-way-TLS and mutual-TLS legs of `yuzu_gw_heartbeat_conn_rpc_tests` mint throwaway certificates with the `openssl` CLI under `$TMPDIR`. The certificate tests in `yuzu_gw_authz_tests` and `yuzu_gw_authz_rpc_tests` mint theirs under `/tmp`. `yuzu_gw_mtls_tests` keeps its own setup (also under `/tmp`) and ignores `YUZU_REQUIRE_TLS_TESTS`: without `openssl` it substitutes placeholder tests that always pass, named `mTLS handshake skipped: <reason>` and `one-way handshake skipped (openssl unavailable)`. By default an unavailable or failing `openssl` makes the legs of the other three modules (`yuzu_gw_heartbeat_conn_rpc_tests`, `yuzu_gw_authz_tests`, `yuzu_gw_authz_rpc_tests`) contribute no tests and print `SKIPPED <module>: openssl certificates unavailable: ...` on the console, so a run without `openssl` can still report all tests passed. Set `YUZU_REQUIRE_TLS_TESTS=1` in the environment to turn that skip into a failing test in those three modules (`yuzu_gw_authz_tests:certs_unavailable/2` implements the switch). Use it on any machine that is expected to have `openssl`. It is optional and unset by default; the `linux` job of `ci.yml` sets it, and no other workflow or job does.
 
 **Proto codegen drift (`check-proto-codegen.sh`).** The gateway carries its own gpb-generated `apps/yuzu_gw/src/*_pb.erl` (separate from the server's protoc output). gpb modules are self-contained: change a `.proto` field but forget to regenerate and the gateway silently drops that field in transit (the PR5 enrollment-CSR field-drop bug). The guard regenerates with rebar.config's own pinned `gpb_opts` (read via `file:consult`, so it cannot drift from the build) into a temp dir and byte-diffs against the committed modules. It runs after `rebar3 compile` (needs `_build/gpb`) and is wired into the release workflow's gateway job. gpb is version-pinned (4.21.7) + `target_erlang_version` fixed, so the output is deterministic. To fix a drift failure: regenerate the modules and commit them.
 
