@@ -101,7 +101,7 @@ env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
   # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
-  # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
+  # self-hosted runners (originally yuzu-wsl2-linux + yuzu-local-windows, since retired). Yuzu has
   # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
   # thrashing the cache between configs. This is a self-hosted-only budget:
   # the macOS leg moved to the BigMags pool (#3217) and no longer uploads
@@ -274,12 +274,9 @@ jobs:
   # `== 'true'` (fail-closed: an unhealthy or unknown runner skips the
   # job in <30s rather than queuing 30 min into a stalled runner).
   #
-  # Output names are slugified runner names from .github/runner-inventory.json:
-  #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
-  #   yuzu-local-windows → yuzu_local_windows_healthy
-  # Plus a pool gate:
+  # Pool gates:
   #   linux_pool_healthy → true iff >=1 [self-hosted, Linux, X64] runner is online
-  #     (any yuzu-bigtam-* OR the yuzu-wsl2-linux Shulgi fallback). The Linux jobs
+  #     (the yuzu-bigtam-* runners, the only Linux runners in the inventory). The Linux jobs
   #     gate on the pool, not a single named runner, so a free pool member keeps
   #     them running and a fully-offline pool still skips them fast.
   #
@@ -299,11 +296,10 @@ jobs:
       pull-requests: read
     outputs:
       # Pool gate for the [self-hosted, Linux, X64] jobs (proto-compat, linux):
-      # true iff >=1 eligible Linux runner (any yuzu-bigtam-* OR the yuzu-wsl2-linux
-      # Shulgi fallback) is online. Replaces the old single-named yuzu_wsl2_linux gate.
+      # true iff >=1 eligible Linux runner (the yuzu-bigtam-* runners) is online.
       linux_pool_healthy: ${{ steps.health.outputs.linux_pool_healthy }}
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
-      # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
+      # job, whose toolchain is 26.04-only.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
       # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
       # Shulgi is an operator testbed, not a production scheduling fallback.
@@ -311,8 +307,6 @@ jobs:
       # Exact BigMags pool gate matching the macOS job's runs-on labels.
       # No GitHub-hosted or Shulgi fallback can satisfy the Apple-Silicon job.
       bigmags_pool_healthy: ${{ steps.health.outputs.bigmags_pool_healthy }}
-      yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
-      yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
       # code_changed (issue #1978): false iff every changed file in a PR is in
       # the docs/ignore set the pull_request trigger used to carry. Gates the
@@ -535,11 +529,11 @@ jobs:
     name: "Proto backward-compat"
     needs: [preflight]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
-    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
+    # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
     if: needs.preflight.outputs.linux_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -570,7 +564,7 @@ jobs:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
-    # 26.04-only and cannot build on the Shulgi 24.04 fallback, so gate on
+    # 26.04-only (the retired Shulgi runners were 24.04), so gate on
     # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
     # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
     # Big Tam skips this job fast instead of queueing against an empty pool.
@@ -614,8 +608,8 @@ jobs:
       # since push-triggered runs aren't PR-fast-path latency sensitive.
       # NOT a guarantee the freed runner reaches the intended PR job: this
       # matrix isn't the only claimant on the pool. `proto-compat` below
-      # targets the bare `[self-hosted, Linux, X64]` label, which every
-      # Big Tam Linux runner also carries, and runs on the same push trigger
+      # is pinned to the same `yuzu-bigtam-linux` label, so it draws on
+      # the same runners, and runs on the same push trigger
       # this cap targets — it can claim the freed runner itself (its own
       # `timeout-minutes: 5` means it self-frees quickly, but it is a real
       # same-push competitor, not just the already-named nightly-overlap

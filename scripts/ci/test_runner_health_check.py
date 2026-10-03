@@ -533,5 +533,64 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("failed before it could emit typed evidence", sentinel)
 
 
+    def test_self_hosted_runner_label_lists_are_pinned_to_a_declared_pool(self) -> None:
+        """A bare [self-hosted, Linux, X64] list matches every runner carrying
+        those default labels, including runners outside the inventory (a retired
+        runner stayed registered and took proto-compat and cache-prune jobs).
+        Every self-hosted `runs-on:` / matrix `runner:` label list must carry a
+        yuzu-* pool label and be a subset of some declared runner's labels.
+
+        Covers: inline flow lists (single or multi-line), block lists, and a
+        bare `runs-on: self-hosted` string, in *.yml and *.yaml workflows.
+        Skips any list containing a `${{ }}` expression. Does not cover
+        `runs-on: ${{ matrix.runner }}` itself (its matrix `runner:` lists are
+        scanned instead), the `runs-on: {group:, labels:}` mapping form, or
+        matrix keys other than `runner:`. Labels are compared case-insensitively
+        and trailing `# comments` are ignored."""
+        inventory = json.loads(
+            (ROOT / ".github" / "runner-inventory.json").read_text(encoding="utf-8")
+        )
+        declared = [set(r["labels"]) for r in inventory["expected_runners"]]
+        flow = re.compile(r"^[ \t-]*(?:runs-on|runner):[ \t]*\[([^\]]*)\]", re.MULTILINE)
+        block = re.compile(
+            r"^[ \t]*runs-on:[ \t]*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)", re.MULTILINE
+        )
+        string = re.compile(
+            r"^[ \t]*runs-on:[ \t]*['\"]?(self-hosted)['\"]?[ \t]*(?:#.*)?$",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        offenders: list[str] = []
+
+        def norm(raw: str) -> str:
+            return raw.split("#", 1)[0].strip().strip("'\"").lower()
+
+        declared = [{x.lower() for x in d} for d in declared]
+
+        def check(name: str, labels: set[str], shown: str) -> None:
+            if "self-hosted" not in labels or any("${{" in x for x in labels):
+                return
+            pooled = any(label.startswith("yuzu-") for label in labels)
+            if not pooled or not any(labels <= d for d in declared):
+                offenders.append(f"{name}: {shown}")
+
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            text = path.read_text(encoding="utf-8")
+            for m in flow.finditer(text):
+                labels = {norm(p) for p in m.group(1).split(",") if norm(p)}
+                check(path.name, labels, f"[{m.group(1).strip()}]")
+            for m in block.finditer(text):
+                labels = {
+                    norm(ln.strip()[1:])
+                    for ln in m.group(1).splitlines()
+                    if ln.strip().startswith("-") and norm(ln.strip()[1:])
+                }
+                check(path.name, labels, f"block {sorted(labels)}")
+            for m in string.finditer(text):
+                offenders.append(f"{path.name}: runs-on: {m.group(1)} (bare string)")
+        self.assertEqual([], offenders)
+
+
 if __name__ == "__main__":
     unittest.main()
