@@ -458,3 +458,274 @@ TEST_CASE("route type and protocol names fall back to a numbered token, never an
 }
 
 #endif // __linux__
+
+#if defined(__APPLE__)
+
+#include <cstring>
+
+namespace {
+
+const std::map<int, std::string>& mac_capture_interfaces() {
+    // From the capture host's socket.if_nameindex(): lo0 = 1, en0 = 7, utun0..6 = 19..25.
+    static const std::map<int, std::string> m{{1, "lo0"},   {7, "en0"},   {19, "utun0"},
+                                              {20, "utun1"}, {21, "utun2"}, {22, "utun3"},
+                                              {23, "utun4"}, {24, "utun5"}, {25, "utun6"}};
+    return m;
+}
+
+std::string mac_iface(int idx) {
+    const auto it = mac_capture_interfaces().find(idx);
+    return it == mac_capture_interfaces().end() ? std::string{} : it->second;
+}
+
+std::vector<unsigned char> read_hex_blob(const fs::path& p) {
+    REQUIRE(fs::exists(p));
+    std::ifstream f(p);
+    std::string hex;
+    std::getline(f, hex);
+    while (!hex.empty() && (hex.back() == '\r' || hex.back() == ' '))
+        hex.pop_back();
+    REQUIRE(!hex.empty());
+    REQUIRE(hex.size() % 2 == 0);
+    std::vector<unsigned char> bytes;
+    for (std::size_t i = 0; i < hex.size(); i += 2)
+        bytes.push_back(static_cast<unsigned char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+    return bytes;
+}
+
+// ── synthetic builders: ONLY for shapes a real kernel never emits ────────
+
+std::vector<unsigned char> sin_bytes(unsigned char a, unsigned char b, unsigned char c,
+                                     unsigned char d) {
+    struct sockaddr_in sin {};
+    sin.sin_len = sizeof(sin);
+    sin.sin_family = AF_INET;
+    const unsigned char addr[4] = {a, b, c, d};
+    std::memcpy(&sin.sin_addr, addr, 4);
+    std::vector<unsigned char> out(sizeof(sin));
+    std::memcpy(out.data(), &sin, sizeof(sin));
+    return out;
+}
+
+// A netmask sockaddr the way the kernel trims it: sa_len covers only up to the last
+// non-zero byte of the address, everything after is implicitly zero.
+std::vector<unsigned char> trimmed_mask_v4(std::initializer_list<unsigned char> mask_bytes) {
+    std::vector<unsigned char> out(4 + mask_bytes.size(), 0); // len, family, port(2), then mask
+    out[0] = static_cast<unsigned char>(out.size());
+    out[1] = AF_INET;
+    std::size_t i = 4;
+    for (auto b : mask_bytes)
+        out[i++] = b;
+    return out;
+}
+
+std::vector<unsigned char> route_msg(int flags, unsigned short index,
+                                     const std::vector<unsigned char>& dst,
+                                     const std::vector<unsigned char>* gw,
+                                     const std::vector<unsigned char>* mask) {
+    std::vector<unsigned char> buf(sizeof(rt_msghdr), 0);
+    int addrs = RTA_DST;
+    auto add = [&](const std::vector<unsigned char>& sa) {
+        buf.insert(buf.end(), sa.begin(), sa.end());
+        while (buf.size() % 4 != 0)
+            buf.push_back(0);
+    };
+    add(dst);
+    if (gw) {
+        addrs |= RTA_GATEWAY;
+        add(*gw);
+    }
+    if (mask) {
+        addrs |= RTA_NETMASK;
+        add(*mask);
+    }
+    rt_msghdr hdr{};
+    hdr.rtm_msglen = static_cast<unsigned short>(buf.size());
+    hdr.rtm_version = RTM_VERSION;
+    hdr.rtm_type = RTM_GET;
+    hdr.rtm_index = index;
+    hdr.rtm_flags = flags;
+    hdr.rtm_addrs = addrs;
+    std::memcpy(buf.data(), &hdr, sizeof(hdr));
+    return buf;
+}
+
+} // namespace
+
+// ── The real capture ──────────────────────────────────────────────────────
+
+TEST_CASE("routes decode of a real NET_RT_DUMP matches netstat's table",
+          "[network_config][routes][pf_route]") {
+    const auto blob = read_hex_blob(fixture_dir("macos") / "net_rt_dump.hex");
+    const auto out = parse_route_table_dump(blob);
+    CHECK_FALSE(out.truncated); // a clean real dump must not look malformed
+    CHECK_FALSE(out.capped);
+
+    std::vector<std::string> rows;
+    for (const auto& rec : out.records)
+        rows.push_back(format_route_row(mac_route_to_row(rec, mac_iface(rec.ifindex))));
+
+    // Hand-checked against the `netstat -rnW` ground truth in the provenance file.
+    // The fixture also holds 9 real neighbour / cloned / group / own-address entries
+    // that must NOT appear here (LLINFO, WASCLONED, MULTICAST, LOCAL).
+    const std::vector<std::string> expected{
+        "route|ipv4|0.0.0.0|0|192.0.2.1|en0|-|-|unicast|static",
+        "route|ipv4|0.0.0.0|0|-|utun6|-|-|unicast|static",
+        "route|ipv4|100.64.0.0|10|-|utun6|-|-|unicast|static",
+        "route|ipv4|100.100.100.100|32|-|utun6|-|-|unicast|static",
+        "route|ipv4|127.0.0.0|8|127.0.0.1|lo0|-|-|unicast|static",
+        "route|ipv4|169.254.0.0|16|-|en0|-|-|unicast|static",
+        "route|ipv4|192.0.2.0|24|-|en0|-|-|unicast|static",
+        "route|ipv4|192.0.2.1|32|-|en0|-|-|unicast|static",
+        "route|ipv4|192.0.2.66|32|-|en0|-|-|unicast|static",
+        "route|ipv4|255.255.255.255|32|-|en0|-|-|unicast|static",
+        "route|ipv4|255.255.255.255|32|-|utun6|-|-|unicast|static",
+        "route|ipv6|::|0|fe80::|utun0|-|-|unicast|other",
+        "route|ipv6|::|0|fe80::|utun1|-|-|unicast|other",
+        "route|ipv6|::|0|fe80::|utun2|-|-|unicast|other",
+        "route|ipv6|::|0|fe80::|utun3|-|-|unicast|other",
+        "route|ipv6|::|0|fe80::|utun4|-|-|unicast|other",
+        "route|ipv6|::|0|fe80::|utun5|-|-|unicast|other",
+        "route|ipv6|::|0|fd7a:115c:a1e0::|utun6|-|-|unicast|other",
+        "route|ipv6|fd7a:115c:a1e0::|48|fe80::200:5eff:fe00:5307|utun6|-|-|unicast|other",
+        "route|ipv6|fd7a:115c:a1e0::53|128|-|utun6|-|-|unicast|static",
+        "route|ipv6|fe80::|64|fe80::1|lo0|-|-|unicast|other",
+        "route|ipv6|fe80::|64|-|en0|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5301|utun0|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5302|utun1|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5303|utun2|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5304|utun3|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5305|utun4|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5306|utun5|-|-|unicast|other",
+        "route|ipv6|fe80::|64|fe80::200:5eff:fe00:5307|utun6|-|-|unicast|other",
+    };
+    REQUIRE(rows.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        CHECK(rows[i] == expected[i]);
+}
+
+TEST_CASE("routes decode of a truncated real dump is flagged, never complete",
+          "[network_config][routes][pf_route]") {
+    auto blob = read_hex_blob(fixture_dir("macos") / "net_rt_dump.hex");
+    REQUIRE(blob.size() > 1000);
+    blob.resize(blob.size() - 50); // lands inside the last message
+    const auto out = parse_route_table_dump(blob);
+    CHECK(out.truncated);
+    CHECK_FALSE(out.records.empty());
+}
+
+// ── Adversarial / malformed shapes ────────────────────────────────────────
+
+TEST_CASE("macOS netmask prefix handles trimmed sockaddrs and rejects holes",
+          "[network_config][routes][pf_route]") {
+    unsigned p = 99;
+    // sa_len 0 / a bare 4-byte header: the all-zero mask, /0.
+    const unsigned char zero_len[4] = {0, 0, 0, 0};
+    REQUIRE(routes_detail::mac_mask_prefix(zero_len, false, p));
+    CHECK(p == 0);
+    // /10 trimmed to two mask bytes (ff c0): sa_len = 4 + 2.
+    const auto m10 = trimmed_mask_v4({0xff, 0xc0});
+    REQUIRE(routes_detail::mac_mask_prefix(m10.data(), false, p));
+    CHECK(p == 10);
+    // /24 trimmed to three bytes.
+    const auto m24 = trimmed_mask_v4({0xff, 0xff, 0xff});
+    REQUIRE(routes_detail::mac_mask_prefix(m24.data(), false, p));
+    CHECK(p == 24);
+    // /32 untrimmed.
+    const auto m32 = trimmed_mask_v4({0xff, 0xff, 0xff, 0xff});
+    REQUIRE(routes_detail::mac_mask_prefix(m32.data(), false, p));
+    CHECK(p == 32);
+    // ff 00 ff: a 1 after a 0 — never guess a prefix for it.
+    const auto hole = trimmed_mask_v4({0xff, 0x00, 0xff});
+    CHECK_FALSE(routes_detail::mac_mask_prefix(hole.data(), false, p));
+    // ff 0f: partial byte whose low bits are set, not a prefix.
+    const auto low = trimmed_mask_v4({0xff, 0x0f});
+    CHECK_FALSE(routes_detail::mac_mask_prefix(low.data(), false, p));
+}
+
+TEST_CASE("routes decode treats a route with no netmask as a host route",
+          "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(203, 0, 113, 9);
+    const auto msg = route_msg(RTF_UP | RTF_HOST | RTF_STATIC, 7, dst, nullptr, nullptr);
+    const auto out = parse_route_table_dump(msg);
+    REQUIRE(out.records.size() == 1);
+    CHECK(out.records[0].prefix_len == 32);
+    CHECK(out.records[0].destination == "203.0.113.9");
+    CHECK_FALSE(out.truncated);
+}
+
+TEST_CASE("routes decode skips every host-local / neighbour / cloned / group flag",
+          "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(10, 0, 0, 1);
+    const auto mask = trimmed_mask_v4({0xff, 0xff, 0xff, 0xff});
+    for (const int skip : {RTF_LLINFO, RTF_WASCLONED, RTF_MULTICAST, RTF_BROADCAST, RTF_LOCAL}) {
+        const auto msg = route_msg(RTF_UP | RTF_HOST | skip, 7, dst, nullptr, &mask);
+        CHECK(parse_route_table_dump(msg).records.empty());
+    }
+    const auto keep = route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, &mask);
+    CHECK(parse_route_table_dump(keep).records.size() == 1);
+}
+
+TEST_CASE("routes decode reports blackhole and reject routes by type",
+          "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(203, 0, 113, 0);
+    const auto mask = trimmed_mask_v4({0xff, 0xff, 0xff});
+    auto bh = parse_route_table_dump(route_msg(RTF_UP | RTF_BLACKHOLE | RTF_STATIC, 1, dst, nullptr, &mask));
+    REQUIRE(bh.records.size() == 1);
+    CHECK(mac_route_to_row(bh.records[0], "lo0").type == "blackhole");
+    auto rj = parse_route_table_dump(route_msg(RTF_UP | RTF_REJECT | RTF_STATIC, 1, dst, nullptr, &mask));
+    REQUIRE(rj.records.size() == 1);
+    CHECK(mac_route_to_row(rj.records[0], "lo0").type == "reject");
+}
+
+TEST_CASE("routes decode flags a non-contiguous netmask as malformed and emits no row",
+          "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(10, 0, 0, 0);
+    const auto bad = trimmed_mask_v4({0xff, 0x00, 0xff});
+    const auto out = parse_route_table_dump(route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, &bad));
+    CHECK(out.records.empty());
+    CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode stops on an unrecognised rtm_version", "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(10, 0, 0, 0);
+    const auto mask = trimmed_mask_v4({0xff, 0xff, 0xff});
+    auto msg = route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, &mask);
+    reinterpret_cast<rt_msghdr*>(msg.data())->rtm_version = static_cast<unsigned char>(RTM_VERSION + 1);
+    const auto out = parse_route_table_dump(msg);
+    CHECK(out.records.empty());
+    CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode survives a sockaddr whose sa_len overruns its record",
+          "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(10, 0, 0, 0);
+    auto msg = route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, nullptr);
+    msg[sizeof(rt_msghdr)] = 200; // sa_len claims 200 bytes in a record that holds 16
+    const auto out = parse_route_table_dump(msg);
+    CHECK(out.records.empty());
+    CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode survives a zero-length message", "[network_config][routes][pf_route]") {
+    std::vector<unsigned char> blob(sizeof(rt_msghdr), 0); // rtm_msglen == 0
+    const auto out = parse_route_table_dump(blob);
+    CHECK(out.records.empty());
+    CHECK(out.truncated);
+}
+
+TEST_CASE("routes decode stops at the row cap and says so", "[network_config][routes][pf_route]") {
+    const auto dst = sin_bytes(10, 0, 0, 0);
+    const auto mask = trimmed_mask_v4({0xff, 0xff, 0xff, 0xff});
+    const auto one = route_msg(RTF_UP | RTF_STATIC, 7, dst, nullptr, &mask);
+    std::vector<unsigned char> blob;
+    blob.reserve(one.size() * (kRoutesRowCap + 5));
+    for (std::size_t i = 0; i < kRoutesRowCap + 5; ++i)
+        blob.insert(blob.end(), one.begin(), one.end());
+    const auto out = parse_route_table_dump(blob);
+    CHECK(out.capped);
+    CHECK(out.records.size() == kRoutesRowCap);
+    CHECK_FALSE(out.truncated); // capped is its own outcome, not a malformed read
+}
+
+#endif // __APPLE__

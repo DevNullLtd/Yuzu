@@ -402,4 +402,243 @@ inline RouteRow linux_route_to_row(const RtRouteFull& r, std::string interface) 
 
 #endif // __linux__
 
+#if defined(__APPLE__)
+
+// ── macOS: PF_ROUTE NET_RT_DUMP (all families) ───────────────────────────
+
+/// One decoded routing-socket route. Interface is the kernel's rtm_index; the
+/// impure leg resolves it to a name (if_indextoname), so this decoder stays pure.
+struct MacRoute {
+    bool is_ipv6 = false;
+    std::string destination;
+    unsigned prefix_len = 0;
+    std::string gateway; // empty = on-link (an AF_LINK gateway) or no gateway
+    int ifindex = 0;
+    int flags = 0; // rtm_flags
+};
+
+struct MacRoutesParse {
+    std::vector<MacRoute> records;
+    bool truncated = false; // a malformed record/chain was met; the table may be short
+    bool capped = false;    // stopped at kRoutesRowCap; the table is longer than reported
+};
+
+namespace routes_detail {
+
+// Routes that describe the HOST rather than the network's reachability, plus
+// per-neighbour and transient entries. Skipped for the same reason the Linux leg
+// skips the local table: an operator wants the configured routes, and the arp
+// action already owns neighbour entries (RTF_LLINFO).
+//   RTF_LLINFO    ARP / NDP neighbour entries
+//   RTF_WASCLONED host routes the kernel cloned from a CLONING route on demand
+//   RTF_MULTICAST / RTF_BROADCAST  group routes
+//   RTF_LOCAL     the host's own addresses
+inline constexpr int kMacSkipFlags =
+    RTF_LLINFO | RTF_WASCLONED | RTF_MULTICAST | RTF_BROADCAST | RTF_LOCAL;
+
+inline std::string mac_v4_text(const unsigned char* sa) {
+    char buf[INET_ADDRSTRLEN]{};
+    return ::inet_ntop(AF_INET, sa + offsetof(struct sockaddr_in, sin_addr), buf, sizeof(buf))
+               ? std::string{buf}
+               : std::string{};
+}
+
+/// KAME stores the interface scope of a link-local (or link/node-scoped multicast)
+/// address in bytes 2-3 of the address itself (`fe80:7::` is `fe80::%en0`). That
+/// is an encoding artefact, not part of the address — and it is the only place the
+/// scope lives in a dump — so it is cleared; the row's `interface` carries it.
+inline std::string mac_v6_text(const unsigned char* sa) {
+    unsigned char a[16]{};
+    std::memcpy(a, sa + offsetof(struct sockaddr_in6, sin6_addr), sizeof(a));
+    const bool link_local = a[0] == 0xfe && (a[1] & 0xc0) == 0x80;
+    const bool scoped_mc = a[0] == 0xff && ((a[1] & 0x0f) == 1 || (a[1] & 0x0f) == 2);
+    if (link_local || scoped_mc)
+        a[2] = a[3] = 0;
+    char buf[INET6_ADDRSTRLEN]{};
+    return ::inet_ntop(AF_INET6, a, buf, sizeof(buf)) ? std::string{buf} : std::string{};
+}
+
+/// Prefix length from a routing-socket netmask sockaddr. The kernel TRIMS these:
+/// `sa_len` covers only the bytes up to the last non-zero one, and everything
+/// past it is implicitly zero (a /0 mask has `sa_len` 0 or 4). The sockaddr
+/// family byte is not reliable here, so the DESTINATION's family decides the
+/// address width. Returns false for a non-contiguous mask.
+inline bool mac_mask_prefix(const unsigned char* sa, bool v6, unsigned& out) {
+    const std::size_t sa_len = sa[0];
+    const std::size_t addr_off =
+        v6 ? offsetof(struct sockaddr_in6, sin6_addr) : offsetof(struct sockaddr_in, sin_addr);
+    const std::size_t width = v6 ? 16 : 4;
+    const std::size_t avail = sa_len > addr_off ? std::min(width, sa_len - addr_off) : 0;
+    unsigned char bytes[16]{};
+    std::memcpy(bytes, sa + addr_off, avail);
+    unsigned ones = 0;
+    std::size_t i = 0;
+    for (; i < width && bytes[i] == 0xff; ++i)
+        ones += 8;
+    if (i < width) {
+        unsigned char b = bytes[i];
+        while (b & 0x80) {
+            ++ones;
+            b = static_cast<unsigned char>(b << 1);
+        }
+        if (b != 0)
+            return false; // a 1 bit after a 0 bit
+        for (++i; i < width; ++i)
+            if (bytes[i] != 0)
+                return false;
+    }
+    out = ones;
+    return true;
+}
+
+} // namespace routes_detail
+
+/**
+ * Decode a NET_RT_DUMP blob (address family 0 = IPv4 and IPv6 together) into the
+ * routes a reader could act on. Walk and bounds-check discipline is the SAME as
+ * parse_default_route_dump(): every rtm_msglen is checked against the remaining
+ * buffer, an unrecognised rtm_version stops the walk, every sockaddr's sa_len is
+ * bounds-checked before its bytes are read, the ROUNDUP unit is the fixed 4-byte
+ * routing-socket alignment, and every multi-byte header is memcpy'd. Any
+ * malformation sets `truncated` instead of looping or reading out of bounds.
+ *
+ * Skipped (see routes_detail::kMacSkipFlags): neighbour, cloned, group and
+ * host-own-address entries. A destination that is neither AF_INET nor AF_INET6 is
+ * skipped silently. A route with no netmask is a host route (full-length prefix).
+ * Stops at kRoutesRowCap kept routes and sets `capped`.
+ */
+inline MacRoutesParse parse_route_table_dump(std::span<const unsigned char> blob) {
+    MacRoutesParse out;
+    std::size_t off = 0;
+
+    while (off + sizeof(rt_msghdr) <= blob.size()) {
+        rt_msghdr hdr{};
+        std::memcpy(&hdr, blob.data() + off, sizeof(hdr));
+
+        if (hdr.rtm_msglen < sizeof(rt_msghdr) || off + hdr.rtm_msglen > blob.size() ||
+            hdr.rtm_version != RTM_VERSION) {
+            out.truncated = true;
+            break;
+        }
+
+        const unsigned char* rec_end = blob.data() + off + hdr.rtm_msglen;
+        const unsigned char* p = blob.data() + off + sizeof(rt_msghdr);
+
+        const unsigned char* sa_dst = nullptr;
+        const unsigned char* sa_gw = nullptr;
+        const unsigned char* sa_mask = nullptr;
+        bool chain_ok = true;
+
+        for (int i = 0; i < RTAX_MAX && p < rec_end; ++i) {
+            if (!(hdr.rtm_addrs & (1 << i)))
+                continue;
+            const std::size_t remaining = static_cast<std::size_t>(rec_end - p);
+            if (remaining < 2)
+                break; // the chain ends here — not an overrun
+            constexpr std::size_t kAlign = sizeof(std::uint32_t);
+            const std::size_t entry_len = p[0] ? p[0] : kAlign;
+            if (remaining < entry_len) {
+                out.truncated = true;
+                chain_ok = false;
+                break;
+            }
+            if (i == RTAX_DST)
+                sa_dst = p;
+            else if (i == RTAX_GATEWAY)
+                sa_gw = p;
+            else if (i == RTAX_NETMASK)
+                sa_mask = p;
+            const std::size_t adv = (entry_len + kAlign - 1) & ~(kAlign - 1);
+            if (adv > remaining) {
+                out.truncated = true;
+                chain_ok = false;
+                break;
+            }
+            p += adv;
+        }
+        off += hdr.rtm_msglen;
+
+        if (!chain_ok || sa_dst == nullptr)
+            continue;
+        if ((hdr.rtm_flags & routes_detail::kMacSkipFlags) != 0)
+            continue;
+
+        MacRoute rec;
+        rec.ifindex = hdr.rtm_index;
+        rec.flags = hdr.rtm_flags;
+        // A zero-length destination is the all-zero encoding of an IPv4 default
+        // (same reading as parse_default_route_dump()).
+        const unsigned sa_len = sa_dst[0];
+        const unsigned family = sa_len == 0 ? AF_INET : sa_dst[1];
+        if (family == AF_INET) {
+            rec.is_ipv6 = false;
+            if (sa_len == 0) {
+                rec.destination = "0.0.0.0";
+            } else if (sa_len >= sizeof(struct sockaddr_in)) {
+                rec.destination = routes_detail::mac_v4_text(sa_dst);
+            } else {
+                out.truncated = true;
+                continue;
+            }
+        } else if (family == AF_INET6) {
+            if (sa_len < sizeof(struct sockaddr_in6)) {
+                out.truncated = true;
+                continue;
+            }
+            rec.is_ipv6 = true;
+            rec.destination = routes_detail::mac_v6_text(sa_dst);
+        } else {
+            continue; // AF_LINK / AF_SYSTEM / anything else: not an IP route
+        }
+        if (rec.destination.empty()) {
+            out.truncated = true;
+            continue;
+        }
+
+        const unsigned full = rec.is_ipv6 ? 128u : 32u;
+        rec.prefix_len = full; // no netmask = a host route
+        if (sa_mask != nullptr && !routes_detail::mac_mask_prefix(sa_mask, rec.is_ipv6, rec.prefix_len)) {
+            out.truncated = true; // non-contiguous mask: never emit a guessed prefix
+            continue;
+        }
+
+        if (sa_gw != nullptr && sa_gw[0] != 0) {
+            if (sa_gw[1] == AF_INET && sa_gw[0] >= sizeof(struct sockaddr_in))
+                rec.gateway = routes_detail::mac_v4_text(sa_gw);
+            else if (sa_gw[1] == AF_INET6 && sa_gw[0] >= sizeof(struct sockaddr_in6))
+                rec.gateway = routes_detail::mac_v6_text(sa_gw);
+            // AF_LINK (`link#N`): on-link, no gateway address. Anything else: none.
+        }
+
+        if (out.records.size() >= kRoutesRowCap) {
+            out.capped = true;
+            break;
+        }
+        out.records.push_back(std::move(rec));
+    }
+
+    if (!out.capped && off < blob.size())
+        out.truncated = true;
+    return out;
+}
+
+/// Reduce a decoded macOS route to the cross-OS row. macOS has no route metric
+/// and no table id, and its only provenance is the RTF_STATIC / RTF_DYNAMIC bits:
+/// `origin` says `static` or `dynamic` when the kernel set one, else `other`.
+inline RouteRow mac_route_to_row(const MacRoute& r, std::string interface) {
+    RouteRow row;
+    row.ipv6 = r.is_ipv6;
+    row.destination = r.destination;
+    row.prefix_len = r.prefix_len;
+    row.gateway = r.gateway;
+    row.interface = std::move(interface);
+    row.type = (r.flags & RTF_BLACKHOLE) ? "blackhole" : (r.flags & RTF_REJECT) ? "reject" : "unicast";
+    row.origin = (r.flags & RTF_STATIC)                        ? "static"
+                 : (r.flags & (RTF_DYNAMIC | RTF_MODIFIED)) ? "dynamic"
+                                                                 : "other";
+    return row;
+}
+
+#endif // __APPLE__
+
 } // namespace yuzu::network_config
