@@ -24,7 +24,9 @@ This record covers the gateway agent listener (`:50051`) path through the gatewa
 | Rig run 4 (final gateway code) | `1e9c9784d` | real agents, released and branch builds, plaintext only, one rig (see "Rig run 4") |
 | Code commit of fix round 4 | `e3c9989b4` | test change only: the churn test now cleans up its 240 holder processes and waits for the racers before asserting (process leak measured at 228 per run before, 0 after); fix-agent runs: eunit 401 of 401, three runs from a fresh `_build/test`; dialyzer exit 0 |
 | Code commit of fix round 5 | `b19e4d818` | HELP text of the two heartbeat counters only; eunit 401 of 401 (one run from a fresh `_build/test`) and dialyzer exit 0 at this commit; not rig-run |
-| This record written at | `b19e4d818` plus the documentation commits of fix round 5 | none |
+| Code commit of fix round 7 | `61ca35a3d` | test change only: `handoff_gap_rejects_then_admits` pins the `take_pending` to `register_agent` gap (admitted in the pending window, rejected as `unknown_session` after `take_pending`, admitted again after `register_agent/7`); fix-agent runs: eunit 402 of 402 (three runs from a fresh `_build/test` with `YUZU_REQUIRE_TLS_TESTS=1` exported) and dialyzer exit 0; the test fails when `take_pending` stops consuming the row; not rig-run |
+| CI change | `f420c2318` | the `linux` job of `ci.yml` sets `YUZU_REQUIRE_TLS_TESTS=1`; the Windows and macOS legs do not; not run in CI at the time of writing |
+| This record written at | `61ca35a3d` plus the documentation and CI commits of the final rounds | none |
 
 `2e884bb9b` and `1c145d78a` differ only in tests and documentation, so the gateway source on both rig runs is the same. The later fix commits were **not** run on a rig and are covered by the eunit suite only. Round 1: `605f117d2` (the session index calls tolerate a missing table), `3431d20ea` (`/readyz` reports `sessions_index`) and `026830cd9` (the rejection-summary log state is created at boot). Round 2 code commits: `e139c5e86` (boot-wiring test and two source comments), `9ad473534` (mismatch counter HELP wording), `942fe5770` and `c2d040a66` (test changes) and `ab3986ec1` (comments). The round-3 code commit `21125cc3b` changes a source comment, the `yuzu_gw_heartbeat_rejected_total` HELP text and tests only. Rig run 4 then exercised the gateway source at `1e9c9784d` (the boot path included). The commits after `1e9c9784d` (`050703fcc`, `e3c9989b4`, `b19e4d818` and the documentation commits of fix round 5) change tests, documentation and HELP text only, and were **not** run on a rig.
 
@@ -98,7 +100,7 @@ Gateway source `1e9c9784d`, a release build; C++ agent built from the branch tre
 
 ## Automated results (from the review notes)
 
-At the round-4 test commit `e3c9989b4` and the round-5 HELP commit `b19e4d818` (fix-agent runs, not rig runs): eunit 401 of 401 (three runs from a fresh `_build/test` at `e3c9989b4`, one at `b19e4d818`), dialyzer exit 0 at both.
+At the round-4 test commit `e3c9989b4` and the round-5 HELP commit `b19e4d818` (fix-agent runs, not rig runs): eunit 401 of 401 (three runs from a fresh `_build/test` at `e3c9989b4`, one at `b19e4d818`), dialyzer exit 0 at both. At the handoff-gap test commit `61ca35a3d`: eunit 402 of 402, three runs from a fresh `_build/test` with `YUZU_REQUIRE_TLS_TESTS=1` exported, dialyzer exit 0.
 
 At the post-round-2 tip `ab3986ec1`, run by the fix agents (these are not rig runs):
 

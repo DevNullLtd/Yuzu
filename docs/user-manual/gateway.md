@@ -393,8 +393,8 @@ state created at boot), the round-2 code commits `e139c5e86` (boot test and two
 source comments), `9ad473534` (counter HELP wording), `942fe5770` and `c2d040a66`
 (test changes) and `ab3986ec1` (comments), and the round-3 code commit `21125cc3b` (a source
 comment, the `yuzu_gw_heartbeat_rejected_total` HELP text and tests). The commits after
-`1e9c9784d` (`050703fcc`, `e3c9989b4`, `b19e4d818`, `b497ead98` and later documentation and test
-commits) change tests, documentation and HELP text only, and were not run on a rig. At `ab3986ec1` the fix agents ran eunit (401 of 401,
+`1e9c9784d` (`050703fcc`, `e3c9989b4`, `b19e4d818`, `b497ead98` and later documentation, test and CI
+commits) change tests, documentation, HELP text and the `ci.yml` environment only, and were not run on a rig. At `ab3986ec1` the fix agents ran eunit (401 of 401,
 three times from a fresh build) and dialyzer (clean); these were not rig runs. The per-run record is in
 [the evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 
