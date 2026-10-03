@@ -70,7 +70,7 @@ struct SoftwareEntry {
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
     std::string kind;      // "package" | "app" | "pkg" | "feat" (agent-side vocabulary)
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|brew|optional_feature
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;

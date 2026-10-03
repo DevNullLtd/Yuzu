@@ -276,7 +276,7 @@ the upgrade is a full one. It arrives at the agent's existing phase-spread slot
 (within about 24 h), not all at once, and carries the new rows; hash-skip
 resumes afterwards.
 
-Today it is queried with **direct SQL**, e.g.:
+The inventory is queried today with **direct SQL**, e.g.:
 
 ```sql
 -- Which devices have Google Chrome, and what version?
@@ -552,7 +552,11 @@ Typical causes: Windows DISM busy or `api_unavailable` (the
 constrained Homebrew read on macOS. The warning names the action and the
 reason. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
 after two missed daily cycles; fix the failing action, or remove its plugin,
-and the next daily sync recovers.
+and the next daily sync recovers. A warning of the form `sync: <plugin>.<action>
+read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
+action failure: that host reports more software rows than one report can carry,
+so its report is skipped rather than sent truncated; review the host's
+inventory rather than removing a plugin.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

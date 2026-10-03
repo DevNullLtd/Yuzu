@@ -2262,7 +2262,7 @@ public:
                             std::make_shared<SyncScheduler>(cfg_.agent_id, kv_get, kv_set, sender);
                         SyncScheduler& scheduler = *scheduler_ptr;
                         // Clear the sync-on-demand handle on EVERY exit of this thread
-                        // (normal stop, or a throw out of tick()) so the command loop
+                        // (normal stop, or a throw outside the tick firewall below) so the command loop
                         // never arms a scheduler whose thread is gone.
                         ScopeExit clear_sync_handle{[this]() {
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
