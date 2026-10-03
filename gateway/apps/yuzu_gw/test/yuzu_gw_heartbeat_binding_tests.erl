@@ -55,6 +55,8 @@ binding_test_() ->
        fun pending_without_key_rejected/0},
       {"pending session past its TTL is rejected",
        fun pending_expired_rejected/0},
+      {"take_pending to register_agent gap: rejected, then admitted again",
+       fun handoff_gap_rejects_then_admits/0},
       {"replacement: the old session is rejected, the new one admitted only on its own connection",
        fun replacement_binding/0},
       {"cleanup of a superseded process leaves the newer session bound",
@@ -270,6 +272,40 @@ pending_expired_rejected() ->
     ?assertEqual(0, queued()),
     assert_events([reject_event(unknown_session)]),
     true = ets:delete(?PENDING, S).
+
+%% Subscribe consumes the pending row (take_pending/1) and only then starts
+%% the agent process, whose init publishes the session row (register_agent/7).
+%% In between neither row exists, so a heartbeat is rejected as
+%% unknown_session. That is accepted and documented (ADR-2002 7c lifecycle
+%% table): the agent's next heartbeat is admitted without re-registering.
+%% The steps are driven by hand, so the gap is deterministic.
+handoff_gap_rejects_then_admits() ->
+    A = uid(<<"a">>),
+    S = uid(<<"s">>),
+    ok = yuzu_gw_registry:store_pending(S, #{agent_id => A, conn_key => conn_a}),
+    %% Before the take: admitted through the pending window.
+    ?assertMatch({ok, _, _}, beat(conn_a, S)),
+    ?assertEqual(1, queued()),
+    assert_events([]),
+    %% The Subscribe consume: the gap opens.
+    ?assertMatch(#{agent_id := A}, yuzu_gw_registry:take_pending(S)),
+    ?assertEqual(error, yuzu_gw_registry:lookup_session(S)),
+    ?assertEqual(error, yuzu_gw_registry:lookup_pending_session(S)),
+    ?assertEqual(rejected(), beat(conn_a, S)),
+    ?assertEqual(1, queued()),
+    assert_events([reject_event(unknown_session)]),
+    %% The agent process publishes its session row: the gap closes.
+    P = bind(A, S, conn_a),
+    ?assertMatch({ok, #{agent_id := A, pid := P, conn_key := conn_a}},
+                 yuzu_gw_registry:lookup_session(S)),
+    ?assertMatch({ok, _, _}, beat(conn_a, S)),
+    ?assertEqual(2, queued()),
+    assert_events([]),
+    %% Still bound to its own connection only, and one row for the agent.
+    ?assertEqual(rejected(), beat(conn_b, S)),
+    assert_events([mismatch_event()]),
+    ?assertEqual([[S]], ets:match(?SESSIONS, {'$1', A, '_', '_'})),
+    exit(P, kill).
 
 %%%===================================================================
 %%% Lifecycle

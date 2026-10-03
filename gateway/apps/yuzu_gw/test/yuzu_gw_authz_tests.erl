@@ -262,9 +262,9 @@ setup_certs(BaseDir) ->
 %% setup_certs/0,1 returned `{error, Why}'. EUnit has no skip primitive, so
 %% the choices are no tests (the case count visibly drops, and the skip is
 %% announced on the console) or a failing test. It fails when the environment
-%% variable YUZU_REQUIRE_TLS_TESTS is `1', which a CI leg expected to carry
-%% openssl should set (none does yet), so a broken toolchain cannot pass as a
-%% green run.
+%% variable YUZU_REQUIRE_TLS_TESTS is `1'. The `linux' job of ci.yml sets it;
+%% the Windows and macOS legs do not. A broken toolchain on a leg that sets it
+%% cannot pass as a green run.
 -spec certs_unavailable(string(), term()) -> [{string(), fun(() -> any())}].
 certs_unavailable(Label, Why) ->
     Reason = lists:flatten(io_lib:format("~p", [Why])),
