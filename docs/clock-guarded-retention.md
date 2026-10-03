@@ -389,6 +389,184 @@ Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a
 regenerable observability aid, not compliance evidence, so a from-boot skewed clock deleting a batch
 of already-consumed mappings is an acceptable worst case.
 
+### `ExecutionTracker::reap_stuck_running_executions` (#4982 Part B, fix round 2)
+
+Diverges from this file's two DELETE-based siblings immediately above in kind, not just detail: this
+sweep **MUTATES** live `execution_tracker.executions` rows (cancels a `running`/`agents_targeted=0`
+row past a 30-minute window, excluding anything with a still-`pending` `command_outbox_store.outbox`
+entry) rather than deleting from a regenerable observability table, so its part-1/part-4 choices
+invert theirs:
+
+1. **Would-wipe IS ADOPTED** (unlike `reap_command_execution_mappings`/`reap_event_outbox` above,
+   which decline it). Their tables drain to 100% expiry as ROUTINE behaviour, so a would-wipe verdict
+   there cannot separate a true positive from ordinary drain. This sweep's candidates are the
+   opposite: a healthy fleet's running executions resolve `agents_targeted>0` within seconds, so
+   candidates should always be a SMALL minority of the running population — a pass whose candidates
+   are a LARGE fraction (`kStuckExecWouldWipeRatio = 0.5`, floored at `kStuckExecWouldWipeFloor = 20`
+   total running executions below which the ratio is too noisy to mean anything) is evidence of a
+   systemic bookkeeping bug (e.g. a broad regression in a synchronous dispatch call site's own
+   `set_agents_targeted` call), not a genuine backlog, and acting on it risks mass-cancelling live
+   work.
+4. **Fact-set anomaly dedup IS ADOPTED, at a DELIBERATELY simpler width than `GatewayRouteStore`'s.**
+   The original Part B implementation carved this part out entirely (matching the DELETE-based
+   siblings) — and wedged PERMANENTLY after any routine >24h clock gap (a weekend, a DR failover,
+   extended maintenance) as a result: a decline never advances the primary `stuck_exec_reap_anchor`,
+   so `now_s - anchor` only GROWS on every later pass with no recovery path short of an operator
+   hand-editing `reap_meta`. This is the identical defect class `GatewayRouteStore::reap_stale_routes`
+   above was fixed for (PR #4299). The fix round 2 correction adds a SECOND persisted marker,
+   `stuck_exec_reap_declined = "<anchor>:<direction>"` (direction ∈ forward|backward) — a REPEAT
+   anomaly at the exact SAME (anchor, direction) as a marker armed by a full prior decline pass
+   re-anchors to the CURRENT `now_s` UNCONDITIONALLY and runs the ordinary would-wipe/candidate/cancel
+   logic for that pass (a genuine backlog then drains gradually across passes under the same cap,
+   never trusted all at once); a DIFFERENT-direction anomaly at that frozen anchor, or the very first
+   occurrence of any anomaly, still declines and arms/re-arms the marker against its own (anchor,
+   direction) — mirroring GatewayRouteStore's own direction-keyed fix (a value-only match let an
+   unrelated different-direction anomaly free-ride a frozen anchor and recover against a corrupted
+   reading, that store's round-2 external-review defect).
+
+   **Part-6 recovery mechanism (the doc's own "record which way you went" philosophy, applied to a
+   SECOND question this row's own history raised — not just the missing-anchor one below).**
+   DELIBERATELY OMITTED here: GatewayRouteStore's third marker field, `first_now_ms` (the reading an
+   anomaly was FIRST observed at), which bounds recovery to a real-time-plausible PERSISTENCE INTERVAL
+   rather than a bare (anchor, direction) match — without it, an ε-later second-replica pass reading
+   the SAME frozen marker recovers with zero persistence evidence (that store's own round-4 fix). This
+   gap is real in general but judged SAFE to omit for THIS sweep specifically: a too-eager recovery
+   here can only feed a still-corrupted `now_s` into the SAME would-wipe ratio guard and the SAME
+   unconditional per-pass cap (`kStuckExecReapCap = 500`) this sweep already carries for every
+   accepted pass — a spuriously-huge cutoff makes candidates a LARGE fraction of all running
+   executions (would-wipe's own job to catch) rather than a targeted, silent mass-cancel, and the
+   blast radius is additionally capped at 500 ATOMICALLY-rechecked rows, each individually
+   re-verified against LIVE state at cancel time (the fix round 2 TOCTOU close, below) — never a bare
+   cutoff-matched DELETE/UPDATE the way GatewayRouteStore's own route-tombstone sweep is.
+   GatewayRouteStore has neither safety net for its own sweeps, which is why ITS omission of this
+   field was genuinely unsafe. If a future change ever removes any of these safety nets here, this
+   omission must be re-examined against the same reasoning GatewayRouteStore's own entry above
+   records.
+
+   **Round-3 correction — the would-wipe FLOOR is not a safety net on a recovery pass.** The
+   paragraph above originally claimed the blast radius was bounded "even below the would-wipe
+   floor" by the per-pass cap alone — that was wrong: the floor (`kStuckExecWouldWipeFloor = 20`)
+   exists to SKIP the ratio check entirely on a small running population, so on a fleet with fewer
+   than 20 running executions, a corrupted recovered `now_s` could make its ENTIRE running
+   population look stuck with no ratio check to decline the pass — the 500-row cap does not help
+   here, since the affected population is already smaller than the cap. Fixed by bypassing the
+   would-wipe FLOOR (never the ratio itself) specifically on a pass that took the recovery branch
+   above (`recovering_from_clock_anomaly` in `execution_tracker.cpp`) — a recovered reading is, by
+   construction, one this sweep already judged untrustworthy once, so the small-population
+   noise-floor reasoning that justifies skipping the ratio check on an ORDINARY clean pass does not
+   apply to it. The 50% ratio check is unchanged and still applies on every recovery pass, so the
+   bound this omission now rests on is "at most a minority of the running population, of any size,
+   per recovery pass" — the same bound an above-floor ordinary pass already carries.
+
+   **Round 4/5 note — the floor-bypass residual is scoped to ONLY the recovery pass itself, recorded
+   as an accepted trade-off, not fixed.** Both round-4 adversarial reviewers (graded MEDIUM,
+   non-blocking) flagged that a PERSISTENT, multi-pass corrupt clock on a below-floor fleet re-enters
+   the floor's ordinary ratio-skip on the pass immediately AFTER recovery (the marker is cleared once
+   recovery fires, so a second bad reading right behind the first is not itself covered) — a residual
+   this branch narrows relative to the pre-fix permanent wedge, not one it introduces. The
+   fully-robust fix is the same GatewayRouteStore-style persisted `first_now_ms` distrust window
+   `DELIBERATELY OMITTED` above, spanning multiple passes rather than one; it remains future,
+   separately-scoped work rather than part of this round.
+
+**Claim+mutate atomicity (fix round 2, not a clock-guard part but load-bearing for the SINGLE-WRITER
+rule above).** The original Part B design selected candidates under the advisory lock, then cancelled
+each one via a separate post-commit `mark_cancelled()` call after the lock released — a TOCTOU window
+in which a candidate could receive a genuine dispatch between the select and the cancel (force-
+cancelling a live, still-executing command), and a window in which two replicas could each acquire the
+lock in sequence and both select overlapping candidates, exceeding the declared cap fleet-wide per
+cadence. Fix round 2 moves the ENTIRE claim+mutate sequence — candidate select, would-wipe check, and
+a single atomic `UPDATE ... RETURNING id` re-checking the FULL candidate predicate (not just a
+terminal-status guard) — inside the SAME lock-held transaction, and switches the advisory lock itself
+from blocking to `pg_try_advisory_xact_lock` (all-but-holder skip, matching this store's
+`reap_event_outbox` sibling and `GatewayRouteStore`'s own idiom) so a losing replica's maintenance tick
+is never stalled waiting on it.
+
+**Clock-authority caveat (still open, PR #5226 review round 2, Doomgoose).** This sweep's cutoff is
+PG `now()` read in-SQL, but `dispatched_at` — the column the cutoff is compared against — is written
+from the caller's replica `system_clock` in the common case (`create_execution`'s `now` fallback,
+`execution_tracker.cpp`), not PG `now()`. This is the same clock-domain split the
+`concurrency_claims` reconciler's own caveat above describes, and it is NOT yet met here either —
+unlike that reconciler, though, this sweep stays classed **ReplicaSafe**, not `DisabledUntilFixed`,
+because its blast radius on a multi-replica deployment is independently bounded by the would-wipe
+ratio/floor and the per-pass row cap regardless of which replica's clock a given `dispatched_at` came
+from — a mis-cancelled row is still capped at 500 per pass and still excluded if it carries a real
+agent response. A replica meaningfully behind on `system_clock` can still see a fresh dispatch as
+already past the stuck-exec window sooner than a correctly-clocked replica would. Not fixed; stamping
+`dispatched_at` from PG `now()` at `INSERT` time (mirroring the `concurrency_claims` migration, WS-1
+class, #3715 shape, tracked #4093) is the closing move for both.
+
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a dispatch that is
+genuinely still stuck survives to the next pass regardless of whether this one's cutoff arithmetic
+used a fresh or a from-boot-skewed clock, so acting on the first pass against an unverified clock is
+an acceptable worst case, bounded by the same would-wipe/cap guards as any other pass.
+
+**Upstream candidate-predicate race (fix round 3, #4982) — closed at the SOURCE, not by widening the
+predicate.** Fix round 2's atomic `UPDATE ... RETURNING id` above re-checks `status='running' AND
+agents_targeted=0 AND NOT EXISTS <pending outbox row>` at mutation time and calls that the "full
+candidate predicate" (as of round 3 — a governance Gate 2 fix below adds a THIRD clause; read that
+entry too before treating this round-3 description as current) — but that predicate is only trustworthy if a `'sent'` outbox row genuinely
+implies its execution's `agents_targeted` bookkeeping is settled. It was not: `command_outbox_delivery.cpp`
+called `CommandOutboxStore::mark_sent` (outbox `pending → sent`) and
+`ExecutionTracker::set_agents_targeted` as two SEPARATE autocommit statements. Between the two
+commits, a genuinely in-flight, successfully-dispatched command read `state='sent'` (excluded by the
+outbox clause) with `agents_targeted` still 0 (matching the predicate's own clause) — a false
+candidate for a command that was, in truth, still being delivered/executed, force-cancelled with no
+kill RPC ever sent. Fixed by `CommandOutboxStore::mark_sent_with_target`
+(`command_outbox_store.{hpp,cpp}`): the sent-transition and the real `agents_targeted` count now
+commit in ONE cross-schema transaction on this store's own pool — the same single Postgres
+instance/database this reaper's own cross-schema `NOT EXISTS command_outbox_store.outbox` read
+already relies on — so no reader can ever observe the two half-applied. A DB/lease failure on either
+half rolls BOTH back (the occurrence stays `pending`, re-driven next tick; the agent's `command_id`
+dedup, WS-0, absorbs the harmless re-send) rather than leaving `mark_sent` committed with
+`agents_targeted` unset. This is a NEW instance of the general lesson every entry in this file
+teaches: a reaper's own predicate can be perfectly correctly re-checked and still race, if the WRITE
+SIDE it depends on is allowed to commit as two independent halves.
+
+**Corrupt persisted-anchor self-heal (fix round 7, #4982) — closes a permanent wedge distinct from
+the skew-recovery marker above.** The skew-recovery marker (round 2, above) rescues a `now_s` that
+reads implausibly against a PARSEABLE persisted anchor. It cannot rescue an anchor that is itself
+unparseable or negative — that branch returned `clock_anomaly = true` without touching
+`stuck_exec_reap_anchor` or `stuck_exec_reap_declined`, and precedes the skew-marker read entirely, so
+an anchor corrupted by storage damage, a bad migration, or a manual repair gone wrong took that same
+branch on every future pass with no recovery path short of an operator hand-editing `reap_meta` — the
+identical permanent-wedge class this file's `GatewayRouteStore::reap_stale_routes` entry above already
+fixed for its own sibling anchor. Fixed by mirroring that sibling's corrupt-anchor branch exactly: on
+an unparseable/negative persisted anchor, clear `stuck_exec_reap_declined` and re-anchor
+`stuck_exec_reap_anchor` to THIS pass's own already-sanitised `now_s`, in the same transaction,
+declining only that one pass. Deliberately NOT drain-on-repeat, matching the sibling's own reasoning:
+a garbage anchor is not evidence of genuine elapsed downtime the way a persisting skew is, so the
+repaired pass still declines the actual sweep and the NEXT pass is the first to act on the healed
+anchor.
+
+**Real-agent-response exclusion (governance Gate 2 fix, #4982, BLOCKING, security-guardian,
+empirically reproduced) — the candidate predicate gains a THIRD clause.** The round-3 fix above
+closed the race against the WRITE side (`mark_sent`/`set_agents_targeted` committing as two
+halves) for an OUTBOX-originated dispatch. It said nothing about a SYNCHRONOUS REST/MCP dispatch
+that never touches the outbox at all: if that dispatch genuinely reached one or more agents (real
+responses recorded in `agent_exec_status` via `update_agent_status`, independently of
+`agents_targeted`) but the dispatcher's OWN `set_agents_targeted` bookkeeping write failed,
+`agents_targeted` stayed `0` forever — `refresh_counts_once`'s terminal transition requires
+`agents_targeted > 0` to ever fire — and this sweep force-cancelled that row at the 30-minute mark
+regardless of how many agents actually succeeded, since nothing in the predicate checked for a
+real response. Reproduced: 3 genuine `SUCCESS` responses recorded, `agents_targeted` never set,
+the sweep still cancelled the row and published a terminal `execution-completed` event
+misrepresenting a working execution as cancelled.
+
+Fixed by a third shared clause, `kNoAgentResponseExistsClause` (`execution_tracker.cpp`, same
+file-scope anonymous-namespace shape as the window/cap constants above): `NOT EXISTS (SELECT 1
+FROM execution_tracker.agent_exec_status WHERE execution_id = executions.id)`, `AND`-ed into all
+THREE predicate occurrences (the candidate-count SELECT, the candidate-select SELECT, and the
+atomic cancel UPDATE's own re-check). **This does NOT narrow Part B's original scope**: a dispatch
+refused BEFORE any agent was ever reached (a degraded pre-dispatch quota check, zero agents
+matched the target scope, a dispatch exception, a lost `create_pending` race — Part B's actual
+target population) has ZERO `agent_exec_status` rows, so the new clause is vacuously satisfied and
+such a row is still recovered exactly as before. Only a row with at least one genuine per-agent
+response is now additionally excluded — and that exclusion is permanent, by design: leaving a row
+with a real response wedged (the pre-fix behaviour, now narrowed to exactly this population) is
+strictly safer than falsely cancelling it, since there is no repair path today that re-derives
+`agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
+(force-cancels the row) with the clause removed from all three sites, and passes with it restored.
+
 ### `guardian_lifecycle_journal.cpp`
 
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do

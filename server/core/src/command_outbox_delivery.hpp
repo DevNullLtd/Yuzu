@@ -33,10 +33,11 @@
 ///  `approval_id` and stamped here (this loop is the declared #1398 stamping
 ///  site for outbox dispatch — see `dispatch_caller.hpp`'s closed list).
 ///
-///  Fenced marks — `mark_sent` / `mark_failed` / `reschedule` embed the leader
-///  epoch (read once per tick from the elector). A stale ex-leader is fenced out
-///  of the state change; the row stays `pending` for the true leader (the
-///  duplicate send it may already have made is absorbed by command_id dedup).
+///  Fenced marks — `mark_sent` / `mark_sent_with_target` / `mark_failed` /
+///  `reschedule` embed the leader epoch (read once per tick from the
+///  elector). A stale ex-leader is fenced out of the state change; the row
+///  stays `pending` for the true leader (the duplicate send it may already
+///  have made is absorbed by command_id dedup).
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
 /// historical discipline): a systemic transient gate/directory failure
@@ -44,8 +45,13 @@
 /// degraded `GatewayRouteStore::lookup_routes` read; both mean "the read
 /// itself could not answer", never "answered no") → `reschedule` with
 /// back-off (retry, DON'T mark sent); authority revoked → `mark_failed`;
-/// every other outcome — including `sent == 0` because the targeted agents
-/// are offline right now — → `mark_sent`
+/// a genuine dispatch with an execution row to bookkeep (`sent > 0`) →
+/// `mark_sent_with_target` (#4982 round 3 — the sent-transition and the
+/// execution's real `agents_targeted` count commit ATOMICALLY, closing a
+/// race where a reaper pass could observe the two half-applied and
+/// force-cancel a still-executing command); every other outcome — `sent == 0`
+/// because the targeted agents are offline right now, or no execution row to
+/// bookkeep at all — → plain `mark_sent`
 /// (a missed occurrence is recorded and skipped, never spun into a backlog).
 
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance
@@ -55,6 +61,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -124,6 +131,49 @@ public:
 private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);
     void audit(const OutboxCommand& c, const std::string& result, const std::string& detail);
+
+    /// governance Gate 4+ systematic fix (unhappy-path BLOCKING finding, then
+    /// a security-guardian sibling sweep across every mark_cancelled call
+    /// site in this file): the SOLE chokepoint for cancelling an occurrence's
+    /// execution row on an automatic (never operator-initiated) terminal
+    /// path. A redriven occurrence — route_unreadable/containment_unreadable
+    /// rescheduling EVEN WHEN outcome.sent > 0, a mark_sent_with_target
+    /// degrade rolling a genuine dispatch's bookkeeping back, or tick()'s own
+    /// catch-and-reschedule after a partial-send throw — can reach ANY
+    /// terminal branch in deliver() on a LATER tick for an execution_id that
+    /// already has a real agent_exec_status response from an earlier
+    /// attempt. Never force-cancel that row: declining toward NOT cancelling
+    /// (an undeterminable check, or an existing response) is strictly safer
+    /// than falsely cancelling a genuinely-dispatched execution — the
+    /// stuck-reap sweep's own kNoAgentResponseExistsClause exclusion then
+    /// correctly leaves such a row alone forever. Every one of this file's
+    /// mark_cancelled call sites MUST route through this method, never a
+    /// direct call — a fifth inline copy of this same three-way check is the
+    /// fork pattern this repo treats as a finding in its own right.
+    enum class ExecCancelOutcome {
+        kCancelled,        ///< no prior response existed; mark_cancelled_checked cancelled it.
+        kAlreadyTerminal,  ///< no prior response existed; the row was already terminal (or
+                           ///< unknown) by the time of the check — a benign race with some
+                           ///< other terminal writer, not a failure. Never counted/logged as one
+                           ///< (governance Gate 8 re-review, Doomgoose PR #5226 round 2).
+        kCancelFailed,      ///< no prior response existed; mark_cancelled_checked itself failed
+                           ///< (already counted/logged by this method).
+        kDeclinedHasResponse, ///< a real agent_exec_status response already exists —
+                              ///< the execution row is left 'running', untouched.
+        kDeclinedDegraded,    ///< the agent_exec_status check itself degraded — declines
+                              ///< toward safety, retried on a later pass.
+    };
+    /// Precondition (governance Gate 8 re-review, cpp-safety NICE): every
+    /// caller MUST guard `d_.execution_tracker != nullptr` (and a non-empty
+    /// execution_id) itself before calling — this method dereferences it
+    /// unconditionally. All 4 current call sites already do; this is not
+    /// re-checked here so a caller's own guard stays the single source of
+    /// truth for whether this occurrence has an execution row to bookkeep
+    /// at all.
+    ExecCancelOutcome decline_or_cancel_exec(const std::string& execution_id,
+                                             const std::string& principal,
+                                             const std::string& occurrence_id,
+                                             std::string_view context);
     void count(const char* name);
     // Labeled companion to count(): the bare counter above stays a single
     // series (dashboards/alerts-in-waiting keep working unchanged), while this

@@ -85,6 +85,7 @@
 #include <cstring>
 #include <ctime>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <regex>
@@ -1554,7 +1555,7 @@ const std::string& openapi_spec() {
     },
     "/result-sets": {
       "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
-      "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string"}}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}}}
+      "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted). When device_ids is non-empty, the route additionally gates that field through the admit-then-filter Infrastructure:Read chokepoint (fleet_read_fn, ADR-0017) — a request that omits device_ids (or supplies an empty array) is unaffected and pays no extra cost (#4983).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 256}, "description": "The initial member set. Each entry is capped at 256 bytes (400 RESULT_SET_DEVICE_ID_TOO_LONG, checked before the existence/scope lookup below). #4983: every entry must name a device that exists and is visible to the caller's own scope (checked via the Infrastructure:Read fleet_read_fn chokepoint, ADR-0017) -- a nonexistent or out-of-scope id rejects the WHOLE request (400 RESULT_SET_UNKNOWN_DEVICE_ID), never a silent drop or a partial create"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, a device_ids entry exceeding 256 bytes (RESULT_SET_DEVICE_ID_TOO_LONG), device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), device_ids contains an id that does not exist or is not visible to the caller (RESULT_SET_UNKNOWN_DEVICE_ID -- rejects the whole request, checked only when device_ids is non-empty), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE -- the device_ids existence/scope check itself is unwired or its backing agent registry is unavailable; only reachable when device_ids is non-empty, a request without it is unaffected"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
         // #4980 service-scope 403 description addition below pushed this
@@ -1975,6 +1976,8 @@ void RestApiV1::register_routes(
     UserExistsFn user_exists_fn = user_exists_fn_;
     // #4981 PR-2 — see set_scope_evaluate_fn's doc comment in the .hpp.
     ScopeEvaluateFn scope_evaluate_fn = scope_evaluate_fn_;
+    // #4983 — see set_all_agent_ids_fn's doc comment in the .hpp.
+    AllAgentIdsFn all_agent_ids_fn = all_agent_ids_fn_;
 
     // #1788: resolve the caller's confinement set on a route whose PRIMARY
     // authorization is the per-target `scoped_perm_fn` gate — the TAR retention
@@ -10989,6 +10992,13 @@ void RestApiV1::register_routes(
             if (!quota.has_value()) {
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982: log-only swallowed the failure with no observable
+                    // signal — count it alongside the log line at every call site.
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 // #4306 gov-4306-S7: bare (unlabeled) refusal counter.
                 // Deliberately minimal, not the full
@@ -11017,6 +11027,12 @@ void RestApiV1::register_routes(
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
                                      " execution_id=" + exec_id);
@@ -11048,6 +11064,12 @@ void RestApiV1::register_routes(
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled also failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 500, "RESULT_SET_DISPATCH_FAILED: dispatch raised");
                 return;
@@ -11073,6 +11095,12 @@ void RestApiV1::register_routes(
                 // confinement rationale above.
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 rs_err(res, 503,
                        "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
@@ -11082,6 +11110,12 @@ void RestApiV1::register_routes(
             }
             if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
                 spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+                // #4982
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "set_agents_targeted"}, {"surface", "rest"}})
+                        .increment();
             }
 
             CreateRequest cr;
@@ -11101,6 +11135,12 @@ void RestApiV1::register_routes(
                 // was sent (review B5; mirrors the throw / no-agents paths).
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
                     spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // #4982
+                    if (metrics_registry)
+                        metrics_registry
+                            ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                      {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                            .increment();
                 }
                 if (created.error() == ResultSetError::DbError) {
                     // #4306 fold-in B: this is a SERVER fault after a real
@@ -11210,8 +11250,8 @@ void RestApiV1::register_routes(
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
                   [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
-                   load_owned, deny_fleet_wide_service_scoped, tier_ok](const httplib::Request& req,
-                                                               httplib::Response& res) {
+                   load_owned, deny_fleet_wide_service_scoped, tier_ok, fleet_read_fn,
+                   all_agent_ids_fn](const httplib::Request& req, httplib::Response& res) {
             // guardian-confinement-2298 PR3 §3e sweep finding — same cross-
             // service reach as the GET list above (session->username-keyed,
             // not token-scope-keyed): a service-scoped token could create
@@ -11348,9 +11388,38 @@ void RestApiV1::register_routes(
 
             std::vector<std::string> members;
             if (body.contains("device_ids") && body["device_ids"].is_array()) {
-                for (const auto& d : body["device_ids"])
-                    if (d.is_string())
-                        members.push_back(d.get<std::string>());
+                for (const auto& d : body["device_ids"]) {
+                    if (!d.is_string())
+                        continue;
+                    auto member = d.get<std::string>();
+                    // Gate 3 SHOULD (cpp-expert, #4983 fix round): bound each
+                    // entry to MCP's own kResultSetDeviceIdMaxLen -- up to
+                    // kMaxCitedBadIds (20) of these caller-supplied strings
+                    // get echoed back into the RESULT_SET_UNKNOWN_DEVICE_ID
+                    // body below. Harmless for REST's JSON body, but the
+                    // dashboard fragment's identical echo lands in an
+                    // HX-Trigger response HEADER (see result_set_routes.cpp),
+                    // where header size is a real protocol/proxy ceiling --
+                    // apply the same cap here too for consistency. Reject
+                    // early rather than truncate the echo, matching how this
+                    // route already bounds name/source_kind/parent_id above.
+                    if (member.size() > yuzu::server::mcp::kResultSetDeviceIdMaxLen) {
+                        // Gate 4 BLOCKING (#4983 fix round): audited on the
+                        // same action/outcome/"reason=..." shape as the
+                        // parent_id-too-long guard above -- this branch
+                        // (added in the immediately-preceding fix-round
+                        // commit) reproduced the identical unaudited-
+                        // rejection defect the parent_id/unknown_device_id
+                        // guards were fixed for earlier in this same round.
+                        audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                 "reason=device_id_too_long");
+                        rs_err(res, 400,
+                               std::format("a device_ids entry exceeds {} bytes",
+                                           yuzu::server::mcp::kResultSetDeviceIdMaxLen));
+                        return;
+                    }
+                    members.push_back(std::move(member));
+                }
             }
             // Reject an oversized array before the store dedups it under its
             // write lock — bounds the DoS from a giant device_ids body (B4).
@@ -11359,6 +11428,99 @@ void RestApiV1::register_routes(
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
                 rs_err(res, 400, to_string(ResultSetError::TooManyMembers));
                 return;
+            }
+
+            // #4983: full existence + scope check on a non-empty device_ids.
+            // Scoped to fire ONLY when device_ids was actually supplied and
+            // non-empty — a caller who never uses this field (an empty/
+            // nameless-membership set) sees zero behavior change and pays no
+            // extra gate cost.
+            if (!members.empty()) {
+                if (!fleet_read_fn) {
+                    spdlog::error("result_set.create: fleet_read_fn unwired — misconfigured "
+                                  "call site; failing closed");
+                    // Gate 4 SHOULD (#4983 fix round): the fragment's twin of
+                    // this misconfiguration branch already audits; this one
+                    // didn't. "reason=" matches this handler's own established
+                    // convention (see the length-cap/unknown_device_id guards).
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=fleet_read_fn_unwired");
+                    rs_err(res, 503,
+                           "RESULT_SET_STORE_UNAVAILABLE: device visibility check unavailable");
+                    return;
+                }
+                auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote 401/403/503
+
+                if (!all_agent_ids_fn) {
+                    spdlog::error("result_set.create: all_agent_ids_fn unwired — misconfigured "
+                                  "call site; failing closed");
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=all_agent_ids_fn_unwired");
+                    rs_err(res, 503,
+                           "RESULT_SET_STORE_UNAVAILABLE: device registry unavailable");
+                    return;
+                }
+                // Called ONCE (not per-id) and cached in a set for O(1)
+                // per-id membership checks — see AllAgentIdsFn's doc comment
+                // in the .hpp for why a per-id backing call over up to
+                // kMaxMembersPerSet ids would be its own DoS. Presence-
+                // merged (AgentRegistry::all_ids()), NOT the local-only
+                // agents_fn snapshot — see the same doc comment for the
+                // #4981-precedent reasoning.
+                //
+                // NICE (cpp-expert, #4983 fix round): `known` is never read
+                // again after `known_set` is built, so move each string in
+                // rather than copying it.
+                std::vector<std::string> known = all_agent_ids_fn();
+                const std::unordered_set<std::string> known_set(
+                    std::make_move_iterator(known.begin()), std::make_move_iterator(known.end()));
+
+                // #3564-style oracle safety (see GET /api/v1/devices/{id}'s
+                // identical rationale): a nonexistent id and a real-but-out-
+                // of-scope id are indistinguishable in the response. Unlike
+                // that route, the ids here are the CALLER'S OWN submitted
+                // list, so citing which one(s) failed back to them is not a
+                // disclosure of someone else's device existence.
+                //
+                // NICE (cpp-expert, #4983 fix round): only the first
+                // kMaxCitedBadIds are ever displayed (below) -- track the
+                // total count separately instead of accumulating every bad
+                // id into `bad_ids` when the caller's device_ids can run to
+                // kMaxMembersPerSet (100000) entries.
+                constexpr std::size_t kMaxCitedBadIds = 20;
+                std::vector<std::string> bad_ids;
+                std::size_t bad_id_count = 0;
+                for (const auto& id : members) {
+                    if (!known_set.contains(id) || !authz::in_scope(gate.scope, id)) {
+                        ++bad_id_count;
+                        if (bad_ids.size() < kMaxCitedBadIds)
+                            bad_ids.push_back(id);
+                    }
+                }
+                if (bad_id_count > 0) {
+                    std::string cited;
+                    for (std::size_t i = 0; i < bad_ids.size(); ++i) {
+                        if (i)
+                            cited += ", ";
+                        cited += bad_ids[i];
+                    }
+                    if (bad_id_count > kMaxCitedBadIds)
+                        cited += std::format(" (+{} more)", bad_id_count - kMaxCitedBadIds);
+                    // Audited on the same action/outcome as the parent_id
+                    // shape-check guards above (governance #4307/#4734/#4983
+                    // round) -- the sibling denial a few lines above this one
+                    // (the parent_id ownership/shape checks) is audited; this
+                    // rejection was not, until this fix round.
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                             "reason=unknown_device_id");
+                    rs_err(res, 400,
+                           "RESULT_SET_UNKNOWN_DEVICE_ID: device_ids contains an id that does "
+                           "not exist or is not visible to the caller: " +
+                               cited);
+                    return;
+                }
             }
 
             auto created = result_set_store->create_materialized(cr, members);

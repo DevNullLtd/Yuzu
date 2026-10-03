@@ -59,6 +59,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h> // _getpid
+#else
+#include <unistd.h> // getpid
+#endif
+
 using namespace std::chrono_literals;
 using yuzu::agent::install_log_handoff_in_this_image;
 using yuzu::agent::LogHandoff;
@@ -70,7 +76,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Writes `text` to <build-root>/log_handoff_multi_image_topology.txt so MI-1's
+// Writes `text` to <build-root>/log_handoff_multi_image_topology.<pid>.txt so MI-1's
 // measurement survives past this test run. MESON_BUILD_ROOT is a real env var meson's
 // own test runner sets (not a project convention invented here) - already relied on by
 // this directory's find_users_plugin()-style helpers (see test_users_posix_actions.cpp).
@@ -83,7 +89,21 @@ namespace {
 // this suite), and MI-1/MI-1b/MI-3 each contribute their own section to this one report
 // file - so the FIRST call in a given process truncates (clearing stale content left by
 // an earlier `meson test` run), and every call after that appends, regardless of which
-// TEST_CASE happens to run first.
+// TEST_CASE happens to run first. The file name carries the process id (#5073): the
+// first-call-truncates flag is per PROCESS, so when the agent suite runs as several
+// concurrent test processes a shared name would let one process truncate another's
+// sections. One file per process keeps each report whole. A pid is never reused by a
+// live process, but a later run can land on an old pid and truncate-then-overwrite that
+// stale file (the same truncate-on-first-call behaviour the single fixed name had); unlike
+// that single name, the per-pid names also accumulate one file per run in the build root.
+long current_pid_for_report() {
+#ifdef _WIN32
+    return static_cast<long>(::_getpid());
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
 void write_topology_report(const std::string& text) {
     fs::path out_dir;
     if (const auto* build_root = std::getenv("MESON_BUILD_ROOT"))
@@ -99,7 +119,9 @@ void write_topology_report(const std::string& text) {
     const auto mode = truncated_once ? std::ios::app : std::ios::trunc;
     truncated_once = true;
 
-    std::ofstream out{out_dir / "log_handoff_multi_image_topology.txt", mode};
+    std::ofstream out{out_dir / ("log_handoff_multi_image_topology." +
+                                 std::to_string(current_pid_for_report()) + ".txt"),
+                      mode};
     if (out)
         out << text;
 }

@@ -67,7 +67,10 @@ RestartSec=5
 # drain is ~156s (120s response cap + pump ticks + the 30s socket write timeout, see
 # docs/user-manual/server-admin.md "Sizing"). The two constraints share this one value by
 # coincidence, not by design — raising it for the rollup budget alone still covers MCP;
-# don't LOWER it without checking both.
+# don't LOWER it without checking both. A THIRD, independent reason this value must not drop
+# below a few seconds (#4666 PR-4): the T_server dedicated async logger's exit-time worker
+# join has no self-armed watchdog, so a stalled log sink leaves it bounded ONLY by a second
+# SIGTERM or this deadline — see guardian_ingest.hpp's own header banner.
 TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably

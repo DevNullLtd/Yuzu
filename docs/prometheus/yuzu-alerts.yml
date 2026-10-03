@@ -225,7 +225,7 @@ groups:
       # db_error), the closest available signal to `#4246` item #8's
       # "route-directory desync" alert-rule half. This alert does NOT cover
       # every yuzu_server_gateway_route_desync_total{op,outcome} guard
-      # rejection (session_mismatch/shortfall/unknown_session) — that
+      # rejection (session_mismatch/shortfall/unknown_session/malformed_session_id) — that
       # counter is expected at a low background rate (see its own doc
       # comment) and alerting on it needs real fleet data to set a threshold
       # that doesn't page on a routine post-restart/failover baseline rise;
