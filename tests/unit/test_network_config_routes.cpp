@@ -41,6 +41,27 @@ fs::path fixture_dir(const char* os) {
     return fs::path{YUZU_TEST_FIXTURE_DIR} / "wave11" / "network_config_routes" / os;
 }
 
+// One hex line per recv() datagram / blob, chunk boundaries preserved. std::vector storage
+// is aligned well past NLMSG_ALIGNTO, which the rtnetlink decoder requires.
+std::vector<std::vector<unsigned char>> read_hex_lines(const fs::path& p) {
+    REQUIRE(fs::exists(p));
+    std::ifstream f(p);
+    std::vector<std::vector<unsigned char>> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        if (line.empty())
+            continue;
+        REQUIRE(line.size() % 2 == 0);
+        std::vector<unsigned char> bytes;
+        for (std::size_t i = 0; i < line.size(); i += 2)
+            bytes.push_back(static_cast<unsigned char>(std::stoi(line.substr(i, 2), nullptr, 16)));
+        out.push_back(std::move(bytes));
+    }
+    return out;
+}
+
 } // namespace
 
 // ── Row formatter (portable) ──────────────────────────────────────────────
@@ -240,27 +261,6 @@ std::string iface(int idx) {
     return it == capture_interfaces().end() ? std::string{} : it->second;
 }
 
-// One recv() datagram per hex line, chunk boundaries preserved. std::vector storage
-// is aligned well past NLMSG_ALIGNTO, which the decoder requires.
-std::vector<std::vector<unsigned char>> read_hex_datagrams(const fs::path& p) {
-    REQUIRE(fs::exists(p));
-    std::ifstream f(p);
-    std::vector<std::vector<unsigned char>> out;
-    std::string line;
-    while (std::getline(f, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-            line.pop_back();
-        if (line.empty())
-            continue;
-        REQUIRE(line.size() % 2 == 0);
-        std::vector<unsigned char> bytes;
-        for (std::size_t i = 0; i < line.size(); i += 2)
-            bytes.push_back(static_cast<unsigned char>(std::stoi(line.substr(i, 2), nullptr, 16)));
-        out.push_back(std::move(bytes));
-    }
-    return out;
-}
-
 struct Decoded {
     std::vector<RtRouteFull> records;
     bool done = false;
@@ -353,7 +353,7 @@ std::vector<unsigned char> control_msg(std::uint32_t seq, unsigned short type) {
 
 TEST_CASE("routes decode of a real RTM_GETROUTE AF_UNSPEC dump matches iproute2's table",
           "[network_config][routes][rtnetlink]") {
-    const auto datagrams = read_hex_datagrams(fixture_dir("linux") / "rtm_getroute_dump.hex");
+    const auto datagrams = read_hex_lines(fixture_dir("linux") / "rtm_getroute_dump.hex");
     REQUIRE(datagrams.size() == 2);
 
     const auto d = decode_all(datagrams, 3);
@@ -393,7 +393,7 @@ TEST_CASE("routes decode of a real RTM_GETROUTE AF_UNSPEC dump matches iproute2'
 
 TEST_CASE("routes decode flags the multipath route that was collapsed to its first nexthop",
           "[network_config][routes][rtnetlink]") {
-    const auto d = decode_all(read_hex_datagrams(fixture_dir("linux") / "rtm_getroute_dump.hex"), 3);
+    const auto d = decode_all(read_hex_lines(fixture_dir("linux") / "rtm_getroute_dump.hex"), 3);
     int collapsed = 0;
     for (const auto& rec : d.records) {
         if (rec.multipath_collapsed) {
@@ -408,14 +408,14 @@ TEST_CASE("routes decode flags the multipath route that was collapsed to its fir
 
 TEST_CASE("routes decode ignores replies carrying another sequence number",
           "[network_config][routes][rtnetlink]") {
-    const auto d = decode_all(read_hex_datagrams(fixture_dir("linux") / "rtm_getroute_dump.hex"), 99);
+    const auto d = decode_all(read_hex_lines(fixture_dir("linux") / "rtm_getroute_dump.hex"), 99);
     CHECK(d.records.empty());
     CHECK_FALSE(d.done);
 }
 
 TEST_CASE("routes decode reports a datagram cut mid-message as truncated, never as complete",
           "[network_config][routes][rtnetlink]") {
-    auto datagrams = read_hex_datagrams(fixture_dir("linux") / "rtm_getroute_dump.hex");
+    auto datagrams = read_hex_lines(fixture_dir("linux") / "rtm_getroute_dump.hex");
     datagrams.pop_back(); // no NLMSG_DONE after the cut datagram
     auto& dg = datagrams.front();
     // Cut 10 bytes into the message that follows the first boundary at or past byte 1000:
@@ -614,18 +614,9 @@ std::string mac_iface(int idx) {
 }
 
 std::vector<unsigned char> read_hex_blob(const fs::path& p) {
-    REQUIRE(fs::exists(p));
-    std::ifstream f(p);
-    std::string hex;
-    std::getline(f, hex);
-    while (!hex.empty() && (hex.back() == '\r' || hex.back() == ' '))
-        hex.pop_back();
-    REQUIRE(!hex.empty());
-    REQUIRE(hex.size() % 2 == 0);
-    std::vector<unsigned char> bytes;
-    for (std::size_t i = 0; i < hex.size(); i += 2)
-        bytes.push_back(static_cast<unsigned char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
-    return bytes;
+    auto lines = read_hex_lines(p);
+    REQUIRE(!lines.empty());
+    return std::move(lines.front());
 }
 
 // ── synthetic builders: ONLY for shapes a real kernel never emits ────────

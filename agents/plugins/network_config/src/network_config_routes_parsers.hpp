@@ -27,6 +27,7 @@
  */
 #pragma once
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,24 @@ namespace yuzu::network_config {
 /// default-free-zone host can hold ~1M routes; the plugin must not buffer or
 /// emit an unbounded table, and reports `routes_row_cap_reached` instead.
 inline constexpr std::size_t kRoutesRowCap = 20000;
+
+namespace routes_detail {
+
+struct NameEntry {
+    int id;
+    const char* name;
+};
+
+/// The table's name for `id`, else `<fallback_prefix><id>` — a route field is never empty.
+template <std::size_t N>
+inline std::string lookup_name(const NameEntry (&table)[N], int id, const char* fallback_prefix) {
+    for (const auto& e : table)
+        if (e.id == id)
+            return e.name;
+    return fallback_prefix + std::to_string(id);
+}
+
+} // namespace routes_detail
 
 /// One route, already reduced to the cross-OS row vocabulary.
 struct RouteRow {
@@ -96,54 +115,14 @@ inline constexpr int kWinProtocolLocal = 2; // MIB_IPPROTO_LOCAL
 /// NL_ROUTE_PROTOCOL as Get-NetRoute names it (lower-cased). Numeric literals,
 /// not the SDK enumerators: this header must compile on hosts without them.
 inline std::string win_protocol_name(int p) {
-    switch (p) {
-    case 1:
-        return "other";
-    case 2:
-        return "local";
-    case 3:
-        return "netmgmt";
-    case 4:
-        return "icmp";
-    case 5:
-        return "egp";
-    case 6:
-        return "ggp";
-    case 7:
-        return "hello";
-    case 8:
-        return "rip";
-    case 9:
-        return "isis";
-    case 10:
-        return "esis";
-    case 11:
-        return "cisco";
-    case 12:
-        return "bbn";
-    case 13:
-        return "ospf";
-    case 14:
-        return "bgp";
-    case 15:
-        return "idpr";
-    case 16:
-        return "eigrp";
-    case 17:
-        return "dvmrp";
-    case 18:
-        return "rpl";
-    case 19:
-        return "dhcp";
-    case 10002:
-        return "autostatic";
-    case 10006:
-        return "static";
-    case 10007:
-        return "static_non_dod";
-    default:
-        return "proto" + std::to_string(p);
-    }
+    static constexpr routes_detail::NameEntry kNames[] = {
+        {1, "other"},   {2, "local"},   {3, "netmgmt"},  {4, "icmp"},  {5, "egp"},
+        {6, "ggp"},     {7, "hello"},   {8, "rip"},      {9, "isis"},  {10, "esis"},
+        {11, "cisco"},  {12, "bbn"},    {13, "ospf"},    {14, "bgp"},  {15, "idpr"},
+        {16, "eigrp"},  {17, "dvmrp"},  {18, "rpl"},     {19, "dhcp"}, {10002, "autostatic"},
+        {10006, "static"}, {10007, "static_non_dod"},
+    };
+    return routes_detail::lookup_name(kNames, p, "proto");
 }
 
 /// True for the rows Windows generates for the HOST rather than for reachability,
@@ -163,11 +142,7 @@ inline bool win_route_is_host_local(const WinRoute& r) {
         return r.destination.starts_with("ff") && r.prefix_len == 8;
     // IPv4 multicast is 224.0.0.0/4: first octet 224-239.
     unsigned first = 0;
-    for (char c : r.destination) {
-        if (c < '0' || c > '9')
-            break;
-        first = first * 10 + static_cast<unsigned>(c - '0');
-    }
+    std::from_chars(r.destination.data(), r.destination.data() + r.destination.size(), first);
     return first >= 224 && first <= 239 && r.prefix_len >= 4;
 }
 
@@ -184,6 +159,27 @@ inline RouteRow win_route_to_row(const WinRoute& r) {
     row.origin = win_protocol_name(r.protocol);
     return row;
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+
+namespace routes_detail {
+
+inline bool addr_text(const void* data, std::size_t payload, int family, std::string& out) {
+    const std::size_t need = family == AF_INET6 ? 16 : 4;
+    if (payload < need)
+        return false;
+    unsigned char bytes[16]{};
+    std::memcpy(bytes, data, need);
+    char text[INET6_ADDRSTRLEN]{};
+    if (!::inet_ntop(family, bytes, text, sizeof(text)))
+        return false;
+    out = text;
+    return true;
+}
+
+} // namespace routes_detail
+
+#endif // __linux__ || __APPLE__
 
 #if defined(__linux__)
 
@@ -217,19 +213,6 @@ inline bool rta_u32(const struct rtattr* a, std::uint32_t& out) {
     return true;
 }
 
-inline bool addr_text(const void* data, std::size_t payload, int family, std::string& out) {
-    const std::size_t need = family == AF_INET6 ? 16 : 4;
-    if (payload < need)
-        return false;
-    unsigned char bytes[16]{};
-    std::memcpy(bytes, data, need);
-    char text[INET6_ADDRSTRLEN]{};
-    if (!::inet_ntop(family, bytes, text, sizeof(text)))
-        return false;
-    out = text;
-    return true;
-}
-
 /// RTA_VIA is `struct rtvia { u16 family; u8 addr[]; }` — an IPv4 route whose
 /// next hop is an IPv6 address (RFC 5549). The family inside the attribute, not
 /// the route's own family, decides the address length.
@@ -254,79 +237,25 @@ inline std::string table_name(std::uint32_t t) {
 }
 
 inline std::string type_name(unsigned char t) {
-    switch (t) {
-    case RTN_UNICAST:
-        return "unicast";
-    case RTN_BLACKHOLE:
-        return "blackhole";
-    case RTN_UNREACHABLE:
-        return "unreachable";
-    case RTN_PROHIBIT:
-        return "prohibit";
-    case RTN_THROW:
-        return "throw";
-    case RTN_NAT:
-        return "nat";
-    case RTN_XRESOLVE:
-        return "xresolve";
-    default:
-        return "type" + std::to_string(t);
-    }
+    static constexpr NameEntry kNames[] = {
+        {RTN_UNICAST, "unicast"},     {RTN_BLACKHOLE, "blackhole"}, {RTN_UNREACHABLE, "unreachable"},
+        {RTN_PROHIBIT, "prohibit"},   {RTN_THROW, "throw"},         {RTN_NAT, "nat"},
+        {RTN_XRESOLVE, "xresolve"},
+    };
+    return lookup_name(kNames, t, "type");
 }
 
 // Numeric literals, not RTPROT_* macros: the newer protocol ids (babel, bgp, ...)
 // are missing from older kernel headers and the build must not depend on them.
 inline std::string protocol_name(unsigned char p) {
-    switch (p) {
-    case 0:
-        return "unspec";
-    case 1:
-        return "redirect";
-    case 2:
-        return "kernel";
-    case 3:
-        return "boot";
-    case 4:
-        return "static";
-    case 8:
-        return "gated";
-    case 9:
-        return "ra";
-    case 10:
-        return "mrt";
-    case 11:
-        return "zebra";
-    case 12:
-        return "bird";
-    case 13:
-        return "dnrouted";
-    case 14:
-        return "xorp";
-    case 15:
-        return "ntk";
-    case 16:
-        return "dhcp";
-    case 17:
-        return "mrouted";
-    case 18:
-        return "keepalived";
-    case 42:
-        return "babel";
-    case 99:
-        return "openr";
-    case 186:
-        return "bgp";
-    case 187:
-        return "isis";
-    case 188:
-        return "ospf";
-    case 189:
-        return "rip";
-    case 192:
-        return "eigrp";
-    default:
-        return "proto" + std::to_string(p);
-    }
+    static constexpr NameEntry kNames[] = {
+        {0, "unspec"},   {1, "redirect"}, {2, "kernel"},  {3, "boot"},     {4, "static"},
+        {8, "gated"},    {9, "ra"},       {10, "mrt"},    {11, "zebra"},   {12, "bird"},
+        {13, "dnrouted"}, {14, "xorp"},   {15, "ntk"},    {16, "dhcp"},    {17, "mrouted"},
+        {18, "keepalived"}, {42, "babel"}, {99, "openr"}, {186, "bgp"},    {187, "isis"},
+        {188, "ospf"},   {189, "rip"},    {192, "eigrp"},
+    };
+    return lookup_name(kNames, p, "proto");
 }
 
 } // namespace routes_detail
@@ -549,10 +478,9 @@ inline constexpr int kMacSkipFlags =
     RTF_LLINFO | RTF_WASCLONED | RTF_MULTICAST | RTF_BROADCAST | RTF_LOCAL;
 
 inline std::string mac_v4_text(const unsigned char* sa) {
-    char buf[INET_ADDRSTRLEN]{};
-    return ::inet_ntop(AF_INET, sa + offsetof(struct sockaddr_in, sin_addr), buf, sizeof(buf))
-               ? std::string{buf}
-               : std::string{};
+    std::string out;
+    addr_text(sa + offsetof(struct sockaddr_in, sin_addr), 4, AF_INET, out);
+    return out;
 }
 
 /// KAME stores the interface scope of a link-local (or link/node-scoped multicast)
@@ -566,8 +494,9 @@ inline std::string mac_v6_text(const unsigned char* sa) {
     const bool scoped_mc = a[0] == 0xff && ((a[1] & 0x0f) == 1 || (a[1] & 0x0f) == 2);
     if (link_local || scoped_mc)
         a[2] = a[3] = 0;
-    char buf[INET6_ADDRSTRLEN]{};
-    return ::inet_ntop(AF_INET6, a, buf, sizeof(buf)) ? std::string{buf} : std::string{};
+    std::string out;
+    addr_text(a, sizeof(a), AF_INET6, out);
+    return out;
 }
 
 /// Prefix length from a routing-socket netmask sockaddr. The kernel TRIMS these:

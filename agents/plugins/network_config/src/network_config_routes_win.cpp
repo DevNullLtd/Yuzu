@@ -32,7 +32,6 @@
 
 #include <cstdint>
 #include <format>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -97,7 +96,6 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
     }
     ForwardTableGuard guard{table}; // FreeMibTable on every path below
 
-    std::map<std::uint64_t, std::string> alias_by_luid; // one lookup per interface, not per row
     std::vector<RouteRow> rows;
     bool capped = false;
     bool unformattable = false;
@@ -122,11 +120,7 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
         if (win_route_is_host_local(w))
             continue;
 
-        auto it = alias_by_luid.find(r.InterfaceLuid.Value);
-        if (it == alias_by_luid.end())
-            it = alias_by_luid.emplace(r.InterfaceLuid.Value,
-                                       interface_alias(r.InterfaceLuid, r.InterfaceIndex)).first;
-        w.interface = it->second;
+        w.interface = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
 
         if (rows.size() >= kRoutesRowCap) {
             capped = true;
