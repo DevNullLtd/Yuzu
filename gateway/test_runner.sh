@@ -30,6 +30,9 @@ if ! command -v rebar3 &>/dev/null; then
     exit 1
 fi
 # The verdict comes from the shared summary parser, not rebar3's exit code.
+# `python3` only: this is a local developer runner for Linux/macOS hosts; no
+# workflow invokes it and no Windows runner runs it (Windows CI steps call
+# `python`).
 if ! command -v python3 &>/dev/null; then
     echo "ERROR: python3 not found in PATH (needed for the summary parser)"
     exit 1

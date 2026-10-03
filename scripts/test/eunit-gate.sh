@@ -60,6 +60,9 @@ if ! command -v rebar3 >/dev/null 2>&1; then
     exit 2
 fi
 # Checked up front so a missing parser fails before minutes of tests run.
+# `python3` only: this gate runs from /test and scripts/run-tests.sh on
+# Linux/macOS hosts, never on a Windows runner (Windows CI steps call
+# `python`; no workflow invokes this script).
 if ! command -v python3 >/dev/null 2>&1; then
     echo "eunit-gate: python3 not on PATH (needed for the summary parser)" >&2
     exit 2
