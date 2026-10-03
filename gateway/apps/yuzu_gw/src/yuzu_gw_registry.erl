@@ -263,7 +263,7 @@ lookup_session(SessionId) ->
 lookup_pending_session(SessionId) ->
     try ets:lookup(?PENDING_TABLE, SessionId) of
         [{_, Info, StoredAt}] ->
-            case erlang:system_time(millisecond) - StoredAt > ?PENDING_TTL_MS of
+            case erlang:monotonic_time(millisecond) - StoredAt > ?PENDING_TTL_MS of
                 true  -> error;
                 false -> {ok, maps:get(conn_key, Info, undefined)}
             end;
@@ -390,10 +390,12 @@ list_agents(Limit, Cursor) ->
     {Agents, NextCursor}.
 
 %% @doc Store pending registration info for a session.
-%% Called by agent_service on Register, consumed by Subscribe.
+%% Called by agent_service on Register, consumed by Subscribe. The row is
+%% stamped with the node-local monotonic clock, so the TTL in
+%% `lookup_pending_session/1' and the sweep is immune to wall-clock steps.
 -spec store_pending(binary(), map()) -> ok.
 store_pending(SessionId, Info) ->
-    ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:system_time(millisecond)}),
+    ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:monotonic_time(millisecond)}),
     ok.
 
 %% @doc Atomically retrieve-and-delete pending registration info.
@@ -513,7 +515,7 @@ handle_info(sweep_pending, State) ->
     %% is one recoverable NOT_FOUND that triggers a re-Register. A tighter delete
     %% (ets:select_delete with a StoredAt guard) is the fix if a same-session
     %% re-Register path is ever added.
-    Now = erlang:system_time(millisecond),
+    Now = erlang:monotonic_time(millisecond),
     Expired = ets:foldl(fun({SessionId, _, StoredAt}, Acc) ->
         case Now - StoredAt > ?PENDING_TTL_MS of
             true  -> [SessionId | Acc];

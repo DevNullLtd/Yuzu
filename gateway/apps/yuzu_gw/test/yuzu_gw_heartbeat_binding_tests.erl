@@ -55,6 +55,8 @@ binding_test_() ->
        fun pending_without_key_rejected/0},
       {"pending session past its TTL is rejected",
        fun pending_expired_rejected/0},
+      {"pending session inside its TTL is admitted",
+       fun pending_within_ttl_admitted/0},
       {"take_pending to register_agent gap: rejected, then admitted again",
        fun handoff_gap_rejects_then_admits/0},
       {"replacement: the old session is rejected, the new one admitted only on its own connection",
@@ -264,9 +266,19 @@ pending_without_key_rejected() ->
     ?assertEqual(0, queued()),
     assert_events([reject_event(no_connection)]).
 
+pending_within_ttl_admitted() ->
+    S = uid(<<"p">>),
+    %% 60 s old on the monotonic clock: inside the 120 s TTL.
+    Recent = erlang:monotonic_time(millisecond) - 60 * 1000,
+    true = ets:insert(?PENDING, {S, #{agent_id => <<"x">>, conn_key => conn_a}, Recent}),
+    ?assertMatch({ok, _, _}, beat(conn_a, S)),
+    ?assertEqual(1, queued()),
+    true = ets:delete(?PENDING, S).
+
 pending_expired_rejected() ->
     S = uid(<<"p">>),
-    Old = erlang:system_time(millisecond) - 10 * 60 * 1000,
+    %% The pending table is stamped with the node-local monotonic clock.
+    Old = erlang:monotonic_time(millisecond) - 10 * 60 * 1000,
     true = ets:insert(?PENDING, {S, #{agent_id => <<"x">>, conn_key => conn_a}, Old}),
     ?assertEqual(rejected(), beat(conn_a, S)),
     ?assertEqual(0, queued()),
