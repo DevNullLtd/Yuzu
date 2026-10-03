@@ -1960,8 +1960,9 @@ private:
     /// implicit only while the claim stays in its fifo, so a caller that pops/erases
     /// on `false` leaks the mapping (a ghost (key, rule) entry; #4354). Use
     /// release_or_retain_tombstone_locked where the claim is popped. The remaining
-    /// callers that ignore the result either leave the claim in place (the publish
-    /// pre-pass and fill-in, synthesize_fallback_outcome_locked, the dispatched branch
+    /// callers that ignore the result either leave the claim in place (on_arm_complete's
+    /// staging releases, which run before publish_arm_verdicts_locked, and that
+    /// function's own fill-in, synthesize_fallback_outcome_locked, the dispatched branch
     /// of abandon_claim_locked: a later release or sweep retries it) or run at
     /// sticky-stop time (begin_stop, dispatch_parked_arm_guarded's stop path), where
     /// the leak is moot. Known gap, tracked as a follow-up: abandon_claim_locked's
