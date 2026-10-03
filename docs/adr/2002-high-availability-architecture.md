@@ -1190,8 +1190,11 @@ snapshot (`gateway.proto`: it may be stale) and the replay keeps its own livenes
 rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
 A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s), which
 exists in agent 0.13.0 and newer (checked in the agent source at the v0.12.0 and v0.13.0 tags). An older agent only
-logs `Heartbeat failed` and does not re-register by itself (restart or upgrade it); that matters only when its
-heartbeats are rejected, and the normal direct or L4 topology is unaffected. Rollback is redeploying the
+logs `Heartbeat failed` and stays rejected until it is restarted or upgraded; that matters only when its
+heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
+running without the session index, or after a gateway registry process restart or crash while connections
+stay up (the registry recreates its tables empty; a node failover that leaves the session not held by the
+surviving node is expected to behave the same, inferred, not tested). Rollback is redeploying the
 previous gateway (the only new state is the in-memory index; derived from the change, not run).
 - **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
   through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
@@ -1222,8 +1225,12 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   lookup consistently: `lookup_session/1` is session-keyed and checks that the process is local and
   alive, while `lookup_local_session/1` is agent-keyed and has no node check. The server's
   `unknown_session_ids` verdict stays an advisory snapshot whatever a consumer does with this function.
-  `error` also covers a pending session and the gap between `take_pending` and `register_agent`; use
-  `lookup_pending_session/1` to tell them apart. An `{ok, Map}` result can go stale before the caller
+  `error` also covers a pending session and the gap between `take_pending` and `register_agent`;
+  `lookup_pending_session/1` distinguishes a pending session from that gap, but it does not distinguish
+  the gap from an unknown or expired session (both lookups return `error` for each). The two also differ
+  on age: `lookup_pending_session/1` treats a row older than the 120 s TTL as absent, while `take_pending`
+  ignores the stored timestamp and still admits it until the 60 s sweep removes it, so a `Subscribe` can
+  succeed on a row the lookup reports as absent. An `{ok, Map}` result can go stale before the caller
   acts, so a consumer treats it as advisory and re-checks at the act.
 - **Lifecycle, as implemented.**
 
@@ -1278,7 +1285,8 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   ids; two gateway info lines no longer do. The node-local rule also applies to a multi-node gateway: one
   agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4,
   no per-RPC balancing). Planned agent-side endpoint failover (WS-13) must keep one channel per agent to
-  one node. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
+  one node for the life of a session; a failover that re-registers on a new channel mints a new session and
+  is compatible. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
   is meaningful only on the node that owns the connection.
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)

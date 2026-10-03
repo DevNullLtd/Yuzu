@@ -180,10 +180,14 @@ rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
 again. There is no wire or server change, and no agent change for the supported
 topologies. This recovery needs **agent 0.13.0 or newer** (checked in the agent
 source at the v0.12.0 and v0.13.0 tags). An older agent only logs `Heartbeat failed`
-and does not re-register by itself, so restart or upgrade it. That matters only if
-its heartbeats are rejected (a topology that breaks the one-connection assumption,
-or a gateway running without the session index); the normal direct or L4 topology
-is unaffected.
+and stays rejected until it is restarted or upgraded. That matters only when
+its heartbeats are rejected, which happens in three cases: a topology that breaks the
+one-connection assumption, a gateway running without the session index, and a gateway
+registry process restart or crash while agent connections stay up (the registry
+recreates its tables empty, so every heartbeat for the agents it held is rejected until
+they re-register). A node failover that leaves the session not held by the surviving
+node is expected to behave the same way (inferred, not tested). An agent older than
+0.13.0 was not run through any of these.
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
 directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
@@ -196,6 +200,13 @@ count in the gateway summary log line; the counter is
 `yuzu_gw_heartbeat_session_mismatch_total`) and repeated re-registration, and it
 removes the per-agent separation the check relies on. See
 [Security Hardening](security-hardening.md#gateway-tls-if-you-deploy-the-erlang-gateway).
+
+**Multi-node gateways.** The check reads node-local state, so for the life of a session
+the `Register`, `Subscribe` and `Heartbeat` calls of one agent must reach the same
+gateway node on one connection: use per-connection sticky L4 and do not balance
+per RPC. An agent that re-registers on a new connection (for example after a failover
+to another node) mints a new session, which is compatible with this rule. Multi-node
+behaviour is not tested with a real agent (a two-node registry unit test exists).
 
 *Observed in testing* (a real C++ agent, a plaintext gateway listener, two agents per
 run):
@@ -236,7 +247,9 @@ It carries reason names and counts only, never a session id. The line is written
 when a rejection arrives, so counts that trail the last line wait for the next
 rejection and the line can lag the counters; the counters are authoritative. The rate
 limit is one state shared by all concurrent rejections (it is created at gateway
-start), so a burst of simultaneous first rejections produces one line. At startup the
+start, after telemetry setup and before the gateway supervision tree starts; the agent
+listener belongs to the grpcbox dependency application, which can start first, so a
+heartbeat in that window is rejected and the state is then created lazily), so a burst of simultaneous first rejections produces one line. At startup the
 gateway logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
 rejected heartbeat has no resolved principal, so there is no audit row, only the
 counters and the summary line.
@@ -255,7 +268,8 @@ counters and the summary line.
 - `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
   agent after a gateway registry restart. Observed: after killing the registry process
   with 4 agents attached the counter rose by 4, and all 4 agents were admitted again
-  within about 25 s. It is also expected to rise around a node failover, but that was
+  within about 25 s (observed with agents 0.14.0-rc6 or newer; an agent older than
+  0.13.0 only logs the rejection and stays rejected until it is restarted). It is also expected to rise around a node failover, but that was
   not observed in testing (multi-node was not tested).
 - `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or
   the session it names, has no connection key to compare. Not observed in testing. Its
@@ -896,7 +910,7 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
-| `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent receives `NOT_FOUND` and re-registers. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
+| `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent receives `NOT_FOUND` and re-registers on it (agents 0.13.0 and newer; older agents only log it). A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections, and possibly around agent reconnects (expected, not observed in testing). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
