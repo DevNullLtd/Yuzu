@@ -236,7 +236,8 @@ TEST_CASE("inspect treats a garbage leaf as Missing", "[agent_csr][pki]") {
     fs::remove_all(dir);
 }
 
-TEST_CASE("inspect reports Missing for a leaf that does not match the key on disk (partial renewal)",
+TEST_CASE("inspect reports Missing for a leaf that does not match the key on disk "
+          "(partial renewal)",
           "[agent_csr][pki]") {
     const fs::path dir = yuzu::test::unique_temp_path("agent-csr-mismatch-");
     const auto now = std::chrono::system_clock::now();
@@ -260,7 +261,26 @@ TEST_CASE("inspect reports Missing for a leaf that does not match the key on dis
     CHECK(inspect_provisioned_cert(dir, now) == CertState::Valid);
 
     // A key file that is not a private key is Missing too.
-    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, "not a key", {.owner_only_mode = true}));
+    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, "not a key",
+                                            {.owner_only_mode = true}));
+    CHECK(inspect_provisioned_cert(dir, now) == CertState::Missing);
+
+    // An ENCRYPTED key must be Missing and must never prompt for a passphrase.
+    BIO* pb = BIO_new_mem_buf(kc1->private_key_pem.data(),
+                              static_cast<int>(kc1->private_key_pem.size()));
+    EVP_PKEY* pk = PEM_read_bio_PrivateKey(pb, nullptr, nullptr, nullptr);
+    BIO_free(pb);
+    REQUIRE(pk != nullptr);
+    BIO* eb = BIO_new(BIO_s_mem());
+    REQUIRE(PEM_write_bio_PrivateKey(eb, pk, EVP_aes_256_cbc(), nullptr, 0, nullptr,
+                                     const_cast<char*>("hunter2")) == 1);
+    char* ed = nullptr;
+    const long el = BIO_get_mem_data(eb, &ed);
+    const std::string enc(ed, static_cast<std::size_t>(el));
+    BIO_free(eb);
+    EVP_PKEY_free(pk);
+    REQUIRE(enc.find("ENCRYPTED") != std::string::npos);
+    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, enc, {.owner_only_mode = true}));
     CHECK(inspect_provisioned_cert(dir, now) == CertState::Missing);
 
     fs::remove_all(dir);

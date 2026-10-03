@@ -111,7 +111,9 @@ EVP_PKEY_ptr load_private_key(std::string_view pem) {
     BIO_ptr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
     if (!bio)
         return nullptr;
-    return EVP_PKEY_ptr{PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr)};
+    // No-op passphrase callback: an encrypted key must fail to load, never prompt a tty.
+    return EVP_PKEY_ptr{PEM_read_bio_PrivateKey(
+        bio.get(), nullptr, [](char*, int, int, void*) { return 0; }, nullptr)};
 }
 
 std::optional<std::chrono::system_clock::time_point> from_asn1_time(const ASN1_TIME* at) {

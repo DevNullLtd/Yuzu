@@ -244,8 +244,8 @@ private:
                 } else if (*written) {
                     mode_reassert_failed = (*written)->mode_reassert_failed;
                     dir_fsync_failed = (*written)->dir_fsync_failed;
-                    g_last_persist_error = format_write_warning(mode_reassert_failed, dir_fsync_failed,
-                                                                (*written)->message);
+                    g_last_persist_error = format_write_warning(
+                        mode_reassert_failed, dir_fsync_failed, (*written)->message);
                     spdlog::warn("asset_tags: {}", (*written)->message);
                 }
             }

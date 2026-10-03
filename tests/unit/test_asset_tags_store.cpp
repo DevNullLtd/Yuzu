@@ -442,7 +442,7 @@ TEST_CASE("asset_tags store: fchmod and fsync run on the open fd BEFORE close (#
     CHECK(g.file_close_n == 1);
     // fchmod precedes the fsync so the mode is in the flushed metadata
     CHECK(g.file_fchmod_seq < g.file_fsync_seq);
-    CHECK(g.file_fchmod_seq < g.file_close_seq);
+    CHECK(g.file_fsync_seq < g.file_close_seq);
     // The directory fd is a second, later fsync/close pair, run only after the
     // rename has published the payload and consumed the temp.
     CHECK(g.dir_fsync_n == 1);
@@ -517,10 +517,14 @@ TEST_CASE("asset_tags store: creation mode follows owner_only_mode (R1)",
           "[agent][asset_tags_store]") {
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
     const auto ops = recording_ops();
-    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "a", "x", {.owner_only_mode = true, .fd_ops = &ops}).has_value());
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "a", "x",
+                                            {.owner_only_mode = true, .fd_ops = &ops})
+                .has_value());
     CHECK(g.open_mode == 0600);
     const auto ops2 = recording_ops();
-    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "b", "x", {.owner_only_mode = false, .fd_ops = &ops2}).has_value());
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "b", "x",
+                                            {.owner_only_mode = false, .fd_ops = &ops2})
+                .has_value());
     CHECK(g.open_mode == 0666);
     CHECK(g.file_fchmod_n == 0); // no fchmod when the policy is not owner-only
 }
