@@ -177,7 +177,9 @@ replacement_fencing(#{chan_a := A, chan_b := B}) ->
     %% the newer registration alone, in both tables.
     close_stream(Stream1),
     ok = wait_until(fun() -> not is_process_alive(P1) end, 3000),
-    ?assertEqual({ok, P2}, yuzu_gw_registry:lookup(Id)),
+    %% The routing table itself, not lookup/1, which falls back to the pg
+    %% group and would hide a deleted routing row.
+    ?assertEqual({ok, {P2, S2}}, yuzu_gw_registry:lookup_local_session(Id)),
     ?assertMatch({ok, #{pid := P2}}, yuzu_gw_registry:lookup_session(S2)),
     ?assertMatch({ok, _, _}, heartbeat(B, S2)),
     close_stream(Stream2),

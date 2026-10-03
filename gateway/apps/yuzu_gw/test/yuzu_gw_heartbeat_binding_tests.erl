@@ -296,7 +296,10 @@ superseded_cleanup_is_fenced() ->
     ok = yuzu_gw_registry:deregister_agent(A, P1, S1),
     sync_registry(),
     ?assertMatch({ok, _, _}, beat(conn_b, S2)),
-    ?assertMatch({ok, P2}, yuzu_gw_registry:lookup(A)),
+    %% lookup_local_session/1 reads the routing table only: lookup/1 would
+    %% fall back to the pg group, which still holds P2 and would hide a
+    %% deleted routing row.
+    ?assertEqual({ok, {P2, S2}}, yuzu_gw_registry:lookup_local_session(A)),
     ?assertMatch({ok, #{pid := P2}}, yuzu_gw_registry:lookup_session(S2)),
     exit(P1, kill),
     exit(P2, kill).
