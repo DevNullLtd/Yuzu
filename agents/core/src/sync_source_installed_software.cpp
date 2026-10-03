@@ -89,6 +89,13 @@ bool entry_equal(const SwEntry& a, const SwEntry& b) {
            a.source == b.source;
 }
 
+// The single sort + dedup in the server's comparator order, shared by the cap
+// check and the canonical blob.
+void normalize_installed_software(std::vector<SwEntry>& entries) {
+    std::sort(entries.begin(), entries.end(), entry_less);
+    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
+}
+
 // ── shared line/token splitters (installed_apps + the pkg/wof adapters) ──
 
 // Calls `fn(line)` for every non-empty line (CRLF-tolerant) until it returns false.
@@ -285,20 +292,17 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     // `feature|unsupported|<token>` / `feature|unavailable|<token>`. The restart
     // flag is dropped (transient, no slot); the state token rides in `version`.
     AdaptedRows res;
-    bool unsupported = false;
-    std::string unavailable;
-    bool is_unavailable = false;
+    AdaptedRows sentinel; // status != ok once an unsupported/unavailable sentinel row is seen
     for_each_line(out, [&](std::string_view line) {
         const auto tok = split_tokens(line, 5);
         if (tok[0] != "feature")
             return true;
         if (tok.size() == 3 && tok[1] == "unsupported") {
-            unsupported = true;
+            sentinel.status = AdaptedRows::Status::unsupported;
             return false;
         }
         if (tok.size() == 3 && tok[1] == "unavailable") {
-            is_unavailable = true;
-            unavailable = std::string(tok[2]);
+            sentinel = failed(std::string(tok[2]));
             return false;
         }
         if (tok.size() != 4)
@@ -313,21 +317,11 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
         res.entries.push_back(std::move(e));
         return res.entries.size() <= kMaxEntries;
     });
-    if (unsupported) {
-        res.entries.clear();
-        res.status = AdaptedRows::Status::unsupported;
-        return res;
-    }
-    if (is_unavailable)
-        return failed(unavailable);
+    if (sentinel.status != AdaptedRows::Status::ok)
+        return sentinel;
     if (res.entries.empty())
         return failed("no rows");
     return res;
-}
-
-void normalize_installed_software(std::vector<SwEntry>& entries) {
-    std::sort(entries.begin(), entries.end(), entry_less);
-    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
 }
 
 std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {

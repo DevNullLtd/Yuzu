@@ -86,9 +86,6 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 /// `feature|unavailable|<token>` or no feature rows at all -> failed.
 YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
 
-/// Sort + dedup in the server's comparator order (one copy, shared with the blob).
-YUZU_EXPORT void normalize_installed_software(std::vector<SwEntry>& entries);
-
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries
 /// record-separated (0x1E); fields truncated to the server's cap. MUST be
 /// byte-identical to the server's reconstruction (ADR-0016 §4 /
