@@ -3,8 +3,9 @@
 
 The one summary parser for every gateway test gate: imported by
 scripts/test_gateway.py (the Meson gate, via require_tests_executed), and run
-as a CLI (`cancel-tolerant`) by scripts/test/eunit-gate.sh (/test) and the
-release workflow's EUnit step. Pinned by tests/test_gateway_test_summary.py.
+as a CLI by scripts/test/eunit-gate.sh (/test) and the release workflow's
+EUnit step (`cancel-tolerant`) and by gateway/test_runner.sh (`cancel-tolerant`
+for eunit, `strict` for ct). Pinned by tests/test_gateway_test_summary.py.
 Kept in its own module (not inline in the wrapper) because the wrapper runs
 rebar3 at import time and so cannot be imported by a test.
 
@@ -88,24 +89,24 @@ def executed_count(text):
     return None if s is None else s[0]
 
 
-def require_tests_executed(text, label, returncode):
+def require_tests_executed(text, label, returncode, prog="test_gateway.py"):
     """Turn a green exit with zero executed tests into a failure."""
     if returncode != 0:
         return returncode
     executed = executed_count(text)
     if executed is None:
-        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but printed no "
+        print(f"\n[{prog}] {label}: rebar3 exited 0 but printed no "
               "recognisable test summary -- cannot confirm any test ran. "
               "Failing (#4800). If rebar3 changed its summary wording, "
               "update scripts/gateway_test_summary.py.", file=sys.stderr)
         return 1
     if executed == 0:
-        print(f"\n[test_gateway.py] {label}: rebar3 exited 0 but executed ZERO "
+        print(f"\n[{prog}] {label}: rebar3 exited 0 but executed ZERO "
               "tests -- nothing was discovered (wrong suite directory / --dir) "
               "or every test was skipped (check the CT/eunit logs). Failing so "
               "this cannot pass as a false green (#4800).", file=sys.stderr)
         return 1
-    print(f"\n[test_gateway.py] {label}: {executed} tests executed.")
+    print(f"\n[{prog}] {label}: {executed} tests executed.")
     return 0
 
 
@@ -148,19 +149,35 @@ def cancel_tolerant_verdict(text, returncode):
         f"EUnit exited {returncode} with {failed} failed of {executed} executed.")
 
 
+_USAGE = ("usage: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]\n"
+          "       gateway_test_summary.py strict LABEL RC LOGFILE")
+
+
 def _main(argv):
-    """CLI: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]"""
-    if len(argv) < 3 or argv[0] != "cancel-tolerant":
-        print("usage: gateway_test_summary.py cancel-tolerant RC LOGFILE [--github]",
-              file=sys.stderr)
+    """CLI.
+
+    cancel-tolerant RC LOGFILE [--github]: the EUnit gates (#1005 tolerance).
+    strict LABEL RC LOGFILE: the Meson wrapper's rule for a gate that keeps
+    rebar3's own exit code (a non-zero rc stays non-zero; a green rc must
+    have executed >= 1 test). Used by gateway/test_runner.sh for ct.
+    """
+    mode = argv[0] if argv else None
+    if mode == "cancel-tolerant" and len(argv) >= 3:
+        rc_arg, log_arg = argv[1], argv[2]
+    elif mode == "strict" and len(argv) == 4:
+        rc_arg, log_arg = argv[2], argv[3]
+    else:
+        print(_USAGE, file=sys.stderr)
         return 2
     try:
-        rc = int(argv[1])
-        with open(argv[2], encoding="utf-8", errors="replace") as f:
+        rc = int(rc_arg)
+        with open(log_arg, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except (ValueError, OSError) as exc:
         print(f"gateway_test_summary: {exc}", file=sys.stderr)
         return 2
+    if mode == "strict":
+        return require_tests_executed(text, argv[1], rc, prog="gateway/test_runner.sh")
     code, level, message = cancel_tolerant_verdict(text, rc)
     if message:
         if "--github" in argv[3:]:

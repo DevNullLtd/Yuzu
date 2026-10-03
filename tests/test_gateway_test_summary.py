@@ -188,6 +188,40 @@ class CancelTolerantVerdict(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertRegex(_read(path), r'gateway_test_summary\.py"?\s+cancel-tolerant')
 
+    def test_local_runner_judges_by_the_summary(self):
+        # gateway/test_runner.sh (the documented local runner) used to trust
+        # rebar3's exit code, so the #4800 false green survived there. Every
+        # rebar3 test invocation must go through its `gated` helper, which
+        # hands the capture to the shared parser: strict for ct, the #1005
+        # cancel-tolerant rule for eunit.
+        src = _read(os.path.join(ROOT, 'gateway', 'test_runner.sh'))
+        self.assertRegex(src, r'SUMMARY_PARSER="\$SCRIPT_DIR/\.\./scripts/gateway_test_summary\.py"')
+        self.assertRegex(src, r'python3 "\$SUMMARY_PARSER" strict ')
+        self.assertRegex(src, r'python3 "\$SUMMARY_PARSER" "\$mode" ')
+        calls = re.findall(r'^\s*(?!#)(.*\brebar3 as test\b.*)$', src, re.M)
+        self.assertEqual(len(calls), 4, calls)   # eunit and ct, each with/without cover
+        for line in calls:
+            with self.subTest(call=line):
+                want = 'strict ct' if ' ct ' in line else 'cancel-tolerant eunit'
+                self.assertRegex(line, r'^gated %s rebar3 as test ' % want)
+
+    def test_strict_cli(self):
+        script = os.path.join(ROOT, 'scripts', 'gateway_test_summary.py')
+        with tempfile.TemporaryDirectory(prefix='yuzu_test_') as d:
+            log = os.path.join(d, 'ct.log')
+            for text, rc, want in [('All 5 tests passed.\n', '0', 0),
+                                   ('All 0 tests passed.\n', '0', 1),
+                                   ('no summary\n', '0', 1),
+                                   ('Failed 1 tests. Passed 4 tests. \n', '1', 1)]:
+                with open(log, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                p = subprocess.run([sys.executable, script, 'strict', 'ct', rc, log],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, want, text + p.stdout + p.stderr)
+            p = subprocess.run([sys.executable, script, 'strict', 'ct', '0'],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2)
+
 
 class WrapperWiring(unittest.TestCase):
 
