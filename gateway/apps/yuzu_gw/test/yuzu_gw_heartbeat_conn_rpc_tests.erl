@@ -453,25 +453,7 @@ cleanup(#{server := Server, agent_sup := AgentSup} = State) ->
     catch telemetry:detach(?MISMATCH_HANDLER),
     catch ets:delete(?MISMATCH_TAB),
     catch meck:unload([yuzu_gw_upstream, yuzu_gw_heartbeat_buffer]),
-    stop_agent_sup(AgentSup).
-
-%% Stop the agent supervisor this fixture started and wait until it is gone:
-%% the next fixture's setup reuses `yuzu_gw_agent_sup' when it is registered,
-%% and must not adopt one that is still shutting down. The supervisor was
-%% unlinked after start, so the stop request goes to it directly rather than
-%% as an exit signal from a process that is not its parent.
-stop_agent_sup(undefined) ->
-    ok;
-stop_agent_sup(AgentSup) ->
-    Ref = monitor(process, AgentSup),
-    catch gen_server:stop(AgentSup, shutdown, 5000),
-    receive {'DOWN', Ref, process, AgentSup, _} -> ok
-    after 5000 ->
-        exit(AgentSup, kill),
-        receive {'DOWN', Ref, process, AgentSup, _} -> ok
-        after 1000 -> demonitor(Ref, [flush]), ok
-        end
-    end.
+    yuzu_gw_test_registry:stop_agent_sup(AgentSup).
 
 %% {Listener transport_opts, client channel ssl options} for a transport.
 %% The one-way listener options mirror the agent listener in

@@ -31,7 +31,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_test_registry).
 
--export([ensure/0, ensure_fresh/0]).
+-export([ensure/0, ensure_fresh/0, stop_agent_sup/1]).
 -export([mock_registry_loop/0, mock_registry_drop_index/1,
          mock_registry_restore_index/1]).
 
@@ -77,6 +77,27 @@ ensure_fresh() ->
         Existing  -> evict(Existing)
     end,
     start_fresh(?START_RETRIES).
+
+%% @doc Stop an agent supervisor that a fixture started, and wait until it is
+%% gone. `undefined' (the fixture reused a supervisor it did not start) is a
+%% no-op. The next fixture's setup reuses `yuzu_gw_agent_sup' when the name is
+%% registered, so it must not find one that is still shutting down. Fixtures
+%% unlink the supervisor after starting it, so the stop request goes to it
+%% directly rather than as an exit signal from a process that is not its
+%% parent (a supervisor ignores those). Returns `ok'.
+-spec stop_agent_sup(pid() | undefined) -> ok.
+stop_agent_sup(undefined) ->
+    ok;
+stop_agent_sup(AgentSup) ->
+    Ref = monitor(process, AgentSup),
+    catch gen_server:stop(AgentSup, shutdown, 5000),
+    receive {'DOWN', Ref, process, AgentSup, _} -> ok
+    after 5000 ->
+        exit(AgentSup, kill),
+        receive {'DOWN', Ref, process, AgentSup, _} -> ok
+        after 1000 -> demonitor(Ref, [flush]), ok
+        end
+    end.
 
 %%%===================================================================
 %%% Stand-in registry for readiness tests

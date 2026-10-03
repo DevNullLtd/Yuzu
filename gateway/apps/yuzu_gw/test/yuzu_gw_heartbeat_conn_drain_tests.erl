@@ -494,11 +494,7 @@ cleanup(#{server := Server, agent_sup := AgentSup, handler_id := HandlerId,
     catch telemetry:detach(HandlerId),
     catch ets:delete(Counts),
     catch meck:unload([yuzu_gw_upstream, yuzu_gw_heartbeat_buffer]),
-    case AgentSup of
-        undefined -> ok;
-        _ -> catch exit(AgentSup, shutdown)
-    end,
-    ok.
+    yuzu_gw_test_registry:stop_agent_sup(AgentSup).
 
 %% Two fresh client channels (two HTTP/2 connections) per case, with zeroed
 %% rejection counters and an empty heartbeat buffer history.
