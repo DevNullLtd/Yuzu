@@ -1,5 +1,7 @@
 #include <yuzu/agent/agent_csr.hpp>
 
+#include <atomic_file_write.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <openssl/bn.h>
@@ -10,21 +12,12 @@
 #include <openssl/x509.h>
 
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
-#include <random>
 #include <string_view>
 #include <system_error>
 #include <utility>
-
-#ifndef _WIN32
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace yuzu::agent {
 
@@ -135,131 +128,29 @@ std::string read_text_file(const fs::path& p) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-std::string random_suffix() {
-    static const char* kHex = "0123456789abcdef";
-    // A one-time process-random base (seeded once — no per-call random_device fd
-    // churn) XORed with a monotonic counter: unique within the process and
-    // unpredictable across processes, without depending SOLELY on random_device
-    // entropy (which can degrade in some virtualised hosts). The real
-    // symlink/redirect defence is O_EXCL|O_NOFOLLOW + the 0700 dir below — this
-    // just guarantees collision-free staging.
-    static const std::uint64_t base = [] {
-        std::random_device rd;
-        return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
-    }();
-    static std::atomic<std::uint64_t> counter{0};
-    std::uint64_t v = base ^ counter.fetch_add(1, std::memory_order_relaxed);
-    std::string s;
-    for (int j = 0; j < 16; ++j) {
-        s += kHex[v & 0xF];
-        v >>= 4;
+// Both helpers delegate to yuzu::shared::write_file_atomic (#4723 option 3: one
+// audited implementation shared with asset_tags). The residual path-based rename
+// window and the Windows DACL gap are shared with asset_tags and documented in
+// the banner of agents/shared/atomic_file_write.hpp.
+bool write_atomic(const fs::path& dest, const std::string& contents, bool owner_only) {
+    auto r = yuzu::shared::write_file_atomic(dest, contents, {.owner_only_mode = owner_only});
+    if (!r) {
+        spdlog::error("agent_csr: {}", r.error().message);
+        return false;
     }
-    return s;
+    if (r.value())
+        spdlog::warn("agent_csr: {}", r.value()->message);
+    return true;
 }
 
-// Atomic write of an owner-readable PUBLIC artifact (leaf / chain): stage to a
-// sibling temp, then rename. Default perms are fine — these are not secrets.
+// PUBLIC artifact (leaf / chain): default perms (umask) are fine - not secrets.
 bool write_public_file(const fs::path& dest, const std::string& contents) {
-    std::error_code ec;
-    const fs::path tmp = dest.parent_path() / (dest.filename().string() + ".tmp." + random_suffix());
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            spdlog::error("agent_csr: cannot open temp {}", tmp.string());
-            return false;
-        }
-        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        out.flush();
-        if (!out) {
-            spdlog::error("agent_csr: write failed for {}", tmp.string());
-            out.close();
-            fs::remove(tmp, ec);
-            return false;
-        }
-    }
-    fs::rename(tmp, dest, ec);
-    if (ec) {
-        spdlog::error("agent_csr: rename {} -> {} failed: {}", tmp.string(), dest.string(),
-                      ec.message());
-        fs::remove(tmp, ec);
-        return false;
-    }
-    return true;
+    return write_atomic(dest, contents, false);
 }
 
-// Atomic write of the PRIVATE key at mode 0600 (mirrors FileKeyProvider): the
-// POSIX path creates the temp 0600 from the outset (no umask window), the Windows
-// path uses ofstream + a best-effort permissions tightening (owner-only DACL is a
-// documented follow-up, same as the server key-write path).
+// PRIVATE key: 0600 from creation, re-asserted on the open fd (no umask window).
 bool write_private_key(const fs::path& dest, const std::string& contents) {
-    std::error_code ec;
-    const fs::path tmp = dest.parent_path() / (dest.filename().string() + ".tmp." + random_suffix());
-#ifndef _WIN32
-    {
-        // O_EXCL refuses to reuse an attacker-planted path; O_NOFOLLOW additionally
-        // refuses to open it if the final component is a symlink (defence in depth
-        // for the key write — the cert dir is already 0700/owner-only above).
-        const int fd =
-            ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (fd < 0) {
-            spdlog::error("agent_csr: open temp {} failed: {}", tmp.string(), std::strerror(errno));
-            return false;
-        }
-        const char* p = contents.data();
-        std::size_t remaining = contents.size();
-        bool ok = true;
-        while (remaining > 0) {
-            const ssize_t n = ::write(fd, p, remaining);
-            if (n < 0) {
-                if (errno == EINTR)
-                    continue; // interrupted before any byte written — retry
-                ok = false;
-                break;
-            }
-            if (n == 0) {
-                ok = false;
-                break;
-            }
-            p += n;
-            remaining -= static_cast<std::size_t>(n);
-        }
-        if (::close(fd) != 0)
-            ok = false;
-        if (!ok) {
-            spdlog::error("agent_csr: write failed for {}", tmp.string());
-            fs::remove(tmp, ec);
-            return false;
-        }
-    }
-#else
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            spdlog::error("agent_csr: cannot open temp {}", tmp.string());
-            return false;
-        }
-        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        out.flush();
-        if (!out) {
-            spdlog::error("agent_csr: write failed for {}", tmp.string());
-            out.close();
-            fs::remove(tmp, ec);
-            return false;
-        }
-    }
-#endif
-    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace, ec); // re-assert 0600
-    fs::rename(tmp, dest, ec);
-    if (ec) {
-        spdlog::error("agent_csr: rename {} -> {} failed: {}", tmp.string(), dest.string(),
-                      ec.message());
-        fs::remove(tmp, ec);
-        return false;
-    }
-    fs::permissions(dest, fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace, ec); // re-assert after rename
-    return true;
+    return write_atomic(dest, contents, true);
 }
 
 } // namespace

@@ -8,6 +8,8 @@
 
 #include "test_helpers.hpp"
 
+#include <atomic_file_write.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <openssl/evp.h>
@@ -142,6 +144,36 @@ TEST_CASE("persist + inspect round-trips and keys are 0600", "[agent_csr][pki]")
 
     fs::remove_all(dir);
 }
+
+#ifndef _WIN32
+TEST_CASE("key write refuses a regular file planted at the actual staging path",
+          "[agent_csr][pki]") {
+    // agent_csr's key write is yuzu::shared::write_file_atomic with
+    // owner_only_mode=true (#4723 option 3). The shared tests plant a symlink on
+    // POSIX, which O_NOFOLLOW alone rejects; a REGULAR file is only rejected by
+    // O_EXCL, so this falsifies a regression that drops O_EXCL. forced_temp_suffix
+    // pins the exact staging name the write will try to create.
+    yuzu::test::TempDir dir{"yuzu_test_agent_csr_"};
+    std::error_code ec;
+    fs::create_directories(dir.path, ec); // TempDir only reserves the name
+    REQUIRE_FALSE(ec);
+
+    const auto dest = dir.path / "key.pem";
+    const auto planted = fs::path{dest.string() + ".tmp.forced"};
+    const std::string sentinel = "SENTINEL-DO-NOT-TOUCH";
+    {
+        std::ofstream f(planted, std::ios::binary);
+        f << sentinel;
+    }
+
+    auto r = yuzu::shared::write_file_atomic(
+        dest, "PRIVATE-KEY", {.owner_only_mode = true, .forced_temp_suffix = "forced"});
+    REQUIRE_FALSE(r.has_value());
+    CHECK_FALSE(r.error().message.empty());
+    CHECK(read_all(planted) == sentinel); // exclusive create failed: planted bytes untouched
+    CHECK_FALSE(fs::exists(dest));        // the rename never ran
+}
+#endif
 
 TEST_CASE("inspect reports Missing when nothing is provisioned", "[agent_csr][pki]") {
     const fs::path dir = yuzu::test::unique_temp_path("agent-csr-missing-");
