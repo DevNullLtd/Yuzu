@@ -43,12 +43,25 @@ class ExecutedCount(unittest.TestCase):
 
     def test_summary_shapes(self):
         cases = {
-            # ct
+            # ct. The three lines marked CAPTURED are verbatim output of
+            # `rebar3 as test ct --dir apps/yuzu_gw/test/ct
+            # --suite=yuzu_gw_e2e_SUITE` run locally with rebar3 3.27.0 on
+            # OTP 28.4.2 (the failing and skipping ones with a scratch-only
+            # broken assertion / init_per_testcase skip), including the
+            # trailing space rebar3 prints. rebar3 CT never singularises
+            # "test(s)": "Failed 1 tests." is the real wording. The other
+            # lines come from the format strings in rebar3's CT provider
+            # (extracted from the 3.24.0 binary, the CI pin, during the PR
+            # review), not from a capture.
             'All 52 tests passed.': 52,
+            'All 5 tests passed.': 5,                                    # CAPTURED
+            'Failed 1 tests. Passed 4 tests. ': 5,                       # CAPTURED
+            'Failed 1 tests. Skipped 1 (1, 0) tests. Passed 3 tests. ': 4,  # CAPTURED
             'Failed 6 tests. Skipped 2 (0, 2) tests. Passed 44 tests. ': 50,
             'Skipped 2 (2, 0) tests. Passed 44 tests.': 44,
             'Failed 5 tests. Passed 0 tests.': 5,
-            'Failed 1 test. Passed 51 tests.\r\n': 52,
+            # a CRLF-terminated variant of the captured line above
+            'Failed 1 tests. Passed 4 tests. \r\n': 5,
             # eunit
             '  All 324 tests passed.': 324,
             '  Failed: 2.  Skipped: 0.  Passed: 309.': 311,
@@ -90,6 +103,25 @@ class ExecutedCount(unittest.TestCase):
     def test_last_summary_wins(self):
         self.assertEqual(
             gts.executed_count('All 3 tests passed.\n...\n  All 311 tests passed.\n'), 311)
+
+    def test_several_genuine_summaries_last_one_decides(self):
+        # Documents the limit of "last summary wins". Today `rebar3 ct` is
+        # run once with a single --dir, so one genuine summary is printed.
+        # A future `--spec` run (or any invocation that makes rebar3 print a
+        # summary per group) could print several GENUINE summary lines; the
+        # parser then judges only the last one, so an early failing run
+        # followed by a passing one reads as a pass and the reverse reads as
+        # a fail. This pins that outcome so changing the invocation shape
+        # forces a decision here rather than going unnoticed.
+        failed_then_passed = ('Failed 1 tests. Passed 4 tests. \n'
+                              'All 5 tests passed.\n')
+        passed_then_failed = ('All 5 tests passed.\n'
+                              'Failed 1 tests. Passed 4 tests. \n')
+        self.assertEqual(gts.last_summary(failed_then_passed), (5, 0, False))
+        self.assertEqual(gts.last_summary(passed_then_failed), (5, 1, False))
+        # A zero-executed LAST summary still fails the run.
+        self.assertEqual(gts.require_tests_executed(
+            'All 5 tests passed.\nAll 0 tests passed.\n', 'ct', 0), 1)
 
 
 class RequireTestsExecuted(unittest.TestCase):

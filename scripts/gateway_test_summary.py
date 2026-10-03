@@ -20,9 +20,16 @@ import sys
 #   eunit: "All 311 tests passed."  "2 tests passed."  "Test passed."
 #          "Failed: 2.  Skipped: 0.  Passed: 309."
 #          "There were no tests to run."
-# The LAST summary wins (rebar3 prints one per run; anything earlier is
-# test-emitted noise). No recognisable summary on an otherwise-green run
-# is ALSO a failure: we cannot confirm anything ran.
+# The LAST summary wins. That is sound for the invocations used today: one
+# `rebar3 ct --dir ...` (or one `rebar3 eunit`) prints exactly ONE genuine
+# summary, so anything matching earlier is test-emitted noise. It is NOT an
+# unconditional guarantee: an invocation that makes rebar3 print several
+# genuine summaries (for example `ct --spec`, one per group) would have only
+# its last one judged, so an early failure could be masked by a later pass.
+# tests/test_gateway_test_summary.py pins that outcome; change the
+# invocation shape and that pin forces a decision about aggregating.
+# No recognisable summary on an otherwise-green run is ALSO a failure: we
+# cannot confirm anything ran.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Each alternative must be the WHOLE line (re.M + ^...$): rebar3 and eunit
 # always print their summary on a line of its own (eunit_tty.erl,
