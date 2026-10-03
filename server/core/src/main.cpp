@@ -21,6 +21,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -324,6 +325,17 @@ int main(int argc, char* argv[]) {
                    "storage substrate. REQUIRED — the server fails closed without a reachable "
                    "database (ADR-0006/0007). The agent stays SQLite.")
         ->envname("YUZU_POSTGRES_DSN");
+    // The connection string usually carries a password, and a service's command
+    // line is readable by local users (on Windows, the service's ImagePath and
+    // Environment value both are). This reads it from a file instead (#5272).
+    std::string postgres_dsn_file;
+    app.add_option("--postgres-dsn-file", postgres_dsn_file,
+                   "Read the PostgreSQL connection string from this file instead of taking it "
+                   "on the command line (whole file; a trailing newline and a UTF-8 BOM are "
+                   "ignored). Cannot be combined with --postgres-dsn / YUZU_POSTGRES_DSN. The "
+                   "file's permissions are not checked: keep it in a directory only the "
+                   "server's account can read.")
+        ->envname("YUZU_POSTGRES_DSN_FILE");
     app.add_option("--postgres-pool-size", cfg.postgres_pool_size,
                    "Max concurrent PostgreSQL connections in the shared pool (default 16). "
                    "Raise for high agent counts / slow managed-PG links; tune against "
@@ -839,6 +851,12 @@ int main(int argc, char* argv[]) {
     app.add_option("--oidc-client-secret", cfg.oidc_client_secret,
                    "OIDC client secret (required for Entra/Azure AD web apps)")
         ->envname("YUZU_OIDC_CLIENT_SECRET");
+    std::string oidc_client_secret_file;
+    app.add_option("--oidc-client-secret-file", oidc_client_secret_file,
+                   "Read the OIDC client secret from this file instead of taking it on the "
+                   "command line, which local users can read (#5272). Cannot be combined with "
+                   "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET.")
+        ->envname("YUZU_OIDC_CLIENT_SECRET_FILE");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
                    "OIDC redirect URI (default: auto-computed from web address/port)")
         ->envname("YUZU_OIDC_REDIRECT_URI");
@@ -952,6 +970,36 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // ── Secrets from files (#5272) ──
+    // Resolved here, before anything reads cfg. A failure is reported again
+    // after the log file is set up (below): a Windows service has no console,
+    // so a stderr-only message would never be seen.
+    std::string secret_file_error;
+    auto load_secret_file = [&secret_file_error](const std::string& file, std::string& target,
+                                                 std::string_view file_flag,
+                                                 std::string_view direct) {
+        if (file.empty() || !secret_file_error.empty())
+            return;
+        if (!target.empty()) {
+            secret_file_error = std::format("{} cannot be combined with {} (set on the command "
+                                            "line or in the environment); use one of them",
+                                            file_flag, direct);
+            return;
+        }
+        auto secret = yuzu::server::read_secret_file(file, file_flag);
+        if (!secret) {
+            secret_file_error = secret.error();
+            return;
+        }
+        target = std::move(*secret);
+    };
+    load_secret_file(postgres_dsn_file, cfg.postgres_dsn, "--postgres-dsn-file",
+                     "--postgres-dsn / YUZU_POSTGRES_DSN");
+    load_secret_file(oidc_client_secret_file, cfg.oidc_client_secret, "--oidc-client-secret-file",
+                     "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET");
+    if (!secret_file_error.empty())
+        std::cerr << "Error: " << secret_file_error << "\n";
 
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
@@ -1237,6 +1285,10 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+    if (!secret_file_error.empty()) {
+        spdlog::critical("Refusing to start: {}", secret_file_error);
+        return EXIT_FAILURE;
+    }
 
     // ── Multi-host Postgres DSN guard (HA WS-8) ──
     // A multi-host DSN without target_session_attrs=read-write lets libpq put the

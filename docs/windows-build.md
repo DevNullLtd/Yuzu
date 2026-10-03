@@ -114,8 +114,28 @@ installers run on the customer's machine, today
 `yuzu-agent.iss` / `yuzu-server.iss`, target the Windows PowerShell 5.1
 (`powershell.exe`) that every Windows host has, and carry no PowerShell 7
 guard. They must stay ASCII-only outside comments (5.1 reads BOM-less files
-in the ANSI codepage), must use .NET Framework APIs, and each must first
-reset `PSModulePath` to `$PSHOME\Modules` plus the machine value (#5176).
+in the ANSI codepage), and each must first reset `PSModulePath` to Windows
+PowerShell's own modules (#5176).
+
+**The permission checks (`RunAclCheck` in both installers) must run under
+Constrained Language Mode**, which WDAC script enforcement, or AppLocker
+script rules for an install run by an administrator, imposes on them. So
+they use no .NET method or static call: only property reads, `-match`,
+`-band` and cmdlets, comparing SDDL text by SID alias (#5196). Only
+`generate-config.ps1` needs .NET (password hashing). The server installer
+checks the language mode first and refuses with its own message; an upgrade
+that keeps the existing accounts never runs it.
+
+The installers run these helpers with `-Command`, never `-File`: a
+Group-Policy `AllSigned` execution policy blocks unsigned script *files* even
+with `-ExecutionPolicy Bypass`, but not command text. `generate-config.ps1`
+is therefore read as text and run as a script block. A helper that handles a
+secret takes it from the environment, never from its command line, and fails
+the install on any error rather than warning (#5196). The server installer's
+data-directory handling (`PrepareToInstall`, `RunAclCheck`) follows the
+agent's `SecureTrustAnchorDir` design: refuse links, never adopt what it did
+not create, build a new directory privately and move it into place, verify
+exact permissions. Change them together.
 
 ## Running server tests locally (libpq.dll on PATH)
 
