@@ -1905,15 +1905,15 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
     // caller - GuardianEngine::apply_rules/start_local, still holding mtx_ for its
     // whole body - waits at most cfg_.backend_op_deadline for this rule's arm to
-    // resolve, PLUS, if this rule_id had a prior generation on a bounded key, up to
-    // another deadline for that generation's disarm, since the two are sequential,
-    // not concurrent - a same-key redeploy is therefore up to 2x this deadline, not
-    // 1x, and a rule moving onto a key that holds a RETAINED disarm (Gate 4 hp-1) up
-    // to 3x: prior-key disarm, target-key disarm, own arm; a non-waiting entry point
-    // removes this wait entirely). The deadline is real steady_clock time captured
-    // HERE - after attach_core()'s own prior-disarm wait, which runs inside it - never
-    // the injected clock_() snapshot attach_core() uses for its own bookkeeping
-    // (tests inject fake clocks) and never counted from entry. Every OTHER rule's
+    // resolve; a non-waiting entry point removes this wait entirely). Nothing here
+    // waits on a prior generation's disarm, or on a RETAINED disarm at the head of the
+    // target key (Gate 4 hp-1): attach_core() only submits those off-lock
+    // (submit_disarm_off_lock() returns once the disarm is ADMITTED, not finished), so
+    // the time an own arm claim spends queued behind one counts against this single
+    // deadline rather than adding to it. The deadline is real steady_clock time
+    // captured HERE, after attach_core() returns - never the injected clock_()
+    // snapshot attach_core() uses for its own bookkeeping (tests inject fake clocks)
+    // and never counted from entry. Every OTHER rule's
     // attach/detach and every evaluate_key proceed freely throughout, since
     // registry_mu_ is not held here at all. The commit itself - keys_/rules_/
     // pending_initial/"armed" audit - runs in on_arm_complete on the executor

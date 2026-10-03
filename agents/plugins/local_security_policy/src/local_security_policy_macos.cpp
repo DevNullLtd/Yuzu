@@ -56,7 +56,7 @@ int collect_macos_policy(yuzu::CommandContext& ctx, std::string_view action) {
     if (which == LocalPolicyAction::Password || which == LocalPolicyAction::Lockout)
         return apply_collected(ctx, collect_pwpolicy(which), prefix);
     return apply_collected(
-        ctx, collect_file_policy(FileFlavor::Macos, which, posix_read_file, posix_list_dir), prefix);
+        ctx, collect_file_policy(FileFlavor::Macos, which, make_posix_reader(), posix_list_dir), prefix);
 }
 
 } // namespace yuzu::local_security_policy

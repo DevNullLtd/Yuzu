@@ -56,7 +56,7 @@ assert_eq() {
 assert_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if echo "$haystack" | grep -q "$needle"; then
+    if grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected to contain '$needle')"
@@ -66,7 +66,7 @@ assert_contains() {
 assert_not_contains() {
     TESTS=$((TESTS + 1))
     local desc="$1" needle="$2" haystack="$3"
-    if ! echo "$haystack" | grep -q "$needle"; then
+    if ! grep -qF -- "$needle" <<< "$haystack"; then
         pass "$desc"
     else
         fail "$desc (expected NOT to contain '$needle', but it was present)"
@@ -263,14 +263,14 @@ if [[ -n "$ADMIN_PASS" ]]; then
         "${SERVER_URL}/api/v1/openapi.json" 2>/dev/null || echo "")
     rm -f "$OPENAPI_COOKIE_JAR"
     assert_eq "GET /api/v1/openapi.json (authenticated) → 200" "200" "$OPENAPI_AUTH_STATUS"
-    # Not assert_contains: that helper's `echo "$haystack" | grep -q "$needle"`
-    # pipeline can spuriously report no-match under `pipefail` when the needle
-    # is found on an early line of a large multi-line haystack — grep(1) exits
-    # the instant it matches, echo(1) is still mid-write of the remaining
-    # ~200KB spec body, SIGPIPE kills echo, and pipefail surfaces THAT
-    # non-zero exit rather than grep's success. The pretty-printed OpenAPI
-    # doc (its "openapi" key is on line 2) triggers this every time. Plain
-    # bash glob match has no subshell/pipe to race.
+    # Not a pipe: `echo "$body" | grep -q "$needle"` can spuriously report
+    # no-match under `pipefail` when the needle is on an early line of a large
+    # multi-line body — grep(1) exits the instant it matches, echo(1) is still
+    # mid-write of the remaining ~200KB spec body, SIGPIPE kills echo, and
+    # pipefail surfaces THAT non-zero exit rather than grep's success. The
+    # pretty-printed OpenAPI doc (its "openapi" key is on line 2) triggers this
+    # every time. Plain bash glob match has no subshell/pipe to race (as does
+    # assert_contains, which uses a here-string for the same reason).
     TESTS=$((TESTS + 1))
     if [[ "$OPENAPI_AUTH_BODY" == *'"openapi"'* ]]; then
         pass "GET /api/v1/openapi.json (authenticated) body has openapi"
@@ -550,56 +550,80 @@ log "Category 7: Rate Limiting"
 GOT_429=false
 GOT_RETRY_AFTER=false
 
-# Drive POST /login in parallel until a 429 fires. The production-default
-# login rate limit is 10/sec per IP; the /test pipeline's UAT bumps that
-# to 200/sec (#1006/#1007) so the parallel Phase 5 fan-out doesn't
-# self-DoS. Sequential curl requests are paced by per-request latency
-# (~30-50ms each, so ~20-30/sec max), never exceeding the high UAT
-# bucket. Fan-out via xargs -P to genuinely exceed the bucket: 500
-# requests at concurrency 64 floods the limiter from a cold bucket
-# within a second on any sane box. If the limiter is OFF entirely none
-# of the 500 returns 429 — that IS the bug the test catches.
+# Fire one open-loop burst of POST /login. The production-default login rate
+# limit is 10/sec per IP; the /test pipeline's UAT bumps that to 200/sec
+# (#1006/#1007) so the parallel Phase 5 fan-out doesn't self-DoS. The burst has
+# to exceed that bucket from a cold start, so it must be OPEN-loop: a single
+# curl process (-Z) opens every transfer up front and does not wait on earlier
+# responses. A closed-loop fan-out (xargs -P N, one curl per request) is paced
+# by the handler's latency instead: logins for the same username serialise on a
+# per-username mutex, so a slow handler held the offered rate under the refill
+# rate and the bucket never emptied (the old probe failed most recorded runs).
+# If the limiter is OFF entirely none of the requests returns 429 - that IS the
+# bug the test catches.
+# The first wave of arrivals does the work, so this relies on the server's
+# worker pool (264 by default) exceeding the login bucket (200, start-UAT.sh's
+# --login-rate-limit): shrinking the pool below the bucket silently brings the
+# closed-loop failure back.
+# Each response is reported as "<status> <retry-after>"; reading the header off
+# the same response avoids the refill race of a serial follow-up (the bucket
+# refills within ~10ms after the burst ends). The burst (-Z --parallel-immediate)
+# needs curl >= 7.68 and %header{} needs >= 7.84: on 7.68-7.83 the status is still
+# read and only the Retry-After assertion is skipped; below 7.68 the probe cannot
+# run, which is reported as such rather than as "limiter not triggered".
 RATELIMIT_ATTEMPTS=500
-RATELIMIT_PARALLELISM=64
-RATELIMIT_TMP=$(mktemp -d)
-trap "rm -rf '$RATELIMIT_TMP'" EXIT
-# Each worker writes a full header dump to a per-request file. We then
-# look for any file whose first line is a 429 and inspect its headers
-# for Retry-After. Doing it this way (rather than a serial follow-up
-# after the storm) avoids the refill race — the bucket refills within
-# ~10ms after the storm ends, so a serial follow-up reliably gets a
-# fresh token and we miss the 429 headers.
-seq 1 $RATELIMIT_ATTEMPTS | xargs -P "$RATELIMIT_PARALLELISM" -I{} sh -c "
-    curl -s -D'$RATELIMIT_TMP/h_{}' -o /dev/null \
-        -X POST '${SERVER_URL}/login' \
-        -d 'username=ratelimit_test&password=bad_{}' 2>/dev/null || true
-"
-# Pick any 429 response file and read its headers.
-for h in "$RATELIMIT_TMP"/h_*; do
-    [[ -f "$h" ]] || continue
-    if head -1 "$h" | grep -q "429"; then
-        GOT_429=true
-        if grep -qi "^Retry-After:" "$h"; then
-            GOT_RETRY_AFTER=true
-        fi
-        break
+RATELIMIT_PARALLELISM=300
+IFS=. read -r CURL_MAJOR CURL_MINOR _ <<< "$(curl --version | awk 'NR==1 {print $2}')"
+[[ $CURL_MAJOR =~ ^[0-9]+$ ]] || CURL_MAJOR=0
+[[ $CURL_MINOR =~ ^[0-9]+$ ]] || CURL_MINOR=0
+curl_at_least() { (( CURL_MAJOR > $1 || (CURL_MAJOR == $1 && CURL_MINOR >= $2) )); }
+RATELIMIT_FMT='%{http_code}\n'
+if curl_at_least 7 84; then
+    RATELIMIT_FMT='%{http_code} %header{retry-after}\n'
+fi
+RATELIMIT_OUT=""
+RATELIMIT_RC=0
+if curl_at_least 7 68; then
+    # 300 concurrent sockets need more than macOS's default 256 descriptors: without
+    # headroom most transfers come back 000 and the failure reads as "limiter off".
+    FD_LIMIT=$(ulimit -Sn)
+    if [[ $FD_LIMIT =~ ^[0-9]+$ ]] && (( FD_LIMIT < 1024 )); then
+        ulimit -Sn 1024 2>/dev/null || true
     fi
-done
+    RATELIMIT_OUT=$(curl -s -Z --parallel-immediate --parallel-max "$RATELIMIT_PARALLELISM" \
+        --max-time 60 -o /dev/null -w "$RATELIMIT_FMT" \
+        -X POST -d 'username=ratelimit_test&password=bad' \
+        "${SERVER_URL}/login?[1-${RATELIMIT_ATTEMPTS}]" 2>/dev/null) || RATELIMIT_RC=$?
+fi
+if grep -Eq '^429( |$)' <<< "$RATELIMIT_OUT"; then
+    GOT_429=true
+fi
+if grep -Eq '^429 [0-9]+' <<< "$RATELIMIT_OUT"; then
+    GOT_RETRY_AFTER=true
+fi
 
 TESTS=$((TESTS + 1))
 if $GOT_429; then
     pass "Rate limiting triggered (429 returned within $RATELIMIT_ATTEMPTS parallel requests)"
+elif ! curl_at_least 7 68; then
+    fail "Rate-limit probe needs curl >= 7.68 for --parallel-immediate (found ${CURL_MAJOR}.${CURL_MINOR})"
 else
     fail "Rate limiting NOT triggered (no 429 in $RATELIMIT_ATTEMPTS parallel login attempts)"
+    # all-000 means transport trouble (fds, connect), all-401 a missing limiter, 5xx a sick server
+    log "  statuses: $(awk '{print $1}' <<< "$RATELIMIT_OUT" | sort | uniq -c | tr '\n' ' ')(curl exit $RATELIMIT_RC)"
 fi
 
-TESTS=$((TESTS + 1))
-if $GOT_429 && $GOT_RETRY_AFTER; then
-    pass "429 response includes Retry-After header"
-elif $GOT_429; then
-    fail "429 response missing Retry-After header"
+if ! curl_at_least 7 84; then
+    log "  - Retry-After check skipped: needs curl >= 7.84 for %header{} (found ${CURL_MAJOR}.${CURL_MINOR})"
 else
-    fail "429 never triggered — cannot check Retry-After header"
+    TESTS=$((TESTS + 1))
+    if $GOT_429 && $GOT_RETRY_AFTER; then
+        pass "429 response includes Retry-After header"
+    elif $GOT_429; then
+        fail "429 response missing Retry-After header"
+    else
+        fail "429 never triggered — cannot check Retry-After header"
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════

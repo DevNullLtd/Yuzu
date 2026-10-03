@@ -1,6 +1,6 @@
 /**
  * test_local_security_policy_local_dispatcher.cpp -- loads the ACTUAL built plugin and
- * drives `password_policy`/`lockout_policy`/`audit_policy` through
+ * drives `password_policy`/`lockout_policy`/`audit_policy`/`sudoers` through
  * yuzu::agent::LocalDispatcher. Unguarded (runs on all three OSes). The pure parser tests
  * (test_local_security_policy_parsers.cpp) cover every decision; this file proves the real
  * compiled leg TU actually wires them up -- the class of gap the Linux leg's own real
@@ -17,6 +17,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -65,29 +66,58 @@ std::vector<std::string> rows_of(const std::string& captured) {
 
 } // namespace
 
-TEST_CASE("local_security_policy: descriptor pins the three actions shipped in this PR",
+TEST_CASE("local_security_policy: descriptor pins the four actions; sudoers is the only "
+          "Windows-unsupported leg",
           "[local_security_policy][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;
     const auto* d = plugin->descriptor();
-    REQUIRE(d->action_descriptor_count == 3);
+    REQUIRE(d->action_descriptor_count == 4);
     std::vector<std::string> seen;
     for (int i = 0; d->actions[i] != nullptr; ++i) seen.emplace_back(d->actions[i]);
-    CHECK(seen == std::vector<std::string>{"password_policy", "lockout_policy", "audit_policy"});
+    CHECK(seen == std::vector<std::string>{"password_policy", "lockout_policy", "audit_policy",
+                                           "sudoers"});
+    for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+        const auto& a = d->action_descriptors[i];
+        REQUIRE(a.action != nullptr);
+        const std::string_view action{a.action};
+        INFO("action: " << action);
+        // Every leg is declared for every action, never left undeclared (the capability-matrix
+        // generator needs a complete, stable shape).
+        CHECK(a.linux_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(a.macos_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(a.windows_leg.support != YUZU_SUPPORT_UNDECLARED);
+        CHECK(a.linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(a.linux_leg.rung == 1);
+        CHECK(a.linux_leg.fallback != nullptr);
+        CHECK(a.macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(a.macos_leg.fallback != nullptr);
+        if (action == "sudoers") {
+            CHECK(a.macos_leg.rung == 1);
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_UNSUPPORTED); // no sudoers on Windows
+            CHECK(a.windows_leg.rung == 0);
+            CHECK(a.windows_leg.mechanism == nullptr); // an unsupported leg names no mechanism
+            CHECK(a.windows_leg.fallback != nullptr);  // the reason lives in the fallback text
+        } else {
+            // macOS password/lockout come from pwpolicy (rung 2); audit_policy reads a file.
+            CHECK(a.macos_leg.rung == (action == "audit_policy" ? 1 : 2));
+            CHECK(a.windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
+            CHECK(a.windows_leg.rung == 2); // secedit /export, an argv leaf
+            CHECK(a.windows_leg.fallback != nullptr);
+        }
+    }
 }
 
-TEST_CASE("local_security_policy: an unregistered action (unknown, or the PLANNED sudoers) "
-          "reports rc=1 and a named row, never a silent no-op",
+TEST_CASE("local_security_policy: an unregistered action reports rc=1 and a named row, never a "
+          "silent no-op",
           "[local_security_policy][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
-    for (const char* action : {"bogus_action", "sudoers"}) {
-        const auto result = dispatcher.run(plugin->descriptor(), action);
-        INFO(action);
-        CHECK(result.rc != 0);
-        CHECK(result.captured.find("unknown action:") != std::string::npos);
-    }
+    const auto result = dispatcher.run(plugin->descriptor(), "bogus_action");
+    CHECK(result.rc != 0);
+    CHECK(result.captured.find("unknown action:") != std::string::npos);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNDECLARED); // no typed status on this path
 }
 
 TEST_CASE("local_security_policy: each real action returns at least one well-shaped row "
@@ -96,7 +126,10 @@ TEST_CASE("local_security_policy: each real action returns at least one well-sha
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
-    for (const char* action : {"password_policy", "lockout_policy", "audit_policy"}) {
+    for (const char* action : {"password_policy", "lockout_policy", "audit_policy", "sudoers"}) {
+#if defined(_WIN32)
+        if (std::string_view{action} == "sudoers") continue; // the fixed refusal row, below
+#endif
         const auto result = dispatcher.run(plugin->descriptor(), action);
         const auto rows = rows_of(result.captured);
         INFO(action);
@@ -117,28 +150,41 @@ TEST_CASE("local_security_policy: each real action returns at least one well-sha
 }
 
 #if defined(_WIN32)
-// Adversarial-review finding: the row-shape/status-declared checks above would stay green even
-// if the Windows planned branch regressed to OK/FULL with rc 0 while keeping a `constrained|...`
-// -shaped row -- the exact false-success outcome the routed-concern row (local_security_policy,
-// clause 2: "a PLANNED leg's placeholder must never report OK/success") forbids. Pin the whole
-// contract exactly, matching test_browser_policy_local_dispatcher.cpp's check_planned_placeholder
-// precedent. Unlike browser_policy's planned leg (rc 0), this plugin's returns rc 1
-// (plugin.cpp:153-159) -- the row is written before returning failure, not instead of it.
-TEST_CASE("local_security_policy: the Windows planned leg is pinned exactly, never OK/FULL",
+// LocalDispatcher never sets agent.data_dir, so the three secedit-backed actions stop at the
+// fail-closed data_dir_unset row here: no export, no spawn, nothing written. Pinning that row
+// (and the status, completeness, provenance and rc the plugin's contract gives every degraded
+// read) keeps this case from passing on any other constrained row, e.g. a re-planned leg. The
+// export itself is covered by the pure secedit tests and the rig capture, not this suite.
+TEST_CASE("local_security_policy: Windows policy actions fail closed without agent.data_dir",
           "[local_security_policy][dispatcher]") {
     auto plugin = load_plugin();
     if (!plugin) return;
     yuzu::agent::LocalDispatcher dispatcher;
     for (const char* action : {"password_policy", "lockout_policy", "audit_policy"}) {
-        const auto result = dispatcher.run(plugin->descriptor(), action);
         INFO(action);
-        CHECK(result.rc == 1);
-        const auto rows = rows_of(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == "constrained|windows:planned");
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        const auto result = dispatcher.run(plugin->descriptor(), action);
+        CHECK(result.rc == 0); // degradation is the status, rc is not a proxy for it
+        CHECK(rows_of(result.captured) == std::vector<std::string>{"constrained|data_dir_unset"});
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-        CHECK(result.result_provenance == "windows:planned");
+        CHECK(result.result_provenance == "data_dir_unset");
     }
+}
+
+// Windows has no sudoers: the plugin short-circuits with one fixed row, UNAVAILABLE/PARTIAL and
+// a named provenance -- never a read, never an empty success.
+TEST_CASE("local_security_policy: sudoers refuses cleanly with a fixed row on Windows",
+          "[local_security_policy][dispatcher]") {
+    auto plugin = load_plugin();
+    if (!plugin) return;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor(), "sudoers");
+    CHECK(result.rc == 1);
+    const auto rows = rows_of(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "sudoers|-|unsupported|-|-|-|windows_has_no_sudoers");
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "windows_has_no_sudoers");
 }
 #endif

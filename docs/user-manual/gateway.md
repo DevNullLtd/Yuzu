@@ -147,7 +147,8 @@ revocation, and the future gateway-mTLS cutover.)
 
 Individual agent heartbeats are not forwarded one-by-one. Instead,
 `yuzu_gw_upstream` buffers heartbeats and sends them in a single
-`BatchHeartbeat` RPC at a configurable interval (default: 10 seconds).
+`BatchHeartbeat` RPC at a configurable interval (`heartbeat_batch_interval_ms`,
+default 1000 ms; env override `YUZU_GW_HEARTBEAT_INTERVAL_MS`).
 
 This reduces upstream load from O(agents/interval) to O(nodes/interval).
 
@@ -181,7 +182,9 @@ connectivity records.
 
 The `GatewayUpstream` service is a gRPC service exposed by the C++ server
 specifically for gateway communication. It is defined in
-`proto/yuzu/gateway/v1/gateway.proto`.
+`proto/yuzu/gateway/v1/gateway.proto`. Each core replica answers from its own
+in-memory view of the gateway sessions it holds; see the `BatchHeartbeat`
+message below for the per-replica unknown-session list the server now returns.
 
 ### RPCs
 
@@ -202,8 +205,19 @@ message BatchHeartbeatRequest {
 
 message BatchHeartbeatResponse {
   int32 acknowledged_count = 1;
+  repeated string unknown_session_ids = 2;
+  bool unknown_session_ids_truncated = 3;
 }
 ```
+
+`unknown_session_ids` lists the distinct session ids in the batch that the
+answering server replica does not hold in memory (at most 4096; empty and
+over-length ids are never listed), and `unknown_session_ids_truncated` is set
+when more than that were unknown. A server that predates these fields and a
+server with nothing unknown look the same on the wire, by design. **The gateway
+does not read either field yet** (only the server side exists today), so
+today they have no effect on gateway behaviour; the gateway-side replay that
+will consume them is tracked in #1197.
 
 ### StreamStatusNotification Message
 
@@ -245,7 +259,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {upstream_pool_size, 16},
 
     %% Heartbeat batching interval (ms)
-    {heartbeat_batch_interval_ms, 10000},
+    {heartbeat_batch_interval_ms, 1000},
 
     %% Default command timeout (seconds)
     {default_command_timeout_s, 300},
@@ -484,6 +498,36 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > cannot observe the direct agent peer, and the durable source arrives with the
 > QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
 > `source_ip` with network logs on this path will see the gateway's address.
+
+> **Known limitation - server-only restart (#1197).** After the server restarts
+> while a gateway stays connected, `/health` `agents.online` can stay 0. The
+> server keeps its gateway sessions in memory, and no registration replay was
+> observed in this scenario (the replay drip documented under
+> [Prometheus Metrics](#prometheus-metrics) runs after an upstream reconnect,
+> which a server-only restart did not trigger in the observed runs). Signals at
+> the default log level: the server WARN `GatewayRouteStore renew_leases guard
+> rejected the write (outcome=unknown_session ...)`, logged for each heartbeat
+> batch that carries such a session (about every 30 s per agent on the rig;
+> expect more log volume on a larger fleet), the WARN `ProxyInventory: unknown
+> session` when an inventory report arrives, and
+> `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`
+> rising while `/health` `agents.online` stays at 0. With `--log-level debug`
+> the server also logs `BatchHeartbeat: unknown session` and `0/1 acked`.
+> Observed on one local development rig after a SIGKILL of the server with an
+> immediate restart (about 5 to 13 s of downtime across the four samples), with
+> one agent; graceful shutdown, longer downtime and multiple agents or replicas
+> were not tested. A command to the agent was still delivered while its route
+> lease was unexpired (the lease runs 90 s from the last heartbeat the previous
+> server ingested, so the window after the restart is 90 s minus that
+> heartbeat's age at the kill minus the downtime) and was refused (503)
+> afterwards; if the previous server had ingested no heartbeat there was no
+> such window; the server did not relearn the session in the observed windows
+> (to about 125 s). A full restart of the server, the gateway and the agent
+> restored it (the one agent tested; for a fleet this would mean every agent
+> behind that gateway, which was not tested); that is the only recovery
+> observed and is NOT a recommended procedure (restarting only the gateway, or
+> only the agent, was not tested). The gateway-side fix is tracked in #1197;
+> this note will be revised when it ships.
 
 ---
 
