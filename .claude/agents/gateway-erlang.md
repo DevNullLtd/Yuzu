@@ -94,7 +94,7 @@ For real isolation, either `rm -rf gateway/_build/test` between runs, or drop in
   - `yuzu_gw_agent_handler.erl` — Per-agent connection process
   - `yuzu_gw_upstream.erl` — Server-side gRPC client
   - `yuzu_gw_metrics.erl` — Prometheus metrics
-- `gateway/apps/yuzu_gw/test/` — EUnit test modules; `gateway/apps/yuzu_gw/test/ct/` — standard CT suites (no external prerequisites)
+- `gateway/apps/yuzu_gw/test/` — EUnit test modules; the standard CT suites (no external prerequisites) are in its `ct/` subdirectory
 - `gateway/apps/yuzu_gw/integration_test/` — CT suites that require a real running upstream + enrollment token
 - `gateway/rebar.config` — Build and dependency configuration
 - `docs/erlang-gateway-blueprint.md` — Architecture reference
