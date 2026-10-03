@@ -84,7 +84,7 @@ struct FirmwareRow {
     return {std::string{field}, std::move(v), std::string{source}};
 }
 
-enum class ReadOutcome { ok, absent, denied, failed };
+using ReadOutcome = yuzu::shared::wmi_token::WmiReadOutcome;
 
 /// POSIX errno numbers as plain integers (stable on Linux and macOS): ENOENT = the file
 /// definitively is not there; EACCES/EPERM = refused; anything else failed. ENOTDIR is NOT
@@ -106,8 +106,8 @@ enum class ReadOutcome { ok, absent, denied, failed };
     return ReadOutcome::failed;
 }
 
-/// The stage-aware WMI token classifier is shared (agents/shared/wmi_error_token.hpp); this
-/// plugin only maps its outcome onto ReadOutcome (apply_wmi_error_token).
+/// The stage-aware WMI token classifier and its outcome enum (ReadOutcome) are shared
+/// (agents/shared/wmi_error_token.hpp); apply_wmi_error_token applies the result.
 using yuzu::shared::wmi_token::classify_wmi_error_token;
 
 /// Everything a leg gathered: rows to write plus the failure accounting.
@@ -657,11 +657,7 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
 /// that left it out would read a fault after a returned row as an absence.
 inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token,
                                   std::size_t rows_before_error) {
-    using yuzu::shared::wmi_token::WmiReadOutcome;
-    const WmiReadOutcome w = classify_wmi_error_token(token, rows_before_error);
-    const ReadOutcome o = w == WmiReadOutcome::absent   ? ReadOutcome::absent
-                          : w == WmiReadOutcome::denied ? ReadOutcome::denied
-                                                        : ReadOutcome::failed;
+    const ReadOutcome o = classify_wmi_error_token(token, rows_before_error);
     if (o == ReadOutcome::absent) {
         report.add_all(wmi_bios_rows({}));
         return;

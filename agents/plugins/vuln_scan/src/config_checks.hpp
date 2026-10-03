@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -62,21 +63,21 @@ inline std::string errno_name(int e) {
 
 // badbit = an I/O fault mid-read (e.g. EIO on /proc). failbit+eofbit on a
 // short or empty file is a VALUE (empty string), not a fault.
-inline ReadResult read_value_from(std::istream& in, int fault_errno) {
+inline ReadResult read_value_from(std::istream& in) {
     std::string val;
     std::getline(in, val);
     if (in.bad())
-        return std::unexpected(fault_errno);
+        return std::unexpected(EIO);
     return val;
 }
 
-inline LinesResult read_lines_from(std::istream& in, int fault_errno) {
+inline LinesResult read_lines_from(std::istream& in) {
     std::vector<std::string> lines;
     std::string line;
     while (std::getline(in, line))
         lines.push_back(line);
     if (in.bad())
-        return std::unexpected(fault_errno);
+        return std::unexpected(EIO);
     return lines;
 }
 
@@ -191,26 +192,25 @@ inline std::string run_cmd(const char* cmd) {
 
 // Open failure -> errno from open. A fault after open (badbit) -> the errno the
 // kernel set during the read, else EIO.
-inline ReadResult read_proc_value(const char* path) {
+template <typename Reader>
+inline auto read_file_with(const char* path, Reader reader)
+    -> std::invoke_result_t<Reader, std::ifstream&> {
     std::ifstream f(path);
     if (!f.is_open())
         return std::unexpected(errno ? errno : EIO);
     errno = 0;
-    auto r = read_value_from(f, EIO);
+    auto r = reader(f);
     if (!r && errno != 0)
         return std::unexpected(errno);
     return r;
 }
 
+inline ReadResult read_proc_value(const char* path) {
+    return read_file_with(path, [](std::istream& in) { return read_value_from(in); });
+}
+
 inline LinesResult read_lines(const char* path) {
-    std::ifstream f(path);
-    if (!f.is_open())
-        return std::unexpected(errno ? errno : EIO);
-    errno = 0;
-    auto r = read_lines_from(f, EIO);
-    if (!r && errno != 0)
-        return std::unexpected(errno);
-    return r;
+    return read_file_with(path, [](std::istream& in) { return read_lines_from(in); });
 }
 
 } // namespace detail

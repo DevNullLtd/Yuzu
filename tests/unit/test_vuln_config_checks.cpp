@@ -178,18 +178,18 @@ TEST_CASE("ssh_password_auth_check: absent config is not applicable, other error
 
 TEST_CASE("read_value_from: clean, empty and faulted streams", "[vuln][config]") {
     std::istringstream clean("2\n");
-    auto v = read_value_from(clean, EIO);
+    auto v = read_value_from(clean);
     REQUIRE(v.has_value());
     CHECK(*v == "2");
 
     std::istringstream empty("");
-    auto e = read_value_from(empty, EIO);
+    auto e = read_value_from(empty);
     REQUIRE(e.has_value()); // failbit+eofbit on an empty file is a value, not a fault
     CHECK(e->empty());
 
     std::istringstream faulted("2\n");
     faulted.setstate(std::ios::badbit);
-    auto f = read_value_from(faulted, EIO);
+    auto f = read_value_from(faulted);
     REQUIRE_FALSE(f.has_value());
     CHECK(f.error() == EIO);
     CHECK(aslr_check(f).severity == "UNREADABLE");
@@ -198,18 +198,18 @@ TEST_CASE("read_value_from: clean, empty and faulted streams", "[vuln][config]")
 
 TEST_CASE("read_lines_from: clean, empty and faulted streams", "[vuln][config]") {
     std::istringstream clean("a\nb\n");
-    auto v = read_lines_from(clean, EIO);
+    auto v = read_lines_from(clean);
     REQUIRE(v.has_value());
     CHECK(*v == std::vector<std::string>{"a", "b"});
 
     std::istringstream empty("");
-    auto e = read_lines_from(empty, EIO);
+    auto e = read_lines_from(empty);
     REQUIRE(e.has_value());
     CHECK(e->empty());
 
     std::istringstream faulted("PermitRootLogin no\n");
     faulted.setstate(std::ios::badbit);
-    auto f = read_lines_from(faulted, EIO);
+    auto f = read_lines_from(faulted);
     REQUIRE_FALSE(f.has_value());
     CHECK(f.error() == EIO);
     CHECK(ssh_root_login_check(f).severity == "UNREADABLE");
