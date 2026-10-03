@@ -50,6 +50,7 @@
 namespace {
 
 bool g_fail_alloc = false; // set by oom_leg, cleared before any assertion runs
+int g_injected = 0;        // allocations the failing allocator actually refused
 
 int g_writes = 0;
 int g_status_calls = 0;
@@ -58,6 +59,7 @@ YuzuResultCompleteness g_completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
 char g_provenance[64] = {};
 
 void reset_stubs() {
+    g_injected = 0;
     g_writes = 0;
     g_status_calls = 0;
     g_status = YUZU_RESULT_STATUS_UNDECLARED;
@@ -84,8 +86,10 @@ void check_provenance_is_legal() {
 
 // Plain pair only: libstdc++/libc++ route the nothrow and sized forms through these.
 void* operator new(std::size_t n) {
-    if (g_fail_alloc)
+    if (g_fail_alloc) {
+        ++g_injected;
         throw std::bad_alloc{};
+    }
     if (void* p = std::malloc(n ? n : 1))
         return p;
     throw std::bad_alloc{};
@@ -124,6 +128,9 @@ TEST_CASE("browser_policy run_guarded contains a leg that throws under sustained
     g_fail_alloc = false;
 
     REQUIRE_FALSE(escaped);
+    // The catch arm's token reserve (33 bytes, past every SSO size) must have hit the failing
+    // allocator, or this case proves nothing on a stdlib whose typed-status check is skipped.
+    REQUIRE(g_injected > 0);
     CHECK(rc == 1);
     if (g_status_calls > 0) {
         CHECK(g_status == YUZU_RESULT_STATUS_UNAVAILABLE);
@@ -152,6 +159,9 @@ TEST_CASE("update_source_trust execute_sources contains a leg that throws under 
     g_fail_alloc = false;
 
     REQUIRE_FALSE(escaped);
+    // The catch arm's token reserve (33 bytes, past every SSO size) must have hit the failing
+    // allocator, or this case proves nothing on a stdlib whose typed-status check is skipped.
+    REQUIRE(g_injected > 0);
     // The host must still learn of the failure: a typed UNAVAILABLE/UNKNOWN status, or rc 1.
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));

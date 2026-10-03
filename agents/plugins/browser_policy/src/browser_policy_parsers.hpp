@@ -64,9 +64,8 @@
  * is a complete answer, so no placeholder row is written for it. Every other
  * outcome is reported twice: through the typed result status (CC-07) AND as `status` rows
  * (format_status_row, written first by the legs.hpp seams: a summary row, then one per failing
- * path for a constrained read): a read
- * that could not be completed is `constrained` with the failure tokens, a
- * PLANNED leg or a leg that threw is `unavailable`. The row exists because the
+ * path for a constrained read): a read that could not be completed is `constrained` with the
+ * failure tokens, a PLANNED leg or a leg that threw is `unavailable`. The row exists because the
  * server's response queries (REST, MCP, the dashboard) do not return the typed
  * status today (tracked as #4865; that issue also decides whether these
  * in-band rows are then retired or kept, since the typed status carries no

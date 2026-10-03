@@ -3,18 +3,17 @@
  * and its three per-OS leg TUs (peripherals_legs.hpp / disk_actions_legs.hpp
  * are the sibling shape).
  *
- * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read
- * is not a failed command, and the degradation is reported through the CC-07
- * typed status (`mark_result_read`) AND as in-band `status` rows (a summary row, then one per
- * failing path; the
- * response queries do not return the typed status today). Only the Linux leg
- * reads today; the Windows and macOS legs are PLANNED placeholders that report
- * `mark_result_planned` (UNAVAILABLE, one `status` row) so a host they cannot
- * yet inspect never reads as "no policy configured". Declared unconditionally so
- * the plugin TU and every leg TU see one signature on every OS; only the
- * DEFINITION is self-gated (each leg .cpp wraps its body in
- * `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin TU calls only
- * the host leg — a single-OS build never links the other two.
+ * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read is
+ * not a failed command, and the degradation is reported through the CC-07 typed
+ * status (`mark_result_read`) AND as in-band `status` rows (a summary row, then
+ * one per failing path; the response queries do not return the typed status
+ * today). Only the Linux leg reads today; the Windows and macOS legs are
+ * PLANNED placeholders that report `mark_result_planned` (UNAVAILABLE, one
+ * `status` row) so a host they cannot yet inspect never reads as "no policy
+ * configured". Declared unconditionally so the plugin TU and every leg TU see
+ * one signature on every OS; only the DEFINITION is self-gated (each leg .cpp
+ * wraps its body in `#if defined(_WIN32|__linux__|__APPLE__)`), and the plugin
+ * TU calls only the host leg — a single-OS build never links the other two.
  *
  * WHEN A LEG LANDS (Windows registry, macOS plist): replace its `mark_result_planned`
  * body with a real read that reports through `mark_result_read` BEFORE writing rows, then

@@ -1200,8 +1200,10 @@ TEST_CASE("browser_policy linux leg: a failing file gets one per-path status row
     CHECK(run.path_rows[0].find(dir.path.string()) == std::string::npos);
 }
 
-// MUTATION: raise the push guard in linux_policy_rows_at's `fail` (or drop the cap in
-// mark_result_read) -> more than 64 per-path rows, or no `status_rows_capped` token.
+// MUTATION: drop the cap in mark_result_read, or shift its `>` boundary by one -> more than 64
+// per-path rows, or no `status_rows_capped` token at 65. (Raising the producer-side push guard
+// in linux_policy_rows_at's `fail` is an equivalent mutant on the wire: mark_result_read still
+// caps at 64, so this case cannot see it.)
 TEST_CASE("browser_policy linux leg: per-path status rows are capped, and the summary says so",
           "[browser_policy][linux][cap]") {
     yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_pathcap_"};

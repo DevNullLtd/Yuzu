@@ -558,16 +558,18 @@ TEST_CASE("an unreadable root is constrained with a token per source, never abse
 
 namespace {
 
-enum class ReadMode { pass, fail_first, zero_first, eintr_first, burst_then_fail };
+enum class ReadMode { pass, fail_first, zero_first, eintr_first, burst_then_fail, burst_then_eof };
 
 struct Inject {
     std::string open_fail_suffix; // open() of a path ending so fails with `err`
     int err = 0;
     int fstat_fail_on = 0; // the Nth fstat call fails with `err`
     int fstat_calls = 0;
+    int fstat_skew_on = 0; // the Nth fstat call succeeds but reports a size one byte larger
     ReadMode read_mode = ReadMode::pass;
     int read_calls = 0;
     bool fdopendir_null = false;
+    std::vector<int> dir_fds; // every descriptor handed to fdopendir
     yuzu::shared::DirWalkResult walk_result{};
     bool walk_injected = false;
 };
@@ -586,7 +588,10 @@ int inj_fstat(int fd, struct stat* st) {
         errno = g_inj.err;
         return -1;
     }
-    return ::fstat(fd, st);
+    const int rc = ::fstat(fd, st);
+    if (rc == 0 && g_inj.fstat_calls == g_inj.fstat_skew_on)
+        ++st->st_size;
+    return rc;
 }
 ssize_t inj_read(int fd, void* buf, std::size_t n) {
     const int call = ++g_inj.read_calls;
@@ -608,8 +613,11 @@ ssize_t inj_read(int fd, void* buf, std::size_t n) {
             return -1;
         }
         break;
-    case ReadMode::burst_then_fail: { // every file: 48 bytes, then an error
+    case ReadMode::burst_then_fail:
+    case ReadMode::burst_then_eof: { // every file: 48 bytes, then an error / EOF
         if (call % 2 == 0) {
+            if (g_inj.read_mode == ReadMode::burst_then_eof)
+                return 0;
             errno = g_inj.err;
             return -1;
         }
@@ -621,6 +629,7 @@ ssize_t inj_read(int fd, void* buf, std::size_t n) {
     return ::read(fd, buf, n);
 }
 DIR* inj_fdopendir(int fd) {
+    g_inj.dir_fds.push_back(fd);
     if (g_inj.fdopendir_null) {
         errno = g_inj.err;
         return nullptr;
@@ -648,7 +657,13 @@ struct Walked {
     std::vector<std::string> rows;
     yuzu::shared::ConstraintAccumulator acc;
     lnx::pio::InputBudget budget;
+    std::vector<int> dir_fds;
 };
+
+// A descriptor that was handed to fdopendir is closed once the walk is over (success and failure).
+bool fd_closed(int fd) {
+    return ::fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+}
 
 Walked walk_injected(std::size_t max_input = lnx::pio::kMaxInputBytes) {
     g_inj.fstat_calls = 0;
@@ -659,6 +674,7 @@ Walked walk_injected(std::size_t max_input = lnx::pio::kMaxInputBytes) {
     Walked w;
     w.budget.max_input_bytes = max_input;
     w.rows = lnx::linux_rows_at(t.dir.path, w.acc, w.budget, injected_ops());
+    w.dir_fds = g_inj.dir_fds;
     g_inj = Inject{};
     return w;
 }
@@ -716,8 +732,22 @@ TEST_CASE("injected ops: fdopendir failure is dir_open_failed for each source",
     g_inj = Inject{};
     g_inj.fdopendir_null = true;
     g_inj.err = EMFILE;
-    CHECK(walk_injected().acc.reason() ==
-          "linux:apt_sources:dir_open_failed,linux:apt_keyring:dir_open_failed");
+    const auto w = walk_injected();
+    CHECK(w.acc.reason() == "linux:apt_sources:dir_open_failed,linux:apt_keyring:dir_open_failed");
+    // MUTATION: drop the ScopedFd on the failed-fdopendir path -> the descriptors leak.
+    REQUIRE_FALSE(w.dir_fds.empty());
+    for (const int fd : w.dir_fds)
+        CHECK(fd_closed(fd));
+}
+
+TEST_CASE("injected ops: every directory descriptor is closed after a successful walk",
+          "[update_source_trust][walk][seam_ops]") {
+    g_inj = Inject{};
+    const auto w = walk_injected();
+    // MUTATION: drop the unique_ptr<DIR> closedir -> the released descriptors leak.
+    REQUIRE_FALSE(w.dir_fds.empty());
+    for (const int fd : w.dir_fds)
+        CHECK(fd_closed(fd));
 }
 
 TEST_CASE("injected ops: walk flags surface as enumeration_error and entry_cap",
@@ -766,6 +796,44 @@ TEST_CASE("input budget: bytes of FAILED reads are charged (a run of failing fil
     CHECK(w.acc.reason() == "linux:apt_sources:read_failed,linux:apt_sources:input_cap");
     CHECK(w.budget.used == 144);
     CHECK(w.rows.empty());
+}
+
+TEST_CASE("input budget: every failing exit of a read is charged, and the cap is `used > max`",
+          "[update_source_trust][walk][input_cap]") {
+    const auto sl = fs::file_size(fixture_dir() / "ubuntu-2204/etc/apt/sources.list");
+
+    // The closing fstat fails after the whole first file was read: its bytes are charged, so one
+    // byte under the file's size crosses and stops the walk. MUTATION: return `failed` here
+    // without the budget check -> no input_cap, and the walk reads on (used > sl).
+    g_inj = Inject{};
+    g_inj.fstat_fail_on = 2; // the first file's closing fstat
+    g_inj.err = EBADF;
+    auto w = walk_injected(sl - 1);
+    CHECK(w.acc.reason() == "linux:apt_sources:read_failed,linux:apt_sources:input_cap");
+    CHECK(w.budget.used == sl);
+
+    // modified_during_read (the closing fstat reports another size) is charged the same way.
+    g_inj = Inject{};
+    g_inj.fstat_skew_on = 2;
+    w = walk_injected(sl - 1);
+    CHECK(w.acc.reason() == "linux:apt_sources:modified_during_read,linux:apt_sources:input_cap");
+    CHECK(w.budget.used == sl);
+
+    // short_read after a 48-byte burst: charged, so a 40-byte budget crosses on the first file.
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::burst_then_eof;
+    w = walk_injected(40);
+    CHECK(w.acc.reason() == "linux:apt_sources:short_read,linux:apt_sources:input_cap");
+    CHECK(w.budget.used == 48);
+
+    // A failed read landing EXACTLY on the limit does not cross it (used == max, not > max): files
+    // 1 and 2 fail at 48 and 96, file 3 crosses at 144. MUTATION: `used < max` -> stops at 96.
+    g_inj = Inject{};
+    g_inj.read_mode = ReadMode::burst_then_fail;
+    g_inj.err = EBADF;
+    w = walk_injected(96);
+    CHECK(w.acc.reason() == "linux:apt_sources:read_failed,linux:apt_sources:input_cap");
+    CHECK(w.budget.used == 144);
 }
 
 TEST_CASE("input budget: the production 16 MiB budget stops the walk at the first keyring read",
