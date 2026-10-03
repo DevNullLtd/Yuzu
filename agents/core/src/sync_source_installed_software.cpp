@@ -203,8 +203,9 @@ const InventoryAction kInventoryActions[] = {
 
 std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
     std::vector<SwEntry> entries;
-    // Reads ONE PAST kMaxEntries so the collector's merged-size check can see an
-    // over-cap host and skip the cycle rather than hash a silently truncated list.
+    // Reads ONE PAST kMaxEntries so the collector's per-action raw-count check can
+    // see an over-cap host and skip the cycle rather than hash a silently truncated
+    // list.
     for_each_line(out, [&entries](std::string_view line) {
         // Split on '|' into up to 13 tokens (the `inv` prefix + 12 v2 fields).
         // Anything past the 13th token is dropped — the same truncation the
@@ -383,7 +384,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     src.collect = [plugins = std::move(plugins)]() -> std::optional<std::pair<std::string, std::string>> {
         // installed_apps anchors the report (UP-IN6): without it the other
         // plugins' rows alone would replace the stored inventory.
-        if (!plugins.contains("installed_apps")) {
+        const auto anchor = plugins.find("installed_apps");
+        if (anchor == plugins.end() || anchor->second == nullptr) {
             spdlog::debug("sync: installed_apps plugin not loaded — installed_software source idle");
             return std::nullopt;
         }
@@ -391,7 +393,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
         // Per-call capture cap: v2's 12-field rows (~200 B each raw) would
         // saturate the shared 2 MiB default around ~14k packages, turning a
         // dense host into a permanent silent cycle-skip. 3.5 MiB re-aligns the
-        // capture ceiling with the 3 MiB blob cap (a 16k-row blob is ~3 MiB; raw rows
+        // capture ceiling with the 3 MiB blob cap (a ~17k-row blob is ~3 MiB; raw rows
         // are larger than their canonical form). The shared default stays 2 MiB.
         constexpr std::size_t kInventoryCaptureCap = 3'670'016; // 3.5 MiB
         std::vector<SwEntry> all;
@@ -411,13 +413,22 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
                 return std::nullopt;
             }
             AdaptedRows rows = row.adapt(r.captured);
+            if (rows.entries.size() > kMaxEntries) {
+                // Every adapter stops reading at kMaxEntries + 1 RAW rows, so the post-
+                // dedup merged check below cannot see the overflow once exact
+                // duplicates pull the count back under the cap — a truncated inventory
+                // would ship as complete. Same UP-4 posture as the byte cap.
+                spdlog::warn("sync: {}.{} read more than {} rows — skipping this cycle",
+                             row.plugin, row.action, kMaxEntries);
+                return std::nullopt;
+            }
             if (rows.status == AdaptedRows::Status::unsupported) {
                 spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
                               row.action);
                 continue;
             }
             if (rows.status == AdaptedRows::Status::failed) {
-                spdlog::warn("sync: {}.{} {} — skipping this cycle", row.plugin, row.action,
+                spdlog::warn("sync: {}.{} failed: {} — skipping this cycle", row.plugin, row.action,
                              rows.reason);
                 return std::nullopt;
             }

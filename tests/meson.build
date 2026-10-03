@@ -222,7 +222,7 @@ endif
 agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
 
 # Test fixtures deliberately partial-aggregate-init wide inventory structs
-# (SwEntry is 12 fields, SoftwareEntry 14 stored members (16 wire slots); a 4-field
+# (SwEntry and SoftwareEntry are 14 members each (16 wire slots); a 4-field
 # init IS the contract — "the rest stays empty"). -Wextra's
 # missing-field-initializers would flag every such fixture; suppress it for
 # the TEST targets only — production code stays fully warned.

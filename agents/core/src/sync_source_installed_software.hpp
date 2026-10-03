@@ -30,11 +30,12 @@ namespace yuzu::agent {
 /// Fields an ecosystem does not store stay EMPTY, never synthesised.
 struct SwEntry {
     std::string name;
-    std::string version; // upstream version, release/revision stripped
+    std::string version; // upstream version, release/revision stripped; for ecosystem
+                         // optional_feature, the DISM feature state (no real version)
     std::string publisher; // rpm PACKAGER / deb Maintainer / Windows Publisher
     std::string install_date;
-    std::string kind;      // "package" | "app"
-    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|homebrew
+    std::string kind;      // "package" | "app" | "pkg" | "feat"
+    std::string ecosystem; // rpm|deb|apk|pacman|windows|macos|brew|optional_feature
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
@@ -67,7 +68,7 @@ struct AdaptedRows {
 /// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
 /// ignored; missing trailing tokens read as empty fields (tolerant), tokens
 /// beyond the 12th field are dropped (fields never shift). Bounded at
-/// kMaxEntries + 1 entries: the collector's merged-size check, not this parser,
+/// kMaxEntries + 1 entries: the collector's per-action raw-count check, not this parser,
 /// rejects an over-cap host.
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 

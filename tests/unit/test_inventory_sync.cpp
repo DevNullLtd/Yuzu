@@ -977,6 +977,27 @@ TEST_CASE("extended tail rule: the tail enters the blob only when package_id or 
     CHECK(sha256_hex(installed_software_canonical_blob({base, base})) == one); // exact dup dedups
 }
 
+TEST_CASE("extended tail order: package_id sorts before source, even when they disagree",
+          "[sync][hash][extended_row]") {
+    // Same v2 fields, so the tail decides: a{pid a, src z} vs b{pid b, src a}. A
+    // comparator that swapped the two would put b first.
+    SwEntry a;
+    a.name = "same";
+    a.package_id = "a";
+    a.source = "z";
+    SwEntry b = a;
+    b.package_id = "b";
+    b.source = "a";
+    for (const auto& in : {std::vector<SwEntry>{a, b}, std::vector<SwEntry>{b, a}}) {
+        const auto recs = records_of(installed_software_canonical_blob(in));
+        REQUIRE(recs.size() == 2);
+        CHECK(fields_of(recs[0])[14] == "a");
+        CHECK(fields_of(recs[0])[15] == "z");
+        CHECK(fields_of(recs[1])[14] == "b");
+        CHECK(fields_of(recs[1])[15] == "a");
+    }
+}
+
 TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "macos.txt", "packages"));
@@ -1164,6 +1185,36 @@ TEST_CASE("windows_optional_features adapter: sentinels and empty input", "[sync
         CHECK(e.version == "disabled");
 }
 
+TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
+          "[sync][parse][adapter]") {
+    const std::string too_long(2000, 'v');
+
+    SECTION("packages: 0x1F stripped from the name, version truncated") {
+        const auto r = parse_pkg_inventory_packages_output(
+            nl({supported_status("packages"),
+                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == "wget");
+        CHECK(r.entries[0].version.size() == 1024);
+    }
+    SECTION("managers: over-length version truncated") {
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({supported_status("managers"),
+                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].version.size() == 1024);
+    }
+    SECTION("optional features: invalid UTF-8 in the name becomes U+FFFD") {
+        const auto r = parse_windows_optional_features_output(
+            std::string("feature|Caf\xe9|enabled|0\n"));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].name == std::string("Caf\xef\xbf\xbd"));
+    }
+}
+
 TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence row",
           "[sync][collector]") {
     fake_mac();
@@ -1174,12 +1225,14 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
     const std::set<std::string> sources = {"installed_apps.list_inventory",
                                            "pkg_inventory.packages", "pkg_inventory.managers"};
     std::vector<SwEntry> parsed;
+    std::map<std::string, std::size_t> per_source;
     for (const auto& rec : recs) {
         const auto f = fields_of(rec);
         REQUIRE(f.size() == 16);
         CHECK(f[12].empty());
         CHECK(f[13].empty());
         CHECK(sources.count(f[15]) == 1);
+        ++per_source[f[15]];
         SwEntry e;
         e.name = f[0];
         e.version = f[1];
@@ -1197,6 +1250,9 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
         e.source = f[15];
         parsed.push_back(std::move(e));
     }
+    CHECK(per_source["installed_apps.list_inventory"] == 393);
+    CHECK(per_source["pkg_inventory.packages"] == 66);
+    CHECK(per_source["pkg_inventory.managers"] == 1);
     CHECK(installed_software_canonical_blob(parsed) == got->first); // sorted, stable
     CHECK(got->second == sha256_hex(got->first));
     check_blob_size(got->first, recs.size());
@@ -1343,6 +1399,11 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
     REQUIRE(got.has_value());
     CHECK(records_of(got->first).size() == 20000);
 
+    // 20,001 RAW rows where one is an exact duplicate: the splitter stopped at the
+    // cap, so the deduped count (20,000) must not launder a truncated read.
+    g_fake[0].out["list_inventory"] = lines(20000) + "inv|n0|1|\n";
+    CHECK_FALSE(collect_with(only_ia).has_value());
+
     // Byte cap: the entry cap runs first, so the over-cap input stays <= 20,000
     // rows and under the raw capture cap, but its canonical blob exceeds kMaxBlobBytes.
     // 12,000 x 200 B names is proven under the cap by the test itself.
@@ -1352,6 +1413,9 @@ TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector 
     g_fake[0].out["list_inventory"] = under;
     REQUIRE(collect_with(only_ia).has_value());
 
-    g_fake[0].out["list_inventory"] = lines(16000, 200);
+    // The capture itself must not be truncated (that would skip for the wrong reason).
+    const std::string over = lines(16000, 200);
+    CHECK(over.size() < 3'670'016); // kInventoryCaptureCap
+    g_fake[0].out["list_inventory"] = over;
     CHECK_FALSE(collect_with(only_ia).has_value());
 }

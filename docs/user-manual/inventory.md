@@ -19,7 +19,9 @@ cadences.
   that answers "unsupported on this OS", is skipped (except `installed_apps`:
   without it the source stays idle, because it anchors the report); an action
   that fails (non-zero exit, truncated output, a constrained or unavailable
-  answer, or no applications at all from `installed_apps`) skips that day's
+  answer, a malformed status row, no feature rows from
+  `windows_optional_features`, or no applications at all from `installed_apps`)
+  skips that day's
   report and keeps the last good state — nothing is deleted. Every row's `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
@@ -267,6 +269,12 @@ SELECT version FROM public.schema_meta WHERE store = 'software_inventory_store';
 ```
 
 Deploy the server before any agent that emits the new fields.
+
+**Agent upgrade.** An agent that collects the extra actions (`source`,
+Homebrew, optional features) changes its content hash, so its first report after
+the upgrade is a full one. It arrives at the agent's existing phase-spread slot
+(within about 24 h), not all at once, and carries the new rows; hash-skip
+resumes afterwards.
 
 Today it is queried with **direct SQL**, e.g.:
 
@@ -534,6 +542,17 @@ agent was built with `-Dbuild_agent=true` (the default for released binaries)
 and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
+
+**One host stopped reporting after upgrading agents; its log shows
+`sync: <plugin>.<action> … — skipping this cycle`.** One of the collected
+actions failed, and a failure skips the WHOLE report for that day — the
+applications too — and keeps the last good inventory (nothing is deleted).
+Typical causes: Windows DISM busy or `api_unavailable` (the
+`windows_optional_features` action answers `feature|unavailable|…`), or a
+constrained Homebrew read on macOS. The warning names the action and the
+reason. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
+after two missed daily cycles; fix the failing action, or remove its plugin,
+and the next daily sync recovers.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
 initial `installed_apps` plugin read the Windows registry with the ANSI `Reg*A`

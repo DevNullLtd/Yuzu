@@ -2333,7 +2333,18 @@ public:
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
-                            auto sleep = scheduler.tick(now_secs);
+                            // Exception firewall (mirrors the heartbeat thread): a throw
+                            // mid-tick leaves the persisted state at the last save_state, so
+                            // the next tick simply re-collects.
+                            std::chrono::seconds sleep{60};
+                            try {
+                                sleep = scheduler.tick(now_secs);
+                            } catch (const std::exception& e) {
+                                spdlog::warn("Daily-sync tick failed: {} — retrying in 60 s",
+                                             e.what());
+                            } catch (...) {
+                                spdlog::warn("Daily-sync tick failed — retrying in 60 s");
+                            }
                             auto remaining = sleep;
                             while (remaining.count() > 0 && !should_stop()) {
                                 // __sync__.now: re-tick immediately; the drain at the top of
