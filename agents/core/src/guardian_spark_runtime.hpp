@@ -1789,7 +1789,7 @@ private:
     /// Exception first: a tombstone whose index release fails again AT this sweep is
     /// not popped and IS re-dispatchable - the sweep stops at it, and
     /// try_dispatch_head_locked (which has no outcome/withdrawn guard) then flips it
-    /// Queued -> Dispatching. Known gap, tracked as a follow-up; unreachable in
+    /// Queued -> Dispatching. Known gap, tracked as #5322; unreachable in
     /// production (erase_rule is noexcept), constructible only through the
     /// index-remove test seam. Intent: pop every TERMINAL, never-dispatched claim at
     /// the front of `entry` (a Queued claim that already carries an outcome or a
@@ -1982,14 +1982,14 @@ private:
     /// locked's own fill-in; synthesize_fallback_outcome_locked; the dispatched branch
     /// of abandon_claim_locked. (2) They run at sticky-stop time, where the leak is
     /// moot: begin_stop; dispatch_parked_arm_guarded's stop path. Known gap, tracked as
-    /// a follow-up: abandon_claim_locked's Queued branch ignores `false` and then
+    /// #5323: abandon_claim_locked's Queued branch ignores `false` and then
     /// erases the claim.
     bool release_claim_index_locked(KeyClaim& claim) noexcept;
     /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
     /// retained tombstone. The same-call sweep (try_dispatch_head_locked ->
     /// sweep_terminal_queued_locked, which every caller reaches next) retries the
     /// release immediately; the tombstone is re-dispatched only if that retry also
-    /// fails (known gap, tracked as a follow-up). "withdrawn" here means "never
+    /// fails (known gap, tracked as #5322). "withdrawn" here means "never
     /// re-commit" (the convention of fail_all_claims_locked's tombstones; the `live`
     /// filter in on_arm_complete excludes withdrawn claims). It is set even on a claim
     /// nobody withdrew (e.g. a non-adopted wedge). The helper also writes

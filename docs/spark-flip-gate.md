@@ -609,7 +609,7 @@ flip, with a red-first test each:
   `tests/unit/test_guardian_spark_runtime.cpp`, at least one per fix site. This criterion is
   satisfied once PR #<PR> merges; the retained-tombstone gaps it leaves are the next two bullets.
 - **NEW flip criterion (added 2026-10-03, Dave's ruling; found while planning the #4354 fix)**:
-  #<ISSUE-A>, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
+  #5322, a retained withdrawn tombstone can be re-dispatched, or can strand a clean follower
   behind it. One mechanism with two faces, so one fix. Construction (existing test seams only):
   `fill_pool`; park an arm ra on a key; arm `set_index_remove_fault_for_test`; detach ra (Case 0 in
   `withdraw_rule_after_wedge_sweep_locked` retains it because its release fails); re-arm the
@@ -642,7 +642,7 @@ flip, with a red-first test each:
   alone converts the redispatch into the strand). Criterion: resolved, or explicitly re-assessed
   and recorded here, before the flip - the E5+E6 exposure cap that
   bounds it lapses at the flip (see the rung 9c PR-5 acceptance criteria preamble above).
-- **RECORDED, not flip-gating unless Dave rules otherwise (added 2026-10-03)**: #<ISSUE-B>,
+- **RECORDED, not flip-gating unless Dave rules otherwise (added 2026-10-03)**: #5323,
   `abandon_claim_locked`'s `Queued` branch erases the claim from the fifo after a failed index
   release, leaving a ghost mapping (the #4354 defect class on a different path). Not a one-line
   helper swap: the `Queued` branch erases the claim from the fifo in the same step, before the
