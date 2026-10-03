@@ -114,7 +114,7 @@ Run each component under its own system user:
 > the agent listener (`transport_opts` with `verify => verify_none`,
 > `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
-> cluster, demo and UAT composes use plaintext `sys.config` files and do not.
+> cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:

@@ -291,7 +291,7 @@ counters and the summary line.
   flickers. Check `yuzu_gw_heartbeat_session_mismatch_total` and the
   `connection_mismatch=` count in the summary log line, then check the proxy topology
   between the agents and `:50051`; use L4 or TLS passthrough. Do not rely on the online
-  count alone: in rig run 4, released agents that stayed rejected or wedged were still
+  count alone: in rig run 4, rejected or orphaned agents (observed with v0.12.0) were still
   counted online by the server's `/health` `agents.online`, so diagnose that case from the
   rejection counters, the gateway summary log, the agent log and heartbeat freshness. The
   online count flickering was observed only in the run behind an HTTP/2-terminating proxy.
@@ -593,7 +593,7 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 | Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes run plaintext on the shipped default or UAT/demo `sys.config`; the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or an inline UAT/demo `sys.config`; the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
 | server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
 TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
@@ -617,7 +617,7 @@ TLS without pinning the CA) is either inert or **MITM-able** — if the gateway 
 chains to a *public* CA and the agent falls back to the system trust store, any
 publicly-trusted impostor cert for the dial host is accepted. The agent half (CA
 distribution + TLS-dial wiring + a fail-closed guard for `tls_enabled` with an
-empty CA path) lands in **PR5b**; do not flip the listener ahead of it.
+empty CA path) shipped as #1314 (the reference gateway compose is the worked example); the flag-day order below still applies when you enable the listener on an existing fleet.
 
 **Flag-day upgrade order (enabling the listener disconnects every plaintext agent
 at once — there is no dual-listen transition):**
@@ -643,7 +643,7 @@ PR5d / the QUIC migration (#376).
 Of the shipped composes, `docker-compose.reference-gateway.yml` already ships
 one-way TLS on the agent listener (#1314). The cluster
 (`docker-compose.reference-gateway-cluster.yml`), demo, full-UAT, viz-UAT and
-sanitizer-UAT composes use the shipped default or a UAT/demo `sys.config` and
+sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, use the shipped default or a UAT/demo `sys.config` and
 are plaintext (the automated flip for those is tracked in issue **#1289**). To
 stand up an **encrypted** agent↔gateway↔server stack from the
 current artifacts today, wire it by hand in this order:
