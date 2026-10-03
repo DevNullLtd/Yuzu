@@ -14,6 +14,7 @@
 
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
+#include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -63,11 +64,14 @@ struct RespV1Harness {
     bool audit_persist{true}; // flip to simulate an audit-write failure
     std::vector<AuditRecord> audit_log;
 
+    yuzu::MetricsRegistry metrics; // #4644/#4703 counters, seeded like production
+
     RestApiV1 api;
 
     explicit RespV1Harness(pg::PgPool& pool) {
         response_store = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(response_store->is_open());
+        yuzu::server::seed_response_metrics(metrics);
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -120,7 +124,7 @@ struct RespV1Harness {
                             /*device_token_store=*/nullptr,
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
-                            /*metrics_registry=*/nullptr,
+                            /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
@@ -693,6 +697,47 @@ TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte ca
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"].size() == 1);
     CHECK_FALSE(body["pagination"].contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("v1 response routes count rejected numeric params and cut exports, by surface "
+          "(#4644, #4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(mk_resp("instr-metric", "agent-" + std::to_string(i), 0,
+                                        std::string(400, 'x'), 100 + i));
+    using yuzu::server::kResponseExportTruncatedMetric;
+    using yuzu::server::kResponseParamRejectedMetric;
+    auto rejected = [&](const char* surface) {
+        return h.metrics.counter(kResponseParamRejectedMetric, {{"surface", surface}}).value();
+    };
+    auto cut = [&](const char* surface, const char* cause) {
+        return h.metrics
+            .counter(kResponseExportTruncatedMetric, {{"surface", surface}, {"cause", cause}})
+            .value();
+    };
+
+    // One rejection per v1 handler: query, aggregate, export.
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric?limit=100abc")->status == 400);
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric/aggregate?since=1e9")->status == 400);
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric/export?status=0x1")->status == 400);
+    CHECK(rejected("rest_v1") == 3.0);
+    CHECK(rejected("rest") == 0.0);
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric?limit=2")->status == 200);
+    CHECK(rejected("rest_v1") == 3.0);
+
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric/export?limit=2")->status == 200);
+    CHECK(cut("rest_v1", "row_cap") == 1.0);
+    CHECK(h.sink.Get("/api/v1/responses/instr-metric/export")->status == 200);
+    CHECK(cut("rest_v1", "row_cap") == 1.0);
+    {
+        ExportByteCapGuard cap(500);
+        CHECK(h.sink.Get("/api/v1/responses/instr-metric/export?format=csv")->status == 200);
+    }
+    CHECK(cut("rest_v1", "byte_cap") == 1.0);
+    CHECK(cut("rest", "byte_cap") == 0.0);
 }
 
 TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (#4644, #4703)",

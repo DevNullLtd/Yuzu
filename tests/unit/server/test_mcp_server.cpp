@@ -16464,8 +16464,10 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
     store.store(mk_resp("exec-strict", "instr-strict", "agent-1", 0, "ok", 100));
     store.store(mk_resp("exec-strict", "instr-strict", "agent-2", 1, "other", 101));
 
+    yuzu::MetricsRegistry reg;
     McpTestServer ts;
     ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
     ts.start("operator");
 
     auto call = [&](const std::string& args) {
@@ -16494,6 +16496,12 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
 
+    // #4644 observability: exactly the 10 rejections above were counted, on the mcp surface.
+    CHECK(reg.counter("yuzu_server_response_param_rejected_total", {{"surface", "mcp"}}).value() ==
+          10.0);
+    CHECK(reg.counter("yuzu_server_response_param_rejected_total", {{"surface", "rest"}}).value() ==
+          0.0);
+
     // -1 (documented "any"), omitted, and a real status all still work.
     auto any = call(R"({"instruction_id":"instr-strict","status":-1})");
     REQUIRE(any.contains("result"));
@@ -16503,6 +16511,9 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
     auto rows = nlohmann::json::parse(one["result"]["content"][0]["text"].get<std::string>());
     REQUIRE(rows.size() == 1);
     CHECK(rows[0]["output"] == "other");
+    // Valid calls do not count.
+    CHECK(reg.counter("yuzu_server_response_param_rejected_total", {{"surface", "mcp"}}).value() ==
+          10.0);
 }
 
 TEST_CASE("MCP query_responses: rejects when neither id provided",

@@ -70,6 +70,7 @@
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -8639,6 +8640,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     *status_opt > std::numeric_limits<int>::max()) {
                     // retry-hint-exempt: malformed client input, not a store/query fault --
                     // resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
                     res.set_content(
                         a4_error(kInvalidParams,
                                  "status must be a JSON integer >= -1 (-1 or omitted = any)"),
@@ -8650,6 +8652,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON type), not a
                     // store/query fault -- resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
                     res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
                                     "application/json");
                     return;

@@ -3,6 +3,7 @@
 #include "authz_model.hpp"
 #include "data_export.hpp"
 #include "http_route_sink.hpp"
+#include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_store.hpp"
 
@@ -87,6 +88,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
         if (!apply_response_numeric_params(req, filter,
                                            kRespParamStatus | kRespParamSince | kRespParamUntil)) {
+            count_response_param_rejected(deps.metrics, "rest");
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
@@ -177,6 +179,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         if (!apply_response_numeric_params(req, q,
                                            kRespParamStatus | kRespParamSince | kRespParamUntil |
                                                kRespParamLimit)) {
+            count_response_param_rejected(deps.metrics, "rest");
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
@@ -258,6 +261,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
                                export_filename(instruction_id, "csv", cut.any()) + "\"");
             if (cut.any())
                 res.set_header("X-Result-Truncated-By-Cap", "true");
+            record_response_export_cut(deps.metrics, "rest", cut, {});
             res.set_content(std::move(csv), "text/csv; charset=utf-8");
         } else {
             nlohmann::json arr = nlohmann::json::array();
@@ -280,6 +284,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
             envelope["responses"] = std::move(arr);
             if (cut.any())
                 envelope["result_truncated_by_cap"] = true;
+            record_response_export_cut(deps.metrics, "rest", cut, {});
             res.set_header("Content-Disposition",
                            "attachment; filename=\"" +
                                export_filename(instruction_id, "json", cut.any()) + "\"");
@@ -318,6 +323,7 @@ void register_response_routes(HttpRouteSink& sink, Deps deps) {
         if (!apply_response_numeric_params(req, q,
                                            kRespParamStatus | kRespParamSince | kRespParamUntil |
                                                kRespParamLimit | kRespParamOffset)) {
+            count_response_param_rejected(deps.metrics, "rest");
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",

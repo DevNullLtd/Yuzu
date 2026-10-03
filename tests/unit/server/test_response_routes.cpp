@@ -20,6 +20,7 @@
 /// key/schema as test_response_store.cpp — the registry replay-verifies the
 /// resulting schema, not the setup lambda's literal text).
 
+#include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_routes.hpp"
 #include "test_route_sink.hpp"
@@ -227,6 +228,8 @@ struct PgHarness {
 
     std::vector<AuditRow> audits;
 
+    yuzu::MetricsRegistry metrics; // #4644/#4703 counters; outlives the sink's handlers
+
     yuzu::server::test::TestRouteSink sink; // LAST — see file header.
 
     PgHarness() {
@@ -242,6 +245,8 @@ struct PgHarness {
 
         response::Deps deps;
         deps.store = store.get();
+        deps.metrics = &metrics;
+        yuzu::server::seed_response_metrics(metrics);
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&) -> authz::FleetReadGate {
             authz::FleetReadGate g;
@@ -570,6 +575,74 @@ TEST_CASE("GET /api/responses/:id/export: a ROW-cap cut renames the download and
               "attachment; filename=\"responses-instr-rowcut." + f + "\"");
         CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
     }
+}
+
+TEST_CASE("legacy response routes count rejected numeric params and cut exports, by surface "
+          "(#4644, #4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-metric";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'x');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    using yuzu::server::kResponseExportTruncatedMetric;
+    using yuzu::server::kResponseParamRejectedMetric;
+    auto rejected = [&](const char* surface) {
+        return h.metrics.counter(kResponseParamRejectedMetric, {{"surface", surface}}).value();
+    };
+    auto cut = [&](const char* surface, const char* cause) {
+        return h.metrics
+            .counter(kResponseExportTruncatedMetric, {{"surface", surface}, {"cause", cause}})
+            .value();
+    };
+
+    // One rejection per legacy handler (list, aggregate, export): three increments.
+    CHECK(h.sink.Get("/api/responses/instr-metric?limit=100abc")->status == 400);
+    CHECK(h.sink.Get("/api/responses/instr-metric/aggregate?since=1e9")->status == 400);
+    CHECK(h.sink.Get("/api/responses/instr-metric/export?status=0x1")->status == 400);
+    CHECK(rejected("rest") == 3.0);
+    CHECK(rejected("rest_v1") == 0.0);
+    CHECK(rejected("mcp") == 0.0);
+    // A valid request does not count.
+    CHECK(h.sink.Get("/api/responses/instr-metric?limit=2")->status == 200);
+    CHECK(rejected("rest") == 3.0);
+
+    // Row-cap cut (limit 2 of 3), then a complete export, then a byte-cap cut.
+    CHECK(h.sink.Get("/api/responses/instr-metric/export?limit=2")->status == 200);
+    CHECK(cut("rest", "row_cap") == 1.0);
+    CHECK(h.sink.Get("/api/responses/instr-metric/export")->status == 200);
+    CHECK(cut("rest", "row_cap") == 1.0);
+    CHECK(cut("rest", "byte_cap") == 0.0);
+    {
+        struct CapGuard {
+            std::size_t saved;
+            explicit CapGuard(std::size_t cap) : saved(export_body_byte_cap().exchange(cap)) {}
+            ~CapGuard() { export_body_byte_cap().store(saved); }
+        } cap(500);
+        CHECK(h.sink.Get("/api/responses/instr-metric/export?format=csv")->status == 200);
+    }
+    CHECK(cut("rest", "byte_cap") == 1.0);
+    CHECK(cut("rest_v1", "byte_cap") == 0.0);
+}
+
+TEST_CASE("seed_response_metrics pre-seeds every closed series at zero (#4644, #4703)",
+          "[server][routes][response_routes]") {
+    yuzu::MetricsRegistry m;
+    yuzu::server::seed_response_metrics(m);
+    const auto text = m.serialize();
+    for (const char* s : {"rest", "rest_v1", "mcp"})
+        CHECK(text.find(std::string("yuzu_server_response_param_rejected_total{surface=\"") + s +
+                        "\"} 0") != std::string::npos);
+    for (const char* s : {"rest", "rest_v1"})
+        for (const char* c : {"row_cap", "byte_cap"})
+            CHECK(text.find(std::string("yuzu_server_response_export_truncated_total{surface=\"") +
+                            s + "\",cause=\"" + c + "\"} 0") != std::string::npos);
+    CHECK(text.find("# HELP yuzu_server_response_export_truncated_total") != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

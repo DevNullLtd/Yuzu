@@ -32,6 +32,7 @@
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate/export row builders
+#include "response_export_metrics.hpp"
 #include "response_query_params.hpp" // #4644/#4703: strict numeric params + export byte cap
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
@@ -9612,7 +9613,7 @@ void RestApiV1::register_routes(
     // response bodies to any Execution:Read holder lacking Response:Read.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/responses)",
-        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
                                                    httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -9641,6 +9642,7 @@ void RestApiV1::register_routes(
             // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
             if (!apply_response_numeric_params(req, q,
                                                kRespParamStatus | kRespParamSince | kRespParamUntil | kRespParamLimit)) {
+                count_response_param_rejected(metrics_registry, "rest_v1");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");
@@ -9790,7 +9792,7 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/aggregate)",
-        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
                                                    httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -9862,6 +9864,7 @@ void RestApiV1::register_routes(
             // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
             if (!apply_response_numeric_params(req, filter,
                                                kRespParamStatus | kRespParamSince | kRespParamUntil)) {
+                count_response_param_rejected(metrics_registry, "rest_v1");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");
@@ -9943,7 +9946,7 @@ void RestApiV1::register_routes(
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128})/export)",
-        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
                                                    httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -9996,6 +9999,7 @@ void RestApiV1::register_routes(
             // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
             if (!apply_response_numeric_params(req, q,
                                                kRespParamStatus | kRespParamSince | kRespParamUntil | kRespParamLimit)) {
+                count_response_param_rejected(metrics_registry, "rest_v1");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");
@@ -10102,11 +10106,12 @@ void RestApiV1::register_routes(
                 res.set_content(list_json(arr.str(), arr.size(), 0, 50, cut.any()),
                                 "application/json; charset=utf-8");
             }
+            record_response_export_cut(metrics_registry, "rest_v1", cut, cid);
         });
 
     sink.Get(
         R"(/api/v1/responses/([A-Za-z0-9_-]{1,128}))",
-        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+        [fleet_read_fn, audit_fn, response_store, metrics_registry](const httplib::Request& req,
                                                    httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -10157,6 +10162,7 @@ void RestApiV1::register_routes(
             // "100abc" as 0/1/100); status < -1 is rejected rather than read as "any".
             if (!apply_response_numeric_params(req, q,
                                                kRespParamStatus | kRespParamSince | kRespParamUntil | kRespParamLimit)) {
+                count_response_param_rejected(metrics_registry, "rest_v1");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
                                 "application/json");

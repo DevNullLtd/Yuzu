@@ -65,6 +65,10 @@ class HttpRouteSink;
 class ResponseStore;
 } // namespace yuzu::server
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server::response {
 
 /// Construction deps for `register_response_routes`. Every closure/pointer
@@ -86,6 +90,8 @@ struct Deps {
     /// `ServerImpl::response_store_`. Null or `!is_open()` -> every route
     /// answers 503 without touching it.
     ResponseStore* store{nullptr};
+    /// `ServerImpl::metrics_`. Null is allowed (tests): the #4644/#4703 counters are skipped.
+    yuzu::MetricsRegistry* metrics{nullptr};
 };
 
 /// Register all 3 Responses API routes against `sink`, in the load-bearing
