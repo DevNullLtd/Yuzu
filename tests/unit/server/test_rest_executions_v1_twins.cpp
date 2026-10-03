@@ -486,7 +486,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses: offset is rejected with 400, "
     CHECK(res->status == 400);
 }
 
-TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query parameter is a 400, "
+TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query parameter is a 400 "
           "not a different valid-looking filter; -1 'any' and zero-padding still pass (#4644)",
           "[pg][rest][executions][v1][responses]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
@@ -500,6 +500,7 @@ TEST_CASE("GET /api/v1/executions/:id/responses: a malformed numeric query param
     auto res = h.sink.Get("/api/v1/executions/" + exec_id + "/responses?" + bad);
     REQUIRE(res);
     CHECK(res->status == 400);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
 
     const std::string good = GENERATE(as<std::string>{}, "status=-1", "status=007", "limit=10");
     INFO(good);

@@ -23,6 +23,7 @@
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_routes.hpp"
+#include "test_export_cap_guard.hpp"
 #include "test_route_sink.hpp"
 
 #include "authz_model.hpp"
@@ -42,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 using namespace yuzu::server;
 using json = nlohmann::json;
@@ -378,7 +380,7 @@ TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-
 // #4644 / #4703: strict numeric parameters, export limit ceiling, export byte cap
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400, not a "
+TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400 not a "
           "different valid-looking filter (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
@@ -397,19 +399,25 @@ TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400,
     CHECK(body["error"]["message"] == "invalid numeric query parameter");
 }
 
-TEST_CASE("legacy response routes: limit/offset reject trailing garbage where accepted (#4644)",
+TEST_CASE("legacy response routes: limit and offset reject trailing garbage where accepted (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
     h.seed("instr-strict-lim", "agent-1", 1);
 
-    const std::string route = GENERATE(as<std::string>{}, "", "/export");
-    const std::string query =
-        GENERATE(as<std::string>{}, "limit=100abc", "limit=1e3", "limit=0x10", "limit=",
-                 "offset=1e1", "offset=2abc");
+    // Explicit (route, query) pairs rather than a cross product: /export reads limit but
+    // has no offset parameter, so offset garbage there is not a pair worth asserting.
+    const auto [route, query] = GENERATE(
+        std::pair<std::string, std::string>{"", "limit=100abc"},
+        std::pair<std::string, std::string>{"", "limit=1e3"},
+        std::pair<std::string, std::string>{"", "limit=0x10"},
+        std::pair<std::string, std::string>{"", "limit="},
+        std::pair<std::string, std::string>{"", "offset=1e1"},
+        std::pair<std::string, std::string>{"", "offset=2abc"},
+        std::pair<std::string, std::string>{"/export", "limit=100abc"},
+        std::pair<std::string, std::string>{"/export", "limit=1e3"},
+        std::pair<std::string, std::string>{"/export", "limit=0x10"},
+        std::pair<std::string, std::string>{"/export", "limit="});
     INFO("route=" << route << " query=" << query);
-    // /export has no offset param (it ignores it); only assert the 400 where it is read.
-    if (route == "/export" && query.starts_with("offset"))
-        return;
     auto res = h.sink.Get("/api/responses/instr-strict-lim" + route + "?" + query);
     REQUIRE(res);
     CHECK(res->status == 400);
@@ -436,7 +444,7 @@ TEST_CASE("legacy response catch-all: a valid offset still paginates (#4644 must
     CHECK(count_for("?offset=3") == 0);
 }
 
-TEST_CASE("export limit normalisation: the ceiling is exactly 10000, the floor 1, omitted = ceiling",
+TEST_CASE("export limit normalisation: the ceiling is exactly 10000 the floor 1 omitted = ceiling",
           "[server][routes][response_routes]") {
     using yuzu::server::kExportRowLimitCap;
     using yuzu::server::normalize_export_limit;
@@ -451,7 +459,7 @@ TEST_CASE("export limit normalisation: the ceiling is exactly 10000, the floor 1
     CHECK(normalize_export_limit(false, 12345) == 10000);
 }
 
-TEST_CASE("legacy response routes: well-formed numerics still pass, incl. zero-padding and "
+TEST_CASE("legacy response routes: well-formed numerics still pass incl. zero-padding and "
           "the -1 'any' sentinel (#4644)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
@@ -466,7 +474,7 @@ TEST_CASE("legacy response routes: well-formed numerics still pass, incl. zero-p
     CHECK(res->status == 200);
 }
 
-TEST_CASE("GET /api/responses/:id/export: a caller-supplied limit is clamped to [1,10000], "
+TEST_CASE("GET /api/responses/:id/export: a caller-supplied limit is clamped to 1 to 10000 "
           "like the v1 twin (#4703)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
@@ -508,13 +516,8 @@ TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and 
         h.store->store(r);
     }
 
-    struct CapGuard {
-        std::size_t saved;
-        explicit CapGuard(std::size_t cap) : saved(export_body_byte_cap().exchange(cap)) {}
-        ~CapGuard() { export_body_byte_cap().store(saved); }
-    };
     {
-        CapGuard cap(600);
+        yuzu::test::ExportByteCapGuard cap(600);
         auto res_json = h.sink.Get("/api/responses/instr-bytecap/export");
         REQUIRE(res_json);
         REQUIRE(res_json->status == 200);
@@ -577,8 +580,129 @@ TEST_CASE("GET /api/responses/:id/export: a ROW-cap cut renames the download and
     }
 }
 
-TEST_CASE("legacy response routes count rejected numeric params and cut exports, by surface "
-          "(#4644, #4703)",
+namespace {
+// Rows in a CSV export body: every record ends CRLF and the header is one of them. The
+// seeded payloads contain no CR/LF, so a line count is a row count plus one.
+std::size_t csv_data_rows(const std::string& body) {
+    std::size_t lines = 0;
+    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
+         pos = body.find("\r\n", pos + 2))
+        ++lines;
+    return lines == 0 ? 0 : lines - 1;
+}
+} // namespace
+
+TEST_CASE("GET /api/responses/:id/export: no limit serves every row up to the ceiling and "
+          "limit 0 serves exactly one (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    // 101 rows: more than the plain-list default of 100, so a handler that fell back to
+    // the store default instead of the export ceiling would serve 100 and fail here.
+    for (int i = 0; i < 101; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-default";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    auto all_json = h.sink.Get("/api/responses/instr-default/export");
+    REQUIRE(all_json);
+    auto body = json::parse(all_json->body);
+    CHECK(body["responses"].size() == 101);
+    CHECK(body["count"] == 101);
+    CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    auto all_csv = h.sink.Get("/api/responses/instr-default/export?format=csv");
+    REQUIRE(all_csv);
+    CHECK(csv_data_rows(all_csv->body) == 101);
+
+    // limit=0 is clamped UP to one row (never "no rows") and, with 100 more matching,
+    // is a row-cap cut.
+    auto zero = h.sink.Get("/api/responses/instr-default/export?limit=0");
+    REQUIRE(zero);
+    auto zero_body = json::parse(zero->body);
+    CHECK(zero_body["responses"].size() == 1);
+    CHECK(zero_body.value("result_truncated_by_cap", false) == true);
+}
+
+TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and never flags "
+          "a last row that merely crosses it (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    {
+        StoredResponse r;
+        r.instruction_id = "instr-lastcross";
+        r.agent_id = "agent-0";
+        r.status = 0;
+        r.output = std::string(400, 'y');
+        r.timestamp = 100;
+        h.store->store(r);
+    }
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-progress";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'z');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    yuzu::test::ExportByteCapGuard cap(1); // every row alone exceeds this
+
+    // One row, and it crosses the cap: nothing was dropped, so nothing is flagged.
+    auto one_json = h.sink.Get("/api/responses/instr-lastcross/export");
+    REQUIRE(one_json);
+    auto one = json::parse(one_json->body);
+    CHECK(one["responses"].size() == 1);
+    CHECK_FALSE(one.contains("result_truncated_by_cap"));
+    CHECK(one_json->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.json\"");
+    auto one_csv = h.sink.Get("/api/responses/instr-lastcross/export?format=csv");
+    REQUIRE(one_csv);
+    CHECK(csv_data_rows(one_csv->body) == 1);
+    CHECK(one_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(one_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.csv\"");
+
+    // Three rows: progress is guaranteed (exactly one served) and the cut is flagged.
+    auto many_json = h.sink.Get("/api/responses/instr-progress/export");
+    REQUIRE(many_json);
+    auto many = json::parse(many_json->body);
+    CHECK(many["responses"].size() == 1);
+    CHECK(many.value("result_truncated_by_cap", false) == true);
+    auto many_csv = h.sink.Get("/api/responses/instr-progress/export?format=csv");
+    REQUIRE(many_csv);
+    CHECK(csv_data_rows(many_csv->body) == 1);
+    CHECK(many_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+}
+
+TEST_CASE("legacy response routes: since at or below zero and until zero mean unbounded "
+          "(#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-window";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
+    // change: the strict parser only decides what is a number, not what a number means.
+    for (const char* q : {"since=-5", "since=0", "until=0", "since=0&until=0"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/responses/instr-window/export?") + q);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(json::parse(res->body)["responses"].size() == 3);
+    }
+}
+
+TEST_CASE("legacy response routes count rejected numeric params and cut exports by surface "
+          "(#4644 #4703)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
     for (int i = 0; i < 3; ++i) {
@@ -619,18 +743,14 @@ TEST_CASE("legacy response routes count rejected numeric params and cut exports,
     CHECK(cut("rest", "row_cap") == 1.0);
     CHECK(cut("rest", "byte_cap") == 0.0);
     {
-        struct CapGuard {
-            std::size_t saved;
-            explicit CapGuard(std::size_t cap) : saved(export_body_byte_cap().exchange(cap)) {}
-            ~CapGuard() { export_body_byte_cap().store(saved); }
-        } cap(500);
+        yuzu::test::ExportByteCapGuard cap(500);
         CHECK(h.sink.Get("/api/responses/instr-metric/export?format=csv")->status == 200);
     }
     CHECK(cut("rest", "byte_cap") == 1.0);
     CHECK(cut("rest_v1", "byte_cap") == 0.0);
 }
 
-TEST_CASE("seed_response_metrics pre-seeds every closed series at zero (#4644, #4703)",
+TEST_CASE("seed_response_metrics pre-seeds every closed series at zero (#4644 #4703)",
           "[server][routes][response_routes]") {
     yuzu::MetricsRegistry m;
     yuzu::server::seed_response_metrics(m);

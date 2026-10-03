@@ -17,6 +17,7 @@
 #include "response_export_metrics.hpp"
 #include "response_query_params.hpp"
 #include "response_store.hpp"
+#include "test_export_cap_guard.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -528,7 +529,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: management-group scope filters anot
 
 // ── #4644: strict numeric query parameters ─────────────────────────────────
 
-TEST_CASE("response routes: a malformed numeric query parameter is a 400, never a different "
+TEST_CASE("response routes: a malformed numeric query parameter is a 400 never a different "
           "valid-looking filter (#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
@@ -566,7 +567,7 @@ TEST_CASE("response routes: limit rejects trailing garbage on the routes that ac
     CHECK(res->status == 400);
 }
 
-TEST_CASE("response routes: well-formed numerics still pass, including zero-padding and the "
+TEST_CASE("response routes: well-formed numerics still pass including zero-padding and the "
           "-1 'any' sentinel (the fix is not over-strict) (#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
@@ -583,7 +584,7 @@ TEST_CASE("response routes: well-formed numerics still pass, including zero-padd
     CHECK(res->status == 200);
 }
 
-TEST_CASE("response export: status filter matches the row it names, so a malformed value can no "
+TEST_CASE("response export: status filter matches the row it names so a malformed value can no "
           "longer silently widen it (#4644)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
@@ -602,17 +603,6 @@ TEST_CASE("response export: status filter matches the row it names, so a malform
 
 // ── #4703: total export body byte cap ──────────────────────────────────────
 
-namespace {
-// Lowers the shared export byte cap for one test, restoring it on scope exit so a failed
-// REQUIRE cannot leak a tiny cap into later tests in the same process.
-struct ExportByteCapGuard {
-    std::size_t saved;
-    explicit ExportByteCapGuard(std::size_t cap)
-        : saved(yuzu::server::export_body_byte_cap().exchange(cap)) {}
-    ~ExportByteCapGuard() { yuzu::server::export_body_byte_cap().store(saved); }
-};
-} // namespace
-
 TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON and CSV and "
           "sets the same truncation signal as the row cap (#4703)",
           "[pg][rest][responses][v1]") {
@@ -624,7 +614,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
                                         std::string(400, 'x'), 100 + i));
 
     {
-        ExportByteCapGuard cap(600); // < two rows
+        yuzu::test::ExportByteCapGuard cap(600); // < two rows
         auto res_json = h.sink.Get("/api/v1/responses/instr-bytecap/export");
         REQUIRE(res_json);
         REQUIRE(res_json->status == 200);
@@ -691,7 +681,7 @@ TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte ca
     RespV1Harness h(pool);
     h.response_store->store(mk_resp("instr-bytecap-one", "agent-A", 0, std::string(400, 'y'), 100));
 
-    ExportByteCapGuard cap(10); // the single row alone exceeds this
+    yuzu::test::ExportByteCapGuard cap(10); // the single row alone exceeds this
     auto res = h.sink.Get("/api/v1/responses/instr-bytecap-one/export");
     REQUIRE(res);
     auto body = nlohmann::json::parse(res->body);
@@ -699,8 +689,109 @@ TEST_CASE("GET /api/v1/responses/:id/export: a LAST row that crosses the byte ca
     CHECK_FALSE(body["pagination"].contains("result_truncated_by_cap"));
 }
 
-TEST_CASE("v1 response routes count rejected numeric params and cut exports, by surface "
-          "(#4644, #4703)",
+namespace {
+// Rows in a CSV export body: every record ends CRLF and the header is one of them. The
+// seeded payloads contain no CR/LF, so a line count is a row count plus one.
+std::size_t v1_csv_data_rows(const std::string& body) {
+    std::size_t lines = 0;
+    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
+         pos = body.find("\r\n", pos + 2))
+        ++lines;
+    return lines == 0 ? 0 : lines - 1;
+}
+} // namespace
+
+TEST_CASE("GET /api/v1/responses/:id/export: no limit serves every row up to the ceiling and "
+          "limit 0 serves exactly one (#4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    // 101 rows: more than the query route's default of 100, so a handler that fell back
+    // to that default instead of the export ceiling would serve 100 and fail here.
+    for (int i = 0; i < 101; ++i)
+        h.response_store->store(
+            mk_resp("instr-default", "agent-" + std::to_string(i), 0, "o", 100 + i));
+
+    auto all_json = h.sink.Get("/api/v1/responses/instr-default/export");
+    REQUIRE(all_json);
+    auto all = nlohmann::json::parse(all_json->body);
+    CHECK(all["data"].size() == 101);
+    CHECK_FALSE(all["pagination"].contains("result_truncated_by_cap"));
+    auto all_csv = h.sink.Get("/api/v1/responses/instr-default/export?format=csv");
+    REQUIRE(all_csv);
+    CHECK(v1_csv_data_rows(all_csv->body) == 101);
+
+    auto zero = h.sink.Get("/api/v1/responses/instr-default/export?limit=0");
+    REQUIRE(zero);
+    auto zero_body = nlohmann::json::parse(zero->body);
+    CHECK(zero_body["data"].size() == 1);
+    REQUIRE(zero_body["pagination"].contains("result_truncated_by_cap"));
+    CHECK(zero_body["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+}
+
+TEST_CASE("GET /api/v1/responses/:id/export: the byte cap always serves one row and never "
+          "flags a last row that merely crosses it (#4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    h.response_store->store(mk_resp("instr-lastcross", "agent-0", 0, std::string(400, 'y'), 100));
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(
+            mk_resp("instr-progress", "agent-" + std::to_string(i), 0, std::string(400, 'z'),
+                    100 + i));
+    yuzu::test::ExportByteCapGuard cap(1); // every row alone exceeds this
+
+    auto one_json = h.sink.Get("/api/v1/responses/instr-lastcross/export");
+    REQUIRE(one_json);
+    auto one = nlohmann::json::parse(one_json->body);
+    CHECK(one["data"].size() == 1);
+    CHECK_FALSE(one["pagination"].contains("result_truncated_by_cap"));
+    CHECK(one_json->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.json\"");
+    auto one_csv = h.sink.Get("/api/v1/responses/instr-lastcross/export?format=csv");
+    REQUIRE(one_csv);
+    CHECK(v1_csv_data_rows(one_csv->body) == 1);
+    CHECK(one_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(one_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.csv\"");
+
+    auto many_json = h.sink.Get("/api/v1/responses/instr-progress/export");
+    REQUIRE(many_json);
+    auto many = nlohmann::json::parse(many_json->body);
+    CHECK(many["data"].size() == 1);
+    REQUIRE(many["pagination"].contains("result_truncated_by_cap"));
+    CHECK(many["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+    auto many_csv = h.sink.Get("/api/v1/responses/instr-progress/export?format=csv");
+    REQUIRE(many_csv);
+    CHECK(v1_csv_data_rows(many_csv->body) == 1);
+    CHECK(many_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+}
+
+TEST_CASE("v1 response routes: since at or below zero and until zero mean unbounded (#4644)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    for (int i = 0; i < 3; ++i)
+        h.response_store->store(
+            mk_resp("instr-window", "agent-" + std::to_string(i), 0, "o", 100 + i));
+    // Pinned so a future "tighten" of the stores' zero-is-unbounded rule is a visible
+    // change: the strict parser only decides what is a number, not what a number means.
+    for (const char* route : {"", "/export"}) {
+        for (const char* q : {"since=-5", "since=0", "until=0", "since=0&until=0"}) {
+            INFO(route << " " << q);
+            auto res = h.sink.Get(std::string("/api/v1/responses/instr-window") + route + "?" + q);
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            CHECK(nlohmann::json::parse(res->body)["data"].size() == 3);
+        }
+    }
+}
+
+TEST_CASE("v1 response routes count rejected numeric params and cut exports by surface "
+          "(#4644 #4703)",
           "[pg][rest][responses][v1]") {
     YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -733,14 +824,14 @@ TEST_CASE("v1 response routes count rejected numeric params and cut exports, by 
     CHECK(h.sink.Get("/api/v1/responses/instr-metric/export")->status == 200);
     CHECK(cut("rest_v1", "row_cap") == 1.0);
     {
-        ExportByteCapGuard cap(500);
+        yuzu::test::ExportByteCapGuard cap(500);
         CHECK(h.sink.Get("/api/v1/responses/instr-metric/export?format=csv")->status == 200);
     }
     CHECK(cut("rest_v1", "byte_cap") == 1.0);
     CHECK(cut("rest", "byte_cap") == 0.0);
 }
 
-TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (#4644, #4703)",
+TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (#4644 #4703)",
           "[rest][responses][v1]") {
     using yuzu::server::append_rows_until_byte_cap;
     using yuzu::server::parse_query_int;
@@ -768,4 +859,15 @@ TEST_CASE("append_rows_until_byte_cap / parse_query_int: pure helper contracts (
     CHECK(total == 40);
     total = 0;
     CHECK_FALSE(append_rows_until_byte_cap(rows, 40, [&](int r) { return total += static_cast<std::size_t>(r); }));
+
+    // The `>=` boundary: three rows of 10. A cap of 20 is REACHED by the second row, so the
+    // third is left out (cut); a cap of 21 is not reached until the third, which is the last
+    // row, so nothing is left out. `>` instead of `>=` would flip the first of these.
+    const std::vector<int> three{10, 10, 10};
+    total = 0;
+    CHECK(append_rows_until_byte_cap(three, 20, [&](int r) { return total += static_cast<std::size_t>(r); }));
+    CHECK(total == 20);
+    total = 0;
+    CHECK_FALSE(append_rows_until_byte_cap(three, 21, [&](int r) { return total += static_cast<std::size_t>(r); }));
+    CHECK(total == 30);
 }

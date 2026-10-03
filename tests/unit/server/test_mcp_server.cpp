@@ -16454,7 +16454,7 @@ TEST_CASE("MCP query_responses: rows carry the widened field set (#2146 A2-R2 --
     }
 }
 
-TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is invalid params, "
+TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is invalid params "
           "never silently read as 'any' or a different value (#4644)",
           "[pg][mcp][integration][response][fanout]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -16514,6 +16514,87 @@ TEST_CASE("MCP query_responses: a wrong-typed or out-of-domain status/limit is i
     // Valid calls do not count.
     CHECK(reg.counter("yuzu_server_response_param_rejected_total", {{"surface", "mcp"}}).value() ==
           10.0);
+}
+
+TEST_CASE("MCP query_responses: the strict status and limit boundaries (#4644)",
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i)
+        store.store(mk_resp("exec-edge", "instr-edge", "agent-" + std::to_string(i), 0, "ok",
+                            100 + i));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.start("operator");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":75,"params":{"name":"query_responses","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    auto served_rows = [](const nlohmann::json& body) -> std::size_t {
+        REQUIRE(body.contains("result"));
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>())
+            .size();
+    };
+
+    // Rejected as -32602. JSON null is rejected on purpose (UP-6): the previous reader
+    // treated an explicit null as "use the default", which a typed client can send by
+    // accident; the documented way to say "default" is to omit the key. 5.0 is a float
+    // and "5" a string: neither is an integer, whatever the number looks like.
+    for (const char* bad : {R"({"instruction_id":"instr-edge","status":null})",
+                            R"({"instruction_id":"instr-edge","status":5.0})",
+                            R"({"instruction_id":"instr-edge","status":"5"})",
+                            R"({"instruction_id":"instr-edge","status":false})",
+                            R"({"instruction_id":"instr-edge","status":2147483648})",
+                            R"({"instruction_id":"instr-edge","limit":null})",
+                            R"({"instruction_id":"instr-edge","limit":5.0})",
+                            R"({"instruction_id":"instr-edge","limit":"5"})",
+                            R"({"instruction_id":"instr-edge","limit":true})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+
+    // The largest status an int can hold is accepted (it just matches nothing), and limit
+    // is clamped on both sides rather than rejected: 0 and negative values serve one row
+    // (never zero, which a worker would read as "no responses"), and INT64_MAX serves all
+    // three (a wrapped negative would have clamped to one).
+    CHECK(served_rows(call(R"({"instruction_id":"instr-edge","status":2147483647})")) == 0);
+    CHECK(served_rows(call(R"({"instruction_id":"instr-edge","limit":0})")) == 1);
+    CHECK(served_rows(call(R"({"instruction_id":"instr-edge","limit":-5})")) == 1);
+    CHECK(served_rows(call(R"({"instruction_id":"instr-edge","limit":9223372036854775807})")) == 3);
+}
+
+TEST_CASE("MCP list_product_packs: an unsigned limit above INT64_MAX is invalid params "
+          "(param_int_strict has other callers) (#4644)",
+          "[mcp][integration][product_pack][4029][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_pp_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::ProductPackStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.product_pack_store_for_test = &store;
+    ts.start("readonly");
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":111,"params":{"name":"list_product_packs","arguments":)" +
+            args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    // nlohmann's unsigned variant is is_number_integer() and get<int64_t>() wraps it to -1,
+    // so the helper shared by every strict-limit tool must refuse it, not just query_responses.
+    auto wrapped = call(R"({"limit":18446744073709551615})");
+    REQUIRE(wrapped.contains("error"));
+    CHECK(wrapped["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(call(R"({"limit":10})").contains("result"));
 }
 
 TEST_CASE("MCP query_responses: rejects when neither id provided",
