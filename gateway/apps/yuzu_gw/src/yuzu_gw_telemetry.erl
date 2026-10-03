@@ -408,7 +408,8 @@ declare_metrics() ->
                "this node but the call arrived on a different connection than "
                "the one that opened it. Also rises when an HTTP/2 proxy "
                "between agents and the gateway spreads one agent's calls over "
-               "several connections, and briefly around agent reconnects. "
+               "several connections, and possibly around agent reconnects "
+               "(expected, not observed in testing). "
                "Carries event=security for SIEM routing"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
