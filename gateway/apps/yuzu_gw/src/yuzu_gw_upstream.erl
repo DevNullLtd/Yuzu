@@ -26,11 +26,26 @@
 %%%   server that disappears again mid-replay fails fast and the drip
 %%%   stops; the next genuine recovery restarts it.
 %%%
+%%% Targeted replay on a heartbeat verdict (#1197 PR-C):
+%%%   The server answers every BatchHeartbeat with the sessions it does not
+%%%   know. yuzu_gw_heartbeat_buffer casts those ids to replay_sessions/1,
+%%%   which queues exactly the ones this node still holds onto the same drip.
+%%%   One pending entry per agent, a guard window against replaying a session
+%%%   again right after it was replayed, and a queue cap bound the work a
+%%%   verdict can create. A verdict that arrives while the breaker is open is
+%%%   dropped and counted (a later heartbeat lists the sessions again); one
+%%%   that arrives half_open is queued, and its first replay RPC is the probe.
+%%%
 %%% Configuration (sys.config / application env):
 %%%   circuit_breaker_failure_threshold   — consecutive failures to trip (default 5)
 %%%   circuit_breaker_reset_timeout_ms    — initial open duration (default 10000)
 %%%   circuit_breaker_max_reset_timeout_ms — max backoff cap (default 300000)
 %%%   registration_replay_spacing_ms      — gap between replay RPCs (default 20)
+%%%   registration_replay_session_guard_ms - how long a replayed session is not
+%%%                                          queued again by a verdict
+%%%                                          (default 10000, valid 0..3600000)
+%%%   registration_replay_queue_max       - most agents the replay queue holds
+%%%                                          (default 10000, valid 1..1000000)
 %%   cluster_id                          — this gateway's trust-zone/region id,
 %%                                          stamped on every StreamStatusNotification
 %%                                          (default <<"default">>; ADR-2002 §7)
@@ -66,6 +81,10 @@
 -define(DEFAULT_CB_RESET_MS, 10000).
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
+-define(DEFAULT_REPLAY_SESSION_GUARD_MS, 10000).
+-define(MAX_REPLAY_SESSION_GUARD_MS, 3600000).
+-define(DEFAULT_REPLAY_QUEUE_MAX, 10000).
+-define(MAX_REPLAY_QUEUE_MAX, 1000000).
 
 %% CC-03 wire-capability handshake (proto/yuzu/gateway/v1/gateway.proto,
 %% StreamStatusNotification.wire_capabilities): the literal this gateway
@@ -87,6 +106,14 @@
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
     replay_queue    :: [{binary(), binary() | undefined, map()}],  %% agents still to re-proxy ([] = idle)
+    %% Sessions replayed within the last session_guard_ms (monotonic ms of the
+    %% pop that replayed them). Stamped only when the drip actually sends the
+    %% ProxyRegister, never when an entry is queued or skipped, and pruned on
+    %% every verdict and when the queue empties, so it is bounded by the
+    %% sessions replayed within one guard window.
+    recent_replays   = #{} :: #{binary() => integer()},
+    session_guard_ms :: non_neg_integer(),
+    replay_queue_max :: pos_integer(),
     %% Guardian drift-event forwards in flight (bounded by MAX_GUARDIAN_INFLIGHT)
     guardian_pids   :: #{pid() => true},
     %% HA WS-4 4.1 — the trust-zone/region cluster id this gateway belongs to
@@ -137,11 +164,17 @@ forward_guardian_message(AgentId, ResponseFrame) ->
     gen_server:cast(?SERVER, {forward_guardian_message, AgentId, ResponseFrame}).
 
 %% @doc Replay the registrations of the sessions the server reported as
-%% unknown (#1197 PR-C). Placeholder seam: exported so the red tests
-%% compile, no behaviour yet.
+%% unknown in a BatchHeartbeat response (#1197 PR-C).
+%%
+%% Fire-and-forget (cast), called by yuzu_gw_heartbeat_buffer once per flush
+%% and so never blocking it. `ok' means handed over, not replayed: the ids are
+%% dropped when the circuit is open, when this node does not hold the session,
+%% when the agent is already queued, when the session was replayed within the
+%% guard window, and when the queue is full. The caller has already bounded
+%% the list (at most 4096 binaries of 1 to 64 bytes).
 -spec replay_sessions([binary()]) -> ok.
-replay_sessions(_SessionIds) ->
-    ok.
+replay_sessions(SessionIds) ->
+    gen_server:cast(?SERVER, {replay_sessions, SessionIds}).
 
 %% @doc Query the current circuit breaker state (for health checks).
 -spec circuit_state() -> closed | open | half_open.
@@ -157,11 +190,16 @@ init([]) ->
     BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
     MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
     ReplaySpacing = application:get_env(yuzu_gw, registration_replay_spacing_ms, ?DEFAULT_REPLAY_SPACING_MS),
+    SessionGuard = env_int(registration_replay_session_guard_ms,
+                           ?DEFAULT_REPLAY_SESSION_GUARD_MS, 0, ?MAX_REPLAY_SESSION_GUARD_MS),
+    QueueMax = env_int(registration_replay_queue_max,
+                       ?DEFAULT_REPLAY_QUEUE_MAX, 1, ?MAX_REPLAY_QUEUE_MAX),
     ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
-                "replay_spacing=~bms, cluster_id=~s)",
-                [Threshold, BaseTimeout, ReplaySpacing, ClusterId]),
+                "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
+                "cluster_id=~s)",
+                [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax, ClusterId]),
 
     {ok, #state{
         notify_pids     = #{},
@@ -174,6 +212,9 @@ init([]) ->
         cb_timer        = undefined,
         replay_spacing  = ReplaySpacing,
         replay_queue    = [],
+        recent_replays  = #{},
+        session_guard_ms = SessionGuard,
+        replay_queue_max = QueueMax,
         guardian_pids   = #{},
         cluster_id      = ClusterId
     }}.
@@ -301,15 +342,33 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
             end
     end;
 
+handle_cast({replay_sessions, SessionIds}, #state{cb_state = open} = State) ->
+    %% Drop, do not queue: the upstream is known to be down, so every replay
+    %% RPC would fail fast anyway. The server lists these sessions again on a
+    %% later heartbeat once it answers, so nothing is lost but time.
+    Count = length(SessionIds),
+    emit_verdict_dropped(circuit_open, Count),
+    logger:debug("Registration replay: heartbeat verdict named ~b session(s) "
+                 "while the circuit is open; dropped", [Count]),
+    {noreply, State};
+handle_cast({replay_sessions, SessionIds}, State) ->
+    %% closed or half_open. half_open queues on purpose: the first replay
+    %% RPC is the probe that decides whether the breaker closes.
+    {noreply, enqueue_sessions(SessionIds, State)};
+
 handle_cast(replay_registrations, #state{replay_queue = [_ | _]} = State) ->
     %% Gate 7 UP-5 — a drip is already in flight. The OLD behaviour
     %% reseeded `replay_queue` with a fresh full-fleet snapshot on every
     %% cast, so a server that flapped (fail→recover→fail→recover under
     %% packet loss) restarted the replay from zero each time and, at
-    %% fleet scale, never drained. Drop the cast: the running drip
-    %% already holds a registry snapshot and will complete. If the
-    %% upstream genuinely went away again, check_circuit aborts the drip
-    %% and the next true half_open->closed recovery reseeds from scratch.
+    %% fleet scale, never drained. Drop the cast: the running drip will
+    %% complete. Since #1197 PR-C the running queue may be a TARGETED one
+    %% (the sessions a heartbeat verdict named), not a snapshot of every
+    %% agent, so an agent that is not in it is not replayed by this
+    %% recovery; it relies on a later verdict, which lists it within one
+    %% heartbeat interval plus one flush. If the upstream genuinely went
+    %% away again, check_circuit aborts the drip and the next true
+    %% half_open->closed recovery reseeds from scratch.
     logger:debug("Registration replay: drip already in flight "
                  "(~b queued) — ignoring redundant trigger",
                  [length(State#state.replay_queue)]),
@@ -327,6 +386,8 @@ handle_cast(replay_registrations, State) ->
         _ ->
             logger:info("Registration replay: re-proxying ~b agent(s) upstream",
                         [length(Agents)]),
+            telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                              #{count => 1}, #{trigger => breaker}),
             self() ! replay_next,
             {noreply, State#state{replay_queue = Agents}}
     end;
@@ -340,7 +401,7 @@ handle_cast(_Msg, State) ->
 %% the gen_server and a server that vanishes again mid-replay fails fast.
 handle_info(replay_next, #state{replay_queue = []} = State) ->
     %% Queue drained — replay complete.
-    {noreply, State};
+    {noreply, prune_recent_replays(State)};
 handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq} | Rest],
                                 replay_spacing = Spacing} = State) ->
     State2 =
@@ -352,7 +413,8 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 %% restart it from a fresh registry snapshot.
                 logger:warning("Registration replay aborted: circuit open "
                                "(~b agent(s) not yet re-proxied)", [length(Rest) + 1]),
-                State1#state{replay_queue = []};
+                emit_queue_depth(0),
+                prune_recent_replays(State1#state{replay_queue = []});
             {allow, #state{notify_pids = Pids} = State1}
                     when map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT ->
                 %% HA WS-4 4.4 review fix (F2): a replay-ADOPTED session
@@ -373,7 +435,9 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                 schedule_replay_next(State1#state.replay_queue, Spacing),
                 State1;
             {allow, State1} ->
-                NextState =
+                %% Step is {done, State} when this head entry is finished
+                %% (replayed or skipped), or `abort' to drop the whole queue.
+                Step =
                     case map_size(RegisterReq) of
                         0 ->
                             %% Agent registered without a stashed request
@@ -381,7 +445,8 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                             %% it without disturbing the breaker.
                             logger:debug("Registration replay: skipping ~s (no stored request)",
                                         [AgentId]),
-                            State1;
+                            emit_queue_depth(length(Rest)),
+                            {done, State1};
                         _ ->
                             %% HA WS-4 4.4 (`#4246` #6): re-verify liveness
                             %% right before replaying — the drip is
@@ -401,21 +466,43 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq
                             %% pattern here means the `{ok, {Pid, SessionId}}`
                             %% clause only fires when the CURRENT local
                             %% session still equals it — a mismatch (or no
-                            %% row at all) falls to the catch-all.
+                            %% row at all) falls to the catch-all clause.
                             case yuzu_gw_registry:lookup_local_session(AgentId) of
                                 {ok, {Pid, SessionId}} ->
-                                    do_replay_one(AgentId, Pid, SessionId, RegisterReq,
-                                                 length(Rest), State1);
+                                    %% Stamp here, and only here: the session
+                                    %% is stamped when this drip really sends
+                                    %% it (a breaker-seeded entry too), never
+                                    %% when it was queued or skipped.
+                                    {done, do_replay_one(AgentId, Pid, SessionId, RegisterReq,
+                                                         length(Rest),
+                                                         stamp_replayed(SessionId, State1))};
+                                {error, unavailable} ->
+                                    %% The registry's tables are gone (its process
+                                    %% died; it is a sibling under one_for_one).
+                                    %% Nothing queued can be re-verified, so drop
+                                    %% the queue instead of crashing this process:
+                                    %% each agent comes back on a later verdict.
+                                    logger:warning("Registration replay aborted: registry unavailable "
+                                                   "(~b queued entries dropped); they return on "
+                                                   "their next heartbeat", [length(Rest) + 1]),
+                                    emit_queue_depth(0),
+                                    abort;
                                 _ ->
                                     logger:debug(
                                         "Registration replay: skipping ~s (no longer live "
                                         "locally, or reconnected under a different session, "
                                         "since this drip was queued)", [AgentId]),
-                                    State1
+                                    emit_queue_depth(length(Rest)),
+                                    {done, State1}
                             end
                     end,
-                schedule_replay_next(Rest, Spacing),
-                NextState#state{replay_queue = Rest}
+                case Step of
+                    {done, NextState} ->
+                        schedule_replay_next(Rest, Spacing),
+                        advance_queue(NextState, Rest);
+                    abort ->
+                        prune_recent_replays(State1#state{replay_queue = []})
+                end
         end,
     {noreply, State2};
 
@@ -453,6 +540,23 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
     NewState =
         case Result of
+            {ok, #{accepted := false} = Response} ->
+                %% The server answered OK but did not install the session
+                %% (RegisterResponse.accepted = false, e.g. a rejected
+                %% enrollment). Re-announcing a session the server never
+                %% installed would only be rejected again, and the next
+                %% verdict would replay it again, so tear down this process's
+                %% stream: the agent then registers directly and follows its
+                %% own outcome. The answer is authoritative, so it is a breaker
+                %% SUCCESS (as for the superseded case below), and the attempt
+                %% is stamped like any other replay. A MISSING `accepted' key
+                %% still means accepted. The reason is the server's text, so
+                %% it is cut before it is logged; no session id is logged.
+                logger:warning("Registration replay: ~s was not accepted by the server (~s); "
+                               "disconnecting so the agent follows its own registration path",
+                               [AgentId, reject_reason_for_log(Response)]),
+                yuzu_gw_agent:disconnect(Pid),
+                record_result_no_replay({ok, Response}, State);
             {ok, Response} ->
                 %% HA WS-4 4.4: the server now ALWAYS adopts the presented
                 %% session on success (never a throwaway fresh mint, see
@@ -569,14 +673,13 @@ on_success(#state{cb_state = closed} = State) ->
     %% one full-fleet replay that runs to completion; redundant
     %% triggers while it drains are dropped. The storm was the
     %% restart-from-zero, not the trigger.
-    logger:info("Upstream recovered (closed, ~b prior failures) — "
-                "scheduling registration replay", [State#state.cb_failures]),
+    logger:info("Upstream recovered (closed, ~b prior failures)",
+                [State#state.cb_failures]),
     {State#state{cb_failures = 0}, replay};
 on_success(#state{cb_state = half_open, cb_base_timeout = BaseTimeout} = State) ->
     %% Probe succeeded — close the circuit, reset backoff. The breaker
     %% fully tripped, so the upstream was definitely down; replay.
-    logger:info("Circuit breaker: half_open -> closed (probe succeeded) — "
-                "scheduling registration replay"),
+    logger:info("Circuit breaker: half_open -> closed (probe succeeded)"),
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"closed">>}),
@@ -627,6 +730,133 @@ schedule_replay_next([], _Spacing) ->
 schedule_replay_next(_Rest, Spacing) ->
     erlang:send_after(Spacing, self(), replay_next),
     ok.
+
+%% @doc Queue the entries for the sessions a heartbeat verdict named (#1197
+%% PR-C). Ids are resolved to entries by session (yuzu_gw_registry:
+%% entries_for_sessions/1), and each pop is re-verified by agent
+%% (lookup_local_session/1): two decisions, two keys.
+%%
+%% Per entry, in verdict order, the first rule that applies wins:
+%%   - the agent is already queued: skipped. One pending entry per agent, so
+%%     a second session for the same agent is not queued; the earlier entry
+%%     is skipped as stale at its pop and the new session is listed again by
+%%     the agent's next heartbeat.
+%%   - the session was replayed within the guard window: skipped. The verdict
+%%     was computed before that replay landed.
+%%   - the queue is at its cap: dropped and counted (queue_full).
+%%   - otherwise appended.
+%% The first two are deduplication, not loss, and are not counted as drops.
+%% Ids this node does not hold are counted as not_local. Membership is
+%% checked against a map built once from the queue, so a verdict costs O(k)
+%% for the queue and the k ids, never O(k) per id.
+%%
+%% When anything was appended: one registration_replay_triggered event, the
+%% queue depth is reported (so the gauge is not stale until the first pop),
+%% and the drip is started if the queue was empty. A running drip picks the
+%% new entries up on its own. The log line carries counts only, never ids.
+-spec enqueue_sessions([binary()], #state{}) -> #state{}.
+enqueue_sessions(SessionIds, State0) ->
+    #state{replay_queue = Queue, recent_replays = Recent,
+           replay_queue_max = Max} = State = prune_recent_replays(State0),
+    Entries = yuzu_gw_registry:entries_for_sessions(SessionIds),
+    NotLocal = length(SessionIds) - length(Entries),
+    QueueLen = length(Queue),
+    QueuedAgents = maps:from_keys([AgentId || {AgentId, _, _} <- Queue], true),
+    {RevAppended, _, Size, AlreadyQueued, WithinGuard, QueueFull} =
+        lists:foldl(
+          fun({AgentId, SessionId, _} = Entry, {Rev, Agents, Len, Dup, Guarded, Full}) ->
+              case {maps:is_key(AgentId, Agents), maps:find(SessionId, Recent), Len >= Max} of
+                  {true, _, _} ->
+                      {Rev, Agents, Len, Dup + 1, Guarded, Full};
+                  {false, {ok, _}, _} ->
+                      {Rev, Agents, Len, Dup, Guarded + 1, Full};
+                  {false, error, true} ->
+                      {Rev, Agents, Len, Dup, Guarded, Full + 1};
+                  {false, error, false} ->
+                      {[Entry | Rev], Agents#{AgentId => true}, Len + 1, Dup, Guarded, Full}
+              end
+          end,
+          {[], QueuedAgents, QueueLen, 0, 0, 0}, Entries),
+    emit_verdict_dropped(not_local, NotLocal),
+    emit_verdict_dropped(queue_full, QueueFull),
+    Appended = Size - QueueLen,
+    Level = case Appended of 0 -> debug; _ -> info end,
+    logger:log(Level, "Registration replay: heartbeat verdict named ~b session(s); "
+                      "queued ~b, not local ~b, already queued ~b, within guard ~b, "
+                      "queue full ~b",
+               [length(SessionIds), Appended, NotLocal, AlreadyQueued, WithinGuard, QueueFull]),
+    case RevAppended of
+        [] ->
+            State;
+        _ ->
+            telemetry:execute([yuzu, gw, upstream, registration_replay_triggered],
+                              #{count => 1}, #{trigger => heartbeat}),
+            emit_queue_depth(Size),
+            case Queue of
+                [] -> self() ! replay_next;
+                _  -> ok
+            end,
+            State#state{replay_queue = Queue ++ lists:reverse(RevAppended)}
+    end.
+
+%% @doc The head entry is finished: keep the rest of the queue. When that
+%% empties the queue the replay is complete, so stale guard stamps are pruned
+%% here (the `replay_next' clause for an empty queue is not reached after the
+%% last pop).
+advance_queue(State, []) ->
+    prune_recent_replays(State#state{replay_queue = []});
+advance_queue(State, Rest) ->
+    State#state{replay_queue = Rest}.
+
+%% @doc Record that SessionId is being replayed now. An entry seeded with no
+%% session (the register_agent/5 back-compat path) has nothing a verdict could
+%% name, so it is not stamped.
+stamp_replayed(SessionId, #state{recent_replays = Recent} = State) when is_binary(SessionId) ->
+    State#state{recent_replays = Recent#{SessionId => erlang:monotonic_time(millisecond)}};
+stamp_replayed(_SessionId, State) ->
+    State.
+
+%% @doc Forget guard stamps older than the guard window.
+prune_recent_replays(#state{recent_replays = Recent, session_guard_ms = Guard} = State) ->
+    Cutoff = erlang:monotonic_time(millisecond) - Guard,
+    State#state{recent_replays = maps:filter(fun(_, Stamp) -> Stamp > Cutoff end, Recent)}.
+
+%% @doc Report the replay queue depth without counting a replay: a
+%% registration_replay event with replayed = 0 sets the gauge and adds
+%% nothing to the replay counter. Called on append, skip and abort, so the
+%% gauge is not stale between replay RPCs (do_replay_one/6 reports its own).
+emit_queue_depth(Depth) ->
+    telemetry:execute([yuzu, gw, upstream, registration_replay],
+                      #{replayed => 0, queue_depth => Depth}, #{}).
+
+%% @doc Count session ids from a verdict that were not queued, by reason
+%% (not_local | circuit_open | queue_full). A zero count emits nothing.
+emit_verdict_dropped(_Reason, 0) ->
+    ok;
+emit_verdict_dropped(Reason, Count) ->
+    telemetry:execute([yuzu, gw, heartbeat, verdict_dropped],
+                      #{count => Count}, #{reason => Reason}).
+
+%% @doc The server's reject_reason, cut to 128 bytes for the log. Bytes, not
+%% graphemes: the text is untrusted and need not be valid UTF-8.
+reject_reason_for_log(Response) ->
+    case maps:get(reject_reason, Response, <<>>) of
+        Reason when is_binary(Reason) -> binary:part(Reason, 0, min(byte_size(Reason), 128));
+        _                             -> <<>>
+    end.
+
+%% @doc Read an integer application env key that must lie in Min..Max; an
+%% invalid value is logged (naming the key) and replaced by the default.
+-spec env_int(atom(), integer(), integer(), integer()) -> integer().
+env_int(Key, Default, Min, Max) ->
+    case application:get_env(yuzu_gw, Key, Default) of
+        Value when is_integer(Value), Value >= Min, Value =< Max ->
+            Value;
+        Bad ->
+            logger:warning("Invalid ~s value ~p (expected an integer in ~b..~b); using ~b",
+                           [Key, Bad, Min, Max, Default]),
+            Default
+    end.
 
 %%%===================================================================
 %%% Internal — RPC execution
