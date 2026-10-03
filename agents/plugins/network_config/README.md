@@ -65,9 +65,9 @@ flowchart LR
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | **None.** Every leg is a native Win32 read API; none requires elevation. | 2026-09-07 on bare metal as `SYSTEM` | no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp) |
-| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`) |
-| Linux | agent's own unprivileged account (`yuzu`) | **None** for adapters/ip_addresses/dns_servers/proxy/arp (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present. | 2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`) |
+| Windows | agent service account (LocalSystem today, #1442) | **None.** Every leg is a native Win32 read API; none requires elevation. | 2026-09-07 on bare metal as `SYSTEM`; `routes` 2026-10-03 on bare metal as `SYSTEM` | no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp); `routes` instead returns `rc=0` with `UNAVAILABLE`/`PARTIAL` `network_config:routes_table_unavailable` |
+| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501 | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`) |
+| Linux | agent's own unprivileged account (`yuzu`) | **None** for adapters/ip_addresses/dns_servers/proxy/arp/routes (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present. | 2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime; `routes` 2026-10-03, also `euid 0` (an RTM_GETROUTE dump is an unprivileged read by design, but it was not measured below root) | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`, `network_config:rtnetlink_routes_dump_incomplete`) |
 
 Binaries/subprocesses: only the Linux `dns_cache` leg spawns a subprocess — `resolvectl cache`, falling
 back to `systemd-resolve --statistics`, both via the bounded direct-argv runner (no `/bin/sh`)
@@ -478,8 +478,9 @@ not assert row count for the same reason: `tests/unit/test_network_config_local_
    local/broadcast/anycast/multicast route types, reports only the FIRST nexthop of a multipath route,
    and shows an `ip nexthop`-object route's gateway as `nhid:<n>` (both are flagged in the result
    status, never silent). macOS has no route metric and no table id (`metric` and `table` are `-`),
-   its `origin` is only the RTF_STATIC/RTF_DYNAMIC bit (else `other`), and it drops neighbour,
-   cloned, multicast, broadcast and own-address entries. Windows reports the ROUTE metric alone —
+   its `origin` is only the RTF_STATIC/RTF_DYNAMIC bit (else `other`), and it drops entries
+   flagged as neighbour (RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) —
+   the limited-broadcast `255.255.255.255/32` route carries none of those flags and is reported. Windows reports the ROUTE metric alone —
    Windows adds the interface metric when ranking routes and that sum is not shown — and drops the
    host's own and broadcast addresses (Protocol `Local` with a full-length prefix) and the multicast
    prefixes, but keeps connected-subnet routes (Protocol `Local` with a shorter prefix). A consumer

@@ -119,8 +119,7 @@ TEST_CASE("format_route_row cannot be split by an interface name containing the 
 
 namespace {
 
-// Mirrors the leg's own unpacking of a row: an unspecified next hop (0.0.0.0 / ::) is
-// on-link and becomes empty.
+// Mirrors the leg's own unpacking of a row, through the same win_next_hop() the leg uses.
 std::vector<WinRoute> read_windows_fixture(const fs::path& p) {
     REQUIRE(fs::exists(p));
     std::ifstream f(p);
@@ -144,7 +143,7 @@ std::vector<WinRoute> read_windows_fixture(const fs::path& p) {
         r.ipv6 = c[0] == "ipv6";
         r.destination = c[1];
         r.prefix_len = static_cast<unsigned>(std::stoul(c[2]));
-        r.next_hop = (c[3] == "0.0.0.0" || c[3] == "::") ? std::string{} : c[3];
+        r.next_hop = win_next_hop(c[3], c[3] == "0.0.0.0" || c[3] == "::");
         r.interface = c[4];
         r.metric = std::stoul(c[6]);
         r.protocol = std::stoi(c[7]);
@@ -160,10 +159,11 @@ TEST_CASE("windows routes from a real GetIpForwardTable2 capture keep reachabili
     const auto table = read_windows_fixture(fixture_dir("windows") / "forward_table.tsv");
     REQUIRE(table.size() == 41);
 
+    const auto result = win_routes_to_rows(table);
+    CHECK_FALSE(result.capped);
     std::vector<std::string> rows;
-    for (const auto& r : table)
-        if (!win_route_is_host_local(r))
-            rows.push_back(format_route_row(win_route_to_row(r)));
+    for (const auto& r : result.rows)
+        rows.push_back(format_route_row(r));
 
     // Hand-checked against the Get-NetRoute ground truth in the provenance file.
     const std::vector<std::string> expected{
@@ -188,6 +188,29 @@ TEST_CASE("windows routes from a real GetIpForwardTable2 capture keep reachabili
     REQUIRE(rows.size() == expected.size());
     for (std::size_t i = 0; i < expected.size(); ++i)
         CHECK(rows[i] == expected[i]);
+}
+
+TEST_CASE("windows routes: the cap counts kept routes, not the host's own entries",
+          "[network_config][routes][windows_map]") {
+    const auto table = read_windows_fixture(fixture_dir("windows") / "forward_table.tsv");
+    // The fixture holds 41 routes of which 17 are kept. Capping at 17 keeps them all and is NOT
+    // capped even though 24 host-local rows were skipped on the way; capping at 3 is capped and
+    // returns exactly the first 3 kept rows.
+    const auto exact = win_routes_to_rows(table, 17);
+    CHECK_FALSE(exact.capped);
+    CHECK(exact.rows.size() == 17);
+    const auto three = win_routes_to_rows(table, 3);
+    CHECK(three.capped);
+    REQUIRE(three.rows.size() == 3);
+    CHECK(format_route_row(three.rows[0]) == format_route_row(exact.rows[0]));
+    CHECK(format_route_row(three.rows[2]) == format_route_row(exact.rows[2]));
+}
+
+TEST_CASE("windows next hop: unspecified means on-link", "[network_config][routes][windows_map]") {
+    CHECK(win_next_hop("0.0.0.0", true).empty());
+    CHECK(win_next_hop("::", true).empty());
+    CHECK(win_next_hop("192.0.2.1", false) == "192.0.2.1");
+    CHECK(win_next_hop("", false).empty()); // an AF_UNSPEC hop formats to empty and stays on-link
 }
 
 TEST_CASE("windows host-local rule: Local full-length and Local multicast are dropped, the rest kept",

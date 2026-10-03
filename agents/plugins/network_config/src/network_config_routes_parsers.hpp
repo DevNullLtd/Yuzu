@@ -162,6 +162,35 @@ inline RouteRow win_route_to_row(const WinRoute& r) {
     return row;
 }
 
+/// An unspecified next hop (0.0.0.0 / ::) means the route is on-link: no gateway.
+inline std::string win_next_hop(std::string text, bool unspecified) {
+    return unspecified ? std::string{} : std::move(text);
+}
+
+struct WinRoutesResult {
+    std::vector<RouteRow> rows;
+    bool capped = false; // more kept routes than `cap`; `rows` is the first `cap`
+};
+
+/// Drop the host's own entries, then cap — the cap counts KEPT routes, so a normal
+/// workstation's per-interface multicast/broadcast rows never eat into it — and map each
+/// remaining route to its row. Everything decidable without Windows headers lives here; the
+/// leg only unpacks MIB_IPFORWARD_ROW2 into WinRoute.
+inline WinRoutesResult win_routes_to_rows(const std::vector<WinRoute>& routes,
+                                          std::size_t cap = kRoutesRowCap) {
+    WinRoutesResult out;
+    for (const auto& r : routes) {
+        if (win_route_is_host_local(r))
+            continue;
+        if (out.rows.size() >= cap) {
+            out.capped = true;
+            break;
+        }
+        out.rows.push_back(win_route_to_row(r));
+    }
+    return out;
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 
 namespace routes_detail {

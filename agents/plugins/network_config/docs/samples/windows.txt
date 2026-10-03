@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-03 · LocalSystem (elevated) · leg-hash pending
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-03 · LocalSystem (elevated; addresses redacted) · leg-hash pending
 == action=adapters
 adapter|Tailscale|-|100000|up
 adapter|Ethernet|FC:34:97:65:1E:0A|1000|up

@@ -1479,9 +1479,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "PF_ROUTE sysctl NET_RT_DUMP",
          "IPv4 and IPv6; macOS has no route metric or table id, so those fields are '-', and the "
-         "origin is only the RTF_STATIC/RTF_DYNAMIC bit; neighbour, cloned, multicast, broadcast "
-         "and own-address entries are not reported"},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetIpForwardTable2", nullptr},
+         "origin is only the RTF_STATIC/RTF_DYNAMIC bit; entries flagged as neighbour "
+         "(RTF_LLINFO), cloned, multicast, broadcast or own-address (RTF_LOCAL) are not reported "
+         "(the limited-broadcast 255.255.255.255/32 route carries none of those flags and is)"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "GetIpForwardTable2",
+         "IPv4 and IPv6; the host's own and broadcast addresses (Protocol Local, full-length "
+         "prefix) and the multicast prefixes are not reported, connected-subnet routes are; the "
+         "metric is the route metric alone, without the interface metric"},
     },
 };
 

@@ -96,8 +96,8 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
     }
     ForwardTableGuard guard{table}; // FreeMibTable on every path below
 
-    std::vector<RouteRow> rows;
-    bool capped = false;
+    std::vector<WinRoute> routes;
+    routes.reserve(table->NumEntries);
     bool unformattable = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPFORWARD_ROW2& r = table->Table[i];
@@ -112,28 +112,21 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
         w.ipv6 = family == AF_INET6;
         w.prefix_len = r.DestinationPrefix.PrefixLength;
         bool hop_unspecified = true;
-        std::string hop = sockaddr_text(r.NextHop, hop_unspecified); // AF_UNSPEC -> empty
-        w.next_hop = hop_unspecified ? std::string{} : std::move(hop); // unspecified = on-link
+        w.next_hop = win_next_hop(sockaddr_text(r.NextHop, hop_unspecified), hop_unspecified);
+        w.interface = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
         w.metric = r.Metric;
         w.protocol = static_cast<int>(r.Protocol);
-
-        if (win_route_is_host_local(w))
-            continue;
-
-        w.interface = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
-
-        if (rows.size() >= kRoutesRowCap) {
-            capped = true;
-            break;
-        }
-        rows.push_back(win_route_to_row(w));
+        routes.push_back(std::move(w));
     }
 
-    if (capped)
+    // The host-local filter, the cap-after-filter and the row mapping are the pure
+    // win_routes_to_rows() (network_config_routes_parsers.hpp), tested on every host.
+    const auto result = win_routes_to_rows(routes);
+    if (result.capped)
         acc.add_failure(kTokRowCap);
     if (unformattable)
         acc.add_failure("network_config:routes_row_unformattable");
-    emit_routes(ctx, rows, acc, /*unavailable=*/false);
+    emit_routes(ctx, result.rows, acc, /*unavailable=*/false);
     return 0;
 }
 
