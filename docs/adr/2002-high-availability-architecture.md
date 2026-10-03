@@ -1209,7 +1209,7 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   `yuzu_gw_heartbeat_rejected_total{reason=unknown_session|no_connection|registry_unavailable}` and
   `yuzu_gw_heartbeat_session_mismatch_total{event="security"}`, all pre-seeded to 0 and ASCII-HELP, plus
   one rate-limited summary log line that never carries a session id. A rejected heartbeat has no resolved
-  principal, so the observability carve-out applies (metric and sampled log, no audit row). No alert rule
+  principal, so the observability carve-out applies (metric and a rate-limited summary log, no audit row). No alert rule
   ships yet.
 - **Lookup primitive.** `yuzu_gw_registry:lookup_session/1` returns `{ok, #{agent_id, pid, conn_key}}`,
   `error` (not held on this node, or the process is no longer alive) or `{error, unavailable}` (the
@@ -1222,6 +1222,9 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   lookup consistently: `lookup_session/1` is session-keyed and checks that the process is local and
   alive, while `lookup_local_session/1` is agent-keyed and has no node check. The server's
   `unknown_session_ids` verdict stays an advisory snapshot whatever a consumer does with this function.
+  `error` also covers a pending session and the gap between `take_pending` and `register_agent`; use
+  `lookup_pending_session/1` to tell them apart. An `{ok, Map}` result can go stale before the caller
+  acts, so a consumer treats it as advisory and re-checks at the act.
 - **Lifecycle, as implemented.**
 
 | Event | Index row |
@@ -1247,9 +1250,17 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   and none reached the server, while the agents still enrolled and received commands and re-registered
   on their back-off ladder (2 s doubling to a 300 s cap); behind an L4 TCP forwarder (nginx `stream`)
   there were no rejections. The agent-facing message is the same `unknown session` for every reason, so
-  operators diagnose from the counters and the summary log. A multiplexing HTTP/2 proxy with upstream
-  keepalive, a multi-node gateway, a listener that requires client certificates, fleet-scale storms,
-  Windows service mode and a macOS agent were not tested.
+  operators diagnose from the counters and the summary log. Not tested with a real agent: a multi-node
+  gateway (a two-node registry unit test, `yuzu_gw_registry_multinode_tests`, exists) and a listener that
+  requires client certificates (a test-client mutual TLS leg exists in
+  `yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client certificates). Not
+  tested at all: a multiplexing HTTP/2 proxy with upstream keepalive, fleet-scale storms, Windows service
+  mode, a macOS agent, a real hot code load and the real C++ agent across a GOAWAY. The rig runs used
+  gateway commit `1c145d78a` (the first plaintext run used `2e884bb9b`, which differs only in tests and
+  docs); three later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
+  `026830cd9` summary log state created at boot) are covered by eunit only, and the boot path of the
+  final tip has not been exercised on a rig. The run record is
+  [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 - **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
   gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and
   its binding end with the connection (there is no drain period). A heartbeat that reaches the gateway
@@ -1264,7 +1275,11 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   real hot code load was not run). `/readyz` reports `sessions_index` and answers 503 while the table is
   missing. `yuzu_gw_sessions` is a protected table written only by the registry process.
 - **Limits.** `Subscribe` admission is unchanged by this change. Some log lines still include session
-  ids; two gateway info lines no longer do.
+  ids; two gateway info lines no longer do. The node-local rule also applies to a multi-node gateway: one
+  agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4,
+  no per-RPC balancing). Planned agent-side endpoint failover (WS-13) must keep one channel per agent to
+  one node. A future heartbeat-forwarding slice cannot reuse the connection pid as its key, because a pid
+  is meaningful only on the node that owns the connection.
 
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
