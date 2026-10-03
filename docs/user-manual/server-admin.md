@@ -5096,16 +5096,21 @@ and `rest_v1` each get their own one-a-minute allowance).
 
 **What the bound covers.** The cut is applied inside the store query, so an export holds about 50
 MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
-kept can run past it by up to its own size (each of `output` and `error_detail` is capped at 2 MiB
-at ingest, about 4 MiB per row). The serialization-time backstop counts escaped bytes, so a result
-under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
+kept can run past it by up to its own size (each of `output` and `error_detail` is cut to 2 MiB at
+ingest before invalid bytes and NULs become the 3-byte U+FFFD, so a row is about 4 MiB for text
+output and up to about 12 MiB for output dense in invalid bytes or NULs). The serialization-time
+backstop counts escaped bytes (the whole body so far for CSV, each serialized row object for JSON),
+so a result under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
 of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bounded fetch, against
 398 MiB with the unbounded one; other row shapes were not measured, and the serialized body built
-afterwards is additional. The plain list routes (`GET /api/v1/responses/{id}`, the legacy `GET
-/api/responses/{id}`, MCP `query_responses`, `GET /api/v1/executions/{id}/responses`) are capped by
-row count only, at most 1000 rows of up to 2 MiB per field, and the execution visualization route
-and the dashboard results fragment and scan page read up to 10,000 rows with no byte bound; this
-change does not bound their memory.
+afterwards is additional. These named routes are not covered by the byte cap: the plain list
+routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses`,
+`GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
+2 MiB of raw bytes per field, and the execution visualization route and the dashboard results
+fragment and scan page read up to 10,000 rows with no byte bound; this change does not bound their
+memory. Two internal reads also have no byte bound and take their limit from something other than a
+request parameter: the fleet visualization snapshot's collect poll (the number of agents it
+dispatched to, plus 16) and the deployment poll (a fixed 50,000).
 
 **Pool sizing.** An export holds one connection from the server's shared Postgres pool for the
 fetch and the parse. The pool is sized by `--postgres-pool-size` (default 16) and is shared by

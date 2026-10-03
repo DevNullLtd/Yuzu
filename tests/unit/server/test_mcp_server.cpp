@@ -16545,7 +16545,7 @@ TEST_CASE("MCP query_responses: the status and limit rejections carry the docume
     REQUIRE(lim.contains("error"));
     CHECK(lim["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(lim["error"]["message"] ==
-          "limit must be a JSON integer no larger than 9223372036854775807");
+          "limit must be a JSON integer that fits in a signed 64-bit value");
 }
 
 TEST_CASE("MCP query_responses: the strict status and limit boundaries (#4644)",

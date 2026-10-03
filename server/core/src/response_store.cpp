@@ -843,12 +843,14 @@ std::optional<BoundedResponses> ResponseStore::query_bounded(const std::string& 
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             BoundedResponses out;
-            out.result_bytes = PQresultMemorySize(res.get());
             const int n = PQntuples(res.get());
             out.rows.reserve(static_cast<std::size_t>(n));
             for (int i = 0; i < n; ++i)
                 out.rows.push_back(parse_response_row(res.get(), i));
             if (n > 0) {
+                // A zero-row result still carries its column descriptors, so the memory
+                // size is only reported when rows came back (0 otherwise, as documented).
+                out.result_bytes = PQresultMemorySize(res.get());
                 out.row_cap_hit = to_i64(PQgetvalue(res.get(), 0, 12)) > limit;
                 out.byte_cap_hit = to_i64(PQgetvalue(res.get(), 0, 13)) > 0;
             }

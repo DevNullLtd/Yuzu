@@ -6099,7 +6099,8 @@ same enum as the bundle-steps `status` field documented above.
 A caller cannot tell a complete result from a capped one from row count alone. `GET
 /api/v1/responses/{id}` sets `pagination.result_truncated_by_cap: true` when the served row count
 equals `limit`, matching MCP `query_responses`' own `hit_cap` convention (it can be set when the
-result is exactly `limit` rows long). The two export routes signal **exactly**: they report a cut
+result is exactly `limit` rows long). `GET /api/v1/executions/{id}/responses` clamps `limit` to
+1000 silently and carries no such flag at all. The two export routes signal **exactly**: they report a cut
 only when matching rows were actually left out, by the row cap or the byte cap below. There is no
 cursor on these routes and `offset` is rejected (see above), so to read past a cap either pull once
 per `agent_id`, or move the window with `until` set to the oldest `timestamp` you received. `until`
@@ -6111,25 +6112,32 @@ a different order on each call; the export routes order ties by `id` descending.
 **Export body size cap (#4703).** Both export routes (this family's `GET /api/v1/responses/{id}/export`
 and the legacy `GET /api/responses/{id}/export`) also stop once the rows served carry 50 MiB of
 payload (`output` plus `error_detail`, as stored), on top of the row-count cap: each response's
-`output`/`error_detail` is capped at only 2 MiB at ingest, so a row-count cap alone still let a
+`output`/`error_detail` is cut to only 2 MiB of raw bytes at ingest, so a row-count cap alone still let a
 10,000-row export serialize to tens of GB. The cut is made **inside the store query**: the database
 keeps rows while the payload of the rows before them is under the cap, so the fetch holds about 50
 MiB of payload plus one final row, not every row up to `limit`. The cap is on whole rows, so the
-last row kept can run past it by up to its own size (each of `output` and `error_detail` is capped
-at 2 MiB at ingest, so about 4 MiB), and at least one row is always served, so a single row larger
-than the cap is still returned. A second check while serializing counts the escaped row bytes (CSV
-quoting and JSON framing make the serialized row larger than its raw payload, and it excludes
-commas, the JSON envelope and the legacy route's pretty-print whitespace), so the body is
-approximately, not exactly, bounded, and a result under 50 MiB of raw payload can still be cut and
-flagged `byte_cap` when its escaped form crosses the cap. One measurement, 400 rows of 512 KiB:
+last row kept can run past it by up to its own size. Each of `output` and `error_detail` is cut to
+2 MiB of raw bytes at ingest, and only afterwards is each invalid byte or NUL replaced by the 3-byte
+U+FFFD, so a row is about 4 MiB for text output and can reach about 12 MiB for output dense in
+invalid bytes or NULs. At least one row is always served, so a single row larger than the cap is
+still returned. A second check while serializing counts what each format builds (CSV quoting and
+JSON framing make the serialized row larger than its raw payload): for JSON it is the serialized
+size of each row object, which excludes the commas between rows, the envelope and the legacy
+route's pretty-print whitespace; for CSV it is the whole body so far, header, quoting and commas
+included. So the body is approximately, not exactly, bounded, and a result under 50 MiB of raw
+payload can still be cut and flagged `byte_cap` when its escaped form crosses the cap. One measurement, 400 rows of 512 KiB:
 the store query's peak resident memory rose by 99 MiB with this bounded fetch, against 398 MiB
 with the unbounded `query()` fetch; other row shapes were not measured, and the serialized body
-built afterwards is additional. What this does **not** bound: the plain list routes (`GET
-/api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses` and `GET
-/api/v1/executions/{id}/responses`) are capped by row count only (at most 1000 rows of up to 2
-MiB per field); the execution visualization route and the two dashboard result fetches (the
-results fragment and the scan page) read up to 10,000 rows through the same unbounded `query()`
-and are not covered by this change either. The cap is not operator-tunable.
+built afterwards is additional. These named routes are **not** covered by the byte cap: the plain
+list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
+`query_responses` and `GET /api/v1/executions/{id}/responses`) are capped by row count only (at
+most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth described above);
+the execution visualization route and the two dashboard result fetches (the results fragment and
+the scan page) read up to 10,000 rows through the same unbounded `query()`. Two internal reads
+also bypass it and take their limit from something other than a request parameter: the fleet
+visualization snapshot's collect poll sizes it from the number of agents it dispatched to
+(`dispatched.size() + 16`), and the deployment poll uses a fixed 50,000. The cap is not
+operator-tunable.
 
 **Detecting a cut export.** A cut is marked on both export routes and both formats. JSON carries
 `pagination.result_truncated_by_cap: true` (v1) or a top-level `result_truncated_by_cap: true`
@@ -6138,10 +6146,15 @@ every consumer: after the data rows, one extra record whose first field is `# re
 cause=row_cap` (or `cause=byte_cap`) padded with empty fields to the width of the header (7 columns
 on the legacy route, 10 on v1). A strict CSV parser that expects a number in the `id` column fails
 on it; that is the intent, since a cut file must not be read as complete. An uncut export never has
-it and is byte-identical to an export without the feature. Both formats also set two out-of-body
+it and is byte-identical to an export without the feature. A quoted cell can legitimately contain
+text that looks like the trailer (agent output is arbitrary), so parse the file as CSV and read the
+**final record**; do not regex-match lines. Both formats also set two out-of-body
 signals: an `X-Result-Truncated-By-Cap: true` response header (CSV only; the JSON formats carry the
 field instead) and a download name of `responses-<id>-truncated.json` or `.csv` instead of
-`responses-<id>.json` or `.csv` in `Content-Disposition`. Those two are lost by a plain
+`responses-<id>.json` or `.csv` in `Content-Disposition`. Any character of `<id>` outside
+`[A-Za-z0-9._-]` is written as `_` there (only the legacy route's id pattern, `[^/]+`, can carry
+one; the v1 routes admit `[A-Za-z0-9_-]` only), so a legacy export of an id such as `cmd:1` is
+downloaded as `responses-cmd_1.csv`. Those two are lost by a plain
 `curl -o out.csv ...`, which names the file itself and discards the headers; `curl -sS -D - -o out.csv
 ...` prints the headers alongside the file, and `curl -OJ` keeps the server's file name. A body that
 merely ends on the row that crosses the cap is not truncated. Each cut also increments
@@ -10079,7 +10092,10 @@ Convert a JSON result set to CSV format for download.
 
 #### `GET /api/responses/{id}`
 
-Get command responses for a specific command ID.
+Get command responses for a specific command ID. An explicit `limit` is capped at 1000; when the
+caller asked for more than 1000 and the page came back full, the body carries a top-level
+`result_truncated_by_cap: true` (see "Differences between the v1 and the legacy routes" under
+Command/Instruction Responses).
 
 #### `GET /api/responses/{id}/aggregate`
 

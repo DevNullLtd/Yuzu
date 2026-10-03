@@ -2190,6 +2190,34 @@ TEST_CASE("ResponseStore query_bounded survives a limit of INT_MAX (limit + 1 do
     CHECK_FALSE(r->byte_cap_hit);
 }
 
+TEST_CASE("ResponseStore query_bounded reports result_bytes 0 for a zero-row result",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // A different instruction has rows, so a zero here is the "no rows matched" path and
+    // not an empty store.
+    put_response(store, "cmd-other", "agent-1", 100, 16);
+
+    ResponseQuery q;
+    q.limit = 10;
+    auto none = store.query_bounded("cmd-no-rows", q, std::nullopt, 1 << 20);
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK_FALSE(none->row_cap_hit);
+    CHECK_FALSE(none->byte_cap_hit);
+    // A zero-row libpq result still carries its column descriptors; the field is documented
+    // as 0 when no rows came back, so that is what it must report.
+    CHECK(none->result_bytes == 0);
+
+    // The same call with a matching row reports a non-zero size (the field is live).
+    auto one = store.query_bounded("cmd-other", q, std::nullopt, 1 << 20);
+    REQUIRE(one.has_value());
+    CHECK(one->rows.size() == 1);
+    CHECK(one->result_bytes > 0);
+}
+
 TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks ties by id",
           "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

@@ -71,7 +71,7 @@ filtering and pagination.
 | `status` | integer | Filter by status (integer enum value) |
 | `since` | integer | Only responses after this Unix timestamp |
 | `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default) |
+| `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default). Asking for more than 1000 and getting a full page sets `result_truncated_by_cap` in the envelope |
 | `offset` | integer | Offset for pagination (default 0) |
 
 **Response envelope:**
@@ -82,6 +82,10 @@ filtering and pagination.
   "count": 42
 }
 ```
+
+When the caller asked for more than 1000 rows and the page came back full (exactly 1000 rows), the
+envelope also carries `"result_truncated_by_cap": true`: more rows may exist past the ceiling. The
+field is absent otherwise.
 
 **Example --- fetch all responses for an instruction:**
 
@@ -207,12 +211,16 @@ The CSV format includes the columns:
 
 **A bounded export can be cut.** Besides the row limit, an export stops once the rows served
 carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
-served; the last row kept can run past the cap by up to its own size, about 4 MiB). The cap is not
+served; the last row kept can run past the cap by up to its own size: about 4 MiB for text output,
+up to about 12 MiB for output dense in invalid bytes or NULs, because each field is cut to 2 MiB at
+ingest before invalid bytes and NULs are replaced by the 3-byte U+FFFD). The cap is not
 configurable. A cut export, whether by the row limit with more matching rows left, or by the byte
 cap, is marked, so check for it before trusting a bulk pull: the JSON envelope has a top-level
 `"result_truncated_by_cap": true`, and a CSV file ends with one extra trailer record,
 `# result_truncated_by_cap cause=row_cap` (or `byte_cap`) padded with empty fields to the header's
-width. The trailer is the signal that reaches every consumer. Two out-of-body signals accompany
+width. The trailer is the signal that reaches every consumer. Agent output is arbitrary, so a
+quoted cell can contain text that looks like the trailer: parse the file as CSV and read the final
+record, do not regex-match lines. Two out-of-body signals accompany
 it: a CSV response carries an `X-Result-Truncated-By-Cap: true` header, and the download is named
 `responses-<instruction_id>-truncated.<json|csv>` instead of `responses-<instruction_id>.<json|csv>`.
 A plain `curl -o responses.csv ...` keeps neither (curl picks the file name and drops the headers);

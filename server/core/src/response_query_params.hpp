@@ -130,16 +130,21 @@ inline constexpr int kQueryRowLimitCap = 1000;
 ///   1. in SQL (`ResponseStore::query_bounded`), so the fetch itself -- libpq's
 ///      PGresult and the parsed vector -- holds this much payload plus one final row
 ///      (a row is kept while the rows BEFORE it are under the cap, so the last kept row
-///      can run past it by up to its own size, about 4 MiB: each of the two fields is
-///      capped at 2 MiB at ingest) and never materialises the rest; and
+///      can run past it by up to its own size: about 4 MiB for text output, up to about
+///      12 MiB for output dense in invalid bytes or NULs, because each of the two fields
+///      is cut to 2 MiB at ingest BEFORE invalid bytes and NULs become 3-byte U+FFFD) and
+///      never materialises the rest; and
 ///   2. at serialization (`append_rows_until_byte_cap`) as a backstop, because CSV
 ///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
-/// Both cut on whole rows and always serve at least one row. What this does NOT bound:
-/// the plain list routes (`GET .../responses/{id}`, MCP `query_responses` and
+/// Both cut on whole rows and always serve at least one row. The NAMED routes below are not
+/// bounded by it: the plain list routes (`GET .../responses/{id}`, MCP `query_responses` and
 /// `GET /api/v1/executions/{id}/responses`: each at most 1000 rows, no byte bound), the
 /// execution visualization route (`query()` with a 10,000-row limit), and the dashboard
 /// `/fragments/results` and scan-page fetches (`query()` with limit 10,000); none of
-/// those goes through `query_bounded`.
+/// those goes through `query_bounded`. Two internal reads (server.cpp: the fleet
+/// visualization snapshot's collect poll, limit = dispatched agents + 16, and the
+/// deployment poll, a fixed 50,000) are likewise unbounded by bytes and take their limit
+/// from something other than a request parameter.
 /// A flat constant local to the export surface -- NOT the ingest cap, which bounds a
 /// different thing -- and not operator-tunable. Well above any realistic export (a
 /// 10,000-row export of typical command output is a few MiB).

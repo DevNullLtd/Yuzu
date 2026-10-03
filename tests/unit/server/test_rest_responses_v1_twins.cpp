@@ -682,6 +682,54 @@ TEST_CASE("GET /api/v1/responses/:id/export: the total-byte cap truncates JSON a
           "attachment; filename=\"responses-instr-bytecap.csv\"");
 }
 
+TEST_CASE("GET /api/v1/responses/:id/export: the SERIALIZATION backstop alone flags a byte-cap "
+          "cut when the SQL cut kept every row (#4703)",
+          "[pg][rest][responses][v1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, respv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RespV1Harness h(pool);
+    // Quote-heavy payload: 100 raw bytes per row, but CSV doubles each quote and JSON
+    // escapes each one, so the serialized row is about twice its raw payload.
+    for (int i = 0; i < 2; ++i)
+        h.response_store->store(mk_resp("instr-backstop", "agent-" + std::to_string(i), 1,
+                                        std::string(100, '"'), 100 + i));
+
+    // Cap 150 sits between one row's raw payload (100) and its serialized size (>150).
+    // Precondition, so this test can only pass through the backstop: the SQL cut keeps both
+    // rows (the rows BEFORE the second total 100 < 150) and reports no cut of its own.
+    {
+        ResponseQuery q;
+        q.limit = 10000;
+        auto sql_only = h.response_store->query_bounded("instr-backstop", q, std::nullopt, 150);
+        REQUIRE(sql_only.has_value());
+        REQUIRE(sql_only->rows.size() == 2);
+        REQUIRE_FALSE(sql_only->byte_cap_hit);
+        REQUIRE_FALSE(sql_only->row_cap_hit);
+    }
+
+    yuzu::test::ExportByteCapGuard cap(150);
+
+    auto res_json = h.sink.Get("/api/v1/responses/instr-backstop/export");
+    REQUIRE(res_json);
+    REQUIRE(res_json->status == 200);
+    auto body = nlohmann::json::parse(res_json->body);
+    CHECK(body["data"].size() == 1); // the backstop stopped before the second row
+    REQUIRE(body["pagination"].contains("result_truncated_by_cap"));
+    CHECK(body["pagination"]["result_truncated_by_cap"].get<bool>() == true);
+    CHECK(res_json->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-backstop-truncated.json\"");
+
+    auto res_csv = h.sink.Get("/api/v1/responses/instr-backstop/export?format=csv");
+    REQUIRE(res_csv);
+    REQUIRE(res_csv->status == 200);
+    CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(v1_csv_trailer(res_csv->body) ==
+          "# result_truncated_by_cap cause=byte_cap,,,,,,,,,");
+    CHECK(v1_csv_data_rows(res_csv->body) == 1);
+    CHECK(res_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-backstop-truncated.csv\"");
+}
+
 TEST_CASE("GET /api/v1/responses/:id/export: a ROW-cap cut renames the download and an "
           "exactly-full export does not (#4703 UP-3)",
           "[pg][rest][responses][v1]") {
