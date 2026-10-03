@@ -5,7 +5,8 @@
  *
  * Each `run_<os>` is a READ and returns 0 unconditionally: a degraded read
  * is not a failed command, and the degradation is reported through the CC-07
- * typed status (`mark_result_read`) AND as one in-band `status` row (the
+ * typed status (`mark_result_read`) AND as in-band `status` rows (a summary row, then one per
+ * failing path; the
  * response queries do not return the typed status today). Only the Linux leg
  * reads today; the Windows and macOS legs are PLANNED placeholders that report
  * `mark_result_planned` (UNAVAILABLE, one `status` row) so a host they cannot
@@ -25,7 +26,9 @@
  * status, Sensitivity, Sample, Caveats 3), the planned blocks in
  * test_browser_policy_local_dispatcher.cpp, docs/agent-privilege-model.md's row, the
  * capability matrix row and counts, the capability-map cell, the catalogue header comment,
- * the agent_registry description, and the changelog fragment. The grep is the actual
+ * the agent_registry description, and the changelog fragment. Also the hard-coded `linux:` in
+ * mark_result_read's status_rows_capped token (below) and the `"/etc"` root-failure path in
+ * browser_policy_linux_parsers.hpp -- both are Linux-only today. The grep is the actual
  * completeness check; this list is a starting point, not a closed set.
  */
 #pragma once
@@ -115,8 +118,8 @@ inline void write_rows(yuzu::CommandContext& ctx, const std::vector<std::string>
 ///                            policy set (browser not installed, nothing
 ///                            managed) — no row of any kind is written for it.
 ///   failure_reason set    -> CONSTRAINED/PARTIAL with the (comma-joined,
-///                            `<os>:<detail>`) reason, AND one in-band
-///                            `status|...|constrained|...|<reason>` row: some
+///                            `<os>:<detail>`) reason, AND an in-band summary
+///                            `status|...|constrained|-|<reason>` row followed by per-path rows (below): some
 ///                            root, directory, file or value could not be read
 ///                            or decoded, so the rows are a lower bound, never
 ///                            proof of absence.

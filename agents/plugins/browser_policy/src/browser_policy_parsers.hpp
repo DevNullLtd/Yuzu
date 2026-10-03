@@ -62,8 +62,9 @@
  * OUTCOME, IN BAND. A host with no managed policy (browser not installed, no
  * policy files) reports ZERO rows and a clean OK status — an absent policy set
  * is a complete answer, so no placeholder row is written for it. Every other
- * outcome is reported twice: through the typed result status (CC-07) AND as ONE
- * `status` row (format_status_row, written first by the legs.hpp seams): a read
+ * outcome is reported twice: through the typed result status (CC-07) AND as `status` rows
+ * (format_status_row, written first by the legs.hpp seams: a summary row, then one per failing
+ * path for a constrained read): a read
  * that could not be completed is `constrained` with the failure tokens, a
  * PLANNED leg or a leg that threw is `unavailable`. The row exists because the
  * server's response queries (REST, MCP, the dashboard) do not return the typed
@@ -374,7 +375,7 @@ struct PathFailure {
 /// `linux:status_rows_capped`.
 inline constexpr std::size_t kMaxPathFailureRows = 64;
 
-/// The ONE in-band outcome row, nine fields wide like a policy row so the
+/// The in-band outcome row (summary, or one per failing path), nine fields wide like a policy row so the
 /// definition's columns line up:
 ///
 ///   status|-|-|-|policies|-|<state>|<source>|<reason>

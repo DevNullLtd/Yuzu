@@ -93,7 +93,7 @@ Every row is pipe-delimited; field 0 is the row kind and the first row is always
 | `CONSTRAINED` | partial | `linux:rpm_repo:planned` | `/etc/yum.repos.d` has entries and the rpm/dnf `.repo` family is not read (caveat 3); the apt rows that were read are still emitted |
 | `UNAVAILABLE` | unknown | `windows:planned` | Windows: one `status\|sources\|unsupported\|windows:planned` row (caveat 4) |
 | `UNAVAILABLE` | unknown | `macos:planned` | macOS: one `status\|sources\|unsupported\|macos:planned` row (caveat 4) |
-| `UNAVAILABLE` | unknown | `windows:leg:exception:<category>` / `linux:leg:exception:<category>` / `macos:leg:exception:<category>`, `<category>` one of `bad_alloc`, `std_exception`, `unknown` (the exception text is deliberately never carried) | a leg threw: one `status\|sources\|unsupported\|<os>:leg:exception:<category>` row, reported instead of unwinding across the plugin boundary |
+| `UNAVAILABLE` | unknown | `windows:leg:exception:<category>` / `linux:leg:exception:<category>` / `macos:leg:exception:<category>`, `<category>` one of `bad_alloc`, `std_exception`, `unknown` (the exception text is deliberately never carried) | a leg threw: one `status\|sources\|unsupported\|<os>:leg:exception:<category>` row, reported instead of unwinding across the plugin boundary. Under sustained allocation failure the category suffix can be lost, leaving the bare `<os>:leg:exception`, and the row itself may not be written; the typed status (or a non-zero rc) still reaches the host. |
 
 ### Reading a constrained result
 
@@ -109,7 +109,7 @@ A token names the source family (`apt_sources`, `apt_keyring` or `rpm_repo`), no
 | `short_read`, `modified_during_read` | the file changed while it was read | run the action again |
 | `invalid_bytes` | a NUL or non-UTF-8 byte in a reported field after redaction was replaced with `?` | fix the file; the affected field shows `?` |
 | `planned` (`linux:rpm_repo:planned`) | `/etc/yum.repos.d` has entries and the rpm/dnf family is not read yet | none; every rpm-family host reports this until that leg exists |
-| `<os>:leg:exception:<category>` | the leg threw (`bad_alloc`, `std_exception` or `unknown`); the row is `unsupported` | report it; nothing was read |
+| `<os>:leg:exception:<category>` | the leg threw (`bad_alloc`, `std_exception` or `unknown`); the row is `unsupported`; the bare `<os>:leg:exception` means the category could not be appended under allocation failure | report it; nothing was read |
 | `unparsed_entry` | an entry apt itself would reject (an unterminated `[`, a missing suite) | fix the entry |
 | `open_failed`, `read_failed`, `dir_open_failed`, `io_error`, `enumeration_error` | the OS refused or failed an operation | check the path and the host's storage |
 

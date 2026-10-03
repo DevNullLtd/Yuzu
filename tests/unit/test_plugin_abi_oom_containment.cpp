@@ -127,6 +127,12 @@ TEST_CASE("browser_policy run_guarded contains a leg that throws under sustained
         CHECK(g_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     }
     check_provenance_is_legal();
+#if defined(_LIBCPP_VERSION)
+    // The 19-byte bare prefix fits libc++'s 22-byte SSO, so the SDK's std::string copy
+    // cannot throw and the typed status MUST land with exactly the bare prefix.
+    REQUIRE(g_status_calls == 1);
+    CHECK(std::string_view{g_provenance} == kPrefix);
+#endif
 }
 
 TEST_CASE("update_source_trust execute_sources contains a leg that throws under sustained OOM",
@@ -147,4 +153,10 @@ TEST_CASE("update_source_trust execute_sources contains a leg that throws under 
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
     check_provenance_is_legal();
+#if defined(_LIBCPP_VERSION)
+    // The 19-byte bare prefix fits libc++'s 22-byte SSO, so the SDK's std::string copy
+    // cannot throw and the typed status MUST land with exactly the bare prefix.
+    REQUIRE(g_status_calls == 1);
+    CHECK(std::string_view{g_provenance} == kPrefix);
+#endif
 }

@@ -56,6 +56,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <fstream>
 #include <iterator>
@@ -739,13 +740,15 @@ TEST_CASE("injected ops: walk flags surface as enumeration_error and entry_cap",
 TEST_CASE("input budget: a walk past the budget records input_cap and stops",
           "[update_source_trust][walk][input_cap]") {
     g_inj = Inject{};
-    // sources.list is 2477 bytes (10 rows) and debian.sources 443: the second read
-    // crosses 2500, so its rows and every later file are dropped.
-    const auto w = walk_injected(2500);
+    // The second read crosses the limit (the first file's size plus one byte), so its
+    // rows and every later file are dropped.
+    const auto sl = fs::file_size(fixture_dir() / "ubuntu-2204/etc/apt/sources.list");
+    const auto ds = fs::file_size(fixture_dir() / "debian-bookworm/etc/apt/sources.list.d/debian.sources");
+    const auto w = walk_injected(sl + 1);
     // MUTATION: never charging the budget removes the token and restores all 17 rows.
     CHECK(w.acc.reason() == "linux:apt_sources:input_cap");
-    CHECK(w.rows.size() == 10);
-    CHECK(w.budget.used == 2477 + 443);
+    CHECK(w.rows.size() == 10); // sources.list's rows only
+    CHECK(w.budget.used == sl + ds);
     for (const auto& r : w.rows)
         CHECK(r.rfind("apt_keyring|", 0) == std::string::npos);
 }
@@ -763,6 +766,89 @@ TEST_CASE("input budget: bytes of FAILED reads are charged (a run of failing fil
     CHECK(w.acc.reason() == "linux:apt_sources:read_failed,linux:apt_sources:input_cap");
     CHECK(w.budget.used == 144);
     CHECK(w.rows.empty());
+}
+
+TEST_CASE("input budget: the production 16 MiB budget stops the walk at the first keyring read",
+          "[update_source_trust][walk][input_cap][seam]") {
+    // Real I/O through run_linux_at (default PosixOps, fresh default budget): fifteen
+    // hardlinks of one 1 MiB comment-only file (zero rows) plus two 4-byte keyrings.
+    yuzu::test::TempDir dir{"yuzu_test_update_source_trust_linux_"};
+    const fs::path d = dir.path / "etc" / "apt";
+    fs::create_directories(d / "sources.list.d");
+    fs::create_directories(d / "trusted.gpg.d");
+    const std::string pgp("\x99\x01\x0d\x04", 4);
+    const auto put = [](const fs::path& p, const std::string& body) {
+        std::ofstream(p, std::ios::binary) << body;
+    };
+    put(d / "sources.list.d" / "a00.list", std::string(lnx::pio::kMaxFileBytes, '#'));
+    const auto link = [&](int i) {
+        fs::create_hard_link(d / "sources.list.d" / "a00.list",
+                             d / "sources.list.d" / std::format("a{:02}.list", i));
+    };
+    for (int i = 1; i < 15; ++i)
+        link(i);
+    put(d / "trusted.gpg", pgp);
+    put(d / "trusted.gpg.d" / "x.gpg", pgp);
+
+    const auto count = [](const std::vector<std::string>& rows, std::string_view kind) {
+        return std::count_if(rows.begin(), rows.end(),
+                             [&](const std::string& r) { return r.rfind(kind, 0) == 0; });
+    };
+    // 15 MiB + two heads: within the budget, every row present.
+    {
+        const auto result = run_leg(dir.path);
+        const auto rows = captured_rows(result.captured);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_OK);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+        CHECK(result.result_provenance.empty());
+        CHECK(count(rows, "apt_keyring|") == 2);
+        CHECK(count(rows, "apt_source|") == 0);
+    }
+    // The 16th link lands EXACTLY on kMaxInputBytes (`used > max` is still false), so
+    // the 4-byte trusted.gpg head is the read that crosses. The symlink is the
+    // sentinel: visited only if the walk wrongly continued into trusted.gpg.d, where
+    // it would add symlink_refused to the provenance.
+    // MUTATION: a changed constant, a `>=` flip, a default-budget wiring change or
+    // add_keyring_file ignoring Outcome::input_cap fails one of the two runs.
+    link(15);
+    fs::create_symlink("nowhere", d / "trusted.gpg.d" / "y.gpg");
+    {
+        const auto result = run_leg(dir.path);
+        const auto rows = captured_rows(result.captured);
+        CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+        CHECK(result.result_provenance == "linux:apt_keyring:input_cap");
+        CHECK(count(rows, "apt_keyring|") == 0);
+        CHECK(count(rows, "apt_source|") == 0);
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows[0] == "status|sources|constrained|linux:apt_keyring:input_cap");
+    }
+}
+
+TEST_CASE("walk: a replaced byte inside redacted userinfo does not set invalid_bytes; one after the '@' does",
+          "[update_source_trust][walk][wire]") {
+    yuzu::test::TempDir dir{"yuzu_test_update_source_trust_linux_"};
+    const fs::path f = dir.path / "etc" / "apt" / "sources.list";
+    fs::create_directories(f.parent_path());
+    const auto walk = [&](const std::string& line, yuzu::shared::ConstraintAccumulator& acc) {
+        std::ofstream(f, std::ios::binary | std::ios::trunc) << line;
+        lnx::pio::InputBudget budget;
+        return lnx::linux_rows_at(dir.path, acc, budget);
+    };
+    {
+        yuzu::shared::ConstraintAccumulator acc;
+        const auto rows = walk("deb http://user:pa\xff" "ss@host.example/debian bookworm main\n", acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].find("http://REDACTED@host.example/debian") != std::string::npos);
+        CHECK(rows[0].find('?') == std::string::npos);
+        CHECK_FALSE(acc.any_failure());
+    }
+    {
+        yuzu::shared::ConstraintAccumulator acc;
+        const auto rows = walk("deb http://user:pass@host\xff.example/debian bookworm main\n", acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(acc.reason() == "linux:apt_sources:invalid_bytes");
+    }
 }
 
 #endif // !defined(_WIN32)

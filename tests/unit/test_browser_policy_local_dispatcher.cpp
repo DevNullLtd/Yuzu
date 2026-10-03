@@ -776,6 +776,9 @@ TEST_CASE("browser_policy plugin: run_guarded contains an exception that is not 
     CHECK(result.rc == 1);
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_provenance == std::string{bp::kExceptionToken} + ":unknown");
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == expected_status_row("unavailable", result.result_provenance));
 }
 
 // MUTATION: drop the bad_alloc arm of exception_category() -> it reads `std_exception`.

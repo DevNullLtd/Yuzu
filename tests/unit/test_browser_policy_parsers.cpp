@@ -71,7 +71,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -1207,9 +1207,8 @@ TEST_CASE("browser_policy linux leg: per-path status rows are capped, and the su
     yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_pathcap_"};
     const auto write_bad = [&](std::size_t count) {
         for (std::size_t i = 0; i < count; ++i) {
-            char name[32];
-            std::snprintf(name, sizeof name, "bad_%03zu.json", i);
-            write_file(dir.path, std::string{"etc/opt/chrome/policies/managed/"} + name, "{ nope");
+            write_file(dir.path, std::format("etc/opt/chrome/policies/managed/bad_{:03}.json", i),
+                       "{ nope");
         }
     };
     write_bad(kMaxPathFailureRows); // exactly the cap: every file is named, nothing is dropped
@@ -1238,10 +1237,12 @@ TEST_CASE("browser_policy linux: an unreadable policy directory is constrained, 
     PermRestore restore{locked};
     REQUIRE(::chmod(locked.c_str(), 0000) == 0);
 
-    std::string reason;
-    const auto rows = lnx::linux_policy_rows_at(dir.path, reason);
+    const auto run = run_leg(dir.path);
+    const auto& rows = run.rows;
     // Listing the locked directory must fail loudly, not read as "no policy".
-    CHECK(reason.find("linux:permission_denied") != std::string::npos);
+    CHECK(run.provenance.find("linux:permission_denied") != std::string::npos);
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed|linux:permission_denied");
     CHECK(count_prefix(rows, "policy|chrome|mandatory|") == 0);
     // The other directories still read.
     CHECK(count_prefix(rows, "policy|chrome|recommended|") == 2);
@@ -1503,6 +1504,8 @@ TEST_CASE("browser_policy linux leg: the row cap is reported, and exactly-at-cap
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:row_cap");
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/b.json|linux:row_cap");
 
     // The cap is per leg, not per file: it also stops the next vendor/level.
     write_file(dir.path, "etc/opt/edge/policies/managed/e.json", R"({"E": 5})");
@@ -1532,6 +1535,8 @@ TEST_CASE("browser_policy linux leg: a truncated directory listing is reported, 
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:entry_cap"); // the per-directory bound, not the per-leg row cap
+    REQUIRE(run.path_rows.size() == 1); // attributed to the level directory, not a file
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed|linux:entry_cap");
 }
 
 TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",
@@ -1551,6 +1556,8 @@ TEST_CASE("browser_policy linux leg: the file-size cap is exact and reported",
     CHECK(run.rows.empty());
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.provenance == "linux:oversized");
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/a.json|linux:oversized");
 }
 
 TEST_CASE("browser_policy linux leg: the total read budget is exact and reported",
@@ -1579,6 +1586,8 @@ TEST_CASE("browser_policy linux leg: the total read budget is exact and reported
     CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(run.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(run.provenance == "linux:byte_cap"); // the run-wide read bound, not the per-file cap
+    REQUIRE(run.path_rows.size() == 1);
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/c.json|linux:byte_cap");
 }
 
 TEST_CASE("browser_policy linux leg: a cap stops the walk, so a later sibling adds no failure token",
@@ -1640,10 +1649,12 @@ TEST_CASE("browser_policy linux leg: a root that is not a directory is constrain
           "[browser_policy][linux][tree]") {
     yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_fileroot_"};
     write_file(dir.path, "iamafile", "x");
-    std::string reason;
-    const auto rows = lnx::linux_policy_rows_at(dir.path / "iamafile", reason);
-    CHECK(rows.empty());
-    CHECK(reason == "linux:not_a_directory");
+    const fs::path root = dir.path / "iamafile";
+    const auto run = run_leg(root);
+    CHECK(run.rows.empty());
+    CHECK(run.provenance == "linux:not_a_directory");
+    REQUIRE(run.path_rows.size() == 1); // the root itself is never shown: the logical /etc
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|/etc|linux:not_a_directory");
 }
 
 TEST_CASE("browser_policy linux leg: the README's statements about Chromium's looser reader hold",

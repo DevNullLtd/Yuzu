@@ -9,7 +9,11 @@
 // `what()` is deliberately NOT carried: it is unbounded, untrusted text (it can embed a file
 // name, a path or attacker-influenced bytes) and must not travel on the wire.
 //
-// Consumers: browser_policy (run_guarded), update_source_trust, later plugins.
+// Consumers: browser_policy (run_guarded) and update_source_trust (execute_sources). #4877's fleet-wide
+// question is answered PLUGIN-LOCAL for now: the other plugins that guard their whole execute body
+// (firmware_posture, execution_artifacts, platform_security, app_control, autoruns, hardware,
+// installed_apps, ...) keep their own fixed tokens; adopting the category there is one PR per plugin
+// (its README result-status table and provenance literals change), tracked as a follow-up.
 //
 // Platform-agnostic pure C++, no OS call, no I/O.
 #pragma once

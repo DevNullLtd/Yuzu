@@ -251,7 +251,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`windows:leg:exception:<category>` / `macos:leg:exception:<category>` / `linux:leg:exception:<category>`, `<category>` one of `bad_alloc`, `std_exception`, `unknown` (the exception text is deliberately never carried)",
       "status": "`UNAVAILABLE`",
-      "when": "a leg threw; reported (with one `unavailable` `status` row) instead of unwinding across the plugin boundary"
+      "when": "a leg threw; reported (with one `unavailable` `status` row) instead of unwinding across the plugin boundary. Under sustained allocation failure the category suffix can be lost, leaving the bare `<os>:leg:exception`, and the row itself may not be written; the typed status (or rc 1) still reaches the host."
     }
   ],
   "samples": {
