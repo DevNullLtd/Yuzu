@@ -34,6 +34,9 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <exception_category.hpp> // yuzu::shared::exception_category
+
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,8 +47,8 @@ int run_windows(yuzu::CommandContext& ctx);
 int run_linux(yuzu::CommandContext& ctx);
 int run_macos(yuzu::CommandContext& ctx);
 
-/// Reason literal for an exception that escaped a leg (never crosses the
-/// plugin ABI: run_guarded, below, catches it and reports it through this token).
+/// Reason PREFIX for an exception that escaped a leg (never crosses the plugin ABI:
+/// run_guarded, below, catches it and reports `<prefix>:<bad_alloc|std_exception|unknown>`).
 #if defined(_WIN32)
 inline constexpr std::string_view kExceptionToken = "windows:leg:exception";
 #elif defined(__APPLE__)
@@ -69,6 +72,15 @@ template <typename Leg>
     try {
         return leg(ctx);
     } catch (...) {
+        // exception_category() is noexcept, but the string build can throw on allocation
+        // failure: a failed build falls back to the bare prefix.
+        std::string token;
+        try {
+            token.reserve(kExceptionToken.size() + 14);
+            token.append(kExceptionToken).append(1, ':').append(yuzu::shared::exception_category());
+        } catch (...) {
+            token.assign(kExceptionToken); // SSO-sized in practice; best effort
+        }
         // Each report is its own guard: building or writing the row, and the typed status
         // itself (the SDK copies the provenance into a std::string), can each throw on an
         // allocation failure, and none may let a second exception cross the plugin ABI. If the
@@ -77,12 +89,12 @@ template <typename Leg>
         // write_output) therefore leaves an `unavailable` row behind its own output: "written
         // first, at most one" holds for every outcome except that one.
         try {
-            ctx.write_output(format_status_row(kStateUnavailable, kExceptionToken));
+            ctx.write_output(format_status_row(kStateUnavailable, token));
         } catch (...) {
         }
         try {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, kExceptionToken);
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, token);
         } catch (...) {
         }
         return 1;
@@ -107,11 +119,23 @@ inline void write_rows(yuzu::CommandContext& ctx, const std::vector<std::string>
 ///                            root, directory, file or value could not be read
 ///                            or decoded, so the rows are a lower bound, never
 ///                            proof of absence.
-inline void mark_result_read(yuzu::CommandContext& ctx, std::string_view failure_reason) {
+/// `per_path` names WHICH file/directory each failure token belongs to: after the summary
+/// row, up to kMaxPathFailureRows rows `status|-|-|-|policies|-|constrained|<logical_path>|
+/// <token>` follow. When more were recorded the summary reason gains `linux:status_rows_capped`
+/// (typed status and summary row alike).
+inline void mark_result_read(yuzu::CommandContext& ctx, std::string_view failure_reason,
+                             std::span<const PathFailure> per_path = {}) {
     if (!failure_reason.empty()) {
-        ctx.write_output(format_status_row(kStateConstrained, failure_reason));
+        const bool capped = per_path.size() > kMaxPathFailureRows;
+        std::string reason{failure_reason};
+        if (capped)
+            reason += ",linux:status_rows_capped";
+        ctx.write_output(format_status_row(kStateConstrained, reason));
+        for (std::size_t i = 0; i < per_path.size() && i < kMaxPathFailureRows; ++i)
+            ctx.write_output(format_status_row(kStateConstrained, per_path[i].token,
+                                               per_path[i].logical_path));
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              failure_reason);
+                              reason);
         return;
     }
     ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");

@@ -364,10 +364,22 @@ inline constexpr std::string_view kActionName = "policies";
 inline constexpr std::string_view kStateConstrained = "constrained";
 inline constexpr std::string_view kStateUnavailable = "unavailable";
 
+/// One failure attributed to the logical file or directory it happened at (never an injected
+/// test root); mark_result_read turns each into a per-path `status` row.
+struct PathFailure {
+    std::string logical_path;
+    std::string token;
+};
+/// Per-path status rows written per read; past this the summary reason gains
+/// `linux:status_rows_capped`.
+inline constexpr std::size_t kMaxPathFailureRows = 64;
+
 /// The ONE in-band outcome row, nine fields wide like a policy row so the
 /// definition's columns line up:
 ///
-///   status|-|-|-|policies|-|<state>|-|<reason>
+///   status|-|-|-|policies|-|<state>|<source>|<reason>
+///
+/// `source` is "-" on the summary row and the logical path on a per-path row.
 ///
 /// `state` is `constrained` (a read that could not be completed) or
 /// `unavailable` (a planned leg, or a leg that threw); `reason` is the same
@@ -375,14 +387,17 @@ inline constexpr std::string_view kStateUnavailable = "unavailable";
 /// provenance. Only ever written when the outcome is NOT a complete read (see
 /// the header note). The result never contains a NUL byte.
 [[nodiscard]] inline std::string format_status_row(std::string_view state,
-                                                   std::string_view reason) {
+                                                   std::string_view reason,
+                                                   std::string_view source = "-") {
     detail::WireFlags flags;
     std::string out{kStatusRowTag};
     out += "|-|-|-|";
     out += kActionName;
     out += "|-|";
     out += detail::wire_field(state, flags);
-    out += "|-|";
+    out += '|';
+    out += detail::wire_field(source, flags);
+    out += '|';
     out += detail::wire_field(reason, flags);
     return out;
 }

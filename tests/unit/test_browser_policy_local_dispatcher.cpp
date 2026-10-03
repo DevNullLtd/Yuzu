@@ -62,6 +62,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <istream>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -196,8 +197,15 @@ std::vector<std::string> check_outcome_rows(const yuzu::agent::LocalDispatcher::
         CHECK(is_status_row(all_rows.front())); // the outcome leads the stream
     }
     if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
-        REQUIRE(status_rows.size() == 1);
+        // The summary row, then one per-path row for each file/directory that failed.
+        REQUIRE(!status_rows.empty());
         CHECK(status_rows[0] == expected_status_row("constrained", result.result_provenance));
+        for (std::size_t i = 1; i < status_rows.size(); ++i) {
+            const auto fields = split_fields_escape_aware(status_rows[i]);
+            REQUIRE(fields.size() == kPolicyFieldCount);
+            CHECK(fields[6] == "constrained");
+            CHECK(fields[7].rfind("/etc/", 0) == 0); // a logical path, never "-" or a test root
+        }
     } else if (result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE) {
         REQUIRE(status_rows.size() == 1);
         CHECK(status_rows[0] == expected_status_row("unavailable", result.result_provenance));
@@ -730,16 +738,17 @@ TEST_CASE("browser_policy plugin: an exception inside a leg is reported as UNAVA
     CHECK(result.rc == 1);
     const auto rows = captured_rows(result.captured);
     REQUIRE(rows.size() == 1); // no policy row, exactly the one in-band outcome row
-    CHECK(rows[0] == expected_status_row("unavailable", bp::kExceptionToken));
+    const std::string expected = std::string{bp::kExceptionToken} + ":std_exception";
+    CHECK(rows[0] == expected_status_row("unavailable", expected));
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    CHECK(result.result_provenance == std::string{bp::kExceptionToken});
+    CHECK(result.result_provenance == expected);
 #if defined(_WIN32)
-    CHECK(result.result_provenance == "windows:leg:exception");
+    CHECK(result.result_provenance == "windows:leg:exception:std_exception");
 #elif defined(__APPLE__)
-    CHECK(result.result_provenance == "macos:leg:exception");
+    CHECK(result.result_provenance == "macos:leg:exception:std_exception");
 #else
-    CHECK(result.result_provenance == "linux:leg:exception");
+    CHECK(result.result_provenance == "linux:leg:exception:std_exception");
 #endif
 }
 
@@ -751,6 +760,11 @@ int throwing_non_std_execute(YuzuCommandContext* raw, const char* /*action*/,
     yuzu::CommandContext ctx{raw};
     return bp::run_guarded(ctx, [](yuzu::CommandContext&) -> int { throw 42; });
 }
+int throwing_bad_alloc_execute(YuzuCommandContext* raw, const char* /*action*/,
+                               const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    return bp::run_guarded(ctx, [](yuzu::CommandContext&) -> int { throw std::bad_alloc{}; });
+}
 } // namespace
 
 TEST_CASE("browser_policy plugin: run_guarded contains an exception that is not a std::exception",
@@ -761,7 +775,22 @@ TEST_CASE("browser_policy plugin: run_guarded contains an exception that is not 
     const auto result = dispatcher.run(&descriptor, "policies");
     CHECK(result.rc == 1);
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-    CHECK(result.result_provenance == std::string{bp::kExceptionToken});
+    CHECK(result.result_provenance == std::string{bp::kExceptionToken} + ":unknown");
+}
+
+// MUTATION: drop the bad_alloc arm of exception_category() -> it reads `std_exception`.
+TEST_CASE("browser_policy plugin: run_guarded names an allocation failure as bad_alloc",
+          "[browser_policy][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &throwing_bad_alloc_execute;
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, "policies");
+    CHECK(result.rc == 1);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_provenance == std::string{bp::kExceptionToken} + ":bad_alloc");
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == expected_status_row("unavailable", result.result_provenance));
 }
 
 // The production root binding, pinned as source. run_linux is ONE line, `return

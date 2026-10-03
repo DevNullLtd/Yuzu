@@ -71,6 +71,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <type_traits>
@@ -608,6 +609,24 @@ TEST_CASE("browser_policy: the status row is nine fields, escapes its reason, an
           "status|-|-|-|policies|-|constrained|-|linux:permission_denied,linux:json_unparseable");
     CHECK(split_fields(constrained).size() == 9);
 
+    // Field 7 is the source: "-" on a summary row, the logical path on a per-path row.
+    const auto per_path = format_status_row(
+        kStateConstrained, "linux:json_unparseable", "/etc/opt/chrome/policies/managed/a.json");
+    CHECK(per_path == "status|-|-|-|policies|-|constrained|/etc/opt/chrome/policies/managed/a.json|"
+                      "linux:json_unparseable");
+    CHECK(split_fields(per_path).size() == 9);
+
+    // The source goes through the same wire escaper as every free-text field: a pipe in a file
+    // name cannot shift the field count, and a source past the 64 KiB cap is cut, never wider.
+    const auto piped = format_status_row(kStateConstrained, "linux:oversized", "/etc/a|b.json");
+    CHECK(split_fields(piped).size() == 9);
+    CHECK(piped.find("a\\|b.json") != std::string::npos);
+    const auto huge = format_status_row(kStateConstrained, "linux:oversized",
+                                        std::string(kMaxFieldBytes * 2, '|'));
+    CHECK(split_fields(huge).size() == 9);
+    CHECK(huge.size() < 2 * kMaxFieldBytes + 1024);
+    CHECK(survives_transport(huge));
+
     // The reason is a token list today, but the formatter still owns the wire grammar: a pipe,
     // a NUL or a bad byte in it can neither shift the field count nor truncate the row.
     const auto hostile = format_status_row(kStateConstrained, std::string("a|b\0\xFF", 5));
@@ -969,7 +988,8 @@ constexpr std::string_view kChromeManaged = "/etc/opt/chrome/policies/managed/ch
 struct LegRun {
     int rc = -1;
     std::vector<std::string> rows;  // the `policy|` rows only
-    std::string status_row;         // the in-band `status|` row, or "" when the read completed
+    std::string status_row;         // the in-band summary `status|` row, or "" when the read completed
+    std::vector<std::string> path_rows; // the per-path `status|` rows that follow it
     YuzuResultStatus status = YUZU_RESULT_STATUS_UNDECLARED;
     YuzuResultCompleteness completeness = YUZU_RESULT_COMPLETENESS_UNKNOWN;
     std::string provenance;
@@ -1006,9 +1026,12 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
         if (line.empty())
             continue;
         if (line.rfind("status|", 0) == 0) {
-            CHECK(out.status_row.empty()); // one outcome row per leg run in this file
-            out.status_row = line;
-            status_row_first = first_line;
+            if (out.status_row.empty()) { // the first status row is the summary
+                out.status_row = line;
+                status_row_first = first_line;
+            } else {
+                out.path_rows.push_back(line); // per-path rows follow the summary
+            }
         } else {
             out.rows.push_back(line);
         }
@@ -1026,6 +1049,7 @@ LegRun run_leg(const fs::path& root, const WalkLimits& limits = {}) {
         CHECK(out.status_row == "status|-|-|-|policies|-|constrained|-|" + out.provenance);
     } else {
         CHECK(out.status_row.empty());
+        CHECK(out.path_rows.empty());
     }
     return out;
 }
@@ -1157,6 +1181,47 @@ TEST_CASE("browser_policy linux: malformed JSON is constrained and never hides i
     const auto none = lnx::linux_policy_rows_at(only_bad.path, reason);
     CHECK(none.empty());
     CHECK(reason == "linux:json_unparseable");
+}
+
+TEST_CASE("browser_policy linux leg: a failing file gets one per-path status row, after the summary",
+          "[browser_policy][linux][tree]") {
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_perpath_"};
+    write_file(dir.path, "etc/opt/chrome/policies/managed/a_good.json", R"({"ShowHomeButton": true})");
+    write_file(dir.path, "etc/opt/chrome/policies/managed/b_bad.json", "{ nope");
+    write_file(dir.path, "etc/opt/chrome/policies/managed/c_good.json", R"({"HomepageIsNewTabPage": false})");
+    const auto run = run_leg(dir.path);
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(run.rows.size() == 2); // both siblings' policy rows stand
+    CHECK(run.status_row == "status|-|-|-|policies|-|constrained|-|linux:json_unparseable");
+    REQUIRE(run.path_rows.size() == 1);
+    // The LOGICAL path: the injected temp root never appears.
+    CHECK(run.path_rows[0] == "status|-|-|-|policies|-|constrained|"
+                              "/etc/opt/chrome/policies/managed/b_bad.json|linux:json_unparseable");
+    CHECK(run.path_rows[0].find(dir.path.string()) == std::string::npos);
+}
+
+// MUTATION: raise the push guard in linux_policy_rows_at's `fail` (or drop the cap in
+// mark_result_read) -> more than 64 per-path rows, or no `status_rows_capped` token.
+TEST_CASE("browser_policy linux leg: per-path status rows are capped, and the summary says so",
+          "[browser_policy][linux][cap]") {
+    yuzu::test::TempDir dir{"yuzu_test_browser_policy_leg_pathcap_"};
+    const auto write_bad = [&](std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            char name[32];
+            std::snprintf(name, sizeof name, "bad_%03zu.json", i);
+            write_file(dir.path, std::string{"etc/opt/chrome/policies/managed/"} + name, "{ nope");
+        }
+    };
+    write_bad(kMaxPathFailureRows); // exactly the cap: every file is named, nothing is dropped
+    auto run = run_leg(dir.path);
+    CHECK(run.path_rows.size() == kMaxPathFailureRows);
+    CHECK(run.provenance == "linux:json_unparseable");
+
+    write_bad(kMaxPathFailureRows + 1); // one over: 64 rows, and the summary says rows were cut
+    run = run_leg(dir.path);
+    CHECK(run.path_rows.size() == kMaxPathFailureRows);
+    CHECK(run.provenance == "linux:json_unparseable,linux:status_rows_capped");
+    CHECK(run.status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
 
 TEST_CASE("browser_policy linux: an unreadable policy directory is constrained, siblings survive",

@@ -47,8 +47,9 @@ metadata:
     macOS legs planned - each follows as its own PR; on those hosts the action
     returns one `status` row and result status UNAVAILABLE with provenance
     `<os>:planned`. A host with no managed policy returns zero rows and a clean
-    result status; a read that could not be completed adds one `constrained`
-    status row. Values are reported verbatim. The plugin never enforces, fetches
+    result status; a read that could not be completed adds a `constrained`
+    status row, followed by one per-path status row naming each file or
+    directory that failed. Values are reported verbatim. The plugin never enforces, fetches
     or changes anything.
   tags: [browser, policy, inventory, software]
 
@@ -70,17 +71,20 @@ spec:
     #
     #   policy|<browser>|<level>|<scope>|<name>|<value_type>|<value>|<source>|<detail>
     #   status|-|-|-|policies|-|<constrained|unavailable>|-|<reason tokens>
+    #   status|-|-|-|policies|-|constrained|<logical_path>|<token>
     #
     # A `status` row is written FIRST and only when the read was not complete (a
     # read that could not be finished, a planned leg, a leg that threw); it
-    # repeats the typed result status in band. A complete read writes none, and a
+    # repeats the typed result status in band. A CONSTRAINED read writes the
+    # summary row first, then one per-path row per failure (at most 64;
+    # `linux:status_rows_capped` on the summary when more were due). A complete read writes none, and a
     # host with no managed policy returns zero rows. Free text is escaped for the
     # server's pipe grammar (safe_output_field; lossy on backslash by design).
     columns:
       - name: row_kind
         type: string
         values: [policy, status]
-        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-".'
+        description: 'Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are "-", except source on a per-path status row (the logical path the reason token names).'
         example: policy
         platforms: [windows, linux, darwin]
       - name: browser
@@ -118,7 +122,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: 'The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path.'
+        description: 'The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path. On a status row: "-" on the summary row; on a per-path row the logical /etc/... path of the file or directory whose failure token is in detail, never an injected test root.'
         example: /etc/opt/chrome/policies/managed/corp.json
         platforms: [linux]
       - name: detail
