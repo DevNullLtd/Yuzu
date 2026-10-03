@@ -445,7 +445,7 @@ struct TarOpenOptions {
     /// durability, crash, corruption, integrity-check/quarantine or WAL
     /// checkpoint behaviour. Default false == synchronous left at SQLite's
     /// default (FULL); a pin test asserts that (test_tar_store.cpp).
-    bool relaxed_durability_for_tests{false};
+    bool relaxed_durability_for_test{false};
 };
 
 class TarDatabase {

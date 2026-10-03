@@ -64,7 +64,7 @@ TEST_CASE("TarDatabase: open creates database file", "[tar][store][lifecycle]") 
 }
 
 // Pin: the production open path must keep SQLite's default synchronous=FULL (2).
-// TarOpenOptions::relaxed_durability_for_tests exists ONLY so unit tests can skip
+// TarOpenOptions::relaxed_durability_for_test exists ONLY so unit tests can skip
 // the per-commit fsync; if the default ever drifts to a relaxed value every real
 // agent's tar.db silently loses crash durability. SQLite reports synchronous as
 // 0=OFF 1=NORMAL 2=FULL 3=EXTRA. Both modes must still be WAL.
@@ -94,6 +94,43 @@ TEST_CASE("TarDatabase: default open is synchronous=FULL; only the test option r
     auto explicit_default = TarDatabase::open(explicit_file.path, TarOpenOptions{});
     REQUIRE(explicit_default.has_value());
     CHECK(pragma_of(*explicit_default, "synchronous") == "2");
+}
+
+// Twin of the pin above: the relaxation must come AFTER the open-time integrity
+// check / quarantine (#559), so a corrupt file is still detected and quarantined
+// when the option is set, and the fresh post-quarantine connection is then relaxed.
+// Moving the pragma ahead of the integrity check fails this test.
+TEST_CASE("TarDatabase: relaxed open still runs the integrity check and quarantines",
+          "[tar][store][lifecycle][durability]") {
+    yuzu::test::TempDbFile tmp{"yuzu_test_tar_sync_twin_"};
+    {
+        std::ofstream f(tmp.path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "this is not a valid sqlite database -- corrupt tar.db for the relaxed twin";
+    }
+
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    CHECK(db.quarantined_this_open().has_value()); // integrity check was not bypassed
+
+    auto sync = db.execute_query("PRAGMA synchronous");
+    REQUIRE(sync.has_value());
+    REQUIRE(sync->rows.size() == 1);
+    CHECK(sync->rows[0][0] == "0"); // the fresh post-quarantine handle is relaxed
+    auto jm = db.execute_query("PRAGMA journal_mode");
+    REQUIRE(jm.has_value());
+    REQUIRE(jm->rows.size() == 1);
+    CHECK(jm->rows[0][0] == "wal");
+
+    { TarDatabase discard = std::move(db); }
+    const std::string prefix = tmp.path.filename().string() + ".corrupt-";
+    for (const auto& entry : fs::directory_iterator(tmp.path.parent_path())) {
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) {
+            std::error_code ec;
+            fs::remove(entry.path(), ec); // tidy up the quarantine artifact
+        }
+    }
 }
 
 TEST_CASE("TarDatabase: warehouse tables created on open", "[tar][store][lifecycle]") {
