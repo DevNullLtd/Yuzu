@@ -685,7 +685,7 @@ MSI-registered products, SDK and runtime component packages and some system comp
 241 rows on one developer workstation); Linux is always `-` by design, since a package installs to many prefixes.
 `-` also results from a Windows value longer than 511 characters or stored with a non-string registry type, and
 for per-user installs, which the machine-scope `list` does not read. `bundle_id` is `-` on Windows
-and Linux, and on macOS for a non-bundle location or beyond the 5000-application / 120 s enrichment cap.
+and Linux, and on macOS for a non-bundle location or for a row the bounded bundle-id pass (30 s, at most 5000 applications, one pass in flight) did not reach -- that run also carries a leading `warning|bundle_id_*` row and a CONSTRAINED status, so a `-` from a cut-short pass is never silent.
 
 **The results table shows column headers with nothing under them.** The dashboard splits `installed_apps` rows at
 the first `|` (`app` plus one merged cell) while the headers come from the definition. Nothing is lost: read the
