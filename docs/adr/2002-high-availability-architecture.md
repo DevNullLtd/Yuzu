@@ -1264,9 +1264,11 @@ previous gateway (the only new state is the in-memory index; derived from the ch
   tested at all: a multiplexing HTTP/2 proxy with upstream keepalive, fleet-scale storms, Windows service
   mode, a macOS agent, a real hot code load and the real C++ agent across a GOAWAY. The rig runs used
   gateway commit `1c145d78a` (the first plaintext run used `2e884bb9b`, which differs only in tests and
-  docs); three later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
-  `026830cd9` summary log state created at boot) are covered by eunit only, and the boot path of the
-  final tip has not been exercised on a rig. The run record is
+  docs); later fix commits (`605f117d2` index guard, `3431d20ea` `/readyz` `sessions_index`,
+  `026830cd9` summary log state created at boot, and the round-2 code commits `e139c5e86` boot test and
+  two comments, `9ad473534` counter HELP wording, `942fe5770` and `c2d040a66` test changes, `ab3986ec1`
+  comments) are covered by eunit only (fix-agent runs, not rig runs), and the boot path of the final tip
+  has not been exercised on a rig. The run record is
   [gateway-heartbeat-connection-binding-2026-10-03](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 - **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
   gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and

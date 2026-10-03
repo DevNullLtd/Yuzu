@@ -333,11 +333,14 @@ keepalive, Windows service mode, a macOS agent, fleet-scale storms, a real hot c
 load, and the real C++ agent across a `GOAWAY`.
 
 The rig runs used gateway commit `1c145d78a` (the first run, plaintext, ran on
-`2e884bb9b`, which differs from it only in tests and docs). Three later fix
+`2e884bb9b`, which differs from it only in tests and docs). Later fix
 commits were not run on a rig and are covered by the eunit suite only: `605f117d2`
 (index guard), `3431d20ea` (`/readyz` `sessions_index`) and `026830cd9` (summary log
-state created at boot). The boot path of the final tip has not been exercised on a
-rig. The per-run record is in
+state created at boot), and the round-2 code commits `e139c5e86` (boot test and two
+source comments), `9ad473534` (counter HELP wording), `942fe5770` and `c2d040a66`
+(test changes) and `ab3986ec1` (comments). The round-3 code commit `21125cc3b` changes a source comment, the `yuzu_gw_heartbeat_rejected_total` HELP text and tests only. The boot path of the final tip
+has not been exercised on a rig. At `ab3986ec1` the fix agents ran eunit (401 of 401,
+three times from a fresh build) and dialyzer (clean); these were not rig runs. The per-run record is in
 [the evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 
 ### Subscribe Stream Proxy
