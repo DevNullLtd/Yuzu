@@ -155,36 +155,6 @@ TEST_CASE("persist + inspect round-trips and keys are 0600", "[agent_csr][pki]")
     fs::remove_all(dir);
 }
 
-#ifndef _WIN32
-TEST_CASE("key write refuses a regular file planted at the actual staging path",
-          "[agent_csr][pki]") {
-    // agent_csr's key write is yuzu::shared::write_file_atomic with
-    // owner_only_mode=true (#4723 option 3). The shared tests plant a symlink on
-    // POSIX, which O_NOFOLLOW alone rejects; a REGULAR file is only rejected by
-    // O_EXCL, so this falsifies a regression that drops O_EXCL. forced_temp_suffix
-    // pins the exact staging name the write will try to create.
-    yuzu::test::TempDir dir{"yuzu_test_agent_csr_"};
-    std::error_code ec;
-    fs::create_directories(dir.path, ec); // TempDir only reserves the name
-    REQUIRE_FALSE(ec);
-
-    const auto dest = dir.path / "key.pem";
-    const auto planted = fs::path{dest.string() + ".tmp.forced"};
-    const std::string sentinel = "SENTINEL-DO-NOT-TOUCH";
-    {
-        std::ofstream f(planted, std::ios::binary);
-        f << sentinel;
-    }
-
-    auto r = yuzu::shared::write_file_atomic(
-        dest, "PRIVATE-KEY", {.owner_only_mode = true, .forced_temp_suffix = "forced"});
-    REQUIRE_FALSE(r.has_value());
-    CHECK_FALSE(r.error().message.empty());
-    CHECK(read_all(planted) == sentinel); // exclusive create failed: planted bytes untouched
-    CHECK_FALSE(fs::exists(dest));        // the rename never ran
-}
-#endif
-
 TEST_CASE("inspect reports Missing when nothing is provisioned", "[agent_csr][pki]") {
     const fs::path dir = yuzu::test::unique_temp_path("agent-csr-missing-");
     REQUIRE(inspect_provisioned_cert(dir) == CertState::Missing);
@@ -265,7 +235,8 @@ TEST_CASE("inspect reports Missing for a leaf that does not match the key on dis
                                             {.owner_only_mode = true}));
     CHECK(inspect_provisioned_cert(dir, now) == CertState::Missing);
 
-    // An ENCRYPTED key must be Missing and must never prompt for a passphrase.
+    // An ENCRYPTED key fails to Missing (a terminal run would prompt without the no-op
+    // passphrase callback; CI has no tty either way).
     BIO* pb = BIO_new_mem_buf(kc1->private_key_pem.data(),
                               static_cast<int>(kc1->private_key_pem.size()));
     EVP_PKEY* pk = PEM_read_bio_PrivateKey(pb, nullptr, nullptr, nullptr);

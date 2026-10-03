@@ -276,6 +276,7 @@ CertState inspect_provisioned_cert(const fs::path& cert_dir,
     EVP_PKEY_ptr key = load_private_key(key_pem);
     OPENSSL_cleanse(key_pem.data(), key_pem.size());
     if (!key) {
+        ERR_clear_error();
         spdlog::warn("agent_csr: {} is unreadable or not a private key — treating the "
                      "credential as missing",
                      paths.key_path.string());

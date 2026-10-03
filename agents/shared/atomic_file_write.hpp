@@ -9,12 +9,11 @@
  * policy, failure path) is unit-testable without loading any plugin.
  *
  * Write path: sibling `<dest>.tmp.<16 hex>`, the suffix a process-unique
- * random value from `detail::temp_suffix()` (mirrors agents/core/src/
- * agent_csr.cpp's random_suffix() and agents/shared/win_reg_handle.hpp's
- * unique_hive_mount_name()). The temp is created EXCLUSIVELY: POSIX opens it
- * with O_CREAT|O_EXCL|O_NOFOLLOW directly (no ofstream, no separate
- * chmod-after-open window); Windows opens it with `std::ios::noreplace`
- * (C++23 P2467R1; CREATE_NEW semantics). Either way, a file already at the
+ * random value from `detail::temp_suffix()` (same salt scheme as
+ * agents/shared/win_reg_handle.hpp's unique_hive_mount_name()). The temp is
+ * created EXCLUSIVELY: POSIX opens it with O_CREAT|O_EXCL|O_NOFOLLOW directly (no
+ * ofstream, no separate chmod-after-open window); Windows opens it with
+ * `std::ios::noreplace` (C++23 P2467R1; CREATE_NEW semantics). Either way, a file already at the
  * exclusive-create temp path — planted or left over — makes the create FAIL,
  * rather than being followed or overwritten. The guard that removes the temp
  * on a later failure is armed only AFTER that exclusive create succeeds, so a
@@ -30,14 +29,19 @@
  *     the on-disk mode stays deterministic under an unusual umask. A failed
  *     fchmod is a WriteWarning{mode_reassert_failed}, not a write failure: the
  *     file cannot be wider than 0600 (created at 0600 & ~umask), only narrower.
- *   - false: POSIX creates at 0666, so the process umask applies — what the
- *     ofstream-based writers produce — and an ordinary file keeps its
- *     accessible permissions. No fchmod is issued.
+ *   - false: POSIX creates the temp at 0666 (umask applies) — what the
+ *     ofstream-based writers produced — and, when dest already exists as a
+ *     regular file, carries its rwx bits (0777 mask) onto the open fd before the
+ *     first byte is written, so replacing a file never changes its mode. Owner,
+ *     group, ACLs, xattrs, hard links, setuid/setgid/sticky and a symlink at
+ *     dest are NOT preserved: rename replaces the inode. A failed carry-over is
+ *     a WriteWarning{mode_reassert_failed}.
  * On Windows owner_only_mode has no effect: the DACL is not tightened here
  * (documented follow-up).
  *
  * POSIX call order: write loop -> fchmod(fd) [owner_only_mode] -> fsync(fd)
- * -> close(fd) -> rename -> open/fsync/close of the parent directory.
+ * (F_FULLFSYNC, then fsync, on macOS) -> close(fd) -> rename -> open/fsync/close
+ * of the parent directory (same flush).
  *   - A failed file fsync is an IoError (#4727 decision: fsync adopted on
  *     POSIX); the temp is removed.
  *   - A failed parent-directory open, fsync or close is a
@@ -89,7 +93,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #else
-#include <win_str.hpp> // yuzu::win::to_wide (also pulls <windows.h>)
+#include <win_str.hpp> // NOMINMAX/WIN32_LEAN_AND_MEAN-sanitised <windows.h> (ReplaceFileW)
 #endif
 
 namespace yuzu::shared {
@@ -103,19 +107,32 @@ struct IoError {
 /// replaced). Both flags may be set; `message` joins the causes with "; ".
 struct WriteWarning {
     std::string message;
-    /// fchmod(0600) on the open fd failed; the temp was created at 0600 & ~umask, so
-    /// the file is never WIDER than 0600 but may be narrower (even unreadable by the owner)
+    /// fchmod on the open fd failed: the 0600 re-assert (owner_only_mode=true: the file is
+    /// never WIDER than 0600, only narrower, even unreadable by the owner) or the existing-dest
+    /// mode carry-over (owner_only_mode=false: the file lands at 0666 & ~umask instead of
+    /// dest's prior rwx bits)
     bool mode_reassert_failed = false;
     bool dir_fsync_failed = false; ///< rename durable only after the next OS flush
 };
 
 #ifndef _WIN32
+/// fsync that reaches the medium: on Darwin plain fsync stops at the drive cache, so
+/// F_FULLFSYNC is tried first and fsync is the fallback where the volume rejects it (same
+/// shape as server/core/src/key_provider.cpp).
+inline int durable_fsync(int fd) noexcept {
+#ifdef __APPLE__
+    if (::fcntl(fd, F_FULLFSYNC) == 0)
+        return 0;
+#endif
+    return ::fsync(fd);
+}
+
 /// Syscall seam (#4726): lets a test observe call order and inject failures.
 struct PosixFdOps {
     int (*open)(const char*, int, mode_t) = [](const char* p, int f, mode_t m) {
         return ::open(p, f, m);
     };
-    int (*fsync)(int) = &::fsync;
+    int (*fsync)(int) = &durable_fsync;
     int (*fchmod)(int, mode_t) = &::fchmod;
     int (*close)(int) = &::close;
 };
@@ -159,7 +176,10 @@ inline std::string temp_suffix() {
 /// left over) that this process did not create, and must never be deleted.
 class TempFileGuard {
 public:
-    explicit TempFileGuard(std::filesystem::path p) : path_(std::move(p)) {}
+    // Holds a reference, not a copy: constructing the guard right after the exclusive create
+    // must not allocate, or a bad_alloc there would orphan the temp the create just made.
+    // The caller's tmp outlives the guard.
+    explicit TempFileGuard(const std::filesystem::path& p) noexcept : path_(p) {}
     TempFileGuard(const TempFileGuard&) = delete;
     TempFileGuard& operator=(const TempFileGuard&) = delete;
     ~TempFileGuard() {
@@ -171,7 +191,7 @@ public:
     void dismiss() noexcept { armed_ = false; }
 
 private:
-    std::filesystem::path path_;
+    const std::filesystem::path& path_;
     bool armed_{true};
 };
 
@@ -252,6 +272,19 @@ write_file_atomic(const std::filesystem::path& dest, std::string_view bytes,
         const int fd = file.get();
         temp_guard.emplace(tmp);
 
+        // owner_only_mode=false replacing an EXISTING regular file: carry its rwx bits onto the
+        // temp (fd-bound, before any byte lands) so a 0755 script keeps +x and a 0600 file is not
+        // widened to the umask default. See the banner for what is not preserved.
+        if (!opts.owner_only_mode) {
+            struct stat st{};
+            if (::stat(dest.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+                ops.fchmod(fd, st.st_mode & 0777) != 0) {
+                warning = WriteWarning{"could not carry the mode of " + dest.string() + " onto " +
+                                           tmp.string() + ": " + std::strerror(errno),
+                                       true, false};
+            }
+        }
+
         const char* p = bytes.data();
         std::size_t remaining = bytes.size();
         bool ok = true;
@@ -308,14 +341,11 @@ write_file_atomic(const std::filesystem::path& dest, std::string_view bytes,
             return std::unexpected(IoError{"write to " + tmp.string() + " failed"});
     }
     // fs::rename can fail if dest is open; ReplaceFileW first when it exists (#1681).
-    {
-        const std::wstring wold = yuzu::win::to_wide(tmp.string());
-        const std::wstring wnew = yuzu::win::to_wide(dest.string());
-        if (fs::exists(dest, ec) &&
-            ReplaceFileW(wnew.c_str(), wold.c_str(), nullptr, 0, nullptr, nullptr)) {
-            temp_guard->dismiss();
-            return warning;
-        }
+    // path::c_str() is the native wchar_t* on Windows: no code-page round trip (XP-2).
+    if (fs::exists(dest, ec) &&
+        ReplaceFileW(dest.c_str(), tmp.c_str(), nullptr, 0, nullptr, nullptr)) {
+        temp_guard->dismiss();
+        return warning;
     }
 #endif
 

@@ -474,6 +474,24 @@ TEST_CASE("AtomicWrite: owner_only_mode=false creates at 0666 & ~umask, not 0600
     CHECK((st.st_mode & 0777) == (0666 & ~u));
 }
 
+TEST_CASE("AtomicWrite: owner_only_mode=false keeps an existing file's rwx bits",
+          "[filesystem][atomic]") {
+    TempDir td("yuzu_test_atomic_carry");
+    auto target = td.path / "carry.txt";
+    { std::ofstream f(target, std::ios::binary); f << "old"; }
+
+    // Each differs from 0666 & ~umask at the usual umask 022.
+    for (const mode_t want : {mode_t{0755}, mode_t{0664}, mode_t{0600}}) {
+        REQUIRE(::chmod(target.c_str(), want) == 0);
+        REQUIRE(yuzu::shared::write_file_atomic(target, "new", {.owner_only_mode = false})
+                    .has_value());
+        struct stat st{};
+        REQUIRE(::stat(target.c_str(), &st) == 0);
+        CHECK((st.st_mode & 0777) == want);
+    }
+    CHECK(read_file(target) == "new");
+}
+
 TEST_CASE("AtomicWrite: owner_only_mode=false fails on a file fsync error, keeps dest, no temp",
           "[filesystem][atomic]") {
     TempDir td("yuzu_test_atomic_fsync_eio");

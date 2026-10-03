@@ -526,7 +526,56 @@ TEST_CASE("asset_tags store: creation mode follows owner_only_mode (R1)",
                                             {.owner_only_mode = false, .fd_ops = &ops2})
                 .has_value());
     CHECK(g.open_mode == 0666);
-    CHECK(g.file_fchmod_n == 0); // no fchmod when the policy is not owner-only
+    CHECK(g.file_fchmod_n == 0); // no fchmod when the policy is not owner-only AND dest is new
+}
+
+TEST_CASE("asset_tags store: mode carry-over (R1 follow-up)", "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    std::error_code mk_ec;
+    fs::create_directories(dir.path, mk_ec); // TempDir only reserves the name
+    REQUIRE_FALSE(mk_ec);
+    const auto dest = dir.path / "s.json";
+    { std::ofstream(dest, std::ios::binary) << "old"; }
+
+    SECTION("owner_only_mode=false over an existing dest: a failed fchmod is a warning") {
+        const auto ops = recording_ops();
+        g.fail_fchmod = true;
+        auto r = yuzu::shared::write_file_atomic(dest, "x",
+                                                 {.owner_only_mode = false, .fd_ops = &ops});
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        CHECK((*r)->mode_reassert_failed);
+        CHECK_FALSE((*r)->dir_fsync_failed);
+        CHECK(g.file_fchmod_n == 1);
+        std::ifstream in(dest, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        CHECK(content == "x");
+    }
+    SECTION("owner_only_mode=true over a 0644 dest still lands at 0600") {
+        REQUIRE(::chmod(dest.c_str(), 0644) == 0);
+        const auto ops = recording_ops();
+        REQUIRE(wrote_clean(write_state_file_atomic(dest, "{}", {}, &ops)));
+        struct stat st{};
+        REQUIRE(::stat(dest.c_str(), &st) == 0);
+        CHECK((st.st_mode & 0777) == 0600);
+        CHECK(g.file_fchmod_n == 1); // the 0600 re-assert only: no carry-over onto a key file
+    }
+}
+
+TEST_CASE("asset_tags store: a dest that is a directory is an IoError and leaves no temp",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "state.json";
+    std::error_code mk_ec;
+    fs::create_directories(dest, mk_ec); // also creates dir.path
+    REQUIRE_FALSE(mk_ec);
+
+    auto r = write_state_file_atomic(dest, "{}");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("rename") != std::string::npos);
+    CHECK(fs::is_directory(dest));
+    CHECK(fs::is_empty(dest));
+    CHECK(unexpected_entries(dir.path, dest).empty());
 }
 
 TEST_CASE("asset_tags store: a failed file close is an IoError and leaves no temp",

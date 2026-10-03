@@ -159,7 +159,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: last_persist_error
         type: string
-        description: Message of the most recent persistence failure or write warning, or - when none.
+        description: Message of the most recent persistence failure or write warning, or `-` when none.
         example: "-"
         platforms: [windows, linux, darwin]
 

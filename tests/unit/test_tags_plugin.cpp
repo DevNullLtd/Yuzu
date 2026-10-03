@@ -52,7 +52,7 @@ TEST_CASE("tags: save_tags round-trips through load_tags and leaves no temp",
     }};
     g_tags = {{"role", "web"}, {"env", "prod"}};
 
-    save_tags();
+    REQUIRE(save_tags());
     const auto saved = g_tags;
     g_tags.clear();
     load_tags();
@@ -79,6 +79,28 @@ TEST_CASE("tags: save_tags creates the file at 0666 & ~umask, not 0600",
     struct stat st{};
     REQUIRE(::stat(g_tags_path.c_str(), &st) == 0);
     CHECK((st.st_mode & 0777) == (0666 & ~u));
+}
+
+TEST_CASE("tags: an existing 0600 tags.json keeps 0600 across save_tags", "[agent][tags_plugin]") {
+    yuzu::test::TempDir dir{"yuzu_test_tags_"};
+    g_tags_path = dir.path / "tags.json";
+    yuzu::test::ScopeExit reset{[] {
+        g_tags.clear();
+        g_tags_path.clear();
+    }};
+    g_tags = {{"k", "v"}};
+    REQUIRE(save_tags());
+    REQUIRE(::chmod(g_tags_path.c_str(), 0600) == 0);
+
+    g_tags["k"] = "w";
+    REQUIRE(save_tags());
+
+    struct stat st{};
+    REQUIRE(::stat(g_tags_path.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0600);
+    g_tags.clear();
+    load_tags();
+    CHECK(g_tags["k"] == "w");
 }
 
 TEST_CASE("tags: save_tags replaces tags.json by rename, never in place", "[agent][tags_plugin]") {
@@ -125,7 +147,8 @@ TEST_CASE("tags: save_tags replaces tags.json by rename, never in place", "[agen
 }
 #endif
 
-TEST_CASE("tags: a failed save is logged, does not throw, and leaves the parent untouched",
+TEST_CASE("tags: a failed save returns false, is logged, does not throw, and leaves the parent "
+          "untouched",
           "[agent][tags_plugin]") {
     yuzu::test::TempDir dir{"yuzu_test_tags_"};
     std::error_code ec;
@@ -143,7 +166,7 @@ TEST_CASE("tags: a failed save is logged, does not throw, and leaves the parent 
     }};
     g_tags = {{"k", "v"}};
 
-    CHECK_NOTHROW(save_tags());
+    CHECK_FALSE(save_tags());
 
     std::ifstream in(blocker, std::ios::binary);
     std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

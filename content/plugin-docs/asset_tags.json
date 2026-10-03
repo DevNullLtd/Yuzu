@@ -453,7 +453,7 @@
           "values": null
         },
         {
-          "description": "Message of the most recent persistence failure or write warning, or - when none.",
+          "description": "Message of the most recent persistence failure or write warning, or `-` when none.",
           "example": "-",
           "name": "last_persist_error",
           "platforms": [
@@ -539,7 +539,7 @@
   },
   "privileges": [
     {
-      "grant": "None — plain file I/O under `<data_dir>`, no OS API, no elevated right",
+      "grant": "None — plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW` (no extra privilege)",
       "if_refused": "No refusal path exists; a write failure is logged and reported as `CONSTRAINED` / `persist_failed` on `sync` (see below); an unreadable or corrupt state file is logged and ignored",
       "measured": "2026-09-07 on bare metal as SYSTEM",
       "os": "Windows",
@@ -566,7 +566,7 @@
       "completeness": "full",
       "provenance": "(empty)",
       "status": "`OK`",
-      "when": "`sync`: the new state was written to `<data_dir>/asset_tags.json`, or no data dir is configured and there is nothing to write"
+      "when": "`sync`: the new state was written to `<data_dir>/asset_tags.json` with no warning, or no data dir is configured and there is nothing to write"
     },
     {
       "completeness": "partial",
