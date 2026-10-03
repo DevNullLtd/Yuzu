@@ -140,6 +140,9 @@ error names the cause:
 
 ## 1. Linux runner `yuzu-wsl2-linux` shows offline / tmux is dying
 
+> **Historical:** `yuzu-wsl2-linux` (Shulgi) is retired and no longer in
+> `.github/runner-inventory.json`. The runbook below is kept only as a record.
+
 **Symptom:**
 
 - GitHub Actions runners page (`gh api repos/Tr3kkR/Yuzu/actions/runners`)

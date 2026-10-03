@@ -534,13 +534,13 @@ of reading as NOT TESTED.
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
-**Retired:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
+**Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
 Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
 `proto-compat` and `cache-prune-linux` are pinned to `yuzu-bigtam-linux`; they
 previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
-must also be deregistered on the GitHub side (Settings → Actions → Runners).
+must also be deregistered on the GitHub side (repo or organisation Settings → Actions → Runners); until then the inventory sentinel reports them as unknown runners.
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 

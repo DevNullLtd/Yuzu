@@ -5,10 +5,12 @@ off the old single-host runners: all Linux → Big Tam (`yuzu-bigtam-linux`), al
 Windows → Wee Tam (`yuzu-weetam-windows`). Sequence: `ci.yml` linux (#1609,
 merged) → `sanitizer-tests` + `nightly` + `codeql` Linux → **`release.yml` Linux
 legs + the remaining Windows stragglers + build-speed** (PR #1615). **`yuzu-wsl2-linux`
-(Shulgi) and `yuzu-local-windows` are retired** — remove them from
-`.github/runner-inventory.json` (item 6) to silence the inventory sentinel.
-`proto-compat` / `cache-prune-linux` keep the bare `[self-hosted, Linux, X64]`
-label (no compiler) and land on Big Tam.
+(Shulgi) and `yuzu-local-windows` are retired**, and are removed from
+`.github/runner-inventory.json` (item 6). `proto-compat` / `cache-prune-linux`
+are pinned to `yuzu-bigtam-linux`; they previously used the bare
+`[self-hosted, Linux, X64]` label, which the Shulgi WSL2 runner also carried.
+Deregistering the runners in GitHub (Settings → Actions → Runners) is a separate
+admin step; until it is done the sentinel reports them as unknown runners.
 
 The sections below are the historical runbook + per-file record; the future-tense
 "deferred" / "pre-flip" framing is preserved as the record of how the flip was
@@ -166,10 +168,11 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    the runner NAME, not a label — would have queued forever; Shulgi's label is
    `yuzu-shulgi`. release.yml only runs at tag time, so the first Big Tam release
    is its real validation; note Big Tam ships RPM 6.0 vs Shulgi's 4.x.)
-6. **`.github/runner-inventory.json`** — **DONE.** `yuzu-wsl2-linux` and
+6. **`.github/runner-inventory.json`** — **DONE for the inventory; runner
+   deregistration on GitHub is still a separate admin step.** `yuzu-wsl2-linux` and
    `yuzu-local-windows` removed (both retired); `proto-compat` and
-   `cache-prune-linux` pinned to `yuzu-bigtam-linux` so the bare-label jobs can no
-   longer land on a leftover registered Shulgi runner. The pool gates are
+   `cache-prune-linux` pinned to `yuzu-bigtam-linux`, so those two jobs can no
+   longer land on a still-registered Shulgi runner. The pool gates are
    label-driven, so retired runners just drop out (nothing gates on `all_healthy`).
 7. **`docs/ci-architecture.md`** — **DONE (2026-06-21, #1615).** Runner-topology
    table consolidated (Big Tam = all Linux, Wee Tam = all Windows, both retired

@@ -17,7 +17,7 @@ Two consumers (do not duplicate the logic):
    Also emits `linux_pool_healthy` — true iff >=1 runner eligible for the
    [self-hosted, Linux, X64] job pool is online (see LINUX_POOL_LABELS). The
    proto-compat + linux jobs gate on the pool rather than a single named runner,
-   so any free pool member (yuzu-bigtam-* or the Shulgi fallback) keeps them
+   so any free pool member (the yuzu-bigtam-* runners) keeps them
    running, while a wholly-offline pool still skips them fast. Likewise emits
    `weetam_pool_healthy` for the exact [self-hosted, Windows, X64,
    yuzu-weetam-windows] pool used by the Windows jobs.
@@ -61,10 +61,9 @@ RETRY_DELAYS_SECONDS = (1, 2)
 # superset of this set is eligible to run them. In preflight mode the script
 # emits `linux_pool_healthy=true` iff >=1 such runner is online+labelled
 # (fail-closed: zero online -> the Linux jobs skip fast, exactly as the old
-# single-named gate did when that one runner was down). This includes Shulgi
-# (yuzu-wsl2-linux) as a fallback during the BigTam cutover; Shulgi drops out of
-# the pool automatically when it is later removed from the inventory, leaving the
-# yuzu-bigtam-* runners as the pool. Per-runner `<slug>_healthy` outputs are still
+# single-named gate did when that one runner was down). The pool is whatever the
+# inventory declares with these labels, which is now the yuzu-bigtam-* runners
+# (the retired Shulgi runners were removed from the inventory). Per-runner `<slug>_healthy` outputs are still
 # emitted unchanged (the sentinel and any pinned-runner gates rely on them).
 LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
 
