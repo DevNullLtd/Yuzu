@@ -135,7 +135,7 @@ and then never re-register (observed, 19 minutes, reproduced on a second agent);
 `--no-auto-update` they re-registered 20 to 21 s after a gateway registry restart (observed with
 v0.13.0 and v0.14.0-rc6; it is a command-line flag with no environment variable). Agent v0.12.0 only logs `Heartbeat failed` and never re-registers by itself (older versions were not tested)
 (observed with v0.12.0, 29 failures in 14.5 minutes with default settings; a `--no-auto-update` run was watched for only about 2 minutes and behaved the same; older than v0.12.0 was not tested), so for persistent missing state they stay
-rejected until restarted or upgraded (a heartbeat that falls in the short gap between the session
+rejected until restarted or upgraded (such agents were still counted online by the server's `/health` `agents.online` in the rig, so check the rejection counters and the agent log, not the online count) (a heartbeat that falls in the short gap between the session
 leaving the pending table and its agent process registering can succeed later without
 re-registration). Upgrade the agents first, then the gateway, with a build that includes the #2182
 fix once released; until then, restart an agent that stays rejected (restarting the agent service

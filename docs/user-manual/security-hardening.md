@@ -107,13 +107,14 @@ Run each component under its own system user:
 
 ## Gateway TLS (if you deploy the Erlang gateway)
 
-> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
+> **⚠ The gateway agent listener (`:50051`) is plaintext in every shipped compose except the reference gateway compose.**
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (`transport_opts` with `verify => verify_none`,
 > `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
-> CA to your agents. It is not on by default in the deployed composes until PR5b.
+> CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
+> cluster, demo and UAT composes use plaintext `sys.config` files and do not.
 
 If you deploy the gateway, you **must** protect the agent edge — either enable the
 PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
