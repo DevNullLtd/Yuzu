@@ -304,6 +304,14 @@ compute_dispatch_tag(const CommandCapability& cap, std::string_view plugin, std:
         compute_plan_hash(plugin, action, parameters, target_arm, execution_id));
 }
 
+/// The injected kill-switch decision (#5294). `nullopt` = killed for every OS
+/// OR degraded (the store performs the fail-closed collapse); a value =
+/// allowed, holding the agent OS values whose per-OS switch is OFF (empty = no
+/// OS withheld). The production binders wrap
+/// `PluginConfigStore::kill_switch_decision`.
+using KillSwitchFn = std::function<std::optional<std::unordered_set<std::string>>(
+    std::string_view plugin, std::string_view action)>;
+
 class ClassifiedCommand; // Forward decl — completed below; needed as an
                          // incomplete type by the declaration immediately
                          // following.
@@ -315,7 +323,7 @@ class ClassifiedCommand; // Forward decl — completed below; needed as an
 /// second default-argument set on the same declaration is ill-formed).
 [[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
     const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    const KillSwitchFn& action_allowed,
     std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
     const std::unordered_map<std::string, std::string>& parameters = {},
     const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
@@ -341,18 +349,28 @@ public:
     /// `pb::CommandRequest` at a call site that forgot which type it held.
     [[nodiscard]] const pb::CommandRequest& wire() const noexcept { return cmd_; }
 
+    /// Agent OS values whose per-OS kill switch is OFF for this command's
+    /// plugin/action (#5294); empty = no OS withheld. Dispatch turns this
+    /// into a per-target filter via `AgentRegistry::ids_with_os`.
+    [[nodiscard]] const std::unordered_set<std::string>& kill_switched_os() const noexcept {
+        return kill_switched_os_;
+    }
+
 private:
     friend class yuzu::server::ServerImpl;
     friend struct ClassifiedCommandTestAccess;
     friend std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
-        const CommandCapability&, const std::function<bool(std::string_view, std::string_view)>&,
+        const CommandCapability&, const KillSwitchFn&,
         std::string_view, std::string_view, const std::string&,
         const std::unordered_map<std::string, std::string>&, const std::string&, int, int,
         const std::string&, const std::string&);
 
-    explicit ClassifiedCommand(pb::CommandRequest cmd) : cmd_(std::move(cmd)) {}
+    explicit ClassifiedCommand(pb::CommandRequest cmd,
+                               std::unordered_set<std::string> kill_switched_os = {})
+        : cmd_(std::move(cmd)), kill_switched_os_(std::move(kill_switched_os)) {}
 
     pb::CommandRequest cmd_;
+    std::unordered_set<std::string> kill_switched_os_;
 };
 
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
@@ -378,21 +396,24 @@ private:
 /// reintroduces exactly the ZERO-callers gap `finalize_classified_command`'s
 /// own extraction (M6, wave1 remediation) closed.
 ///
-/// Returns `std::nullopt` when the action is allowed (including when
-/// `action_allowed` is unset — legacy-open); a populated `DispatchDenial`
-/// (always `DispatchDenialReason::KillSwitched`) otherwise. Every caller of
+/// Returns the OS values withheld by a per-OS switch (empty when none, and
+/// when `action_allowed` is unset — legacy-open) when the action is allowed;
+/// a populated `DispatchDenial` (always `DispatchDenialReason::KillSwitched`)
+/// otherwise. Every caller of
 /// `classify_and_authorize_dispatch` that also needs the kill-switch
 /// dimension — today `finalize_classified_command` and the MCP pre-dispatch
 /// dry run (server.cpp's `authorize_dispatch_fn_` production closure) — calls
 /// this directly rather than re-deriving the condition.
-[[nodiscard]] inline std::optional<DispatchDenial> kill_switch_denial(
-    const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed) {
-    if (action_allowed && !action_allowed(cap.plugin, cap.action)) {
-        return DispatchDenial{DispatchDenialReason::KillSwitched, std::string(cap.securable),
-                              cap.operation};
+[[nodiscard]] inline std::expected<std::unordered_set<std::string>, DispatchDenial>
+kill_switch_denial(const CommandCapability& cap, const KillSwitchFn& action_allowed) {
+    if (!action_allowed)
+        return std::unordered_set<std::string>{};
+    auto decision = action_allowed(cap.plugin, cap.action);
+    if (!decision) {
+        return std::unexpected(DispatchDenial{DispatchDenialReason::KillSwitched,
+                                              std::string(cap.securable), cap.operation});
     }
-    return std::nullopt;
+    return std::move(*decision);
 }
 
 /// The composition step `ServerImpl::build_classified_command` runs AFTER
@@ -417,13 +438,14 @@ private:
 ///    it as part of an unrelated extraction.
 [[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
     const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    const KillSwitchFn& action_allowed,
     std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
     const std::unordered_map<std::string, std::string>& parameters,
     const std::string& payload, int stagger_seconds, int delay_seconds,
     const std::string& target_arm, const std::string& execution_id) {
-    if (auto denial = kill_switch_denial(cap, action_allowed)) {
-        return std::unexpected(*denial);
+    auto kill_switched_os = kill_switch_denial(cap, action_allowed);
+    if (!kill_switched_os) {
+        return std::unexpected(kill_switched_os.error());
     }
 
     pb::CommandRequest cmd;
@@ -443,7 +465,7 @@ private:
     cmd.set_dispatch_tag(
         compute_dispatch_tag(cap, raw_plugin, raw_action, ordered_params, target_arm, execution_id));
 
-    return ClassifiedCommand(std::move(cmd));
+    return ClassifiedCommand(std::move(cmd), std::move(*kill_switched_os));
 }
 
 /// Test-only door to the private constructor above (#2367 pattern — mirrors
@@ -1034,6 +1056,17 @@ public:
     // next re-register -- a plugin installed since is not visible here until
     // then; documented at the call site, not re-litigated per caller.
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin) const;
+
+    // #5294: ids whose KNOWN agent OS (local session `os`, else the
+    // cross-replica presence row's `os`; local wins) is in `os_values` -- the
+    // targets a per-OS kill switch withholds. Empty `os_values` -> empty set
+    // with NO presence read (zero cost for every dispatch without a per-OS
+    // row). An id with an empty `os` everywhere is never included (absence of
+    // data is not a killed OS). A degraded presence read with a non-empty
+    // `os_values` returns the error: the caller refuses the dispatch rather
+    // than silently narrowing enforcement to this replica's local sessions.
+    [[nodiscard]] std::expected<std::unordered_set<std::string>, PresenceReadError>
+    ids_with_os(const std::unordered_set<std::string>& os_values) const;
 
     // Evaluate a scope expression against all agents (local + cross-replica
     // presence), return matching agent IDs. `rs_store` resolves the

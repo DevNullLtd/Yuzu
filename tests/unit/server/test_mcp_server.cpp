@@ -13809,6 +13809,7 @@ TEST_CASE("MCP execute_instruction: every target quarantined reports status="
     CHECK(sc["retry_after_ms"].is_null());
     CHECK(sc["agents_quarantined"] == 1);
     CHECK(sc["agents_unknown_plugin"] == 0);
+    CHECK(sc["agents_kill_switched_os"] == 0);
     auto text_str = sc["message"].get<std::string>();
     CHECK(text_str.find("quarantine") != std::string::npos);
     CHECK(text_str.find("permanent") != std::string::npos);

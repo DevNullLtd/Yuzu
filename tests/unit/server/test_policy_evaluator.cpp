@@ -117,6 +117,9 @@ struct Harness {
     // denied_quarantined) rather than delivered or not_sent -- a THIRD way a
     // claimed target can fail to be delivered, distinct from both.
     std::set<std::string> quarantined;
+    // #5294: agent ids the fake dispatch_fn withholds via
+    // ConfinedDispatchOutcome::kill_switched_os (per-OS kill switch OFF).
+    std::set<std::string> kill_switched_os;
     // WS-4 4.2b Task D (#3424/#3511 under-count): when set, the fake
     // dispatch_fn returns `route_unreadable` for the WHOLE batch (mirroring
     // ArmDispatchResult::route_unreadable's systemic-directory-read-failure
@@ -211,6 +214,11 @@ struct Harness {
                     // attempted, failed) and from a canned-absent lookup below.
                     outcome.denied_quarantined.push_back(a);
                     ++outcome.denied_quarantined_count;
+                    continue;
+                }
+                if (kill_switched_os.count(a)) {
+                    outcome.kill_switched_os.push_back(a);
+                    ++outcome.kill_switched_os_count;
                     continue;
                 }
                 auto it = canned.find(a + "|" + plugin);
@@ -869,6 +877,37 @@ TEST_CASE("policy evaluator: a mixed delivered+quarantined remediate batch marks
     // and wired up for delivery, re-claims and delivers it -- proving the
     // release actually happened rather than merely not writing 'fixing'.
     h.quarantined.erase("agentB");
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
+}
+
+TEST_CASE("policy evaluator: a mixed delivered+kill_switched_os remediate batch marks only "
+          "the delivered target 'fixing' and re-dispatches the withheld one once restored (#5294)",
+          "[pg][policy][evaluator]") {
+    // compute_delivered's `not_delivered` set must fold in
+    // outcome.kill_switched_os: in a sent>0 batch the withheld id is absent
+    // from `sent`, so without it the id reads as delivered and the
+    // per-(policy,agent) claim is never re-attempted after the switch is
+    // turned back on.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.kill_switched_os.insert("agentB");
+
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 1);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    h.kill_switched_os.erase("agentB");
     h.canned["agentB|fixp"] = {1, "ok"};
     auto rr2 = ev.remediate(pid, {"agentB"});
     REQUIRE(rr2.ok);

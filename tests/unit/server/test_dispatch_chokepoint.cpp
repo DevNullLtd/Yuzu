@@ -739,8 +739,8 @@ constexpr CommandCapability kTarPurgeCap{
 TEST_CASE("finalize_classified_command: the per-action kill switch refuses AFTER classification, "
           "naming the classified securable — never a permissive default on a thrown switch",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_off =
-        [](std::string_view, std::string_view) { return false; };
+    yuzu::server::detail::KillSwitchFn switch_off =
+        [](std::string_view, std::string_view) { return std::nullopt; };
 
     auto result = finalize_classified_command(kTarPurgeCap, switch_off, "tar", "purge_source",
                                                "cmd-1", {}, {}, 0, 0, {}, {});
@@ -759,10 +759,13 @@ TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLAS
     // A callback that only recognizes the canonical spelling — if
     // finalize_classified_command consulted the caller's raw "TAR"/"PURGE_SOURCE"
     // instead of cap.plugin/cap.action, this would (wrongly) refuse.
-    std::function<bool(std::string_view, std::string_view)> canonical_only =
-        [](std::string_view plugin, std::string_view action) {
-            return plugin == "tar" && action == "purge_source";
-        };
+    yuzu::server::detail::KillSwitchFn canonical_only =
+        [](std::string_view plugin,
+           std::string_view action) -> std::optional<std::unordered_set<std::string>> {
+        if (plugin == "tar" && action == "purge_source")
+            return std::unordered_set<std::string>{};
+        return std::nullopt;
+    };
 
     auto result = finalize_classified_command(kTarPurgeCap, canonical_only, "TAR", "PURGE_SOURCE",
                                                "cmd-2", {}, {}, 0, 0, {}, {});
@@ -772,18 +775,35 @@ TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLAS
 TEST_CASE("finalize_classified_command: an unwired kill-switch callback is legacy-open, mirroring "
           "an absent PluginConfigStore in production — never a hard refusal",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> unwired; // empty — no store wired
+    yuzu::server::detail::KillSwitchFn unwired; // empty — no store wired
 
     auto result = finalize_classified_command(kTarPurgeCap, unwired, "tar", "purge_source", "cmd-3",
                                                {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
+    CHECK(result->kill_switched_os().empty());
+}
+
+TEST_CASE("finalize_classified_command: a per-OS switch OFF is carried on the classified command "
+          "(#5294), and does not refuse the dispatch",
+          "[server][dispatch][chokepoint][os_kill_switch]") {
+    yuzu::server::detail::KillSwitchFn per_os =
+        [](std::string_view, std::string_view) -> std::optional<std::unordered_set<std::string>> {
+        return std::unordered_set<std::string>{"windows"};
+    };
+
+    auto result = finalize_classified_command(kTarPurgeCap, per_os, "tar", "purge_source", "cmd-os",
+                                               {}, {}, 0, 0, {}, {});
+    REQUIRE(result.has_value());
+    CHECK(result->kill_switched_os() == std::unordered_set<std::string>{"windows"});
 }
 
 TEST_CASE("finalize_classified_command: BR-009 — the wire command carries the CANONICAL "
           "plugin/action the catalogue resolved, never the caller's raw casing",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
 
     // Caller dispatched with a differently-cased spelling — classify() is
     // case-insensitive so this would have been authorized against kTarPurgeCap,
@@ -800,8 +820,10 @@ TEST_CASE("finalize_classified_command: parameters, payload, stagger and delay r
           "command verbatim, and the dispatch tag is composed over the CALLER's raw plugin/action "
           "(not the canonical spelling) — matching what compute_dispatch_tag always received",
           "[server][dispatch][chokepoint]") {
-    std::function<bool(std::string_view, std::string_view)> switch_on =
-        [](std::string_view, std::string_view) { return true; };
+    yuzu::server::detail::KillSwitchFn switch_on =
+        [](std::string_view, std::string_view) {
+            return std::optional<std::unordered_set<std::string>>{std::unordered_set<std::string>{}};
+        };
     const std::unordered_map<std::string, std::string> params{{"path", "/var/log"}};
 
     auto result =

@@ -1353,7 +1353,7 @@ groups:
       - alert: YuzuDispatchTargetRejected
         expr: |
           sum by (route, reason) (
-            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin"}[15m])
+            increase(yuzu_server_dispatch_target_rejected_total{reason!~"quarantined|unknown_plugin|kill_switched_os"}[15m])
           ) > 3
         labels:
           severity: warning

@@ -700,6 +700,22 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // flagged absent.
         const auto plugin_missing = deps.registry->ids_missing_plugin(classified->wire().plugin());
 
+        // #5294: ids withheld by a per-OS kill switch. A degraded presence
+        // read while a per-OS switch is OFF refuses the whole dispatch (fail
+        // closed) rather than enforcing on local sessions only. The
+        // SendTimeGuard above discards the send-time entry on this exit.
+        const auto os_kill_switched = deps.registry->ids_with_os(classified->kill_switched_os());
+        if (!os_kill_switched) {
+            spdlog::error("command dispatch {}:{} refused: presence unreadable while a per-OS "
+                          "kill switch is OFF",
+                          plugin, action);
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"agent presence could not be read while a per-OS kill switch is set — dispatch is failing closed and reaching no agent","reason":"os_gate_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
         // #881: filled by whichever arm branch below actually ran, then
         // audited once — BEFORE the sent==0 -> 503 branch further down —
         // so a deliberate policy denial correlates with the transport
@@ -713,6 +729,8 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // #3511: mirrors denied_quarantined_count for the plugin-presence
         // filter — see ArmDispatchResult::unknown_plugin_count.
         std::size_t unknown_plugin_count = 0;
+        // #5294: mirrors unknown_plugin_count for the per-OS kill-switch filter.
+        std::size_t kill_switched_os_count = 0;
         // WS-4 4.2b Task D: mirrors the two counts above — ArmDispatchResult
         // has no aggregation of its own (each arm branch below runs the walk
         // once), so this is simply whatever the arm that ran reported.
@@ -730,7 +748,8 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         const auto dispatch_broadcast = [&]() -> yuzu::server::ArmDispatchResult {
             return yuzu::server::dispatch_confined_arms(
                 yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-                /*broadcast_on_none=*/true, containment_gate, confined_sink, plugin_missing);
+                /*broadcast_on_none=*/true, containment_gate, confined_sink, plugin_missing,
+                *os_kill_switched);
         };
 
         if (arm == yuzu::server::DispatchArm::Group) {
@@ -746,11 +765,12 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             t.group_members = &members;
             const auto result = yuzu::server::dispatch_confined_arms(
                 arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate, confined_sink,
-                plugin_missing);
+                plugin_missing, *os_kill_switched);
             sent = result.sent;
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
         } else if (arm == yuzu::server::DispatchArm::Scope) {
             // Scope expression dispatch.
@@ -812,11 +832,12 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 t.scope_matched = &*ladder.matched;
                 const auto result = yuzu::server::dispatch_confined_arms(
                     arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                    confined_sink, plugin_missing);
+                    confined_sink, plugin_missing, *os_kill_switched);
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
                 unknown_plugin_count = result.unknown_plugin_count;
+                kill_switched_os_count = result.kill_switched_os_count;
                 route_unreadable = result.route_unreadable;
             }
             // else: the ladder already audited the abort (db_degraded /
@@ -831,11 +852,12 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             t.agent_ids = &agent_ids;
             const auto result = yuzu::server::dispatch_confined_arms(
                 arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate, confined_sink,
-                plugin_missing);
+                plugin_missing, *os_kill_switched);
             sent = result.sent;
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
         } else if (arm == yuzu::server::DispatchArm::Broadcast) {
             // Explicitly asked for the fleet by its published name — #1788
@@ -847,6 +869,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
         } else {
             // Broadcast ONLY when the caller named no target at all (#2500).
@@ -915,6 +938,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             // command to any agent" 503 instead of the specific
             // `plugin_not_found` one below.
             unknown_plugin_count = result.unknown_plugin_count;
+            kill_switched_os_count = result.kill_switched_os_count;
             route_unreadable = result.route_unreadable;
         }
 
@@ -944,6 +968,11 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             deps.audit_unknown_plugin_dispatch_fn("command", caller.principal,
                                                   caller.principal_role, command_id, plugin,
                                                   unknown_plugin_count);
+        });
+        guarded(command_id, "audit_kill_switched_os_dispatch", deps.metrics, [&] {
+            deps.audit_kill_switched_os_dispatch_fn("command", caller.principal,
+                                                    caller.principal_role, command_id, plugin,
+                                                    kill_switched_os_count);
         });
 
         // Forward commands queued for gateway agents
@@ -986,6 +1015,12 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
+            } else if (kill_switched_os_count > 0) {
+                // #5294: every reachable target runs an OS whose per-OS kill
+                // switch is OFF -- withheld, not an empty fleet.
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target runs an OS for which this plugin action is switched off — dispatch was withheld, not attempted","reason":"kill_switched_os","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
             } else {
                 res.set_content(
                     R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
@@ -1027,6 +1062,9 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         if (unknown_plugin_count > 0)
             toast_suffix += "; " + std::to_string(unknown_plugin_count) +
                             " withheld (plugin not found)";
+        if (kill_switched_os_count > 0)
+            toast_suffix += "; " + std::to_string(kill_switched_os_count) +
+                            " withheld (OS switched off)";
         res.set_header("HX-Trigger", "{\"showToast\":{\"message\":\"Command sent to " +
                                          std::to_string(sent) + " agent(s)" + toast_suffix +
                                          "\",\"level\":\"success\"}}");
@@ -1048,6 +1086,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                                   {"agents_reached", sent},
                                   {"withheld_quarantined", denied_quarantined_count},
                                   {"withheld_unknown_plugin", unknown_plugin_count},
+                                  {"withheld_kill_switched_os", kill_switched_os_count},
                                   {"thead_html", thead_html}});
         // #2557 fix #6: `audit_emitted` on the SUCCESS response too, matching
         // every denial arm's convention — previously only the denial arms

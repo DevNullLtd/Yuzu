@@ -48,7 +48,10 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
     if (claimed.empty())
         return;
 
-    if (outcome.containment_unreadable) {
+    // #5294: `os_gate_unreadable` (presence unreadable while a per-OS kill
+    // switch is OFF) has the identical shape -- the dispatch is refused before
+    // targeting, so `sent == 0` and no per-id set names these ids.
+    if (outcome.containment_unreadable || outcome.os_gate_unreadable) {
         // The gate itself failed closed: EVERY id was withheld by the
         // `contained()` lambda BEFORE its `send_to`, so `sent == 0` and none
         // of them appear in `sent`, `not_sent`, or the named-permanent sets --
@@ -109,6 +112,18 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
                  .to_step = failed_step,
                  .error = phase + " dispatch withheld: content_dist plugin not found on "
                                   "this device's reported inventory"});
+    }
+    // #5294: a per-OS kill-switch withhold is a per-device fact like
+    // quarantine (and operator-reversible), so it fails the row here rather
+    // than leaving it claimed forever awaiting a response that never comes.
+    for (const auto& aid : outcome.kill_switched_os) {
+        if (permanent_ids.insert(aid).second)
+            failed.push_back(
+                {.agent_id = aid,
+                 .from_step = claimed_step,
+                 .to_step = failed_step,
+                 .error = phase + " dispatch withheld: per-OS kill switch is off for this "
+                                  "device's OS"});
     }
 
     // PR #3939 review round, security-guardian finding: `outcome.not_sent`

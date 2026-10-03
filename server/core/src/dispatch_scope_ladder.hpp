@@ -264,7 +264,8 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
     const authz::VisibleSet& exec_visible, bool broadcast_on_none, const ContainmentGate& gate,
     const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
     const ConcurrencyClaimFn& claim_fn = nullptr,
-    const std::unordered_set<std::string>& plugin_missing = {}) {
+    const std::unordered_set<std::string>& plugin_missing = {},
+    const std::unordered_set<std::string>& os_kill_switched = {}) {
     ConfinedDispatchOutcome outcome;
     outcome.containment_unreadable = gate.enforced && gate.fail_closed;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
@@ -292,13 +293,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         ConfinedDispatchTargets t;
         t.group_members = &members;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing);
+                                              plugin_missing, os_kill_switched);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.kill_switched_os = r.kill_switched_os;
+        outcome.kill_switched_os_count = r.kill_switched_os_count;
         outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
@@ -315,13 +318,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                              plugin_missing);
+                                              plugin_missing, os_kill_switched);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
         outcome.unknown_plugin = r.unknown_plugin;
         outcome.unknown_plugin_count = r.unknown_plugin_count;
+        outcome.kill_switched_os = r.kill_switched_os;
+        outcome.kill_switched_os_count = r.kill_switched_os_count;
         outcome.route_unreadable = r.route_unreadable;
         return outcome;
     }
@@ -337,13 +342,15 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         }
     }
     const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
-                                          plugin_missing);
+                                          plugin_missing, os_kill_switched);
     outcome.sent = r.sent;
     outcome.denied_quarantined = r.denied_quarantined;
     outcome.denied_quarantined_count = r.denied_quarantined_count;
     outcome.not_sent = r.not_sent;
     outcome.unknown_plugin = r.unknown_plugin;
     outcome.unknown_plugin_count = r.unknown_plugin_count;
+    outcome.kill_switched_os = r.kill_switched_os;
+    outcome.kill_switched_os_count = r.kill_switched_os_count;
     outcome.route_unreadable = r.route_unreadable;
     return outcome;
 }
@@ -472,6 +479,21 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // large fleet under a high single-target dispatch rate.
     const auto plugin_missing = registry.ids_missing_plugin(cmd.wire().plugin());
 
+    // #5294: the per-OS kill-switch id set, computed BEFORE `claim_fn` exists so
+    // a refusal here can never leak a claim. A degraded presence read with a
+    // per-OS switch OFF refuses the whole dispatch (fail closed) instead of
+    // narrowing enforcement to this replica's local sessions.
+    auto os_kill_switched = registry.ids_with_os(cmd.kill_switched_os());
+    if (!os_kill_switched) {
+        ConfinedDispatchOutcome refused;
+        refused.command_id = command_id;
+        refused.os_gate_unreadable = true;
+        spdlog::error("wire_and_dispatch_confined: refusing dispatch of {}.{} -- presence "
+                      "unreadable while a per-OS kill switch is OFF",
+                      cmd.wire().plugin(), cmd.wire().action());
+        return refused;
+    }
+
     // ADR-1007: per-device concurrency claim. Only wired for
     // concurrency_mode == "per-device" with a definition_id supplied and a
     // live tracker. Two definition-aware callers DO reach this gated
@@ -522,7 +544,7 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
 
     auto outcome =
         resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible, broadcast_on_none, gate,
-                                      resolvers, sink, claim_fn, plugin_missing);
+                                      resolvers, sink, claim_fn, plugin_missing, *os_kill_switched);
     outcome.command_id = command_id;
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every
@@ -547,9 +569,14 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // does, so an id withheld for a missing plugin holds an open claim too.
     // No fail-closed analogue here (plugin-presence has no degraded-read
     // mode), so unlike `denied_quarantined` this list is never elided.
+    //
+    // #5294: `outcome.kill_switched_os` is the FOURTH bucket in the same leak
+    // class -- `os_killed` runs the identical "claimed, then `continue` before
+    // send" shape, so without releasing it the target stays excluded for the
+    // claim TTL after the per-OS switch is restored.
     if (claim_fn && execution_tracker) {
         std::size_t leaked = outcome.not_sent.size() + outcome.denied_quarantined.size() +
-                             outcome.unknown_plugin.size();
+                             outcome.unknown_plugin.size() + outcome.kill_switched_os.size();
         if (leaked > 0) {
             // One batched UPDATE (#881 discipline — matches `claim_fn`'s own
             // unnest-batched INSERT), not a per-id loop: a large not_sent set
@@ -562,6 +589,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                               outcome.denied_quarantined.end());
             to_release.insert(to_release.end(), outcome.unknown_plugin.begin(),
                               outcome.unknown_plugin.end());
+            to_release.insert(to_release.end(), outcome.kill_switched_os.begin(),
+                              outcome.kill_switched_os.end());
             // definition_id scoping (Gate 2 security-guardian finding, PR
             // #3784 fix round): execution_id alone is NOT a safe match key
             // here — every workflow-step dispatch (workflow_routes.cpp)
@@ -576,9 +605,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                                                           to_release);
             spdlog::info("wire_and_dispatch_confined: released {} per-device concurrency "
                          "claim(s) for execution_id={} that were taken but never delivered "
-                         "(undelivered={}, quarantine-denied={}, unknown-plugin={})",
+                         "(undelivered={}, quarantine-denied={}, unknown-plugin={}, os-kill-switched={})",
                          leaked, execution_id, outcome.not_sent.size(),
-                         outcome.denied_quarantined.size(), outcome.unknown_plugin.size());
+                         outcome.denied_quarantined.size(), outcome.unknown_plugin.size(),
+                         outcome.kill_switched_os.size());
         }
     }
     return outcome;

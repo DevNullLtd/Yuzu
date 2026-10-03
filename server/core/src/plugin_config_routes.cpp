@@ -192,10 +192,12 @@ nlohmann::json secret_meta_json(const PluginConfigStore::SecretMeta& m) {
 nlohmann::json kill_switch_json(const PluginConfigStore::KillSwitchEntry& e) {
     return {{"plugin", e.plugin},
            {"action", e.action},
+           {"os", e.os},
            {"enabled", e.enabled},
            {"reason", e.reason},
            {"set_by", e.set_by},
-           {"updated_at_ms", e.updated_at_ms}};
+           {"updated_at_ms", e.updated_at_ms},
+           {"source", e.source}};
 }
 
 /// "who" for updated_by/set_by columns — the authenticated session's stable
@@ -279,7 +281,8 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
                 const std::string plugin = req.matches[1].str();
                 const std::string action = req.has_param("action") ? req.get_param_value("action") : "";
-                auto entry = deps.store->get_kill_switch(plugin, action);
+                const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
+                auto entry = deps.store->get_kill_switch(plugin, action, os);
                 if (!entry) {
                     write_store_error(res, entry.error());
                     return;
@@ -325,15 +328,15 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 // internally, so the audit row emitted below (before the
                 // mutation — see audit_or_503's doc comment) is never
                 // recorded for an input the store would reject anyway.
-                if (!plugin_config::parse_kill_switch_scope(plugin, action) ||
-                    !plugin_config::is_valid_reason(reason) ||
+                const std::string os = req.has_param("os") ? req.get_param_value("os") : "";
+                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
+                if (!scope || !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(actor(*session))) {
                     write_store_error(res, PluginConfigStore::Error::InvalidInput);
                     return;
                 }
 
-                const std::string target_id =
-                    action.empty() ? plugin : plugin + "." + action;
+                const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
                 const std::string detail_str =
                     std::string("enabled=") + (enabled ? "true" : "false");
                 if (!audit_or_503(deps.audit_fn, req, res, "plugin_config.kill_switch.set",
@@ -341,7 +344,7 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                     return;
 
                 auto result =
-                    deps.store->set_kill_switch(plugin, action, enabled, reason, actor(*session));
+                    deps.store->set_kill_switch(plugin, action, enabled, reason, actor(*session), os);
                 if (!result) {
                     audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/false,
                                   "PluginConfig", target_id, detail_str);

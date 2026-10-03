@@ -94,6 +94,9 @@ struct Deps {
     AuditQuarantineFailClosedFn audit_quarantine_dispatch_fail_closed_fn;
     AuditQuarantineDeniedBatchFn audit_quarantine_dispatch_denied_batch_fn;
     AuditUnknownPluginFn audit_unknown_plugin_dispatch_fn;
+    /// #5294: same signature/shape as the plugin-absence sibling, for ids
+    /// withheld by a per-OS kill switch.
+    AuditUnknownPluginFn audit_kill_switched_os_dispatch_fn;
     AuditScopeResolutionFailedFn audit_scope_resolution_failed_fn;
     AuditScopeEvaluationAbortedFn audit_scope_evaluation_aborted_fn;
 };

@@ -1606,6 +1606,28 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     return missing;
 }
 
+std::expected<std::unordered_set<std::string>, PresenceReadError>
+AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) const {
+    std::unordered_set<std::string> out;
+    if (os_values.empty())
+        return out;
+    // live_presence() runs OFF mu_ (same discipline as all_ids / evaluate_scope).
+    auto presence = live_presence();
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (!s->os.empty() && os_values.contains(s->os))
+            out.insert(id);
+    }
+    for (const auto& p : *presence) {
+        // Local wins: a session on this replica is judged by its own os.
+        if (!agents_.contains(p.agent_id) && !p.os.empty() && os_values.contains(p.os))
+            out.insert(p.agent_id);
+    }
+    return out;
+}
+
 // Collect every from_result_set:<id> reference in a scope expression so the
 // resolver can preload owner-checked membership once per set. The scope AST is
 // a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.

@@ -241,6 +241,26 @@ TEST_CASE("CommandOutboxDelivery[pg]: route_unreadable reschedules, never marks 
     CHECK(probe.calls == 1);
 }
 
+TEST_CASE("CommandOutboxDelivery[pg]: os_gate_unreadable reschedules, never marks sent (#5294 "
+          "-- presence unreadable while a per-OS kill switch is OFF)",
+          "[command_outbox][pg][delivery]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-os-retry", "cmd-or"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.os_gate_unreadable = true; // refused before targeting: sent == 0, no per-id data
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    // Not a delivered occurrence: marking it sent/skipped would silently drop
+    // a scheduled command on a transient presence read.
+    CHECK(fx.raw_state("occ-os-retry") == "pending");
+    loop.tick();
+    CHECK(probe.calls == 1);
+}
+
 TEST_CASE("CommandOutboxDelivery[pg]: carries approval provenance from the row",
           "[command_outbox][pg][delivery]") {
     DeliveryPg fx;

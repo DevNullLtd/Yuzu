@@ -26,9 +26,11 @@
 ///     plaintext — `set_secret`'s own return value is metadata
 ///     (`SecretMeta`, which structurally has no value field), never an echo
 ///     of what it just sealed.
-///   - `kill_switches` — `<plugin>` or `<plugin>.<action>` -> enabled +
+///   - `kill_switches` — `<plugin>[.<action>][@<os>]` -> enabled +
 ///     reason + who. Absence of a row means "enabled" (not killed) — a row
 ///     is written only once an operator has explicitly flipped the switch.
+///     A per-OS row (`@windows|linux|darwin`, #5294) only ever narrows: the
+///     effective state is the AND of the plugin/action layer and the OS layer.
 ///
 /// ADR-0010 secret handling — one `SecretCodec` instance per store (the
 /// playbook's "Instance model", `AuthDB` is the worked precedent this
@@ -59,7 +61,9 @@
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <optional>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -102,10 +106,16 @@ public:
     struct KillSwitchEntry {
         std::string plugin;
         std::string action; ///< "" = whole-plugin switch
+        std::string os;     ///< "" = all OSes; else windows|linux|darwin
         bool enabled{true};
         std::string reason;
         std::string set_by;
         std::int64_t updated_at_ms{0};
+        /// scope_key of the row that produced reason/set_by/updated_at/enabled
+        /// ("" when no row exists). With an `os` request this can differ from
+        /// the requested scope: the first OFF row in specificity order when
+        /// the effective state is off.
+        std::string source;
     };
 
     /// Borrows the shared pool and the CALLER'S OWN `SecretCodec` instance
@@ -184,13 +194,19 @@ public:
     /// (an `unexpected` here must not be collapsed to "enabled" by a
     /// careless caller; `action_allowed` is what performs that collapse
     /// correctly, to `false`).
+    ///
+    /// With a non-empty `os`, `enabled` is the EFFECTIVE value (AND of the
+    /// plugin/action layer and the OS layer) and `reason`/`set_by`/
+    /// `updated_at_ms`/`source` are attributed to the row that produced the
+    /// decision, never to an ON row shown beside `enabled=false`.
     [[nodiscard]] std::expected<KillSwitchEntry, Error>
-    get_kill_switch(std::string_view plugin, std::string_view action) const;
+    get_kill_switch(std::string_view plugin, std::string_view action,
+                    std::string_view os = "") const;
 
     /// Flip the switch. Mutate-and-return via `RETURNING`.
     [[nodiscard]] std::expected<KillSwitchEntry, Error>
     set_kill_switch(std::string_view plugin, std::string_view action, bool enabled,
-                    std::string_view reason, std::string_view set_by);
+                    std::string_view reason, std::string_view set_by, std::string_view os = "");
 
     /// THE fail-closed chokepoint every dispatch-gating caller must use.
     /// Action-level row wins over a plugin-level row; no row at all means
@@ -203,6 +219,14 @@ public:
     /// leaving each dispatch call site to remember it).
     [[nodiscard]] bool action_allowed(std::string_view plugin, std::string_view action) const;
 
+    /// The fail-closed decision with the per-OS layer: nullopt = killed for
+    /// every OS OR degraded (closed store, lease timeout, query failure, bad
+    /// scope); a value = allowed, holding the agent OS values whose per-OS
+    /// switch is OFF (empty = no OS withheld). ONE statement, one MVCC
+    /// snapshot. `action_allowed` is `kill_switch_decision(...).has_value()`.
+    [[nodiscard]] std::optional<std::unordered_set<std::string>>
+    kill_switch_decision(std::string_view plugin, std::string_view action) const;
+
     /// Wave 7: idempotent boot-time seed for a plugin that ships
     /// default-off (e.g. `execution_artifacts`, the forensics class). Writes
     /// a PLUGIN-LEVEL row (`action` = "") with `enabled=false`,
@@ -212,8 +236,11 @@ public:
     /// failure (closed store, invalid plugin/reason, or the INSERT itself
     /// failing) — a conflict (row already exists, whichever value it holds)
     /// is success, not a distinct case the caller needs to branch on.
+    /// A non-empty `os` seeds a per-OS row instead, so a new OS leg can ship
+    /// off where the plugin is already on.
     [[nodiscard]] bool seed_kill_switch_default_off(std::string_view plugin,
-                                                     std::string_view reason);
+                                                     std::string_view reason,
+                                                     std::string_view os = "");
 
 private:
     pg::PgPool& pool_;

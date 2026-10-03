@@ -83,6 +83,13 @@ struct Harness {
             // engine must settle the claim on ANY zero-sent outcome.
             if (gate_unreadable)
                 return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            // #5294: refused before targeting -- sent == 0, no per-id sets.
+            if (os_gate_unreadable) {
+                yuzu::server::ConfinedDispatchOutcome refused;
+                refused.command_id = "cmd";
+                refused.os_gate_unreadable = true;
+                return refused;
+            }
             // WS-4 4.2b Task D fix (#3424/#3511 under-count): `route_unreadable`
             // is NOT `containment_unreadable`'s shape. A fail-closed containment
             // gate withholds every id BEFORE its send, forcing `sent == 0` — the
@@ -97,6 +104,7 @@ struct Harness {
             // sent/quarantined/withheld/offline -- exactly like production.
             std::vector<std::string> quarantined;
             std::vector<std::string> withheld;
+            std::vector<std::string> os_withheld;
             std::vector<std::string> offline;
             int out_of_scope_count = 0;
             for (const auto& a : agents) {
@@ -110,6 +118,8 @@ struct Harness {
                 // can put one agent id in BOTH sets to exercise that.
                 if (denied_quarantined_agents.count(a))
                     quarantined.push_back(a);
+                else if (kill_switched_os_agents.count(a))
+                    os_withheld.push_back(a);
                 else if (unknown_plugin_agents.count(a))
                     withheld.push_back(a);
                 else if (offline_agents.count(a))
@@ -119,6 +129,7 @@ struct Harness {
                                               : static_cast<int>(agents.size()) - out_of_scope_count -
                                                     static_cast<int>(quarantined.size()) -
                                                     static_cast<int>(withheld.size()) -
+                                                    static_cast<int>(os_withheld.size()) -
                                                     static_cast<int>(offline.size());
             return {.sent = reached,
                    .denied_quarantined = quarantined,
@@ -127,6 +138,8 @@ struct Harness {
                    .not_sent = offline,
                    .unknown_plugin = withheld,
                    .unknown_plugin_count = withheld.size(),
+                   .kill_switched_os = os_withheld,
+                   .kill_switched_os_count = os_withheld.size(),
                    .route_unreadable = route_unreadable};
         };
         return d;
@@ -135,6 +148,8 @@ struct Harness {
     bool deny_dispatch{false};
     bool gate_unreadable{false};
     bool route_unreadable{false};
+    bool os_gate_unreadable{false};
+    std::unordered_set<std::string> kill_switched_os_agents;
     std::unordered_set<std::string> unknown_plugin_agents;
     std::unordered_set<std::string> offline_agents;
     std::unordered_set<std::string> denied_quarantined_agents;
@@ -330,6 +345,59 @@ TEST_CASE("deployment engine retries after a transient containment-gate failure 
     advance(deps, id, cfg, authorized, test_caller());
     CHECK(h.dispatch_count("stage", "a1") == 2);
     CHECK(step_of(store, id, "a1") == "staging");
+}
+
+TEST_CASE("deployment engine reverts the whole claim on os_gate_unreadable (#5294)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+
+    // os_gate_unreadable: presence could not be read while a per-OS switch is
+    // OFF, so the dispatch was refused before targeting. A transient systemic
+    // fact -- the claim is undone, never settled to a permanent 'failed'.
+    const std::string id1 = "e-os-gate-unreadable";
+    REQUIRE(store.create_deployment(make_dep(id1), {tgt("a1")}));
+    Harness h{store};
+    h.os_gate_unreadable = true;
+    auto deps = h.deps();
+    advance(deps, id1, cfg, {"a1"}, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id1, "a1") == "pending");
+    h.os_gate_unreadable = false;
+    advance(deps, id1, cfg, {"a1"}, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 2);
+    CHECK(step_of(store, id1, "a1") == "staging");
+
+}
+
+TEST_CASE("deployment engine fails a kill-switched device in a mixed batch instead of leaving "
+          "it claimed forever (#5294)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+
+    // sent > 0: the withheld device is named, so it settles to 'failed'.
+    const std::string id2 = "e-os-killed-mixed";
+    REQUIRE(store.create_deployment(make_dep(id2), {tgt("b1"), tgt("b2")}));
+    Harness h2{store};
+    h2.kill_switched_os_agents = {"b2"};
+    auto deps2 = h2.deps();
+    advance(deps2, id2, cfg, {"b1", "b2"}, test_caller());
+    CHECK(step_of(store, id2, "b1") == "staging");
+    CHECK(step_of(store, id2, "b2") == "failed");
+    for (const auto& d : store.get_devices(id2))
+        if (d.agent_id == "b2")
+            CHECK(d.error.find("per-OS kill switch") != std::string::npos);
 }
 
 TEST_CASE("deployment engine retries after a transient GatewayRouteStore directory-read "

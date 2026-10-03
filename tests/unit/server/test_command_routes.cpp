@@ -311,6 +311,9 @@ struct CommandHarness {
                 if (audit_unknown_plugin_throws)
                     throw std::runtime_error("audit_unknown_plugin_dispatch threw");
             };
+        deps.audit_kill_switched_os_dispatch_fn =
+            [](std::string_view, const std::string&, const std::string&, const std::string&,
+               const std::string&, std::size_t) {};
         deps.audit_scope_resolution_failed_fn =
             [](const std::string&, const std::string&, const std::string&,
               const std::string&) {};
