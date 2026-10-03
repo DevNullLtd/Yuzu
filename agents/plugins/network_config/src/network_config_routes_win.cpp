@@ -55,22 +55,31 @@ struct ForwardTableGuard {
     ForwardTableGuard& operator=(const ForwardTableGuard&) = delete;
 };
 
-/// Text of a SOCKADDR_INET, or empty when the family is neither IPv4 nor IPv6 or the
-/// address cannot be formatted. `unspecified` is set for an all-zero address.
-std::string sockaddr_text(const SOCKADDR_INET& a, bool& unspecified) {
+/// Text of a SOCKADDR_INET plus whether it is the all-zero address. Returned as ONE value on
+/// purpose: an earlier shape returned the text and set `unspecified` through an out-parameter, and
+/// a call that also read that flag as another argument of the same call read it before it was set
+/// (C++ leaves argument evaluation order unspecified; MSVC goes right to left) and every next hop
+/// came out on-link.
+struct SockText {
+    std::string text;       // empty when the family is neither IPv4 nor IPv6 or it cannot be formatted
+    bool unspecified = false; // all-zero address (0.0.0.0 / ::)
+};
+
+SockText sockaddr_text(const SOCKADDR_INET& a) {
     char buf[INET6_ADDRSTRLEN]{};
-    unspecified = false;
     if (a.si_family == AF_INET) {
-        unspecified = a.Ipv4.sin_addr.s_addr == 0;
-        return ::InetNtopA(AF_INET, const_cast<IN_ADDR*>(&a.Ipv4.sin_addr), buf, sizeof(buf))
-                   ? std::string{buf}
-                   : std::string{};
+        const bool zero = a.Ipv4.sin_addr.s_addr == 0;
+        return {::InetNtopA(AF_INET, const_cast<IN_ADDR*>(&a.Ipv4.sin_addr), buf, sizeof(buf))
+                    ? std::string{buf}
+                    : std::string{},
+                zero};
     }
     if (a.si_family == AF_INET6) {
-        unspecified = IN6_IS_ADDR_UNSPECIFIED(&a.Ipv6.sin6_addr) != 0;
-        return ::InetNtopA(AF_INET6, const_cast<IN6_ADDR*>(&a.Ipv6.sin6_addr), buf, sizeof(buf))
-                   ? std::string{buf}
-                   : std::string{};
+        const bool zero = IN6_IS_ADDR_UNSPECIFIED(&a.Ipv6.sin6_addr) != 0;
+        return {::InetNtopA(AF_INET6, const_cast<IN6_ADDR*>(&a.Ipv6.sin6_addr), buf, sizeof(buf))
+                    ? std::string{buf}
+                    : std::string{},
+                zero};
     }
     return {};
 }
@@ -101,9 +110,8 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
     bool unformattable = false;
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPFORWARD_ROW2& r = table->Table[i];
-        bool dest_unspecified = false;
         WinRoute w;
-        w.destination = sockaddr_text(r.DestinationPrefix.Prefix, dest_unspecified);
+        w.destination = sockaddr_text(r.DestinationPrefix.Prefix).text;
         const auto family = r.DestinationPrefix.Prefix.si_family;
         if ((family != AF_INET && family != AF_INET6) || w.destination.empty()) {
             unformattable = true; // never emit a row with a guessed destination
@@ -111,8 +119,9 @@ int collect_routes_win(yuzu::CommandContext& ctx) {
         }
         w.ipv6 = family == AF_INET6;
         w.prefix_len = r.DestinationPrefix.PrefixLength;
-        bool hop_unspecified = true;
-        w.next_hop = win_next_hop(sockaddr_text(r.NextHop, hop_unspecified), hop_unspecified);
+        // An AF_UNSPEC hop formats to empty text with `unspecified` false: still on-link.
+        const SockText hop = sockaddr_text(r.NextHop);
+        w.next_hop = win_next_hop(hop.text, hop.unspecified);
         w.interface = interface_alias(r.InterfaceLuid, r.InterfaceIndex);
         w.metric = r.Metric;
         w.protocol = static_cast<int>(r.Protocol);
