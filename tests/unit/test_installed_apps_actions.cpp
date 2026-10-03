@@ -35,7 +35,11 @@
  *     emitted rows. A fixture string re-asserts the parser and proves nothing
  *     about the migration; external functional review specifically found that
  *     the parser-only tests survive reverting every changed call site.
- *   - Bound: these two cases are the ONLY process-spawning tests added here,
+ *   - A third macOS case (one more system_profiler run, ~2 s) is the only way to
+ *     reach do_list's degraded bundle-id wiring: the reader is agent-core-resident
+ *     and the process-wide in-flight flag the plugin image shares with this
+ *     executable is the seam that forces Busy without a production test hook.
+ *   - Bound: the cases above are the ONLY process-spawning tests added here,
  *     and both are macOS/POSIX-gated. Everything else added by this PR is a
  *     pure-function case. If the cost ever becomes a problem, the right move
  *     is an integration tag, not weaker assertions.
@@ -174,6 +178,12 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
     // Shape invariant: every emitted line is an `app|...` row, whether a
     // real app/package or the plugin's own "No applications found" sentinel
     // -- never a stray error string or fragment from a reverted parser.
+#if defined(__APPLE__)
+    // Healthy host: the bounded bundle-id pass completes untruncated, so no
+    // `warning|bundle_id_*` row precedes the app rows (that row is the only
+    // absent-vs-not-read signal; the 7-field row shape is frozen).
+    CHECK(result.captured.find("warning|bundle_id_") == std::string::npos);
+#endif
     CHECK(count_non_matching_lines(result.captured, "app|") == 0);
 
     // Wire contract (ADR-0028 binding condition): every row is
@@ -246,11 +256,14 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
 #include "installed_apps_macos_receipts.hpp"
 #include "installed_apps_parsers.hpp"
 
+#include <yuzu/agent/bundle_id_read.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <future>
+#include <thread>
 
 namespace parsers = yuzu::installed_apps::parsers;
 namespace macos_receipts = yuzu::installed_apps::macos_receipts;
@@ -567,6 +580,95 @@ TEST_CASE("installed_apps plugin: receipt-plist read and pkgutil --pkg-info fall
 
     CHECK(via_receipt->version == via_pkgutil.version);
     CHECK(via_receipt->install_time == via_pkgutil.install_time);
+}
+
+// The bounded bundle-id pass's degraded wiring in do_list (warning row + typed
+// status) is unreachable from the pure tests, which only pin the mapping helpers.
+// agent-core is a shared library, so this executable and the loaded plugin bind
+// ONE in-flight flag: parking a blocked reader through the _for_test seam (1 ms
+// deadline -> TimedOut, worker left holding the flag) makes the plugin's own
+// `list` pass report Busy -- no production seam involved.
+TEST_CASE("installed_apps plugin: list reports a busy bundle-id pass as a leading warning row "
+          "and CONSTRAINED/PARTIAL",
+          "[installed_apps][posix_actions]") {
+    using namespace std::chrono_literals;
+    using yuzu::agent::BundleIdPassStatus;
+    using yuzu::agent::read_bundle_ids_bounded_for_test;
+
+    auto plugin = load_installed_apps_plugin();
+    if (!plugin)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
+
+    // Opens the gate on scope exit: a failing REQUIRE must not leave a worker
+    // wedged forever holding the process-wide flag (it would turn every later
+    // `list` case into Busy).
+    std::promise<void> gate;
+    bool gate_open = false;
+    const auto release = [&] {
+        if (!gate_open) {
+            gate_open = true;
+            gate.set_value();
+        }
+    };
+    yuzu::test::ScopeExit opener{release};
+    auto gate_f = gate.get_future().share();
+    const auto blocked = [gate_f](const std::string&) -> std::string {
+        gate_f.wait();
+        return {};
+    };
+
+    // A sibling test's abandoned worker may still hold the flag (Busy): poll until
+    // this call is the one that times out and so owns the wedge.
+    auto st = BundleIdPassStatus::Busy;
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            st = read_bundle_ids_bounded_for_test({"/x"}, 1ms, blocked).status;
+            CHECK((st == BundleIdPassStatus::TimedOut || st == BundleIdPassStatus::Busy));
+            return st == BundleIdPassStatus::TimedOut;
+        },
+        10s));
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "list");
+    release();
+
+    if (result.rc != 0)
+        SKIP("system_profiler degraded on this host -- the bundle-id pass was not reached");
+
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "installed_apps:bundle_id_busy");
+
+    std::istringstream iss(result.captured);
+    std::string line;
+    std::size_t row_count = 0;
+    bool first = true;
+    while (std::getline(iss, line)) {
+        if (line.empty())
+            continue;
+        if (first) {
+            CHECK(line.starts_with("warning|bundle_id_busy:"));
+            first = false;
+            continue;
+        }
+        ++row_count;
+        REQUIRE(line.starts_with("app|"));
+        const auto fields = split_fields_escape_aware(line);
+        REQUIRE(fields.size() == 7);
+        CHECK(fields[6] == "-"); // the pass never ran: every bundle_id is "not read"
+    }
+    CHECK(row_count > 0);
+
+    // Leave the flag free so the healthy `list` case is not poisoned under --order rand.
+    auto after = BundleIdPassStatus::Busy;
+    CHECK(yuzu::test::spin_until(
+        [&] {
+            after = read_bundle_ids_bounded_for_test(
+                        {"/x"}, 5000ms, [](const std::string&) { return std::string{"z"}; })
+                        .status;
+            return after == BundleIdPassStatus::Completed;
+        },
+        10s));
 }
 
 #endif // __APPLE__

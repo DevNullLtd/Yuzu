@@ -16,8 +16,12 @@
 
 #include <yuzu/agent/bundle_id_read.hpp>
 
+#include "test_helpers.hpp"
+
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <string>
 #include <thread>
@@ -27,36 +31,6 @@ using namespace std::chrono_literals;
 using yuzu::agent::BundleIdPassResult;
 using yuzu::agent::BundleIdPassStatus;
 using yuzu::agent::read_bundle_ids_bounded_for_test;
-
-namespace {
-
-// Yield (no sleep) until pred() or 10s; returns pred().
-template <typename Pred> bool spin_until(Pred pred) {
-    const auto end = std::chrono::steady_clock::now() + 10s;
-    while (!pred()) {
-        if (std::chrono::steady_clock::now() > end)
-            return false;
-        std::this_thread::yield();
-    }
-    return true;
-}
-
-// Opens a gate on scope exit if the test did not: a failing REQUIRE must not
-// leave a worker wedged forever (it would hold the process-wide in-flight flag
-// and turn every later test into Busy). Declared AFTER the promise it opens.
-struct GateOpener {
-    std::promise<void>& gate;
-    bool open = false;
-    void release() {
-        if (!open) {
-            open = true;
-            gate.set_value();
-        }
-    }
-    ~GateOpener() { release(); }
-};
-
-} // namespace
 
 TEST_CASE("read_bundle_ids_bounded completes with ids aligned to paths", "[bundle_id][agent]") {
     const std::vector<std::string> paths{"/a", "/b", "/c"};
@@ -72,7 +46,17 @@ TEST_CASE("read_bundle_ids_bounded completes with ids aligned to paths", "[bundl
 TEST_CASE("a blocked reader times out with a partial snapshot, then Busy, then recovers",
           "[bundle_id][agent]") {
     std::promise<void> gate;
-    GateOpener opener{gate};
+    // Opens the gate on scope exit if the test did not: a failing REQUIRE must not
+    // leave a worker wedged forever (it would hold the process-wide in-flight flag
+    // and turn every later test into Busy). Declared AFTER the promise it opens.
+    bool gate_open = false;
+    const auto release = [&] {
+        if (!gate_open) {
+            gate_open = true;
+            gate.set_value();
+        }
+    };
+    yuzu::test::ScopeExit opener{release};
     // The abandoned worker outlives this scope on failure: everything it touches
     // is captured BY VALUE (shared state), never by reference to the stack.
     auto gate_f = gate.get_future().share();
@@ -110,13 +94,15 @@ TEST_CASE("a blocked reader times out with a partial snapshot, then Busy, then r
     CHECK(busy0.status == BundleIdPassStatus::Busy);
     CHECK(gate_f.wait_for(0ms) == std::future_status::timeout);
 
-    opener.release();
+    release();
     BundleIdPassResult again;
-    REQUIRE(spin_until([&] {
-        again = read_bundle_ids_bounded_for_test(paths, 5000ms,
-                                                 [](const std::string& p) { return "com.y." + p; });
-        return again.status != BundleIdPassStatus::Busy;
-    }));
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            again = read_bundle_ids_bounded_for_test(
+                paths, 5000ms, [](const std::string& p) { return "com.y." + p; });
+            return again.status != BundleIdPassStatus::Busy;
+        },
+        10s));
     CHECK(again.status == BundleIdPassStatus::Completed);
     CHECK(again.ids[1] == "com.y./b");
 
@@ -133,11 +119,21 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[bundle_id][agent
 
     // Starts from zero outstanding calls in this image (sibling tests' guards
     // are released on their own threads shortly after they finish).
-    REQUIRE(spin_until([] { return g_outstanding_bounded_calls.load() == 0; }));
+    REQUIRE(yuzu::test::spin_until([] { return g_outstanding_bounded_calls.load() == 0; }, 10s));
 
-    static std::atomic_flag flag = ATOMIC_FLAG_INIT; // outlives any worker
+    static std::atomic_flag flag; // outlives any worker
     std::promise<void> gate;
-    GateOpener opener{gate};
+    // Opens the gate on scope exit if the test did not: a failing REQUIRE must not
+    // leave a worker wedged forever (it would hold the process-wide in-flight flag
+    // and turn every later test into Busy). Declared AFTER the promise it opens.
+    bool gate_open = false;
+    const auto release = [&] {
+        if (!gate_open) {
+            gate_open = true;
+            gate.set_value();
+        }
+    };
+    yuzu::test::ScopeExit opener{release};
     auto gate_f = gate.get_future().share();
     for (int i = 0; i < kMaxOutstandingBoundedCalls; ++i) {
         auto parked = yuzu::shared::bounded_call_ex(1ms, [gate_f]() -> bool {
@@ -160,8 +156,8 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[bundle_id][agent
     CHECK(rej.ids.size() == paths.size()); // path-aligned, like Busy
     CHECK_FALSE(entered->load());
 
-    opener.release();
-    REQUIRE(spin_until([] { return g_outstanding_bounded_calls.load() == 0; }));
+    release();
+    REQUIRE(yuzu::test::spin_until([] { return g_outstanding_bounded_calls.load() == 0; }, 10s));
 
     // Flag was released on Rejected: a Busy here means the clear was lost.
     auto ok = yuzu::agent::detail::bounded_bundle_id_pass(flag, paths, 5000ms, reader);
@@ -170,11 +166,25 @@ TEST_CASE("a Rejected admission releases the in-flight flag", "[bundle_id][agent
     CHECK(ok.ids[0] == "com.x./a");
 }
 
-#if defined(__APPLE__) && defined(YUZU_HAVE_SECURITY_FRAMEWORK)
-TEST_CASE("real reader resolves Safari's bundle identifier", "[bundle_id][agent]") {
-    auto r = yuzu::agent::read_bundle_ids_bounded({"/System/Applications/Safari.app"}, 10000ms);
+#if defined(__APPLE__)
+// A minimal fixture bundle (Contents/Info.plist only) keeps the case independent
+// of which system apps this macOS release ships.
+TEST_CASE("real reader resolves a fixture bundle's identifier", "[bundle_id][agent]") {
+    yuzu::test::TempDir dir("yuzu_test_bundle_");
+    const auto app = dir.path / "Fixture.app";
+    std::filesystem::create_directories(app / "Contents");
+    std::ofstream(app / "Contents" / "Info.plist")
+        << R"(<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.yuzu.test.fixture</string>
+<key>CFBundleName</key><string>Fixture</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+)";
+    auto r = yuzu::agent::read_bundle_ids_bounded({app.string()}, 10000ms);
     REQUIRE(r.status == BundleIdPassStatus::Completed);
     REQUIRE(r.ids.size() == 1);
-    CHECK(r.ids[0] == "com.apple.Safari");
+    CHECK(r.ids[0] == "com.yuzu.test.fixture");
 }
 #endif

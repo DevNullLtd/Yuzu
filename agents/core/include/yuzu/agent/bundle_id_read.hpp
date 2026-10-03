@@ -27,6 +27,10 @@
  * keychain_read.hpp), so the driver is a header-only template taking the
  * flag by reference: production binds agent-core's flag, tests bind their own
  * and saturate their own image's counter.
+ *
+ * Plugins call the two exported functions ONLY and never instantiate the
+ * template themselves: an instantiation inside a plugin image puts the detached
+ * worker's text back into a dlclose()-able object, the hazard this header removes.
  */
 
 #include <atomic>
@@ -113,6 +117,12 @@ BundleIdPassResult bounded_bundle_id_pass(std::atomic_flag& in_flight,
             try {
                 id = reader(paths[i]);
             } catch (...) {
+                // Deliberate deviation from passwd_lookup.hpp's "a throw is a non-arrival"
+                // rule: the production reader is CF Create/Get calls (null on failure, never
+                // a throw) plus one std::string build, so the only throw is bad_alloc and the
+                // column is informational. Recorded as "no identifier" rather than growing the
+                // status enum; a future reader that CAN throw must add a Failed status instead
+                // of relying on this catch.
             }
             std::lock_guard<std::mutex> lock(state->mtx);
             state->ids[i] = std::move(id);
