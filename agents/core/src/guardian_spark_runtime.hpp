@@ -1782,8 +1782,13 @@ private:
     /// Pop every TERMINAL, never-dispatched claim at the front of `entry` (a Queued
     /// claim that already carries an outcome or a commit exception: a withdrawn or
     /// release-failed tombstone), retrying its index release. Governance pass-3
-    /// sg-3/ar-4/cs-5: such a tombstone must never be re-dispatched as an arm, never
-    /// re-committed by the live sweep, and never sit ahead of a Disarm claim. Called
+    /// sg-3/ar-4/cs-5: such a tombstone must not be re-dispatched as an arm, re-
+    /// committed by the live sweep, or sit ahead of a Disarm claim. The sweep pops
+    /// only what it can release; a tombstone whose release fails again stays at the
+    /// front, and try_dispatch_head_locked (which has no outcome/withdrawn guard)
+    /// then flips it Queued -> Dispatching, so such a tombstone IS re-dispatchable.
+    /// Known exception, tracked as a follow-up: a second release failure at the
+    /// same-key sweep (unreachable in production: erase_rule is noexcept). Called
     /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
     /// Disarm). noexcept by construction (iterator erases + a noexcept release).
     void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
@@ -1951,8 +1956,26 @@ private:
     /// Never throws (r3 C2/C3): a throw inside index_->remove_rule is counted
     /// (claim_index_release_failures_) and reported as false, with index_held left
     /// true so the next release retries.
-    /// Callers may ignore the result: retry is implicit in the retained ownership.
+    /// The result MUST be consulted before a claim is popped or erased: retry is
+    /// implicit only while the claim stays in its fifo, so a caller that pops/erases
+    /// on `false` leaks the mapping (a ghost (key, rule) entry; #4354). Use
+    /// release_or_retain_tombstone_locked where the claim is popped. The remaining
+    /// callers that ignore the result either leave the claim in place (the publish
+    /// pre-pass and fill-in, synthesize_fallback_outcome_locked, the dispatched branch
+    /// of abandon_claim_locked: a later release or sweep retries it) or run at
+    /// sticky-stop time (begin_stop, dispatch_parked_arm_guarded's stop path), where
+    /// the leak is moot. Known gap, tracked as a follow-up: abandon_claim_locked's
+    /// Queued branch ignores `false` and then erases the claim.
     bool release_claim_index_locked(KeyClaim& claim) noexcept;
+    /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
+    /// retained tombstone for the next same-key sweep. "withdrawn" here means "never
+    /// re-commit" (the convention of fail_all_claims_locked's tombstones; the `live`
+    /// filter in publish_arm_verdicts_locked excludes withdrawn claims). It
+    /// is set even on a claim nobody withdrew (e.g. a non-adopted wedge), which is
+    /// harmless: the claim is terminal, and is_retained_wedge reads kind/dispatch/
+    /// waiter_abandoned/end, never withdrawn. Returns true iff c no longer owns a
+    /// mapping and may be popped/erased.
+    [[nodiscard]] bool release_or_retain_tombstone_locked(KeyClaim& c) noexcept;
     /// registry_mu_ held. The waiter gave up on `claim` (deadline or stop): a Queued
     /// claim is erased outright, a dispatched one is marked waiter_abandoned for its
     /// completion to finish. Returns the string outcome for the caller.

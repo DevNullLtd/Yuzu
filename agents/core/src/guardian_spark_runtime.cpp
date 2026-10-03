@@ -976,6 +976,14 @@ void GuardianSparkRuntime::fault_here_for_test(int point) {
     }
 }
 
+bool GuardianSparkRuntime::release_or_retain_tombstone_locked(KeyClaim& c) noexcept {
+    if (release_claim_index_locked(c))
+        return true;
+    c.withdrawn = true;
+    c.dispatch = ClaimDispatch::Queued; // sweepable (sweep requires Queued)
+    return false;
+}
+
 bool GuardianSparkRuntime::publish_arm_verdicts_locked(
     const std::string& key, const std::shared_ptr<KeyClaim>& claim,
     const std::vector<std::shared_ptr<KeyClaim>>& finished,
@@ -1027,7 +1035,7 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
                 c->end = ClaimEnd::CommitThrew;
             }
         }
-        if (!fifo.empty() && fifo.front() == c)
+        if (release_or_retain_tombstone_locked(*c) && !fifo.empty() && fifo.front() == c)
             fifo.pop_front();
     }
     if (firewall && !fifo.empty() && fifo.front() == claim) {
@@ -1038,10 +1046,7 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
             // never dropped - dropping it would leave a ghost (key, rule) mapping
             // that makes the next same-key attach take the shared-watcher branch
             // for a key that has no PerKey. The next same-key event sweeps it.
-            if (!release_claim_index_locked(*c)) {
-                c->withdrawn = true;
-                c->dispatch = ClaimDispatch::Queued;
-            }
+            (void)release_or_retain_tombstone_locked(*c);
             if (!c->outcome) {
                 fault_here_for_test(7); // ch-1: the SIBLING fill-in allocation, in
                                         // the firewall loop - shares this function
@@ -1108,8 +1113,8 @@ void GuardianSparkRuntime::finalize_arm_compensation(std::shared_ptr<ArmCompensa
             if (eit != claims_.end() && !eit->second.fifo.empty() &&
                 eit->second.fifo.front() == cont->claim) {
                 if (cont->claim->outcome || cont->claim->commit_exception) {
-                    release_claim_index_locked(*cont->claim);
-                    eit->second.fifo.pop_front();
+                    if (release_or_retain_tombstone_locked(*cont->claim))
+                        eit->second.fifo.pop_front();
                     if (eit->second.fifo.empty())
                         claims_.erase(eit);
                     else
@@ -1731,8 +1736,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         // the head is terminal, so pop it rather than leave a Dispatched
                         // tombstone nothing pops - a detach would then queue a Disarm
                         // behind it that nothing drives (governance pass-3 sg-3/ar-4/cs-5).
-                        release_claim_index_locked(*claim); // noexcept; no-op once committed
-                        eit->second.fifo.pop_front();
+                        if (release_or_retain_tombstone_locked(*claim)) // no-op release once committed
+                            eit->second.fifo.pop_front();
                         if (eit->second.fifo.empty())
                             claims_.erase(eit);
                         else
