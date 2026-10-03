@@ -588,21 +588,37 @@ registration_churn_keeps_one_row_per_agent() ->
     Racers = 4,
     Superseded = ets:new(churn_superseded, [public, bag]),
     Violations = ets:new(churn_violations, [public, bag]),
+    %% Every holder process ever registered (superseded ones included), so the
+    %% test can reap all of them, and a probe counter proving the racers ran.
+    Holders = ets:new(churn_holders, [public, bag]),
+    Probes = ets:new(churn_probes, [public, set]),
+    true = ets:insert(Probes, {n, 0}),
     Ids = [uid(<<"churn">>) || _ <- lists:seq(1, Agents)],
     Keyed = lists:zip(Ids, [{churn_conn, I} || I <- lists:seq(1, Agents)]),
     Self = self(),
     %% Racers: heartbeat for sessions known to be superseded; any admission is
     %% a violation.
-    RacerPids = [spawn_link(fun() -> racer(Superseded, Violations) end)
+    RacerPids = [spawn_link(fun() -> racer(Superseded, Violations, Probes) end)
                  || _ <- lists:seq(1, Racers)],
+    RacerMons = [erlang:monitor(process, R) || R <- RacerPids],
     Workers = [spawn_link(fun() ->
-                   Last = churn_agent(Id, Key, Rounds, Superseded, Violations),
+                   Last = churn_agent(Id, Key, Rounds, Superseded, Violations, Holders),
                    Self ! {churned, self(), Id, Last}
                end) || {Id, Key} <- Keyed],
     Finals = [receive {churned, W, Id, Last} -> {Id, Last} after 30000 -> timeout end
               || {W, {Id, _}} <- lists:zip(Workers, Keyed)],
-    [R ! stop || R <- RacerPids],
     try
+        %% At least one probe must have happened before the racers are stopped,
+        %% else a racer that never ran would prove nothing.
+        ?assertEqual(ok, wait_until(fun() -> probe_count(Probes) > 0 end, 5000)),
+        [R ! stop || R <- RacerPids],
+        %% Wait for every racer to exit so no late result can miss the check.
+        lists:foreach(fun(M) ->
+            receive {'DOWN', M, process, _, _} -> ok
+            after 5000 -> ?assert(racer_did_not_exit)
+            end
+        end, RacerMons),
+        ?assert(probe_count(Probes) > 0),
         ?assertEqual([], ets:tab2list(Violations)),
         lists:foreach(fun({Id, {Pid, S}}) ->
             %% Exactly one row for this agent id, and it is the last session.
@@ -617,27 +633,44 @@ registration_churn_keeps_one_row_per_agent() ->
             ?assertEqual(error, yuzu_gw_registry:lookup_session(S))
         end, Old)
     after
-        [exit(P, kill) || {_, {P, _}} <- Finals],
+        [exit(R, kill) || R <- RacerPids],
+        %% Reap every holder, superseded ones included, and wait until all are down.
+        AllHolders = [P || {P} <- ets:tab2list(Holders)],
+        HolderMons = [erlang:monitor(process, P) || P <- AllHolders],
+        [exit(P, kill) || P <- AllHolders],
+        lists:foreach(fun(M) ->
+            receive {'DOWN', M, process, _, _} -> ok
+            after 5000 -> ok
+            end
+        end, HolderMons),
+        ?assertEqual([], [P || P <- AllHolders, is_process_alive(P)]),
         ok = wait_until(fun() ->
             lists:all(fun(Id) ->
                 ets:match(?SESSIONS, {'_', Id, '_', '_'}) =:= []
             end, Ids)
         end, 3000),
         ets:delete(Superseded),
-        ets:delete(Violations)
+        ets:delete(Violations),
+        ets:delete(Holders),
+        ets:delete(Probes)
     end.
+
+probe_count(Probes) ->
+    ets:lookup_element(Probes, n, 2).
 
 %% One agent: register Rounds times under rotating session ids on its own
 %% connection. Returns {Pid, SessionId} of the last registration.
-churn_agent(Id, Key, Rounds, Superseded, Violations) ->
+churn_agent(Id, Key, Rounds, Superseded, Violations, Holders) ->
     Ctx = ctx_with(Key),
-    churn_agent(Id, Key, Ctx, 1, Rounds, undefined, Superseded, Violations).
+    churn_agent(Id, Key, Ctx, 1, Rounds, undefined, Superseded, Violations, Holders).
 
-churn_agent(_Id, _Key, _Ctx, N, Rounds, Last, _Superseded, _Violations) when N > Rounds ->
+churn_agent(_Id, _Key, _Ctx, N, Rounds, Last, _Superseded, _Violations, _Holders)
+  when N > Rounds ->
     Last;
-churn_agent(Id, Key, Ctx, N, Rounds, Prev, Superseded, Violations) ->
+churn_agent(Id, Key, Ctx, N, Rounds, Prev, Superseded, Violations, Holders) ->
     S = iolist_to_binary([Id, "-s", integer_to_list(N)]),
     Pid = bind(Id, S, Key),
+    ets:insert(Holders, {Pid}),
     case Prev of
         {_PrevPid, PrevS} ->
             %% The register call above has returned: the replaced session is
@@ -655,9 +688,9 @@ churn_agent(Id, Key, Ctx, N, Rounds, Prev, Superseded, Violations) ->
         ok       -> ok;
         rejected -> ets:insert(Violations, {S, Key, current_rejected})
     end,
-    churn_agent(Id, Key, Ctx, N + 1, Rounds, {Pid, S}, Superseded, Violations).
+    churn_agent(Id, Key, Ctx, N + 1, Rounds, {Pid, S}, Superseded, Violations, Holders).
 
-racer(Superseded, Violations) ->
+racer(Superseded, Violations, Probes) ->
     receive stop -> ok
     after 0 ->
         case ets:tab2list(Superseded) of
@@ -670,10 +703,11 @@ racer(Superseded, Violations) ->
                 case yuzu_gw_registry:lookup_session(S) of
                     error -> ok;
                     Other -> ets:insert(Violations, {S, Other, racer})
-                end
+                end,
+                ets:update_counter(Probes, n, 1)
         end,
         erlang:yield(),
-        racer(Superseded, Violations)
+        racer(Superseded, Violations, Probes)
     end.
 
 info_logs_carry_no_session_id() ->
