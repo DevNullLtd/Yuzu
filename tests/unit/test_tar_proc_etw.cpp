@@ -116,13 +116,13 @@ TEST_CASE("backfill_proc_events_from_etl rejects missing/garbage input without c
     REQUIRE(yuzu::tar::backfill_proc_events_from_etl("", 0).empty());
 
     // Non-existent file → OpenTrace fails, no events (off-Windows: a no-op stub).
-    const std::string missing = yuzu::test::unique_temp_path("tar-no-etl").string();
+    const std::string missing = yuzu::test::unique_temp_path("yuzu_test_tar_no_etl_").string();
     REQUIRE(yuzu::tar::backfill_proc_events_from_etl(missing, 1'000'000'000LL).empty());
 
     // A real file that is NOT a valid .etl (corrupt/torn trace) → the replay must
     // fail cleanly and return empty, never crash (the data dir is writable by the
     // service account, so a malformed file is a reachable input).
-    const std::string garbage = yuzu::test::unique_temp_path("tar-garbage").string();
+    const std::string garbage = yuzu::test::unique_temp_path("yuzu_test_tar_garbage_").string();
     {
         std::ofstream f(garbage, std::ios::binary);
         f << "this is not a valid ETL trace file";

@@ -41,6 +41,7 @@
 #include "tar_db.hpp"
 #include "tar_power_parsers.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
@@ -95,7 +96,7 @@ struct TestTarDb {
 
 TestTarDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_power_");
-    auto result = TarDatabase::open(tmp);
+    auto result = yuzu::test::open_tar_test_db(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
 }

@@ -14,6 +14,7 @@
 #include "tar_schema_registry.hpp"
 #include "tar_status_format.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -54,15 +55,18 @@ int64_t row_count(TarDatabase& db, const std::string& table) {
 // enabled, retention at t_now deletes the outside half only; with the source
 // disabled, retention preserves all 48.
 void seed_process_hourly(TarDatabase& db, int64_t t_now) {
+    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
     for (int h = 0; h < 48; ++h) {
         REQUIRE(db.execute_sql(std::format("INSERT INTO process_hourly "
                                            "(hour_ts,name,user,start_count,stop_count) "
                                            "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
                                            t_now - h * 3600)));
     }
+    REQUIRE(db.execute_sql("COMMIT"));
 }
 
 void seed_tcp_hourly(TarDatabase& db, int64_t t_now) {
+    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
     for (int h = 0; h < 48; ++h) {
         REQUIRE(db.execute_sql(std::format("INSERT INTO tcp_hourly "
                                            "(hour_ts,remote_addr,remote_port,proto,process_name,"
@@ -70,6 +74,7 @@ void seed_tcp_hourly(TarDatabase& db, int64_t t_now) {
                                            "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
                                            t_now - h * 3600)));
     }
+    REQUIRE(db.execute_sql("COMMIT"));
 }
 
 } // namespace
@@ -83,8 +88,8 @@ TEST_CASE("TAR retention: disabled source preserves hourly rows past cutoff",
     // per-source guard, two retention passes (t0+1h and t0+25h) drain
     // process_hourly entirely after the operator disables process_enabled
     // — even though the configure docstring promises queryability.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-issue539-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_issue539_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -108,8 +113,8 @@ TEST_CASE("TAR retention: enabled sources still age out past cutoff",
     // the #539 fix would silently disable retention everywhere. With the
     // 48-row centered seed, exactly the rows with hour_ts < (t_now -
     // retention_default) are deleted.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-issue539-enabled-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_issue539_enabled_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -136,8 +141,8 @@ TEST_CASE("TAR retention: re-enabling a source resumes retention", "[tar][retent
     // resume normal aging. The guard is purely config-driven, so flipping
     // <source>_enabled back to "true" must immediately re-arm time-based
     // retention on the next rollup tick.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-issue539-resume-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_issue539_resume_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -169,8 +174,8 @@ TEST_CASE("TAR retention: usage_daily_user prunes independently of usage_daily's
     // has nothing to do this pass, usage_daily_user still prunes its own
     // expired row on its own facts.
     yuzu::tar::RetentionGuardState guard;
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-usage-retention-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_usage_retention_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -212,8 +217,8 @@ TEST_CASE("TAR retention: usage_daily_user prunes independently of usage_daily's
 TEST_CASE("TAR paused_at: enabled→disabled writes the timestamp", "[tar][paused_at][pr-a]") {
     // Operator transitions process_enabled from default ("true") to "false"
     // — paused_at must record the wall-clock now passed to the helper.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-disable-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_pra_disable_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -234,8 +239,8 @@ TEST_CASE("TAR paused_at: disabled→enabled clears the timestamp to \"0\"",
     // distinguish "never paused" from "no key present"). The reverse
     // transition is the operator-journey close-out: freeze → export →
     // re-enable; the row drops out of the dashboard's retention-paused list.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-reenable-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_pra_reenable_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -259,8 +264,8 @@ TEST_CASE("TAR paused_at: recovering an errored source via =true clears the time
     // enabled=true alongside a paused timestamp (dashboard renders a collecting
     // source as paused). Both legs now gate on the canonical tri-state, so the
     // recovery clears paused_at. Pre-fix this CHECK held the stale 1735689600.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-errored-reenable-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_560_errored_reenable_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -289,8 +294,8 @@ TEST_CASE("TAR source_enabled: the destructive-purge paused-guard predicate (15.
     // would let a purge hit an actively-collecting source, or wrongly refuse a
     // paused one — is caught here even though do_purge_source itself lives in the
     // (test-unlinked) plugin TU. Governance B1.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-15a-guard-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_15a_guard_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -321,8 +326,8 @@ TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
     // already holds, paused_at must NOT advance — otherwise repeated
     // configure round-trips would pretend the pause is fresher than it is,
     // misleading the retention-paused list's "paused since" column.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-idem-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_pra_idem_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -338,8 +343,8 @@ TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
 TEST_CASE("TAR paused_at: per-source isolation", "[tar][paused_at][pr-a]") {
     // Disabling process must not touch tcp / service / user paused_at — the
     // PR-A retention-paused list relies on per-source rows being independent.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-iso-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_pra_iso_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -362,8 +367,8 @@ TEST_CASE("TAR paused_at: per-source isolation", "[tar][paused_at][pr-a]") {
 
 TEST_CASE("TAR #538: enabled→disabled clears the diff baseline state",
           "[tar][paused_at][issue538]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-clear-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_clear_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -385,8 +390,8 @@ TEST_CASE("TAR #538: disabling tcp clears the 'network' baseline key, not 'tcp'"
     // tcp's snapshot-diff baseline lives under "network" (diff_state_key). A
     // clear that targeted the literal source name "tcp" would be a silent no-op
     // and the ghost-death bug would survive — pin the mapping here.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-tcpmap-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_tcpmap_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -410,8 +415,8 @@ TEST_CASE("TAR #538: every snapshot-diff source clears its mapped baseline",
                           {"software", "software"},
                           {"arp", "arp"},         {"dns", "dns"}}; // ADR-0015 snapshot-diff sources
 
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-parity-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_parity_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -439,8 +444,8 @@ TEST_CASE("TAR #538: disabling one source does not clear another's baseline",
     // Cross-source isolation: a regression that cleared ALL keys instead of the
     // targeted one would still pass the per-source parity test above. Seed all
     // four side-by-side, disable one, assert only its key is wiped.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-xsrc-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_xsrc_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -465,8 +470,8 @@ TEST_CASE("TAR #538: a failed baseline clear leaves the source ENABLED (UP-1)",
     // baseline, which reintroduces ghost "stopped" events on re-enable while the
     // operator saw success. Inject a clear failure by dropping tar_state so the
     // set_state INSERT prepare fails.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-clearfail-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_clearfail_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -484,8 +489,8 @@ TEST_CASE("TAR #538: only the enable→disable TRANSITION clears (idempotent)",
     // The clear must fire on the transition, not on every false-write — a
     // repeated `configure ..._enabled=false` after a re-seed must NOT wipe a
     // freshly-rebuilt baseline (that would re-introduce the race by another door).
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-idem-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_idem_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -504,8 +509,8 @@ TEST_CASE("TAR #538: only the enable→disable TRANSITION clears (idempotent)",
 
 TEST_CASE("TAR #538: re-enable neither clears nor resurrects the baseline",
           "[tar][paused_at][issue538]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-reenable-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_reenable_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -581,8 +586,8 @@ TEST_CASE("TAR #538: disabling perf/procperf does not touch any baseline state",
           "[tar][paused_at][issue538]") {
     // perf/procperf keep an in-memory previous reading (out of scope for #538);
     // the transition must not error and must leave the state store untouched.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-538-perf-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_538_perf_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -602,8 +607,8 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     // process_enabled must not freeze tcp / service / user retention —
     // otherwise a future refactor could turn the per-source guard into a
     // global switch without deleting a named test.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-issue539-isolation-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_issue539_isolation_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -736,8 +741,8 @@ TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
     // array omitted it, so the registered rollup SQL was dead code) AND that
     // load_count counts only the 'loaded' action — a 'blocked' BYOVD load stays
     // full-fidelity in module_live but is excluded from the aggregate count.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-module-rollup-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_module_rollup_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -786,8 +791,8 @@ TEST_CASE("TAR rollup: procperf hourly aggregation keeps a kernel-thread and "
     // process sharing one `name` (the PF_KTHREAD-flag/comm-collision case,
     // UP-7) must fold into TWO hourly rows, not one mislabelled row that
     // silently mixes kernel-scheduling noise into a real app's numbers.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-procperf-rollup-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_procperf_rollup_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -834,8 +839,8 @@ TEST_CASE("TAR rollup: $Software live→daily→monthly counts by action",
     // the data-driven aggregator handles a non-uniform granularity set: daily
     // rolls from live and monthly rolls from daily in one pass. Each action gets
     // its own count column.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-software-rollup-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_software_rollup_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -894,8 +899,8 @@ TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition"
     // testable proxy for "tar.status reports module disabled while default-on
     // sources stay enabled" (do_status itself reads the same default_enabled
     // field but is not compiled into the unit-test exe).
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-default-off-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_default_off_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -930,8 +935,8 @@ TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never
     // that source's rows — otherwise a tampered or bit-flipped value would stop
     // collection (per the gate) yet still let run_retention prune the forensic
     // window the operator believes is paused, the exact breach #560/#559 guard.
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-560-retention-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_560_retention_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -1005,7 +1010,7 @@ void seed_process_monthly_at(TarDatabase& db, int64_t ts, int count) {
 }
 
 struct TarGuardFixture {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-2361-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_2361_"}};
     std::optional<TarDatabase> db;
     yuzu::tar::RetentionGuardState guard;
 
@@ -1019,7 +1024,7 @@ struct TarGuardFixture {
     // delete with no decline and then persist the bad clock (Sol adversarial
     // review). Tests about that bootstrap path pass false and assert the decline.
     explicit TarGuardFixture(bool prime_anchor = true) {
-        auto opened = TarDatabase::open(tmp.path);
+        auto opened = yuzu::test::open_tar_test_db(tmp.path);
         REQUIRE(opened.has_value());
         db.emplace(std::move(*opened));
         REQUIRE(db->create_warehouse_tables());
@@ -1279,6 +1284,7 @@ TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not decline
     // to break the count also breaks the delete that would follow it.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
     for (int h = 0; h < 20; ++h) {
         REQUIRE(f.db->execute_sql(
             std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
@@ -1286,6 +1292,7 @@ TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not decline
                         "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
                         kT0 - 10 * kHourlyCutoffSec)));
     }
+    REQUIRE(f.db->execute_sql("COMMIT"));
     REQUIRE(f.db->execute_sql("DROP TABLE process_hourly"));
 
     run_retention(*f.db, kT0, f.guard);
@@ -1691,6 +1698,7 @@ TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocom
     // tcp_hourly must be ACCEPTED (a survivor, so it is not declined) or it never
     // reaches the plan list and the leak this test hunts for cannot occur.
     auto seed_tcp = [&](int64_t ts, int n) {
+        REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
         for (int h = 0; h < n; ++h) {
             REQUIRE(f.db->execute_sql(
                 std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
@@ -1698,6 +1706,7 @@ TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocom
                             "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
                             ts)));
         }
+        REQUIRE(f.db->execute_sql("COMMIT"));
     };
     seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired
     seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
@@ -1728,6 +1737,7 @@ TEST_CASE("TAR #2361: a NON-aborting statement error fails one table, not the wh
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
     seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
     auto seed_tcp = [&](int64_t ts, int n) {
+        REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
         for (int h = 0; h < n; ++h) {
             REQUIRE(f.db->execute_sql(
                 std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
@@ -1735,6 +1745,7 @@ TEST_CASE("TAR #2361: a NON-aborting statement error fails one table, not the wh
                             "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
                             ts)));
         }
+        REQUIRE(f.db->execute_sql("COMMIT"));
     };
     seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired -> must still be deleted
     seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
@@ -1857,6 +1868,7 @@ TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside i
     // batch must not survive a later failing one.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
+    REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
     for (int h = 0; h < 4; ++h) {
         REQUIRE(f.db->execute_sql(
             std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
@@ -1864,6 +1876,7 @@ TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside i
                         "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
                         kT0 - 10 * kHourlyCutoffSec)));
     }
+    REQUIRE(f.db->execute_sql("COMMIT"));
     REQUIRE(f.db->set_config("pre_batch_write", "kept"));
     REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
                               "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
@@ -2382,7 +2395,7 @@ void install_fault(TarDatabase& db, const char* table, const char* col, const ch
 TEST_CASE("TAR #1654: a failed enabled-flag write rolls back the baseline clear",
           "[tar][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_flagfail_"}};
-    auto opened = TarDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2400,7 +2413,7 @@ TEST_CASE("TAR #1654: a failed enabled-flag write rolls back the baseline clear"
 TEST_CASE("TAR #1654: a failed baseline clear leaves the flag untouched (transactional)",
           "[tar][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_clearfail_"}};
-    auto opened = TarDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2416,7 +2429,7 @@ TEST_CASE("TAR #1654: a failed baseline clear leaves the flag untouched (transac
 TEST_CASE("TAR #1654: a failed paused_at write leaves an enable transition unapplied",
           "[tar][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_pausefail_"}};
-    auto opened = TarDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());
@@ -2432,7 +2445,7 @@ TEST_CASE("TAR #1654: a failed paused_at write leaves an enable transition unapp
 TEST_CASE("TAR #1654: in-function guard rejects unvalidated values and unknown sources",
           "[tar][paused_at][issue1654]") {
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_1654_guard_"}};
-    auto opened = TarDatabase::open(tmp.path);
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());

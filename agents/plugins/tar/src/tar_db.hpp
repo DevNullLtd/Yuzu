@@ -433,14 +433,31 @@ struct StateWrite {
     std::string json;
 };
 
+/// Optional knobs for `TarDatabase::open`. The all-defaults value reproduces the
+/// production open exactly, so the production call site passes nothing.
+struct TarOpenOptions {
+    /// TEST-ONLY. Issue `PRAGMA synchronous=OFF` on the read-write connection
+    /// before the WAL switch and schema DDL, so a unit test stops paying an
+    /// fsync per commit (~17 per bare open, ~4k per tar suite run). It drops the
+    /// durability guarantee of every commit on this connection, so it is ONLY
+    /// for scratch databases that are deleted at the end of the test. NEVER set
+    /// it for a store a real agent owns, nor in a test that exercises
+    /// durability, crash, corruption, integrity-check/quarantine or WAL
+    /// checkpoint behaviour. Default false == synchronous left at SQLite's
+    /// default (FULL); a pin test asserts that (test_tar_store.cpp).
+    bool relaxed_durability_for_tests{false};
+};
+
 class TarDatabase {
 public:
     /**
      * Open (or create) the TAR database at the given path.
      * Creates tables if they don't exist. Sets WAL mode, busy_timeout,
-     * and secure_delete pragmas.
+     * and secure_delete pragmas. `opts` defaults to the production behaviour
+     * (synchronous=FULL); see `TarOpenOptions`.
      */
-    static std::expected<TarDatabase, std::string> open(const std::filesystem::path& path);
+    static std::expected<TarDatabase, std::string> open(const std::filesystem::path& path,
+                                                        const TarOpenOptions& opts = {});
 
     ~TarDatabase();
 

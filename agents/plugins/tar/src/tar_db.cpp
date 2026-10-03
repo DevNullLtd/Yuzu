@@ -359,7 +359,8 @@ TarDatabase& TarDatabase::operator=(TarDatabase&& other) noexcept {
     return *this;
 }
 
-std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem::path& path) {
+std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem::path& path,
+                                                          const TarOpenOptions& opts) {
     // Ensure parent directory exists
     std::error_code ec;
     auto parent = path.parent_path();
@@ -435,8 +436,25 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         }
     }
 
-    // WAL mode for concurrent read performance -- required for correctness
+    // TEST-ONLY durability relaxation (TarOpenOptions). Per-connection and
+    // effective immediately, so it must precede the WAL switch and the schema
+    // DDL below, which are the fsync-heavy part of open(). Placed AFTER the
+    // integrity check / quarantine above: those never run relaxed. Default
+    // (production) leaves synchronous at SQLite's FULL.
     char* err_msg = nullptr;
+    if (opts.relaxed_durability_for_tests) {
+        rc = sqlite3_exec(raw_db, "PRAGMA synchronous=OFF", nullptr, nullptr, &err_msg);
+        if (rc != SQLITE_OK) {
+            std::string err = err_msg ? err_msg : "unknown";
+            sqlite3_free(err_msg);
+            sqlite3_close(raw_db);
+            return std::unexpected(std::format("failed to set synchronous=OFF: {}", err));
+        }
+        sqlite3_free(err_msg);
+        err_msg = nullptr;
+    }
+
+    // WAL mode for concurrent read performance -- required for correctness
     rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";

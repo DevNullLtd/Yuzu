@@ -19,6 +19,7 @@
 #include "tar_db.hpp"
 #include "tar_removable_parsers.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <yuzu/agent/process_enum.hpp>
 
@@ -68,7 +69,7 @@ struct TestTarDb {
 
 TestTarDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_removable_");
-    auto opened = TarDatabase::open(tmp);
+    auto opened = yuzu::test::open_tar_test_db(tmp);
     REQUIRE(opened.has_value());
     return TestTarDb{std::move(*opened), tmp};
 }

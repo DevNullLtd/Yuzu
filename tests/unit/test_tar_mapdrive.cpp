@@ -17,6 +17,7 @@
 #include "tar_db.hpp"
 #include "tar_mapdrive_macos_parsers.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -315,8 +316,8 @@ TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
 
 TEST_CASE("mapdrive insert: historical + live rows round-trip through TarDatabase",
           "[tar][mapdrive][db]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-mapdrive-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_mapdrive_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());

@@ -14,6 +14,7 @@
 #include "tar_db.hpp"               // TarDatabase
 #include "tar_sql_executor.hpp"     // validate_and_translate_sql
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -37,8 +38,8 @@ struct TestDb {
     }
 };
 TestDb make_db() {
-    auto tmp = yuzu::test::unique_temp_path("tar_appperf_");
-    auto r = TarDatabase::open(tmp);
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_appperf_");
+    auto r = yuzu::test::open_tar_test_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }

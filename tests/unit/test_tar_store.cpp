@@ -10,6 +10,7 @@
 #include "tar_netqual_boot.hpp"
 #include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -48,7 +49,7 @@ struct TestTarDb {
 
 static TestTarDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_");
-    auto result = TarDatabase::open(tmp);
+    auto result = yuzu::test::open_tar_test_db(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
 }
@@ -60,6 +61,39 @@ static TestTarDb make_test_db() {
 TEST_CASE("TarDatabase: open creates database file", "[tar][store][lifecycle]") {
     auto t = make_test_db();
     CHECK(fs::exists(t.path));
+}
+
+// Pin: the production open path must keep SQLite's default synchronous=FULL (2).
+// TarOpenOptions::relaxed_durability_for_tests exists ONLY so unit tests can skip
+// the per-commit fsync; if the default ever drifts to a relaxed value every real
+// agent's tar.db silently loses crash durability. SQLite reports synchronous as
+// 0=OFF 1=NORMAL 2=FULL 3=EXTRA. Both modes must still be WAL.
+TEST_CASE("TarDatabase: default open is synchronous=FULL; only the test option relaxes it",
+          "[tar][store][lifecycle][durability]") {
+    auto pragma_of = [](TarDatabase& db, const char* pragma) {
+        auto r = db.execute_query(std::string{"PRAGMA "} + pragma);
+        REQUIRE(r.has_value());
+        REQUIRE(r->rows.size() == 1);
+        return r->rows[0][0];
+    };
+
+    yuzu::test::TempDbFile prod_file{"yuzu_test_tar_sync_default_"};
+    auto prod = TarDatabase::open(prod_file.path); // no options: the production call shape
+    REQUIRE(prod.has_value());
+    CHECK(pragma_of(*prod, "synchronous") == "2");
+    CHECK(pragma_of(*prod, "journal_mode") == "wal");
+
+    yuzu::test::TempDbFile relaxed_file{"yuzu_test_tar_sync_relaxed_"};
+    auto relaxed = yuzu::test::open_tar_test_db(relaxed_file.path);
+    REQUIRE(relaxed.has_value());
+    CHECK(pragma_of(*relaxed, "synchronous") == "0");
+    CHECK(pragma_of(*relaxed, "journal_mode") == "wal");
+
+    // An explicitly default-constructed options object is the production shape too.
+    yuzu::test::TempDbFile explicit_file{"yuzu_test_tar_sync_explicit_"};
+    auto explicit_default = TarDatabase::open(explicit_file.path, TarOpenOptions{});
+    REQUIRE(explicit_default.has_value());
+    CHECK(pragma_of(*explicit_default, "synchronous") == "2");
 }
 
 TEST_CASE("TarDatabase: warehouse tables created on open", "[tar][store][lifecycle]") {
@@ -1318,7 +1352,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     // "new" table from a closed v3 DB, then reopening.
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_upg_");
     {
-        auto db = TarDatabase::open(tmp);
+        auto db = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(db.has_value());
     } // closed
 
@@ -1331,7 +1365,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     }
 
     {
-        auto db = TarDatabase::open(tmp); // must re-create the dropped table
+        auto db = yuzu::test::open_tar_test_db(tmp); // must re-create the dropped table
         REQUIRE(db.has_value());
         ProcPerfRow r;
         r.ts = 1;
@@ -1369,7 +1403,7 @@ TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
     // reached v3+, re-running the create resurrected the table with nothing left
     // to remove it. Every agent restart did this.
     { TarDatabase discard = std::move(t.db); }
-    auto reopened = TarDatabase::open(t.path);
+    auto reopened = yuzu::test::open_tar_test_db(t.path);
     REQUIRE(reopened.has_value());
     CHECK(reopened->schema_version() == 7);
     auto q2 = reopened->execute_query(count_sql);
@@ -1403,7 +1437,7 @@ TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
     }
 
     {
-        auto db = TarDatabase::open(tmp);
+        auto db = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(db.has_value());
         CHECK(db->schema_version() == 7); // the 2→3→4→5→6→7 walk ran
         auto q =
@@ -1431,7 +1465,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     {
         // A v4 database that already carries the resurrected table, exactly as a
         // pre-fix binary would have left it.
-        auto seeded = TarDatabase::open(tmp);
+        auto seeded = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(seeded.has_value());
         REQUIRE(seeded
                     ->execute_query("CREATE TABLE tar_events (id INTEGER PRIMARY KEY "
@@ -1443,7 +1477,7 @@ TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED data
     }
 
     {
-        auto db = TarDatabase::open(tmp);
+        auto db = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(db.has_value());
         CHECK(db->schema_version() == 7);
         auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
@@ -1520,7 +1554,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     }
 
     {
-        auto db = TarDatabase::open(tmp);
+        auto db = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(db.has_value());
         CHECK(db->schema_version() == 7); // the v3→v4→v5→v6→v7 walk ran
 
@@ -1582,7 +1616,7 @@ TEST_CASE("TarDatabase: schema v7 ALTERs is_kthread onto a pre-existing procperf
     }
 
     {
-        auto db = TarDatabase::open(tmp);
+        auto db = yuzu::test::open_tar_test_db(tmp);
         REQUIRE(db.has_value());
         CHECK(db->schema_version() == 7); // the v6→v7 walk ran
 

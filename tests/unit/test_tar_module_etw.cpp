@@ -10,6 +10,7 @@
 #include "tar_module_etw.hpp"
 #include "tar_module_stream.hpp"
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -275,8 +276,8 @@ TEST_CASE("ModuleEtwCollector is a clean no-op off-Windows", "[tar][module][etw]
 
 TEST_CASE("insert_module_events round-trips every column into module_live",
           "[tar][module][store]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"tar-module-insert-"}};
-    auto opened = TarDatabase::open(tmp.path);
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_tar_module_insert_"}};
+    auto opened = yuzu::test::open_tar_test_db(tmp.path);
     REQUIRE(opened.has_value());
     TarDatabase db = std::move(*opened);
     REQUIRE(db.create_warehouse_tables());

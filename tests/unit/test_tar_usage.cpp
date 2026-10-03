@@ -14,6 +14,7 @@
 #include "tar_usage.hpp"
 #include "tar_aggregator.hpp" // source_enabled
 #include "test_helpers.hpp"
+#include "test_tar_db_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -41,7 +42,7 @@ struct TestTarDb {
 
 TestTarDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_usage_");
-    auto result = TarDatabase::open(tmp);
+    auto result = yuzu::test::open_tar_test_db(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
 }
