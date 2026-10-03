@@ -73,8 +73,8 @@ Optional:
   --timeout-minutes N    total wall-clock budget (default: 60)
   --poll-seconds N       polling interval while waiting (default: 30)
   --expect-runner NAME   warn-only: label a completed run WARN if it didn't
-                         run on a runner whose name starts with NAME, so a
-                         pool prefix such as yuzu-bigtam-linux matches
+                         run on a runner named NAME or NAME-<digits>, so a
+                         pool name such as yuzu-bigtam-linux matches
                          yuzu-bigtam-linux-0..3 (helps catch "ran on GH-hosted
                          fallback" drift when the self-hosted runner was down)
   --repo OWNER/NAME      override the repo (default: from gh repo view)
@@ -281,7 +281,7 @@ if [[ -n "$EXPECT_RUNNER" ]]; then
         -q '.jobs[0].runner_name' 2>/dev/null || echo "")
     if [[ -z "$RUNNER_USED" ]]; then
         echo "dispatch-runner-job: warn — could not determine runner_name for run $NEW_RUN_ID"
-    elif [[ "$RUNNER_USED" != "$EXPECT_RUNNER"* ]]; then
+    elif [[ "$RUNNER_USED" != "$EXPECT_RUNNER" && "$RUNNER_USED" != "$EXPECT_RUNNER"-[0-9]* ]]; then
         echo "dispatch-runner-job: warn — ran on '$RUNNER_USED', expected '$EXPECT_RUNNER'"
     else
         echo "dispatch-runner-job: ran on expected runner $RUNNER_USED"
