@@ -166,10 +166,10 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    the runner NAME, not a label — would have queued forever; Shulgi's label is
    `yuzu-shulgi`. release.yml only runs at tag time, so the first Big Tam release
    is its real validation; note Big Tam ships RPM 6.0 vs Shulgi's 4.x.)
-6. **`.github/runner-inventory.json`** — **PENDING.** Remove `yuzu-wsl2-linux` and
-   `yuzu-local-windows` entirely (both retired); confirm the Big Tam + Wee Tam
-   roles are marked live. Until this lands the inventory sentinel flags the retired
-   runners as missing. No workflow gate depends on it — the pool gates are
+6. **`.github/runner-inventory.json`** — **DONE.** `yuzu-wsl2-linux` and
+   `yuzu-local-windows` removed (both retired); `proto-compat` and
+   `cache-prune-linux` pinned to `yuzu-bigtam-linux` so the bare-label jobs can no
+   longer land on a leftover registered Shulgi runner. The pool gates are
    label-driven, so retired runners just drop out (nothing gates on `all_healthy`).
 7. **`docs/ci-architecture.md`** — **DONE (2026-06-21, #1615).** Runner-topology
    table consolidated (Big Tam = all Linux, Wee Tam = all Windows, both retired

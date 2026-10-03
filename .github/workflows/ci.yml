@@ -535,11 +535,11 @@ jobs:
     name: "Proto backward-compat"
     needs: [preflight]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
-    # (yuzu-bigtam-* or the Shulgi fallback). Fail-closed `== 'true'`.
+    # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
     if: needs.preflight.outputs.linux_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
