@@ -107,10 +107,12 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_sup` | Top-level supervisor |
 | `yuzu_gw_agent_sup` | `simple_one_for_one` supervisor for agent processes |
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
-| `yuzu_gw_registry` | Process groups + ETS routing table |
+| `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
 | `yuzu_gw_router` | Command fanout coordinator |
 | `yuzu_gw_upstream` | gRPC client pool to the C++ server |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
+| `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read through the vendored grpcbox accessors |
+| `yuzu_gw_heartbeat_admission` | Admission decision for agent `Heartbeat` calls (session held by this node and call on the connection that opened it), rejection counters and the rate-limited summary log line |
 | `yuzu_gw_mgmt_service` | Operator-facing gRPC server (ManagementService proxy) |
 | `yuzu_gw_telemetry` | Telemetry event definitions and handlers |
 | `yuzu_gw_gauge` | Periodic gauge emission for Prometheus |
@@ -241,14 +243,26 @@ counters and the summary line.
 
 **Reading the counters.**
 
+- Symptom first: agents re-register every few minutes, or the server's online count
+  flickers. Check `yuzu_gw_heartbeat_session_mismatch_total` and the
+  `connection_mismatch=` count in the summary log line, then check the proxy topology
+  between the agents and `:50051`; use L4 or TLS passthrough.
 - `yuzu_gw_heartbeat_session_mismatch_total` that keeps rising for more than about
-  15 minutes points to a topology that breaks one connection per agent (an
-  HTTP/2-terminating proxy, or similar). A brief rise around agent reconnects is
-  churn.
+  15 minutes (a rule of thumb, not a measured value) points to a topology that breaks
+  one connection per agent (an HTTP/2-terminating proxy, or similar). A brief rise
+  around agent reconnects is expected but was not observed in testing: the counter
+  stayed at 0 through agent and gateway restarts in the rig runs.
 - `yuzu_gw_heartbeat_rejected_total{reason="unknown_session"}` rises by about one per
-  agent after a gateway registry restart or a node failover. Observed: after killing
-  the registry process with 4 agents attached the counter rose by 4, and all 4 agents
-  were admitted again within about 25 s.
+  agent after a gateway registry restart. Observed: after killing the registry process
+  with 4 agents attached the counter rose by 4, and all 4 agents were admitted again
+  within about 25 s. It is also expected to rise around a node failover, but that was
+  not observed in testing (multi-node was not tested).
+- `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or
+  the session it names, has no connection key to compare. Not observed in testing. Its
+  possible causes are a registration path that carries no connection key, or a
+  regression in the connection accessor (`yuzu_gw_conn` returns `undefined` when the
+  vendored grpcbox accessor fails, see `gateway/_checkouts/grpcbox/YUZU_PATCH.md`). The
+  decision is in `gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_admission.erl`.
 - `yuzu_gw_heartbeat_rejected_total{reason="registry_unavailable"}` stays at 0 on a
   gateway that was restarted to deploy this change. A non-zero value means the session
   index table was missing when a heartbeat arrived (new code loaded into a running
@@ -262,6 +276,14 @@ topology with only partial affinity, where an occasional heartbeat does land on 
 right connection, would be expected to keep retries frequent (inferred, not tested);
 and each retry is a registration through the gateway to the server. The back-off was
 observed with two agents only, and no storm test was run at fleet scale.
+
+**Health probes.** The shipped container healthchecks use `/healthz` (liveness).
+`/readyz` also reports `sessions_index` and answers 503 while the table is missing, so
+a load balancer that should drain such a node must probe `:8081/readyz`.
+
+**Rolling upgrades.** Restart one gateway node at a time behind an L4 balancer. Agents
+on a restarted node reconnect and re-register on their back-off. Multi-node behaviour
+is not tested.
 
 **Upgrading.** Deploy this change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
@@ -281,14 +303,28 @@ agents re-register on their own (agents older than 0.13.0 may need a restart, se
 check. This is derived from the change and was not run.
 
 **Tested configurations** (observed, with the rejection counters at 0): a real C++ agent over one-way TLS (it enrolled one-way, received a per-agent
-certificate and reconnected with mutual TLS; a second agent ran steady one-way TLS;
+certificate and then presented its client certificate; the listener does not require one; a second agent ran steady one-way TLS;
 the counters stayed at 0 through gateway, agent and server restarts; the listener
 advertises `h2` through NPN only and the agent connects without an ALPN error), a
 Windows agent (about 25 minutes, plaintext), the released agents v0.13.0 and
 v0.14.0-rc6 (plaintext), a 31-minute soak with 4 agents plus a run with 25 extra
-agents, and heartbeat intervals of 1 s, 2 s and 120 s. **Not tested:** a multi-node
-gateway, a listener that requires client certificates (the shipped listener does
-not), Windows service mode, a macOS agent, and fleet-scale storms.
+agents, and non-default agent heartbeat intervals.
+
+**Not tested with a real agent:** a multi-node gateway (a two-node registry unit test,
+`yuzu_gw_registry_multinode_tests`, exists), and a listener that requires client
+certificates (a test-client mutual TLS leg exists in
+`yuzu_gw_heartbeat_conn_rpc_tests`; the shipped listener does not require client
+certificates). **Not tested at all:** a multiplexing HTTP/2 proxy with upstream
+keepalive, Windows service mode, a macOS agent, fleet-scale storms, a real hot code
+load, and the real C++ agent across a `GOAWAY`.
+
+The rig runs used gateway commit `1c145d78a` (the first run, plaintext, ran on
+`2e884bb9b`, which differs from it only in tests and docs). Three later fix
+commits were not run on a rig and are covered by the eunit suite only: `605f117d2`
+(index guard), `3431d20ea` (`/readyz` `sessions_index`) and `026830cd9` (summary log
+state created at boot). The boot path of the final tip has not been exercised on a
+rig. The per-run record is in
+[the evidence record](../security-reviews/gateway-heartbeat-connection-binding-2026-10-03.md).
 
 ### Subscribe Stream Proxy
 
@@ -402,7 +438,8 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     %% Prometheus metrics HTTP port
     {prometheus_port, 9568},
 
-    %% Agent telemetry gauge emission interval (ms)
+    %% Agent telemetry gauge emission interval (ms); also the cadence of the
+    %% heartbeat-rejection summary log line
     {telemetry_gauge_interval_ms, 10000},
 
     %% Consistent hash ring: virtual nodes per physical node
@@ -860,7 +897,7 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 | `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent receives `NOT_FOUND` and re-registers. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
-| `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections, and briefly around agent reconnects. There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
+| `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections, and possibly around agent reconnects (expected, not observed in testing). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in

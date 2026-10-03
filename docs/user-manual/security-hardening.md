@@ -126,7 +126,7 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   spread one agent's calls over several connections (see
   [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
-  terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)) — never
+  terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
