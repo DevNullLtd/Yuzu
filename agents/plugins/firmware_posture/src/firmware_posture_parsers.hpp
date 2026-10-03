@@ -18,9 +18,10 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <constraint_accumulator.hpp>
+#include <wmi_error_token.hpp>
 
 #include <algorithm>
-#include <charconv>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -44,6 +45,14 @@ inline constexpr std::string_view kSrcSysctl = "sysctl";
 inline constexpr std::string_view kAbsent = "absent";
 inline constexpr std::string_view kUnreadable = "unreadable";
 inline constexpr std::string_view kUnavailable = "unavailable";
+
+/// The field set wmi_bios_rows always emits (a failed read marks each `unreadable`).
+inline constexpr std::array<std::string_view, 3> kBiosFields = {"vendor", "version", "release_date"};
+
+/// Every field smbios_rows can emit: a failed SMBIOS read cannot tell which optional fields the
+/// firmware specified, so each is `unreadable` rather than silently omitted.
+inline constexpr std::array<std::string_view, 6> kSmbiosFields = {
+    "vendor", "version", "release_date", "rom_size_bytes", "bios_release", "ec_release"};
 
 /// A firmware fact plus its read state: `value` = data; else `unreadable` = the read failed,
 /// otherwise the OS reported nothing (absent).
@@ -97,64 +106,9 @@ enum class ReadOutcome { ok, absent, denied, failed };
     return ReadOutcome::failed;
 }
 
-/// WMI / COM HRESULT bit patterns: WBEM_E_ACCESS_DENIED / E_ACCESSDENIED are refusals; a
-/// missing namespace, class or object (0x8004100E, 0x80041010, 0x80041002) is absence. This is
-/// the meaning of the bare HRESULT only: whether a given wmi_bounded token may read `absent` also
-/// depends on the STAGE that produced it (classify_wmi_error_token).
-[[nodiscard]] constexpr ReadOutcome classify_hresult(std::uint32_t hr) noexcept {
-    if (hr == 0) return ReadOutcome::ok;
-    if (hr == 0x80041003u || hr == 0x80070005u) return ReadOutcome::denied;
-    if (hr == 0x8004100Eu || hr == 0x80041010u || hr == 0x80041002u) return ReadOutcome::absent;
-    return ReadOutcome::failed;
-}
-
-/// The HRESULT a wmi_bounded error token ends in (`..._0x<8 hex digits>`, e.g.
-/// wmi_connect_failed_0x80041003), or nullopt for a token that carries none (com_init_failed,
-/// wmi_deadline_exceeded, ...). Extraction only: what the HRESULT means is classify_hresult's job.
-[[nodiscard]] inline std::optional<std::uint32_t> hresult_from_token(std::string_view token) noexcept {
-    constexpr std::size_t kTail = 10; // "0x" + 8 hex digits
-    if (token.size() < kTail) return std::nullopt;
-    const char* first = token.data() + token.size() - kTail;
-    if (first[0] != '0' || first[1] != 'x') return std::nullopt;
-    std::uint32_t hr = 0;
-    const char* last = token.data() + token.size();
-    const auto [ptr, ec] = std::from_chars(first + 2, last, hr, 16);
-    if (ec != std::errc{} || ptr != last) return std::nullopt;
-    return hr;
-}
-
-/// Classifies a wmi_bounded error token, STAGE-AWARE. A refusal HRESULT is `denied` at every
-/// stage; a token with no HRESULT is `failed`. `absent` is exactly the two answers WMI gives when
-/// the thing really is missing, and nothing else:
-///   - WBEM_E_INVALID_NAMESPACE (0x8004100E) from `wmi_connect_failed_*`: the namespace is not
-///     there (a namespace is resolved at ConnectServer);
-///   - WBEM_E_INVALID_CLASS (0x80041010) from `wmi_query_failed_*`, or from `wmi_next_failed_*`
-///     when NO row had been returned before the failure (`rows_before_error == 0`): the class is
-///     not there. The query runs semisynchronously (FORWARD_ONLY | RETURN_IMMEDIATELY), so
-///     ExecQuery can succeed without resolving the class and the answer then arrives at the
-///     first Next(); tests/unit/test_wmi_bounded.cpp records that WQL validation is deferred to
-///     Next(), and a probe on the rig saw a non-existent class fail at Next with InvalidClass
-///     (issue #4900 tracks a committed real-WMI test). The same answer after a row WAS returned
-///     cannot mean "the class is missing" (the class just answered), so it reads `failed`: the
-///     token carries no iteration index, so the caller passes the count wmi_bounded records.
-/// Every other absence-looking HRESULT is a FAULT and reads `failed`: WBEM_E_NOT_FOUND
-/// (0x80041002) anywhere (Microsoft lists it at connect as a repository-corruption symptom), and
-/// INVALID_NAMESPACE / INVALID_CLASS at a stage that cannot legitimately produce them. The
-/// proxy-blanket stage (CoSetProxyBlanket, after connect and before the query) carries no WBEM
-/// schema answer, so it never reads `absent`. A damaged repository that presents AS one of the two
-/// answers is indistinguishable from a real absence (README caveat 4; decision in #4900).
-[[nodiscard]] inline ReadOutcome
-classify_wmi_error_token(std::string_view token, std::size_t rows_before_error = 0) noexcept {
-    const auto hr = hresult_from_token(token);
-    const ReadOutcome o = hr ? classify_hresult(*hr) : ReadOutcome::failed;
-    if (o != ReadOutcome::absent) return o == ReadOutcome::ok ? ReadOutcome::failed : o;
-    if (token.starts_with("wmi_connect_failed_") && *hr == 0x8004100Eu) return ReadOutcome::absent;
-    if (*hr == 0x80041010u &&
-        (token.starts_with("wmi_query_failed_") ||
-         (token.starts_with("wmi_next_failed_") && rows_before_error == 0)))
-        return ReadOutcome::absent;
-    return ReadOutcome::failed;
-}
+/// The stage-aware WMI token classifier is shared (agents/shared/wmi_error_token.hpp); this
+/// plugin only maps its outcome onto ReadOutcome (apply_wmi_error_token).
+using yuzu::shared::wmi_token::classify_wmi_error_token;
 
 /// Everything a leg gathered: rows to write plus the failure accounting.
 struct FirmwareReport {
@@ -173,6 +127,14 @@ struct FirmwareReport {
     void fail(std::string_view field, std::string_view source, std::string_view token,
               bool was_denied = false) {
         rows.push_back({std::string{field}, std::string{kUnreadable}, std::string{source}});
+        constraints.add_failure(token);
+        denied = denied || was_denied;
+    }
+    /// A failed read of a whole source: one `unreadable` row per field, one token.
+    void fail_all(std::span<const std::string_view> fields, std::string_view source,
+                  std::string_view token, bool was_denied = false) {
+        for (const auto f : fields)
+            rows.push_back({std::string{f}, std::string{kUnreadable}, std::string{source}});
         constraints.add_failure(token);
         denied = denied || was_denied;
     }
@@ -420,27 +382,38 @@ struct Smbios0Result {
 }
 
 /// vendor/version/release_date always (absent when no string); the rest only when specified,
-/// UNLESS `unreadable` says the read itself failed (DMI's bios_release only -- SMBIOS's binary
-/// major/minor bytes have no separate read step to fail, so its call site never sets this).
-inline void add_release(std::vector<FirmwareRow>& out, const char* field, std::optional<unsigned> major,
+/// UNLESS `unreadable` says the read itself failed (DMI's bios_release). Exactly one of
+/// major/minor present is a malformed pair: an `unreadable` row, and the return is true so the
+/// caller records a `<source>:<field>:partial` token (never silently dropped).
+inline bool add_release(std::vector<FirmwareRow>& out, const char* field, std::optional<unsigned> major,
                         std::optional<unsigned> minor, std::string_view source,
                         bool unreadable = false) {
-    if (major && minor)
+    if (major && minor) {
         out.push_back({field, std::to_string(*major) + '.' + std::to_string(*minor), std::string{source}});
-    else if (unreadable)
+        return false;
+    }
+    const bool partial = major.has_value() != minor.has_value();
+    if (unreadable || partial)
         out.push_back({field, std::string{kUnreadable}, std::string{source}});
+    return partial;
 }
 
+/// `partial` (optional) receives `<source>:<field>:partial` for each half-specified release pair.
 [[nodiscard]] inline std::vector<FirmwareRow> smbios_rows(const Smbios0& d,
-                                                          std::string_view source = kSrcSmbios) {
+                                                          std::string_view source = kSrcSmbios,
+                                                          std::vector<std::string>* partial = nullptr) {
     std::vector<FirmwareRow> out;
     out.push_back(field_row("vendor", d.vendor, source));
     out.push_back(field_row("version", d.version, source));
     out.push_back(date_row(d.release_date, source));
     if (d.rom_size_bytes)
         out.push_back({"rom_size_bytes", std::to_string(*d.rom_size_bytes), std::string{source}});
-    add_release(out, "bios_release", d.bios_major, d.bios_minor, source);
-    add_release(out, "ec_release", d.ec_major, d.ec_minor, source);
+    auto rel = [&](const char* f, std::optional<unsigned> ma, std::optional<unsigned> mi) {
+        if (add_release(out, f, ma, mi, source) && partial)
+            partial->push_back(std::string{source} + ':' + f + ":partial");
+    };
+    rel("bios_release", d.bios_major, d.bios_minor);
+    rel("ec_release", d.ec_major, d.ec_minor);
     return out;
 }
 
@@ -490,7 +463,8 @@ struct DmiInfo {
     out.push_back(field_row("vendor", d.vendor, kSrcDmi));
     out.push_back(field_row("version", d.version, kSrcDmi));
     out.push_back(date_row(d.release_date, kSrcDmi));
-    add_release(out, "bios_release", d.bios_major, d.bios_minor, kSrcDmi, d.release_unreadable);
+    add_release(out, "bios_release", d.bios_major, d.bios_minor, kSrcDmi,
+                d.release_unreadable || d.release_malformed);
     return out;
 }
 
@@ -595,14 +569,30 @@ struct FwupdRows {
     return {"update_pending", std::string{kUnavailable}, std::string{kSrcFwupd}};
 }
 
+/// `dbus_<name>` token suffix from a D-Bus error name: the last `.`-segment, lowercased, every
+/// non-[a-z0-9] byte -> `_`, at most 32 bytes (the token is rendered into a pipe-delimited reason).
+[[nodiscard]] inline std::string dbus_error_suffix(std::string_view name) {
+    if (const auto dot = name.rfind('.'); dot != std::string_view::npos) name.remove_prefix(dot + 1);
+    std::string o;
+    for (const char c : name.substr(0, 32)) {
+        const char l = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        o += ((l >= 'a' && l <= 'z') || (l >= '0' && l <= '9')) ? l : '_';
+    }
+    return "dbus_" + o;
+}
+
 /// The pure half of the Linux leg's failed-D-Bus-call handling: maps an already-classified outcome
 /// onto the report. `what` is the failing call (bus_open, get_devices, ...) and `errno_tok` the
-/// caller-formatted errno name (kept in the leg: it is platform vocabulary). Returns true when the
+/// caller-formatted errno name (kept in the leg: it is platform vocabulary); a `failed` outcome that
+/// carries a non-empty D-Bus error name records `dbus_<name>` instead of the errno (a named error
+/// with EACCES stays `failed` by design -- classify_fwupd_error's empty-name gate -- now with the
+/// name visible). Returns true when the
 /// caller continues to the row mapper (NothingToDo: a reachable daemon with no devices); false
 /// when the outcome was final (row and/or token already recorded). `unavailable` writes the row
 /// alone with NO token; `failed` and `denied` write an `unreadable` row plus a token.
 [[nodiscard]] inline bool apply_fwupd_failure(FirmwareReport& report, FwupdOutcome outcome,
-                                              std::string_view what, std::string_view errno_tok) {
+                                              std::string_view what, std::string_view errno_tok,
+                                              std::string_view dbus_name = {}) {
     switch (outcome) {
     case FwupdOutcome::no_devices:
         return true;
@@ -615,7 +605,8 @@ struct FwupdRows {
         return false;
     case FwupdOutcome::failed:
         report.fail("update_pending", kSrcFwupd,
-                    "fwupd:" + std::string{what} + ":" + std::string{errno_tok});
+                    "fwupd:" + std::string{what} + ":" +
+                        (dbus_name.empty() ? std::string{errno_tok} : dbus_error_suffix(dbus_name)));
         return false;
     }
     return false;
@@ -636,10 +627,11 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
 
 /// The pure half of the Linux leg's failed GetUpgrades handling (one call per updatable device).
 /// Returns true when the daemon answered NothingToDo (no upgrade offered): the caller records
-/// HasUpgrades=false. Every other outcome records a token (no row: the device row comes from the
+/// HasUpgrades=false. A `failed` outcome with a D-Bus error name records `dbus_<name>`. Every other outcome records a token (no row: the device row comes from the
 /// mapper) and returns false; `unavailable` and `failed` are the same mid-run failure here.
 [[nodiscard]] inline bool apply_upgrades_failure(FirmwareReport& report, FwupdOutcome outcome,
-                                                 std::string_view errno_tok) {
+                                                 std::string_view errno_tok,
+                                                 std::string_view dbus_name = {}) {
     switch (outcome) {
     case FwupdOutcome::no_devices:
         return true;
@@ -648,7 +640,10 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
         return false;
     case FwupdOutcome::unavailable:
     case FwupdOutcome::failed:
-        report.note_failure("fwupd:get_upgrades:" + std::string{errno_tok});
+        report.note_failure("fwupd:get_upgrades:" +
+                            (outcome == FwupdOutcome::failed && !dbus_name.empty()
+                                 ? dbus_error_suffix(dbus_name)
+                                 : std::string{errno_tok}));
         return false;
     }
     return false;
@@ -657,30 +652,35 @@ inline void record_dmi_read_error(FirmwareReport& report, std::vector<std::strin
 /// The pure half of the Windows leg's failed WMI query: classifies the wmi_bounded error token
 /// (classify_wmi_error_token, given the rows read before the failure) and maps it onto the report.
 /// `absent` writes the explicit absent rows with NO token (a definitive absence is a row, never
-/// silence); a refusal or any other failure writes an `unreadable` vendor row plus
-/// `wmi:<token>`, and a refusal sets the denial flag. `rows_before_error` has no default: a call
+/// silence); a refusal or any other failure writes `unreadable` vendor/version/release_date
+/// rows plus `wmi:<token>`, and a refusal sets the denial flag. `rows_before_error` has no default: a call
 /// that left it out would read a fault after a returned row as an absence.
 inline void apply_wmi_error_token(FirmwareReport& report, std::string_view token,
                                   std::size_t rows_before_error) {
-    const ReadOutcome o = classify_wmi_error_token(token, rows_before_error);
+    using yuzu::shared::wmi_token::WmiReadOutcome;
+    const WmiReadOutcome w = classify_wmi_error_token(token, rows_before_error);
+    const ReadOutcome o = w == WmiReadOutcome::absent   ? ReadOutcome::absent
+                          : w == WmiReadOutcome::denied ? ReadOutcome::denied
+                                                        : ReadOutcome::failed;
     if (o == ReadOutcome::absent) {
         report.add_all(wmi_bios_rows({}));
         return;
     }
-    report.fail("vendor", kSrcWmi, "wmi:" + std::string{token}, o == ReadOutcome::denied);
+    report.fail_all(kBiosFields, kSrcWmi, "wmi:" + std::string{token},
+                    o == ReadOutcome::denied);
 }
 
 /// The pure half of the Windows leg's failed GetSystemFirmwareTable call: classifies the Win32
 /// error. `absent` (no RSMB provider) writes the explicit absent rows with NO token; a refusal or
-/// any other failure writes an `unreadable` vendor row plus `smbios:win32_<n>`.
+/// any other failure writes `unreadable` rows for every SMBIOS field plus `smbios:win32_<n>`.
 inline void apply_smbios_call_failed(FirmwareReport& report, std::uint32_t err) {
     const ReadOutcome o = classify_win32_error(err);
     if (o == ReadOutcome::absent) {
         report.add_all(smbios_rows(Smbios0{}));
         return;
     }
-    report.fail("vendor", kSrcSmbios, "smbios:win32_" + std::to_string(err),
-                o == ReadOutcome::denied);
+    report.fail_all(kSmbiosFields, kSrcSmbios, "smbios:win32_" + std::to_string(err),
+                    o == ReadOutcome::denied);
 }
 
 struct DtNode {
@@ -688,7 +688,7 @@ struct DtNode {
     std::vector<std::string> undecodable;     // present but not text (wrong type / binary)
     // true when IORegistryEntryFromPath itself returned MACH_PORT_NULL: the node either does not
     // exist, or an indistinguishable IOKit-level failure occurred (see select_macos_firmware --
-    // this flag is how the two are told apart, using hw.model as the second signal). A node that
+    // this flag is how the two are told apart, using hw.optional.arm64 as the second signal). A node that
     // was found but is simply empty (no properties at all) is NOT this case and carries `false`.
     bool lookup_failed = false;
 };
@@ -697,19 +697,11 @@ inline constexpr std::string_view kDtRom = "IODeviceTree:/rom";
 inline constexpr std::string_view kDtChosen = "IODeviceTree:/chosen";
 inline constexpr std::string_view kDtRoot = "IODeviceTree:/";
 
-/// Apple Silicon model identifiers are bare "Mac" + digits, e.g. "Mac16,10". Every Intel model name
-/// has a product-family word between "Mac" and the digits: "MacBookPro16,1", "Macmini8,1",
-/// "MacPro7,1". An empty or unrecognised string (including a genuinely unreadable hw.model) can't
-/// be classified either way and returns false -- the caller then treats it like Intel, so an
-/// unexplained failure is never misread as an architecturally-expected absence.
-[[nodiscard]] inline bool is_apple_silicon_model(std::string_view model) {
-    return model.size() > 3 && model.substr(0, 3) == "Mac" &&
-           model[3] >= '0' && model[3] <= '9';
-}
-
 /// Whether a failed node lookup is the architecturally-expected case (Apple Silicon has no /rom)
 /// rather than a real, unexplained IOKit failure. /chosen and / (device-tree root) exist on every
 /// real Mac of either architecture, so only /rom on Apple Silicon is ever legitimately absent.
+/// The architecture signal is `hw.optional.arm64`; nullopt (unreadable) reads as Intel, so an
+/// unexplained failure is never misread as an architecturally-expected absence.
 [[nodiscard]] inline bool node_absence_is_expected(std::string_view node_path, bool apple_silicon) {
     return node_path == kDtRom && apple_silicon;
 }
@@ -739,14 +731,14 @@ struct MacosSelection {
 /// vendor is the device-tree root `manufacturer`. A key that exists but did not decode as text
 /// makes that field `unreadable`, never `absent` -- and so does a node whose own lookup failed,
 /// UNLESS that specific node's absence is architecturally expected (only `/rom` on Apple Silicon;
-/// `/chosen` and `/` are never legitimately absent on any real Mac). `hw_model` is the second
-/// signal a bare failed `IORegistryEntryFromPath` call can't provide on its own.
+/// `/chosen` and `/` are never legitimately absent on any real Mac). `arm64` (hw.optional.arm64) is
+/// the second signal a bare failed `IORegistryEntryFromPath` call can't provide on its own.
 [[nodiscard]] inline MacosSelection select_macos_firmware(const DtNode& rom, const DtNode& chosen,
-                                                          const DtNode& root, const Field& hw_model) {
+                                                          const DtNode& root,
+                                                          std::optional<bool> arm64) {
     MacosSelection s;
     s.version_source = std::string{kAbsent};
-    const bool apple_silicon =
-        hw_model.value && is_apple_silicon_model(*hw_model.value);
+    const bool apple_silicon = arm64.value_or(false);
     auto has = [](const std::vector<std::string>& v, const char* k) {
         return std::find(v.begin(), v.end(), k) != v.end();
     };
@@ -772,6 +764,7 @@ struct MacosSelection {
     take(s.vendor, root, kDtRoot, "manufacturer");
     if (s.vendor.value) s.vendor.unreadable = false;
     if (s.release_date.value) s.release_date.unreadable = false;
+    if (s.version.unreadable) s.version_source = std::string{kUnreadable};
     return s;
 }
 

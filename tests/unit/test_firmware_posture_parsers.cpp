@@ -16,6 +16,7 @@
 
 #include "firmware_posture_parsers.hpp"
 
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -402,20 +403,13 @@ TEST_CASE("normalize_release_date: CIM-datetime fractional-second and UTC-offset
 
 // ── read classification and the shared verdict ───────────────────────────
 
-TEST_CASE("classify_errno / win32 / hresult / fwupd pin exact cases", "[firmware_posture]") {
+TEST_CASE("classify_errno / win32 / fwupd pin exact cases", "[firmware_posture]") {
     CHECK(classify_win32_error(2) == ReadOutcome::absent);   // ERROR_FILE_NOT_FOUND
     CHECK(classify_win32_error(3) == ReadOutcome::absent);   // ERROR_PATH_NOT_FOUND
     CHECK(classify_win32_error(5) == ReadOutcome::denied);   // ERROR_ACCESS_DENIED
     CHECK(classify_win32_error(122) == ReadOutcome::failed); // ERROR_INSUFFICIENT_BUFFER
     CHECK(classify_win32_error(267) == ReadOutcome::failed); // ERROR_DIRECTORY: the ENOTDIR analogue, never absence
     CHECK(classify_win32_error(0) == ReadOutcome::ok);
-    CHECK(classify_hresult(0) == ReadOutcome::ok);
-    CHECK(classify_hresult(0x80041003u) == ReadOutcome::denied);  // WBEM_E_ACCESS_DENIED
-    CHECK(classify_hresult(0x80070005u) == ReadOutcome::denied);  // E_ACCESSDENIED
-    CHECK(classify_hresult(0x8004100Eu) == ReadOutcome::absent);  // WBEM_E_INVALID_NAMESPACE
-    CHECK(classify_hresult(0x80041010u) == ReadOutcome::absent);  // WBEM_E_INVALID_CLASS
-    CHECK(classify_hresult(0x80041002u) == ReadOutcome::absent);  // WBEM_E_NOT_FOUND
-    CHECK(classify_hresult(0x80004005u) == ReadOutcome::failed);  // E_FAIL
     CHECK(classify_errno(0) == ReadOutcome::ok);
     CHECK(classify_errno(2) == ReadOutcome::absent);  // ENOENT
     CHECK(classify_errno(20) == ReadOutcome::failed); // ENOTDIR: a malformed path, never absence
@@ -535,65 +529,8 @@ TEST_CASE("record_dmi_read_error: ENOENT is silent absence; ENOTDIR and EACCES a
     }
 }
 
-TEST_CASE("hresult_from_token: extracts only a trailing 0x<8 hex digits>", "[firmware_posture]") {
-    CHECK(hresult_from_token("wmi_connect_failed_0x80041003") == std::optional<std::uint32_t>{0x80041003u});
-    CHECK(hresult_from_token("x_0x8004100E") == std::optional<std::uint32_t>{0x8004100Eu});
-    CHECK_FALSE(hresult_from_token("wmi_deadline_exceeded").has_value());
-    CHECK_FALSE(hresult_from_token("com_init_failed").has_value());
-    CHECK_FALSE(hresult_from_token("wmi_query_failed_0x8004100").has_value()); // 7 digits
-    CHECK_FALSE(hresult_from_token("wmi_query_failed_0x8004100g").has_value());
-    CHECK_FALSE(hresult_from_token("wmi_query_failed_80041002").has_value());    // no 0x
-    CHECK_FALSE(hresult_from_token("wmi_query_failed_0x80041002_x").has_value()); // not at the tail
-    CHECK_FALSE(hresult_from_token("").has_value());
-}
-
-// The stage-aware WMI error classification. Fails under: any absence-looking HRESULT reading as a
-// definitive `absent` with no token where WMI is not actually answering "missing" (NOT_FOUND
-// anywhere, an enumeration-stage NOT_FOUND / INVALID_NAMESPACE, a connect-stage INVALID_CLASS);
-// and, in the other direction, under losing the `absent` the earlier governance contract
-// (FV-CODEX-01) requires for a MISSING namespace (INVALID_NAMESPACE at connect) or class
-// (INVALID_CLASS at query, or at the first Next(): the query is semisynchronous, see
-// tests/unit/test_wmi_bounded.cpp, so a missing class can arrive there); and under granting
-// `absent` to INVALID_CLASS at a Next() that follows a returned row.
-TEST_CASE("classify_wmi_error_token: absent only for the two answers WMI gives when something is missing",
-          "[firmware_posture]") {
-    // exactly three cells read absent
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x8004100e") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010") == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010") == ReadOutcome::absent);
-    // NOT_FOUND is never a "missing" answer here: Microsoft lists it as a repository-corruption symptom
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041002") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041002") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041002") == ReadOutcome::failed);
-    // a namespace answer at a stage that cannot produce it, and a class answer at connect
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80041010") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x8004100e") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x8004100e") == ReadOutcome::failed);
-    // INVALID_CLASS at Next() after a row was already returned: the class just answered, so this is
-    // a fault, never absence (the token has no iteration index; wmi_bounded records the row count)
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 0) == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 1) == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041010", 512) == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_0x80041010", 0) == ReadOutcome::absent);
-    CHECK(classify_wmi_error_token("wmi_next_failed_0x80041003", 3) == ReadOutcome::denied);
-    // the proxy blanket runs before the query and carries no WBEM schema answer
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041002") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x80041010") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_proxy_blanket_failed_0x8004100e") == ReadOutcome::failed);
-    // A refusal is a refusal at every stage.
-    for (const char* stage : {"wmi_connect_failed_", "wmi_query_failed_", "wmi_proxy_blanket_failed_",
-                              "wmi_next_failed_"}) {
-        INFO(stage);
-        CHECK(classify_wmi_error_token(std::string{stage} + "0x80041003") == ReadOutcome::denied);
-        CHECK(classify_wmi_error_token(std::string{stage} + "0x80070005") == ReadOutcome::denied);
-    }
-    // No HRESULT, an unrelated HRESULT, or an HRESULT of 0: always a failed read.
-    CHECK(classify_wmi_error_token("wmi_deadline_exceeded") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("com_init_failed") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_query_failed_no_in_signature") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x80004005") == ReadOutcome::failed);
-    CHECK(classify_wmi_error_token("wmi_connect_failed_0x00000000") == ReadOutcome::failed);
-}
+// hresult_from_token / classify_hresult / classify_wmi_error_token live in agents/shared/
+// wmi_error_token.hpp and are pinned by tests/unit/test_wmi_error_token.cpp.
 
 // The Windows failed-WMI mapping the leg applies. Fails under: a runtime fault (NOT_FOUND at any
 // stage) writing the explicit absent rows with no token (the false absence the governance review
@@ -613,7 +550,7 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
     {   // one row came back, THEN the enumeration failed with INVALID_CLASS: a fault, never absence
         FirmwareReport rep;
         apply_wmi_error_token(rep, "wmi_next_failed_0x80041010", 1);
-        REQUIRE(rep.rows.size() == 1);
+        REQUIRE(rep.rows.size() == 3); // one unreadable row per field
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
         const auto v = select_verdict(rep.constraints, rep.denied);
         CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
@@ -629,14 +566,14 @@ TEST_CASE("apply_wmi_error_token: absent rows only for a missing namespace or cl
     {   // NOT_FOUND at connect (a repository-corruption symptom): one unreadable row and a token
         FirmwareReport rep;
         apply_wmi_error_token(rep, "wmi_connect_failed_0x80041002", 0);
-        REQUIRE(rep.rows.size() == 1);
+        REQUIRE(rep.rows.size() == 3); // one unreadable row per field
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "wmi:wmi_connect_failed_0x80041002");
     }
     {   // a runtime fault at enumeration: one unreadable row and a token, never absent
         FirmwareReport rep;
         apply_wmi_error_token(rep, "wmi_next_failed_0x80041002", 0);
-        REQUIRE(rep.rows.size() == 1);
+        REQUIRE(rep.rows.size() == 3); // one unreadable row per field
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|wmi");
         const auto v = select_verdict(rep.constraints, rep.denied);
         CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
@@ -672,7 +609,7 @@ TEST_CASE("apply_smbios_call_failed: no RSMB provider is an explicit absent row;
     {   // ERROR_ACCESS_DENIED (5): refusal
         FirmwareReport rep;
         apply_smbios_call_failed(rep, 5);
-        REQUIRE(rep.rows.size() == 1);
+        REQUIRE(rep.rows.size() == 6); // one unreadable row per SMBIOS field
         CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|smbios");
         CHECK(rep.denied);
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "smbios:win32_5");
@@ -681,7 +618,7 @@ TEST_CASE("apply_smbios_call_failed: no RSMB provider is an explicit absent row;
         for (std::uint32_t e : {122u, 267u, 1168u}) {
             FirmwareReport rep;
             apply_smbios_call_failed(rep, e);
-            REQUIRE(rep.rows.size() == 1);
+            REQUIRE(rep.rows.size() == 6); // one unreadable row per SMBIOS field
             CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|smbios");
             const auto v = select_verdict(rep.constraints, rep.denied);
             CHECK(v.status == YUZU_RESULT_STATUS_CONSTRAINED);
@@ -832,7 +769,7 @@ TEST_CASE("select_macos_firmware: REAL CAPTURE Apple Silicon takes /chosen syste
     // unexplained failure on /chosen or / (which the next test case covers).
     const auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true),
                                          dt_node(&cap.at("IODeviceTree:/chosen")),
-                                         dt_node(&cap.at("IODeviceTree:/")), model);
+                                         dt_node(&cap.at("IODeviceTree:/")), true);
     CHECK(*s.version.value == "mBoot-18000.161.10");
     CHECK(s.version_source == "IODeviceTree:/chosen#system-firmware-version");
     CHECK(*s.vendor.value == "Apple Inc.");
@@ -853,15 +790,12 @@ TEST_CASE("select_macos_firmware: REAL CAPTURE Apple Silicon takes /chosen syste
 // node falls through to plain absent again.
 TEST_CASE("select_macos_firmware: a failed /chosen or / lookup is always unreadable, never absent",
           "[firmware_posture][macos]") {
-    Field apple_silicon_model;
-    apple_silicon_model.value = "Mac16,10";
-
     // /chosen lookup failure on Apple Silicon: still unreadable, NOT absent -- /chosen is never
     // legitimately missing on any real Mac, so the architecture gate must not cover it.
     {
         const auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true),
                                              dt_node(nullptr, /*lookup_failed=*/true), DtNode{},
-                                             apple_silicon_model);
+                                             true);
         CHECK((!s.version.value.has_value() && s.version.unreadable));
     }
     // / (root) lookup failure: vendor becomes unreadable, not absent, even with a valid /rom
@@ -870,37 +804,21 @@ TEST_CASE("select_macos_firmware: a failed /chosen or / lookup is always unreada
         DtNode rom;
         rom.props = {{"version", "MBP141.88Z.F000.B00.1904"}};
         const auto s = select_macos_firmware(rom, DtNode{}, dt_node(nullptr, /*lookup_failed=*/true),
-                                             Field{});
+                                             std::nullopt);
         CHECK((!s.vendor.value.has_value() && s.vendor.unreadable));
     }
-    // /rom lookup failure on an INTEL Mac (or an unreadable/absent hw.model) is NOT
+    // /rom lookup failure on an INTEL Mac (hw.optional.arm64 ENOENT = false) is NOT
     // architecturally expected -- unlike the Apple Silicon case above, this must be unreadable.
     {
-        Field intel_model;
-        intel_model.value = "MacBookPro16,1";
-        auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true), DtNode{}, DtNode{},
-                                       intel_model);
+        auto s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true), DtNode{}, DtNode{}, false);
         CHECK((!s.version.value.has_value() && s.version.unreadable));
-        // hw.model itself unreadable: treated as non-Apple-Silicon (never misclassified as the
-        // architecturally-expected case on a signal we don't actually have).
-        Field unreadable_model;
-        unreadable_model.unreadable = true;
+        CHECK(s.version_source == "unreadable");
+        // the signal itself unreadable (nullopt): treated as Intel, never as the expected case.
         s = select_macos_firmware(dt_node(nullptr, /*lookup_failed=*/true), DtNode{}, DtNode{},
-                                  unreadable_model);
+                                  std::nullopt);
         CHECK((!s.version.value.has_value() && s.version.unreadable));
+        CHECK(s.version_source == "unreadable");
     }
-}
-
-TEST_CASE("is_apple_silicon_model: bare Mac+digits only, not an Intel product family",
-          "[firmware_posture][macos]") {
-    CHECK(is_apple_silicon_model("Mac16,10"));
-    CHECK(is_apple_silicon_model("Mac14,2"));
-    CHECK_FALSE(is_apple_silicon_model("MacBookPro16,1")); // Intel: family word before the digits
-    CHECK_FALSE(is_apple_silicon_model("Macmini8,1"));     // Intel
-    CHECK_FALSE(is_apple_silicon_model("MacPro7,1"));      // Intel
-    CHECK_FALSE(is_apple_silicon_model(""));
-    CHECK_FALSE(is_apple_silicon_model("Mac"));  // no digits at all
-    CHECK_FALSE(is_apple_silicon_model("Macx")); // 4th char not a digit
 }
 
 TEST_CASE("node_absence_is_expected: only /rom, only on Apple Silicon", "[firmware_posture][macos]") {
@@ -915,7 +833,7 @@ TEST_CASE("select_macos_firmware: Intel /rom wins; undecodable and missing are d
     DtNode rom, chosen;
     rom.props = {{"version", "MBP141.88Z.F000.B00.1904"}, {"release-date", "04/03/2019"}, {"vendor", "Apple Inc."}};
     chosen.props = {{"system-firmware-version", "mBoot-1"}};
-    auto s = select_macos_firmware(rom, chosen, DtNode{}, Field{});
+    auto s = select_macos_firmware(rom, chosen, DtNode{}, std::nullopt);
     CHECK(*s.version.value == "MBP141.88Z.F000.B00.1904");
     CHECK(s.version_source == "IODeviceTree:/rom#version");
     CHECK(row_str(macos_rows(s, Field{})[2]) == "firmware|release_date|2019-04-03|iokit");
@@ -923,16 +841,207 @@ TEST_CASE("select_macos_firmware: Intel /rom wins; undecodable and missing are d
     // Fails under: a present-but-undecodable key reading as `absent`.
     chosen.props.clear();
     chosen.undecodable = {"system-firmware-version", "firmware-version"};
-    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, Field{});
+    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, std::nullopt);
     CHECK(row_str(macos_rows(s, Field{})[1]) == "firmware|version|unreadable|iokit");
-    s = select_macos_firmware(DtNode{}, DtNode{}, DtNode{}, Field{});
+    CHECK(s.version_source == "unreadable");
+    s = select_macos_firmware(DtNode{}, DtNode{}, DtNode{}, std::nullopt);
     CHECK((s.version_source == "absent" && row_str(macos_rows(s, Field{})[1]) == "firmware|version|absent|iokit"));
     // a later readable candidate clears an earlier unreadable one
     chosen.undecodable = {"system-firmware-version"};
     chosen.props = {{"firmware-version", "mBoot-2"}};
-    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, Field{});
+    s = select_macos_firmware(DtNode{}, chosen, DtNode{}, std::nullopt);
     CHECK((*s.version.value == "mBoot-2" && !s.version.unreadable));
     CHECK(s.version_source == "IODeviceTree:/chosen#firmware-version");
+}
+
+// #4893 item 5: exactly one of major/minor specified is a half-written pair -- an `unreadable` row
+// plus a `<source>:<field>:partial` token, never silence. Fails under: the partial pair vanishing.
+TEST_CASE("add_release / smbios_rows: a half-specified release pair is unreadable plus a partial token",
+          "[firmware_posture][smbios]") {
+    std::vector<FirmwareRow> out;
+    CHECK(add_release(out, "bios_release", 5, std::nullopt, "smbios"));
+    CHECK(add_release(out, "ec_release", std::nullopt, 7, "smbios"));
+    CHECK_FALSE(add_release(out, "bios_release", 5, 17, "smbios"));
+    CHECK_FALSE(add_release(out, "ec_release", std::nullopt, std::nullopt, "smbios")); // neither: no row
+    REQUIRE(out.size() == 3);
+    CHECK(row_str(out[0]) == "firmware|bios_release|unreadable|smbios");
+    CHECK(row_str(out[1]) == "firmware|ec_release|unreadable|smbios");
+    CHECK(row_str(out[2]) == "firmware|bios_release|5.17|smbios");
+
+    Smbios0 d;
+    d.bios_major = 5;
+    std::vector<std::string> partial;
+    const auto rows = smbios_rows(d, kSrcSmbios, &partial);
+    REQUIRE(rows.size() == 4);
+    CHECK(row_str(rows[3]) == "firmware|bios_release|unreadable|smbios");
+    CHECK(partial == std::vector<std::string>{"smbios:bios_release:partial"});
+}
+
+// #4893 item 4: a malformed bios_release is an `unreadable` row (the dmi:bios_release token is the
+// leg's). Fails under: the row staying absent while a token claims a failure.
+TEST_CASE("dmi_rows: a malformed bios_release is an unreadable row", "[firmware_posture][dmi]") {
+    auto files = kDmiPopulated;
+    files["bios_release"] = "abc\n";
+    const auto d = parse_dmi_sysfs(files);
+    REQUIRE(d.release_malformed);
+    const auto rows = dmi_rows(d);
+    REQUIRE(rows.size() == 4);
+    CHECK(row_str(rows[3]) == "firmware|bios_release|unreadable|dmi");
+}
+
+// #4893 item 6: a failed fwupd call with a D-Bus error name shows the name in the token.
+TEST_CASE("dbus_error_suffix / apply_*_failure: a named failure records dbus_<name>", "[firmware_posture][fwupd]") {
+    CHECK(dbus_error_suffix("org.freedesktop.DBus.Error.NoReply") == "dbus_noreply");
+    CHECK(dbus_error_suffix("org.freedesktop.fwupd.Not-Found|x") == "dbus_not_found_x");
+    CHECK(dbus_error_suffix("NoDots") == "dbus_nodots");
+    CHECK(dbus_error_suffix(std::string(100, 'A')) == "dbus_" + std::string(32, 'a'));
+    const auto failed = classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 110);
+    REQUIRE(failed == FwupdOutcome::failed);
+    {
+        FirmwareReport rep;
+        CHECK_FALSE(apply_fwupd_failure(rep, failed, "get_devices", "etimedout",
+                                        "org.freedesktop.DBus.Error.NoReply"));
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_devices:dbus_noreply");
+    }
+    {   // no name: the errno token, unchanged
+        FirmwareReport rep;
+        CHECK_FALSE(apply_fwupd_failure(rep, FwupdOutcome::failed, "bus_open", "enoent"));
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:bus_open:enoent");
+    }
+    {   // a named EACCES stays `failed` by design, now with the name visible
+        FirmwareReport rep;
+        const auto o = classify_fwupd_error("org.freedesktop.DBus.Error.IOError", 13);
+        CHECK(o == FwupdOutcome::failed);
+        CHECK_FALSE(apply_fwupd_failure(rep, o, "get_devices", "eacces", "org.freedesktop.DBus.Error.IOError"));
+        CHECK_FALSE(rep.denied);
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_devices:dbus_ioerror");
+    }
+    {
+        FirmwareReport rep;
+        CHECK_FALSE(apply_upgrades_failure(rep, FwupdOutcome::failed, "etimedout",
+                                           "org.freedesktop.fwupd.NotFound"));
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_upgrades:dbus_notfound");
+    }
+}
+
+// #4893 item 3: one failed source writes every field row as unreadable, one token.
+TEST_CASE("FirmwareReport::fail_all: per-field unreadable rows and one token", "[firmware_posture]") {
+    FirmwareReport rep;
+    rep.fail_all(kSmbiosFields, kSrcSmbios, "smbios:size_race");
+    REQUIRE(rep.rows.size() == 6);
+    CHECK(row_str(rep.rows[0]) == "firmware|vendor|unreadable|smbios");
+    CHECK(row_str(rep.rows[1]) == "firmware|version|unreadable|smbios");
+    CHECK(row_str(rep.rows[2]) == "firmware|release_date|unreadable|smbios");
+    CHECK(row_str(rep.rows[3]) == "firmware|rom_size_bytes|unreadable|smbios");
+    CHECK(row_str(rep.rows[4]) == "firmware|bios_release|unreadable|smbios");
+    CHECK(row_str(rep.rows[5]) == "firmware|ec_release|unreadable|smbios");
+    CHECK_FALSE(rep.denied);
+    CHECK(select_verdict(rep.constraints, rep.denied).reason == "smbios:size_race");
+    FirmwareReport w;
+    apply_wmi_error_token(w, "wmi_next_failed_0x80041003", 2);
+    REQUIRE(w.rows.size() == 3);
+    CHECK(row_str(w.rows[2]) == "firmware|release_date|unreadable|wmi");
+    CHECK(w.denied);
+}
+
+// ── fwupd busctl fixture (REAL CAPTURE) ──────────────────────────────────
+
+// Test-local decoder for busctl's text form of an `aa{sv}` reply: `aa{sv} <n> <m> "key" <sig>
+// <value...>` (m = entries of the device that follows, restated per device), `as <k> "a" "b"`
+// arrays, `t`/`u` integers. Stringifies every value into FwupdDevice (std::map<string,string>);
+// array values join with `,`. Unknown signatures fail the test rather than guessing.
+std::vector<FwupdDevice> decode_busctl_getdevices(const std::string& text) {
+    std::vector<std::string> tok;
+    for (std::size_t i = 0; i < text.size();) {
+        if (std::isspace(static_cast<unsigned char>(text[i]))) { ++i; continue; }
+        std::string t;
+        if (text[i] == '"') {
+            for (++i; i < text.size() && text[i] != '"'; ++i) {
+                if (text[i] == '\\' && i + 1 < text.size()) ++i;
+                t += text[i];
+            }
+            ++i;
+            tok.push_back("\"" + t);
+        } else {
+            while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i]))) t += text[i++];
+            tok.push_back(t);
+        }
+    }
+    std::size_t i = 0;
+    // Every payload read goes through next(): truncated input is a controlled test failure.
+    auto next = [&]() -> const std::string& {
+        REQUIRE(i < tok.size());
+        return tok[i++];
+    };
+    auto str = [&]() {
+        const std::string& q = next();
+        REQUIRE(!q.empty());
+        REQUIRE(q[0] == '"');
+        return q.substr(1);
+    };
+    std::vector<FwupdDevice> out;
+    REQUIRE(next() == "aa{sv}");
+    const auto devices = std::stoul(next());
+    for (std::size_t d = 0; d < devices; ++d) {
+        const auto entries = std::stoul(next());
+        FwupdDevice dev;
+        for (std::size_t e = 0; e < entries; ++e) {
+            const std::string key = str();
+            const std::string sig = next();
+            if (sig == "s") {
+                dev[key] = str();
+            } else if (sig == "t" || sig == "u") {
+                dev[key] = next();
+            } else if (sig == "as") {
+                const auto k = std::stoul(next());
+                std::string joined;
+                for (std::size_t n = 0; n < k; ++n) joined += (n ? "," : "") + str();
+                dev[key] = joined;
+            } else {
+                FAIL("unhandled busctl signature: " << sig);
+            }
+        }
+        out.push_back(std::move(dev));
+    }
+    CHECK(i == tok.size());
+    return out;
+}
+
+// Fails under: the mapper mishandling a real fwupd device -- no Version key, Flags 129
+// (INTERNAL|REGISTERED, not updatable) -- or inventing a failure token for it.
+TEST_CASE("fwupd_device_rows: REAL CAPTURE fwupd_getdevices.txt maps to one non-updatable device row",
+          "[firmware_posture][fwupd]") {
+    std::ifstream f(fixture("linux", "fwupd_getdevices.txt"));
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const auto devices = decode_busctl_getdevices(ss.str());
+    REQUIRE(devices.size() == 1);
+    CHECK(devices[0].at("Name") == "VirtualApple @ 2.50GHz");
+    CHECK(devices[0].at("Flags") == "129");
+    CHECK(devices[0].count("Version") == 0); // a legitimate shape per the provenance file
+    const auto r = fwupd_device_rows(devices);
+    CHECK(r.failures.empty());
+    CHECK(r.update_pending == "no");
+    REQUIRE(r.rows.size() == 2);
+    CHECK(r.rows[0].field == "fwupd_device");
+    CHECK(r.rows[0].value == "id=4bde70ba4e39b28f9eab1628f9dd6e6244c03027;name=VirtualApple @ 2.50GHz;"
+                             "version=absent;updatable=no;needs_reboot=no;update_pending=unknown;unmodelled=no");
+    CHECK(row_str(r.rows[1]) == "firmware|update_pending|no|fwupd");
+}
+
+// Fails under: the capture no longer being busctl's ServiceUnknown text, or `unavailable` writing a
+// token / a row other than the shared one.
+TEST_CASE("fwupd absent: REAL CAPTURE busctl message; unavailable is a row, never a token",
+          "[firmware_posture][fwupd]") {
+    std::ifstream f(fixture("linux", "fwupd_absent.txt"));
+    std::stringstream ss;
+    ss << f.rdbuf();
+    CHECK(ss.str().find("was not provided by any .service files") != std::string::npos);
+    FirmwareReport rep;
+    CHECK_FALSE(apply_fwupd_failure(rep, FwupdOutcome::unavailable, "get_devices", "errno_0"));
+    REQUIRE(rep.rows.size() == 1);
+    CHECK(row_str(rep.rows[0]) == row_str(fwupd_unavailable_row()));
+    CHECK_FALSE(rep.constraints.any_failure());
 }
 
 // Definition contract: a REAL captured row splits into exactly the declared columns.
