@@ -51,6 +51,30 @@ untouched by either revert and stays running — it exercises only synthetic
 fixtures and asserts nothing about real shard state, so it is harmless to
 leave in place while this checker itself is being fixed or reverted.
 
+AGENT FAMILY (`--family agent`, #5073): the same check_partition() set-math also
+proves the agent unit-test suite's three tag-partitioned shards ('agent unit
+tests shard A..C', suite label `agent-shard`) partition the reference spec
+`~[.]~[tsan-heavy]~[flaky-4086]` exactly against the real `yuzu_agent_tests`
+binary. The default family stays `server`, so the existing meson invocation of
+this script ('server pg shard partition invariant') is unchanged. The agent
+family runs as its own meson test() entry, 'agent shard partition invariant'
+(suite: ['agent', 'agent-checks'], defined OUTSIDE `if build_server` because
+the agent suite must be self-sufficient on legs that build no server). It
+proves EXACTNESS, not balance: per-shard case counts are printed as an
+informational `::notice::` only (a count is not a duration, so there is no
+ratio gate); the drift signal is flake-retry.py's 80%-of-budget table. Escape
+hatch for the agent family: remove that one test() block in tests/meson.build;
+the selftest entry is unaffected. A shard that genuinely holds no case fails
+loudly here ('matched ZERO cases'), which is why every agent shard may carry
+--allow-running-no-tests without a silent empty shard being possible. That
+flag is what stops the comma-free shard C failing when `meson test --suite
+agent --test-args '[tag]'` appends a second positional spec; it does NOT make
+`--test-args '[tag]'` a targeted run: Catch2 binds the extra spec to the LAST
+comma-separated OR term only, so shards A and B list a widened set and a mistyped
+tag is no longer loud (measured 2026-10-01 on build-linux, `<shard spec>
+'[nonexistent_zzz]' --list-tests`: A 319, B 437, C 0 cases). Run the binary
+directly (`yuzu_agent_tests '[tag]'`) for a targeted run.
+
 Pure logic (`parse_shard_entries`, `check_partition`) is separated from I/O
 (`introspect_tests`, `list_cases`, `main`) specifically so it can be
 exercised with synthetic fixtures, no real build or binary needed — see
@@ -63,6 +87,7 @@ mutation-test session.
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET  # stdlib, not defusedxml: this parses our
@@ -93,6 +118,26 @@ SMOKE_ENTRY_NAME = "server pg smoke"
 # hand-maintained manifest, the exact defect class this script exists to cure.
 SMOKE_EXACT_CASES = 11
 ALLOW_NO_TESTS_FLAG = "--allow-running-no-tests"
+
+# Agent unit-test shards (#5073): same discovery-by-suite-membership property,
+# a different suite/ref_spec/label, reusing check_partition below. The ref spec
+# spells `~[.]` explicitly (an exclusion-only spec drops hidden cases by Catch2's
+# own rule, but that was not reliably observed on real Windows hardware -- see
+# tests/meson.build's 'agent unit tests shard' comment) and carries the same
+# base exclusions the pre-shard single entry ran with.
+AGENT_SHARD_SUITE = "yuzu:agent-shard"
+AGENT_REF_SPEC = "~[.]~[tsan-heavy]~[flaky-4086]"
+AGENT_LABEL = "agent-shard"
+# Hollow-discovery floor: fewer than this many agent-shard entries is a mistyped
+# suite label or a dropped test() entry, never a valid sharding.
+AGENT_MIN_SHARDS = 2
+# A positional Catch2 tag-filter spec, as flake-retry.py's isolated retry can
+# strip it. COPIED from flake-retry.py's CATCH2_TAG_SPEC (hyphenated filename,
+# awkward to import); test_check_pg_shard_partition.py loads flake-retry.py and
+# fails if the two patterns ever diverge. A shard spec that does not match is not
+# stripped on an isolated case retry, so the retry would AND the case name with
+# the shard filter and zero-match.
+CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 
 
 def gh(kind, msg):
@@ -201,6 +246,69 @@ def parse_smoke_entries(tests):
     for the shared shape rules.
     """
     return _parse_suite_entries(tests, SERVER_PG_SMOKE_SUITE)
+
+
+def parse_agent_entries(tests):
+    """Return (entries, errors) for every agent-shard-suite entry in `tests`
+    (#5073). entries: [(name, exe, tag_filter_spec, opts), ...] -- keeps `opts`
+    like parse_smoke_entries, because check_agent_shard_opts must verify
+    --allow-running-no-tests. See _parse_suite_entries for the shape rules.
+    """
+    return _parse_suite_entries(tests, AGENT_SHARD_SUITE)
+
+
+def check_agent_shard_opts(entries):
+    """Every agent shard must carry --allow-running-no-tests (#5073): meson
+    appends a `--test-args '[tag]'` as a SECOND positional spec, and a shard
+    that then matches no cases (in practice the comma-free shard C) would
+    otherwise exit 2. The flag does not make that a targeted run (A and B
+    widen, see the module docstring). Also asserts each shard spec has the
+    shape flake-retry.py's isolated retry can strip (CATCH2_TAG_SPEC). Returns a
+    list of failure strings (empty = ok)."""
+    failures = [f"{name!r} is missing {ALLOW_NO_TESTS_FLAG!r} -- without it "
+                f"`meson test --suite agent --test-args '[tag]'` exits 2 on a "
+                f"shard that matches none of that tag's cases"
+                for name, _exe, _spec, opts in entries
+                if ALLOW_NO_TESTS_FLAG not in opts]
+    failures += [f"{name!r} spec {spec!r} does not match flake-retry.py's "
+                 f"CATCH2_TAG_SPEC, so an isolated case retry would not strip "
+                 f"it and would zero-match"
+                 for name, _exe, spec, _opts in entries
+                 if not CATCH2_TAG_SPEC.match(spec)]
+    return failures
+
+
+def check_agent_shard_suffix(entries):
+    """Every comma-separated term of every agent shard spec must end with
+    AGENT_REF_SPEC (#5073): tests/meson.build's
+    `agent_shard_suffix` and this script's AGENT_REF_SPEC are two hand-synced
+    literals, and `[flaky-4086]` matches no case on Linux/macOS, so a one-sided
+    edit would otherwise surface only on the Windows leg. The reference is
+    deliberately NOT derived from the meson suffix: a suffix-only edit must be
+    caught, not mirrored. Returns a list of failure strings (empty = ok)."""
+    return [f"{name!r} spec term {term!r} does not end with the reference "
+            f"suffix {AGENT_REF_SPEC!r}; tests/meson.build's agent_shard_suffix "
+            f"and AGENT_REF_SPEC must be edited together"
+            for name, _exe, spec, _opts in entries
+            for term in spec.split(",")
+            if not term.endswith(AGENT_REF_SPEC)]
+
+
+def check_agent_shard_names(entries):
+    """No two agent-shard entry names may be equal, and none may contain
+    another (#5073): flake-retry.py maps a junit name to its entry by LONGEST
+    substring, so a duplicate or contained name is attributed to the wrong
+    entry (budget table, isolated retry). Returns failure strings (empty = ok)."""
+    names = [name for name, _exe, _spec, _opts in entries]
+    failures = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if a == b:
+                failures.append(f"two agent-shard entries share the name {a!r}")
+            elif a in b or b in a:
+                failures.append(f"agent-shard entry name {min(a, b, key=len)!r} "
+                                f"is a substring of {max(a, b, key=len)!r}")
+    return failures
 
 
 def list_cases(exe, filt):
@@ -369,11 +477,61 @@ def check_smoke(smoke_entries, shard_exe, list_cases_fn):
     return True, [], {"smoke_case_count": n}
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--builddir", required=True)
-    args = ap.parse_args(argv)
+def main_agent(args):
+    """The `--family agent` run (#5073): hollow-discovery floor, shape errors,
+    per-shard --allow-running-no-tests / spec shape / reference-suffix / entry-name
+    checks, then check_partition against
+    AGENT_REF_SPEC, then an informational per-shard case-count notice."""
+    tests = introspect_tests(args.builddir)
+    entries4, shape_errors = parse_agent_entries(tests)
+    if shape_errors:
+        for e in shape_errors:
+            gh("error", f"check-pg-shard-partition (agent): {e}")
+        return 1
+    if len(entries4) < AGENT_MIN_SHARDS:
+        gh("error", f"check-pg-shard-partition (agent): found only {len(entries4)} "
+                     f"entries in suite {AGENT_SHARD_SUITE!r} -- hollow "
+                     f"discovery (expected the full set of agent shards)")
+        return 1
+    opt_failures = (check_agent_shard_opts(entries4)
+                    + check_agent_shard_suffix(entries4)
+                    + check_agent_shard_names(entries4))
+    if opt_failures:
+        for f in opt_failures:
+            gh("error", f"check-pg-shard-partition (agent): {f}")
+        return 1
 
+    # Memoise --list-tests so the per-shard counts below reuse the exact sets
+    # the partition proof just used (no second enumeration, no chance of the
+    # printed counts disagreeing with the proven ones).
+    cache = {}
+
+    def cached_list_cases(exe, filt):
+        key = (exe, filt)
+        if key not in cache:
+            cache[key] = list_cases(exe, filt)
+        return cache[key]
+
+    entries = [(name, exe, spec) for name, exe, spec, _opts in entries4]
+    ok, failures, stats = check_partition(
+        entries, cached_list_cases, ref_spec=AGENT_REF_SPEC, label=AGENT_LABEL)
+    if not ok:
+        for f in failures:
+            gh("error", f"check-pg-shard-partition (agent): {f}")
+        return 1
+
+    counts = ", ".join(f"{name}={len(cached_list_cases(exe, spec))}"
+                        for name, exe, spec in entries)
+    gh("notice", f"check-pg-shard-partition (agent): per-shard case counts: "
+                  f"{counts} (informational -- a count is not a duration, no "
+                  f"ratio gate; see tests/meson.build for the balance record)")
+    print(f"check-pg-shard-partition: OK -- {stats['shard_count']} agent shards, "
+          f"{stats['case_count']} cases; exact partition of {AGENT_REF_SPEC!r} "
+          f"(no loss, no duplication)")
+    return 0
+
+
+def main_server(args):
     tests = introspect_tests(args.builddir)
     entries, shape_errors = parse_shard_entries(tests)
     smoke_entries, smoke_shape_errors = parse_smoke_entries(tests)
@@ -425,6 +583,26 @@ def main(argv=None):
           f"cases matched (not executed — see ci.yml's DSN assert + the live "
           f"test run for execution proof)")
     return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--builddir", required=True)
+    ap.add_argument("--family", choices=("server", "agent"), default="server",
+                    help="which test family to check (default: server, the "
+                         "original pg/non-pg/smoke behaviour)")
+    # parse_known_args, not parse_args: `meson test --suite agent --test-args
+    # '[tag]'` appends that tag to EVERY test in the suite, including this
+    # checker's own agent entry, and argparse would
+    # exit 2 on it. The agent family tolerates and ignores trailing extras (it
+    # lists specs from `meson introspect`, never from argv); the server family
+    # keeps the strict behaviour it always had.
+    args, extra = ap.parse_known_args(argv)
+    if args.family == "agent":
+        return main_agent(args)
+    if extra:
+        ap.error(f"unrecognized arguments: {' '.join(extra)}")
+    return main_server(args)
 
 
 if __name__ == "__main__":

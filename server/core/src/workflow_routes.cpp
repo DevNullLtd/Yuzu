@@ -2867,6 +2867,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 !execution_tracker->mark_cancelled(execution_id, session->username)) {
                 spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
+                // no observable signal — count it alongside the log line,
+                // matching Part A's REST/MCP instrumentation pattern.
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                        .increment();
             }
             res.status = 500;
             res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
@@ -2878,6 +2886,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 !execution_tracker->mark_cancelled(execution_id, session->username)) {
                 spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5)
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                        .increment();
             }
             // #881/#3424/#3511: "no agents reached" covers several distinct
             // causes this route did not used to discriminate — every target
@@ -3003,6 +3017,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!execution_tracker->set_agents_targeted(execution_id, sent)) {
                 spdlog::error("workflow_routes: set_agents_targeted failed for execution_id={}",
                               execution_id);
+                // #4982 fix round 2 (Fix 5)
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                                  {{"op", "set_agents_targeted"}, {"surface", "workflow"}})
+                        .increment();
             }
         }
 

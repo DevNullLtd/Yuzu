@@ -156,11 +156,51 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         // (unexpected) mark_failed means the row stays pending for the true
         // leader — this replica must not cancel the exec row or audit a terminal
         // it did not own.
+        //
+        // governance sibling-sweep fix (security-guardian, BLOCKING): a
+        // redriven occurrence (route_unreadable/containment_unreadable
+        // rescheduling even when a PRIOR attempt reached agents with
+        // outcome.sent>0, or a mark_sent_with_target degrade rolling a
+        // genuine dispatch back) can reach THIS branch, on a later tick, for
+        // an execution_id that already has real agent_exec_status
+        // responses — route the cancel through decline_or_cancel_exec, and
+        // say so in the audit detail (this is the ONLY audit row this
+        // occurrence ever gets, unlike the sent==0 path, so it must not
+        // misrepresent a genuinely-dispatched execution as "nothing ran").
         auto marked = d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "authority_denied");
         if (marked.has_value() && *marked) {
-            if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
-            audit(c, "denied", "authority_denied_at_delivery");
+            std::string detail = "authority_denied_at_delivery";
+            if (d_.execution_tracker && !c.execution_id.empty()) {
+                auto outcome = decline_or_cancel_exec(c.execution_id, c.principal,
+                                                      c.occurrence_id, "authority_denied");
+                // governance Gate 8 re-review (unhappy-path + cpp-safety, SHOULD):
+                // kCancelFailed must annotate too — mark_cancelled itself failing
+                // leaves the execution 'running' exactly like the two declined
+                // cases, and this audit row is the ONLY compliance evidence this
+                // occurrence ever gets; leaving it bare here would silently
+                // misrepresent a failed cancel as a clean one.
+                //
+                // switch, no `default:` (cpp-safety fix-round SHOULD, PR #5226
+                // review round 2): -Werror=switch then makes a future 6th
+                // ExecCancelOutcome a BUILD FAILURE here, never a silent
+                // unannotated pass-through in the one audit row this
+                // occurrence ever gets.
+                switch (outcome) {
+                case ExecCancelOutcome::kDeclinedHasResponse:
+                case ExecCancelOutcome::kDeclinedDegraded:
+                    detail += " exec_not_cancelled=prior_agent_response_or_degraded";
+                    break;
+                case ExecCancelOutcome::kCancelFailed:
+                    detail += " exec_not_cancelled=mark_cancelled_failed";
+                    break;
+                case ExecCancelOutcome::kAlreadyTerminal:
+                case ExecCancelOutcome::kCancelled:
+                    // The row reached its end state (by this call or some
+                    // other writer) — not a failure, so no annotation needed.
+                    break;
+                }
+            }
+            audit(c, "denied", detail);
         }
         return;
     }
@@ -200,11 +240,17 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                       "parsed",
                       c.occurrence_id, c.command_id, mcp::kMcpMaxJsonDepth);
         // CDX-P1-02: own-the-mark gating, same as every other terminal path here.
+        // Routed through decline_or_cancel_exec for the same reason as the
+        // authority_denied branch above — see its own comment. A legacy row
+        // written before this depth guard existed could, in principle,
+        // reach this branch on a redrive after an old-binary dispatch; the
+        // guard costs one indexed read on an already-rare path.
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_depth_exceeded");
         if (marked.has_value() && *marked) {
             if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+                decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id,
+                                       "payload_depth_exceeded");
             audit(c, "failure", "payload_depth_exceeded");
         }
         return;
@@ -222,11 +268,14 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                       "marking failed",
                       c.occurrence_id);
         // CDX-P1-02: own-the-mark gating, same as the denial + success paths.
+        // Routed through decline_or_cancel_exec — see authority_denied's
+        // comment above for why.
         auto marked =
             d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_decode_failed");
         if (marked.has_value() && *marked) {
             if (d_.execution_tracker && !c.execution_id.empty())
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+                decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id,
+                                       "payload_decode_failed");
             audit(c, "failure", "payload_decode_failed");
         }
         return;
@@ -304,30 +353,93 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     //      count/audit here (the re-send is dedup-absorbed).
     //    - fenced out / already terminal → the TRUE leader owns finalize+count+
     //      audit; doing it here too would double-count one logical delivery (C-5).
-    auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
-    if (!marked.has_value()) {
-        count("yuzu_server_command_outbox_deliver_degrade_total");
-        spdlog::warn("command_outbox_delivery: mark_sent degraded for occurrence '{}' — "
-                     "will re-drive",
-                     c.occurrence_id);
-        return;
-    }
-    if (!*marked)
-        return; // fenced out or already terminal — not ours to finalize/count/audit
-
-    // 7. We own this delivery. Finalize the (fire-time-created) execution row so
-    //    it cannot idle to the materialise timeout (executions ladder), then count
-    //    and audit exactly once. sent==0 (no agents reachable right now) is a
-    //    DISTINCT outcome from a real delivery — a separate counter so the
-    //    delivered SLI is not inflated by no-agent misses (C-1).
-    if (d_.execution_tracker && !c.execution_id.empty()) {
-        if (outcome.sent > 0) {
-            if (!d_.execution_tracker->set_agents_targeted(c.execution_id, outcome.sent))
-                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
-        } else {
-            (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+    //
+    //    #4982 round 3: a genuine dispatch (`outcome.sent > 0`, with an
+    //    execution row to bookkeep) uses the ATOMIC
+    //    `CommandOutboxStore::mark_sent_with_target` — the sent-transition and
+    //    the real `agents_targeted` count commit in ONE transaction, closing a
+    //    race where a reaper pass could observe `state='sent'` with
+    //    `agents_targeted` still 0 (two separate autocommit statements, one
+    //    committed and one not yet) and force-cancel a live, still-executing
+    //    command with no kill RPC ever sent (see that method's own doc
+    //    comment). Every other case — `sent==0`, or no execution row to
+    //    bookkeep at all — keeps the plain autocommit `mark_sent`. This
+    //    occurrence's CURRENT dispatch attempt reached no agents, but it is
+    //    NOT necessarily true that the execution_id has never had a live
+    //    agent execution — a sent>0 attempt whose OWN
+    //    mark_sent_with_target then degraded rolls the whole transaction
+    //    back (occurrence stays pending, re-driven here), so a redrive CAN
+    //    reach sent==0 for an execution_id that already has real
+    //    agent_exec_status responses from that earlier attempt (governance
+    //    Gate 4 fix, unhappy-path). The `mark_cancelled` call below now
+    //    checks for exactly that case first — see its own comment. An early
+    //    reaper cancel racing a GENUINE no-agents-ever-reached case is still
+    //    harmless (both converge on `cancelled`; `mark_cancelled`'s
+    //    own terminal-exclusion guard makes a second cancel a clean, event-
+    //    free no-op).
+    const bool bookkeep_target = d_.execution_tracker && !c.execution_id.empty();
+    bool owns_delivery = false;
+    if (bookkeep_target && outcome.sent > 0) {
+        auto marked = d_.outbox->mark_sent_with_target(c.occurrence_id, lock_name, epoch,
+                                                       c.execution_id, outcome.sent);
+        if (!marked.has_value()) {
+            count("yuzu_server_command_outbox_deliver_degrade_total");
+            spdlog::warn("command_outbox_delivery: mark_sent_with_target degraded for "
+                         "occurrence '{}' — will re-drive",
+                         c.occurrence_id);
+            return;
+        }
+        owns_delivery = *marked;
+    } else {
+        auto marked = d_.outbox->mark_sent(c.occurrence_id, lock_name, epoch);
+        if (!marked.has_value()) {
+            count("yuzu_server_command_outbox_deliver_degrade_total");
+            spdlog::warn("command_outbox_delivery: mark_sent degraded for occurrence '{}' — "
+                         "will re-drive",
+                         c.occurrence_id);
+            return;
+        }
+        owns_delivery = *marked;
+        if (owns_delivery && bookkeep_target) {
+            // sent==0: no agents reached — cancel the (fire-time-created)
+            // execution row so it doesn't idle to the materialise timeout.
+            //
+            // governance Gate 4 fix (unhappy-path, BLOCKING, independently
+            // discovered second path to the Gate 2 false-cancel class): the
+            // comment above this branch ("a sent==0 occurrence never had a
+            // live agent execution to falsely kill") was true before round
+            // 3's atomic mark_sent_with_target existed, but round 3 itself
+            // broke it — a genuine sent>0 dispatch whose bookkeeping write
+            // then fails rolls the WHOLE transaction back (occurrence stays
+            // pending, re-driven next tick); if reachability drops to zero
+            // by the time of the re-drive, THIS branch runs for an
+            // occurrence whose execution_id may already carry real
+            // agent_exec_status responses from the earlier, genuinely-
+            // dispatched attempt. mark_cancelled's own guard checks only
+            // terminal-status exclusion — it has no agent-response
+            // equivalent of the stuck-reap sweep's
+            // kNoAgentResponseExistsClause (correctly so: the OPERATOR-
+            // initiated cancel route also calls mark_cancelled, and an
+            // operator must still be able to cancel an execution with
+            // partial responses — that exclusion belongs here, at this
+            // automatic-redrive call site, not inside mark_cancelled
+            // itself). Mirror the sweep's own philosophy: a degraded check
+            // declines toward NOT cancelling (leaving the row wedged is
+            // strictly safer than falsely cancelling it; the stuck-reap
+            // sweep's own exclusion then correctly leaves it alone forever
+            // once it sees the same response row). Now the shared chokepoint
+            // (governance sibling-sweep consolidation) every other automatic
+            // cancel site in this file also routes through.
+            decline_or_cancel_exec(c.execution_id, c.principal, c.occurrence_id, "sent==0");
         }
     }
+    if (!owns_delivery)
+        return; // fenced out or already terminal — not ours to finalize/count/audit
+
+    // 7. We own this delivery — count and audit exactly once. sent==0 (no
+    //    agents reachable right now) is a DISTINCT outcome from a real
+    //    delivery — a separate counter so the delivered SLI is not inflated by
+    //    no-agent misses (C-1).
     if (outcome.sent > 0) {
         count("yuzu_server_command_outbox_delivered_total");
         spdlog::info("command_outbox_delivery: delivered occurrence '{}' — command_id={} "
@@ -344,6 +456,60 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         audit(c, "failure",
               "no_agents_reached command_id=" + c.command_id + " execution_id=" + c.execution_id);
     }
+}
+
+CommandOutboxDelivery::ExecCancelOutcome CommandOutboxDelivery::decline_or_cancel_exec(
+    const std::string& execution_id, const std::string& principal,
+    const std::string& occurrence_id, std::string_view context) {
+    auto statuses = d_.execution_tracker->get_agent_statuses_checked(execution_id);
+    if (!statuses.has_value()) {
+        spdlog::warn("command_outbox_delivery: agent_exec_status check degraded for "
+                     "execution_id={} occurrence='{}' ({}) — declining to cancel this tick, "
+                     "will retry on a later pass",
+                     execution_id, occurrence_id, context);
+        return ExecCancelOutcome::kDeclinedDegraded;
+    }
+    if (!statuses->empty()) {
+        spdlog::warn(
+            "command_outbox_delivery: occurrence='{}' reached '{}' but execution_id={} already "
+            "has {} real agent response(s) from an earlier dispatch attempt — NOT cancelling "
+            "(a genuinely-dispatched execution must never be force-cancelled on a later tick's "
+            "terminal failure)",
+            occurrence_id, context, execution_id, statuses->size());
+        return ExecCancelOutcome::kDeclinedHasResponse;
+    }
+    const auto result = d_.execution_tracker->mark_cancelled_checked(execution_id, principal);
+    // Doomgoose PR #5226 review round 2 (cpp-safety fix-round SHOULD): switch,
+    // no `default:` — `-Werror=switch` (#3109 precedent, server_core's own
+    // meson.build) then makes a future 4th MarkCancelledOutcome a BUILD
+    // FAILURE here, never a silent fallthrough to kCancelled (which would
+    // misreport an unhandled outcome as a clean success).
+    switch (result) {
+    case ExecutionTracker::MarkCancelledOutcome::kNoOp:
+        // Distinct from a real failure — some other terminal writer (an
+        // operator cancel, the stuck-reap sweep, a different occurrence's
+        // own cancel of the same execution_id) got there first between our
+        // agent_exec_status check above and this call. The row is already
+        // in the end state we wanted; nothing failed, so this must not log
+        // as an error or count as a bookkeeping failure.
+        spdlog::info("command_outbox_delivery: execution_id={} occurrence='{}' ({}) was already "
+                     "terminal by the time of the cancel — nothing to do",
+                     execution_id, occurrence_id, context);
+        return ExecCancelOutcome::kAlreadyTerminal;
+    case ExecutionTracker::MarkCancelledOutcome::kFailed:
+        spdlog::error("command_outbox_delivery: mark_cancelled failed for execution_id={} "
+                      "occurrence='{}' ({})",
+                      execution_id, occurrence_id, context);
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                         {{"op", "mark_cancelled"}, {"surface", "outbox"}})
+                .increment();
+        return ExecCancelOutcome::kCancelFailed;
+    case ExecutionTracker::MarkCancelledOutcome::kCancelled:
+        return ExecCancelOutcome::kCancelled;
+    }
+    return ExecCancelOutcome::kCancelled; // unreachable; silences -Wreturn-type on some compilers
 }
 
 void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& result,

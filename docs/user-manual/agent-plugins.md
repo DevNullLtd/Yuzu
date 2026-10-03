@@ -42,7 +42,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `interaction` | ✅ ✅ ✅ | Desktop user interaction — notifications, message boxes, input dialogs, surveys, DND | [README](../../agents/plugins/interaction/README.md) |
 | `ioc` | ✅ ✅ ✅ | Indicator of Compromise checking — match IOCs against local endpoint state | [README](../../agents/plugins/ioc/README.md) |
 | `license_scan` | ✅ 🟡 🟡 | Detects software licences across OS, vendor and per-user surfaces | [README](../../agents/plugins/license_scan/README.md) |
-| `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture | [README](../../agents/plugins/local_security_policy/README.md) |
+| `local_security_policy` | 🟡 🟡 🟡 | Reports local password, lockout and audit policy posture and sudoers content | [README](../../agents/plugins/local_security_policy/README.md) |
 | `msi_packages` | ✅ ✅ ⛔ | Enumerates installed packages and product codes (Windows MSI / macOS pkgutil) | [README](../../agents/plugins/msi_packages/README.md) |
 | `netprobe` | ✅ ✅ ✅ | Active network measurement: ICMP/TCP round-trip time, jitter, loss, and DNS resolution timing to operator-chosen targets | [README](../../agents/plugins/netprobe/README.md) |
 | `netstat` | ✅ ✅ ✅ | Enumerates active network connections and listening sockets | [README](../../agents/plugins/netstat/README.md) |

@@ -8,25 +8,25 @@
 
 /// @file plugin_action_catalogue_local_security_policy.hpp
 /// One fragment of the command capability catalogue: `local_security_policy`'s
-/// three actions (`agents/plugins/local_security_policy/src/local_security_policy_plugin.cpp`).
+/// four actions (`agents/plugins/local_security_policy/src/local_security_policy_plugin.cpp`).
 /// Classified by READING the implementation, not the name.
 /// `securable`/`operation` reuse an EXISTING `RbacStore` `types[]`/`ops[]`
 /// entry; none is minted here.
 ///
-/// All three actions are ReadOnly/None: Linux reads bounded config files
-/// (`login.defs`, pwquality/faillock, `/etc/pam.d`, audit rules) and macOS runs
-/// `pwpolicy -getaccountpolicies` (a read-only argv leaf) and reads `audit_control`.
-/// No leg changes host policy or account state. Grouped under the existing `Security`
-/// securable, the antivirus/bitlocker/firewall/autoruns class of read-only
-/// security-posture plugins.
-///
-/// The Windows leg and the `sudoers` action are PLANNED, follow as their own PR (see
-/// local_security_policy_legs.hpp's banner) -- this fragment has 3 rows, not 4, until then.
+/// All four actions are ReadOnly/None: Linux reads bounded config files
+/// (`login.defs`, pwquality/faillock, `/etc/pam.d`, audit rules, sudoers),
+/// macOS runs `pwpolicy -getaccountpolicies` (a read-only argv leaf) and reads
+/// `audit_control` / sudoers, and Windows runs `secedit.exe /export` (a
+/// read-only argv leaf) into an agent-owned scratch directory under
+/// `agent.data_dir`, removed on return and swept by a later dispatch if a crash
+/// orphans it. No leg changes host policy or account state. Grouped
+/// under the existing `Security` securable, the antivirus/bitlocker/firewall/
+/// autoruns class of read-only security-posture plugins.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueLocalSecurityPolicy{{
+inline constexpr std::array<CommandCapability, 4> kPluginActionCatalogueLocalSecurityPolicy{{
     {
         .plugin = "local_security_policy",
         .action = "password_policy",
@@ -57,6 +57,23 @@ inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueLocalSec
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "local_security_policy",
+        .action = "sudoers",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = authz::Operation::Read,
+        // Medium, not Low (owner decision, 2026-09-22, co-01): sudoers rows carry the NOPASSWD flag and
+        // the command allowlist -- a map of where a compromised or careless account could
+        // already run something as root without a password, the same "gaps in coverage"
+        // shape antivirus.av_exclusions' Medium tier is based on. Operator-triage metadata
+        // only (no production code branches on risk_tier today), but published verbatim via
+        // yuzu://plugin-docs.
+        .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
     },
