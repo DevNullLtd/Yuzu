@@ -1189,8 +1189,12 @@ only on that connection and only for a session the node holds. The `unknown_sess
 snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
 rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
 A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s), which
-exists in agent 0.13.0 and newer (checked in the agent source at the v0.12.0 and v0.13.0 tags). An older agent only
-logs `Heartbeat failed` and stays rejected until it is restarted or upgraded; that matters only when its
+exists in agent 0.13.0 and newer (checked in the agent source at the v0.12.0 and v0.13.0 tags). Deployments that use
+the Erlang gateway of this release therefore need agents 0.13.0 or newer: the final 0.13.0 tag, not
+`v0.13.0-rc1` to `v0.13.0-rc6`, which lack the recovery (checked in the agent source); upgrade the agents first, then
+the gateway, and agents that do not connect through the gateway are not affected. An older agent only
+logs `Heartbeat failed` and, for persistent missing state, stays rejected until it is restarted or upgraded (a heartbeat
+in the short take_pending to register_agent gap can succeed later without re-registration); that matters only when its
 heartbeats are rejected: under a topology that breaks the one-connection assumption, against a gateway
 running without the session index, or after a gateway registry process restart or crash while connections
 stay up (the registry recreates its tables empty; a node failover that leaves the session not held by the
@@ -1248,12 +1252,13 @@ previous gateway (the only new state is the in-memory index; derived from the ch
 
 - **Supported topologies.** Agents connect to `:50051` directly, or through an L4 / TLS-passthrough path
   that keeps one TCP connection per agent. An HTTP/2-terminating or HTTP/2-multiplexing proxy between
-  agents and the gateway is not supported for this check: it can spread one agent's calls over several
-  connections (connection mismatches, counted by `yuzu_gw_heartbeat_session_mismatch_total` and shown
+  agents and the gateway is not supported for this check: it may cause repeated heartbeat rejection or share
+  gateway-side connections across agents, removing the per-agent connection separation the check requires. It can
+  spread one agent's calls over several connections (connection mismatches, counted by `yuzu_gw_heartbeat_session_mismatch_total` and shown
   as the `connection_mismatch=` count in the gateway summary log line, plus repeated re-registration)
   and removes the per-agent separation the check relies on. There is no topology knob and no
   `sys.config` change. Observed with a real C++ agent and two agents per run: behind an
-  HTTP/2-terminating proxy (nginx `grpc_pass`) every heartbeat was rejected as a connection mismatch
+  HTTP/2-terminating proxy (nginx `grpc_pass`, two agents) every heartbeat was rejected as a connection mismatch
   and none reached the server, while the agents still enrolled and received commands and re-registered
   on their back-off ladder (2 s doubling to a 300 s cap); behind an L4 TCP forwarder (nginx `stream`)
   there were no rejections. The agent-facing message is the same `unknown session` for every reason, so

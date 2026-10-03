@@ -179,9 +179,15 @@ does for any lost session: it waits an escalating cooldown (2 s on the first
 rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
 again. There is no wire or server change, and no agent change for the supported
 topologies. This recovery needs **agent 0.13.0 or newer** (checked in the agent
-source at the v0.12.0 and v0.13.0 tags). An older agent only logs `Heartbeat failed`
-and stays rejected until it is restarted or upgraded. That matters only when
-its heartbeats are rejected, which happens in three cases: a topology that breaks the
+source at the v0.12.0 and v0.13.0 tags). Deployments that use the Erlang gateway of
+this release need agents 0.13.0 or newer: the final 0.13.0 tag, not
+`v0.13.0-rc1` to `v0.13.0-rc6`, which lack the recovery (checked in the agent source).
+Upgrade the agents first, then the gateway. Agents that do not connect through the
+gateway are not affected. An older agent only logs `Heartbeat failed`
+and, for persistent missing state, stays rejected until it is restarted or upgraded
+(a heartbeat that falls in the short gap between the session leaving the pending table
+and its agent process registering can succeed later without re-registration). That
+matters only when its heartbeats are rejected, which happens in three cases: a topology that breaks the
 one-connection assumption, a gateway running without the session index, and a gateway
 registry process restart or crash while agent connections stay up (the registry
 recreates its tables empty, so every heartbeat for the agents it held is rejected until
@@ -194,7 +200,9 @@ directly, or through an L4 / TLS-passthrough path that keeps one TCP connection 
 agent end to end (a plain TCP load balancer, an L4 virtual IP, a TLS-passthrough
 proxy). An HTTP/2-terminating or HTTP/2-multiplexing proxy between agents and the
 gateway (including a service-mesh sidecar that terminates HTTP/2) is **not
-supported** for this check: it can spread one agent's calls over several
+supported** for this check: it may cause repeated heartbeat rejection or share
+gateway-side connections across agents, removing the per-agent connection separation
+this check requires. It can spread one agent's calls over several
 connections, which shows up as connection mismatches (the `connection_mismatch=`
 count in the gateway summary log line; the counter is
 `yuzu_gw_heartbeat_session_mismatch_total`) and repeated re-registration, and it
@@ -211,13 +219,14 @@ behaviour is not tested with a real agent (a two-node registry unit test exists)
 *Observed in testing* (a real C++ agent, a plaintext gateway listener, two agents per
 run):
 
-- Behind an HTTP/2-terminating proxy (nginx `grpc_pass`), every heartbeat was
+- Behind an HTTP/2-terminating proxy (nginx `grpc_pass`, two agents), every heartbeat was
   rejected as a connection mismatch: the mismatch counter rose and nothing reached
   the server. The agents still enrolled and still received commands over their
   `Subscribe` streams, and they re-registered on their back-off ladder (2 s doubling
   to a 300 s cap). The server's online count for the two agents flickered between 2,
-  1 and 0. The topology therefore fails loudly in the counters and the gateway
-  summary log, not silently.
+  1 and 0. In this observed nginx case the topology therefore fails loudly in the
+  counters and the gateway summary log, not silently; that is one two-agent test, not
+  a guarantee for every HTTP/2-terminating proxy.
 - Behind an L4 TCP forwarder (nginx `stream`), there were zero rejections.
 - A multiplexing HTTP/2 proxy with upstream keepalive was **not tested**.
 
@@ -249,7 +258,7 @@ rejection and the line can lag the counters; the counters are authoritative. The
 limit is one state shared by all concurrent rejections (it is created at gateway
 start, after telemetry setup and before the gateway supervision tree starts; the agent
 listener belongs to the grpcbox dependency application, which can start first, so a
-heartbeat in that window is rejected and the state is then created lazily), so a burst of simultaneous first rejections produces one line. At startup the
+heartbeat in that window is rejected and the state is then created lazily), so in initialized operation a burst of simultaneous first rejections produces one line; a heartbeat before the state exists can race with other lazy initializations and may produce an extra line. At startup the
 gateway logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
 rejected heartbeat has no resolved principal, so there is no audit row, only the
 counters and the summary line.
@@ -299,7 +308,10 @@ a load balancer that should drain such a node must probe `:8081/readyz`.
 on a restarted node reconnect and re-register on their back-off. Multi-node behaviour
 is not tested.
 
-**Upgrading.** Deploy this change with a **gateway restart**. The session index is a
+**Upgrading.** Deployments that use this gateway need agents 0.13.0 or newer (the final
+0.13.0 tag; `v0.13.0-rc1` to `v0.13.0-rc6` lack the recovery): upgrade the agents first, then
+the gateway. Agents that do not connect through the gateway are not affected. Deploy this
+change with a **gateway restart**. The session index is a
 new in-memory table created when the gateway registry starts, and hot code upgrade
 is not supported for this change. New code loaded into a running node has no index
 table (a unit test exercises this by deleting the table inside the registry; a real
