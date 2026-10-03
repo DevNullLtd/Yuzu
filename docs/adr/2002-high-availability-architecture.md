@@ -1210,7 +1210,13 @@ rules. No wire, agent or server change; this change does not fix #1197.
   `error` (not held on this node, or the process is no longer alive) or `{error, unavailable}` (the
   index table does not exist, for example while the registry restarts). Callers must treat
   `{error, unavailable}` as "not admitted", never as "no filter"; admission answers it with the same
-  `NOT_FOUND`. The gateway-side replay change consumes this function and must handle all three shapes.
+  `NOT_FOUND`. A future consumer (the gateway-side replay) must handle all three shapes, and must not
+  read `error` as "gone": it also covers a session that is only pending and the brief gap between
+  `take_pending` and `register_agent`. `{ok, #{conn_key := undefined}}` means the session is held but
+  never admits (it was registered without a connection key), not "not held". A consumer should use one
+  lookup consistently: `lookup_session/1` is session-keyed and checks that the process is local and
+  alive, while `lookup_local_session/1` is agent-keyed and has no node check. The server's
+  `unknown_session_ids` verdict stays an advisory snapshot whatever a consumer does with this function.
 - **Lifecycle, as implemented.**
 
 | Event | Index row |
@@ -1220,22 +1226,38 @@ rules. No wire, agent or server change; this change does not fix #1197.
 | `yuzu_gw_agent:init/1` calls `register_agent/7` | row inserted with the Subscribe connection's key; `maybe_cleanup` also removes the superseded process's row; `/5` and `/6` registrations carry `undefined` and admit nothing; an `undefined` session id is not indexed |
 | agent process cleanup | `deregister_agent/3` is fenced on the caller's own pid and session: it always removes that session's row, and removes the routing row and `pg` memberships only while that pid still owns the agent id, so a process superseded by a newer registration cannot remove it. The unfenced `deregister_agent/1` remains (it removes whichever process holds the agent id, with that row's session entry) |
 | registry `DOWN` for an agent pid | the session row goes only if the agent's routing row still names that pid |
-| registry restart | both tables are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents are expected to recover through their re-register path (not exercised end to end) |
+| registry restart | all of its tables (routing, pending and sessions) are recreated empty; lookups answer `{error, unavailable}` while the table is absent and `error` afterwards, so heartbeats get `NOT_FOUND` and agents recover through their re-register path. Observed on a rig by killing the registry process with 4 real agents attached: `unknown_session` rose by 4 (one per agent), `registry_unavailable` stayed 0, and all 4 agents were admitted again within about 25 s without a manual restart |
 | gateway restart | everything is gone and every connection is dropped; agents reconnect with fresh sessions |
-| upstream replay and `reannounce/2` | untouched: replay never creates, moves or deletes a binding |
+| upstream replay and `reannounce/2` | replay never writes the index directly; a forced disconnect of a superseded replay ends that agent process, and the fenced cleanup then removes its row |
 | server-only restart | untouched: admission does not consult the server, so heartbeats are still admitted and the server's verdict stays advisory |
 
 - **Supported topologies.** Agents connect to `:50051` directly, or through an L4 / TLS-passthrough path
   that keeps one TCP connection per agent. An HTTP/2-terminating or HTTP/2-multiplexing proxy between
   agents and the gateway is not supported for this check: it can spread one agent's calls over several
-  connections (rejections as `connection_mismatch` and repeated re-registration) and removes the
-  per-agent separation the check relies on. There is no topology knob and no `sys.config` change. A
-  GOAWAY, a connection break or a client-side connection replacement while a stream drains can also
-  put a heartbeat on a different connection than its session; the result is a `NOT_FOUND` and a fresh
-  session, paced by the agent's cooldown.
+  connections (connection mismatches, counted by `yuzu_gw_heartbeat_session_mismatch_total` and shown
+  as the `connection_mismatch=` count in the gateway summary log line, plus repeated re-registration)
+  and removes the per-agent separation the check relies on. There is no topology knob and no
+  `sys.config` change. Observed with a real C++ agent and two agents per run: behind an
+  HTTP/2-terminating proxy (nginx `grpc_pass`) every heartbeat was rejected as a connection mismatch
+  and none reached the server, while the agents still enrolled and received commands and re-registered
+  on their back-off ladder (2 s doubling to a 300 s cap); behind an L4 TCP forwarder (nginx `stream`)
+  there were no rejections. The agent-facing message is the same `unknown session` for every reason, so
+  operators diagnose from the counters and the summary log. A multiplexing HTTP/2 proxy with upstream
+  keepalive, a multi-node gateway, a listener that requires client certificates, fleet-scale storms,
+  Windows service mode and a macOS agent were not tested.
+- **Connection close and GOAWAY.** Observed in the gateway's own tests with a test HTTP/2 client: the
+  gateway's HTTP/2 server closes a connection as soon as it sends GOAWAY, so a `Subscribe` stream and
+  its binding end with the connection (there is no drain period). A heartbeat that reaches the gateway
+  on a different connection while the old `Subscribe` is still bound is rejected (`NOT_FOUND`,
+  connection mismatch) and the agent recovers by re-registering. The behaviour of the real C++ agent
+  across a GOAWAY has not been tested.
 - **Deploying.** The index table is created at registry init, so deployment needs a gateway restart;
-  hot code upgrade is not supported for this change (code loaded into a running node has no table and
-  every heartbeat on that node is rejected as `registry_unavailable`).
+  hot code upgrade is not supported for this change. Code loaded into a running node has no table: the
+  registry guards its index calls (`catch error:badarg`), so it survives and keeps its routing rows and
+  `pg` groups, logs one warning, and every heartbeat on that node is rejected as `registry_unavailable`
+  until the gateway is restarted (covered by a unit test that deletes the table inside the registry; a
+  real hot code load was not run). `/readyz` reports `sessions_index` and answers 503 while the table is
+  missing. `yuzu_gw_sessions` is a protected table written only by the registry process.
 - **Limits.** `Subscribe` admission is unchanged by this change. Some log lines still include session
   ids; two gateway info lines no longer do.
 
