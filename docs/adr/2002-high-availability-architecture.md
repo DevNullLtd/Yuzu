@@ -1187,7 +1187,12 @@ session is bound to the connection whose `Subscribe` stream created it; `heartbe
 only on that connection and only for a session the node holds. The `unknown_session_ids` verdict
 (2026-10-01 note) therefore names only sessions the node held at admission time; it remains an advisory
 snapshot (`gateway.proto`: it may be stale) and the replay keeps its own liveness, dedupe and pacing
-rules. No wire, agent or server change; this change does not fix #1197.
+rules. No wire or server change, and no agent change for the supported topologies; this change does not fix #1197.
+A rejected agent re-registers through its `NOT_FOUND` recovery (cooldown from 2 s doubling to 300 s), which
+exists in agent 0.13.0 and newer (checked in the agent source at the v0.12.0 and v0.13.0 tags). An older agent only
+logs `Heartbeat failed` and does not re-register by itself (restart or upgrade it); that matters only when its
+heartbeats are rejected, and the normal direct or L4 topology is unaffected. Rollback is redeploying the
+previous gateway (the only new state is the in-memory index; derived from the change, not run).
 - **Connection key.** The key is the pid of the HTTP/2 connection process that carries the call, read
   through a typed accessor added to the vendored grpcbox as its third `YUZU PATCH` site
   (`grpcbox_stream:connection_pid/1`, `connection_pid_from_ctx/1`; `YUZU_PATCH.md`), wrapped by

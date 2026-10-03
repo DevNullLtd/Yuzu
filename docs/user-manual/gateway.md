@@ -175,7 +175,13 @@ before.
 An agent whose heartbeat is answered `NOT_FOUND` recovers on its own, as it already
 does for any lost session: it waits an escalating cooldown (2 s on the first
 rejection, doubling to a 300 s cap), drops its `Subscribe` stream and registers
-again. There is no wire, agent or server change.
+again. There is no wire or server change, and no agent change for the supported
+topologies. This recovery needs **agent 0.13.0 or newer** (checked in the agent
+source at the v0.12.0 and v0.13.0 tags). An older agent only logs `Heartbeat failed`
+and does not re-register by itself, so restart or upgrade it. That matters only if
+its heartbeats are rejected (a topology that breaks the one-connection assumption,
+or a gateway running without the session index); the normal direct or L4 topology
+is unaffected.
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
 directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
@@ -267,6 +273,12 @@ and process groups, logs one warning, and every heartbeat on that node is reject
 `sessions_index` and answers 503 `not_ready` while it is missing. The table is
 protected: only the registry process writes it. After a restart agents reconnect,
 register and subscribe again, and their sessions are bound to the new connections.
+
+**Rollback.** Redeploy the previous gateway release. The only new state is the in-memory
+session index, and there is no wire, agent or server change, so nothing needs migrating;
+agents re-register on their own (agents older than 0.13.0 may need a restart, see
+[Heartbeat admission](#heartbeat-admission)), and a rollback removes the connection
+check. This is derived from the change and was not run.
 
 **Tested configurations** (observed, with the rejection counters at 0): a real C++ agent over one-way TLS (it enrolled one-way, received a per-agent
 certificate and reconnected with mutual TLS; a second agent ran steady one-way TLS;
