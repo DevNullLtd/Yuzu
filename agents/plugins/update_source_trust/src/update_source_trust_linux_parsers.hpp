@@ -243,24 +243,12 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
                                        : static_cast<std::size_t>(size_bytes);
     out.assign(want, '\0');
     std::size_t total = 0;
-    // Charges the bytes pulled from the kernel on EVERY exit below (ok, short_read,
-    // read_failed, the closing fstat failing, modified_during_read): charging only a
-    // successful read would let a run of failing files bypass the budget.
-    struct Charge {
-        InputBudget& b;
-        std::size_t& total;
-        bool done = false;
-        void flush() noexcept {
-            if (!done)
-                b.used += total;
-            done = true;
-        }
-        ~Charge() { flush(); }
-    } charge{budget, total};
+    // Charged per read so every exit below is charged (ok, short_read, read_failed,
+    // the closing fstat failing, modified_during_read): charging only a successful
+    // read would let a run of failing files bypass the budget.
     // A failure token, then (budget now spent) the cap token that stops the walk.
     const auto fail = [&](std::string_view detail) {
         note_failure(acc, source_prefix, detail);
-        charge.flush();
         if (budget.used <= budget.max_input_bytes)
             return Outcome::failed;
         note_failure(acc, source_prefix, "input_cap");
@@ -279,6 +267,7 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
             return fail("short_read");
         }
         total += static_cast<std::size_t>(n);
+        budget.used += static_cast<std::size_t>(n);
     }
     after_read();
     struct stat after{};
@@ -298,7 +287,6 @@ inline Outcome read_file(const std::filesystem::path& path, std::size_t cap, boo
     const bool just_emptied = !head_only && seen.size == 0 && seen.sec >= now_s - 2 && seen.sec <= now_s + 2;
     if (seen != stamp_of(st) || just_emptied)
         return fail("modified_during_read");
-    charge.flush();
     if (budget.used > budget.max_input_bytes) {
         note_failure(acc, source_prefix, "input_cap");
         return Outcome::input_cap;

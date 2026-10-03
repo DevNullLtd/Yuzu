@@ -421,7 +421,7 @@ linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_rea
     return finish();
 }
 
-/// Rows and summary reason only, for a caller that has no use for the per-path attribution.
+/// The pre-per-path signature, retained for the unit suite; production (run_linux_at) uses the per-path form.
 [[nodiscard]] inline std::vector<std::string>
 linux_policy_rows_at(const std::filesystem::path& root, std::string& failure_reason,
                      const WalkLimits& limits = {}) {

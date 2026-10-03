@@ -145,8 +145,9 @@ TEST_CASE("redact_url_userinfo strips credentials from every URL in a list",
     // A replaced byte can create a URL shape apt never saw (`http:<NUL>//u:pw@h/`),
     // so url_field drops everything up to the last '@' of any word it had to scrub.
     const std::string poisoned("http:\0//u:pw@h.example/x", sizeof("http:\0//u:pw@h.example/x") - 1);
-    CHECK(ust::url_field(poisoned).find("pw") == std::string::npos);
-    CHECK(ust::url_field(std::string("http://a.example/x\xff")) == "http://a.example/x?");
+    std::size_t n = 0;
+    CHECK(ust::url_field(poisoned, n).find("pw") == std::string::npos);
+    CHECK(ust::url_field(std::string("http://a.example/x\xff"), n) == "http://a.example/x?");
 }
 
 // ── apt one-line ─────────────────────────────────────────────────────────

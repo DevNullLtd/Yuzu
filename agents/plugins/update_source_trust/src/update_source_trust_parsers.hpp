@@ -370,11 +370,6 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return field(s);
 }
 
-[[nodiscard]] inline std::string url_field(std::string_view v) {
-    std::size_t ignored = 0;
-    return url_field(v, ignored);
-}
-
 // ── errno -> failure-detail token ────────────────────────────────────────
 
 enum class IoStage { open_file, read_file, open_dir };
