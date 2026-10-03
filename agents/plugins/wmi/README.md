@@ -163,6 +163,7 @@ error|WMI not available on this platform
 - Plugin: `agents/plugins/wmi/src/wmi_plugin.cpp`
 - Definitions: `content/definitions/wmi.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_wmi_local_dispatcher.cpp`
+- Tests: `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_wmi_error_token.cpp` · `tests/unit/test_wmi_local_dispatcher.cpp`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Changelog: `changelog.d/4895-wmi-firmware-vuln-hardening.fixed.md`
 <!-- END GENERATED -->

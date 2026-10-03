@@ -134,7 +134,7 @@
   "caveats": [
     "**CVE matching is a fixed, built-in rule table, not a live feed.** `cve_rules.hpp` lists a static set of CVEs per product; matching is a case-insensitive substring match on the installed app's name against a naive dot/dash-split numeric version comparator. A product whose installed name doesn't contain the rule's substring, or any CVE outside this table, is silently not reported.",
     "**`summary`'s emitted shape doesn't match its declared result columns.** The code emits 3 pipe fields per row (`summary|<severity-or-TOTAL>|<count>`), but the definition YAML declares only 2 result columns, `severity` and `count`. The `TOTAL` row's `count` cell is also a formatted string (`\"<n> findings (<n> issues)\"`), not the declared `int32`.",
-    "**A denied or missing read never surfaces as an explicit error — it becomes the check's negative/default branch.** A failed Windows registry read returns an empty string, read as \"key not present\"; a failed `popen` on Linux/macOS returns empty output, read as \"command absent\" or \"feature disabled\". No sample capture observed an actual permission denial, so this is a code-path claim, not a measured one.",
+    "**On Windows and macOS, and for Linux `popen` probes, a denied or missing read never surfaces as an explicit error — it becomes the check's negative/default branch.** A failed Windows registry read returns an empty string, read as \"key not present\"; a failed `popen` on Linux/macOS returns empty output, read as \"command absent\" or \"feature disabled\". The Linux file-backed checks (SSH, ASLR, `suid_dumpable`) are the exception: a failed read is `UNREADABLE`. No sample capture observed an actual permission denial, so this is a code-path claim, not a measured one.",
     "**`inventory` and `installed_apps` are two collectors for overlapping data.** They already share the same \"installed, held\" package-presence convention on Linux without being merged — a caller working from installed-software identity has two plugins to reconcile.",
     "**No dedicated row in `docs/agent-privilege-model.md`.** The Privileges table above reflects only what each sample capture measured (SYSTEM on Windows, unprivileged on macOS, root in a Linux container), not a documented minimum grant."
   ],
@@ -210,7 +210,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Run a full host vulnerability scan combining CVE matching and configuration compliance checks. CVE matching compares installed software versions against a built-in rule database. Configuration checks verify security hardening settings (firewall state, password policy, remote desktop config, etc.). Each finding is classified by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). Reports progress at 0%, 50%, 90%, 100%.",
+      "description": "Run a full host vulnerability scan combining CVE matching and configuration compliance checks. CVE matching compares installed software versions against a built-in rule database. Configuration checks verify security hardening settings (firewall state, password policy, remote desktop config, etc.). Each finding is classified by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check could not run; not an issue). Reports progress at 0%, 50%, 90%, 100%.",
       "display_name": "Full Vulnerability Scan",
       "execute_roles": [
         "endpoint-admin",
@@ -232,7 +232,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Run a full vulnerability scan (CVE + configuration) and return only the severity summary counts. Provides a quick overview of the endpoint's security posture without the full finding details. Returns total findings, total issues, and per-severity counts (CRITICAL, HIGH, MEDIUM, LOW, INFO).",
+      "description": "Run a full vulnerability scan (CVE + configuration) and return only the severity summary counts. Provides a quick overview of the endpoint's security posture without the full finding details. Returns total findings, total issues, and per-severity counts (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check could not run and is not counted as an issue).",
       "display_name": "Vulnerability Scan Summary",
       "execute_roles": [
         "endpoint-admin",
@@ -265,7 +265,7 @@
     {
       "columns": [
         {
-          "description": "Finding severity assigned by the compliance check that produced this row.",
+          "description": "Finding severity assigned by the compliance check that produced this row. UNREADABLE means the check could not run; not an issue.",
           "example": "HIGH",
           "name": "severity",
           "platforms": [
@@ -279,7 +279,8 @@
             "HIGH",
             "MEDIUM",
             "LOW",
-            "INFO"
+            "INFO",
+            "UNREADABLE"
           ]
         },
         {
@@ -418,7 +419,7 @@
     {
       "columns": [
         {
-          "description": "Finding severity assigned by the check that produced this row.",
+          "description": "Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run; not an issue.",
           "example": "CRITICAL",
           "name": "severity",
           "platforms": [
@@ -432,7 +433,8 @@
             "HIGH",
             "MEDIUM",
             "LOW",
-            "INFO"
+            "INFO",
+            "UNREADABLE"
           ]
         },
         {
@@ -496,7 +498,8 @@
             "HIGH",
             "MEDIUM",
             "LOW",
-            "INFO"
+            "INFO",
+            "UNREADABLE"
           ]
         },
         {
@@ -515,7 +518,7 @@
       "definition_id": "security.vuln_scan.summary"
     }
   ],
-  "outputs_note": "Pipe-delimited rows, one per finding (or per installed package for `inventory`). `scan`,\n`cve_scan`, and `config_scan` share the same 4-field row shape,\n`severity|category|title|detail`; an empty result is never zero rows — a run that finds nothing\nstill emits one placeholder row, `INFO|scan|No vulnerabilities|No issues detected`. `summary` emits\na different, 3-field shape: a literal `summary` discriminator, then a severity name (or the\nliteral `TOTAL`), then a count — one field more than the two result columns (`severity`, `count`)\nthe definition declares. `inventory` emits raw `name|version` pairs with no discriminator.",
+  "outputs_note": "Pipe-delimited rows, one per finding (or per installed package for `inventory`). `scan`,\n`cve_scan`, and `config_scan` share the same 4-field row shape,\n`severity|category|title|detail`; an empty result is never zero rows — a run that finds nothing\nstill emits one placeholder row, `INFO|scan|No vulnerabilities|No issues detected`. `summary` emits\na different, 3-field shape: a literal `summary` discriminator, then a severity name (or the\nliteral `TOTAL`), then a count — one field more than the two result columns (`severity`, `count`)\nthe definition declares. `inventory` emits raw `name|version` pairs with no discriminator.\n\nA Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|config|<title>|<path>: <cause>`\n(for example `eacces`) rather than a finding about an empty value. `UNREADABLE` means the check\ncould not run; it is not an issue, so `summary` leaves it out of the `TOTAL` row's issue count and\nreports it on its own `summary|UNREADABLE|<n>` row after `summary|INFO|<n>`. An absent\n`/etc/ssh/sshd_config` is not a weak setting: both SSH checks emit `INFO` with\n\"/etc/ssh/sshd_config not present; check not applicable\".",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
