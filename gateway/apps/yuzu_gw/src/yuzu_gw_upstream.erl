@@ -47,6 +47,7 @@
          proxy_inventory/1,
          notify_stream_status/5,
          forward_guardian_message/2,
+         replay_sessions/1,
          circuit_state/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 
@@ -134,6 +135,13 @@ notify_stream_status(AgentId, SessionId, Event, PeerAddr, StreamHomeId) ->
 -spec forward_guardian_message(binary(), map()) -> ok.
 forward_guardian_message(AgentId, ResponseFrame) ->
     gen_server:cast(?SERVER, {forward_guardian_message, AgentId, ResponseFrame}).
+
+%% @doc Replay the registrations of the sessions the server reported as
+%% unknown (#1197 PR-C). Placeholder seam: exported so the red tests
+%% compile, no behaviour yet.
+-spec replay_sessions([binary()]) -> ok.
+replay_sessions(_SessionIds) ->
+    ok.
 
 %% @doc Query the current circuit breaker state (for health checks).
 -spec circuit_state() -> closed | open | half_open.

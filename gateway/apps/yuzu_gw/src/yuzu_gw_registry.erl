@@ -39,6 +39,7 @@
          all_agents/0,
          all_agent_pids/0,
          all_register_reqs/0,
+         entries_for_sessions/1,
          agents_for_plugin/1,
          agent_count/0,
          list_agents/2,
@@ -292,6 +293,12 @@ all_agents() ->
 -spec all_agent_pids() -> [pid()].
 all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
+
+%% @doc The replay entries for the sessions this node holds (#1197 PR-C).
+%% Placeholder seam: exported so the red tests compile, no behaviour yet.
+-spec entries_for_sessions([binary()]) -> [{binary(), binary() | undefined, map()}].
+entries_for_sessions(_SessionIds) ->
+    [].
 
 %% @doc Return {AgentId, SessionId, RegisterRequest} for every
 %% currently-registered agent. Used by yuzu_gw_upstream to re-proxy
