@@ -113,6 +113,9 @@ struct SubprocessOptions {
     // The resulting run's termination_reason is line_limit, and exit_code is
     // left at whatever the child's own reap produced (see SubprocessResult::
     // exit_code) -- it is NEVER fabricated to 0 for a signal-killed child.
+    // Bytes the runner drains AFTER the max_lines-th line (while the kill
+    // lands and the pipe empties) are discarded drain: they never set
+    // output_truncated, however late the kill lands (#5298).
     bool stop_after_max_lines = false;
 
     // Per-invocation cancel (see CancellationToken above). Left null (the

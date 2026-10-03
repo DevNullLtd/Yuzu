@@ -1404,8 +1404,18 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             const auto take = static_cast<std::size_t>(n) < avail ? static_cast<std::size_t>(n) : avail;
             if (take > 0)
                 result.output.append(buf.data(), take);
-            if (take < static_cast<std::size_t>(n))
-                result.output_truncated = true;
+
+            // #5298: with stop_after_max_lines, bytes drained AFTER the
+            // line-cap latch (the max_lines-th stored line) are discarded
+            // drain, never part of the result the caller asked for, so they
+            // must not flag output_truncated: the documented contract is that
+            // reaching max_lines is a clean bounded stop. `pre_latch_n` is the
+            // count of bytes of THIS read at or before the latch point
+            // (everything when the latch does not fire here, nothing when it
+            // already fired on an earlier read). Without stop_after_max_lines
+            // line_cap_stop never latches, so this is byte-for-byte the
+            // previous behaviour.
+            std::size_t pre_latch_n = line_cap_stop ? std::size_t{0} : static_cast<std::size_t>(n);
 
             // CDX-P2-005: materialize lines over EVERY drained byte (all `n`,
             // not just the `take` prefix admitted to the blob) so on_line -- a
@@ -1419,12 +1429,16 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 if (ch == '\n') {
                     store_line(std::move(line_buf));
                     line_buf.clear();
+                    if (line_cap_stop && pre_latch_n == static_cast<std::size_t>(n))
+                        pre_latch_n = static_cast<std::size_t>(i) + 1;
                 } else if (line_buf.size() < output_cap) {
                     line_buf += ch;
-                } else {
+                } else if (!line_cap_stop) {
                     result.output_truncated = true;
                 }
             }
+            if (take < pre_latch_n)
+                result.output_truncated = true;
         } else if (n == 0) {
             pipe_eof = true; // EOF: writer(s) closed their end
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -2211,8 +2225,9 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 const auto take = static_cast<std::size_t>(n) < avail ? static_cast<std::size_t>(n) : avail;
                 if (take > 0)
                     result.output.append(buf.data(), take);
-                if (take < static_cast<std::size_t>(n))
-                    result.output_truncated = true;
+                // #5298: bytes drained after the stop_after_max_lines latch
+                // are discarded drain, not truncation (see the POSIX twin).
+                std::size_t pre_latch_n = line_cap_stop ? std::size_t{0} : static_cast<std::size_t>(n);
                 // CDX-P2-005: materialize over every drained byte (all `n`, not
                 // the `take` blob prefix) so on_line keeps streaming past the
                 // blob cap; store_line + the line_buf bound keep storage capped.
@@ -2221,12 +2236,16 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                     if (ch == '\n') {
                         store_line(std::move(line_buf));
                         line_buf.clear();
+                        if (line_cap_stop && pre_latch_n == static_cast<std::size_t>(n))
+                            pre_latch_n = i + 1;
                     } else if (line_buf.size() < output_cap) {
                         line_buf += ch;
-                    } else {
+                    } else if (!line_cap_stop) {
                         result.output_truncated = true;
                     }
                 }
+                if (take < pre_latch_n)
+                    result.output_truncated = true;
             }
         } else if (!have_peek) {
             // The write end has closed (child exited/crashed) --

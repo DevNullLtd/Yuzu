@@ -697,6 +697,96 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exa
 }
 
 namespace {
+// #5298: awk program that emits `head` then `flood` bytes of a single atomic
+// (< PIPE_BUF) write, so the very first 512-byte runner read starts with the
+// head lines and carries post-head bytes in the SAME read. No dependence on
+// how quickly the runner's line-cap kill lands: the post-latch bytes are
+// already in that first read.
+std::string awk_head_then_flood(const std::string& head_printf, const std::string& flood_unit,
+                                int flood_reps) {
+    return "BEGIN{s=\"" + head_printf + "\"; for(i=0;i<" + std::to_string(flood_reps) +
+           ";++i) s=s \"" + flood_unit + "\"; printf \"%s\", s}";
+}
+} // namespace
+
+TEST_CASE("run_bounded_subprocess with stop_after_max_lines does not flag output_truncated for "
+          "bytes drained after the line-cap latch (#5298)",
+          "[subprocess][deadline][macos][linux]") {
+    // Contract (subprocess_runner.hpp stop_after_max_lines): reaching max_lines
+    // is a clean bounded success, "output_truncated=false". The runner kills
+    // the child at the latch but keeps draining to EOF; bytes drained after
+    // the latch are discarded drain, not the caller's result, and used to trip
+    // output_truncated once they exceeded the output cap (the Big Tam CI
+    // failure: `yes` filled the 1,000,000-byte capture before the SIGKILL
+    // landed). Deterministic: a single atomic write whose first 512-byte read
+    // holds the 3 lines AND >cap post-latch bytes, so the post-latch bytes are
+    // in the same read as the latch whatever the kill latency.
+    constexpr std::size_t kLines = 3;
+    constexpr std::size_t kCap = 100;
+    // (a) newline-free flood: trips the line accumulator's per-line cap and
+    // the blob cap after the latch. (b) newline-rich flood: only the blob cap.
+    const std::vector<std::pair<std::string, std::string>> floods = {
+        {"x", "newline-free flood"}, {"x\\n", "newline-rich flood"}};
+    for (const auto& [unit, label] : floods) {
+        CAPTURE(label);
+        SubprocessResult result = run_bounded_subprocess(
+            {"/usr/bin/awk", awk_head_then_flood("a\\nb\\nc\\n", unit, 1500)},
+            SubprocessOptions{.deadline = 10000ms,
+                              .max_lines = kLines,
+                              .stop_after_max_lines = true,
+                              .output_cap_bytes = kCap});
+        CHECK(result.tool_ran);
+        CHECK_FALSE(result.timed_out);
+        CHECK_FALSE(result.output_truncated);
+        REQUIRE(result.lines.size() == kLines);
+        CHECK(result.lines[0] == "a");
+        CHECK(result.lines[2] == "c");
+        // The blob cap itself is still enforced.
+        CHECK(result.output.size() <= kCap);
+        // line_limit when our kill ended the child; exited when the child
+        // finished by itself in the same instant (K-5 race, unavoidable).
+        CHECK((result.termination_reason == TerminationReason::line_limit ||
+               result.termination_reason == TerminationReason::exited));
+    }
+}
+
+TEST_CASE("run_bounded_subprocess: truncation BEFORE the line-cap latch still flags output_truncated "
+          "under stop_after_max_lines (#5298)",
+          "[subprocess][deadline][macos][linux]") {
+    // Everything before the latch behaves as before: an over-long first line
+    // (300 bytes vs a 100-byte cap) is dropped by the line accumulator before
+    // the third line latches the stop, so the result genuinely is truncated.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/awk", "BEGIN{s=\"\"; for(i=0;i<300;++i) s=s \"y\"; "
+                         "printf \"%s\\na\\nb\\nc\\n\", s}"},
+        SubprocessOptions{.deadline = 10000ms,
+                          .max_lines = 3,
+                          .stop_after_max_lines = true,
+                          .output_cap_bytes = 100});
+    CHECK(result.tool_ran);
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.output_truncated);
+    REQUIRE(result.lines.size() == 3);
+    CHECK(result.lines[0] == "a");
+}
+
+TEST_CASE("run_bounded_subprocess WITHOUT stop_after_max_lines still flags output_truncated for a "
+          "flood past the cap (#5298 unchanged behaviour)",
+          "[subprocess][deadline][macos][linux]") {
+    // max_lines alone only caps what is STORED; the drained flood past the
+    // output cap is real truncation and must stay flagged.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/awk", awk_head_then_flood("a\\nb\\nc\\n", "x\\n", 1500)},
+        SubprocessOptions{.deadline = 10000ms, .max_lines = 3, .output_cap_bytes = 100});
+    CHECK(result.tool_ran);
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.output_truncated);
+    CHECK(result.output.size() == 100);
+    CHECK(result.lines.size() == 3);
+    CHECK(result.termination_reason == TerminationReason::exited);
+}
+
+namespace {
 // Places a deliberately non-CLOEXEC descriptor at `target` (dup2 always clears
 // CLOEXEC on the new fd — exactly the inherited-leak scenario), then asks a
 // child whether it can still see it via /dev/fd/<target>. Returns true iff the
