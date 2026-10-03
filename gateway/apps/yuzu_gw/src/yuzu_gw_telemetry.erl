@@ -38,6 +38,7 @@
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
     [yuzu, gw, upstream, notify_dropped],
+    [yuzu, gw, upstream, registration_replay_triggered],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
     [yuzu, gw, guardian, forward_accepted],
@@ -46,6 +47,8 @@
     %% Heartbeat admission (connection-bound sessions)
     [yuzu, gw, heartbeat, rejected],
     [yuzu, gw, heartbeat, session_mismatch],
+    [yuzu, gw, heartbeat, unknown_truncated],
+    [yuzu, gw, heartbeat, verdict_dropped],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -228,6 +231,29 @@ handle_event([yuzu, gw, heartbeat, rejected], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], N);
+
+%% Heartbeat verdict consumer (#1197 PR-C). `registration_replay_triggered'
+%% counts replays that started, by trigger (breaker | heartbeat); the label is
+%% an atom chosen by yuzu_gw_upstream, never caller-supplied, so a sender
+%% cannot control label cardinality. `unknown_truncated' counts verdicts the
+%% server cut short. `verdict_dropped' counts session ids the verdict named
+%% that were not queued for replay, by reason (malformed | not_local |
+%% circuit_open | queue_full); the ids already queued or inside the session
+%% guard are deduplicated, not dropped, and are not counted. A missing label
+%% falls to `unknown' rather than guessing, and the handler must never crash:
+%% telemetry detaches a handler that raises, which would silence every metric.
+handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
+    Trigger = maps:get(trigger, Meta, unknown),
+    prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
+                           [atom_to_binary(Trigger, utf8)], N);
+
+handle_event([yuzu, gw, heartbeat, unknown_truncated], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_heartbeat_unknown_truncated_total, [], N);
+
+handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, unknown),
+    prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total,
+                           [atom_to_binary(Reason, utf8)], N);
 
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
@@ -430,6 +456,34 @@ declare_metrics() ->
      || R <- heartbeat_reject_reasons()],
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_registration_replay_triggered_total},
+        {labels, [trigger]},
+        {help, "Registration replays started, by trigger (breaker = the upstream "
+               "recovered from failures, replaying every agent this node holds; "
+               "heartbeat = the server's heartbeat verdict listed sessions it does "
+               "not know, replaying only those)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_unknown_truncated_total},
+        {labels, []},
+        {help, "BatchHeartbeat responses whose list of unknown sessions the "
+               "server truncated. Sessions beyond the cap are reported again by "
+               "later heartbeats"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_verdict_dropped_total},
+        {labels, [reason]},
+        {help, "Session ids named by a heartbeat verdict that were not queued "
+               "for replay, by reason (malformed = not a usable session id, "
+               "not_local = this node does not hold the session, circuit_open = "
+               "the upstream circuit breaker is open, queue_full = the replay "
+               "queue is at its cap). Ids already queued or replayed within the "
+               "session guard window are not counted"}]),
+    %% Create every series at 0 now (a series that first appears already at 1
+    %% is invisible to increase()).
+    [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
+     || T <- [<<"breaker">>, <<"heartbeat">>]],
+    [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
+     || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},
