@@ -306,6 +306,19 @@ TEST_CASE("render_hive_access_lines: each failure emits exactly one error line",
     CHECK(mf[0] == "error|failed to load hive for sid '" + sid + "'");
 }
 
+TEST_CASE("render_hive_access_lines: a refused hive file emits one error line, after any warning",
+          "[profiles]") {
+    const std::string sid{kAliceSid};
+    const auto fr = render_hive_access_lines(HiveAccessStatus::file_refused, false, "", kAliceSid);
+    REQUIRE(fr.size() == 1);
+    CHECK(fr[0] == "error|hive file refused for sid '" + sid + "'");
+
+    const auto both = render_hive_access_lines(HiveAccessStatus::file_refused, true, "MNT", kAliceSid);
+    REQUIRE(both.size() == 2);
+    CHECK(both[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
+    CHECK(both[1] == fr[0]);
+}
+
 TEST_CASE("render_hive_access_lines: the unload warning names the ACTUAL mount", "[profiles]") {
     // The mount name is salted per call (up-S1), so reconstructing
     // "YUZU_HIVE_<sid>" would print a name that was never mounted and a
