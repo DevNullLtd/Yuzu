@@ -63,8 +63,10 @@ inline std::string errno_name(int e) {
     }
 }
 
-// badbit = an I/O fault mid-read (e.g. EIO on /proc). failbit+eofbit on a
-// short or empty file is a VALUE (empty string), not a fault.
+// badbit = an I/O fault mid-read (libstdc++ records a read() error as badbit with
+// errno set). failbit+eofbit on a short or empty file is a VALUE (empty string)
+// here; libc++ also reports a read fault that way, which is why
+// aslr_check/suid_dumpable_check treat an empty /proc/sys value as a fault.
 inline ReadResult read_value_from(std::istream& in) {
     std::string val;
     std::getline(in, val);
@@ -145,6 +147,11 @@ inline ConfigCheckResult aslr_check(const ReadResult& r) {
     if (!r)
         return detail::unreadable(title, detail::kAslrPath, r.error());
     const auto& val = *r;
+    // A /proc/sys value is never empty: an empty read is a fault the stream did not
+    // flag (libc++ surfaces a read error as EOF, not badbit; a masked file reads
+    // empty), never a value to judge.
+    if (val.empty())
+        return detail::unreadable(title, detail::kAslrPath, EIO);
     bool ok = !val.empty() && val[0] == '2';
     return {ok ? "INFO" : "HIGH", title,
             ok ? "Full randomization enabled (value=2)"
@@ -157,6 +164,8 @@ inline ConfigCheckResult suid_dumpable_check(const ReadResult& r) {
     if (!r)
         return detail::unreadable(title, detail::kSuidPath, r.error());
     const auto& val = *r;
+    if (val.empty())
+        return detail::unreadable(title, detail::kSuidPath, EIO); // see aslr_check
     bool ok = !val.empty() && val[0] == '0';
     return {ok ? "INFO" : "MEDIUM", title,
             ok ? "Restricted (suid_dumpable=0)"
@@ -237,8 +246,9 @@ inline std::string run_cmd(const char* cmd) {
     return result;
 }
 
-// Open failure -> errno from open. A fault after open (badbit) -> the errno the
-// kernel set during the read, else EIO.
+// Open failure -> errno from open. A fault after open (badbit, libstdc++) -> the
+// errno the kernel set during the read, else EIO. (libc++ reports a read fault as
+// EOF; the /proc/sys checks close that in the pure layer.)
 template <typename Reader>
 inline auto read_file_with(const char* path, Reader reader)
     -> std::invoke_result_t<Reader, std::ifstream&> {

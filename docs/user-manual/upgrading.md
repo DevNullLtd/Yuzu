@@ -32,6 +32,14 @@ not supported for this migration at this stage: above about 2 million rows stop 
 then start one and let it finish; below that, start one replica first. The procedure, the row-count query
 and the free-space guidance are in [Installed-Software Inventory](inventory.md) (Upgrading).
 
+## Behaviour change: vuln_scan reports an unreadable config check as UNREADABLE and adds a summary row (#4961)
+
+On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
+
+- **Affected:** scripts that index `summary` positionally or assert six rows; CEL or severity filters (a "no critical/high" policy passes a host it could not measure); dashboards keyed on MEDIUM counts on RHEL-family hosts where a non-root agent cannot read a mode-0600 `sshd_config`.
+- **Do:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.
+- No operator action is required, and rollback is safe (output strings only).
+
 ## Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)
 
 **Not a Breaking lead for the DEX routes and the management-group MEMBER-read path** — those already documented a `503` response before this release; what changes for them is when it fires, not the documented contract. **This does NOT hold for `GET /api/v1/management-groups/{id}`'s own GROUP-ROW read or its MCP twin `get_management_group`** (governance round-2, #1762): before this release, a degraded group-row read answered the SAME flat, undocumented `404 "group not found"` a genuinely nonexistent group id gets — there was no `503` contract for that case at all. This release adds a NEWLY DOCUMENTED, additive `503`/retryable error path for a degraded group-row read specifically; the `404` contract for a genuine not-found is unchanged. A client that already treats any `503` from these routes as retryable per the A4 contract needs no code change; a client that inferred "management group not found" purely from a `404` status code should note that `404` now unambiguously means "no such group" (never "could not tell") — narrower, not wider, than before.

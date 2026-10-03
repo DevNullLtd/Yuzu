@@ -4,7 +4,8 @@
  * A read that failed must surface as UNREADABLE (the check could not run), never
  * as the empty/unexpected-value finding. Covers the pure checks in
  * config_checks.hpp and the portable stream readers' fault detection. Portable:
- * no file or process access, so it runs on every OS.
+ * no process access; the one file access is an open of a path that does not
+ * exist (ENOENT plumbing), on Linux/macOS only.
  */
 
 #include "config_checks.hpp"
@@ -61,8 +62,8 @@ TEST_CASE("aslr_check: read values keep today's rows", "[vuln][config]") {
     CHECK_FALSE(bad.passed);
 
     auto empty = aslr_check(ReadResult{""});
-    CHECK(empty.severity == "HIGH");
-    CHECK(empty.detail == "Not fully enabled (value=) - should be 2");
+    CHECK(empty.severity == "UNREADABLE");
+    CHECK(empty.detail == "/proc/sys/kernel/randomize_va_space: eio");
     CHECK_FALSE(empty.passed);
 }
 
@@ -79,6 +80,9 @@ TEST_CASE("tmp_noexec_check: unreadable, no /tmp mount, noexec and exec", "[vuln
     CHECK_FALSE(tmp_noexec_check(lines({"proc /proc proc rw,nosuid,nodev,noexec 0 0",
                                         "/dev/sda1 / ext4 rw,relatime 0 0"}))
                     .has_value());
+    CHECK_FALSE(tmp_noexec_check(lines({"tmpfs /var/tmp tmpfs rw,noexec 0 0",
+                                        "tmpfs /tmp/x tmpfs rw,noexec 0 0"}))
+                    .has_value()); // ' /tmp ' is a whole-field match
 
     auto noexec = tmp_noexec_check(
         lines({"/dev/sda1 / ext4 rw,relatime 0 0",
@@ -120,8 +124,9 @@ TEST_CASE("suid_dumpable_check: read values keep today's rows", "[vuln][config]"
     CHECK_FALSE(bad.passed);
 
     auto empty = suid_dumpable_check(ReadResult{""});
-    CHECK(empty.severity == "MEDIUM");
-    CHECK(empty.detail == "Not restricted (suid_dumpable=) - SUID programs may dump core");
+    CHECK(empty.severity == "UNREADABLE");
+    CHECK(empty.detail == "/proc/sys/fs/suid_dumpable: eio");
+    CHECK_FALSE(empty.passed);
 }
 
 // ── SSH root login ──────────────────────────────────────────────────────────
@@ -217,6 +222,7 @@ TEST_CASE("read_value_from: clean, empty and faulted streams", "[vuln][config]")
     auto e = read_value_from(empty);
     REQUIRE(e.has_value()); // failbit+eofbit on an empty file is a value, not a fault
     CHECK(e->empty());
+    CHECK(aslr_check(e).severity == "UNREADABLE"); // the check, not the reader, refuses an empty /proc/sys value
 
     std::istringstream faulted("2\n");
     faulted.setstate(std::ios::badbit);
@@ -258,3 +264,16 @@ TEST_CASE("summary_rows: UNREADABLE counted separately and excluded from issues"
         "summary|UNREADABLE|3"};
     CHECK(rows == expected);
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+TEST_CASE("read_proc_value / read_lines: a missing path reports ENOENT", "[vuln][config]") {
+    const char* missing = "/nonexistent/yuzu_test_vuln_config_checks/absent";
+    auto v = detail::read_proc_value(missing);
+    REQUIRE_FALSE(v.has_value());
+    CHECK(v.error() == ENOENT);
+    auto l = detail::read_lines(missing);
+    REQUIRE_FALSE(l.has_value());
+    CHECK(l.error() == ENOENT);
+    CHECK(ssh_root_login_check(l).severity == "INFO");
+}
+#endif

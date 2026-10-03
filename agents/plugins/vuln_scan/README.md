@@ -58,7 +58,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | agent daemon identity (captured as `SYSTEM`) | not established — no `docs/agent-privilege-model.md` row for this plugin | 2026-09-07, bare metal, as SYSTEM | not observed in this capture; a denied `RegOpenKeyExW`/`RegQueryValueExW` fails silently and the read helper returns an empty string, so a blocked registry read surfaces as the check's default branch, not an explicit error |
 | macOS | agent daemon (captured unprivileged, euid 501) | not established — no privilege-model row | 2026-09-07, bare metal, euid 501 (jsmith) | not observed; a failed `popen` command (`spctl`/`fdesetup`/`csrutil`/`socketfilterfw`) returns empty output, which every check parses as its negative/disabled branch |
-| Linux | agent daemon (captured as root, euid 0, container) | not established — no privilege-model row | 2026-09-06, container, euid 0 | not observed; a failed `popen` call or unreadable file returns empty, parsed as the check's negative/default branch |
+| Linux | agent daemon (captured as root, euid 0, container) | not established — no privilege-model row | 2026-09-06, container, euid 0 | not observed; a failed `popen` probe returns empty output, parsed as the check's negative/default branch; a failed file read (SSH, ASLR, `suid_dumpable`, `/tmp` noexec, or an empty `/proc/sys` value) is `UNREADABLE` — a non-root agent on a mode-0600 `sshd_config` (the RHEL-family default) reports both SSH checks `UNREADABLE`; grant the agent read access or run it privileged |
 
 No external binaries on Windows — both software enumeration and the Windows config checks are
 direct `Reg*W` calls, no subprocess. Linux and macOS shell out via `popen`/`system()` to: Linux —

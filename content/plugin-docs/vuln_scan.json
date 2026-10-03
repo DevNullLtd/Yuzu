@@ -541,7 +541,7 @@
     },
     {
       "grant": "not established — no privilege-model row",
-      "if_refused": "not observed; a failed `popen` call or unreadable file returns empty, parsed as the check's negative/default branch",
+      "if_refused": "not observed; a failed `popen` probe returns empty output, parsed as the check's negative/default branch; a failed file read (SSH, ASLR, `suid_dumpable`, `/tmp` noexec, or an empty `/proc/sys` value) is `UNREADABLE` — a non-root agent on a mode-0600 `sshd_config` (the RHEL-family default) reports both SSH checks `UNREADABLE`; grant the agent read access or run it privileged",
       "measured": "2026-09-06, container, euid 0",
       "os": "Linux",
       "runs_as": "agent daemon (captured as root, euid 0, container)"

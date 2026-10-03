@@ -895,6 +895,10 @@ TEST_CASE("dbus_error_suffix / apply_*_failure: a named failure records dbus_<na
     CHECK(dbus_error_suffix("org.freedesktop.fwupd.Not-Found|x") == "dbus_not_found_x");
     CHECK(dbus_error_suffix("NoDots") == "dbus_nodots");
     CHECK(dbus_error_suffix(std::string(100, 'A')) == "dbus_" + std::string(32, 'a'));
+    CHECK(dbus_error_suffix("org.freedesktop.fwupd.Error42") == "dbus_error42"); // digits kept
+    CHECK(dbus_error_suffix("a.b\xC3\xA9\n") == "dbus_b___"); // each high byte and the newline -> '_'
+    CHECK(dbus_error_suffix("trailing.") == "dbus_"); // empty last segment
+    CHECK(dbus_error_suffix("") == "dbus_");
     const auto failed = classify_fwupd_error("org.freedesktop.DBus.Error.NoReply", 110);
     REQUIRE(failed == FwupdOutcome::failed);
     {
@@ -921,6 +925,12 @@ TEST_CASE("dbus_error_suffix / apply_*_failure: a named failure records dbus_<na
         CHECK_FALSE(apply_upgrades_failure(rep, FwupdOutcome::failed, "etimedout",
                                            "org.freedesktop.fwupd.NotFound"));
         CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_upgrades:dbus_notfound");
+    }
+    {   // a name is only used for a `failed` outcome
+        FirmwareReport rep;
+        CHECK_FALSE(apply_upgrades_failure(rep, FwupdOutcome::unavailable, "enoent",
+                                           "org.freedesktop.DBus.Error.ServiceUnknown"));
+        CHECK(select_verdict(rep.constraints, rep.denied).reason == "fwupd:get_upgrades:enoent");
     }
 }
 

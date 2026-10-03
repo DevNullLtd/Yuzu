@@ -10,7 +10,8 @@
  * Output is pipe-delimited via write_output():
  *   <severity>|cve|<CVE-ID>: <description>|<product> <installed_ver> (fixed in <fixed_ver>)
  *   <severity>|config|<title>|<detail>
- *   summary|<severity>|<count>
+ *   UNREADABLE|config|<title>|<path>: <cause>   (a Linux file check that could not run; excluded from the issue tally)
+ *   summary|<severity>|<count>   (CRITICAL..INFO, then UNREADABLE; TOTAL first)
  */
 
 #include <yuzu/plugin.hpp>

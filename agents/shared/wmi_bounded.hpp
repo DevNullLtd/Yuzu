@@ -75,9 +75,9 @@ struct BoundedQueryResult {
     bool truncated = false;  // row_cap reached — enumeration did NOT complete
     // Stable error token when the call failed; absent on success. Never a
     // silent empty result on failure — see the token list below.
-    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> |
-    //   wmi_query_failed_<hr> | wmi_next_timeout | wmi_deadline_exceeded |
-    //   wmi_next_failed_<hr> | wmi_property_enum_failed_<hr>
+    //   com_init_failed | wbem_locator_failed | wmi_connect_failed_<hr> | wmi_proxy_blanket_failed_<hr> |
+    //   wmi_query_failed_<hr> | wmi_query_failed_no_in_signature | wmi_deadline_exceeded | wmi_next_failed_<hr> |
+    //   wmi_put_param_failed_<hr> | wmi_property_enum_failed_<hr>
     std::optional<std::string> error;
     // Rows read successfully BEFORE the failure that set `error` (the rows themselves are cleared
     // on failure); 0 for a failure before the first row and for a result with no error. The
@@ -197,7 +197,7 @@ inline std::string variant_to_string(const VARIANT& v) {
 // properties read before the fault). The caller must fail the whole query on a FAILED return: a
 // setup or per-property fault never yields a row with a silently dropped column.
 // Only WBEM_S_NO_MORE_DATA ends the enumeration normally; any other non-S_NO_ERROR return (FAILED
-// or an undocumented success code) is returned so the caller fails the query (#4895 AC3).
+// or an undocumented success code) is returned so the caller fails the query (#4895, acceptance criterion 3).
 // EndEnumeration()'s own result is ignored: it runs after every property was read and releases the
 // object's cursor only, so it cannot lose data.
 template <class Obj>
@@ -355,7 +355,9 @@ inline BoundedQueryResult run_bounded_wmi_query(const std::wstring& wmi_namespac
 /// holds exactly one row: the method's out-parameters (including any
 /// `ReturnValue`), stringified the same way as a query row.
 ///
-/// No production caller today (governance-reviewed, dormant infrastructure).
+/// One production caller today: bitlocker's per-volume GetConversionStatus/GetEncryptionMethod
+/// calls (bitlocker_plugin.cpp), with a compile-time namespace, fixed method names and an object
+/// path from its own Win32_EncryptableVolume enumeration -- no action input reaches this helper.
 /// This helper performs NO namespace/method/object_path allowlisting itself
 /// -- unlike wmi_plugin.cpp's do_query/do_get_instance, which validate
 /// `namespace` against a hardcoded allowlist and `wql` against a SELECT-only
