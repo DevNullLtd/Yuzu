@@ -71,7 +71,7 @@ filtering and pagination.
 | `status` | integer | Filter by status (integer enum value) |
 | `since` | integer | Only responses after this Unix timestamp |
 | `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to return (default 100) |
+| `limit` | integer | Number of responses to return (default 100, at most 1000; zero or below means the default) |
 | `offset` | integer | Offset for pagination (default 0) |
 
 **Response envelope:**
@@ -171,7 +171,9 @@ filter parameters to the response query endpoint.
 
 The dedicated export endpoint supports both CSV and JSON formats with the same
 filter parameters as the query endpoint. It defaults to a higher limit
-(10,000 rows) for bulk exports.
+(10,000 rows) for bulk exports. Numeric parameters must be one whole base-10 integer
+(`since=1e9`, `limit=100abc`, `status=0x1` and `since=1.5` are `400`, not a different
+filter); `since` at or below `0` and `until=0` mean unbounded.
 
 **Query parameters:**
 
@@ -182,7 +184,7 @@ filter parameters as the query endpoint. It defaults to a higher limit
 | `status` | integer | Filter by status |
 | `since` | integer | Only responses after this Unix timestamp |
 | `until` | integer | Only responses before this Unix timestamp |
-| `limit` | integer | Number of responses to export (default 10,000) |
+| `limit` | integer | Number of responses to export (default and maximum 10,000; zero or below serves one row) |
 
 **Example --- export instruction responses as CSV:**
 
@@ -202,6 +204,18 @@ curl -s -b cookies.txt \
 
 The CSV format includes the columns:
 `id`, `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`.
+
+**A bounded export can be cut.** Besides the row limit, an export stops once the rows served
+carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
+served). The cap is not configurable. A cut export, whether by the row limit with more matching
+rows left, or by the byte cap, is marked three ways, so check for it before trusting a bulk pull:
+the JSON envelope has a top-level `"result_truncated_by_cap": true`, a CSV response carries an
+`X-Result-Truncated-By-Cap: true` header, and the download is named
+`responses-<instruction_id>-truncated.<json|csv>` instead of `responses-<instruction_id>.<json|csv>`.
+The file name is the signal that survives `curl -o` and browser downloads; to see the headers use
+`curl -sS -D - -o responses.csv ...`. Narrow the export with `since`/`until`/`agent_id`/`status`
+and pull again. In the JSON envelope, `count` is the number of rows served. The REST v1 twin
+(`GET /api/v1/responses/{id}/export`) marks a cut the same way, with the flag under `pagination`.
 
 ### Generic JSON-to-CSV export
 

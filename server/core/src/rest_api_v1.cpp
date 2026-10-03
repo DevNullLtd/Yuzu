@@ -9744,15 +9744,14 @@ void RestApiV1::register_routes(
     // BEFORE any LIMIT/aggregate, never post-filter) and the same query
     // semantics (group_by/op/op_column/agent_id/status/since/until), gated
     // on the SAME `Response:Read` securable via `fleet_read_fn`. The legacy
-    // routes do not call the shared row builders below (they share only the strict parser and export caps in `response_query_params.hpp`) — see
+    // routes do not call the shared row builders below; they share only the
+    // strict numeric parser, the export row cap and the export byte cap (all
+    // in `response_query_params.hpp`) and the store's `query_bounded`. See
     // `response_query_model.hpp`'s file comment for why the shared row
     // builders below are a REST-v1/MCP pair, not a three-way share.
     //
-    // Two v1-specific corrections vs. the legacy routes (both deliberate,
-    // documented deviations — see this PR's changelog):
-    //   - `limit` is clamped on BOTH bounds. (The legacy export route used to
-    //     floor only its own DEFAULT at 10000, so a caller-supplied `limit`
-    //     there had no ceiling; #4703 now clamps it to the same [1,10000].)
+    // What still differs from the legacy routes (deliberate, see the
+    // changelog and the user manual):
     //   - `offset` is rejected outright on the plain query route (400, not
     //     silently accepted) — mirrors `/api/v1/executions/{id}/responses`'s
     //     own #4030 Gate 8 fix just above: `query()`'s result set orders by
@@ -9762,6 +9761,10 @@ void RestApiV1::register_routes(
     //     route accepts (and silently mis-serves) `offset` today; this PR
     //     does not fix that pre-existing route, only declines to repeat the
     //     defect on the new one.
+    //   - The row payload, the truncation signal and `limit` ceilings now MATCH
+    //     the legacy export (#4703 gave it the same [1,10000] clamp, the same
+    //     byte cap and the same marks), so they are no longer v1-only
+    //     corrections; the v1 JSON envelope and field set remain distinct.
     //
     // Audit posture: fail-closed `emit_behavioral_audit` on every audited
     // event (a scope-drop "denied" row, parity with the legacy routes' own

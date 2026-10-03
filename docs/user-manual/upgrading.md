@@ -91,6 +91,46 @@ this release or any other, until its schema is replaced (see
 [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
 does not restore it.
 
+## Behaviour change: response routes parse numeric parameters strictly and exports are bounded (#4644, #4703)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** On the legacy
+`/api/responses/{id}[/aggregate|/export]` routes, the `/api/v1/responses/{id}[/aggregate|/export]`
+routes, `GET /api/v1/executions/{id}/responses` and MCP `query_responses`, `status`, `since`,
+`until` and `limit` (and the legacy catch-all route's `offset`) must now be one whole base-10 integer.
+A value that used to be read as a different one is now `400` (`-32602` on MCP): `since=1e9` (was
+epoch second `1`), `status=0x1` (was `0`), `limit=100abc` (was `100`), `since=1.5` (was `1`),
+a leading `+`, whitespace, and a `status` below `-1` (was "no filter"). An empty value and a value
+too large for its type were already `400`.
+
+**Who is affected, and what to do.**
+
+- Scripts that build `since`/`until` from `date +%s.%N` or any fractional timestamp: send integer
+  seconds (`date +%s`).
+- MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
+  the key to get the default. A `status` above `2147483647` and an unsigned value above
+  `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
+  fix applies to every other MCP argument read with the strict integer reader, 16 call sites).
+- Callers that pass `limit=0` or a negative `limit` to the legacy export: it now serves one row
+  (clamped to `1..10000`, like the v1 export). The legacy list route caps an explicit `limit` at
+  1000; zero or below still means its default of 100.
+
+**Exports are bounded.** Both export routes stop at 50 MiB of row payload (`output` plus
+`error_detail`) in addition to the 10,000-row limit, and the cut is made inside the database query,
+so a large export no longer loads every row into the server first. The cap is not operator-tunable.
+A cut export (row limit with more rows left, or the byte cap) is marked with a top-level
+`result_truncated_by_cap: true` (legacy JSON) or `pagination.result_truncated_by_cap` (v1 JSON), an
+`X-Result-Truncated-By-Cap: true` header (CSV), and a download name `responses-<id>-truncated.json`
+or `.csv`. Existing automation should check for it: `curl -sS -D - -o out.csv ...` shows the header,
+`curl -OJ` keeps the `-truncated` name, and the v1 JSON export carries the flag in the body. Narrow
+the window with `since`/`until`/`agent_id`/`status` and pull again.
+
+**Rolling upgrade.** Replicas on the old and the new build answer a malformed value differently
+(`200` versus `400`), so a client can see both during the rollout. No configuration or data
+migration is needed. Two new counters report the effect:
+`yuzu_server_response_param_rejected_total{surface}` and
+`yuzu_server_response_export_truncated_total{surface,cause}`
+([Metrics](metrics.md#response-store-metrics)).
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to

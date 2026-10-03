@@ -5077,6 +5077,35 @@ server process's memory. Behind a load balancer with N replicas the effective
 ceiling is `configured_cap x N`, and a peer that reconnects to a different replica
 gets a fresh allowance.
 
+## Response export bounds
+
+Runbook for the response routes' export limits (#4644, #4703). `GET /api/responses/{id}/export` and
+`GET /api/v1/responses/{id}/export` serve at most 10,000 rows and at most 50 MiB of row payload
+(`output` plus `error_detail`); neither bound is configurable.
+
+**Detecting a cut export.** Watch `yuzu_server_response_export_truncated_total{surface,cause}`:
+`cause="row_cap"` means more rows matched than the limit, `cause="byte_cap"` means the payload cap
+cut the export (preferred when both applied). A byte-cap cut also logs one warning, at most one a
+minute per process, naming the surface and (on v1) the request's correlation id. For a single
+download, the signals are the `X-Result-Truncated-By-Cap: true` header (CSV), the
+`result_truncated_by_cap` field (JSON; under `pagination` on v1), and a `responses-<id>-truncated`
+download name. `curl -sS -D - -o out.csv ...` prints the headers.
+
+**What the bound covers.** The cut is applied inside the store query, so an export holds about 50
+MiB of payload plus at most one more row while it is fetched (measured at the store query on one run
+at about twice the cap, the driver's result plus the parsed rows; the serialized body built
+afterwards is additional and the end-to-end peak was not measured). The export holds one connection
+from the shared Postgres pool for the fetch and the parse, and that pool also serves RBAC, audit and
+the other stores, so a burst of large exports can make other pool users wait; lower the `limit`, narrow with
+`since`/`until`/`agent_id`/`status`, or use a management-group-confined principal to shrink one. The
+plain list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
+`query_responses`, `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000
+rows of up to 2 MiB per field; this change does not bound their memory.
+
+**Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
+for a malformed numeric parameter. A steady non-zero rate on one surface is a client sending
+fractional timestamps, `null`s or trailing characters; it is not a server fault.
+
 ## File Logging
 
 Yuzu writes logs to stdout by default. File logging is opt-in via `--log-file`, with a best-effort fallback at the platform default path (`/var/log/yuzu/server.log` on Linux, `C:\ProgramData\Yuzu\logs\server.log` on Windows, `~/Library/Logs/Yuzu/server.log` on macOS).

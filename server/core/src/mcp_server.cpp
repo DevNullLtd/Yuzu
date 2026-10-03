@@ -634,6 +634,10 @@ static const ToolDef kTools[] = {
      "dispatch is still in flight; a result without it (even with zero rows) means "
      "no rows currently match, or (instruction_id-only queries) in-flight-ness "
      "could not be determined. "
+     "status and limit must be JSON integers: a string, float, boolean or null (omit "
+     "the key for the default), a status outside -1..2147483647, or an integer above "
+     "9223372036854775807 is rejected with -32602 invalid params rather than read as "
+     "\"any\"; a limit of 0 or below is served as 1 and one above 1000 as 1000. "
      "Confined by management group: a caller admitted through a management-group "
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
@@ -8643,7 +8647,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     yuzu::server::count_response_param_rejected(metrics, "mcp");
                     res.set_content(
                         a4_error(kInvalidParams,
-                                 "status must be a JSON integer >= -1 (-1 or omitted = any)"),
+                                 "status must be an integer between -1 and 2147483647 (-1 or omitted = any)"),
                         "application/json");
                     return;
                 }
@@ -8653,7 +8657,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // retry-hint-exempt: malformed client input (wrong JSON type), not a
                     // store/query fault -- resending the same value fails identically.
                     yuzu::server::count_response_param_rejected(metrics, "mcp");
-                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                    res.set_content(a4_error(kInvalidParams,
+                                             "limit must be an integer no larger than "
+                                             "9223372036854775807"),
                                     "application/json");
                     return;
                 }

@@ -457,6 +457,18 @@ TEST_CASE("export limit normalisation: the ceiling is exactly 10000 the floor 1 
     CHECK(normalize_export_limit(true, 0) == 1);
     CHECK(normalize_export_limit(true, -5) == 1);
     CHECK(normalize_export_limit(false, 12345) == 10000);
+
+    // The plain-list ceiling (legacy GET /api/responses/{id}): exactly 1000, and a
+    // non-positive value is left alone on purpose (the store maps it to its default).
+    using yuzu::server::cap_query_limit;
+    using yuzu::server::kQueryRowLimitCap;
+    CHECK(kQueryRowLimitCap == 1000);
+    CHECK(cap_query_limit(2147483647) == 1000);
+    CHECK(cap_query_limit(1001) == 1000);
+    CHECK(cap_query_limit(1000) == 1000);
+    CHECK(cap_query_limit(999) == 999);
+    CHECK(cap_query_limit(0) == 0);
+    CHECK(cap_query_limit(-5) == -5);
 }
 
 TEST_CASE("legacy response routes: well-formed numerics still pass incl. zero-padding and "
