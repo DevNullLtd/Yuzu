@@ -189,7 +189,8 @@ GuardianSparkRuntime::try_dispatch_head_locked(const std::string& key) {
     const auto eit = claims_.find(key);
     if (eit == claims_.end())
         return nullptr;
-    sweep_terminal_queued_locked(eit->second); // never dispatch a tombstone (pass-3 sg-3)
+    sweep_terminal_queued_locked(eit->second); // never dispatch a tombstone the sweep can
+                                               // release (pass-3 sg-3)
     if (eit->second.fifo.empty()) {
         claims_.erase(eit);
         return nullptr;
@@ -990,8 +991,10 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
     std::vector<std::pair<std::shared_ptr<KeyClaim>, ArmVerdict>>& verdicts, bool firewall,
     std::shared_ptr<KeyClaim>& refill) {
     // registry_mu_ held (see the declaration's doc comment). PUBLISH the staged
-    // verdicts, then pop every claim this drain finished (they are a prefix of the
-    // fifo; new claims that queued behind the head meanwhile follow them). A claim
+    // verdicts, then pop the claims this drain finished (they are a prefix of the
+    // fifo; new claims that queued behind the head meanwhile follow them), stopping at
+    // the first whose index release fails: it is retained as a tombstone, with the
+    // claims behind it, and the same-call refill sweep below retries it. A claim
     // that already carries an outcome (a withdrawal published by detach_rule_locked,
     // an abandonment by its waiter) keeps it - the staged verdict fills only an
     // empty slot. Called exactly once per path (on_arm_complete's inline call, or

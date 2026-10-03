@@ -7718,6 +7718,11 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-2): a firewalled drain whose index
 // live.empty / adopted branches) left a (key, rule) mapping in index_ with no fifo
 // residue for any sweep to find. The firewall branch (cs-2 above) already keeps such a
 // claim as a withdrawn Queued tombstone; these cases pin the same for the ordinary pop.
+// Two things are pinned, and the titles say which. The RETAIN branch itself (a release
+// that fails at the pop) is hit by the adopted-wedge case, the two recovery-pop cases
+// and the firewalled-follower case at the end. The other cases pin the RETRY before the
+// pop: the one-shot seam is spent by an earlier staging release, so the pop-time release
+// succeeds and the claim is popped with its mapping gone.
 //
 // All of them observe the leak by consequence, not by counting failures (a failure count
 // does not prove the mapping was cleaned up): a ghost mapping makes the key's refcount
@@ -7736,9 +7741,8 @@ void settle_key_claims(GuardianSparkRuntime& rt, const std::string& key) {
 }
 } // namespace
 
-TEST_CASE("#4354: a withdrawn sibling whose index release fails again at the ordinary publish is "
-          "retained as a tombstone, never popped with its mapping - the key still disarms and "
-          "re-arms",
+TEST_CASE("#4354: a withdrawn sibling whose index release failed at staging is retried before "
+          "the ordinary pop, never popped with its mapping - the key still disarms and re-arms",
           "[spark][runtime][liveness]") {
     // Mutation: drop the release-or-retain at the ordinary pop (the pre-fix loop) -> r2's
     // mapping outlives its pop; r1's detach never reaches the 0-edge (armed_key_count()
@@ -7773,15 +7777,16 @@ TEST_CASE("#4354: a withdrawn sibling whose index release fails again at the ord
     CHECK(rt->claim_index_release_failures() == 1);
     CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (tombstone)
 
-    // Re-arm the one-shot seam BEFORE releasing the hang, so r1's own drain - whose
-    // success branch retries r2's release - fails that retry too.
+    // Re-arm the one-shot seam BEFORE releasing the hang, so the first release of r2 in
+    // r1's own drain (the staging loop in its success branch) fails. The seam is then
+    // spent, so the pop-time retry succeeds: this case pins that retry, not the retain.
     rt->set_index_remove_fault_for_test(true);
     b->release_hang();
     a1.t.join();
     REQUIRE(a1.gen); // r1 itself commits normally
 
     settle_key_claims(*rt, key);
-    CHECK(rt->claim_index_release_failures() == 2); // the drain's retry failed (and nothing else did)
+    CHECK(rt->claim_index_release_failures() == 2); // detach + the staging release; the pop-time retry succeeded
     CHECK(rt->rule_count() == 1);
     CHECK(rt->armed_key_count() == 1);
 
@@ -7808,8 +7813,9 @@ TEST_CASE("#4354: a withdrawn sibling whose index release fails again at the ord
     rt->begin_stop();
 }
 
-TEST_CASE("#4354: a live follower queued behind a retained tombstone commits as a sibling and is "
-          "swept in the same call once the tombstone's release retries OK",
+TEST_CASE("#4354: a live follower queued behind a withdrawn tombstone commits as a sibling and "
+          "the queue drains in the same call once the pop-time retry of the tombstone's release "
+          "succeeds",
           "[spark][runtime][liveness]") {
     // Mutation: as the case above (r2's mapping leaks), and additionally pinning that the
     // follower behind the retained claim is neither popped out of order nor stranded: the
@@ -7937,7 +7943,8 @@ TEST_CASE("#4354: an ADOPTED wedge's late success retains a withdrawn follower w
 }
 
 TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty) and whose "
-          "release fails twice is retained, not popped as a ghost - the next attach arms",
+          "staging release failed is retried before the pop, not popped as a ghost - the next "
+          "attach arms",
           "[spark][runtime][liveness]") {
     // Mutation: pop the compensated head regardless of its release result -> its mapping
     // survives with no keys_ entry (the head never committed), so r4's attach takes the
@@ -7966,8 +7973,9 @@ TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty
     CHECK(rt->claim_index_release_failures() == 1);
     CHECK(rt->claim_queue_depth_for_test(key) == 1);
 
-    // The late success finds no live claim (live.empty), whose own release of the head
-    // fails again, and the subscription is disarmed by the deferred compensating path.
+    // The late success finds no live claim (live.empty), whose own staging release of the
+    // head fails again (the seam is then spent, so the pop-time retry succeeds), and the
+    // subscription is disarmed by the deferred compensating path.
     rt->set_index_remove_fault_for_test(true);
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
@@ -7987,8 +7995,8 @@ TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty
     rt->begin_stop();
 }
 
-TEST_CASE("#4354: a head whose index release fails at the executor-throw staging site is retained, "
-          "not popped as a ghost - the next attach arms",
+TEST_CASE("#4354: a head whose index release fails at the executor-throw staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
           "[spark][runtime][liveness]") {
     // Mutation: drop the release-or-retain at the ordinary pop -> the failed release at
     // on_arm_complete's `!r` staging is never retried, r1 is popped with its mapping, and
@@ -8034,8 +8042,8 @@ TEST_CASE("#4354: a head whose index release fails at the executor-throw staging
     rt->begin_stop();
 }
 
-TEST_CASE("#4354: a head whose index release fails at the backend-refused staging site is retained, "
-          "not popped as a ghost - the next attach arms",
+TEST_CASE("#4354: a head whose index release fails at the backend-refused staging site is retried "
+          "before the pop, not popped as a ghost - the next attach arms",
           "[spark][runtime][liveness]") {
     // Mutation: as the case above, for on_arm_complete's `!armed_live` staging.
     auto r = std::make_shared<FakeReader>();

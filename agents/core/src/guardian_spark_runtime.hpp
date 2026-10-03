@@ -1093,15 +1093,19 @@ private:
     /// a disarm" is the real rearm-after-teardown shape, "disarm behind an arm" is
     /// unreachable. Asserted in debug; the code handles the general push regardless.
     ///
-    /// Index ownership: an Arm claim that is neither withdrawn nor abandoned holds
-    /// exactly one index_ (key, rule_id) mapping (`index_held`), added when it is
-    /// queued (index_->add is the 0->1 detector and detach_rule_locked finds claimed
-    /// rules through key_for_rule) and released by whichever code marks it withdrawn,
-    /// abandoned, failed, or committed (commit passes ownership to the normal
-    /// rules_/keys_ state). Every index_->remove_rule for a claim is guarded by that
-    /// flag because remove_rule() removes the CURRENT mapping with no generation
-    /// check (spark_key_rule_index.hpp) - a stale claim must never remove a
-    /// replacement's mapping.
+    /// Index ownership: an Arm claim holds exactly one index_ (key, rule_id) mapping
+    /// while `index_held` is set, added when it is queued (index_->add is the 0->1
+    /// detector and detach_rule_locked finds claimed rules through key_for_rule) and
+    /// released when the claim is withdrawn, abandoned, failed, or committed (commit
+    /// passes ownership to the normal rules_/keys_ state). A release that fails (test
+    /// seam / defence in depth) leaves `index_held` set: the claim is then withdrawn
+    /// (never re-committed) yet still holds its mapping, and stays in its fifo as a
+    /// tombstone until a later release or sweep succeeds, so `withdrawn` does not by
+    /// itself mean the mapping is gone. Every release of a claim's mapping goes through
+    /// release_claim_index_locked, is guarded by that flag, and calls
+    /// erase_rule(rule_id, generation), which erases only while the claim's generation
+    /// is still the recorded owner (spark_key_rule_index.hpp) - a stale claim must never
+    /// remove a replacement's mapping.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
     /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
@@ -1127,7 +1131,8 @@ private:
         ClaimDispatch dispatch{ClaimDispatch::Queued};
         std::string key;
         IoClass io_class{};
-        bool withdrawn{false};        ///< Arm: its rule was detached while claimed (Case 0 generalised)
+        bool withdrawn{false};        ///< Arm: never re-commit (rule detached while claimed, or a retained tombstone
+                                      ///< after a failed index release); may still hold its mapping until released
         bool waiter_abandoned{false}; ///< the PR-1 synchronous waiter gave up (deadline / stop)
         bool index_held{false};       ///< Arm: owns index_'s (key, rule_id) mapping (see above)
         std::uint32_t admission_rejections{0}; ///< Disarm: retained-after-refusal count
@@ -1779,18 +1784,19 @@ private:
     void release_compensation_and_drain_locked(KeyClaim& claim,
                                                const std::shared_ptr<KeyClaim>& refill,
                                                std::shared_ptr<KeyClaim>& class_refill) noexcept;
-    /// Pop every TERMINAL, never-dispatched claim at the front of `entry` (a Queued
-    /// claim that already carries an outcome or a commit exception: a withdrawn or
-    /// release-failed tombstone), retrying its index release. Governance pass-3
-    /// sg-3/ar-4/cs-5: such a tombstone must not be re-dispatched as an arm, re-
-    /// committed by the live sweep, or sit ahead of a Disarm claim. The sweep pops
-    /// only what it can release; a tombstone whose release fails again stays at the
-    /// front, and try_dispatch_head_locked (which has no outcome/withdrawn guard)
-    /// then flips it Queued -> Dispatching, so such a tombstone IS re-dispatchable.
-    /// Known exception, tracked as a follow-up: a second release failure at the
-    /// same-key sweep (unreachable in production: erase_rule is noexcept). Called
-    /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
-    /// Disarm). noexcept by construction (iterator erases + a noexcept release).
+    /// Exception first: a tombstone whose index release fails again AT this sweep is
+    /// not popped and IS re-dispatchable - the sweep stops at it, and
+    /// try_dispatch_head_locked (which has no outcome/withdrawn guard) then flips it
+    /// Queued -> Dispatching. Known gap, tracked as a follow-up; unreachable in
+    /// production (erase_rule is noexcept), constructible only through the
+    /// index-remove test seam. Intent: pop every TERMINAL, never-dispatched claim at
+    /// the front of `entry` (a Queued claim that already carries an outcome or a
+    /// commit exception: a withdrawn or release-failed tombstone), retrying its index
+    /// release. Governance pass-3 sg-3/ar-4/cs-5: such a tombstone must not be re-
+    /// dispatched as an arm, re-committed by the live sweep, or sit ahead of a Disarm
+    /// claim. Called by try_dispatch_head_locked (refill) and detach_rule_locked
+    /// (before it queues a Disarm). noexcept by construction (iterator erases + a
+    /// noexcept release).
     void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
     /// up-4 (#4221, rung 9c PR-5b): registry_mu_ held. Write a claim's fallback
     /// outcome exactly as publish_arm_verdicts_locked's own fill-in loop would have,
@@ -1888,8 +1894,12 @@ private:
     /// path (nothing to disarm) and finalize_arm_compensation()'s deferred path
     /// (rung 9c PR-2 Unit 4 - previously a local lambda inside on_arm_complete,
     /// extracted so both paths run the identical logic instead of duplicating it).
-    /// PUBLISH `verdicts` onto the matching claims in `finished`, pop the finished
-    /// prefix from `key`'s fifo, and on `firewall` sweep a never-finished head too.
+    /// PUBLISH `verdicts` onto the matching claims in `finished`, then pop `finished`
+    /// from the front of `key`'s fifo, stopping at the first claim whose index release
+    /// fails (#4354): that claim stays as a retained tombstone, with everything behind
+    /// it, for the same-call sweep in try_dispatch_head_locked. On `firewall` with an
+    /// empty `finished` (the drain threw before its fifo snapshot) every claim in the
+    /// fifo is failed instead, a never-finished head included.
     /// `refill` is an OUT param: an arm queued behind the finished prefix, for the
     /// caller to dispatch off-lock once unlocked. Returns true once this call has
     /// done everything it is going to do (including the "entry already vanished"
@@ -1960,21 +1970,31 @@ private:
     /// implicit only while the claim stays in its fifo, so a caller that pops/erases
     /// on `false` leaks the mapping (a ghost (key, rule) entry; #4354). Use
     /// release_or_retain_tombstone_locked where the claim is popped. The remaining
-    /// callers that ignore the result either leave the claim in place (on_arm_complete's
-    /// staging releases, which run before publish_arm_verdicts_locked, and that
-    /// function's own fill-in, synthesize_fallback_outcome_locked, the dispatched branch
-    /// of abandon_claim_locked: a later release or sweep retries it) or run at
-    /// sticky-stop time (begin_stop, dispatch_parked_arm_guarded's stop path), where
-    /// the leak is moot. Known gap, tracked as a follow-up: abandon_claim_locked's
-    /// Queued branch ignores `false` and then erases the claim.
+    /// callers that ignore the result fall into two groups. (1) They leave the claim in
+    /// place, so a later release or sweep retries it: on_arm_complete's staging
+    /// releases (they run before publish_arm_verdicts_locked); publish_arm_verdicts_
+    /// locked's own fill-in; synthesize_fallback_outcome_locked; the dispatched branch
+    /// of abandon_claim_locked. (2) They run at sticky-stop time, where the leak is
+    /// moot: begin_stop; dispatch_parked_arm_guarded's stop path. Known gap, tracked as
+    /// a follow-up: abandon_claim_locked's Queued branch ignores `false` and then
+    /// erases the claim.
     bool release_claim_index_locked(KeyClaim& claim) noexcept;
     /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
-    /// retained tombstone for the next same-key sweep. "withdrawn" here means "never
+    /// retained tombstone. The same-call sweep (try_dispatch_head_locked ->
+    /// sweep_terminal_queued_locked, which every caller reaches next) retries the
+    /// release immediately; the tombstone is re-dispatched only if that retry also
+    /// fails (known gap, tracked as a follow-up). "withdrawn" here means "never
     /// re-commit" (the convention of fail_all_claims_locked's tombstones; the `live`
-    /// filter in on_arm_complete excludes withdrawn claims). It
-    /// is set even on a claim nobody withdrew (e.g. a non-adopted wedge), which is
-    /// harmless: the claim is terminal, and is_retained_wedge reads kind/dispatch/
-    /// waiter_abandoned/end, never withdrawn. Returns true iff c no longer owns a
+    /// filter in on_arm_complete excludes withdrawn claims). It is set even on a claim
+    /// nobody withdrew (e.g. a non-adopted wedge). The helper also writes
+    /// dispatch = Queued (the sweep requires it), and is_retained_wedge reads
+    /// dispatch, so for a retained wedge head that predicate's answer changes; this is
+    /// intended and harmless because the claim is terminal (it carries an outcome or a
+    /// commit_exception) whenever the helper runs. `withdrawn` is redundant with that
+    /// terminal outcome for every current reader (each either also requires no
+    /// outcome, or only chooses a verdict that publish_arm_verdicts_locked discards
+    /// for a claim that already has one); it is kept as defence in depth and to match
+    /// fail_all_claims_locked's convention. Returns true iff c no longer owns a
     /// mapping and may be popped/erased.
     [[nodiscard]] bool release_or_retain_tombstone_locked(KeyClaim& c) noexcept;
     /// registry_mu_ held. The waiter gave up on `claim` (deadline or stop): a Queued
