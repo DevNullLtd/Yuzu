@@ -488,8 +488,10 @@ metadata:
     object route carries no resolved gateway (both flagged in the result
     status). On macOS reads the PF_ROUTE NET_RT_DUMP sysctl for every address
     family; macOS has no route metric or table id, so those are "-", and the
-    origin is only the static/dynamic bit; neighbour, cloned, multicast,
-    broadcast and own-address entries are not reported. On Windows reads
+    origin is only the static/dynamic bit; entries flagged as neighbour,
+    cloned, multicast, broadcast or own-address are not reported (the
+    limited-broadcast 255.255.255.255/32 route carries none of those flags and
+    is). On Windows reads
     GetIpForwardTable2; the metric is the route metric alone, without the
     interface metric Windows adds when ranking routes, and the host's own
     and broadcast addresses and the multicast prefixes are not reported. A
