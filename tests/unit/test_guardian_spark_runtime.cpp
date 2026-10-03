@@ -7987,6 +7987,212 @@ TEST_CASE("#4354: a withdrawn head whose late success is compensated (live.empty
     rt->begin_stop();
 }
 
+TEST_CASE("#4354: a head whose index release fails at the executor-throw staging site is retained, "
+          "not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the ordinary pop -> the failed release at
+    // on_arm_complete's `!r` staging is never retried, r1 is popped with its mapping, and
+    // r4's attach takes the shared-watcher branch and throws std::out_of_range from keys_.at.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The single-shot hang precedes the throw check, so the parked arm throws once released.
+    // The seam is armed only now: nothing releases r1's mapping before the staging site.
+    b->throw_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1); // the staging release; the retry (if any) succeeds
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->throw_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: a head whose index release fails at the backend-refused staging site is retained, "
+          "not popped as a ghost - the next attach arms",
+          "[spark][runtime][liveness]") {
+    // Mutation: as the case above, for on_arm_complete's `!armed_live` staging.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in on_arm_complete retains a head whose index "
+          "release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in on_arm_complete's catch
+    // -> the head is popped with its mapping and r4's attach throws from keys_.at; omit
+    // `dispatch = Queued` from the helper -> the retained head is never swept, so the
+    // queue never drains. (A publish that throws at fault point 3 never reaches the
+    // ordinary pop loop, so this case does not exercise that loop.)
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    QueuedAttach a1;
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Staging: the backend refuses and r1's release fails (seam shot 1), leaving r1 holding
+    // its mapping. Fault point 3 makes the first publish throw after the verdict is
+    // written; the gap hook (it fires because nothing was published) re-arms the seam and
+    // fault point 3 so the SECOND publish throws into the recovery catch, whose pop then
+    // releases r1 (seam shot 2). The hook only stores atomics: it runs on the detached
+    // worker, so no Catch2 assertion in here.
+    b->fail_arm.store(true);
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] {
+        rtp->set_index_remove_fault_for_test(true);
+        rtp->set_drain_fault_point_for_test(3);
+    });
+    b->release_hang();
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 2); // staging + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+
+    b->fail_arm.store(false);
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
+TEST_CASE("#4354: the double-fault recovery pop in finalize_arm_compensation retains a head whose "
+          "index release fails, instead of popping it with its mapping",
+          "[spark][runtime][liveness]") {
+    // Mutation: drop the release-or-retain at the recovery pop in finalize_arm_compensation's
+    // catch -> the head is popped with its mapping and r4's attach throws from keys_.at;
+    // omit `dispatch = Queued` from the helper -> the retained head is never swept.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Withdraw the in-flight head (the key's Dispatched marker), its release failing once.
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r1");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // The late success is live.empty and its own release of the head fails again (seam
+    // shot 2); the subscription is owed a compensating disarm, so on_arm_complete skips
+    // its own publish and the ONLY publish is finalize_arm_compensation's. Fault point 3
+    // (nothing earlier consumes it) makes that publish throw into the recovery catch; the
+    // gap hook re-arms the seam so the recovery pop's release fails (seam shot 3). The hook
+    // only stores an atomic: it runs on the detached worker.
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(3);
+    rt->set_drain_gap_hook_for_test([rtp = rt.get()] { rtp->set_index_remove_fault_for_test(true); });
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; }, std::chrono::seconds(10)));
+    settle_key_claims(*rt, key);
+    CHECK(rt->claim_index_release_failures() == 3); // detach + live.empty + recovery release
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    const auto arms_before = b->arms.load();
+    std::expected<std::uint64_t, std::string> gen4;
+    REQUIRE_NOTHROW(gen4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true));
+    REQUIRE(gen4);
+    CHECK(b->arms.load() == arms_before + 1);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->set_drain_gap_hook_for_test({});
+    rt->begin_stop();
+}
+
 // adversarial round 4 K2/C5: index_add_rollback's .fn runs inside ~GuardianRollback,
 // which swallows exceptions; remove_rule's key copy could throw there and leave a ghost
 // mapping. erase_rule is the same walk without the copy (noexcept).
