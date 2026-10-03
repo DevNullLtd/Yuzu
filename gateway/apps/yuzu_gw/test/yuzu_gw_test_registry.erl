@@ -32,6 +32,8 @@
 -module(yuzu_gw_test_registry).
 
 -export([ensure/0, ensure_fresh/0]).
+-export([mock_registry_loop/0, mock_registry_drop_index/1,
+         mock_registry_restore_index/1]).
 
 %% Tables owned by the registry gen_server (see yuzu_gw_registry:init/1).
 -define(AGENTS_TABLE,  yuzu_gw_agents).
@@ -75,6 +77,68 @@ ensure_fresh() ->
         Existing  -> evict(Existing)
     end,
     start_fresh(?START_RETRIES).
+
+%%%===================================================================
+%%% Stand-in registry for readiness tests
+%%%===================================================================
+
+%% @doc Body of a process registered as `yuzu_gw_registry' by a test that
+%% needs the name to exist but not the real gen_server (the health tests).
+%% Like the real registry it owns a `yuzu_gw_sessions' table, because
+%% readiness reports a registry without that table as not ready. It swallows
+%% every other message, as the plain `mock_loop' stand-ins do.
+-spec mock_registry_loop() -> ok.
+mock_registry_loop() ->
+    ensure_index_table(?START_RETRIES),
+    mock_registry_receive().
+
+%% Drop / recreate the stand-in's table from the owning process, and wait for
+%% it. Returns `ok'.
+-spec mock_registry_drop_index(pid()) -> ok.
+mock_registry_drop_index(Pid) ->
+    mock_registry_call(Pid, drop_index).
+
+-spec mock_registry_restore_index(pid()) -> ok.
+mock_registry_restore_index(Pid) ->
+    mock_registry_call(Pid, restore_index).
+
+mock_registry_call(Pid, Msg) ->
+    Ref = make_ref(),
+    Pid ! {Msg, self(), Ref},
+    receive {done, Ref} -> ok
+    after 5000 -> error({mock_registry_timeout, Msg})
+    end.
+
+mock_registry_receive() ->
+    receive
+        {drop_index, From, Ref} ->
+            catch ets:delete(?SESSIONS_TABLE),
+            From ! {done, Ref},
+            mock_registry_receive();
+        {restore_index, From, Ref} ->
+            ensure_index_table(?START_RETRIES),
+            From ! {done, Ref},
+            mock_registry_receive();
+        stop ->
+            ok;
+        _ ->
+            mock_registry_receive()
+    after 60000 -> ok
+    end.
+
+%% A table of the same name owned by a just-killed process can outlive it for
+%% a moment: retry the create rather than crash the stand-in.
+ensure_index_table(Retries) ->
+    case ets:whereis(?SESSIONS_TABLE) of
+        undefined ->
+            try ets:new(?SESSIONS_TABLE, [named_table, set, public]), ok
+            catch error:badarg when Retries > 0 ->
+                timer:sleep(?RETRY_BACKOFF_MS),
+                ensure_index_table(Retries - 1)
+            end;
+        _ ->
+            ok
+    end.
 
 %%%===================================================================
 %%% Internal

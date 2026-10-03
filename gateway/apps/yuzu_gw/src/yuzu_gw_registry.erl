@@ -35,6 +35,7 @@
          lookup_local_session/1,
          lookup_session/1,
          lookup_pending_session/1,
+         session_index_available/0,
          all_agents/0,
          all_agent_pids/0,
          all_register_reqs/0,
@@ -269,6 +270,13 @@ lookup_pending_session(SessionId) ->
     catch
         error:badarg -> {error, unavailable}
     end.
+
+%% @doc True when the session index table exists. Readiness uses it: a
+%% registry process that is alive without the table (the state after new code
+%% is loaded into a running node) keeps routing but rejects every heartbeat.
+-spec session_index_available() -> boolean().
+session_index_available() ->
+    ets:whereis(?SESSIONS_TABLE) =/= undefined.
 
 is_local_alive(Pid) ->
     node(Pid) =:= node() andalso is_process_alive(Pid).
