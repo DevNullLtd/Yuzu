@@ -33,6 +33,7 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <constraint_accumulator.hpp>
+#include <wmi_error_token.hpp>
 
 #include <algorithm>
 #include <array>
@@ -313,22 +314,28 @@ inline bool is_allowed_cim_namespace(std::string_view ns) noexcept {
 
 enum class CimOutcome { ok, class_absent, permission_denied, failed };
 
-inline bool ends_with(std::string_view s, std::string_view suffix) noexcept {
-    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
-}
-
-/// Classifies a wmi_bounded.hpp error token. class_absent = WBEM_E_INVALID_NAMESPACE
-/// (0x8004100e) / WBEM_E_INVALID_CLASS (0x80041010): fall back to the SrpV2 walk.
-/// permission_denied = WBEM_E_ACCESS_DENIED (0x80041003) / E_ACCESSDENIED (0x80070005).
-/// Anything else is `failed` and stays constrained.
-inline CimOutcome classify_cim_error(const std::optional<std::string>& error) {
+/// Classifies a wmi_bounded.hpp error token via the shared STAGE-AWARE rule
+/// (wmi_error_token.hpp: classify_wmi_error_token). class_absent = the two answers WMI gives when
+/// the thing is missing: WBEM_E_INVALID_NAMESPACE (0x8004100e) at connect, or
+/// WBEM_E_INVALID_CLASS (0x80041010) at query -- or at the FIRST Next() (`rows_before_error == 0`;
+/// the semisynchronous query defers class resolution there): fall back to the SrpV2 walk. The same
+/// HRESULT at any other stage, or at a Next() after a row came back, is a fault and reads
+/// `failed`. permission_denied = WBEM_E_ACCESS_DENIED (0x80041003) / E_ACCESSDENIED (0x80070005)
+/// at any stage. Anything else is `failed` and stays constrained.
+/// `rows_before_error` is BoundedQueryResult::rows_before_error (the rows wmi_bounded cleared).
+inline CimOutcome classify_cim_error(const std::optional<std::string>& error,
+                                     std::size_t rows_before_error) {
     if (!error)
         return CimOutcome::ok;
-    const std::string_view t{*error};
-    if (ends_with(t, "0x8004100e") || ends_with(t, "0x80041010"))
+    switch (yuzu::shared::wmi_token::classify_wmi_error_token(*error, rows_before_error)) {
+    case yuzu::shared::wmi_token::WmiReadOutcome::absent:
         return CimOutcome::class_absent;
-    if (ends_with(t, "0x80041003") || ends_with(t, "0x80070005"))
+    case yuzu::shared::wmi_token::WmiReadOutcome::denied:
         return CimOutcome::permission_denied;
+    case yuzu::shared::wmi_token::WmiReadOutcome::ok:
+    case yuzu::shared::wmi_token::WmiReadOutcome::failed:
+        break;
+    }
     return CimOutcome::failed;
 }
 
@@ -473,9 +480,9 @@ enum class CollectionStep { read, absent_row, skip };
 }
 
 [[nodiscard]] inline CimPlan plan_cim(const std::optional<std::string>& error, const std::vector<WmiRow>& rows,
-                        bool truncated) {
+                        bool truncated, std::size_t rows_before_error) {
     CimPlan plan;
-    switch (classify_cim_error(error)) {
+    switch (classify_cim_error(error, rows_before_error)) {
     case CimOutcome::ok:
         for (const auto& row : rows) {
             if (auto parsed = parse_cim_applocker_row(row))
