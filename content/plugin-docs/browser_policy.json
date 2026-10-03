@@ -40,7 +40,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Lists the enterprise-managed Chrome, Chromium and Edge browser policies configured on the device, one row per policy: the browser, whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under /etc/opt/chrome, /etc/chromium and /etc/opt/edge. Windows and macOS legs planned - each follows as its own PR; on those hosts the action returns one `status` row and result status UNAVAILABLE with provenance `<os>:planned`. A host with no managed policy returns zero rows and a clean result status; a read that could not be completed adds one `constrained` status row. Values are reported verbatim. The plugin never enforces, fetches or changes anything.",
+      "description": "Lists the enterprise-managed Chrome, Chromium and Edge browser policies configured on the device, one row per policy: the browser, whether the policy is mandatory or recommended, its scope, its name, its typed value and the file it was read from. On Linux the rows come from the JSON policy files under /etc/opt/chrome, /etc/chromium and /etc/opt/edge. Windows and macOS legs planned - each follows as its own PR; on those hosts the action returns one `status` row and result status UNAVAILABLE with provenance `<os>:planned`. A host with no managed policy returns zero rows and a clean result status; a read that could not be completed adds a `constrained` status row, followed by one per-path status row naming each file or directory that failed. Values are reported verbatim. The plugin never enforces, fetches or changes anything.",
       "display_name": "Browser Policies",
       "execute_roles": [
         "endpoint-admin",
@@ -72,7 +72,7 @@
     {
       "columns": [
         {
-          "description": "Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are \"-\".",
+          "description": "Row shape discriminator (field 0): policy (one per configured policy) or status (written first, and only when the read was not complete). A status row repeats the typed result status in band; its name field is the action, its value field the state and its detail field the reason tokens; its other fields are \"-\", except source on a per-path status row (the logical path the reason token names).",
           "example": "policy",
           "name": "row_kind",
           "platforms": [
@@ -167,7 +167,7 @@
           "values": null
         },
         {
-          "description": "The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path.",
+          "description": "The logical absolute file the policy was read from, never an injected test root. Only the Linux leg reads policy today; the Windows and macOS legs will report the registry key or plist path. On a status row: \"-\" on the summary row; on a per-path row the logical /etc/... path of the file or directory whose failure token is in detail, never an injected test root.",
           "example": "/etc/opt/chrome/policies/managed/corp.json",
           "name": "source",
           "platforms": [
@@ -231,9 +231,9 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:byte_cap` (more than 16 MiB of policy files read in one run), `linux:json_unparseable`, `linux:json_not_object`, `linux:json_too_deep` and `linux:json_too_complex` (more than 65536 containers in one file) (several tokens are comma-joined)",
+      "provenance": "`linux:<detail>` with `<detail>` one of `permission_denied`, `symlink_refused`, `not_a_directory`, `open_failed`, `stat_failed`, `not_regular`, `oversized`, `read_failed`, `readdir_error`; also `linux:row_cap` (more than 8192 rows in one run), `linux:entry_cap` (one policy directory holds more than 4096 entries), `linux:byte_cap` (more than 16 MiB of policy files read in one run), `linux:json_unparseable`, `linux:json_not_object`, `linux:json_too_deep` and `linux:json_too_complex` (more than 65536 containers in one file); also `linux:status_rows_capped` (more than 64 per-path `status` rows were due; the first 64 are written) (several tokens are comma-joined)",
       "status": "`CONSTRAINED`",
-      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, 16 MiB total parse cap, nesting depth, container count) was hit; one `constrained` `status` row"
+      "when": "Linux: a policy directory or file exists but could not be read completely or decoded, or a bound (row cap, directory entry cap, 1 MiB file cap, 16 MiB total parse cap, nesting depth, container count) was hit; a summary `constrained` `status` row plus per-path rows"
     },
     {
       "completeness": "`PARTIAL`",
@@ -249,7 +249,7 @@
     },
     {
       "completeness": "`PARTIAL`",
-      "provenance": "`windows:leg:exception` / `macos:leg:exception` / `linux:leg:exception`",
+      "provenance": "`windows:leg:exception:<category>` / `macos:leg:exception:<category>` / `linux:leg:exception:<category>`, `<category>` one of `bad_alloc`, `std_exception`, `unknown` (the exception text is deliberately never carried)",
       "status": "`UNAVAILABLE`",
       "when": "a leg threw; reported (with one `unavailable` `status` row) instead of unwinding across the plugin boundary"
     }
