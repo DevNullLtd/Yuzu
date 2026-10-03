@@ -564,7 +564,7 @@ jobs:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     needs: [preflight]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
-    # 26.04-only and cannot build on the Shulgi 24.04 fallback, so gate on
+    # 26.04-only (the retired Shulgi runners were 24.04), so gate on
     # bigtam_pool_healthy (>=1 yuzu-bigtam-linux runner online) rather than the
     # broader linux_pool. Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline
     # Big Tam skips this job fast instead of queueing against an empty pool.

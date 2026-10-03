@@ -188,6 +188,9 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
 
 ## Rollback
 
-Revert the `runs-on` pins and compiler tokens to gcc-13/clang-19/`ImageOS: ubuntu24`
-and the jobs run on Shulgi again unchanged. The staged 26.04 Docker images and
-native files are inert when nothing references them, so they need no rollback.
+Shulgi is retired, so reverting the `runs-on` pins and compiler tokens to
+gcc-13/clang-19/`ImageOS: ubuntu24` no longer puts jobs back on it by itself.
+Recovery from an extended Big Tam outage would need the Shulgi runners
+re-registered, their entries restored in `.github/runner-inventory.json`, and the
+pins reverted together. The staged 26.04 Docker images and native files are inert
+when nothing references them, so they need no rollback.

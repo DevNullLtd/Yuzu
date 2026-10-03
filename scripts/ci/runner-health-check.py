@@ -69,11 +69,12 @@ LINUX_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64"})
 
 # The Big Tam Linux pool. The ci.yml `linux` compile job pins
 # runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux] because its toolchain
-# (GCC 15 / Clang 21) exists only on Big Tam's Ubuntu 26.04 — Shulgi (24.04)
-# cannot build it. preflight emits `bigtam_pool_healthy=true` iff >=1 such
+# (GCC 15 / Clang 21) exists only on Big Tam's Ubuntu 26.04 (the retired Shulgi
+# runners were 24.04 and could not build it). preflight emits `bigtam_pool_healthy=true` iff >=1 such
 # runner is online, so the pinned job skips fast (fail-closed) instead of
 # queueing forever against an offline Big Tam. The compiler-agnostic
-# proto-compat job stays on the broader linux_pool gate.
+# proto-compat job gates on linux_pool_healthy and is pinned to the same
+# yuzu-bigtam-linux label, so the two gates now cover the same runners.
 BIGTAM_POOL_LABELS = frozenset({"self-hosted", "Linux", "X64", "yuzu-bigtam-linux"})
 
 # The Wee Tam Windows pool. Both ci.yml and nightly.yml pin this exact label;

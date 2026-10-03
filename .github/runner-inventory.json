@@ -6,56 +6,56 @@
       "name": "yuzu-bigtam-linux-0",
       "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
       "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
-      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage and the CodeQL Linux leg also run here.",
       "installed": "2026-06-19"
     },
     {
       "name": "yuzu-bigtam-linux-1",
       "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
       "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
-      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage and the CodeQL Linux leg also run here.",
       "installed": "2026-06-19"
     },
     {
       "name": "yuzu-bigtam-linux-2",
       "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
       "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
-      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage and the CodeQL Linux leg also run here.",
       "installed": "2026-06-19"
     },
     {
       "name": "yuzu-bigtam-linux-3",
       "host": "Big Tam (Threadripper 9970X, native Ubuntu 26.04)",
       "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
-      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage, and the CodeQL Linux leg migrate here after the yuzu-shulgi pin cutover.",
+      "role": "Linux CI pool (shared label yuzu-bigtam-linux) — ci.yml proto-compat + linux matrix. Sanitizers, coverage and the CodeQL Linux leg also run here.",
       "installed": "2026-06-19"
     },
     {
       "name": "yuzu-weetam-windows-0",
       "host": "Wee Tam (Threadripper 9970X, native Windows 11)",
       "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
-      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaces yuzu-local-windows after the Shulgi cutover.",
+      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaced the retired yuzu-local-windows.",
       "installed": "2026-06-20"
     },
     {
       "name": "yuzu-weetam-windows-1",
       "host": "Wee Tam (Threadripper 9970X, native Windows 11)",
       "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
-      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaces yuzu-local-windows after the Shulgi cutover.",
+      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaced the retired yuzu-local-windows.",
       "installed": "2026-06-20"
     },
     {
       "name": "yuzu-weetam-windows-2",
       "host": "Wee Tam (Threadripper 9970X, native Windows 11)",
       "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
-      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaces yuzu-local-windows after the Shulgi cutover.",
+      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaced the retired yuzu-local-windows.",
       "installed": "2026-06-20"
     },
     {
       "name": "yuzu-weetam-windows-3",
       "host": "Wee Tam (Threadripper 9970X, native Windows 11)",
       "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
-      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaces yuzu-local-windows after the Shulgi cutover.",
+      "role": "Windows MSVC CI pool (shared label yuzu-weetam-windows) — ci.yml windows matrix (release + debug), codeql Windows leg. Replaced the retired yuzu-local-windows.",
       "installed": "2026-06-20"
     },
     {
