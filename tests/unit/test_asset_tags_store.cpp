@@ -440,7 +440,8 @@ TEST_CASE("asset_tags store: fchmod and fsync run on the open fd BEFORE close (#
     CHECK(g.file_fsync_n == 1);
     CHECK(g.file_fchmod_n == 1);
     CHECK(g.file_close_n == 1);
-    CHECK(g.file_fsync_seq < g.file_fchmod_seq);
+    // fchmod precedes the fsync so the mode is in the flushed metadata
+    CHECK(g.file_fchmod_seq < g.file_fsync_seq);
     CHECK(g.file_fchmod_seq < g.file_close_seq);
     // The directory fd is a second, later fsync/close pair, run only after the
     // rename has published the payload and consumed the temp.
@@ -452,7 +453,7 @@ TEST_CASE("asset_tags store: fchmod and fsync run on the open fd BEFORE close (#
     CHECK(g.stray_n == 0);
 }
 
-TEST_CASE("asset_tags store: a failed fchmod is a mode_unrestricted warning",
+TEST_CASE("asset_tags store: a failed fchmod is a mode_reassert_failed warning",
           "[agent][asset_tags_store]") {
     yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
     const auto dest = dir.path / "s.json";
@@ -461,7 +462,7 @@ TEST_CASE("asset_tags store: a failed fchmod is a mode_unrestricted warning",
     auto r = write_state_file_atomic(dest, "{}", {}, &ops);
     REQUIRE(r.has_value());
     REQUIRE(r->has_value());
-    CHECK((*r)->mode_unrestricted);
+    CHECK((*r)->mode_reassert_failed);
     CHECK_FALSE((*r)->dir_fsync_failed);
     CHECK(fs::exists(dest));
 }
@@ -488,7 +489,7 @@ TEST_CASE("asset_tags store: a failed directory fsync is a dir_fsync_failed warn
     REQUIRE(r.has_value());
     REQUIRE(r->has_value());
     CHECK((*r)->dir_fsync_failed);
-    CHECK_FALSE((*r)->mode_unrestricted);
+    CHECK_FALSE((*r)->mode_reassert_failed);
     CHECK(fs::exists(dest));
 }
 
@@ -508,7 +509,7 @@ TEST_CASE("asset_tags store: a failed directory open or close is a dir_fsync_fai
     REQUIRE(r.has_value());
     REQUIRE(r->has_value());
     CHECK((*r)->dir_fsync_failed);
-    CHECK_FALSE((*r)->mode_unrestricted);
+    CHECK_FALSE((*r)->mode_reassert_failed);
     CHECK(fs::exists(dest));
 }
 

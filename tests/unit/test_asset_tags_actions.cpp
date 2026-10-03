@@ -515,11 +515,11 @@ TEST_CASE("asset_tags sync: typed WriteWarning flags escalate the result status 
     };
     const Case cases[] = {
         {"mode only", true, false, YUZU_RESULT_COMPLETENESS_FULL,
-         "asset_tags:persist_mode_unrestricted", "last_persist_error|mode_unrestricted: "},
+         "asset_tags:persist_mode_reassert_failed", "last_persist_error|mode_reassert_failed: "},
         {"dir only", false, true, YUZU_RESULT_COMPLETENESS_FULL, "asset_tags:persist_dir_unsynced",
          "last_persist_error|dir_fsync_failed: "},
-        {"both", true, true, YUZU_RESULT_COMPLETENESS_FULL, "asset_tags:persist_mode_unrestricted",
-         "last_persist_error|mode_unrestricted+dir_fsync_failed: "},
+        {"both", true, true, YUZU_RESULT_COMPLETENESS_FULL, "asset_tags:persist_mode_reassert_failed",
+         "last_persist_error|mode_reassert_failed+dir_fsync_failed: "},
     };
 
     int i = 0;

@@ -341,18 +341,19 @@ struct SyncStatusDecision {
 
 /// Combined-warning policy. A failed write is PARTIAL (nothing reached disk).
 /// A successful write that carries a warning is FULL but CONSTRAINED; when both
-/// warning flags are set the security cause (mode_unrestricted) outranks the
-/// durability cause (dir_fsync_failed). The flags are the typed fields of the
+/// warning flags are set the mode cause (mode_reassert_failed: the file may be
+/// narrower than 0600 and fail the next load) outranks the durability cause
+/// (dir_fsync_failed: one rename may roll back). The flags are the typed fields of the
 /// store's WriteWarning -- never derived from its message text.
 [[nodiscard]] constexpr SyncStatusDecision decide_sync_status(bool persisted,
-                                                              bool mode_unrestricted,
+                                                              bool mode_reassert_failed,
                                                               bool dir_fsync_failed) noexcept {
     if (!persisted)
         return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                 "asset_tags:persist_failed"};
-    if (mode_unrestricted)
+    if (mode_reassert_failed)
         return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_FULL,
-                "asset_tags:persist_mode_unrestricted"};
+                "asset_tags:persist_mode_reassert_failed"};
     if (dir_fsync_failed)
         return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_FULL,
                 "asset_tags:persist_dir_unsynced"};
@@ -363,11 +364,11 @@ struct SyncStatusDecision {
 /// final cap_value truncation can only shorten the free-text detail (a long path
 /// in the first cause can never push the second cause out). Labels come from the
 /// typed flags, never from parsing `message`.
-inline std::string format_write_warning(bool mode_unrestricted, bool dir_fsync_failed,
+inline std::string format_write_warning(bool mode_reassert_failed, bool dir_fsync_failed,
                                         std::string_view message) {
     std::string out;
-    if (mode_unrestricted)
-        out += "mode_unrestricted";
+    if (mode_reassert_failed)
+        out += "mode_reassert_failed";
     if (dir_fsync_failed)
         out += out.empty() ? "dir_fsync_failed" : "+dir_fsync_failed";
     out += ": ";

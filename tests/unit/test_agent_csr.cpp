@@ -235,3 +235,33 @@ TEST_CASE("inspect treats a garbage leaf as Missing", "[agent_csr][pki]") {
     REQUIRE(inspect_provisioned_cert(dir) == CertState::Missing);
     fs::remove_all(dir);
 }
+
+TEST_CASE("inspect reports Missing for a leaf that does not match the key on disk (partial renewal)",
+          "[agent_csr][pki]") {
+    const fs::path dir = yuzu::test::unique_temp_path("agent-csr-mismatch-");
+    const auto now = std::chrono::system_clock::now();
+    auto kc1 = generate_key_and_csr("pair-1");
+    REQUIRE(kc1.has_value());
+    const std::string leaf = self_sign(kc1->private_key_pem, now - 1h, now + 24h * 365, "pair-1");
+    REQUIRE(persist_provisioned_cert(dir, kc1->private_key_pem, leaf, ""));
+    REQUIRE(inspect_provisioned_cert(dir, now) == CertState::Valid);
+
+    // The on-disk state a key-success/leaf-failure renewal leaves: old leaf, new key.
+    const auto paths = provisioned_cert_paths(dir);
+    auto kc2 = generate_key_and_csr("pair-2");
+    REQUIRE(kc2.has_value());
+    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, kc2->private_key_pem,
+                                            {.owner_only_mode = true}));
+    CHECK(inspect_provisioned_cert(dir, now) == CertState::Missing);
+
+    // Restoring the matching key makes it Valid again: the check is the pairing.
+    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, kc1->private_key_pem,
+                                            {.owner_only_mode = true}));
+    CHECK(inspect_provisioned_cert(dir, now) == CertState::Valid);
+
+    // A key file that is not a private key is Missing too.
+    REQUIRE(yuzu::shared::write_file_atomic(paths.key_path, "not a key", {.owner_only_mode = true}));
+    CHECK(inspect_provisioned_cert(dir, now) == CertState::Missing);
+
+    fs::remove_all(dir);
+}

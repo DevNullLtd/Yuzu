@@ -64,7 +64,9 @@ enum class CertState {
 
 /// Inspect the persisted leaf (if any) and decide whether the agent should send a
 /// CSR. Pure read — modifies nothing. `now` is injectable for tests. A leaf that
-/// cannot be parsed, or is missing its key, is reported as Missing.
+/// cannot be parsed, or is missing its key, is reported as Missing. A leaf whose
+/// public key does not match the key on disk (a renewal that replaced the key but
+/// not the leaf) is also Missing, so startup re-enrolls instead of presenting the pair.
 [[nodiscard]] YUZU_EXPORT CertState
 inspect_provisioned_cert(const std::filesystem::path& cert_dir,
                          std::chrono::system_clock::time_point now =

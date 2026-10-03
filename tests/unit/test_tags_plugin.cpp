@@ -25,7 +25,9 @@
 #include <string>
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -77,6 +79,49 @@ TEST_CASE("tags: save_tags creates the file at 0666 & ~umask, not 0600",
     struct stat st{};
     REQUIRE(::stat(g_tags_path.c_str(), &st) == 0);
     CHECK((st.st_mode & 0777) == (0666 & ~u));
+}
+
+TEST_CASE("tags: save_tags replaces tags.json by rename, never in place", "[agent][tags_plugin]") {
+    yuzu::test::TempDir dir{"yuzu_test_tags_"};
+    g_tags_path = dir.path / "tags.json";
+    yuzu::test::ScopeExit reset{[] {
+        g_tags.clear();
+        g_tags_path.clear();
+    }};
+    g_tags = {{"a", "1"}};
+    save_tags();
+
+    // Hold the OLD file open across the second save. A rename swaps the directory
+    // entry to a new inode and leaves the old one intact for its readers; a
+    // truncating in-place write (the pre-#4728 behaviour) keeps the inode and
+    // overwrites what the reader sees. Deterministic -- no reader races a writer.
+    struct stat before{};
+    REQUIRE(::stat(g_tags_path.c_str(), &before) == 0);
+    const int old_fd = ::open(g_tags_path.c_str(), O_RDONLY);
+    REQUIRE(old_fd >= 0);
+    yuzu::test::ScopeExit close_old{[&] { ::close(old_fd); }};
+
+    g_tags = {{"a", "2"}, {"b", "3"}};
+    save_tags();
+
+    struct stat after{};
+    REQUIRE(::stat(g_tags_path.c_str(), &after) == 0);
+    CHECK(after.st_ino != before.st_ino);
+
+    struct stat old_now{};
+    REQUIRE(::fstat(old_fd, &old_now) == 0);
+    CHECK(old_now.st_nlink == 0); // the old inode was unlinked by the rename, not rewritten
+
+    std::string old_view;
+    char buf[256];
+    for (ssize_t n = ::read(old_fd, buf, sizeof buf); n > 0; n = ::read(old_fd, buf, sizeof buf))
+        old_view.append(buf, static_cast<std::size_t>(n));
+    CHECK(old_view.find("\"a\": \"1\"") != std::string::npos); // wholly old
+    CHECK(old_view.find("\"b\"") == std::string::npos);
+
+    g_tags.clear();
+    load_tags();
+    CHECK(g_tags.count("b") == 1);
 }
 #endif
 

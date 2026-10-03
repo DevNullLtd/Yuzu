@@ -220,7 +220,7 @@ private:
         CategoryValues current;
         int64_t last_sync = 0;
         bool persisted = true;
-        bool mode_unrestricted = false;
+        bool mode_reassert_failed = false;
         bool dir_fsync_failed = false;
         {
             // One critical section: mutate, snapshot, and persist under the
@@ -242,9 +242,9 @@ private:
                     g_last_persist_error = cap_value(written.error().message);
                     spdlog::warn("asset_tags: state not persisted: {}", written.error().message);
                 } else if (*written) {
-                    mode_unrestricted = (*written)->mode_unrestricted;
+                    mode_reassert_failed = (*written)->mode_reassert_failed;
                     dir_fsync_failed = (*written)->dir_fsync_failed;
-                    g_last_persist_error = format_write_warning(mode_unrestricted, dir_fsync_failed,
+                    g_last_persist_error = format_write_warning(mode_reassert_failed, dir_fsync_failed,
                                                                 (*written)->message);
                     spdlog::warn("asset_tags: {}", (*written)->message);
                 }
@@ -270,7 +270,7 @@ private:
 
         // The in-memory state advanced and the rows above are truthful either
         // way; the status tells the caller whether the write reached disk.
-        const auto decision = decide_sync_status(persisted, mode_unrestricted, dir_fsync_failed);
+        const auto decision = decide_sync_status(persisted, mode_reassert_failed, dir_fsync_failed);
         ctx.set_result_status(decision.status, decision.completeness, decision.provenance);
         return 0;
     }

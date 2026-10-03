@@ -28,14 +28,15 @@
  *     re-asserts 0600 via `fchmod` on the still-open fd (fd-bound, so it
  *     cannot race a writer that unlinked and replanted the temp's path), so
  *     the on-disk mode stays deterministic under an unusual umask. A failed
- *     fchmod is a WriteWarning{mode_unrestricted}, not a write failure.
+ *     fchmod is a WriteWarning{mode_reassert_failed}, not a write failure: the
+ *     file cannot be wider than 0600 (created at 0600 & ~umask), only narrower.
  *   - false: POSIX creates at 0666, so the process umask applies — what the
  *     ofstream-based writers produce — and an ordinary file keeps its
  *     accessible permissions. No fchmod is issued.
  * On Windows owner_only_mode has no effect: the DACL is not tightened here
  * (documented follow-up).
  *
- * POSIX call order: write loop -> fsync(fd) -> fchmod(fd) [owner_only_mode]
+ * POSIX call order: write loop -> fchmod(fd) [owner_only_mode] -> fsync(fd)
  * -> close(fd) -> rename -> open/fsync/close of the parent directory.
  *   - A failed file fsync is an IoError (#4727 decision: fsync adopted on
  *     POSIX); the temp is removed.
@@ -102,8 +103,10 @@ struct IoError {
 /// replaced). Both flags may be set; `message` joins the causes with "; ".
 struct WriteWarning {
     std::string message;
-    bool mode_unrestricted = false; ///< fchmod to 0600 failed; file replaced at a wider mode
-    bool dir_fsync_failed = false;  ///< rename durable only after the next OS flush
+    /// fchmod(0600) on the open fd failed; the temp was created at 0600 & ~umask, so
+    /// the file is never WIDER than 0600 but may be narrower (even unreadable by the owner)
+    bool mode_reassert_failed = false;
+    bool dir_fsync_failed = false; ///< rename durable only after the next OS flush
 };
 
 #ifndef _WIN32
@@ -268,16 +271,17 @@ write_file_atomic(const std::filesystem::path& dest, std::string_view bytes,
             p += n;
             remaining -= static_cast<std::size_t>(n);
         }
-        // Flush file data before the rename can publish it (#4727: adopted).
-        if (ok && ops.fsync(fd) != 0) {
-            ok = false;
-            fail = "fsync of " + tmp.string() + " failed: " + std::strerror(errno);
-        }
-        // Re-assert 0600 on the still-open fd, before close (fd-bound, see banner).
+        // Re-assert 0600 on the still-open fd BEFORE the fsync so the mode is persisted
+        // with the data (fd-bound, see banner).
         if (ok && opts.owner_only_mode && ops.fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
             warning = WriteWarning{
                 "could not restrict " + tmp.string() + " to 0600: " + std::strerror(errno), true,
                 false};
+        }
+        // Flush file data before the rename can publish it (#4727: adopted).
+        if (ok && ops.fsync(fd) != 0) {
+            ok = false;
+            fail = "fsync of " + tmp.string() + " failed: " + std::strerror(errno);
         }
         if (file.close() != 0 && ok) {
             ok = false;

@@ -9,6 +9,10 @@
  *
  * One case: the replacement lands, no temp sibling survives, and on POSIX the
  * file mode follows the umask (owner_only_mode=false at the production site).
+ * Two checks pin the wiring itself: a planted bystander at the retired fixed
+ * temp name (`target.txt.yuzu_tmp`) must survive untouched (the pre-#4728 helper
+ * overwrote and consumed it), and on POSIX the replacement must land by rename
+ * onto a new inode (an in-place truncating write would keep the inode).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -30,7 +34,9 @@
 #include <vector>
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -113,6 +119,21 @@ TEST_CASE("filesystem plugin: replace persists through the shared atomic write",
         std::ofstream f(file, std::ios::binary);
         f << "hello world";
     }
+    const auto legacy = dir.path / "target.txt.yuzu_tmp";
+    const std::string sentinel = "SENTINEL-DO-NOT-TOUCH";
+    {
+        std::ofstream f(legacy, std::ios::binary);
+        f << sentinel;
+    }
+#ifndef _WIN32
+    // Hold the OLD file open across the dispatch: a rename leaves the old inode
+    // intact for its readers; an in-place truncate keeps the inode.
+    struct stat before{};
+    REQUIRE(::stat(file.c_str(), &before) == 0);
+    const int old_fd = ::open(file.c_str(), O_RDONLY);
+    REQUIRE(old_fd >= 0);
+    yuzu::test::ScopeExit close_old{[&] { ::close(old_fd); }};
+#endif
 
     const std::string path_str = file.string();
     const std::array<YuzuParam, 3> params{
@@ -124,15 +145,30 @@ TEST_CASE("filesystem plugin: replace persists through the shared atomic write",
     CHECK(r.captured.find("replacements_made|1") != std::string::npos);
     CHECK(read_all(file) == "hello yuzu");
 
-    // Exactly the one file: neither a `.tmp.*` nor a legacy `.yuzu_tmp` sibling.
+    // The retired fixed temp name is never opened or consumed.
+    CHECK(read_all(legacy) == sentinel);
+
+    // target + the untouched legacy-named bystander: no `.tmp.*` sibling survives.
     std::size_t entries = 0;
     for (const auto& e : fs::directory_iterator(dir.path, ec)) {
         (void)e;
         ++entries;
     }
-    CHECK(entries == 1);
+    CHECK(entries == 2);
 
 #ifndef _WIN32
+    struct stat after{};
+    REQUIRE(::stat(file.c_str(), &after) == 0);
+    CHECK(after.st_ino != before.st_ino);
+    struct stat old_now{};
+    REQUIRE(::fstat(old_fd, &old_now) == 0);
+    CHECK(old_now.st_nlink == 0); // the old inode was unlinked by the rename, not rewritten
+    std::string old_view;
+    char buf[64];
+    for (ssize_t n = ::read(old_fd, buf, sizeof buf); n > 0; n = ::read(old_fd, buf, sizeof buf))
+        old_view.append(buf, static_cast<std::size_t>(n));
+    CHECK(old_view == "hello world"); // wholly old -- never the replacement, never empty
+
     const mode_t u = ::umask(0);
     ::umask(u);
     struct stat st{};

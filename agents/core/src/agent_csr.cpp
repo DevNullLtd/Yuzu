@@ -105,6 +105,15 @@ X509_ptr load_cert(std::string_view pem) {
     return X509_ptr{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
 }
 
+EVP_PKEY_ptr load_private_key(std::string_view pem) {
+    if (pem.empty() || pem.size() > kMaxPemSize)
+        return nullptr;
+    BIO_ptr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
+    if (!bio)
+        return nullptr;
+    return EVP_PKEY_ptr{PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr)};
+}
+
 std::optional<std::chrono::system_clock::time_point> from_asn1_time(const ASN1_TIME* at) {
     if (!at)
         return std::nullopt;
@@ -228,8 +237,13 @@ bool persist_provisioned_cert(const fs::path& cert_dir, const std::string& key_p
     fs::permissions(cert_dir, fs::perms::owner_all, fs::perm_options::replace, ec); // 0700
 
     const auto paths = provisioned_cert_paths(cert_dir);
-    // Key first (the secret), then the public artifacts. A crash between writes
-    // leaves the leaf missing → inspect() reports Missing → clean re-enroll.
+    // Key first (the secret), then the public artifacts. The two writes are not one
+    // transaction: a failure after the key write (rename error, ENOSPC, Windows
+    // sharing violation, fsync EIO) leaves the OLD leaf beside the NEW key.
+    // inspect_provisioned_cert() detects that pairing mismatch and reports Missing,
+    // so the next startup re-enrolls instead of presenting an unusable pair. On first
+    // enrollment a crash between writes simply leaves the leaf missing → Missing →
+    // clean enroll.
     // PRIVATE key: 0600 from creation, re-asserted on the open fd (no umask window).
     if (!write_atomic(paths.key_path, key_pem, /*owner_only=*/true))
         return false;
@@ -254,6 +268,25 @@ CertState inspect_provisioned_cert(const fs::path& cert_dir,
     X509_ptr cert = load_cert(leaf);
     if (!cert)
         return CertState::Missing;
+    // The leaf must pair with the key on disk (a renewal that replaced the key but
+    // not the leaf leaves a date-valid but unusable pair).
+    std::string key_pem = read_text_file(paths.key_path);
+    EVP_PKEY_ptr key = load_private_key(key_pem);
+    OPENSSL_cleanse(key_pem.data(), key_pem.size());
+    if (!key) {
+        spdlog::warn("agent_csr: {} is unreadable or not a private key — treating the "
+                     "credential as missing",
+                     paths.key_path.string());
+        return CertState::Missing;
+    }
+    if (X509_check_private_key(cert.get(), key.get()) != 1) {
+        ERR_clear_error();
+        spdlog::warn("agent_csr: {} does not match the public key in {} — a renewal "
+                     "replaced the key but not the leaf; treating the credential as "
+                     "missing so startup re-enrolls",
+                     paths.key_path.string(), paths.cert_path.string());
+        return CertState::Missing;
+    }
     auto nb = from_asn1_time(X509_get0_notBefore(cert.get()));
     auto na = from_asn1_time(X509_get0_notAfter(cert.get()));
     if (!nb || !na || *na <= *nb)
