@@ -540,7 +540,7 @@ Big Tam and Wee Tam, and removed from `.github/runner-inventory.json`.
 `proto-compat` and `cache-prune-linux` are pinned to `yuzu-bigtam-linux`; they
 previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
-were deregistered on the GitHub side on 2026-10-03. With the pin, `proto-compat` queues (it does not fail) while all four
+were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
 Big Tam slots are busy. When no Big Tam runner is online, the preflight job
 fails (required pool `bigtam`) and `proto-compat` is skipped.
 

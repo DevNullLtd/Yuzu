@@ -10,7 +10,7 @@ legs + the remaining Windows stragglers + build-speed** (PR #1615). **`yuzu-wsl2
 are pinned to `yuzu-bigtam-linux`; they previously used the bare
 `[self-hosted, Linux, X64]` label, which the Shulgi WSL2 runner also carried.
 The runners were deregistered on GitHub (Settings → Actions → Runners) on
-2026-10-03.
+2026-10-03, per the repo admin.
 
 The sections below are the historical runbook + per-file record; the future-tense
 "deferred" / "pre-flip" framing is preserved as the record of how the flip was
@@ -169,7 +169,7 @@ Incremental order: do ci.yml first, prove it green on Big Tam, then the rest.
    `yuzu-shulgi`. release.yml only runs at tag time, so the first Big Tam release
    is its real validation; note Big Tam ships RPM 6.0 vs Shulgi's 4.x.)
 6. **`.github/runner-inventory.json`** — **DONE.** The runners were deregistered
-   on GitHub on 2026-10-03, and `yuzu-wsl2-linux` and
+   on GitHub on 2026-10-03 (per the repo admin), and `yuzu-wsl2-linux` and
    `yuzu-local-windows` were removed from the inventory (both retired); `proto-compat` and
    `cache-prune-linux` are pinned to `yuzu-bigtam-linux`, so a bare-label job can no
    longer land on a Shulgi runner if one is ever re-registered. The pool gates are

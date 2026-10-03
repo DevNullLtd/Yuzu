@@ -543,8 +543,10 @@ class WorkflowWiringTests(unittest.TestCase):
         Covers: inline flow lists (single or multi-line), block lists, and a
         bare `runs-on: self-hosted` string, in *.yml and *.yaml workflows.
         Skips any list containing a `${{ }}` expression. Does not cover
-        `runs-on: ${{ matrix.runner }}` itself; its matrix `runner:` lists are
-        scanned instead."""
+        `runs-on: ${{ matrix.runner }}` itself (its matrix `runner:` lists are
+        scanned instead), the `runs-on: {group:, labels:}` mapping form, or
+        matrix keys other than `runner:`. Labels are compared case-insensitively
+        and trailing `# comments` are ignored."""
         inventory = json.loads(
             (ROOT / ".github" / "runner-inventory.json").read_text(encoding="utf-8")
         )
@@ -553,8 +555,16 @@ class WorkflowWiringTests(unittest.TestCase):
         block = re.compile(
             r"^[ \t]*runs-on:[ \t]*\n((?:[ \t]+-[ \t]*[^\n]+\n?)+)", re.MULTILINE
         )
-        string = re.compile(r"^[ \t]*runs-on:[ \t]*['\"]?(self-hosted)['\"]?[ \t]*$", re.MULTILINE)
+        string = re.compile(
+            r"^[ \t]*runs-on:[ \t]*['\"]?(self-hosted)['\"]?[ \t]*(?:#.*)?$",
+            re.MULTILINE | re.IGNORECASE,
+        )
         offenders: list[str] = []
+
+        def norm(raw: str) -> str:
+            return raw.split("#", 1)[0].strip().strip("'\"").lower()
+
+        declared = [{x.lower() for x in d} for d in declared]
 
         def check(name: str, labels: set[str], shown: str) -> None:
             if "self-hosted" not in labels or any("${{" in x for x in labels):
@@ -568,13 +578,13 @@ class WorkflowWiringTests(unittest.TestCase):
         for path in workflows:
             text = path.read_text(encoding="utf-8")
             for m in flow.finditer(text):
-                labels = {p.strip().strip("'\"") for p in m.group(1).split(",") if p.strip()}
+                labels = {norm(p) for p in m.group(1).split(",") if norm(p)}
                 check(path.name, labels, f"[{m.group(1).strip()}]")
             for m in block.finditer(text):
                 labels = {
-                    ln.strip()[1:].strip().strip("'\"")
+                    norm(ln.strip()[1:])
                     for ln in m.group(1).splitlines()
-                    if ln.strip().startswith("-")
+                    if ln.strip().startswith("-") and norm(ln.strip()[1:])
                 }
                 check(path.name, labels, f"block {sorted(labels)}")
             for m in string.finditer(text):

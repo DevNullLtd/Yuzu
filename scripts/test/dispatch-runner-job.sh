@@ -281,7 +281,10 @@ if [[ -n "$EXPECT_RUNNER" ]]; then
         -q '.jobs[0].runner_name' 2>/dev/null || echo "")
     if [[ -z "$RUNNER_USED" ]]; then
         echo "dispatch-runner-job: warn — could not determine runner_name for run $NEW_RUN_ID"
-    elif [[ "$RUNNER_USED" != "$EXPECT_RUNNER" && "$RUNNER_USED" != "$EXPECT_RUNNER"-[0-9]* ]]; then
+    elif ! { [[ "$RUNNER_USED" == "$EXPECT_RUNNER" ]] || {
+                 rest="${RUNNER_USED#"$EXPECT_RUNNER"-}"
+                 [[ "$rest" != "$RUNNER_USED" && "$rest" =~ ^[0-9]+$ ]]
+             }; }; then
         echo "dispatch-runner-job: warn — ran on '$RUNNER_USED', expected '$EXPECT_RUNNER'"
     else
         echo "dispatch-runner-job: ran on expected runner $RUNNER_USED"
