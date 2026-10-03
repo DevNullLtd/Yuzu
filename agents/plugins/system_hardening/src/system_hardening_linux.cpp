@@ -1,7 +1,7 @@
 /**
  * system_hardening_linux.cpp -- Linux leg: the allowlisted /proc/sys reads.
  *
- * SHAPE, NOT A COPY, of vuln_scan's config_checks.hpp:73-80 read_proc_value
+ * SHAPE, NOT A COPY, of vuln_scan's config_checks.hpp detail::read_proc_value
  * (single path). That helper returns {} for ENOENT, EACCES and every other
  * failure alike; a posture plugin must not, so this reader uses
  * ::open(O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW|O_NOCTTY) + ::fstat + ::read and hands
