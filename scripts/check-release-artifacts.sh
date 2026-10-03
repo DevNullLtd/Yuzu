@@ -41,6 +41,11 @@
 #     yuzu-server-image.cdx.json   + .spdx.json
 #     yuzu-gateway-image.cdx.json  + .spdx.json
 #     yuzu-postgres-image.cdx.json + .spdx.json   (#1318)
+#     yuzu-server-chisel-image.cdx.json  + .spdx.json   (#5242)
+#     yuzu-gateway-chisel-image.cdx.json + .spdx.json   (#5242)
+#     yuzu-agent-chisel-image.cdx.json   + .spdx.json   (#5242)
+#   (yuzu-agent-bundle-chisel is built after the release from its assets, so
+#   its SBOM is not a release asset and is not expected here.)
 #
 # Every file's name must also be one GitHub stores unchanged (letters,
 # digits, ".", "_" and "-", starting with a letter or digit), or SHA256SUMS
@@ -112,6 +117,11 @@ SBOM_BASES=(
   # yuzu-postgres joined the release images in #1318; docker-publish-postgres
   # is in the release job's needs, so its SBOM artifact must be present.
   "yuzu-postgres-image"
+  # The chisel images: docker-publish-chisel is in the release job's needs
+  # since #5242, so their SBOM artifacts must be present too.
+  "yuzu-server-chisel-image"
+  "yuzu-gateway-chisel-image"
+  "yuzu-agent-chisel-image"
 )
 
 for base in "${SBOM_BASES[@]}"; do

@@ -174,26 +174,27 @@ enrollment token. Build/usage: `docs/agent-bundle.md` and
 ## Publishing (release pipeline)
 
 The `docker-publish-chisel` job in `.github/workflows/release.yml` builds all
-three `*.chisel` Dockerfiles **multi-arch (linux/amd64 + linux/arm64)** and
-pushes them as `ghcr.io/<owner>/yuzu-{server,gateway,agent}-chisel:<version>`,
-signed (cosign keyless) with SLSA provenance. It is gated on the same core build
-jobs as `docker-publish` (`build-linux`, `build-gateway`) and runs in parallel
-with it, but is **not** a dependency of the `release` job, so a slow or failed
-demo-image build never blocks the actual release.
+three `*.chisel` Dockerfiles for **linux/amd64** (the QEMU-emulated arm64 leg
+was dropped; see the open decision below) and pushes them as
+`ghcr.io/<owner>/yuzu-{server,gateway,agent}-chisel:<version>`, signed (cosign
+keyless) with SLSA provenance. It is gated on the same core build jobs as
+`docker-publish` (`build-linux`, `build-gateway`) and runs in parallel with it.
+Since #5242 it **is** a dependency of the `release` job, so the chisel images'
+SBOMs are always release assets inside `SHA256SUMS`; a failed chisel build now
+blocks the release.
 
 The three-triplet **agent bundle** (`yuzu-agent-bundle-chisel`) is *not* built by
 this job — it repackages the release's own signed agent binaries for three OS
 triplets and is published separately after the release (see `docs/agent-bundle.md`
 and `scripts/build-agent-bundle.sh`).
 
-> **Open decision — arm64 build strategy.** The job currently builds arm64 via
-> **QEMU emulation** on the amd64 self-hosted runner. The C++ images compile all
-> vcpkg dependencies (gRPC, abseil, protobuf, OpenSSL) from source, which is very
-> slow under emulation and may need the 240-minute timeout on a cold cache. For
-> a sustainable release cadence, move the arm64 leg to a **native arm64 runner**
-> (self-hosted, or a GitHub-hosted `ubuntu-24.04-arm`) and merge per-arch
-> manifests. This needs a runner-topology decision — see the team before relying
-> on the QEMU path for every release.
+> **Open decision — arm64 build strategy.** The QEMU-emulated arm64 leg was
+> dropped: the C++ images compile all vcpkg dependencies (gRPC, abseil,
+> protobuf, OpenSSL) from source, which was very slow and flaky under
+> emulation. The images are amd64-only until arm64 returns on a **native arm64
+> runner** (self-hosted, or a GitHub-hosted `ubuntu-24.04-arm`) with per-arch
+> manifests merged. That needs a runner-topology decision. Since #5242 the
+> release waits on this job, so any arm64 leg must stay within its timeout.
 
 Until a release publishes these images, run the demo with `--build` on the
 target architecture. On an arm64 host (Apple Silicon, Ampere, Graviton) that
