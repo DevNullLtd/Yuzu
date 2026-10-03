@@ -512,8 +512,8 @@ flip, with a red-first test each:
   still end congestion-expired); (2) the parked-arm signals exported as heartbeat tags -
   `arms_parked_total`, `arm_redrives`, `compensation_reservation_refused`, `claim_drain_failures`,
   the current parked depth (`arms_parked()`) and, from #4354, `claim_index_release_failures()`
-  (which counts release attempts, not claims) plus the retained-tombstone count are runtime
-  accessors only today, so
+  (which counts release attempts, not claims) are runtime accessors only today, and no
+  retained-tombstone count exists yet (only the test-only `claim_queue_depth_for_test`), so
   `arm_pending > 0` cannot yet be told apart from ordinary in-flight arms; (3) a decision on the
   deferred faster redrive/expiry cadence (expiry lands between the deadline
   and the deadline plus one heartbeat interval (30 s by default), and the redrive sweep is a ~5 s
@@ -624,9 +624,9 @@ flip, with a red-first test each:
   `expire_overdue_claims` each refuse or skip it, so rb waits for a same-key attach, its own
   deadline, or `begin_stop`. Not reachable in production today (`erase_rule` is noexcept; the failure path is exercised only
   through `set_index_remove_fault_for_test`). #4354's fix does not change the trigger (a second
-  release failure at the same-key sweep) but adds four producers of a retained tombstone (the
-  ordinary publish pop, the firewall branch and both recovery pops), where those paths previously
-  left a ghost mapping; under a persistent failure each producer feeds the redispatch cycle, so
+  release failure at the same-key sweep) but adds three producers of a retained tombstone (the
+  ordinary publish pop and both recovery pops; the firewall branch already retained), where those
+  paths previously left a ghost mapping; under a persistent failure each producer feeds the redispatch cycle, so
   this criterion's fix must cover them. Further scenarios recorded from read-only analysis (not
   executed; each needs a counted or sticky failure seam that does not exist today, because with
   the one-shot seam every producer's tombstone is swept within the same lock hold): a late
