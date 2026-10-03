@@ -23,7 +23,9 @@ is handled.
 
 The output file is rewritten only when its bytes differ from what is already
 on disk, so the build_always_stale custom_target does not force a recompile
-and relink of the server on every ninja invocation.
+and relink of the server on every ninja invocation. An existing output that
+cannot be read (OSError on the read) counts as changed and is written anew; an
+unreadable-and-unwritable output therefore fails at the write.
 """
 
 from __future__ import annotations  # 'dict | None' type hints under py 3.9
