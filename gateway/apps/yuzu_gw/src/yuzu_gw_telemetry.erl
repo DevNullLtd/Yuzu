@@ -398,8 +398,9 @@ declare_metrics() ->
                "unknown_session = not held by this node, no_connection = "
                "no connection key to compare, registry_unavailable = the "
                "session index does not exist). The agent re-registers on the "
-               "NOT_FOUND answer (agents 0.13.0 and newer; older agents "
-               "only log it). A held session whose heartbeat arrived on "
+               "NOT_FOUND answer when its build includes the reconnect fix "
+               "(see the gateway manual); older agents only log it. A held "
+               "session whose heartbeat arrived on "
                "a different connection is counted in "
                "yuzu_gw_heartbeat_session_mismatch_total instead"}]),
     prometheus_counter:declare([
@@ -409,8 +410,11 @@ declare_metrics() ->
                "this node but the call arrived on a different connection than "
                "the one that opened it. Also rises when an HTTP/2 proxy "
                "between agents and the gateway spreads one agent's calls over "
-               "several connections, and possibly around agent reconnects "
-               "(expected, not observed in testing). "
+               "several connections. A rise of one per affected agent is "
+               "expected when an agent's connection is replaced while its "
+               "session is still held (observed with an injected GOAWAY, a "
+               "test-only trigger; not observed with an abrupt close or a "
+               "gateway restart). "
                "Carries event=security for SIEM routing"}]),
     %% Create every series at 0 now (a series that first appears already at 1
     %% is invisible to increase()).
