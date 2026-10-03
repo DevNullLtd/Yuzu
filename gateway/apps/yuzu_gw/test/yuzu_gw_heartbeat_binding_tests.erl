@@ -633,7 +633,10 @@ registration_churn_keeps_one_row_per_agent() ->
             ?assertEqual(error, yuzu_gw_registry:lookup_session(S))
         end, Old)
     after
-        [exit(R, kill) || R <- RacerPids],
+        %% Unlink first: the racers are linked, and killing a linked racer would
+        %% otherwise kill this (non-trapping) test process, so an earlier
+        %% assertion failure would be reported as `killed` and skip the cleanup.
+        [begin unlink(R), exit(R, kill) end || R <- RacerPids],
         %% Reap every holder, superseded ones included, and wait until all are down.
         AllHolders = [P || {P} <- ets:tab2list(Holders)],
         HolderMons = [erlang:monitor(process, P) || P <- AllHolders],
