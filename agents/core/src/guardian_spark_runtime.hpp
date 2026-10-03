@@ -1970,7 +1970,7 @@ private:
     /// registry_mu_ held (#4354). Retry c's index release; on failure keep c as a
     /// retained tombstone for the next same-key sweep. "withdrawn" here means "never
     /// re-commit" (the convention of fail_all_claims_locked's tombstones; the `live`
-    /// filter in publish_arm_verdicts_locked excludes withdrawn claims). It
+    /// filter in on_arm_complete excludes withdrawn claims). It
     /// is set even on a claim nobody withdrew (e.g. a non-adopted wedge), which is
     /// harmless: the claim is terminal, and is_retained_wedge reads kind/dispatch/
     /// waiter_abandoned/end, never withdrawn. Returns true iff c no longer owns a
