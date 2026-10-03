@@ -323,3 +323,190 @@ TEST_CASE("asset_tags store: failure paths", "[agent][asset_tags_store]") {
         CHECK_FALSE(text.error().message.empty());
     }
 }
+
+#ifndef _WIN32
+// ---------------------------------------------------------------------------
+// fd-ordering / fsync / creation-mode seams (#4726, #4727). Capture-less
+// lambdas record into these statics, then forward to the real syscall.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct FdRec {
+    int seq = 0;
+    // Descriptor numbers are REUSED (the file fd is closed before the directory
+    // is opened), so each identity is cleared when its fd closes.
+    int file_fd = -1, dir_fd = -1;
+    int file_fsync_seq = 0, file_fchmod_seq = 0, file_close_seq = 0;
+    int dir_fsync_seq = 0, dir_close_seq = 0;
+    int file_fsync_n = 0, file_fchmod_n = 0, file_close_n = 0;
+    int dir_fsync_n = 0, dir_close_n = 0, stray_n = 0;
+    mode_t open_mode = 0;
+    bool fail_fchmod = false, fail_file_fsync = false, fail_dir_fsync = false;
+    bool fail_dir_close = false, fail_dir_open = false;
+    fs::path dest;
+    bool dest_final_at_dir_fsync = false; // rename done + temp gone when the dir fsync ran
+} g;
+
+yuzu::shared::PosixFdOps recording_ops() {
+    const auto dest = g.dest;
+    g = FdRec{};
+    g.dest = dest;
+    yuzu::shared::PosixFdOps o;
+    o.open = [](const char* p, int fl, mode_t m) {
+        if ((fl & O_DIRECTORY) && g.fail_dir_open) {
+            errno = EACCES;
+            return -1;
+        }
+        const int fd = ::open(p, fl, m);
+        if (fl & O_DIRECTORY) {
+            g.dir_fd = fd;
+        } else {
+            g.file_fd = fd;
+            g.open_mode = m;
+        }
+        return fd;
+    };
+    o.fsync = [](int fd) {
+        if (fd == g.file_fd) {
+            g.file_fsync_seq = ++g.seq;
+            ++g.file_fsync_n;
+            if (g.fail_file_fsync) { errno = EIO; return -1; }
+        } else if (fd == g.dir_fd) {
+            g.dir_fsync_seq = ++g.seq;
+            ++g.dir_fsync_n;
+            std::error_code ec;
+            g.dest_final_at_dir_fsync =
+                !g.dest.empty() && fs::exists(g.dest, ec) &&
+                unexpected_entries(g.dest.parent_path(), g.dest).empty();
+            if (g.fail_dir_fsync) { errno = EIO; return -1; }
+        } else {
+            ++g.stray_n;
+        }
+        return ::fsync(fd);
+    };
+    o.fchmod = [](int fd, mode_t m) {
+        if (fd == g.file_fd) {
+            g.file_fchmod_seq = ++g.seq;
+            ++g.file_fchmod_n;
+        } else {
+            ++g.stray_n;
+        }
+        if (g.fail_fchmod) { errno = EPERM; return -1; }
+        return ::fchmod(fd, m);
+    };
+    o.close = [](int fd) {
+        const int rc = ::close(fd);
+        if (fd == g.file_fd) {
+            g.file_close_seq = ++g.seq;
+            ++g.file_close_n;
+            g.file_fd = -1;
+        } else if (fd == g.dir_fd) {
+            g.dir_close_seq = ++g.seq;
+            ++g.dir_close_n;
+            g.dir_fd = -1;
+            if (g.fail_dir_close) { errno = EIO; return -1; }
+        } else {
+            ++g.stray_n;
+        }
+        return rc;
+    };
+    return o;
+}
+
+} // namespace
+
+TEST_CASE("asset_tags store: fchmod and fsync run on the open fd BEFORE close (#4726)",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    g.dest = dest;
+    const auto ops = recording_ops();
+    auto r = write_state_file_atomic(dest, "{}", {}, &ops);
+    REQUIRE(wrote_clean(r));
+    CHECK(g.file_fsync_n == 1);
+    CHECK(g.file_fchmod_n == 1);
+    CHECK(g.file_close_n == 1);
+    CHECK(g.file_fsync_seq < g.file_fchmod_seq);
+    CHECK(g.file_fchmod_seq < g.file_close_seq);
+    // The directory fd is a second, later fsync/close pair, run only after the
+    // rename has published the payload and consumed the temp.
+    CHECK(g.dir_fsync_n == 1);
+    CHECK(g.dir_close_n == 1);
+    CHECK(g.file_close_seq < g.dir_fsync_seq);
+    CHECK(g.dir_fsync_seq < g.dir_close_seq);
+    CHECK(g.dest_final_at_dir_fsync);
+    CHECK(g.stray_n == 0);
+}
+
+TEST_CASE("asset_tags store: a failed fchmod is a mode_unrestricted warning",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    const auto ops = recording_ops();
+    g.fail_fchmod = true;
+    auto r = write_state_file_atomic(dest, "{}", {}, &ops);
+    REQUIRE(r.has_value());
+    REQUIRE(r->has_value());
+    CHECK((*r)->mode_unrestricted);
+    CHECK_FALSE((*r)->dir_fsync_failed);
+    CHECK(fs::exists(dest));
+}
+
+TEST_CASE("asset_tags store: a failed file fsync is an IoError and leaves no temp",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    const auto ops = recording_ops();
+    g.fail_file_fsync = true;
+    auto r = write_state_file_atomic(dest, "{}", {}, &ops);
+    REQUIRE_FALSE(r.has_value());
+    CHECK_FALSE(fs::exists(dest));
+    CHECK(unexpected_entries(dir.path, dest).empty());
+}
+
+TEST_CASE("asset_tags store: a failed directory fsync is a dir_fsync_failed warning",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    const auto ops = recording_ops();
+    g.fail_dir_fsync = true;
+    auto r = write_state_file_atomic(dest, "{}", {}, &ops);
+    REQUIRE(r.has_value());
+    REQUIRE(r->has_value());
+    CHECK((*r)->dir_fsync_failed);
+    CHECK_FALSE((*r)->mode_unrestricted);
+    CHECK(fs::exists(dest));
+}
+
+TEST_CASE("asset_tags store: a failed directory open or close is a dir_fsync_failed warning",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto dest = dir.path / "s.json";
+    g.dest = dest;
+    const auto ops = recording_ops();
+    SECTION("open") {
+        g.fail_dir_open = true;
+    }
+    SECTION("close") {
+        g.fail_dir_close = true;
+    }
+    auto r = write_state_file_atomic(dest, "{}", {}, &ops);
+    REQUIRE(r.has_value());
+    REQUIRE(r->has_value());
+    CHECK((*r)->dir_fsync_failed);
+    CHECK_FALSE((*r)->mode_unrestricted);
+    CHECK(fs::exists(dest));
+}
+
+TEST_CASE("asset_tags store: creation mode follows owner_only_mode (R1)",
+          "[agent][asset_tags_store]") {
+    yuzu::test::TempDir dir{"yuzu_test_asset_tags_"};
+    const auto ops = recording_ops();
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "a", "x", {true, {}, &ops}).has_value());
+    CHECK(g.open_mode == 0600);
+    const auto ops2 = recording_ops();
+    REQUIRE(yuzu::shared::write_file_atomic(dir.path / "b", "x", {false, {}, &ops2}).has_value());
+    CHECK(g.open_mode == 0666);
+    CHECK(g.file_fchmod_n == 0); // no fchmod when the policy is not owner-only
+}
+#endif
