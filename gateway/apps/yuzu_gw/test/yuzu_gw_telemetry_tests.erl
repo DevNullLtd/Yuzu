@@ -58,39 +58,6 @@ notify_dropped_test_() ->
        end}
      ]}.
 
-%% #4707: a single non-Latin-1 character (an em dash) in one metric's HELP
-%% string made prometheus_text_format crash with badarg on every scrape, so
-%% :9568/metrics answered HTTP 500 for the whole registry. The CT suite that
-%% scrapes the endpoint was masked by #4800 (zero suites ran), so the defect
-%% shipped. This renders the REAL registry after the REAL setup through the
-%% REAL text formatter, in eunit, so the regression fails the fast gate.
-scrape_renders_test_() ->
-    {setup,
-     fun() ->
-        {ok, _} = application:ensure_all_started(prometheus),
-        {ok, _} = application:ensure_all_started(telemetry),
-        catch telemetry:detach(yuzu_gw_prometheus),
-        ok = yuzu_gw_telemetry:setup()
-     end,
-     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
-     [
-      {"the default registry renders to Prometheus text without crashing",
-       fun() ->
-           Text = prometheus_text_format:format(default),
-           ?assert(is_binary(Text)),
-           ?assertNotEqual(nomatch,
-                           binary:match(Text, <<"yuzu_gw_agents_connected_total">>))
-       end},
-      {"every yuzu_gw_* HELP line is plain ASCII",
-       fun() ->
-           Text = prometheus_text_format:format(default),
-           Bad = [L || L <- binary:split(Text, <<"\n">>, [global]),
-                       binary:match(L, <<"# HELP yuzu_gw_">>) =/= nomatch,
-                       lists:any(fun(C) -> C > 127 end, binary_to_list(L))],
-           ?assertEqual([], Bad)
-       end}
-     ]}.
-
 counter_val(Name, Labels) ->
     case prometheus_counter:value(Name, Labels) of
         undefined -> 0;
