@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <expected>
 #include <fstream>
+#include <format>
 #include <istream>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -79,6 +81,31 @@ inline LinesResult read_lines_from(std::istream& in) {
     if (in.bad())
         return std::unexpected(EIO);
     return lines;
+}
+
+// Pure summary output (one string per output line): the TOTAL row first, then
+// one row per severity. UNREADABLE (the check could not run)
+// is counted separately and is NOT an issue, nor is INFO.
+inline std::vector<std::string> summary_rows(const std::vector<std::string>& severities) {
+    std::map<std::string, int> counts;
+    for (const char* sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"})
+        counts[sev] = 0;
+    for (const auto& s : severities)
+        counts[s]++;
+
+    int total = 0;
+    int issues = 0;
+    for (const auto& [sev, count] : counts) {
+        total += count;
+        if (sev != "INFO" && sev != "UNREADABLE")
+            issues += count;
+    }
+
+    std::vector<std::string> rows;
+    rows.push_back(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
+    for (const char* sev : {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNREADABLE"})
+        rows.push_back(std::format("summary|{}|{}", sev, counts[sev]));
+    return rows;
 }
 
 namespace detail {

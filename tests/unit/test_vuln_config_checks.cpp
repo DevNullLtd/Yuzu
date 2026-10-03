@@ -217,3 +217,13 @@ TEST_CASE("read_lines_from: clean, empty and faulted streams", "[vuln][config]")
     REQUIRE(pw.has_value());
     CHECK(pw->severity == "UNREADABLE");
 }
+
+TEST_CASE("summary_rows: UNREADABLE counted separately and excluded from issues",
+          "[vuln][config]") {
+    const auto rows = summary_rows({"INFO", "INFO", "HIGH", "UNREADABLE", "UNREADABLE", "UNREADABLE"});
+    const std::vector<std::string> expected{
+        "summary|TOTAL|6 findings (1 issues)", "summary|CRITICAL|0", "summary|HIGH|1",
+        "summary|MEDIUM|0",                    "summary|LOW|0",      "summary|INFO|2",
+        "summary|UNREADABLE|3"};
+    CHECK(rows == expected);
+}
