@@ -1262,10 +1262,13 @@ NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
 no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (unsigned —
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
+
 The macOS job installs Erlang/OTP 28 + rebar3 per run via `erlef/setup-beam`
 (`ImageOS: macos26`), the same pin as the Linux leg, so the gateway is built and its
 eunit/ct suites run on macOS too. Before #4841 it had no Erlang and Meson silently
-skipped the gateway. Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
+skipped the gateway.
+
+Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
 `fork-dynamic-review.yml` Linux leg, which installs Erlang the same way) now runs
 `scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
 fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project

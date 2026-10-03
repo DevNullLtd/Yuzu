@@ -598,13 +598,13 @@ was fixed by the hotfix #5177/#5199. #4708 is a test-only defect.
 The gateway's EUnit check was unaffected and did run.
 
 #4800 closes it: the check now runs the suites on the Linux, Windows and macOS legs (52
-Common Test cases were measured on Linux and on Windows when it merged; the macOS count
-was not measured then), and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
+Common Test cases were measured on Linux and on Windows on 2026-09-23; the macOS count
+was not measured), and the wrapper fails any run that exits 0 without executing a test. `/test`'s EUnit gate
 and the release workflow's EUnit step were brought under the same rule. A hermetic
 self-test (`tests/test_gateway_test_summary.py`) pins the directory and the rule. The same
 change closes a second, older gap (#4841): the macOS CI leg never had Erlang, so Meson
 silently skipped the gateway there and the leg passed without building or testing it. The
-macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (ci.yml, nightly, sanitizer-tests) checks, right after
+macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (ci.yml, nightly, sanitizer-tests, fork-dynamic-review.yml) checks, right after
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
